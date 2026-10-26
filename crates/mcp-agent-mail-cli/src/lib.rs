@@ -1784,6 +1784,13 @@ pub enum ArchiveCommand {
         /// Emit content-free phase timings and file/byte counters to stderr.
         #[arg(long)]
         diagnostics: bool,
+        /// Omit the top-level doctor/ recovery history from the ZIP without
+        /// removing source files. Mailbox data and Git history stay included.
+        #[arg(long)]
+        exclude_recovery: bool,
+        /// ZIP deflate level: 0 (fastest) through 9 (smallest).
+        #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(i64).range(0..=9))]
+        compression_level: i64,
     },
     List {
         #[arg(long, short = 'n', default_value_t = 0)]
@@ -53304,12 +53311,16 @@ http_headers = { Authorization = "Bearer secret" }
                         scrub_preset,
                         label,
                         diagnostics,
+                        exclude_recovery,
+                        compression_level,
                     },
             } => {
                 assert!(projects.is_empty());
                 assert_eq!(scrub_preset, "archive");
                 assert!(label.is_none());
                 assert!(!diagnostics);
+                assert!(!exclude_recovery);
+                assert_eq!(compression_level, 9);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -53330,6 +53341,9 @@ http_headers = { Authorization = "Bearer secret" }
             "-l",
             "nightly",
             "--diagnostics",
+            "--exclude-recovery",
+            "--compression-level",
+            "1",
         ])
         .expect("failed to parse archive save flags");
         match cli.command.expect("expected command") {
@@ -53340,15 +53354,35 @@ http_headers = { Authorization = "Bearer secret" }
                         scrub_preset,
                         label,
                         diagnostics,
+                        exclude_recovery,
+                        compression_level,
                     },
             } => {
                 assert_eq!(projects, vec!["proj1".to_string(), "proj2".to_string()]);
                 assert_eq!(scrub_preset, "strict");
                 assert_eq!(label.as_deref(), Some("nightly"));
                 assert!(diagnostics);
+                assert!(exclude_recovery);
+                assert_eq!(compression_level, 1);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_rejects_archive_compression_level_outside_deflate_range() {
+        for level in ["-1", "10"] {
+            assert!(
+                Cli::try_parse_from([
+                    "am",
+                    "archive",
+                    "save",
+                    &format!("--compression-level={level}"),
+                ])
+                .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["am", "archive", "save", "--compression-level=0"]).is_ok());
     }
 
     #[test]
@@ -56516,6 +56550,225 @@ http_headers = { Authorization = "Bearer secret" }
             meta["database"]["source_path"].as_str(),
             Some(embedded_db.to_string_lossy().as_ref()),
             "archive metadata should still report the embedded sqlite source path"
+        );
+    }
+
+    #[test]
+    fn archive_save_recovery_exclusion_is_opt_in_and_restorable() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+        let source_db = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&source_db);
+        let recovery = Path::new("doctor/reclaimable/old.sqlite3");
+        let project_note = Path::new("projects/proj-alpha/doctor/notes.txt");
+        let attachment = Path::new("projects/proj-alpha/attachments/body.bin");
+        for (path, bytes) in [
+            (recovery, b"recovery evidence".as_slice()),
+            (project_note, b"project data".as_slice()),
+            (attachment, b"attachment data".as_slice()),
+        ] {
+            std::fs::create_dir_all(storage_root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(storage_root.join(path), bytes).unwrap();
+        }
+
+        for exclude_recovery in [false, true] {
+            let options = if exclude_recovery {
+                ArchiveSaveOptions {
+                    exclude_recovery: true,
+                    compression_level: 1,
+                    ..ArchiveSaveOptions::default()
+                }
+            } else {
+                ArchiveSaveOptions::default()
+            };
+            let archive = archive_save_state_internal(
+                &source_db,
+                &storage_root,
+                vec!["proj-alpha".to_string()],
+                "archive".to_string(),
+                Some(format!("recovery-{exclude_recovery}")),
+                options,
+                &ArchiveDiagnostics::disabled(),
+            )
+            .unwrap();
+            let (metadata, error) = load_archive_metadata(&archive);
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(
+                metadata["storage"]["recovery_history_included"],
+                !exclude_recovery
+            );
+            assert_eq!(metadata["compression_level"], options.compression_level);
+            assert_eq!(metadata["fts_enabled"], false);
+            let mut zip = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+            assert_eq!(
+                zip.by_name("storage_repo/doctor/reclaimable/old.sqlite3")
+                    .is_ok(),
+                !exclude_recovery,
+            );
+            for name in [
+                ARCHIVE_SNAPSHOT_RELATIVE,
+                "storage_repo/.git/HEAD",
+                "storage_repo/projects/proj-alpha/doctor/notes.txt",
+                "storage_repo/projects/proj-alpha/attachments/body.bin",
+            ] {
+                assert!(zip.by_name(name).is_ok(), "missing {name}");
+            }
+            drop(zip);
+
+            let restore_dir = root.path().join(format!("restored-{exclude_recovery}"));
+            std::fs::create_dir(&restore_dir).unwrap();
+            let restored_db = restore_dir.join("mailbox.sqlite3");
+            let restored_storage = restore_dir.join("storage_repo");
+            archive_restore_state(
+                archive,
+                &restored_db,
+                &restored_storage,
+                true,
+                false,
+                || Ok(()),
+            )
+            .expect("backup with either recovery policy remains restorable");
+            assert_eq!(restored_storage.join(recovery).exists(), !exclude_recovery);
+            assert_eq!(
+                std::fs::read(restored_storage.join(project_note)).unwrap(),
+                b"project data"
+            );
+            assert_eq!(
+                std::fs::read(restored_storage.join(attachment)).unwrap(),
+                b"attachment data"
+            );
+            let conn =
+                mcp_agent_mail_db::DbConn::open_file(restored_db.display().to_string()).unwrap();
+            let messages = conn
+                .query_sync("SELECT subject, body_md FROM messages ORDER BY id", &[])
+                .unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].get_named::<String>("body_md").unwrap(), "hello");
+            assert_eq!(messages[1].get_named::<String>("body_md").unwrap(), "world");
+            assert_eq!(
+                std::fs::read(storage_root.join(recovery)).unwrap(),
+                b"recovery evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_save_excludes_its_own_output_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path();
+        let output = storage.join(ARCHIVE_DIR_NAME);
+        std::fs::create_dir_all(output.join("mailbox-archive-zip-stage")).unwrap();
+        std::fs::write(output.join("previous.zip"), b"previous archive").unwrap();
+        std::fs::write(
+            output.join("mailbox-archive-zip-stage/mailbox-state.zip"),
+            b"incomplete archive",
+        )
+        .unwrap();
+        std::fs::write(storage.join("message.md"), b"mailbox data").unwrap();
+        let exclusions = archive_save_storage_exclusions(
+            storage,
+            &storage.join("storage.sqlite3"),
+            &output,
+            false,
+        )
+        .unwrap();
+        let mut selected = Vec::new();
+        collect_files_with_exclusions(
+            storage,
+            storage,
+            &exclusions,
+            &mut selected,
+            &ArchiveDiagnostics::disabled(),
+        )
+        .unwrap();
+        assert_eq!(selected, vec![PathBuf::from("message.md")]);
+        assert_eq!(
+            std::fs::read(output.join("previous.zip")).unwrap(),
+            b"previous archive"
+        );
+        assert!(exclusions.contains(Path::new(ARCHIVE_DIR_NAME)));
+        assert!(!exclusions.contains(Path::new("doctor")));
+    }
+
+    #[test]
+    fn archive_save_output_exclusion_resolves_relative_paths_and_refuses_same_directory() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+        let storage = Path::new("storage");
+        let output = storage.join(ARCHIVE_DIR_NAME);
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("previous.zip"), b"previous archive").unwrap();
+        std::fs::write(storage.join("message.md"), b"mailbox data").unwrap();
+        let canonical_output = std::fs::canonicalize(&output).unwrap();
+        let exclusions = archive_save_storage_exclusions(
+            storage,
+            &storage.join("storage.sqlite3"),
+            &canonical_output,
+            false,
+        )
+        .unwrap();
+        let mut selected = Vec::new();
+        collect_files_with_exclusions(
+            storage,
+            storage,
+            &exclusions,
+            &mut selected,
+            &ArchiveDiagnostics::disabled(),
+        )
+        .unwrap();
+        assert_eq!(selected, vec![PathBuf::from("message.md")]);
+
+        let canonical_storage = std::fs::canonicalize(storage).unwrap();
+        assert!(
+            archive_save_storage_exclusions(
+                storage,
+                &storage.join("storage.sqlite3"),
+                &canonical_storage,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            archive_save_storage_exclusions(
+                storage,
+                &storage.join("storage.sqlite3"),
+                &storage.join("missing-output"),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_save_output_exclusion_resolves_directory_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        let alias = root.path().join("storage-alias");
+        let output = storage.join(ARCHIVE_DIR_NAME);
+        std::fs::create_dir_all(&output).unwrap();
+        std::os::unix::fs::symlink(&storage, &alias).unwrap();
+        let exclusions =
+            archive_save_storage_exclusions(&alias, &alias.join("storage.sqlite3"), &output, false)
+                .unwrap();
+        assert!(exclusions.contains(Path::new(ARCHIVE_DIR_NAME)));
+        assert!(
+            archive_save_storage_exclusions(
+                &alias,
+                &alias.join("storage.sqlite3"),
+                &storage,
+                false,
+            )
+            .is_err()
         );
     }
 
@@ -86441,7 +86694,7 @@ fn archive_save_state(
         projects,
         scrub_preset,
         label,
-        true,
+        ArchiveSaveOptions::default(),
         &ArchiveDiagnostics::disabled(),
     )
 }
@@ -86459,9 +86712,58 @@ fn archive_save_state_locked(
         projects,
         scrub_preset,
         label,
-        false,
+        ArchiveSaveOptions {
+            acquire_mailbox_read_lock: false,
+            ..ArchiveSaveOptions::default()
+        },
         &ArchiveDiagnostics::disabled(),
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArchiveSaveOptions {
+    acquire_mailbox_read_lock: bool,
+    exclude_recovery: bool,
+    compression_level: i64,
+}
+
+impl Default for ArchiveSaveOptions {
+    fn default() -> Self {
+        Self {
+            acquire_mailbox_read_lock: true,
+            exclude_recovery: false,
+            compression_level: 9,
+        }
+    }
+}
+
+fn archive_save_storage_exclusions(
+    storage_root: &Path,
+    database_path: &Path,
+    archive_dir: &Path,
+    exclude_recovery: bool,
+) -> CliResult<std::collections::BTreeSet<PathBuf>> {
+    // The output root is canonical, while STORAGE_ROOT may be relative or use
+    // a filesystem alias. Compare directory identities in the same spelling.
+    let canonical_storage = std::fs::canonicalize(storage_root)?;
+    let canonical_output = std::fs::canonicalize(archive_dir)?;
+    if canonical_output == canonical_storage {
+        return Err(CliError::InvalidArgument(
+            "archive output directory must differ from the mailbox storage root".to_string(),
+        ));
+    }
+    let mut excluded = archive_storage_excluded_relative_paths(storage_root, database_path);
+    if exclude_recovery {
+        // Only the root recovery namespace is optional. A project's own
+        // doctor/ directory, messages, attachments and .git remain intact.
+        excluded.insert(PathBuf::from("doctor"));
+    }
+    // Previous archives and the currently staged ZIP are output, not mailbox
+    // authority. Never recursively embed them when saving inside storage.
+    if let Ok(relative_archive_dir) = canonical_output.strip_prefix(&canonical_storage) {
+        excluded.insert(relative_archive_dir.to_path_buf());
+    }
+    Ok(excluded)
 }
 
 fn archive_save_state_internal(
@@ -86470,12 +86772,17 @@ fn archive_save_state_internal(
     projects: Vec<String>,
     scrub_preset: String,
     label: Option<String>,
-    acquire_mailbox_read_lock: bool,
+    options: ArchiveSaveOptions,
     diagnostics: &ArchiveDiagnostics,
 ) -> CliResult<PathBuf> {
     use chrono::Timelike;
 
     diagnostics.start(ArchivePhase::Prepare);
+    if !(0..=9).contains(&options.compression_level) {
+        return Err(CliError::InvalidArgument(
+            "archive compression level must be between 0 and 9".to_string(),
+        ));
+    }
     let source_db = PathBuf::from(resolve_sqlite_runtime_path(&source_db.to_string_lossy()));
 
     let preset = match share::normalize_scrub_preset(&scrub_preset) {
@@ -86497,7 +86804,7 @@ fn archive_save_state_internal(
         )));
     }
 
-    let _mailbox_read_locks = if acquire_mailbox_read_lock {
+    let _mailbox_read_locks = if options.acquire_mailbox_read_lock {
         Some(acquire_cli_mailbox_read_locks_for_paths(
             &source_db,
             storage_root,
@@ -86576,6 +86883,12 @@ fn archive_save_state_internal(
     let projects_requested = projects.clone();
     let label_value = label.clone().unwrap_or_default();
     let source_path = source.reported_path().display().to_string();
+    let excluded_storage_paths = archive_save_storage_exclusions(
+        storage_root,
+        source.reported_path(),
+        &archive_dir,
+        options.exclude_recovery,
+    )?;
 
     let metadata = serde_json::json!({
         "version": 1,
@@ -86595,7 +86908,12 @@ fn archive_save_state_internal(
             "source_path": storage_root.display().to_string(),
             "git_head": detect_git_head(storage_root),
             "archive_dir": ARCHIVE_STORAGE_DIRNAME,
+            "recovery_history_included": !options.exclude_recovery,
+            "excluded_paths": excluded_storage_paths.iter()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>(),
         },
+        "compression_level": options.compression_level,
         "label": label_value,
         "tooling": {
             "package": "mcp-agent-mail",
@@ -86634,7 +86952,7 @@ fn archive_save_state_internal(
         .map_err(|e| CliError::Other(format!("zip time error: {e}")))?;
     let base_options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
-        .compression_level(Some(9))
+        .compression_level(Some(options.compression_level))
         .last_modified_time(fixed_time);
 
     // metadata.json
@@ -86657,8 +86975,6 @@ fn archive_save_state_internal(
     // storage_repo/*
     diagnostics.start(ArchivePhase::Enumerate);
     let mut files = Vec::new();
-    let excluded_storage_paths =
-        archive_storage_excluded_relative_paths(storage_root, source.reported_path());
     collect_files_with_exclusions(
         storage_root,
         storage_root,
@@ -86668,7 +86984,7 @@ fn archive_save_state_internal(
     )?;
     files.sort();
     diagnostics.finish();
-    // Keep the existing write/enumerate/write order and compression settings.
+    // Resume ZIP writing after the selected storage files have been enumerated.
     diagnostics.start(ArchivePhase::Zip);
     for rel in files {
         let full_path = storage_root.join(&rel);
@@ -87058,6 +87374,8 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             scrub_preset,
             label,
             diagnostics,
+            exclude_recovery,
+            compression_level,
         } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             let source_path = cfg
@@ -87080,7 +87398,11 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                 projects,
                 scrub_preset,
                 label,
-                true,
+                ArchiveSaveOptions {
+                    exclude_recovery,
+                    compression_level,
+                    ..ArchiveSaveOptions::default()
+                },
                 &diagnostics,
             )?;
             Ok(())

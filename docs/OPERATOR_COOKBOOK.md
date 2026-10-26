@@ -691,7 +691,7 @@ wrapping on overflow.
 | `snapshot` | Create the private SQLite snapshot |
 | `filter` | Select projects and remove out-of-scope rows from the snapshot |
 | `scrub` | Apply the requested scrub preset and snapshot-purpose policy |
-| `finalize` | Rebuild snapshot storage, search indexes, views, and statistics |
+| `finalize` | Rebuild a compact standalone mailbox snapshot; private backups omit viewer search indexes and materialized tables |
 | `archive_metadata` | Prepare the existing archive metadata |
 | `zip_writing` | Write and compress ZIP members, then finish the ZIP |
 | `storage_enumeration` | Walk the existing storage selection and sort members |
@@ -741,3 +741,39 @@ rg '^archive_save_diagnostic ' /abs/path/archive-save.stderr.log \
 The flag does not alter locking, project filtering, scrub semantics, compression
 settings, archive members, restore format, or atomic publication. It does not
 exclude or delete recovery evidence, and it does not change the offline limit.
+
+
+### Control backup size and compression
+
+A build with these options lists `--exclude-recovery` and
+`--compression-level` in `am archive save --help`. Private archive snapshots
+retain restore state and the compact standalone database rebuild, without
+building the FTS index and materialized tables used only by published share
+viewers. Published `am share` bundles still build those viewer artifacts.
+
+For an existing offline backup run or a disposable replica:
+
+```bash
+am archive save --project /abs/path/project --scrub-preset archive \
+  --label nightly --exclude-recovery --compression-level 1 --diagnostics
+```
+
+`--exclude-recovery` omits only the top-level `STORAGE_ROOT/doctor/` directory
+from the ZIP. It leaves the source files untouched and preserves mailbox
+messages, attachments, reservations, agent identities, and Git history.
+A project's nested `doctor/` directory is still included. Recovery material
+already present in Git objects remains part of that history; this option is
+not an erasure or redaction policy. The default includes recovery history.
+
+Deflate levels range from `0` (fastest) to `9` (smallest); the default remains
+`9`. Lower levels trade a larger ZIP for less compression work. Metadata
+records the compression level, recovery-history policy, and omitted storage
+paths. These settings do not change the database scrub preset or the restore
+command.
+
+When the output directory is inside `STORAGE_ROOT`, saves automatically omit
+that directory so an archive cannot contain earlier backups or its own
+temporary ZIP. This check resolves relative paths and directory aliases; the
+output directory must differ from the mailbox storage root. The dedicated
+SQLite snapshot is still included; the embedded
+live database and its sidecars remain excluded from the storage payload.
