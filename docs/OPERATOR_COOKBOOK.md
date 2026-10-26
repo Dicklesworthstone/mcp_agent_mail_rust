@@ -993,3 +993,7 @@ only prints the proposed destination and preservation operations. It does not
 decompress every entry, verify the SQLite snapshot, or prove that restoration
 will succeed. Preserve existing good archives until the new archive has passed
 the required restore checks.
+
+The completed component checks, paired compression measurements, and remaining
+native test gates for issue #365 are recorded in
+[Archive issue #365: validation record](ARCHIVE_365_VALIDATION.md).
