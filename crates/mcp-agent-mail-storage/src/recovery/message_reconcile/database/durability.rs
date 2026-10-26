@@ -751,9 +751,10 @@ mod tests {
             )
             .unwrap()
             .0;
-            // A directory where the canonical regular file must go forces
-            // the production archive writer to fail; nothing fakes its Result.
-            std::fs::create_dir_all(&paths.canonical).unwrap();
+            // A directory where the outbox regular file must go forces
+            // the production archive writer to fail for 901 without poisoning
+            // 902's canonical-ID scan of `messages/YYYY/MM/`.
+            std::fs::create_dir_all(&paths.outbox).unwrap();
             let before = crate::wbq_stats();
             let mut ops = prepared
                 .iter()
@@ -800,7 +801,7 @@ mod tests {
             assert!(!ledger().unknown_failure);
 
             std::fs::rename(
-                &paths.canonical,
+                &paths.outbox,
                 config.storage_root.join("retained-wbq-obstruction"),
             )
             .unwrap();
