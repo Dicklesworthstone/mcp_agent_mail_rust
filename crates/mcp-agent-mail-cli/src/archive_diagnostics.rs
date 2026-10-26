@@ -4,7 +4,7 @@
 //! on the caller. Like the CLI's other blocking workers, it uses the shared
 //! worker-stack policy and is stopped and joined, including on error/unwind.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ pub(crate) enum ArchivePhase {
     Metadata,
     Enumerate,
     Zip,
+    Verify,
     Publish,
 }
 
@@ -37,18 +38,8 @@ impl ArchivePhase {
             Self::Metadata => "archive_metadata",
             Self::Enumerate => "storage_enumeration",
             Self::Zip => "zip_writing",
+            Self::Verify => "archive_verification",
             Self::Publish => "publication",
-        }
-    }
-}
-
-impl From<mcp_agent_mail_share::SnapshotPhase> for ArchivePhase {
-    fn from(phase: mcp_agent_mail_share::SnapshotPhase) -> Self {
-        match phase {
-            mcp_agent_mail_share::SnapshotPhase::Snapshot => Self::Snapshot,
-            mcp_agent_mail_share::SnapshotPhase::Filter => Self::Filter,
-            mcp_agent_mail_share::SnapshotPhase::Scrub => Self::Scrub,
-            mcp_agent_mail_share::SnapshotPhase::Finalize => Self::Finalize,
         }
     }
 }
@@ -64,10 +55,17 @@ struct Counters {
     archive_bytes: u64,
 }
 
+struct ProgressSample {
+    phase: &'static str,
+    files: u64,
+    bytes: u64,
+}
+
 struct State {
     started: Instant,
     phase: Option<(ArchivePhase, Instant)>,
     counters: Counters,
+    progress_sample: Option<ProgressSample>,
     heartbeat: bool,
     emit: Box<dyn Fn(&str) + Send + Sync>,
 }
@@ -132,6 +130,7 @@ impl ArchiveDiagnostics {
             started: Instant::now(),
             phase: None,
             counters: Counters::default(),
+            progress_sample: None,
             heartbeat: false,
             emit,
         }));
@@ -161,10 +160,6 @@ impl ArchiveDiagnostics {
         }
     }
 
-    pub(crate) const fn enabled(&self) -> bool {
-        self.state.is_some()
-    }
-
     fn update(&self, update: impl FnOnce(&mut State)) {
         if let Some(state) = &self.state {
             update(&mut state.lock().unwrap_or_else(|error| error.into_inner()));
@@ -186,72 +181,80 @@ impl ArchiveDiagnostics {
         });
     }
 
-    pub(crate) fn discovered(&self, bytes: Option<u64>) {
+    /// Feed the cooperative, fine-grained save events into the independent
+    /// heartbeat. Adjacent fine phases may share one diagnostic phase, and
+    /// their local counters must not reset the cumulative diagnostic totals.
+    pub(crate) fn observe_progress(&self, event: &super::ArchiveProgressEvent) {
+        let phase = match event.phase {
+            "prepare" | "mailbox_lock" => ArchivePhase::Prepare,
+            "source_reconciliation" => ArchivePhase::SnapshotSource,
+            "snapshot_copy" => ArchivePhase::Snapshot,
+            "snapshot_scope" => ArchivePhase::Filter,
+            "snapshot_scrub" => ArchivePhase::Scrub,
+            "snapshot_compact" | "snapshot_viewer" => ArchivePhase::Finalize,
+            "metadata" => ArchivePhase::Metadata,
+            "storage_inventory" => ArchivePhase::Enumerate,
+            "compress_snapshot" | "compress_storage" | "finalize_zip" => ArchivePhase::Zip,
+            "verify_zip" => ArchivePhase::Verify,
+            "publish" => ArchivePhase::Publish,
+            _ => return,
+        };
         self.update(|state| {
-            let counters = &mut state.counters;
-            counters.storage_files = counters.storage_files.saturating_add(1);
-            if let Some(bytes) = bytes {
-                counters.storage_bytes = counters.storage_bytes.saturating_add(bytes);
-            } else {
-                counters.storage_size_unknown = counters.storage_size_unknown.saturating_add(1);
+            let now = Instant::now();
+            let changed_phase = state.phase.map(|(active, _)| active) != Some(phase);
+            if changed_phase {
+                state.report("completed", now);
+                state.phase = Some((phase, now));
             }
-        });
-    }
 
-    pub(crate) fn snapshot_bytes(&self, bytes: u64) {
-        self.update(|state| state.counters.snapshot_bytes = bytes);
+            let (files, bytes) = state
+                .progress_sample
+                .as_ref()
+                .filter(|sample| sample.phase == event.phase)
+                .map_or((event.files, event.bytes), |sample| {
+                    (
+                        event.files.saturating_sub(sample.files),
+                        event.bytes.saturating_sub(sample.bytes),
+                    )
+                });
+            let counters = &mut state.counters;
+            match event.phase {
+                "storage_inventory" => {
+                    counters.storage_files = counters.storage_files.saturating_add(files);
+                    counters.storage_bytes = counters.storage_bytes.saturating_add(bytes);
+                }
+                "compress_snapshot" | "compress_storage" => {
+                    counters.zip_files = counters.zip_files.saturating_add(files);
+                    counters.zip_bytes = counters.zip_bytes.saturating_add(bytes);
+                }
+                // Verification reads every member again. It must not count
+                // those bytes or files as additional ZIP payload.
+                _ => {}
+            }
+            counters.snapshot_bytes = event.snapshot_bytes;
+            counters.archive_bytes = event.archive_bytes;
+            state.progress_sample = Some(ProgressSample {
+                phase: event.phase,
+                files: event.files,
+                bytes: event.bytes,
+            });
+
+            if changed_phase {
+                state.report("started", now);
+            }
+            if phase == ArchivePhase::Publish && event.state == "completed" {
+                state.report("completed", now);
+                state.phase = None;
+            }
+            // A completed fine phase can be followed by another fine phase
+            // with the same coarse name. Only a coarse transition or the
+            // successful publication ends it. Failure/cancellation leaves it
+            // active so Drop reports one terminal failure and joins the worker.
+        });
     }
 
     pub(crate) fn archive_bytes(&self, bytes: u64) {
         self.update(|state| state.counters.archive_bytes = bytes);
-    }
-
-    fn wrote_bytes(&self, bytes: usize) {
-        self.update(|state| {
-            state.counters.zip_bytes = state
-                .counters
-                .zip_bytes
-                .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
-        });
-    }
-
-    fn wrote_file(&self) {
-        self.update(|state| {
-            state.counters.zip_files = state.counters.zip_files.saturating_add(1);
-        });
-    }
-
-    pub(crate) fn write_entry(&self, writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
-        if self.enabled() {
-            CountedWriter {
-                writer,
-                diagnostics: self,
-            }
-            .write_all(bytes)?;
-            self.wrote_file();
-        } else {
-            writer.write_all(bytes)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn copy_entry(
-        &self,
-        reader: &mut impl Read,
-        writer: &mut impl Write,
-    ) -> io::Result<u64> {
-        if !self.enabled() {
-            return io::copy(reader, writer);
-        }
-        let bytes = io::copy(
-            reader,
-            &mut CountedWriter {
-                writer,
-                diagnostics: self,
-            },
-        )?;
-        self.wrote_file();
-        Ok(bytes)
     }
 }
 
@@ -281,23 +284,6 @@ fn emit_record(line: &str) {
     }
 }
 
-struct CountedWriter<'a, W> {
-    writer: &'a mut W,
-    diagnostics: &'a ArchiveDiagnostics,
-}
-
-impl<W: Write> Write for CountedWriter<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.writer.write(bytes)?;
-        self.diagnostics.wrote_bytes(written);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,45 +305,209 @@ mod tests {
             .unwrap()
     }
 
+    fn progress(
+        phase: &'static str,
+        state: &'static str,
+        files: u64,
+        bytes: u64,
+    ) -> crate::ArchiveProgressEvent {
+        let mut observer = |_: &crate::ArchiveProgressEvent| Ok(());
+        let mut event = crate::ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        )
+        .event;
+        event.phase = phase;
+        event.state = state;
+        event.files = files;
+        event.bytes = bytes;
+        event.snapshot_bytes = 7;
+        event.archive_bytes = 24;
+        event
+    }
+
+    fn with_zip_progress<T>(
+        diagnostics: &ArchiveDiagnostics,
+        run: impl FnOnce(&mut crate::ArchiveSaveProgress<'_>) -> crate::CliResult<T>,
+    ) -> crate::CliResult<T> {
+        let mut observer = |event: &crate::ArchiveProgressEvent| {
+            diagnostics.observe_progress(event);
+            Ok(())
+        };
+        let mut progress = crate::ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        progress.event.phase = "compress_storage";
+        progress.emit("started")?;
+        let result = run(&mut progress);
+        progress.emit(if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        })?;
+        result
+    }
+
+    #[test]
+    fn archive_diagnostics_progress_bridge_coalesces_phases_and_counts_payload_once() {
+        let (diagnostics, records) = recorded();
+        for (phase, state, files, bytes) in [
+            ("prepare", "started", 0, 0),
+            ("prepare", "completed", 0, 0),
+            ("mailbox_lock", "started", 0, 0),
+            ("mailbox_lock", "completed", 0, 0),
+            ("source_reconciliation", "started", 0, 0),
+            ("source_reconciliation", "completed", 0, 0),
+            ("snapshot_copy", "started", 0, 0),
+            ("snapshot_copy", "completed", 0, 0),
+            ("snapshot_scope", "started", 0, 0),
+            ("snapshot_scope", "completed", 0, 0),
+            ("snapshot_scrub", "started", 0, 0),
+            ("snapshot_scrub", "completed", 0, 0),
+            ("snapshot_compact", "started", 0, 0),
+            ("snapshot_compact", "completed", 0, 0),
+            ("snapshot_viewer", "started", 0, 0),
+            ("snapshot_viewer", "completed", 0, 0),
+            ("metadata", "started", 0, 0),
+            ("metadata", "completed", 0, 0),
+            ("storage_inventory", "started", 0, 0),
+            ("storage_inventory", "progress", 1, 3),
+            ("storage_inventory", "completed", 2, 10),
+            ("storage_inventory", "completed", 2, 10),
+            ("compress_snapshot", "started", 0, 0),
+            ("compress_snapshot", "progress", 0, 3),
+            ("compress_snapshot", "completed", 2, 20),
+            ("compress_storage", "started", 0, 0),
+            ("compress_storage", "progress", 1, 4),
+            ("compress_storage", "progress", 1, 4),
+            ("compress_storage", "completed", 2, 10),
+            ("finalize_zip", "started", 0, 0),
+            ("finalize_zip", "completed", 0, 0),
+            ("verify_zip", "started", 0, 0),
+            ("verify_zip", "progress", 3, 25),
+            ("verify_zip", "completed", 4, 30),
+            ("publish", "started", 0, 0),
+            ("publish", "completed", 0, 0),
+        ] {
+            diagnostics.observe_progress(&progress(phase, state, files, bytes));
+        }
+        drop(diagnostics);
+        let records = records.lock().unwrap();
+        let phases = [
+            "prepare",
+            "snapshot_source",
+            "snapshot",
+            "filter",
+            "scrub",
+            "finalize",
+            "archive_metadata",
+            "storage_enumeration",
+            "zip_writing",
+            "archive_verification",
+            "publication",
+        ];
+        assert_eq!(records.len(), phases.len() * 2);
+        for (phase, pair) in phases.iter().zip(records.chunks_exact(2)) {
+            assert!(pair[0].contains(&format!("phase={phase} status=started")));
+            assert!(pair[1].contains(&format!("phase={phase} status=completed")));
+        }
+        let completed = records.last().unwrap();
+        assert_eq!(number(completed, "storage_files"), 2);
+        assert_eq!(number(completed, "storage_bytes"), 10);
+        assert_eq!(number(completed, "storage_size_unknown"), 0);
+        assert_eq!(number(completed, "zip_files"), 4);
+        assert_eq!(number(completed, "zip_bytes"), 30);
+        assert_eq!(number(completed, "snapshot_bytes"), 7);
+        assert_eq!(number(completed, "archive_bytes"), 24);
+        assert!(
+            records
+                .iter()
+                .all(|record| !record.contains("status=failed"))
+        );
+    }
+
+    #[test]
+    fn archive_diagnostics_progress_bridge_keeps_failure_active_until_drop() {
+        for terminal in ["failed", "cancelled"] {
+            let (diagnostics, records) = recorded();
+            for (phase, state, files, bytes) in [
+                ("compress_snapshot", "started", 0, 0),
+                ("compress_snapshot", "completed", 2, 20),
+                ("compress_storage", "started", 0, 0),
+                ("compress_storage", "progress", 1, 4),
+                ("compress_storage", terminal, 1, 7),
+            ] {
+                diagnostics.observe_progress(&progress(phase, state, files, bytes));
+            }
+            assert_eq!(records.lock().unwrap().len(), 1);
+            drop(diagnostics);
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records[1].contains("phase=zip_writing status=failed"));
+            assert_eq!(number(&records[1], "zip_files"), 3);
+            assert_eq!(number(&records[1], "zip_bytes"), 27);
+            assert!(
+                records
+                    .iter()
+                    .all(|record| !record.contains("status=completed"))
+            );
+        }
+    }
+
     #[test]
     fn archive_diagnostics_disabled_preserves_io_without_a_worker() {
         let diagnostics = ArchiveDiagnostics::new(false);
         assert!(diagnostics.state.is_none());
         assert!(diagnostics.worker.is_none());
-        diagnostics.start(ArchivePhase::Zip);
         let mut output = Vec::new();
-        diagnostics.write_entry(&mut output, b"metadata").unwrap();
-        diagnostics
-            .copy_entry(&mut &b"payload"[..], &mut output)
-            .unwrap();
+        with_zip_progress(&diagnostics, |progress| {
+            crate::archive_write_all(&mut output, b"metadata", false, progress)?;
+            progress.advance(1, 0, false)?;
+            crate::archive_copy_exact(&mut &b"payload"[..], &mut output, 7, false, progress)?;
+            progress.advance(1, 0, false)
+        })
+        .unwrap();
         diagnostics.finish();
         assert_eq!(output, b"metadatapayload");
+        assert!(diagnostics.state.is_none());
+        assert!(diagnostics.worker.is_none());
     }
 
     #[test]
     fn archive_diagnostics_counters_saturate_without_per_file_output() {
         let (diagnostics, records) = recorded();
-        diagnostics.start(ArchivePhase::Enumerate);
-        diagnostics.discovered(Some(u64::MAX));
-        for _ in 0..10_000 {
-            diagnostics.discovered(Some(1));
+        diagnostics.observe_progress(&progress("storage_inventory", "started", 0, 0));
+        for files in 1..=10_001 {
+            diagnostics.observe_progress(&progress(
+                "storage_inventory",
+                "progress",
+                files,
+                u64::MAX,
+            ));
         }
-        diagnostics.discovered(None);
-        diagnostics.update(|state| {
-            state.counters.zip_files = u64::MAX;
-            state.counters.zip_bytes = u64::MAX;
-        });
-        diagnostics.wrote_file();
-        diagnostics.wrote_bytes(1);
+        // ZIP counters accumulate across separate fine phases. Advancing the
+        // next phase after a maximum-sized snapshot must saturate, not wrap.
+        for (phase, state, files, bytes) in [
+            ("storage_inventory", "completed", 10_001, u64::MAX),
+            ("compress_snapshot", "started", 0, 0),
+            ("compress_snapshot", "completed", u64::MAX, u64::MAX),
+            ("compress_storage", "started", 0, 0),
+            ("compress_storage", "completed", 1, 1),
+        ] {
+            diagnostics.observe_progress(&progress(phase, state, files, bytes));
+        }
         diagnostics.finish();
         drop(diagnostics);
         let records = records.lock().unwrap();
-        assert_eq!(records.len(), 2, "counters must not emit one line per file");
-        let completed = &records[1];
+        assert_eq!(records.len(), 4, "counters must not emit one line per file");
+        let completed = records.last().unwrap();
         assert!(completed.contains("status=completed"));
-        assert_eq!(number(completed, "storage_files"), 10_002);
+        assert_eq!(number(completed, "storage_files"), 10_001);
         assert_eq!(number(completed, "storage_bytes"), u64::MAX);
-        assert_eq!(number(completed, "storage_size_unknown"), 1);
+        // Inventory requires metadata, so no synthetic unknown-size branch
+        // contributes to the retained diagnostic-schema field.
+        assert_eq!(number(completed, "storage_size_unknown"), 0);
         assert_eq!(number(completed, "zip_files"), u64::MAX);
         assert_eq!(number(completed, "zip_bytes"), u64::MAX);
         assert!(
@@ -416,14 +566,24 @@ mod tests {
     #[test]
     fn archive_diagnostics_zip_failure_keeps_partial_bytes_without_completing_file() {
         let (diagnostics, records) = recorded();
-        diagnostics.start(ArchivePhase::Zip);
         let mut output = FailAfter {
             bytes: Vec::new(),
             limit: 3,
         };
-        let error = diagnostics
-            .copy_entry(&mut &b"private payload"[..], &mut output)
-            .unwrap_err();
+        let error = with_zip_progress(&diagnostics, |progress| {
+            crate::archive_copy_exact(
+                &mut &b"private payload"[..],
+                &mut output,
+                15,
+                false,
+                progress,
+            )?;
+            progress.advance(1, 0, false)
+        })
+        .unwrap_err();
+        let crate::CliError::Io(error) = error else {
+            panic!("expected the injected writer I/O failure");
+        };
         assert_eq!(error.to_string(), "PRIVATE-CREDENTIAL-in-error");
         drop(diagnostics);
         let records = records.lock().unwrap();
@@ -440,13 +600,21 @@ mod tests {
     #[test]
     fn archive_diagnostics_success_counts_empty_and_large_entries() {
         let (diagnostics, records) = recorded();
-        diagnostics.start(ArchivePhase::Zip);
         let mut output = Vec::new();
-        diagnostics.write_entry(&mut output, b"").unwrap();
         let payload = vec![42; 256 * 1024];
-        diagnostics
-            .copy_entry(&mut payload.as_slice(), &mut output)
-            .unwrap();
+        with_zip_progress(&diagnostics, |progress| {
+            crate::archive_write_all(&mut output, b"", false, progress)?;
+            progress.advance(1, 0, false)?;
+            crate::archive_copy_exact(
+                &mut payload.as_slice(),
+                &mut output,
+                payload.len() as u64,
+                false,
+                progress,
+            )?;
+            progress.advance(1, 0, false)
+        })
+        .unwrap();
         diagnostics.finish();
         drop(diagnostics);
         assert_eq!(output, payload);

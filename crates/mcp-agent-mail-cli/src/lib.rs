@@ -1781,14 +1781,17 @@ pub enum ArchiveCommand {
         scrub_preset: String,
         #[arg(long, short = 'l')]
         label: Option<String>,
-        /// Emit content-free phase timings and file/byte counters to stderr.
+        /// Emit content-free phase timings and a periodic stderr heartbeat.
         #[arg(long)]
         diagnostics: bool,
-        /// Omit the top-level doctor/ recovery history from the ZIP without
-        /// removing source files. Mailbox data and Git history stay included.
+        /// Omit top-level doctor/ recovery history without removing source files.
+        /// Omit this flag when the archive must include historical recovery evidence.
         #[arg(long)]
         exclude_recovery: bool,
-        /// ZIP deflate level: 0 (fastest) through 9 (smallest).
+        /// Phase progress on stderr (also available without a terminal).
+        #[arg(long, value_enum, default_value = "text")]
+        progress: ArchiveProgressFormat,
+        /// ZIP compression: 0 stores bytes, 1..=9 use increasing deflate effort.
         #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(i64).range(0..=9))]
         compression_level: i64,
     },
@@ -1809,6 +1812,14 @@ pub enum ArchiveCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ArchiveProgressFormat {
+    #[default]
+    Text,
+    Json,
+    Off,
 }
 
 #[derive(Subcommand, Debug)]
@@ -16353,44 +16364,57 @@ impl CanonicalSnapshotSource {
         scrub_preset: share::ScrubPreset,
         purpose: share::SnapshotPurpose,
     ) -> Result<share::SnapshotContext, share::ShareError> {
-        self.create_share_snapshot_context_with_observer(
-            snapshot_path,
-            project_filters,
-            scrub_preset,
-            purpose,
-            &mut |_| {},
-        )
+        match self.kind {
+            CanonicalSnapshotSourceKind::LiveSqlite => share::create_snapshot_context(
+                &self.actual_path,
+                snapshot_path,
+                project_filters,
+                scrub_preset,
+                purpose,
+            ),
+            CanonicalSnapshotSourceKind::LiveSnapshot
+            | CanonicalSnapshotSourceKind::ArchiveSnapshot
+            | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
+                share::create_private_canonical_snapshot_context(
+                    &self.actual_path,
+                    snapshot_path,
+                    project_filters,
+                    scrub_preset,
+                    purpose,
+                )
+            }
+        }
     }
 
-    fn create_share_snapshot_context_with_observer(
+    fn create_share_snapshot_context_with_progress(
         &self,
         snapshot_path: &Path,
         project_filters: &[String],
         scrub_preset: share::ScrubPreset,
         purpose: share::SnapshotPurpose,
-        observer: &mut dyn FnMut(share::SnapshotPhaseEvent),
+        progress: &mut dyn FnMut(share::SnapshotProgress) -> Result<(), share::ShareError>,
     ) -> Result<share::SnapshotContext, share::ShareError> {
         match self.kind {
             CanonicalSnapshotSourceKind::LiveSqlite => {
-                share::create_snapshot_context_with_observer(
+                share::create_snapshot_context_with_progress(
                     &self.actual_path,
                     snapshot_path,
                     project_filters,
                     scrub_preset,
                     purpose,
-                    observer,
+                    progress,
                 )
             }
             CanonicalSnapshotSourceKind::LiveSnapshot
             | CanonicalSnapshotSourceKind::ArchiveSnapshot
             | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
-                share::create_private_canonical_snapshot_context_with_observer(
+                share::create_private_canonical_snapshot_context_with_progress(
                     &self.actual_path,
                     snapshot_path,
                     project_filters,
                     scrub_preset,
                     purpose,
-                    observer,
+                    progress,
                 )
             }
         }
@@ -53312,6 +53336,7 @@ http_headers = { Authorization = "Bearer secret" }
                         label,
                         diagnostics,
                         exclude_recovery,
+                        progress,
                         compression_level,
                     },
             } => {
@@ -53320,6 +53345,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(label.is_none());
                 assert!(!diagnostics);
                 assert!(!exclude_recovery);
+                assert_eq!(progress, ArchiveProgressFormat::Text);
                 assert_eq!(compression_level, 9);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -53342,6 +53368,8 @@ http_headers = { Authorization = "Bearer secret" }
             "nightly",
             "--diagnostics",
             "--exclude-recovery",
+            "--progress",
+            "json",
             "--compression-level",
             "1",
         ])
@@ -53355,6 +53383,7 @@ http_headers = { Authorization = "Bearer secret" }
                         label,
                         diagnostics,
                         exclude_recovery,
+                        progress,
                         compression_level,
                     },
             } => {
@@ -53363,6 +53392,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert_eq!(label.as_deref(), Some("nightly"));
                 assert!(diagnostics);
                 assert!(exclude_recovery);
+                assert_eq!(progress, ArchiveProgressFormat::Json);
                 assert_eq!(compression_level, 1);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -53382,6 +53412,19 @@ http_headers = { Authorization = "Bearer secret" }
                 .is_err()
             );
         }
+        assert!(Cli::try_parse_from(["am", "archive", "save", "--compression-level=0"]).is_ok());
+    }
+
+    #[test]
+    fn clap_archive_save_rejects_invalid_performance_options() {
+        for level in ["10", "-1", "1000000"] {
+            assert!(
+                Cli::try_parse_from(["am", "archive", "save", "--compression-level", level])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["am", "archive", "save", "--progress", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["am", "archive", "save", "--progress", "off"]).is_ok());
         assert!(Cli::try_parse_from(["am", "archive", "save", "--compression-level=0"]).is_ok());
     }
 
@@ -55383,15 +55426,87 @@ http_headers = { Authorization = "Bearer secret" }
         seed_mailbox_db(&source_db);
         println!(">>> seed_mailbox_db done");
 
+        // Preserve historical recovery bytes, including a prior database and
+        // a large population of undo artifacts. None are derived viewer data.
+        let recovery_dir = storage_root.join("doctor/reclaimable/previous-run");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        std::fs::copy(&source_db, recovery_dir.join("prior.sqlite3")).unwrap();
+        let recovery_payload = vec![0x5a_u8; 4096];
+        for index in 0..256 {
+            std::fs::write(
+                recovery_dir.join(format!("backup-{index:04}.bin")),
+                &recovery_payload,
+            )
+            .unwrap();
+        }
+        let expected_recovery_bytes =
+            std::fs::metadata(&source_db).unwrap().len() + 256 * recovery_payload.len() as u64;
+
         // Save archive for a single project to exercise scoping.
-        let archive_path = archive_save_state(
+        let mut events = Vec::new();
+        let mut observer = |event: &ArchiveProgressEvent| {
+            events.push(event.clone());
+            Ok(())
+        };
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let archive_path = archive_save_state_with_progress(
             &source_db,
             &storage_root,
             vec!["proj-alpha".to_string()],
             "archive".to_string(),
             Some("nightly".to_string()),
+            ArchiveSaveOptions {
+                compression_level: 6,
+                ..ArchiveSaveOptions::default()
+            },
+            &mut progress,
         )
         .expect("archive save");
+        progress.emit("completed").unwrap();
+        drop(progress);
+        let phases: Vec<_> = events
+            .iter()
+            .filter(|event| event.state == "started")
+            .map(|event| event.phase)
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "mailbox_lock",
+                "source_reconciliation",
+                "snapshot_copy",
+                "snapshot_scope",
+                "snapshot_scrub",
+                "snapshot_compact",
+                "metadata",
+                "storage_inventory",
+                "compress_snapshot",
+                "compress_storage",
+                "finalize_zip",
+                "verify_zip",
+                "publish",
+            ]
+        );
+        for phase in ["storage_inventory", "compress_storage", "verify_zip"] {
+            let completed = events
+                .iter()
+                .find(|event| event.phase == phase && event.state == "completed")
+                .unwrap();
+            assert_eq!(completed.recovery_files, 257);
+            assert_eq!(completed.recovery_bytes, expected_recovery_bytes);
+        }
+        let progress_json = serde_json::to_string(&events).unwrap();
+        assert!(
+            !progress_json.contains(root.path().to_str().unwrap()),
+            "progress must not expose mailbox paths"
+        );
+        assert!(
+            !progress_json.contains("GreenCastle"),
+            "progress must not expose identities"
+        );
         assert!(archive_path.exists());
         println!(">>> archive_save_state done");
 
@@ -55413,6 +55528,14 @@ http_headers = { Authorization = "Bearer secret" }
         println!(">>> zip meta verified");
         assert_eq!(meta["scrub_preset"].as_str(), Some("archive"));
         assert_eq!(meta["label"].as_str(), Some("nightly"));
+        assert_eq!(meta["fts_enabled"], false);
+        assert_eq!(meta["compression"]["level"], 6);
+        assert_eq!(meta["storage"]["recovery_history"]["policy"], "included");
+        assert_eq!(meta["storage"]["recovery_history"]["files"], 257);
+        assert_eq!(
+            meta["storage"]["recovery_history"]["size_bytes"],
+            expected_recovery_bytes
+        );
         assert_eq!(
             meta["projects_requested"].as_array().unwrap().len(),
             1,
@@ -55565,6 +55688,20 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             std::fs::read(restore_storage.join(".git/HEAD")).unwrap(),
             b"0123456789abcdef\n"
+        );
+        for index in 0..256 {
+            assert_eq!(
+                std::fs::read(restore_storage.join(format!(
+                    "doctor/reclaimable/previous-run/backup-{index:04}.bin"
+                )))
+                .unwrap(),
+                recovery_payload,
+            );
+        }
+        assert_eq!(
+            std::fs::read(restore_storage.join("doctor/reclaimable/previous-run/prior.sqlite3"))
+                .unwrap(),
+            std::fs::read(&source_db).unwrap(),
         );
     }
 
@@ -56392,16 +56529,24 @@ http_headers = { Authorization = "Bearer secret" }
         let obstruction = root.path().join("not-a-directory");
         std::fs::write(&obstruction, b"preserve recovery evidence").unwrap();
         let (diagnostics, records) = capture_archive_diagnostics();
-        diagnostics.start(ArchivePhase::Enumerate);
         let mut files = Vec::new();
-        let result = collect_files_with_exclusions(
-            root.path(),
-            &obstruction,
-            &BTreeSet::new(),
-            &mut files,
-            &diagnostics,
+        let result = {
+            let mut observer = |event: &ArchiveProgressEvent| {
+                diagnostics.observe_progress(event);
+                Ok(())
+            };
+            let mut progress = ArchiveSaveProgress::new(
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                &mut observer,
+            );
+            progress.event.phase = "storage_inventory";
+            progress.emit("started").unwrap();
+            inventory_archive_storage(&obstruction, &BTreeSet::new(), &mut progress)
+                .map(|found| files = found)
+        };
+        assert!(
+            matches!(result, Err(CliError::Other(message)) if message.contains("archive directory changed during inventory"))
         );
-        assert!(matches!(result, Err(CliError::Io(_))));
         drop(diagnostics);
         let records = records.lock().unwrap();
         assert_eq!(records.len(), 2);
@@ -56464,93 +56609,73 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(std::fs::read(evidence).unwrap(), b"original evidence");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn collect_files_skips_symlink_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        std::fs::create_dir_all(base.join("nested")).unwrap();
-        std::fs::write(base.join("nested/file.txt"), b"hello").unwrap();
-        std::os::unix::fs::symlink(base.join("nested/file.txt"), base.join("linked.txt")).unwrap();
+    fn archive_zip_creation_refuses_to_replace_existing_content() {
+        use std::io::Write as _;
 
-        let mut files = Vec::new();
-        collect_files(base, base, &mut files).expect("collect files");
-        assert_eq!(files, vec![PathBuf::from("nested/file.txt")]);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("archive.zip");
+        let mut file = create_archive_zip_file(&path).unwrap();
+        file.write_all(b"private archive").unwrap();
+        drop(file);
+        let error = create_archive_zip_file(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"private archive");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "private mail must not be group/world-readable"
+            );
+        }
     }
 
     #[test]
-    fn archive_save_state_excludes_embedded_live_sqlite_from_storage_payload() {
-        let _lock = ARCHIVE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        use std::io::Read;
-
+    fn archive_publication_never_clobbers_a_concurrent_winner() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
-        let _cwd = CwdGuard::chdir(root.path());
+        let staged = root.path().join("staged.zip");
+        let destination = root.path().join("archive.zip");
+        std::fs::write(&staged, b"new archive").unwrap();
+        std::fs::write(&destination, b"previous archive").unwrap();
+        let error = publish_archive_zip(&staged, &destination, &ArchiveDiagnostics::disabled())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous archive");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new archive");
+        let free_destination = root.path().join("archive-2.zip");
+        let bytes =
+            publish_archive_zip(&staged, &free_destination, &ArchiveDiagnostics::disabled())
+                .unwrap();
+        assert_eq!(bytes, 11);
+        assert_eq!(std::fs::read(&free_destination).unwrap(), b"new archive");
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous archive");
+    }
 
-        let storage_root = root.path().join("storage_repo");
-        seed_storage_root(&storage_root);
-
-        let embedded_db = storage_root.join("storage.sqlite3");
-        seed_mailbox_db(&embedded_db);
-        std::fs::write(storage_root.join("storage.sqlite3-wal"), b"wal").unwrap();
-        std::fs::write(storage_root.join("storage.sqlite3-shm"), b"shm").unwrap();
-
-        let archive_path = archive_save_state(
-            &embedded_db,
-            &storage_root,
-            vec!["proj-alpha".to_string()],
-            "archive".to_string(),
-            Some("embedded-db".to_string()),
-        )
-        .expect("archive save should succeed");
-
-        let file = std::fs::File::open(&archive_path).unwrap();
-        let mut zip = zip::ZipArchive::new(file).unwrap();
-        let mut names = Vec::new();
-        for i in 0..zip.len() {
-            names.push(zip.by_index(i).unwrap().name().to_string());
-        }
-
-        assert!(
-            names.iter().any(|name| name == ARCHIVE_SNAPSHOT_RELATIVE),
-            "archive should still contain the dedicated snapshot entry"
-        );
-        assert!(
-            names.iter().any(|name| name == "storage_repo/.git/HEAD"),
-            "archive should still contain regular storage repo files"
-        );
-        assert!(
-            !names
-                .iter()
-                .any(|name| name == "storage_repo/storage.sqlite3"),
-            "archive storage payload must not leak the live embedded sqlite file"
-        );
-        assert!(
-            !names
-                .iter()
-                .any(|name| name == "storage_repo/storage.sqlite3-wal"),
-            "archive storage payload must not leak embedded sqlite WAL sidecars"
-        );
-        assert!(
-            !names
-                .iter()
-                .any(|name| name == "storage_repo/storage.sqlite3-shm"),
-            "archive storage payload must not leak embedded sqlite SHM sidecars"
-        );
-
-        let mut meta_contents = String::new();
-        zip.by_name(ARCHIVE_METADATA_FILENAME)
-            .unwrap()
-            .read_to_string(&mut meta_contents)
-            .unwrap();
-        let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
-        assert_eq!(
-            meta["database"]["source_path"].as_str(),
-            Some(embedded_db.to_string_lossy().as_ref()),
-            "archive metadata should still report the embedded sqlite source path"
-        );
+    #[cfg(unix)]
+    #[test]
+    fn archive_publication_refuses_a_dangling_destination_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged.zip");
+        let destination = root.path().join("archive.zip");
+        let missing = root.path().join("missing.zip");
+        std::fs::write(&staged, b"new archive").unwrap();
+        std::os::unix::fs::symlink(&missing, &destination).unwrap();
+        let error = publish_archive_zip(&staged, &destination, &ArchiveDiagnostics::disabled())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read_link(&destination).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new archive");
     }
 
     #[test]
@@ -56678,15 +56803,16 @@ http_headers = { Authorization = "Bearer secret" }
             false,
         )
         .unwrap();
-        let mut selected = Vec::new();
-        collect_files_with_exclusions(
-            storage,
-            storage,
-            &exclusions,
-            &mut selected,
-            &ArchiveDiagnostics::disabled(),
-        )
-        .unwrap();
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let selected = inventory_archive_storage(storage, &exclusions, &mut progress)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.relative)
+            .collect::<Vec<_>>();
         assert_eq!(selected, vec![PathBuf::from("message.md")]);
         assert_eq!(
             std::fs::read(output.join("previous.zip")).unwrap(),
@@ -56716,15 +56842,16 @@ http_headers = { Authorization = "Bearer secret" }
             false,
         )
         .unwrap();
-        let mut selected = Vec::new();
-        collect_files_with_exclusions(
-            storage,
-            storage,
-            &exclusions,
-            &mut selected,
-            &ArchiveDiagnostics::disabled(),
-        )
-        .unwrap();
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let selected = inventory_archive_storage(storage, &exclusions, &mut progress)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.relative)
+            .collect::<Vec<_>>();
         assert_eq!(selected, vec![PathBuf::from("message.md")]);
 
         let canonical_storage = std::fs::canonicalize(storage).unwrap();
@@ -56772,74 +56899,516 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn archive_zip_creation_refuses_to_replace_existing_content() {
-        use std::io::Write as _;
+    fn collect_files_skips_symlink_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        std::fs::write(base.join("nested/file.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink(base.join("nested/file.txt"), base.join("linked.txt")).unwrap();
+
+        std::os::unix::fs::symlink(base, base.join("nested/loop")).unwrap();
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let files =
+            inventory_archive_storage(base, &BTreeSet::new(), &mut progress).expect("inventory");
+        assert_eq!(
+            files
+                .into_iter()
+                .map(|file| file.relative)
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("nested/file.txt")]
+        );
+    }
+
+    #[test]
+    fn archive_save_state_excludes_embedded_live_sqlite_from_storage_payload() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::io::Read;
 
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("archive.zip");
-        let mut file = create_archive_zip_file(&path).unwrap();
-        file.write_all(b"private archive").unwrap();
-        drop(file);
-        let error = create_archive_zip_file(&path).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&path).unwrap(), b"private archive");
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let embedded_db = storage_root.join("storage.sqlite3");
+        seed_mailbox_db(&embedded_db);
+        std::fs::write(storage_root.join("storage.sqlite3-wal"), b"wal").unwrap();
+        std::fs::write(storage_root.join("storage.sqlite3-shm"), b"shm").unwrap();
+
+        let archive_path = archive_save_state(
+            &embedded_db,
+            &storage_root,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("embedded-db".to_string()),
+        )
+        .expect("archive save should succeed");
+
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut names = Vec::new();
+        for i in 0..zip.len() {
+            names.push(zip.by_index(i).unwrap().name().to_string());
+        }
+
+        assert!(
+            names.iter().any(|name| name == ARCHIVE_SNAPSHOT_RELATIVE),
+            "archive should still contain the dedicated snapshot entry"
+        );
+        assert!(
+            names.iter().any(|name| name == "storage_repo/.git/HEAD"),
+            "archive should still contain regular storage repo files"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "storage_repo/storage.sqlite3"),
+            "archive storage payload must not leak the live embedded sqlite file"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "storage_repo/storage.sqlite3-wal"),
+            "archive storage payload must not leak embedded sqlite WAL sidecars"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "storage_repo/storage.sqlite3-shm"),
+            "archive storage payload must not leak embedded sqlite SHM sidecars"
+        );
+
+        let mut meta_contents = String::new();
+        zip.by_name(ARCHIVE_METADATA_FILENAME)
+            .unwrap()
+            .read_to_string(&mut meta_contents)
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
+        assert_eq!(
+            meta["database"]["source_path"].as_str(),
+            Some(embedded_db.to_string_lossy().as_ref()),
+            "archive metadata should still report the embedded sqlite source path"
+        );
+    }
+
+    #[test]
+    fn archive_inventory_excludes_relative_embedded_database_and_sidecars() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+        let storage = root.path().join("storage");
+        std::fs::create_dir_all(storage.join("doctor/reclaimable")).unwrap();
+        std::fs::write(storage.join("storage.sqlite3"), b"live").unwrap();
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            std::fs::write(storage.join(format!("storage.sqlite3{suffix}")), b"sidecar").unwrap();
+        }
+        std::fs::write(storage.join("doctor/reclaimable/old.sqlite3"), b"history").unwrap();
+        let excluded =
+            archive_storage_excluded_relative_paths(&storage, Path::new("storage/storage.sqlite3"));
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let files = inventory_archive_storage(&storage, &excluded, &mut progress).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].relative,
+            PathBuf::from("doctor/reclaimable/old.sqlite3")
+        );
+        assert_eq!(progress.event.recovery_bytes, 7);
+        // Restore calls the same exclusion helper before creating its targets.
+        let missing = archive_storage_excluded_relative_paths(
+            Path::new("restore/storage"),
+            Path::new("restore/storage/mailbox.sqlite3"),
+        );
+        assert!(missing.contains(Path::new("mailbox.sqlite3")));
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            assert!(missing.contains(&PathBuf::from(format!("mailbox.sqlite3{suffix}"))));
+        }
+    }
+
+    #[test]
+    fn archive_save_cancellation_never_publishes_partial_archive() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+        let storage = root.path().join("storage");
+        seed_storage_root(&storage);
+        let source = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&source);
+        let original_db = std::fs::read(&source).unwrap();
+        let output = archive_states_dir(true).unwrap();
+        let previous = output.join("previous.zip");
+        std::fs::write(&previous, b"previous completed archive").unwrap();
+
+        for cancelled_phase in [
+            "source_reconciliation",
+            "snapshot_copy",
+            "snapshot_compact",
+            "storage_inventory",
+            "compress_snapshot",
+            "compress_storage",
+            "finalize_zip",
+            "verify_zip",
+            "publish",
+        ] {
+            let cancellation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let flag = Arc::clone(&cancellation);
+            let mut observer = |event: &ArchiveProgressEvent| {
+                if event.phase == cancelled_phase && event.state == "started" {
+                    flag.store(2, Ordering::Relaxed);
+                }
+                Ok(())
+            };
+            let mut progress = ArchiveSaveProgress::new(cancellation, &mut observer);
+            let result = archive_save_state_with_progress(
+                &source,
+                &storage,
+                vec![],
+                "archive".to_string(),
+                None,
+                ArchiveSaveOptions {
+                    compression_level: 6,
+                    ..ArchiveSaveOptions::default()
+                },
+                &mut progress,
+            );
+            assert!(result.is_err(), "must stop at {cancelled_phase}");
+            assert_eq!(
+                progress.cancellation.load(Ordering::Relaxed),
+                2,
+                "must reach {cancelled_phase}"
+            );
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                original_db,
+                "source preserved at {cancelled_phase}"
+            );
+            assert_eq!(
+                std::fs::read(&previous).unwrap(),
+                b"previous completed archive"
+            );
+            assert_eq!(
+                std::fs::read_dir(&output).unwrap().count(),
+                1,
+                "no published or temporary ZIP after {cancelled_phase}"
+            );
+        }
+        assert!(
+            archive_save_state(&source, &storage, vec![], "archive".to_string(), None).is_ok(),
+            "cancelled saves must release mailbox locks for retry"
+        );
+    }
+
+    #[test]
+    fn archive_save_rejects_output_equal_to_storage_before_database_work() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+        let output = archive_states_dir(true).unwrap();
+        let error = archive_save_state(
+            &root.path().join("missing.sqlite3"),
+            &output,
+            vec![],
+            "archive".to_string(),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must differ from the mailbox storage root")
+        );
+        assert!(!root.path().join("missing.sqlite3").exists());
+        assert_eq!(
+            std::fs::read_dir(archive_states_dir(false).unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn archive_copy_bounds_work_and_cancels_between_chunks() {
+        struct Endless {
+            reads: usize,
+            max_buffer: usize,
+        }
+        impl std::io::Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.max_buffer = self.max_buffer.max(buffer.len());
+                buffer.fill(0xa5);
+                Ok(buffer.len())
+            }
+        }
+        let cancellation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flag = Arc::clone(&cancellation);
+        let mut observer = |event: &ArchiveProgressEvent| {
+            if event.bytes >= 64 * 1024 {
+                flag.store(2, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let mut progress = ArchiveSaveProgress::new(cancellation, &mut observer);
+        progress.report_interval = std::time::Duration::ZERO;
+        let mut input = Endless {
+            reads: 0,
+            max_buffer: 0,
+        };
+        let mut output = Vec::new();
+        let error = archive_copy_exact(
+            &mut input,
+            &mut output,
+            u64::from(u32::MAX) + 1,
+            true,
+            &mut progress,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CliError::ExitCode(130)));
+        assert_eq!(
+            input.reads, 1,
+            "cancellation work is bounded independently of member size"
+        );
+        assert_eq!(input.max_buffer, 64 * 1024);
+        assert_eq!(output.len(), 64 * 1024);
+        assert_eq!(progress.event.recovery_bytes, 64 * 1024);
+
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let mut sink = std::io::sink();
+        archive_copy_exact(&mut input, &mut sink, 17, false, &mut progress).unwrap();
+        assert_eq!(
+            progress.event.bytes, 17,
+            "growing files cannot extend the inventoried copy"
+        );
+        assert!(
+            archive_copy_exact(&mut &b"short"[..], &mut sink, 10, false, &mut progress).is_err()
+        );
+    }
+
+    #[test]
+    fn archive_storage_member_names_preserve_relative_components() {
+        assert_eq!(
+            archive_storage_member_name(Path::new("doctor/recovery/previous.sqlite3")).unwrap(),
+            "storage_repo/doctor/recovery/previous.sqlite3"
+        );
+        for invalid in ["", "..", "doctor/../outside.sqlite3"] {
+            assert!(archive_storage_member_name(Path::new(invalid)).is_err());
+        }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(
-                mode & 0o077,
-                0,
-                "private mail must not be group/world-readable"
+            use std::os::unix::ffi::OsStrExt;
+            assert!(archive_storage_member_name(Path::new("doctor/old\\copy.sqlite3")).is_err());
+            let invalid_utf8 = std::ffi::OsStr::from_bytes(b"doctor/\xff.sqlite3");
+            assert!(archive_storage_member_name(Path::new(invalid_utf8)).is_err());
+
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("old\\copy.sqlite3"), b"history").unwrap();
+            let mut observer = |_: &ArchiveProgressEvent| Ok(());
+            let mut progress = ArchiveSaveProgress::new(
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                &mut observer,
+            );
+            let error = inventory_archive_storage(root.path(), &BTreeSet::new(), &mut progress)
+                .unwrap_err();
+            assert!(error.to_string().contains("cannot preserve a backslash"));
+        }
+    }
+
+    #[test]
+    fn archive_writer_refuses_changed_or_symlinked_inventory_member() {
+        use std::io::Cursor;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("recovery.sqlite3");
+        std::fs::write(&file, b"old").unwrap();
+        let expected = std::fs::metadata(&file).unwrap();
+        std::fs::write(&file, b"changed size").unwrap();
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let error = write_archive_file(
+            &mut zip,
+            &file,
+            "doctor/old.sqlite3",
+            &expected,
+            archive_zip_options(6).unwrap(),
+            true,
+            &mut progress,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed after inventory"));
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            let expected = std::fs::metadata(&file).unwrap();
+            assert!(
+                write_archive_file(
+                    &mut zip,
+                    &link,
+                    "doctor/link",
+                    &expected,
+                    archive_zip_options(6).unwrap(),
+                    true,
+                    &mut progress
+                )
+                .is_err()
             );
         }
     }
 
     #[test]
-    fn archive_publication_never_clobbers_a_concurrent_winner() {
-        let root = tempfile::tempdir().unwrap();
-        let staged = root.path().join("staged.zip");
-        let destination = root.path().join("archive.zip");
-        std::fs::write(&staged, b"new archive").unwrap();
-        // A competing save occupies the name after filename selection.
-        std::fs::write(&destination, b"previous archive").unwrap();
-        let error = publish_archive_zip(&staged, &destination, &ArchiveDiagnostics::disabled())
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            CliError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists
-        ));
-        assert_eq!(std::fs::read(&destination).unwrap(), b"previous archive");
-        assert_eq!(std::fs::read(&staged).unwrap(), b"new archive");
-        let free_destination = root.path().join("archive-2.zip");
-        let bytes =
-            publish_archive_zip(&staged, &free_destination, &ArchiveDiagnostics::disabled())
+    fn archive_compression_levels_roundtrip_through_the_real_zip_backend() {
+        use std::io::{Cursor, Read, Write};
+        let payload = (0_u8..=255).cycle().take(131_073).collect::<Vec<_>>();
+        for level in 0..=9 {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file("recovery.sqlite3", archive_zip_options(level).unwrap())
                 .unwrap();
-        assert_eq!(bytes, 11);
-        assert_eq!(std::fs::read(&free_destination).unwrap(), b"new archive");
-        assert!(!staged.exists());
-        assert_eq!(std::fs::read(&destination).unwrap(), b"previous archive");
+            writer.write_all(&payload).unwrap();
+            let bytes = writer.finish().unwrap().into_inner();
+            let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut member = archive.by_name("recovery.sqlite3").unwrap();
+            assert_eq!(
+                member.compression(),
+                if level == 0 {
+                    zip::CompressionMethod::Stored
+                } else {
+                    zip::CompressionMethod::Deflated
+                }
+            );
+            let mut restored = Vec::new();
+            member.read_to_end(&mut restored).unwrap();
+            assert_eq!(restored, payload, "compression level {level}");
+        }
+        assert!(archive_zip_options(-1).is_err());
+        assert!(archive_zip_options(10).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn archive_publication_refuses_a_dangling_destination_symlink() {
+    fn archive_verification_checks_crc_and_required_members() {
+        use std::io::{Seek, SeekFrom, Write};
         let root = tempfile::tempdir().unwrap();
-        let staged = root.path().join("staged.zip");
-        let destination = root.path().join("archive.zip");
-        let missing = root.path().join("missing.zip");
-        std::fs::write(&staged, b"new archive").unwrap();
-        std::os::unix::fs::symlink(&missing, &destination).unwrap();
-        let error = publish_archive_zip(&staged, &destination, &ArchiveDiagnostics::disabled())
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            CliError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists
-        ));
-        assert_eq!(std::fs::read_link(&destination).unwrap(), missing);
-        assert!(!missing.exists());
-        assert_eq!(std::fs::read(&staged).unwrap(), b"new archive");
+        let path = root.path().join("fixture.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = archive_zip_options(6)
+            .unwrap()
+            .compression_method(zip::CompressionMethod::Stored)
+            .compression_level(None);
+        for name in [
+            ARCHIVE_METADATA_FILENAME,
+            ARCHIVE_SNAPSHOT_RELATIVE,
+            "storage_repo/doctor/previous.sqlite3",
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(b"verified bytes").unwrap();
+        }
+        zip.finish().unwrap();
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let expected = [
+            (ARCHIVE_METADATA_FILENAME, 14),
+            (ARCHIVE_SNAPSHOT_RELATIVE, 14),
+            ("storage_repo/doctor/previous.sqlite3", 14),
+        ];
+        verify_saved_archive(&path, &expected, &mut progress).unwrap();
+        assert_eq!(progress.event.files, 3);
+        assert_eq!(progress.event.recovery_bytes, 14);
+        assert!(verify_saved_archive(&path, &expected[..2], &mut progress).is_err());
+
+        let mut wrong_name = expected;
+        wrong_name[2].0 = "storage_repo/doctor/different.sqlite3";
+        let error = verify_saved_archive(&path, &wrong_name, &mut progress).unwrap_err();
+        assert!(matches!(error, CliError::Other(message) if message.contains("name mismatch")));
+
+        let mut wrong_size = expected;
+        wrong_size[2].1 += 1;
+        let error = verify_saved_archive(&path, &wrong_size, &mut progress).unwrap_err();
+        assert!(matches!(error, CliError::Other(message) if message.contains("size mismatch")));
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let offset = archive
+            .by_name("storage_repo/doctor/previous.sqlite3")
+            .unwrap()
+            .data_start()
+            .expect("member data offset");
+        drop(archive);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.sync_all().unwrap();
+        assert!(
+            verify_saved_archive(&path, &expected, &mut progress).is_err(),
+            "corruption must prevent publication"
+        );
+    }
+
+    #[test]
+    fn archive_zip64_preserves_more_than_65535_members() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large-member-count.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = archive_zip_options(1)
+            .unwrap()
+            .compression_method(zip::CompressionMethod::Stored)
+            .compression_level(None);
+        for name in [ARCHIVE_METADATA_FILENAME, ARCHIVE_SNAPSHOT_RELATIVE] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(b"fixture").unwrap();
+        }
+        // Cross the classic ZIP directory limit without allocating GiBs or
+        // depending on timing. Every recovery artifact gets read back with CRC.
+        let mut recovery_names = Vec::new();
+        for index in 0_u32..65_536 {
+            let name = format!("storage_repo/doctor/reclaimable/{index:05}.bin");
+            zip.start_file(&name, options).unwrap();
+            zip.write_all(&index.to_le_bytes()).unwrap();
+            recovery_names.push(name);
+        }
+        zip.finish().unwrap();
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let mut expected = vec![
+            (ARCHIVE_METADATA_FILENAME, 7),
+            (ARCHIVE_SNAPSHOT_RELATIVE, 7),
+        ];
+        expected.extend(recovery_names.iter().map(|name| (name.as_str(), 4)));
+        verify_saved_archive(&path, &expected, &mut progress).unwrap();
+        assert_eq!(progress.event.recovery_files, 65_536);
+        assert_eq!(progress.event.recovery_bytes, 65_536 * 4);
     }
 
     // -----------------------------------------------------------------------
@@ -86608,50 +87177,531 @@ fn resolve_archive_path(candidate: &Path) -> CliResult<PathBuf> {
     )))
 }
 
-fn collect_files_with_exclusions(
-    base: &Path,
-    dir: &Path,
-    excluded_rel_paths: &std::collections::BTreeSet<PathBuf>,
-    out: &mut Vec<PathBuf>,
-    diagnostics: &ArchiveDiagnostics,
-) -> CliResult<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            continue;
+/// Progress contains counts and phase names, never mailbox paths or content.
+/// Counters are local to a phase; completion records include its final totals.
+#[derive(Clone, Debug, Serialize)]
+struct ArchiveProgressEvent {
+    schema_version: u32,
+    operation: &'static str,
+    phase: &'static str,
+    state: &'static str,
+    elapsed_ms: u64,
+    phase_elapsed_ms: u64,
+    files: u64,
+    bytes: u64,
+    recovery_files: u64,
+    recovery_bytes: u64,
+    snapshot_bytes: u64,
+    archive_bytes: u64,
+    total_files: Option<u64>,
+    total_bytes: Option<u64>,
+    table: Option<&'static str>,
+    rows_copied: Option<u64>,
+}
+
+struct ArchiveSaveProgress<'a> {
+    observer: &'a mut dyn FnMut(&ArchiveProgressEvent) -> CliResult<()>,
+    cancellation: Arc<std::sync::atomic::AtomicUsize>,
+    started: std::time::Instant,
+    phase_started: std::time::Instant,
+    last_report: std::time::Instant,
+    report_interval: std::time::Duration,
+    event: ArchiveProgressEvent,
+}
+
+impl<'a> ArchiveSaveProgress<'a> {
+    fn new(
+        cancellation: Arc<std::sync::atomic::AtomicUsize>,
+        observer: &'a mut dyn FnMut(&ArchiveProgressEvent) -> CliResult<()>,
+    ) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            observer,
+            cancellation,
+            started: now,
+            phase_started: now,
+            last_report: now,
+            report_interval: std::time::Duration::from_secs(2),
+            event: ArchiveProgressEvent {
+                schema_version: 1,
+                operation: "archive_save",
+                phase: "prepare",
+                state: "started",
+                elapsed_ms: 0,
+                phase_elapsed_ms: 0,
+                files: 0,
+                bytes: 0,
+                recovery_files: 0,
+                recovery_bytes: 0,
+                snapshot_bytes: 0,
+                archive_bytes: 0,
+                total_files: None,
+                total_bytes: None,
+                table: None,
+                rows_copied: None,
+            },
         }
-        let rel = match path.strip_prefix(base) {
-            Ok(rel) => rel.to_path_buf(),
-            Err(_) => continue,
-        };
-        if excluded_rel_paths.contains(&rel) {
-            continue;
+    }
+
+    fn check_cancelled(&self) -> CliResult<()> {
+        let signal = self.cancellation.load(Ordering::Relaxed);
+        if signal == 0 {
+            Ok(())
+        } else {
+            Err(CliError::ExitCode(128 + i32::try_from(signal).unwrap_or(2)))
         }
-        if file_type.is_dir() {
-            collect_files_with_exclusions(base, &path, excluded_rel_paths, out, diagnostics)?;
-        } else if file_type.is_file() {
-            if diagnostics.enabled() {
-                // Counter-only metadata is best effort. It must neither add
-                // I/O to the default path nor make an otherwise valid save fail.
-                diagnostics.discovered(entry.metadata().ok().map(|metadata| metadata.len()));
+    }
+
+    fn emit(&mut self, state: &'static str) -> CliResult<()> {
+        let now = std::time::Instant::now();
+        self.event.state = state;
+        self.event.elapsed_ms =
+            u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
+        self.event.phase_elapsed_ms =
+            u64::try_from(now.duration_since(self.phase_started).as_millis()).unwrap_or(u64::MAX);
+        self.last_report = now;
+        (self.observer)(&self.event)
+    }
+
+    fn phase(&mut self, phase: &'static str) -> CliResult<()> {
+        self.check_cancelled()?;
+        if self.event.phase != phase {
+            self.emit("completed")?;
+            self.event.phase = phase;
+            self.phase_started = std::time::Instant::now();
+            self.event.files = 0;
+            self.event.bytes = 0;
+            self.event.recovery_files = 0;
+            self.event.recovery_bytes = 0;
+            self.event.total_files = None;
+            self.event.total_bytes = None;
+            self.event.table = None;
+            self.event.rows_copied = None;
+            self.emit("started")?;
+        }
+        self.check_cancelled()
+    }
+
+    fn checkpoint(&mut self) -> CliResult<()> {
+        self.check_cancelled()?;
+        if self.last_report.elapsed() >= self.report_interval {
+            self.emit("progress")?;
+        }
+        self.check_cancelled()
+    }
+
+    fn advance(&mut self, files: u64, bytes: u64, recovery: bool) -> CliResult<()> {
+        self.event.files = self.event.files.saturating_add(files);
+        self.event.bytes = self.event.bytes.saturating_add(bytes);
+        if recovery {
+            self.event.recovery_files = self.event.recovery_files.saturating_add(files);
+            self.event.recovery_bytes = self.event.recovery_bytes.saturating_add(bytes);
+        }
+        self.checkpoint()
+    }
+
+    fn snapshot(&mut self, update: share::SnapshotProgress) -> Result<(), share::ShareError> {
+        let result = (|| {
+            self.phase(match update.phase {
+                share::SnapshotProgressPhase::Copy => "snapshot_copy",
+                share::SnapshotProgressPhase::Scope => "snapshot_scope",
+                share::SnapshotProgressPhase::Scrub => "snapshot_scrub",
+                share::SnapshotProgressPhase::Compact => "snapshot_compact",
+                share::SnapshotProgressPhase::Viewer => "snapshot_viewer",
+            })?;
+            let changed_table = self.event.table != update.table;
+            if changed_table && self.event.table.is_some() {
+                self.emit("progress")?;
             }
-            out.push(rel);
+            self.event.table = update.table;
+            self.event.rows_copied = Some(update.rows_copied);
+            if changed_table {
+                self.emit("progress")?;
+            }
+            self.checkpoint()
+        })();
+        result.map_err(|error| {
+            share::ShareError::Io(std::io::Error::new(
+                if self.cancellation.load(Ordering::Relaxed) == 0 {
+                    std::io::ErrorKind::Other
+                } else {
+                    std::io::ErrorKind::Interrupted
+                },
+                error.to_string(),
+            ))
+        })
+    }
+}
+
+fn print_archive_progress(
+    format: ArchiveProgressFormat,
+    event: &ArchiveProgressEvent,
+) -> CliResult<()> {
+    use std::io::Write;
+    let line = match format {
+        ArchiveProgressFormat::Off => return Ok(()),
+        ArchiveProgressFormat::Json => {
+            let line = serde_json::to_string(event)
+                .map_err(|error| CliError::Format(error.to_string()))?;
+            format!("{line}\n")
         }
+        ArchiveProgressFormat::Text => {
+            let table = event.table.map_or_else(String::new, |table| {
+                format!(" table={table} rows={}", event.rows_copied.unwrap_or(0))
+            });
+            format!(
+                "archive_save phase={} state={} elapsed_ms={} phase_elapsed_ms={} files={} bytes={} recovery_files={} recovery_bytes={} snapshot_bytes={} archive_bytes={}{}\n",
+                event.phase,
+                event.state,
+                event.elapsed_ms,
+                event.phase_elapsed_ms,
+                event.files,
+                event.bytes,
+                event.recovery_files,
+                event.recovery_bytes,
+                event.snapshot_bytes,
+                event.archive_bytes,
+                table,
+            )
+        }
+    };
+    if !ftui_runtime::stdio_capture::try_capture(line.as_bytes()) {
+        // A closed diagnostic pipe must not abort a completed backup or panic
+        // during cleanup. The observer used by tests can still inject errors.
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
     }
     Ok(())
 }
 
-#[cfg(test)]
-fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<()> {
-    collect_files_with_exclusions(
-        base,
-        dir,
-        &std::collections::BTreeSet::new(),
-        out,
-        &ArchiveDiagnostics::disabled(),
-    )
+/// Signal handlers only set a flag. The foreground owner unwinds at bounded
+/// copy/page checkpoints, releasing locks and discarding unpublished staging.
+struct ArchiveSaveSignals(Vec<signal_hook::SigId>);
+
+impl ArchiveSaveSignals {
+    fn install(cancellation: &Arc<std::sync::atomic::AtomicUsize>) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let mut guard = Self(Vec::new());
+        #[cfg(not(unix))]
+        let guard = Self(Vec::new());
+        #[cfg(unix)]
+        let force_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(unix)]
+        for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+            // First signal requests cleanup at the next checkpoint. A second
+            // signal retains the OS escape hatch for an opaque database call.
+            guard
+                .0
+                .push(signal_hook::flag::register_conditional_default(
+                    signal,
+                    Arc::clone(&force_stop),
+                )?);
+            guard.0.push(signal_hook::flag::register_usize(
+                signal,
+                Arc::clone(cancellation),
+                signal as usize,
+            )?);
+            guard.0.push(signal_hook::flag::register(
+                signal,
+                Arc::clone(&force_stop),
+            )?);
+        }
+        #[cfg(not(unix))]
+        let _ = cancellation;
+        Ok(guard)
+    }
+}
+
+impl Drop for ArchiveSaveSignals {
+    fn drop(&mut self) {
+        for registration in self.0.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveStorageFile {
+    relative: PathBuf,
+    member_name: String,
+    metadata: std::fs::Metadata,
+}
+
+impl ArchiveStorageFile {
+    fn is_recovery(&self) -> bool {
+        self.relative.starts_with("doctor")
+    }
+}
+
+fn archive_storage_member_name(relative: &Path) -> CliResult<String> {
+    let mut name = String::from(ARCHIVE_STORAGE_DIRNAME);
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(CliError::Other(format!(
+                "archive requires a relative storage filename: {}",
+                relative.display()
+            )));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            CliError::Other(format!(
+                "archive cannot encode non-UTF-8 filename: {}",
+                relative.display()
+            ))
+        })?;
+        // A literal Unix backslash would otherwise become a directory
+        // separator during ZIP restoration. Reject it instead of silently
+        // renaming the input or colliding with another member. On Windows,
+        // separators have already been removed by Path::components().
+        if component.contains('\\') {
+            return Err(CliError::Other(format!(
+                "archive cannot preserve a backslash in filename: {}",
+                relative.display()
+            )));
+        }
+        name.push('/');
+        name.push_str(component);
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(CliError::Other(
+            "archive storage filename must not be empty".to_string(),
+        ));
+    }
+    Ok(name)
+}
+
+fn inventory_archive_storage(
+    root: &Path,
+    excluded: &BTreeSet<PathBuf>,
+    progress: &mut ArchiveSaveProgress<'_>,
+) -> CliResult<Vec<ArchiveStorageFile>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    // Close each directory iterator before visiting its children. Depth does
+    // not consume stack space or keep one descriptor open per ancestor.
+    while let Some(directory) = pending.pop() {
+        progress.checkpoint()?;
+        if !std::fs::symlink_metadata(&directory)?.is_dir() {
+            return Err(CliError::Other(format!(
+                "archive directory changed during inventory: {}",
+                directory.display()
+            )));
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            progress.checkpoint()?;
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| CliError::Other(error.to_string()))?
+                .to_path_buf();
+            if excluded.contains(&relative) {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                let file = ArchiveStorageFile {
+                    member_name: archive_storage_member_name(&relative)?,
+                    relative,
+                    metadata: entry.metadata()?,
+                };
+                progress.advance(1, file.metadata.len(), file.is_recovery())?;
+                files.push(file);
+            }
+            // Preserve the existing policy: never dereference archive symlinks.
+        }
+    }
+    files.sort_by(|a, b| a.relative.cmp(&b.relative));
+    progress.checkpoint()?;
+    Ok(files)
+}
+
+fn archive_file_metadata_matches(expected: &std::fs::Metadata, actual: &std::fs::Metadata) -> bool {
+    if !actual.is_file()
+        || expected.len() != actual.len()
+        || expected.modified().ok() != actual.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if expected.dev() != actual.dev()
+            || expected.ino() != actual.ino()
+            || expected.ctime() != actual.ctime()
+            || expected.ctime_nsec() != actual.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn archive_copy_exact(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    size: u64,
+    recovery: bool,
+    progress: &mut ArchiveSaveProgress<'_>,
+) -> CliResult<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = size;
+    while remaining > 0 {
+        progress.checkpoint()?;
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = match reader.read(&mut buffer[..limit]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            return Err(CliError::Other(
+                "archive member ended before its inventoried size".to_string(),
+            ));
+        }
+        archive_write_all(writer, &buffer[..read], recovery, progress)?;
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+fn archive_write_all(
+    writer: &mut impl std::io::Write,
+    mut bytes: &[u8],
+    recovery: bool,
+    progress: &mut ArchiveSaveProgress<'_>,
+) -> CliResult<()> {
+    while !bytes.is_empty() {
+        progress.checkpoint()?;
+        let chunk_len = bytes.len().min(64 * 1024);
+        let written = match writer.write(&bytes[..chunk_len]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "archive writer accepted no bytes",
+            )
+            .into());
+        }
+        // Count accepted input even when the following partial write fails.
+        progress.advance(0, written as u64, recovery)?;
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+fn archive_zip_options(compression_level: i64) -> CliResult<zip::write::SimpleFileOptions> {
+    if !(0..=9).contains(&compression_level) {
+        return Err(CliError::InvalidArgument(
+            "compression level must be in 0..=9".to_string(),
+        ));
+    }
+    let fixed_time = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .map_err(|error| CliError::Other(format!("zip time error: {error}")))?;
+    let options = zip::write::SimpleFileOptions::default()
+        // Recovery database copies can exceed 4 GiB. Always reserve ZIP64
+        // fields, including when compressed output grows slightly on input.
+        .large_file(true)
+        .last_modified_time(fixed_time);
+    // The pinned ZIP backend accepts deflate levels 1..=9 and rejects 0.
+    // Represent the advertised no-compression setting with ZIP's Stored
+    // method, which requires that no deflate level be supplied.
+    Ok(if compression_level == 0 {
+        options
+            .compression_method(zip::CompressionMethod::Stored)
+            .compression_level(None)
+    } else {
+        options
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(compression_level))
+    })
+}
+
+fn write_archive_file<W: std::io::Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    source: &Path,
+    name: &str,
+    expected: &std::fs::Metadata,
+    options: zip::write::SimpleFileOptions,
+    recovery: bool,
+    progress: &mut ArchiveSaveProgress<'_>,
+) -> CliResult<()> {
+    progress.checkpoint()?;
+    let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(source)?;
+    if !archive_file_metadata_matches(expected, &file.metadata()?) {
+        return Err(CliError::Other(format!(
+            "archive input changed after inventory: {}",
+            source.display()
+        )));
+    }
+    #[cfg(unix)]
+    let options = {
+        use std::os::unix::fs::MetadataExt;
+        options.unix_permissions(expected.mode() & 0o777)
+    };
+    zip.start_file(name, options)
+        .map_err(|error| CliError::Other(format!("zip write error: {error}")))?;
+    archive_copy_exact(&mut file, zip, expected.len(), recovery, progress)?;
+    if !archive_file_metadata_matches(expected, &file.metadata()?) {
+        return Err(CliError::Other(format!(
+            "archive input changed while being read: {}",
+            source.display()
+        )));
+    }
+    progress.advance(1, 0, recovery)
+}
+
+fn verify_saved_archive(
+    path: &Path,
+    expected: &[(&str, u64)],
+    progress: &mut ArchiveSaveProgress<'_>,
+) -> CliResult<()> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| CliError::Other(format!("archive verification failed: {error}")))?;
+    if archive.len() != expected.len() {
+        return Err(CliError::Other(
+            "archive verification found an unexpected member count".to_string(),
+        ));
+    }
+    for required in [ARCHIVE_METADATA_FILENAME, ARCHIVE_SNAPSHOT_RELATIVE] {
+        archive.by_name(required).map_err(|error| {
+            CliError::Other(format!("archive verification missing {required}: {error}"))
+        })?;
+    }
+    progress.event.total_files = Some(expected.len() as u64);
+    let mut sink = std::io::sink();
+    for (index, &(expected_name, expected_size)) in expected.iter().enumerate() {
+        progress.checkpoint()?;
+        let mut member = archive
+            .by_index(index)
+            .map_err(|error| CliError::Other(format!("archive verification failed: {error}")))?;
+        // CRC covers member payloads, not central-directory names or sizes.
+        // Compare the exact inventory before accepting a verified archive.
+        if member.name() != expected_name {
+            return Err(CliError::Other(format!(
+                "archive verification found a member name mismatch at index {index}"
+            )));
+        }
+        let size = member.size();
+        if size != expected_size {
+            return Err(CliError::Other(format!(
+                "archive verification found a member size mismatch at index {index}"
+            )));
+        }
+        let recovery = member.name().starts_with("storage_repo/doctor/");
+        archive_copy_exact(&mut member, &mut sink, size, recovery, progress)?;
+        // Read through EOF as well: ZIP's reader verifies CRC at that boundary.
+        if member.read(&mut [0_u8; 1])? != 0 {
+            return Err(CliError::Other(
+                "archive verification found a member size mismatch".to_string(),
+            ));
+        }
+        progress.advance(1, 0, recovery)?;
+    }
+    Ok(())
 }
 
 fn archive_storage_excluded_relative_paths(
@@ -86659,7 +87709,30 @@ fn archive_storage_excluded_relative_paths(
     database_path: &Path,
 ) -> std::collections::BTreeSet<PathBuf> {
     let mut excluded = std::collections::BTreeSet::new();
-    let Ok(relative_db) = database_path.strip_prefix(storage_root) else {
+    // Match in one coordinate system, even when DATABASE_URL is relative or
+    // the storage directory was reached through a symlink alias. Canonicalize
+    // the parent only: an absent primary may still have sidecars to exclude.
+    let absolute_db = if database_path.is_absolute() {
+        database_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(database_path)
+    };
+    let normalized_db = absolute_db
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(absolute_db.file_name())
+        .map_or_else(|| absolute_db.clone(), |(parent, name)| parent.join(name));
+    let absolute_root = if storage_root.is_absolute() {
+        storage_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(storage_root)
+    };
+    let normalized_root = absolute_root.canonicalize().unwrap_or(absolute_root);
+    let Ok(relative_db) = normalized_db.strip_prefix(&normalized_root) else {
         return excluded;
     };
     extend_sqlite_artifact_relative_paths(&mut excluded, relative_db);
@@ -86680,19 +87753,6 @@ fn extend_sqlite_artifact_relative_paths(
         sidecar_rel.push(suffix);
         excluded_rel_paths.insert(PathBuf::from(sidecar_rel));
     }
-}
-
-#[cfg(unix)]
-fn file_mode(path: &Path) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path)
-        .map(|m| m.mode() & 0o777)
-        .unwrap_or(0o644)
-}
-
-#[cfg(not(unix))]
-fn file_mode(_path: &Path) -> u32 {
-    0o644
 }
 
 fn confirm(prompt: &str, default: bool) -> CliResult<bool> {
@@ -86812,9 +87872,7 @@ fn archive_save_storage_exclusions(
     database_path: &Path,
     archive_dir: &Path,
     exclude_recovery: bool,
-) -> CliResult<std::collections::BTreeSet<PathBuf>> {
-    // The output root is canonical, while STORAGE_ROOT may be relative or use
-    // a filesystem alias. Compare directory identities in the same spelling.
+) -> CliResult<BTreeSet<PathBuf>> {
     let canonical_storage = std::fs::canonicalize(storage_root)?;
     let canonical_output = std::fs::canonicalize(archive_dir)?;
     if canonical_output == canonical_storage {
@@ -86824,13 +87882,12 @@ fn archive_save_storage_exclusions(
     }
     let mut excluded = archive_storage_excluded_relative_paths(storage_root, database_path);
     if exclude_recovery {
-        // Only the root recovery namespace is optional. A project's own
-        // doctor/ directory, messages, attachments and .git remain intact.
+        // Explicit opt-in affects only the root recovery namespace. Nested
+        // project directories, mailbox state and Git history remain included.
         excluded.insert(PathBuf::from("doctor"));
     }
-    // Previous archives and the currently staged ZIP are output, not mailbox
-    // authority. Never recursively embed them when saving inside storage.
     if let Ok(relative_archive_dir) = canonical_output.strip_prefix(&canonical_storage) {
+        // Output is not mailbox authority; never embed previous or staged ZIPs.
         excluded.insert(relative_archive_dir.to_path_buf());
     }
     Ok(excluded)
@@ -86845,14 +87902,74 @@ fn archive_save_state_internal(
     options: ArchiveSaveOptions,
     diagnostics: &ArchiveDiagnostics,
 ) -> CliResult<PathBuf> {
+    archive_save_state_reporting(
+        source_db,
+        storage_root,
+        projects,
+        scrub_preset,
+        label,
+        options,
+        ArchiveProgressFormat::Text,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        diagnostics,
+    )
+}
+
+fn archive_save_state_reporting(
+    source_db: &Path,
+    storage_root: &Path,
+    projects: Vec<String>,
+    scrub_preset: String,
+    label: Option<String>,
+    options: ArchiveSaveOptions,
+    format: ArchiveProgressFormat,
+    cancellation: Arc<std::sync::atomic::AtomicUsize>,
+    diagnostics: &ArchiveDiagnostics,
+) -> CliResult<PathBuf> {
+    let mut observer = |event: &ArchiveProgressEvent| {
+        diagnostics.observe_progress(event);
+        print_archive_progress(format, event)
+    };
+    let mut progress = ArchiveSaveProgress::new(cancellation, &mut observer);
+    progress.emit("started")?;
+    let result = archive_save_state_with_progress(
+        source_db,
+        storage_root,
+        projects,
+        scrub_preset,
+        label,
+        options,
+        &mut progress,
+    );
+    match result {
+        Ok(path) => {
+            progress.emit("completed")?;
+            Ok(path)
+        }
+        Err(error) => {
+            let cancelled = progress.cancellation.load(Ordering::Relaxed) != 0;
+            progress.emit(if cancelled { "cancelled" } else { "failed" })?;
+            if cancelled {
+                progress.check_cancelled()?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn archive_save_state_with_progress(
+    source_db: &Path,
+    storage_root: &Path,
+    projects: Vec<String>,
+    scrub_preset: String,
+    label: Option<String>,
+    options: ArchiveSaveOptions,
+    progress: &mut ArchiveSaveProgress<'_>,
+) -> CliResult<PathBuf> {
     use chrono::Timelike;
 
-    diagnostics.start(ArchivePhase::Prepare);
-    if !(0..=9).contains(&options.compression_level) {
-        return Err(CliError::InvalidArgument(
-            "archive compression level must be between 0 and 9".to_string(),
-        ));
-    }
+    let base_options = archive_zip_options(options.compression_level)?;
+    progress.checkpoint()?;
     let source_db = PathBuf::from(resolve_sqlite_runtime_path(&source_db.to_string_lossy()));
 
     let preset = match share::normalize_scrub_preset(&scrub_preset) {
@@ -86874,6 +87991,20 @@ fn archive_save_state_internal(
         )));
     }
 
+    // Compare directory identities before database work. Descendant output
+    // directories are excluded explicitly from the later storage inventory.
+    let storage_root = std::fs::canonicalize(storage_root)?;
+    let storage_root = storage_root.as_path();
+    let archive_dir = archive_states_dir(true)?;
+    let archive_dir = std::fs::canonicalize(archive_dir)?;
+    if archive_dir == storage_root {
+        return Err(CliError::InvalidArgument(format!(
+            "archive output directory must differ from the mailbox storage root {}",
+            storage_root.display(),
+        )));
+    }
+
+    progress.phase("mailbox_lock")?;
     let _mailbox_read_locks = if options.acquire_mailbox_read_lock {
         Some(acquire_cli_mailbox_read_locks_for_paths(
             &source_db,
@@ -86882,8 +88013,7 @@ fn archive_save_state_internal(
     } else {
         None
     };
-    diagnostics.finish();
-    diagnostics.start(ArchivePhase::SnapshotSource);
+    progress.phase("source_reconciliation")?;
     let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
     let source = resolve_canonical_snapshot_source_path(
         &source_db,
@@ -86891,7 +88021,6 @@ fn archive_save_state_internal(
         storage_root_is_explicit,
         "archive save",
     )?;
-    let archive_dir = archive_states_dir(true)?;
     let timestamp = Utc::now();
     let timestamp = timestamp.with_nanosecond(0).unwrap_or(timestamp);
     let base_name = compose_archive_basename(timestamp, &projects, &preset_str, label.as_deref());
@@ -86901,36 +88030,20 @@ fn archive_save_state_internal(
         .prefix("mailbox-archive-")
         .tempdir()?;
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
-    diagnostics.finish();
 
-    ftui_runtime::ftui_println!("Creating mailbox archive...");
     // A private save: the preset alone decides (the lossless `archive`
     // preset keeps registration tokens so a restore can still send).
-    let context = source.create_share_snapshot_context_with_observer(
+    let context = source.create_share_snapshot_context_with_progress(
         &snapshot_path,
         &projects,
         preset,
         share::SnapshotPurpose::PrivateArchive,
-        &mut |event| match event {
-            share::SnapshotPhaseEvent::Started(phase) => diagnostics.start(phase.into()),
-            share::SnapshotPhaseEvent::Finished(phase) => {
-                if diagnostics.enabled()
-                    && matches!(
-                        phase,
-                        share::SnapshotPhase::Snapshot | share::SnapshotPhase::Finalize
-                    )
-                    && let Ok(metadata) = std::fs::metadata(&snapshot_path)
-                {
-                    diagnostics.snapshot_bytes(metadata.len());
-                }
-                diagnostics.finish();
-            }
-        },
+        &mut |update| progress.snapshot(update),
     )?;
 
-    diagnostics.start(ArchivePhase::Metadata);
+    progress.phase("metadata")?;
     let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
-    diagnostics.snapshot_bytes(snapshot_size);
+    progress.event.snapshot_bytes = snapshot_size;
     let destination_name = destination
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -86953,12 +88066,18 @@ fn archive_save_state_internal(
     let projects_requested = projects.clone();
     let label_value = label.clone().unwrap_or_default();
     let source_path = source.reported_path().display().to_string();
+
+    progress.phase("storage_inventory")?;
     let excluded_storage_paths = archive_save_storage_exclusions(
         storage_root,
         source.reported_path(),
         &archive_dir,
         options.exclude_recovery,
     )?;
+    let files = inventory_archive_storage(storage_root, &excluded_storage_paths, progress)?;
+    let storage_bytes = progress.event.bytes;
+    let recovery_files = progress.event.recovery_files;
+    let recovery_bytes = progress.event.recovery_bytes;
 
     let metadata = serde_json::json!({
         "version": 1,
@@ -86978,12 +88097,23 @@ fn archive_save_state_internal(
             "source_path": storage_root.display().to_string(),
             "git_head": detect_git_head(storage_root),
             "archive_dir": ARCHIVE_STORAGE_DIRNAME,
+            "files": files.len(),
+            "size_bytes": storage_bytes,
             "recovery_history_included": !options.exclude_recovery,
             "excluded_paths": excluded_storage_paths.iter()
                 .map(|path| path.to_string_lossy().replace('\\', "/"))
                 .collect::<Vec<_>>(),
+            "recovery_history": {
+                "policy": if options.exclude_recovery { "excluded_by_request" } else { "included" },
+                "files": recovery_files,
+                "size_bytes": recovery_bytes,
+            },
         },
         "compression_level": options.compression_level,
+        "compression": {
+            "method": if options.compression_level == 0 { "stored" } else { "deflate" },
+            "level": options.compression_level,
+        },
         "label": label_value,
         "tooling": {
             "package": "mcp-agent-mail",
@@ -86995,90 +88125,83 @@ fn archive_save_state_internal(
         ],
     });
     let sorted_metadata = sort_json_keys(&metadata);
-    let metadata_json =
-        serde_json::to_string_pretty(&sorted_metadata).unwrap_or_else(|_| "{}".to_string());
+    let metadata_json = serde_json::to_string_pretty(&sorted_metadata)
+        .map_err(|error| CliError::Format(error.to_string()))?;
 
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Write to a temp file under the archive directory, then move into place (atomic).
+    // A failed, cancelled or unverified archive never gets its final name.
     let zip_dir = tempfile::Builder::new()
         .prefix("mailbox-archive-zip-")
         .tempdir_in(&archive_dir)?;
     let temp_zip_path = zip_dir.path().join("mailbox-state.zip");
-    diagnostics.finish();
-
-    use zip::DateTime;
-    use zip::write::SimpleFileOptions;
-
-    diagnostics.start(ArchivePhase::Zip);
-    let file = create_archive_zip_file(&temp_zip_path)?;
-    let mut zip = zip::ZipWriter::new(file);
-    let fixed_time = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
-        .map_err(|e| CliError::Other(format!("zip time error: {e}")))?;
-    let base_options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .compression_level(Some(options.compression_level))
-        .last_modified_time(fixed_time);
+    let temp_zip = create_archive_zip_file(&temp_zip_path)?;
+    let mut zip = zip::ZipWriter::new(temp_zip);
 
     // metadata.json
+    progress.phase("compress_snapshot")?;
+    progress.event.total_files = Some(2);
+    progress.event.total_bytes = Some(snapshot_size + metadata_json.len() as u64);
     zip.start_file(ARCHIVE_METADATA_FILENAME, base_options)
         .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
-    diagnostics.write_entry(&mut zip, metadata_json.as_bytes())?;
+    archive_write_all(&mut zip, metadata_json.as_bytes(), false, progress)?;
+    progress.advance(1, 0, false)?;
 
     // snapshot/mailbox.sqlite3
-    let snapshot_zip_name = ARCHIVE_SNAPSHOT_RELATIVE.replace('\\', "/");
-    let snapshot_mode = file_mode(&snapshot_path);
-    zip.start_file(
-        snapshot_zip_name,
-        base_options.unix_permissions(snapshot_mode),
-    )
-    .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
-    let mut snapshot_file = std::fs::File::open(&snapshot_path)?;
-    diagnostics.copy_entry(&mut snapshot_file, &mut zip)?;
-    diagnostics.finish();
+    write_archive_file(
+        &mut zip,
+        &snapshot_path,
+        ARCHIVE_SNAPSHOT_RELATIVE,
+        &std::fs::metadata(&snapshot_path)?,
+        base_options,
+        false,
+        progress,
+    )?;
 
     // storage_repo/*
-    diagnostics.start(ArchivePhase::Enumerate);
-    let mut files = Vec::new();
-    collect_files_with_exclusions(
-        storage_root,
-        storage_root,
-        &excluded_storage_paths,
-        &mut files,
-        diagnostics,
-    )?;
-    files.sort();
-    diagnostics.finish();
-    // Resume ZIP writing after the selected storage files have been enumerated.
-    diagnostics.start(ArchivePhase::Zip);
-    for rel in files {
-        let full_path = storage_root.join(&rel);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        let zip_name = format!("{ARCHIVE_STORAGE_DIRNAME}/{rel_str}");
-        let mode = file_mode(&full_path);
-
-        zip.start_file(zip_name, base_options.unix_permissions(mode))
-            .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
-        let mut f = std::fs::File::open(&full_path)?;
-        diagnostics.copy_entry(&mut f, &mut zip)?;
+    progress.phase("compress_storage")?;
+    progress.event.total_files = Some(files.len() as u64);
+    progress.event.total_bytes = Some(storage_bytes);
+    for file in &files {
+        let full_path = storage_root.join(&file.relative);
+        write_archive_file(
+            &mut zip,
+            &full_path,
+            &file.member_name,
+            &file.metadata,
+            base_options,
+            file.is_recovery(),
+            progress,
+        )?;
     }
 
-    zip.finish()
+    progress.phase("finalize_zip")?;
+    let temp_zip = zip
+        .finish()
         .map_err(|e| CliError::Other(format!("zip finalize error: {e}")))?;
-    if diagnostics.enabled()
-        && let Ok(metadata) = std::fs::metadata(&temp_zip_path)
-    {
-        diagnostics.archive_bytes(metadata.len());
-    }
-    diagnostics.finish();
+    temp_zip.sync_all()?;
+    progress.event.archive_bytes = temp_zip.metadata()?.len();
+    drop(temp_zip);
 
-    let size_bytes = match publish_archive_zip(&temp_zip_path, &destination, diagnostics) {
+    progress.phase("verify_zip")?;
+    progress.event.total_bytes = Some(snapshot_size + metadata_json.len() as u64 + storage_bytes);
+    let mut expected_members = Vec::with_capacity(files.len() + 2);
+    expected_members.push((ARCHIVE_METADATA_FILENAME, metadata_json.len() as u64));
+    expected_members.push((ARCHIVE_SNAPSHOT_RELATIVE, snapshot_size));
+    expected_members.extend(
+        files
+            .iter()
+            .map(|file| (file.member_name.as_str(), file.metadata.len())),
+    );
+    verify_saved_archive(&temp_zip_path, &expected_members, progress)?;
+    progress.phase("publish")?;
+    let size_bytes = match publish_archive_zip(
+        &temp_zip_path,
+        &destination,
+        &ArchiveDiagnostics::disabled(),
+    ) {
         Ok(bytes) => bytes,
         Err(error) => {
-            // Preserve completed work on a collision or uncertain durability.
-            // If rename already succeeded, its destination is never removed.
+            // Preserve the completed, verified ZIP on a collision or uncertain
+            // durability. A destination already published is never removed.
             let retained_stage = zip_dir.keep();
             return Err(CliError::Other(format!(
                 "archive publication to {} was not confirmed: {error}; inspect the destination \
@@ -87088,6 +88211,8 @@ fn archive_save_state_internal(
             )));
         }
     };
+    progress.event.archive_bytes = size_bytes;
+
     let projects_desc = if projects.is_empty() {
         vec!["all".to_string()]
     } else {
@@ -87476,6 +88601,7 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             label,
             diagnostics,
             exclude_recovery,
+            progress,
             compression_level,
         } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -87492,8 +88618,10 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             let config = Config::from_env();
             let storage_root = config.storage_root;
 
+            let cancellation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _signals = ArchiveSaveSignals::install(&cancellation)?;
             let diagnostics = ArchiveDiagnostics::new(diagnostics);
-            let _path = archive_save_state_internal(
+            let _path = archive_save_state_reporting(
                 &source_db,
                 &storage_root,
                 projects,
@@ -87504,6 +88632,8 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                     compression_level,
                     ..ArchiveSaveOptions::default()
                 },
+                progress,
+                cancellation,
                 &diagnostics,
             )?;
             Ok(())

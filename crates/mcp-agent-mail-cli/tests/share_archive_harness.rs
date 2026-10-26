@@ -579,6 +579,7 @@ fn archive_diagnostics(stderr: &str) -> Vec<BTreeMap<&str, &str>> {
                 | "archive_metadata"
                 | "storage_enumeration"
                 | "zip_writing"
+                | "archive_verification"
                 | "publication"
         ));
         assert!(matches!(
@@ -665,9 +666,9 @@ fn archive_save_diagnostics_cli_reports_phases_counters_and_preserves_scrub_sema
                 "scrub",
                 "finalize",
                 "archive_metadata",
-                "zip_writing",
                 "storage_enumeration",
                 "zip_writing",
+                "archive_verification",
                 "publication"
             ]
         );

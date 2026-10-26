@@ -637,158 +637,275 @@ saved baseline file you can compare later.
 For release-signoff performance work, capture the baseline on a machine that is
 not already saturated by other agent builds.
 
-## 16. Diagnose archive save phases [stateful]
+## 16. Save and diagnose a private mailbox archive [stateful]
 
-**Goal:** Locate time spent in `archive save` using elapsed times and aggregate
-file/byte counters, without adding mailbox contents or credentials to diagnostic
-records. This addresses the missing phase visibility reported in
+**Goal:** Complete a restorable backup within an existing maintenance window,
+and identify the expensive phase when it does not finish. These observations
+address the visibility gap in
 [GH#365](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/365);
-it does not establish the cause of that report's slow saves.
+they do not establish the cause of the reporter's earlier slow saves.
 
-**Build requirement:** `--diagnostics` requires a build containing this change.
-The installed v0.3.39 from the issue does not support the option. Source builds
-may still report package version `0.3.39`, so check the actual binary's command
-help instead of relying on its version string:
+**Build requirement:** Check the actual binary's command help. The installed
+v0.3.39 from that report does not expose these progress and diagnostic options,
+and a newer source build may still report package version `0.3.39`:
 
 ```bash
-# From a checkout containing the archive diagnostics change:
+# From a checkout containing these changes, with the default target directory:
 cargo build --locked --release -p mcp-agent-mail-cli --features portable --bin am
 ./target/release/am archive save --help
 ```
 
-Confirm that the help lists `--diagnostics`. Help does not create an archive.
-Use that exact binary with the existing save command only against a disposable
-replica or within the already approved offline run. Keep its working directory,
-mailbox configuration, supervisor recovery procedure, and timeout unchanged;
-this recipe does not require an additional live-mailbox outage.
+If `CARGO_TARGET_DIR` is customized, use the binary from that directory.
+Confirm that help lists `--progress`, `--diagnostics`, `--compression-level`,
+and `--exclude-recovery`. Help does not create an archive. Use that exact
+binary for the examples below, keeping the existing command's project
+selectors, working directory, mailbox configuration, and timeout.
+
+Use the same `DATABASE_URL` and `STORAGE_ROOT` as the service. Archives are saved
+under `archived_mailbox_states/` in the detected project root. Keep output and
+captured logs outside `STORAGE_ROOT` when possible. If the output directory is
+inside storage, save excludes that exact subtree to avoid including previous
+backups or its own temporary ZIP. The output directory cannot be the storage
+root itself. Relative paths and directory aliases are resolved for this check.
+Stop writers gracefully through the existing supervisor and confirm ownership
+with `am doctor locks --json` and `am doctor drain --json`; inspect
+`safe_to_mutate`, not just the exit status.
+Keep the supervisor's recovery/startup tail and the existing outage deadline.
+Run these commands only against an isolated replica or in the already scheduled
+backup window; diagnosing a previous timeout does not require another daytime
+archive attempt.
 
 ```bash
-# Existing offline run or isolated replica only; replace these placeholders.
-/abs/path/checkout/target/release/am archive save \
-  --project /abs/path/project \
-  --scrub-preset archive \
-  --label nightly \
-  --diagnostics 2>/abs/path/archive-save.stderr.log
+am archive save --label nightly --scrub-preset archive --progress text
+
+# For a scheduled job, retain structured phase records alongside its log:
+am archive save --label nightly --progress json \
+  2>/abs/path/backup-evidence/archive-save.stderr.log
+
+# Independent coarse-phase heartbeats, without the cooperative progress stream:
+am archive save --label nightly --progress off --diagnostics \
+  2>/abs/path/backup-evidence/archive-save.stderr.log
 ```
 
-Keep the archive output directory and the captured log outside `STORAGE_ROOT`.
-The option is off by default. Existing stdout and exit behavior are preserved;
-additional records are written to stderr with the prefix
-`archive_save_diagnostic`. Phase start, completion, and failure records are
-immediate. While a phase is running, there is at most one periodic record per
-five seconds on the reporter's cadence, rather than a line for each file. A
-periodic record may occur close to a phase boundary. `heartbeat=1` means the
-periodic worker started; `heartbeat=0` means it could not start and only phase
-boundaries are available. Times use a monotonic clock: total elapsed
-milliseconds since the save began and elapsed milliseconds in the current
-phase occurrence. Numeric counters and elapsed times saturate rather than
-wrapping on overflow.
+Text progress is enabled by default and goes to stderr, including when the
+command runs without a terminal. `--progress json` emits structured progress
+records; other error or warning diagnostics may also appear on stderr.
+`--progress off` suppresses progress. The final archive path and success
+summary remain on stdout. `--diagnostics` is a separate, optional stream that
+is off by default. It can be combined with any progress mode.
 
-| Phase | Work being measured |
-|---|---|
-| `prepare` | Argument, path, and mailbox-lock preparation |
-| `snapshot_source` | Resolve the canonical source, including any existing private-source fallback |
-| `snapshot` | Create the private SQLite snapshot |
-| `filter` | Select projects and remove out-of-scope rows from the snapshot |
-| `scrub` | Apply the requested scrub preset and snapshot-purpose policy |
-| `finalize` | Rebuild a compact standalone mailbox snapshot; private backups omit viewer search indexes and materialized tables |
-| `archive_metadata` | Prepare the existing archive metadata |
-| `zip_writing` | Write and compress ZIP members, then finish the ZIP |
-| `storage_enumeration` | Walk the existing storage selection and sort members |
-| `publication` | Sync the completed ZIP, publish without replacing an existing destination, and sync parent directories on Unix |
+### Interpreting the phases
 
-`zip_writing` can appear before and after `storage_enumeration`: the existing
-save order writes metadata and the snapshot before enumerating the storage
-tree. Elapsed time for each occurrence starts at that occurrence's start.
+| Progress phase | Diagnostic phase | Work being measured |
+|----------------|------------------|---------------------|
+| `prepare`, `mailbox_lock` | `prepare` | Validate arguments and paths, then acquire mailbox activity locks before reading the source |
+| `source_reconciliation` | `snapshot_source` | Compare the live database with the canonical archive and, if needed, reconstruct a private source; this may traverse archives and execute SQL before the main snapshot copy |
+| `snapshot_copy` | `snapshot` | Read one consistent source transaction and build a private canonical SQLite database, including committed WAL rows through the owning engine; this is SQL extraction rather than a raw main-file copy |
+| `snapshot_scope` | `filter` | Apply project selection to the private snapshot |
+| `snapshot_scrub` | `scrub` | Apply the selected scrub policy; the default `archive` preset preserves private recovery state |
+| `snapshot_compact` | `finalize` | Produce the standalone snapshot that will be restored; private archives omit the static share viewer's FTS indexes and materialized tables |
+| `metadata` | `archive_metadata` | Read snapshot metadata and prepare archive metadata |
+| `storage_inventory` | `storage_enumeration` | Enumerate selected regular storage files and their sizes, including recovery history |
+| `compress_snapshot`, `compress_storage`, `finalize_zip` | `zip_writing` | Write metadata, snapshot, and storage payloads, then finish the ZIP central directory |
+| `verify_zip` | `archive_verification` | Read back the completed ZIP and verify its members before publication |
+| `publish` | `publication` | Sync the completed, verified ZIP, publish without replacing an existing destination, and sync parent directories on Unix |
 
-File and byte-work counters are cumulative within one invocation.
-`snapshot_bytes` and `archive_bytes` are size gauges, reporting the most recent
-observation rather than adding repeated measurements; a snapshot can shrink
-during finalization. A zero size gauge can mean it has not yet been measured.
-Interpret all values with the current phase:
+Storage inventory precedes ZIP writing. The diagnostic `zip_writing` phase is
+one continuous occurrence across the three finer compression/finalization
+phases, followed by `archive_verification` and then `publication`.
+
+Elapsed phase time measures this invocation. It is not an estimate of the
+remaining maintenance window. A single SQL operation can take time between
+progress callbacks; the last phase identifies where to investigate, while
+process CPU and I/O samples help determine whether work is continuing.
+Progress records carry `schema_version: 1`, the phase, a state such as
+`started`, `progress`, `completed`, `cancelled`, or `failed`, and elapsed times.
+File/byte counters reset for each phase; snapshot `rows_copied` counts rows in
+the named table. `recovery_files` and `recovery_bytes` distinguish top-level
+`doctor/` history from the rest of the selected storage. Retain completed
+records to compare totals across phases. Verification reads payloads again;
+its phase-local byte count is verification work, not additional archive input.
+The `snapshot_bytes` and `archive_bytes` fields are size gauges retained across
+phase changes.
+
+Cooperative progress is rate-limited to a two-second interval between
+checkpoints, with immediate boundary records. It is not an independent timer
+that proves a blocked operation is responsive. Cancellation is checked between
+SQL pages and filesystem copy chunks; an individual database statement or
+blocking filesystem call may still delay shutdown, so keep the supervisor's
+hard limit. On Unix, the first SIGINT/SIGTERM requests cleanup at a checkpoint;
+a second termination signal uses its default termination behavior and may leave
+unpublished temporary files.
+
+### Optional independent diagnostics and privacy
+
+`--diagnostics` writes records prefixed `archive_save_diagnostic` to stderr.
+Coarse phase start, completion, and failure records are immediate. While a
+phase runs, an independent reporter emits at most one periodic `running`
+record per five seconds on its cadence; a periodic record may be close to a
+phase boundary. `heartbeat=1` means that worker started. `heartbeat=0` means
+it could not start and only boundary records are available. Elapsed times use
+a monotonic clock, and numeric values saturate instead of wrapping.
+
+Diagnostic work counters accumulate across the whole invocation:
 
 | Counter | Meaning |
-|---|---|
-| `storage_files` | Regular storage files selected by the existing traversal |
-| `storage_bytes` | Sum of known selected-file sizes; incomplete when `storage_size_unknown` is nonzero |
-| `storage_size_unknown` | Selected files whose size could not be obtained for diagnostics |
-| `zip_files` | ZIP entries whose input payload was fully accepted, including metadata and snapshot entries |
-| `zip_bytes` | Uncompressed bytes accepted by the ZIP writer, including a partially written current entry |
-| `snapshot_bytes` | Observed snapshot file size |
-| `archive_bytes` | Observed compressed size of the completed ZIP |
+|---------|---------|
+| `storage_files` | Selected regular storage files discovered by inventory |
+| `storage_bytes` | Sum of their observed sizes |
+| `storage_size_unknown` | Unknown selected-file sizes; the current inventory requires metadata and fails rather than silently selecting an unknown size |
+| `zip_files` | Entries whose input payload was fully accepted, including metadata and snapshot entries |
+| `zip_bytes` | Uncompressed payload bytes accepted at progress checkpoints, including a partial current entry; verification reads do not increase this counter |
+| `snapshot_bytes` | Most recently observed snapshot size, a gauge rather than a running sum |
+| `archive_bytes` | Observed compressed size of the completed ZIP, also a gauge |
 
-Even after an entry's input is fully accepted, final compression and the ZIP
-central directory may still be pending until `zip_writing` completes.
+A zero size gauge may mean it has not yet been measured, and a snapshot can
+shrink during finalization. Even after an entry's input is fully accepted,
+compression or central-directory output may remain until ZIP writing completes.
+These are observations rather than a completion percentage or an ETA.
 
-These are observations, not a completion percentage or an ETA. SQLite work can
-continue while file/byte counters stay unchanged. A heartbeat indicates that
-the diagnostic reporter is running; it does not prove that the current
-operation is advancing, and silence after forced termination cannot produce a
-failure record. Phase timing alone does not prove deadlock, establish a
-reconciliation backlog, or attribute cost to recovery-directory size.
+SQLite work can continue while file and byte counters stay unchanged. A
+heartbeat proves that the diagnostic reporter is running, not that the current
+operation is advancing. Forced termination cannot reliably emit a failure
+record. Phase timing alone does not prove a deadlock, establish a reconciliation
+backlog, or attribute cost to recovery-directory size.
 
-Only the prefixed diagnostic records have the content-free contract: fixed
-phase/status names and numeric times/counters, with no file paths, project
-selectors, labels, message bodies, credentials, SQL, or raw error strings.
-Normal command output and existing errors can still contain paths and other
-operator details. To retain just the phase records for review:
-
-```bash
-rg '^archive_save_diagnostic ' /abs/path/archive-save.stderr.log \
-  > /abs/path/archive-save.diagnostics.log
-```
-
-The flag does not alter locking, project filtering, scrub semantics, compression
-settings, archive members, restore format, or atomic publication. It does not
-exclude or delete recovery evidence, and it does not change the offline limit.
-
-
-### Control backup size and compression
-
-A build with these options lists `--exclude-recovery` and
-`--compression-level` in `am archive save --help`. Private archive snapshots
-retain restore state and the compact standalone database rebuild, without
-building the FTS index and materialized tables used only by published share
-viewers. Published `am share` bundles still build those viewer artifacts.
-
-For an existing offline backup run or a disposable replica:
+The progress records and prefixed diagnostic records contain fixed
+phase/status/schema names and numeric times or counters. They do not include
+paths, project selectors, labels, message bodies, credentials, SQL, or raw
+errors. Normal command output and existing warnings/errors may still contain
+operator details. To retain only the coarse diagnostics for review:
 
 ```bash
-am archive save --project /abs/path/project --scrub-preset archive \
-  --label nightly --exclude-recovery --compression-level 1 --diagnostics
+rg '^archive_save_diagnostic ' /abs/path/backup-evidence/archive-save.stderr.log \
+  > /abs/path/backup-evidence/archive-save.diagnostics.log
 ```
 
-`--exclude-recovery` omits only the top-level `STORAGE_ROOT/doctor/` directory
-from the ZIP. It leaves the source files untouched and preserves mailbox
-messages, attachments, reservations, agent identities, and Git history.
-A project's nested `doctor/` directory is still included. Recovery material
-already present in Git objects remains part of that history; this option is
-not an erasure or redaction policy. The default includes recovery history.
+Enabling diagnostics does not change payload selection, scrub policy,
+compression, locking, or the maintenance deadline.
 
-Deflate levels range from `0` (fastest) to `9` (smallest); the default remains
-`9`. Lower levels trade a larger ZIP for less compression work. Metadata
-records the compression level, recovery-history policy, and omitted storage
-paths. These settings do not change the database scrub preset or the restore
-command.
+The snapshot source decision may reconstruct a private database if the live
+index is missing or behind authoritative archive state. That is separate from
+the daemon's periodic message, identity, and reservation reconcilers. Historical
+`deferred reconcile` warnings count retries, often of the same entity; their
+line count is not the number of outstanding repairs.
 
-When the output directory is inside `STORAGE_ROOT`, saves automatically omit
-that directory so an archive cannot contain earlier backups or its own
-temporary ZIP. This check resolves relative paths and directory aliases; the
-output directory must differ from the mailbox storage root. The dedicated
-SQLite snapshot is still included; the embedded
-live database and its sidecars remain excluded from the storage payload.
+### Safe diagnostics for an existing run [read-only]
 
+On Linux, sample the actual archive-save PID from the supervisor during its
+already scheduled invocation. Do not launch another save just to collect these
+observations:
 
-### Completed archive publication
+```bash
+SAVE_PID=12345  # replace with the verified archive-save process ID
+date --iso-8601=seconds
+cat "/proc/$SAVE_PID/io"
+cat "/proc/$SAVE_PID/stat"
+find "/proc/$SAVE_PID/fd" -mindepth 1 -maxdepth 1 -type l -printf '.' | wc -c
+```
 
-On Unix, new archive ZIPs are created with owner-only permissions because the
-lossless preset includes registration credentials and private mail. Save syncs
-the completed ZIP before publication and uses an atomic no-replace move: a
-competing backup, directory, or dangling symlink at the chosen destination
-cannot be overwritten. Parent directory updates are synced on Unix; Windows
-retains the file flush and atomic no-replace move.
+Record samples at a modest interval, such as the existing 60-second sampling
+plan, together with phase output and the supervisor's CPU/wall-time summary.
+Retain the PID's start time from `/proc/PID/stat` so PID reuse is not mistaken
+for continuation of the same run. Permission errors or process exit mean the
+sample is unavailable, not zero activity.
 
-If publication or its durability check fails, the command reports failure
-and retains its staging directory for inspection. A destination already
-published is preserved. The error identifies both locations; inspect them
+`rchar`/`wchar` report read/write activity including cached I/O;
+`read_bytes`/`write_bytes` describe storage I/O and can remain flat when data is
+cached. Growing CPU time with little storage I/O can be SQL computation or
+compression. A fixed temporary database size or unchanged mtime does not prove
+a deadlock or identify the active SQL statement. Descriptor counts show resource
+growth but do not measure completion. Treat these as supporting observations;
+the named phase and its counters provide the attribution. Keep file-descriptor
+targets and mailbox paths private if collecting additional local detail.
+
+Existing native diagnostics answer narrower questions:
+
+| Command | What it can establish | What it does not establish |
+|---------|-----------------------|----------------------------|
+| `am doctor locks --json` / `am doctor drain --json` | Current ownership and whether the mailbox is drained | Which archive-save phase is consuming CPU |
+| `am doctor check --json` | Database/namespace health and archive inventory findings | That an archive save will finish within its deadline |
+| `am doctor archive-scan --json` | Archive hygiene findings | A current, deduplicated reconciler backlog or ZIP integrity |
+| `am doctor archive-verify --json` | Read-only comparison of archive artifacts with SQLite | Verification of a saved mailbox ZIP; commit provenance is not checked by this pass |
+| `am doctor artifacts --json` / `am doctor backups --json` | Recovery and backup inventory | Permission to discard an old-looking artifact |
+| `am doctor reclaim --dry-run --json` | A preview of recovery-debris consolidation | A reduction in archived bytes: move-only consolidation still leaves those bytes under `doctor/reclaimable/` |
+
+Run diagnostics at an appropriate existing inspection point; full archive
+comparison itself traverses and reads data. The v0.3.39 binary in the report
+has no archive-save phase-progress flag, and these health commands cannot
+retroactively identify the expensive phase of an earlier invocation. A healthy
+result is evidence against the specific failures checked, not a reason to run
+an unrequested repair or reconstruct operation.
+
+### Recovery history, compression, and verification
+
+Compression settings range from `0` through `9`; the default remains `9`.
+`--compression-level 1` trades a larger ZIP for less compression work, level `0`
+uses uncompressed ZIP storage, and levels `1` through `9` use deflate with
+increasing compression effort. Compare
+phase times and output sizes on isolated copies of the same fixture before
+changing a production maintenance budget. A smaller archive is not necessarily
+faster to produce, and host CPU contention affects wall time independently of
+archive contents. For such a comparison, preserve the full recovery history:
+
+```bash
+am archive save --label compression-comparison --scrub-preset archive \
+  --compression-level 1 --progress json
+```
+
+By default, all regular files under top-level `doctor/`, including forensic
+bundles and `doctor/reclaimable/`, remain included. They may contain unique
+recovery evidence or the bytes needed by a later undo. Their size alone does
+not prove they caused a timeout, and age or a filename containing `reclaimable`
+is not sufficient proof that they can be omitted. ZIP64 supports large
+individual recovery files as well as archives with many members.
+
+The existing opt-in `--exclude-recovery` option omits only top-level
+`STORAGE_ROOT/doctor/` from the ZIP without modifying its source. A project's
+nested `doctor/` directory remains selected. The mailbox snapshot, messages,
+attachments, reservations, identities, and Git history remain restorable, but
+the archive intentionally lacks that top-level forensic recovery evidence.
+Do not use this option when the backup must preserve complete recovery history.
+Recovery bytes already stored in Git objects may still be included; exclusion
+is not an erasure or redaction policy. Metadata records the compression level,
+recovery-history policy, and omitted storage paths. These settings do not
+change the scrub preset or restore command.
+
+The automatically excluded output subtree prevents recursive backup growth.
+The dedicated SQLite snapshot remains included, while the embedded live
+database and its sidecars are excluded from the storage payload. Storage
+symlinks are not dereferenced.
+
+The `archive` preset is intended for a private backup and preserves sensitive
+mailbox state. `--project` scopes the SQLite snapshot, while the selected storage
+tree is included for restoration. A mailbox archive is therefore not a
+sanitized share bundle; use the share/export workflow in section 11 for
+publication. Published share bundles still build their viewer artifacts.
+
+Before publication, save compares every ZIP member's name and uncompressed
+size with the expected inventory, then reads each entry through EOF to check
+its CRC, including the required snapshot and metadata members. This deliberate
+verification pass consumes additional I/O and decompression work; its time is
+reported separately. A failed or cancelled save does not replace an existing
+good archive.
+
+New ZIPs use owner-only permissions on Unix because private backups contain
+registration credentials and mail. Publication uses the existing atomic
+no-replace move: a competing backup, directory, or dangling symlink at the
+chosen destination cannot be overwritten. The completed file is flushed before
+the move, and parent directory updates are synced on Unix. Windows retains the
+file flush and atomic no-replace move.
+
+If publication or its durability check fails, save reports failure and retains
+the verified ZIP's staging directory for inspection. An already-published
+destination is preserved. The error identifies both locations; inspect them
 before retrying instead of assuming that no archive was created.
+
+ZIP verification establishes container integrity. It does not prove that the
+runtime database engine can restore and use the snapshot. Meaningful recovery
+tests must also restore into an isolated mailbox and inspect database rows,
+message/attachment files, and recovery evidence. `am archive restore --dry-run`
+only prints the proposed destination and preservation operations. It does not
+decompress every entry, verify the SQLite snapshot, or prove that restoration
+will succeed. Preserve existing good archives until the new archive has passed
+the required restore checks.
