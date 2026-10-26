@@ -33740,8 +33740,15 @@ fn doctor_database_inventory_failure_strategy(
 fn doctor_require_recoverable_probe_error(error: &CliError) -> CliResult<()> {
     doctor_refuse_host_storage_fault("Database probe", error)?;
     let detail = error.to_string();
+    let classification_detail = match detail.split_once("; guarded offline canonical open failed: ")
+    {
+        Some((prefix, suffix)) if suffix.contains("refuses a cross-engine canonical open") => {
+            prefix
+        }
+        _ => detail.as_str(),
+    };
     if matches!(error, CliError::Io(_))
-        || !mcp_agent_mail_db::classify_db_error_message(&detail).repairable
+        || !mcp_agent_mail_db::classify_db_error_message(classification_detail).repairable
     {
         return Err(CliError::Other(format!(
             "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: {detail}"
