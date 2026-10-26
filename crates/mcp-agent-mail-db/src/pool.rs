@@ -5372,9 +5372,13 @@ impl DbPool {
             )));
         }
         let rotated_backup = if let Some(expected) = &existing_backup {
-            match rotate_existing_proactive_backup(
+            let rotation_time = staged_authority
+                .modified
+                .map_or_else(SystemTime::now, |modified| SystemTime::now().min(modified));
+            match rotate_existing_proactive_backup_at(
                 &bak_path,
                 expected,
+                rotation_time,
                 rename_noreplace_preserving_source,
             ) {
                 Ok(rotated) => Some(rotated),
@@ -17449,9 +17453,19 @@ fn quarantine_stale_proactive_backup_companions(
     Ok(None)
 }
 
+#[cfg(test)]
 fn rotate_existing_proactive_backup(
     backup_path: &Path,
     expected: &SqliteFileWitness,
+    move_backup: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> DbResult<PathBuf> {
+    rotate_existing_proactive_backup_at(backup_path, expected, SystemTime::now(), move_backup)
+}
+
+fn rotate_existing_proactive_backup_at(
+    backup_path: &Path,
+    expected: &SqliteFileWitness,
+    rotation_time: SystemTime,
     mut move_backup: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> DbResult<PathBuf> {
     if !is_real_file(backup_path) || !sqlite_recovery_candidate_is_standalone(backup_path) {
@@ -17460,7 +17474,9 @@ fn rotate_existing_proactive_backup(
             backup_path.display()
         )));
     }
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let timestamp = chrono::DateTime::<chrono::Utc>::from(rotation_time)
+        .format("%Y%m%d_%H%M%S")
+        .to_string();
     for collision in 0..=9_999 {
         let rotated = proactive_backup_rotation_path(backup_path, &timestamp, collision);
         if sqlite_candidate_artifact_conflicts(&rotated) {

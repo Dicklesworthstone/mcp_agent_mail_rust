@@ -928,7 +928,16 @@ fn select_verified_snapshot_inner(primary: &Path) -> Option<SelectedVerifiedSnap
         return None;
     }
 
-    for candidate in crate::pool::sqlite_backup_candidates(&primary) {
+    let mut candidates = crate::pool::sqlite_backup_candidates(&primary);
+    if let Some(pos) = candidates
+        .iter()
+        .position(|candidate| candidate == &canonical_bak)
+    {
+        let bak = candidates.remove(pos);
+        candidates.insert(0, bak);
+    }
+
+    for candidate in candidates {
         if !crate::pool::sqlite_recovery_candidate_is_standalone(&candidate) {
             continue;
         }
