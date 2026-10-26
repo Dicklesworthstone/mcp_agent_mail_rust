@@ -547,6 +547,14 @@ fn ensure_no_other_file_readers(source: &Path, retained: &File) -> io::Result<()
 /// exclusion for Agent Mail publishers and verified restore readers, while
 /// accounting reports unlinked allocation rather than a free-space delta.
 #[cfg(target_os = "linux")]
+fn is_proc_task_gone(error: &io::Error) -> bool {
+    // Linux procfs returns ENOENT when `/proc/<pid>` vanishes before open and
+    // ESRCH (errno 3, "No such process") when the task exits after a proc file
+    // or directory handle was opened (`get_proc_task(inode) == NULL`).
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
+}
+
+#[cfg(target_os = "linux")]
 fn ensure_no_file_readers(
     source: &Path,
     retained_identity: &Metadata,
@@ -565,7 +573,11 @@ fn ensure_no_file_readers(
     };
     for entry in std::fs::read_dir("/proc")? {
         charge()?;
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_proc_task_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -575,7 +587,7 @@ fn ensure_no_file_readers(
         };
         let descriptors = match std::fs::read_dir(entry.path().join("fd")) {
             Ok(descriptors) => descriptors,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if is_proc_task_gone(&error) => continue,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
                     && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
@@ -588,7 +600,7 @@ fn ensure_no_file_readers(
             charge()?;
             let descriptor = match descriptor {
                 Ok(descriptor) => descriptor,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if is_proc_task_gone(&error) => continue,
                 Err(error) => return Err(error),
             };
             if pid == own_pid
@@ -604,7 +616,7 @@ fn ensure_no_file_readers(
             }
             let target = match std::fs::read_link(descriptor.path()) {
                 Ok(target) => target,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if is_proc_task_gone(&error) => continue,
                 Err(error)
                     if error.kind() == io::ErrorKind::PermissionDenied
                         && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
@@ -623,7 +635,7 @@ fn ensure_no_file_readers(
             } else {
                 match descriptor_references_inode(&entry.path(), &descriptor, retained_identity) {
                     Ok(same_inode) => same_inode,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) if is_proc_task_gone(&error) => continue,
                     Err(error)
                         if error.kind() == io::ErrorKind::PermissionDenied
                             && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
@@ -669,7 +681,7 @@ fn ensure_no_mapped_file_readers(
     const MAX_PROCESS_MAP_BYTES: u64 = 8 * 1024 * 1024;
     let maps_file = match File::open(process.join("maps")) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
                 && reader_inventory_denial_is_foreign(process, self_status)? =>
@@ -684,7 +696,7 @@ fn ensure_no_mapped_file_readers(
         .read_to_end(&mut maps)
     {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
                 && reader_inventory_denial_is_foreign(process, self_status)? =>
@@ -925,7 +937,7 @@ fn reader_inventory_denial_is_foreign(
             Ok(_) => return Ok(false),
             // A process that exited between the denial and status inspection no
             // longer retains a descriptor. Other unavailable evidence refuses.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) if is_proc_task_gone(&error) => return Ok(true),
             Err(error) => return Err(error),
         }
     }
@@ -2031,5 +2043,14 @@ mapping.close()
             b"prior evidence"
         );
         assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_task_gone_recognizes_not_found_and_esrch_only() {
+        assert!(is_proc_task_gone(&io::Error::from_raw_os_error(2)));
+        assert!(is_proc_task_gone(&io::Error::from_raw_os_error(3)));
+        assert!(!is_proc_task_gone(&io::Error::from_raw_os_error(13)));
+        assert!(!is_proc_task_gone(&io::Error::from_raw_os_error(5)));
     }
 }

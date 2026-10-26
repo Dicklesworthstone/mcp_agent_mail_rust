@@ -153,8 +153,7 @@ pub struct ResolvedGitBinary {
 static CACHE: OnceLock<Mutex<Option<ResolvedGitBinary>>> = OnceLock::new();
 
 fn cache_ttl_secs() -> u64 {
-    std::env::var("AM_GIT_BINARY_CACHE_SECS")
-        .ok()
+    crate::config::infra_env_value("AM_GIT_BINARY_CACHE_SECS")
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(86_400) // 24h default
 }
@@ -175,7 +174,7 @@ fn cache_ttl_secs() -> u64 {
 /// is NOT an error here — caller gets `Ok(resolved)` and can inspect
 /// `resolved.version.is_known_bad()` if they want strict behavior.
 pub fn resolve_git_binary() -> Result<ResolvedGitBinary, GitBinaryError> {
-    resolve_git_binary_with_env(|k| std::env::var(k).ok())
+    resolve_git_binary_with_env(crate::config::infra_env_value)
 }
 
 /// Resolution with a custom env lookup. Useful for testing without

@@ -30,9 +30,10 @@ pub mod undo;
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_storage::recovery::reservation_reconcile;
+use mcp_agent_mail_storage::recovery::{active_reservations, reservation_reconcile};
 use mcp_agent_mail_tools::reservation_parity::{
     ReservationParityReport, check_reservation_parity_with_canonical_conn,
+    check_reservation_parity_with_sync_query,
 };
 use serde::Serialize;
 use std::fs;
@@ -462,23 +463,29 @@ const COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD: usize = 3;
 /// a pass, and republished a release, for health to call its drift converging.
 const RESERVATION_RECONCILE_PROGRESS_WINDOW_US: i64 = 10 * 60 * 1_000_000;
 
-/// Whether reservation drift is the background reconciler's work in progress
-/// (br-kp1in.19). `Ok(note)` only when every drift item belongs to a row
-/// released in `SQLite` whose artifact still reads active (the one direction
-/// the reconciler repairs) and the reconciler has both run and republished a
-/// release within the window. A reconciler that is absent, idle, or running
-/// without repairing anything keeps health failing; `Err(Some(note))` says
-/// which, for drift it would otherwise own.
+/// Whether reservation drift is the background reconcilers' work in progress
+/// (br-kp1in.19). `Ok(note)` only when every drift item belongs either to a row
+/// released in `SQLite` whose artifact still reads active (owned by
+/// `reservation_reconcile`) or to a valid active row missing its live-generation
+/// artifact (owned by `active_reservations`), and each needed reconciler has
+/// both run and republished within the window. A reconciler that is absent,
+/// idle, or running without repairing anything keeps health failing;
+/// `Err(Some(note))` says which, for drift it would otherwise own.
 fn reservation_parity_reconciling(
     report: &ReservationParityReport,
-    progress: Option<&reservation_reconcile::ReservationReconcileProgress>,
+    release_progress: Option<&reservation_reconcile::ReservationReconcileProgress>,
+    active_progress: Option<&active_reservations::ActiveReservationProgress>,
     now_us: i64,
 ) -> Result<String, Option<String>> {
     let drift = &report.drift;
-    if drift.total() == 0 || drift.release_pending_mismatches != drift.total() {
+    if drift.total() == 0
+        || drift
+            .release_pending_mismatches
+            .saturating_add(drift.active_pending_rows)
+            != drift.total()
+    {
         return Err(None);
     }
-    let rows = drift.release_pending_rows;
     let fix = fixers::fix_only_command("fm-db-state-files-reservation-db-archive-parity");
     // A time further in the future than clock skew explains is not evidence
     // of recent progress (the clock moved back since it was written).
@@ -487,27 +494,69 @@ fn reservation_parity_reconciling(
             && now_us.saturating_sub(ts_us) <= RESERVATION_RECONCILE_PROGRESS_WINDOW_US
     };
     let window_min = RESERVATION_RECONCILE_PROGRESS_WINDOW_US / 60_000_000;
-    let Some(progress) = progress.filter(|progress| recent(progress.pass_us)) else {
-        return Err(Some(format!(
-            "reservation_parity: {rows} released reservation(s) await the background \
-             reconciler, which has not run in the last {window_min} min (is the server up?); \
-             next: {fix}"
-        )));
-    };
-    match progress.last_repair_us.filter(|ts_us| recent(*ts_us)) {
-        Some(last_repair_us) => Ok(format!(
-            "warn: reservation parity: reconciling {rows} released reservation(s); the \
-             background reconciler (pid {}) last republished one {}s ago",
-            progress.pid,
-            now_us.saturating_sub(last_repair_us) / 1_000_000
-        )),
-        None => Err(Some(format!(
-            "reservation_parity: the background reconciler (pid {}) is running but has not \
-             republished any of {rows} pending release(s) in the last {window_min} min; \
-             next: {fix}",
-            progress.pid
-        ))),
+    let mut converging_notes = Vec::new();
+
+    if drift.release_pending_rows > 0 {
+        let rows = drift.release_pending_rows;
+        let Some(progress) = release_progress.filter(|progress| recent(progress.pass_us)) else {
+            return Err(Some(format!(
+                "reservation_parity: {rows} released reservation(s) await the background \
+                 reconciler, which has not run in the last {window_min} min (is the server up?); \
+                 next: {fix}"
+            )));
+        };
+        match progress.last_repair_us.filter(|ts_us| recent(*ts_us)) {
+            Some(last_repair_us) => converging_notes.push(format!(
+                "reconciling {rows} released reservation(s); the background reconciler (pid {}) \
+                 last republished one {}s ago",
+                progress.pid,
+                now_us.saturating_sub(last_repair_us) / 1_000_000
+            )),
+            None => {
+                return Err(Some(format!(
+                    "reservation_parity: the background reconciler (pid {}) is running but has not \
+                     republished any of {rows} pending release(s) in the last {window_min} min; \
+                     next: {fix}",
+                    progress.pid
+                )));
+            }
+        }
     }
+
+    if drift.active_pending_rows > 0 {
+        let rows = drift.active_pending_rows;
+        let Some(progress) = active_progress.filter(|progress| recent(progress.pass_us)) else {
+            return Err(Some(format!(
+                "reservation_parity: {rows} active reservation(s) missing archive artifact(s) \
+                 await the background reconciler, which has not run in the last {window_min} min \
+                 (is the server up?); next: {fix}"
+            )));
+        };
+        match progress.last_repair_us.filter(|ts_us| recent(*ts_us)) {
+            Some(last_repair_us) => converging_notes.push(format!(
+                "reconciling {rows} active reservation(s) missing archive artifact(s); the \
+                 background reconciler (pid {}) last republished one {}s ago",
+                progress.pid,
+                now_us.saturating_sub(last_repair_us) / 1_000_000
+            )),
+            None => {
+                return Err(Some(format!(
+                    "reservation_parity: the background reconciler (pid {}) is running but has not \
+                     republished any of {rows} missing active reservation artifact(s) in the last \
+                     {window_min} min; next: {fix}",
+                    progress.pid
+                )));
+            }
+        }
+    }
+
+    if converging_notes.is_empty() {
+        return Err(None);
+    }
+    Ok(format!(
+        "warn: reservation parity: {}",
+        converging_notes.join("; ")
+    ))
 }
 
 fn reservation_parity_is_cosmetic(report: &ReservationParityReport) -> bool {
@@ -1907,7 +1956,7 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let system_git_version = git_version_text_from_stdout(&raw);
-    let am_git_binary_env = std::env::var("AM_GIT_BINARY").ok();
+    let am_git_binary_env = mcp_agent_mail_core::config::infra_env_value("AM_GIT_BINARY");
     let am_git_binary_version = am_git_binary_env
         .as_deref()
         .and_then(|path| Command::new(path).arg("--version").output().ok())
@@ -2709,34 +2758,33 @@ fn support_schema_versions(
     database_url: &str,
     redaction: &SupportRedactionContext,
 ) -> serde_json::Value {
-    let conn = match crate::open_db_for_doctor_check(database_url) {
-        Ok(conn) => conn,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "unavailable",
-                "detail": redact_support_text(&err.to_string(), redaction),
+    let sample_from_query =
+        |query_fn: &dyn Fn(&str) -> Option<Vec<mcp_agent_mail_db::sqlmodel_core::Row>>| {
+            let user_version = query_fn("PRAGMA user_version").and_then(|rows| {
+                rows.first()
+                    .and_then(|row| row.get_named::<i64>("user_version").ok())
             });
-        }
-    };
-    let user_version = conn
-        .query_sync("PRAGMA user_version", &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<i64>("user_version").ok())
-        });
-    let sqlite_version = conn
-        .query_sync("SELECT sqlite_version() AS sqlite_version", &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<String>("sqlite_version").ok())
-        });
-    serde_json::json!({
-        "status": "captured",
-        "database_user_version": user_version,
-        "sqlite_version": sqlite_version,
-    })
+            let sqlite_version =
+                query_fn("SELECT sqlite_version() AS sqlite_version").and_then(|rows| {
+                    rows.first()
+                        .and_then(|row| row.get_named::<String>("sqlite_version").ok())
+                });
+            serde_json::json!({
+                "status": "captured",
+                "database_user_version": user_version,
+                "sqlite_version": sqlite_version,
+            })
+        };
+    if let Ok(conn) = crate::open_db_sync_read_only_with_database_url(database_url) {
+        return sample_from_query(&|sql| conn.query_sync(sql, &[]).ok());
+    }
+    match crate::open_db_for_doctor_check_read_only_with_context(database_url) {
+        Ok(opened) => sample_from_query(&|sql| opened.conn.query_sync(sql, &[]).ok()),
+        Err(err) => serde_json::json!({
+            "status": "unavailable",
+            "detail": redact_support_text(&err.to_string(), redaction),
+        }),
+    }
 }
 
 fn support_sqlite_sidecar_metadata(database_path: &Path) -> serde_json::Value {
@@ -3436,10 +3484,21 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         );
     }
     let mut live_mailbox_degraded = false;
-    match crate::doctor_database_fix_strategy_read_only(
+    let fix_strategy = if crate::robot::live_server_proves_mailbox_healthy(
+        &config,
         &probe_target.database_url,
         &probe_target.storage_root,
     ) {
+        Ok(crate::DoctorDatabaseFixStrategy::None(
+            "Database passed live server health_check probes".to_string(),
+        ))
+    } else {
+        crate::doctor_database_fix_strategy_read_only(
+            &probe_target.database_url,
+            &probe_target.storage_root,
+        )
+    };
+    match fix_strategy {
         Ok(crate::DoctorDatabaseFixStrategy::None(_)) => {}
         Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => {
             ftui_runtime::ftui_println!(
@@ -3599,13 +3658,26 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
-    match crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
-        .and_then(|opened| {
-            check_reservation_parity_with_canonical_conn(&opened.conn, &probe_target.storage_root)
+    let reservation_parity =
+        match crate::open_db_sync_read_only_with_database_url(&probe_target.database_url) {
+            Ok(conn) => check_reservation_parity_with_sync_query(&conn, &probe_target.storage_root)
                 .map_err(|error| {
                     CliError::Other(format!("reservation parity check failed: {error}"))
-                })
-        }) {
+                }),
+            Err(_) => {
+                crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
+                    .and_then(|opened| {
+                        check_reservation_parity_with_canonical_conn(
+                            &opened.conn,
+                            &probe_target.storage_root,
+                        )
+                        .map_err(|error| {
+                            CliError::Other(format!("reservation parity check failed: {error}"))
+                        })
+                    })
+            }
+        };
+    match reservation_parity {
         Ok(report) => {
             ftui_runtime::ftui_println!("{}", report.health_line());
             if !report.ok {
@@ -3616,10 +3688,14 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
                         COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD,
                     );
                 } else {
-                    let progress = reservation_reconcile::read_progress(&probe_target.storage_root);
+                    let release_progress =
+                        reservation_reconcile::read_progress(&probe_target.storage_root);
+                    let active_progress =
+                        active_reservations::read_progress(&probe_target.storage_root);
                     match reservation_parity_reconciling(
                         &report,
-                        progress.as_ref(),
+                        release_progress.as_ref(),
+                        active_progress.as_ref(),
                         mcp_agent_mail_core::timestamps::now_micros(),
                     ) {
                         Ok(note) => ftui_runtime::ftui_println!("{note}"),
@@ -5261,10 +5337,17 @@ mod tests {
                 pass_us,
                 last_repair_us,
             };
+        let active_progress =
+            |pass_us, last_repair_us| active_reservations::ActiveReservationProgress {
+                pid: 9,
+                pass_us,
+                last_repair_us,
+            };
 
         let converging = reservation_parity_reconciling(
             &pending,
             Some(&progress(now - minute, Some(now - 2 * minute))),
+            None,
             now,
         )
         .expect("a reconciler that just republished a release is converging");
@@ -5293,7 +5376,7 @@ mod tests {
                 Some(progress(now + 30 * minute, Some(now + 30 * minute))),
             ),
         ] {
-            let stalled = reservation_parity_reconciling(&pending, progress.as_ref(), now)
+            let stalled = reservation_parity_reconciling(&pending, progress.as_ref(), None, now)
                 .expect_err(label)
                 .expect("pending releases get a reason");
             assert!(
@@ -5301,6 +5384,63 @@ mod tests {
                 "{label}: {stalled}"
             );
         }
+
+        // Reconcilable missing active artifacts follow the same convergence rule.
+        let pending_active = report(ReservationParityDriftSummary {
+            missing_archive_artifacts: 8,
+            active_pending_rows: 8,
+            ..Default::default()
+        });
+        let converging_active = reservation_parity_reconciling(
+            &pending_active,
+            None,
+            Some(&active_progress(now - minute, Some(now - 2 * minute))),
+            now,
+        )
+        .expect("an active reconciler that just repaired an artifact is converging");
+        assert!(
+            converging_active.contains("reconciling 8 active reservation(s)"),
+            "{converging_active}"
+        );
+        for (label, progress) in [
+            ("absent", None),
+            (
+                "stale pass",
+                Some(active_progress(now - 11 * minute, Some(now - 11 * minute))),
+            ),
+            (
+                "no recent repair",
+                Some(active_progress(now - minute, Some(now - 30 * minute))),
+            ),
+            ("never repaired", Some(active_progress(now - minute, None))),
+        ] {
+            let stalled =
+                reservation_parity_reconciling(&pending_active, None, progress.as_ref(), now)
+                    .expect_err(label)
+                    .expect("pending active repairs get a reason");
+            assert!(
+                stalled.contains("active reservation(s) missing archive artifact(s)")
+                    && stalled.contains("am doctor fix --only"),
+                "{label}: {stalled}"
+            );
+        }
+
+        // Unreconcilable missing active artifacts (e.g. expired or missing holder)
+        // are not owned by the active reconciler and fail without a reconciler note.
+        let unreconcilable_active = report(ReservationParityDriftSummary {
+            missing_archive_artifacts: 8,
+            active_pending_rows: 7,
+            ..Default::default()
+        });
+        assert_eq!(
+            reservation_parity_reconciling(
+                &unreconcilable_active,
+                None,
+                Some(&active_progress(now - minute, Some(now - minute))),
+                now,
+            ),
+            Err(None)
+        );
 
         // Drift the reconciler does not own fails without a reconciler note,
         // even while it is visibly repairing other rows.
@@ -5315,6 +5455,7 @@ mod tests {
             reservation_parity_reconciling(
                 &mixed,
                 Some(&progress(now - minute, Some(now - minute))),
+                None,
                 now
             ),
             Err(None)

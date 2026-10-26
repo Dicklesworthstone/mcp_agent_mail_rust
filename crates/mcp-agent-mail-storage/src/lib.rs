@@ -4157,6 +4157,62 @@ fn quarantine_startup_artifact_if_exists(
     }
 }
 
+static FILE_LOCK_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicU64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+std::thread_local! {
+    static ACTIVE_PROJECT_LOCK_GENERATIONS: std::cell::RefCell<Vec<(PathBuf, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn bump_file_lock_generation(lock_path: &Path) -> u64 {
+    let counter = {
+        let mut map = FILE_LOCK_GENERATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(map.entry(lock_path.to_path_buf()).or_default())
+    };
+    counter.fetch_add(1, Ordering::AcqRel).saturating_add(1)
+}
+
+fn active_project_lock_generation(project_root: &Path) -> Option<u64> {
+    ACTIVE_PROJECT_LOCK_GENERATIONS.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(root, _)| root == project_root)
+            .map(|(_, generation)| *generation)
+    })
+}
+
+struct ActiveProjectLockGenerationGuard {
+    pushed: bool,
+}
+
+impl ActiveProjectLockGenerationGuard {
+    fn new(project_root: &Path, generation: Option<u64>) -> Self {
+        let Some(generation) = generation else {
+            return Self { pushed: false };
+        };
+        let root = project_root.to_path_buf();
+        ACTIVE_PROJECT_LOCK_GENERATIONS.with(|stack| {
+            stack.borrow_mut().push((root, generation));
+        });
+        Self { pushed: true }
+    }
+}
+
+impl Drop for ActiveProjectLockGenerationGuard {
+    fn drop(&mut self) {
+        if self.pushed {
+            ACTIVE_PROJECT_LOCK_GENERATIONS.with(|stack| {
+                let _ = stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
 /// Per-project advisory file lock with stale detection.
 ///
 /// Mirrors the Python `AsyncFileLock` semantics:
@@ -4171,6 +4227,8 @@ pub struct FileLock {
     stale_timeout: Duration,
     max_retries: usize,
     held: bool,
+    mutates_message_tree: bool,
+    acquired_generation: Option<u64>,
     /// Retained file handle that holds the OS-level flock.
     /// Must live as long as the lock is held; dropping releases the flock.
     lock_file: Option<fs::File>,
@@ -4193,8 +4251,19 @@ impl FileLock {
             stale_timeout: Duration::from_secs(180),
             max_retries: 5,
             held: false,
+            mutates_message_tree: true,
+            acquired_generation: None,
             lock_file: None,
         }
+    }
+
+    /// Mark this lock acquisition as not mutating the project's `messages/` tree
+    /// (e.g. reservation or agent-profile writes), preserving single-writer
+    /// canonical-ID cache continuity across non-message project lock holds.
+    #[must_use]
+    const fn without_message_tree_mutation(mut self) -> Self {
+        self.mutates_message_tree = false;
+        self
     }
 
     /// Configure timeout.
@@ -4301,6 +4370,9 @@ impl FileLock {
 
                 // Lock acquired - retain file handle to hold the OS-level flock
                 self.write_metadata()?;
+                if self.mutates_message_tree {
+                    self.acquired_generation = Some(bump_file_lock_generation(&self.path));
+                }
                 self.lock_file = Some(file);
                 self.held = true;
                 return Ok(());
@@ -4519,10 +4591,15 @@ pub fn with_project_lock<F, T>(archive: &ProjectArchive, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
-    with_project_lock_inner(archive, true, f)
+    with_project_lock_inner(archive, true, true, f)
 }
 
-fn with_project_lock_inner<F, T>(archive: &ProjectArchive, create_parent: bool, f: F) -> Result<T>
+fn with_project_lock_inner<F, T>(
+    archive: &ProjectArchive,
+    create_parent: bool,
+    mutates_message_tree: bool,
+    f: F,
+) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
@@ -4533,6 +4610,9 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let mut lock = FileLock::new(project_root.join(".archive.lock"));
+    if !mutates_message_tree {
+        lock = lock.without_message_tree_mutation();
+    }
     let lock_start = std::time::Instant::now();
     if create_parent {
         lock.acquire()?;
@@ -4543,7 +4623,9 @@ where
         .storage
         .archive_lock_wait_us
         .record(lock_start.elapsed().as_micros() as u64);
+    let _gen_guard = ActiveProjectLockGenerationGuard::new(&project_root, lock.acquired_generation);
     let result = f();
+    drop(_gen_guard);
     lock.release()?;
     result
 }
@@ -8796,7 +8878,7 @@ pub fn write_agent_profile_with_config(
     // as lifecycle reconciliation. The publication fence precedes the project
     // lock, matching every other archive writer's lock order.
     let _mutation = ArchiveMutationGuard::begin_at(repo_root);
-    let rel = with_project_lock(archive, || {
+    let rel = with_project_lock_inner(archive, true, false, || {
         let project_root = archive_project_root_checked(archive)?;
         let profile_dir = project_root.join("agents").join(name);
         ensure_dir(&profile_dir)?;
@@ -9027,7 +9109,8 @@ fn publish_reservation_writes(
     };
     let mut lock = FileLock::new(root.join(".archive.lock"))
         .with_timeout(Duration::ZERO)
-        .with_max_retries(0);
+        .with_max_retries(0)
+        .without_message_tree_mutation();
     lock.acquire()?;
     validate_reservation_publications(checks)?;
     let result = staged.publish();
@@ -9420,18 +9503,43 @@ const fn message_file_stamp(_metadata: &fs::Metadata) -> Option<MessageFileStamp
 }
 
 /// Front-matter ids of one project's canonical message files, parsed once and
-/// reused while a file's stamp is unchanged.
+/// reused while a file's stamp is unchanged, plus a single-writer reverse index
+/// (`by_id`) and directory/recent-file stamps (br-dgut7, br-kp1in.47).
 ///
-/// Every canonical write checks that no other file claims its message id, and
-/// parsing every file for that made each write O(messages in the project):
-/// thousands of opens per message in large live projects (br-dgut7). The walk
-/// still lists and stats every file, but only new or changed files are parsed.
-/// An entry is trusted only when the file last changed [`RACY_STAMP_WINDOW`]
-/// before it was parsed; otherwise a rewrite inside one filesystem timestamp
-/// tick could keep the stamp while changing the id (git's racily-clean rule).
+/// The mailbox owner is the sole legitimate archive writer under `.archive.lock`.
+/// Once an initial full walk has populated `files`, `by_id`, and `dir_stamps`,
+/// subsequent batches from this process update the cache on publication and
+/// verify in O(batch) metadata calls (with 0 `read_dir` calls) that lock
+/// continuity, `messages_root`, target shard directories, recent files, target
+/// canonical paths, and any candidate colliding paths are unchanged. A full walk
+/// revalidates at startup, on untracked lock acquisition, every
+/// [`CANONICAL_ID_INDEX_REVALIDATE_INTERVAL`], or on any stamp mismatch.
 #[derive(Debug, Default)]
 struct CanonicalIdCache {
     files: HashMap<PathBuf, CanonicalIdCacheEntry>,
+    by_id: HashMap<i64, BTreeSet<PathBuf>>,
+    dir_stamps: HashMap<PathBuf, MessageFileStamp>,
+    recent_files: VecDeque<PathBuf>,
+    last_full_walk_at: Option<Instant>,
+    expected_next_lock_generation: Option<u64>,
+}
+
+const CANONICAL_ID_INDEX_REVALIDATE_INTERVAL: Duration = Duration::from_secs(300);
+const CANONICAL_ID_RECENT_WINDOW: usize = 4;
+
+impl CanonicalIdCache {
+    fn invalidate(&mut self) {
+        self.last_full_walk_at = None;
+        self.expected_next_lock_generation = None;
+    }
+
+    fn push_recent_file(&mut self, path: PathBuf) {
+        self.recent_files.retain(|existing| existing != &path);
+        self.recent_files.push_back(path);
+        while self.recent_files.len() > CANONICAL_ID_RECENT_WINDOW {
+            let _ = self.recent_files.pop_front();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9453,6 +9561,160 @@ const RACY_STAMP_WINDOW: Duration = Duration::from_secs(2);
 
 static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalIdCache>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+std::thread_local! {
+    static CANONICAL_ID_CHECK_FS_COUNTS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+fn canonical_id_read_dir(path: &Path) -> std::io::Result<fs::ReadDir> {
+    #[cfg(test)]
+    CANONICAL_ID_CHECK_FS_COUNTS.with(|counts| {
+        let (read_dirs, metadatas) = counts.get();
+        counts.set((read_dirs.saturating_add(1), metadatas));
+    });
+    fs::read_dir(path)
+}
+
+fn canonical_id_symlink_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    CANONICAL_ID_CHECK_FS_COUNTS.with(|counts| {
+        let (read_dirs, metadatas) = counts.get();
+        counts.set((read_dirs, metadatas.saturating_add(1)));
+    });
+    fs::symlink_metadata(path)
+}
+
+#[cfg(test)]
+fn reset_canonical_id_check_fs_counts() {
+    CANONICAL_ID_CHECK_FS_COUNTS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(test)]
+fn canonical_id_check_fs_counts() -> (usize, usize) {
+    CANONICAL_ID_CHECK_FS_COUNTS.with(std::cell::Cell::get)
+}
+
+fn canonical_id_cache_for(messages_root: &Path) -> Arc<Mutex<CanonicalIdCache>> {
+    let mut caches = CANONICAL_ID_CACHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(caches.entry(messages_root.to_path_buf()).or_default())
+}
+
+fn current_path_stamp(path: &Path) -> Option<MessageFileStamp> {
+    fs::symlink_metadata(path)
+        .ok()
+        .and_then(|meta| message_file_stamp(&meta))
+}
+
+fn advance_canonical_id_cache_lock_generation(messages_root: &Path, current_lock_gen: u64) {
+    let cache = canonical_id_cache_for(messages_root);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.expected_next_lock_generation == Some(current_lock_gen) {
+        cache.expected_next_lock_generation = Some(current_lock_gen.saturating_add(1));
+    }
+}
+
+fn invalidate_canonical_id_cache_for_archive(archive: &ProjectArchive) {
+    if let Ok(project_root) = archive_project_root_checked(archive) {
+        let cache = canonical_id_cache_for(&project_root.join("messages"));
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate();
+    }
+}
+
+fn record_published_canonical_messages(
+    archive: &ProjectArchive,
+    published_canonicals: &[(&Path, Option<i64>)],
+) {
+    let Ok(project_root) = archive_project_root_checked(archive) else {
+        return;
+    };
+    let messages_root = project_root.join("messages");
+    let cache = canonical_id_cache_for(&messages_root);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.last_full_walk_at.is_none() {
+        return;
+    }
+
+    let parsed_at_ns = unix_time_ns(SystemTime::now());
+    let mut touched_dirs = BTreeSet::new();
+    touched_dirs.insert(messages_root);
+
+    for &(canonical_path, message_id) in published_canonicals {
+        let Ok(meta) = fs::symlink_metadata(canonical_path) else {
+            cache.invalidate();
+            return;
+        };
+        if !meta.file_type().is_file() {
+            cache.invalidate();
+            return;
+        }
+        let Some(stamp) = message_file_stamp(&meta) else {
+            cache.invalidate();
+            return;
+        };
+        let owned_path = canonical_path.to_path_buf();
+        if let Some(prev) = cache.files.insert(
+            owned_path.clone(),
+            CanonicalIdCacheEntry {
+                stamp,
+                parsed_at_ns,
+                id: message_id,
+            },
+        ) && let Some(prev_id) = prev.id
+            && Some(prev_id) != message_id
+            && let Some(paths) = cache.by_id.get_mut(&prev_id)
+        {
+            paths.remove(canonical_path);
+            if paths.is_empty() {
+                cache.by_id.remove(&prev_id);
+            }
+        }
+        if let Some(id) = message_id {
+            cache
+                .by_id
+                .entry(id)
+                .or_default()
+                .insert(owned_path.clone());
+        }
+        cache.push_recent_file(owned_path);
+
+        if let Some(month_dir) = canonical_path.parent() {
+            touched_dirs.insert(month_dir.to_path_buf());
+            if let Some(year_dir) = month_dir.parent() {
+                touched_dirs.insert(year_dir.to_path_buf());
+            }
+        }
+    }
+
+    for dir_path in touched_dirs {
+        let Ok(meta) = fs::symlink_metadata(&dir_path) else {
+            cache.invalidate();
+            return;
+        };
+        if !meta.file_type().is_dir() {
+            cache.invalidate();
+            return;
+        }
+        let Some(stamp) = message_file_stamp(&meta) else {
+            cache.invalidate();
+            return;
+        };
+        cache.dir_stamps.insert(dir_path, stamp);
+    }
+
+    cache.expected_next_lock_generation =
+        active_project_lock_generation(&project_root).map(|g| g.saturating_add(1));
+}
 
 fn unix_time_ns(time: SystemTime) -> i128 {
     time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
@@ -9485,8 +9747,17 @@ fn collect_canonical_message_id_index_with_window(
             messages_root.display()
         )));
     }
-    match fs::symlink_metadata(messages_root) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
+    let active_lock_gen = messages_root
+        .parent()
+        .and_then(active_project_lock_generation);
+    let cache = canonical_id_cache_for(messages_root);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.invalidate();
+
+    let root_stamp = match canonical_id_symlink_metadata(messages_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => message_file_stamp(&metadata),
         Ok(_) => {
             return Err(StorageError::InvalidPath(format!(
                 "canonical message root is not a directory: {}",
@@ -9495,22 +9766,24 @@ fn collect_canonical_message_id_index_with_window(
         }
         // A newly initialized project has no message namespace yet.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cache.files.clear();
+            cache.by_id.clear();
+            cache.dir_stamps.clear();
+            cache.recent_files.clear();
+            cache.last_full_walk_at = Some(Instant::now());
+            cache.expected_next_lock_generation = active_lock_gen.map(|g| g.saturating_add(1));
             return Ok((index, parsed));
         }
         Err(error) => return Err(error.into()),
-    }
-    let year_entries = fs::read_dir(messages_root)?;
-    let cache = {
-        let mut caches = CANONICAL_ID_CACHES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(caches.entry(messages_root.to_path_buf()).or_default())
     };
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let year_entries = canonical_id_read_dir(messages_root)?;
     let racy_window_ns = i128::try_from(racy_window.as_nanos()).unwrap_or(i128::MAX);
-    let mut seen = HashSet::with_capacity(cache.files.len());
+    let mut seen = BTreeSet::new();
+    let mut new_by_id: HashMap<i64, BTreeSet<PathBuf>> = HashMap::new();
+    let mut new_dir_stamps = HashMap::new();
+    if let Some(root_stamp) = root_stamp {
+        new_dir_stamps.insert(messages_root.to_path_buf(), root_stamp);
+    }
     for year_entry in year_entries {
         let year_entry = year_entry?;
         let year_path = year_entry.path();
@@ -9526,8 +9799,14 @@ fn collect_canonical_message_id_index_with_window(
                 year_path.display()
             )));
         }
+        if let Some(year_stamp) = canonical_id_symlink_metadata(&year_path)
+            .ok()
+            .and_then(|meta| message_file_stamp(&meta))
+        {
+            new_dir_stamps.insert(year_path.clone(), year_stamp);
+        }
 
-        for month_entry in fs::read_dir(&year_path)? {
+        for month_entry in canonical_id_read_dir(&year_path)? {
             let month_entry = month_entry?;
             let month_path = month_entry.path();
             let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
@@ -9542,14 +9821,20 @@ fn collect_canonical_message_id_index_with_window(
                     month_path.display()
                 )));
             }
+            if let Some(month_stamp) = canonical_id_symlink_metadata(&month_path)
+                .ok()
+                .and_then(|meta| message_file_stamp(&meta))
+            {
+                new_dir_stamps.insert(month_path.clone(), month_stamp);
+            }
 
-            for file_entry in fs::read_dir(&month_path)? {
+            for file_entry in canonical_id_read_dir(&month_path)? {
                 let file_entry = file_entry?;
                 let file_path = file_entry.path();
                 if file_path.extension().is_none_or(|ext| ext != "md") {
                     continue;
                 }
-                let metadata = fs::symlink_metadata(&file_path)?;
+                let metadata = canonical_id_symlink_metadata(&file_path)?;
                 if !metadata.file_type().is_file() {
                     return Err(StorageError::InvalidPath(format!(
                         "canonical message is not a regular file: {}",
@@ -9578,7 +9863,7 @@ fn collect_canonical_message_id_index_with_window(
                             return Err(error);
                         }
                     };
-                    let after = fs::symlink_metadata(&file_path)?;
+                    let after = canonical_id_symlink_metadata(&file_path)?;
                     if !after.file_type().is_file() || message_file_stamp(&after) != stamp {
                         cache.files.remove(&file_path);
                         return Err(StorageError::LockContention {
@@ -9606,6 +9891,10 @@ fn collect_canonical_message_id_index_with_window(
                 let Some(existing_id) = existing_id else {
                     continue;
                 };
+                new_by_id
+                    .entry(existing_id)
+                    .or_default()
+                    .insert(file_path.clone());
                 if wanted_ids.contains(&existing_id) {
                     index
                         .entry(existing_id)
@@ -9616,6 +9905,19 @@ fn collect_canonical_message_id_index_with_window(
         }
     }
     cache.files.retain(|path, _| seen.contains(path));
+    cache.by_id = new_by_id;
+    cache.dir_stamps = new_dir_stamps;
+    cache.recent_files.retain(|path| seen.contains(path));
+    for path in seen.iter().rev() {
+        if cache.recent_files.len() >= CANONICAL_ID_RECENT_WINDOW {
+            break;
+        }
+        if !cache.recent_files.contains(path) {
+            cache.recent_files.push_back(path.clone());
+        }
+    }
+    cache.last_full_walk_at = Some(Instant::now());
+    cache.expected_next_lock_generation = active_lock_gen.map(|g| g.saturating_add(1));
     Ok((index, parsed))
 }
 
@@ -9749,16 +10051,194 @@ fn reject_canonical_message_id_collision_from_index(
     )
 }
 
+fn try_collect_existing_batch_message_ids_fast(
+    archive: &ProjectArchive,
+    project_root: &Path,
+    messages_root: &Path,
+    entries: &[MessageBundleBatchEntry<'_>],
+    wanted_ids: &HashSet<i64>,
+) -> Result<Option<HashMap<i64, Vec<PathBuf>>>> {
+    let Some(current_lock_gen) = active_project_lock_generation(project_root) else {
+        return Ok(None);
+    };
+    let cache = canonical_id_cache_for(messages_root);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(last_walk) = cache.last_full_walk_at else {
+        return Ok(None);
+    };
+    if last_walk.elapsed() >= CANONICAL_ID_INDEX_REVALIDATE_INTERVAL {
+        return Ok(None);
+    }
+    if cache.expected_next_lock_generation != Some(current_lock_gen) {
+        return Ok(None);
+    }
+    if path_existing_prefix_has_symlink(messages_root)? {
+        return Err(StorageError::InvalidPath(format!(
+            "canonical message directory must not include symlinks: {}",
+            messages_root.display()
+        )));
+    }
+    match canonical_id_symlink_metadata(messages_root) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            let Some(root_stamp) = message_file_stamp(&meta) else {
+                return Ok(None);
+            };
+            if cache.dir_stamps.get(messages_root).copied() != Some(root_stamp) {
+                return Ok(None);
+            }
+        }
+        Ok(_) => {
+            return Err(StorageError::InvalidPath(format!(
+                "canonical message root is not a directory: {}",
+                messages_root.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if cache.dir_stamps.is_empty() && cache.files.is_empty() {
+                cache.expected_next_lock_generation = Some(current_lock_gen.saturating_add(1));
+                return Ok(Some(HashMap::new()));
+            }
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    let mut target_canonical_paths = Vec::with_capacity(entries.len());
+    let mut target_year_dirs = BTreeSet::new();
+    let mut target_month_dirs = BTreeSet::new();
+    for entry in entries {
+        let (paths, _, _) =
+            message_paths_for_bundle(archive, entry.message, entry.sender, entry.recipients)?;
+        if let Some(month_dir) = paths.canonical.parent() {
+            target_month_dirs.insert(month_dir.to_path_buf());
+            if let Some(year_dir) = month_dir.parent() {
+                target_year_dirs.insert(year_dir.to_path_buf());
+            }
+        }
+        target_canonical_paths.push(paths.canonical);
+    }
+    if let Some(last_recent) = cache.recent_files.back()
+        && let Some(month_dir) = last_recent.parent()
+    {
+        target_month_dirs.insert(month_dir.to_path_buf());
+        if let Some(year_dir) = month_dir.parent() {
+            target_year_dirs.insert(year_dir.to_path_buf());
+        }
+    }
+
+    for dir_path in target_year_dirs.iter().chain(target_month_dirs.iter()) {
+        match canonical_id_symlink_metadata(dir_path) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    return Ok(None);
+                }
+                let Some(stamp) = message_file_stamp(&meta) else {
+                    return Ok(None);
+                };
+                if cache.dir_stamps.get(dir_path).copied() != Some(stamp) {
+                    return Ok(None);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if cache.dir_stamps.contains_key(dir_path) {
+                    return Ok(None);
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    for recent_path in &cache.recent_files {
+        let Some(cached_entry) = cache.files.get(recent_path) else {
+            return Ok(None);
+        };
+        let Ok(meta) = canonical_id_symlink_metadata(recent_path) else {
+            return Ok(None);
+        };
+        if !meta.file_type().is_file() || message_file_stamp(&meta) != Some(cached_entry.stamp) {
+            return Ok(None);
+        }
+    }
+
+    for target_path in &target_canonical_paths {
+        match canonical_id_symlink_metadata(target_path) {
+            Ok(meta) => {
+                if !meta.file_type().is_file() {
+                    return Ok(None);
+                }
+                let Some(stamp) = message_file_stamp(&meta) else {
+                    return Ok(None);
+                };
+                let Some(cached_entry) = cache.files.get(target_path) else {
+                    return Ok(None);
+                };
+                if cached_entry.stamp != stamp {
+                    return Ok(None);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if cache.files.contains_key(target_path) {
+                    return Ok(None);
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let mut index = HashMap::new();
+    for &wanted_id in wanted_ids {
+        if let Some(paths) = cache.by_id.get(&wanted_id) {
+            let mut matched = Vec::with_capacity(paths.len());
+            for existing_path in paths {
+                let Some(cached_entry) = cache.files.get(existing_path) else {
+                    return Ok(None);
+                };
+                let Ok(meta) = canonical_id_symlink_metadata(existing_path) else {
+                    return Ok(None);
+                };
+                if !meta.file_type().is_file()
+                    || message_file_stamp(&meta) != Some(cached_entry.stamp)
+                {
+                    return Ok(None);
+                }
+                matched.push(existing_path.clone());
+            }
+            if !matched.is_empty() {
+                index.insert(wanted_id, matched);
+            }
+        }
+    }
+
+    cache.expected_next_lock_generation = Some(current_lock_gen.saturating_add(1));
+    Ok(Some(index))
+}
+
 fn collect_existing_batch_message_ids(
     archive: &ProjectArchive,
     entries: &[MessageBundleBatchEntry<'_>],
 ) -> Result<HashMap<i64, Vec<PathBuf>>> {
+    let project_root = archive_project_root_checked(archive)?;
+    let messages_root = project_root.join("messages");
     let wanted_ids = batch_message_ids(entries);
     if wanted_ids.is_empty() {
+        if let Some(current_lock_gen) = active_project_lock_generation(&project_root) {
+            advance_canonical_id_cache_lock_generation(&messages_root, current_lock_gen);
+        }
         return Ok(HashMap::new());
     }
 
-    let messages_root = archive_project_root_checked(archive)?.join("messages");
+    if let Some(fast_index) = try_collect_existing_batch_message_ids_fast(
+        archive,
+        &project_root,
+        &messages_root,
+        entries,
+        &wanted_ids,
+    )? {
+        return Ok(fast_index);
+    }
+
     collect_canonical_message_id_index(&messages_root, &wanted_ids)
 }
 
@@ -9774,21 +10254,30 @@ std::thread_local! {
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+enum PreparedPublicationTry<P, T> {
+    Published(T),
+    Deferred {
+        prepared: P,
+        lock_generation: Option<u64>,
+        messages_root_stamp: Option<MessageFileStamp>,
+    },
+}
+
 /// Keep an immutable message's complete identity scan out of the global fence
-/// when possible, without reusing a proof after releasing its project locks.
+/// when possible, and reuse the prepared proof across fence contention when no
+/// message-affecting project lock or `messages/` directory change intervened.
 ///
-/// `prepare` is read-only and may run twice. Both existing project locks remain
-/// held from its observation through `publish`. Taking a blocking fence here
-/// would invert the established fence-before-project order, so this first
-/// attempt ONLY tries admission. Contention releases both project locks and
-/// discards the proof before the conservative fence-first path rescans.
-/// Nested callers already own the fence and use that established path too.
+/// `prepare` is read-only and may run twice when another message writer or
+/// repair lock acquires `.archive.lock` while waiting for the global fence.
+/// Nested callers already own the fence and use the established fence-first path.
 fn with_prepared_message_publication<P, T>(
     archive: &ProjectArchive,
     mut prepare: impl FnMut() -> Result<P>,
     mut publish: impl FnMut(P) -> Result<T>,
 ) -> Result<T> {
     let repo_root = archive_repo_root_checked(archive)?;
+    let project_root = archive_project_root_checked(archive)?;
+    let messages_root = project_root.join("messages");
     let mut publish = |prepared| {
         #[cfg(test)]
         if let Some(hook) =
@@ -9798,8 +10287,9 @@ fn with_prepared_message_publication<P, T>(
         }
         publish(prepared)
     };
+    let mut deferred_prepared: Option<(P, Option<u64>, Option<MessageFileStamp>)> = None;
     if ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get) == 0 {
-        let published = with_project_lock_inner(archive, false, || {
+        let outcome = with_project_lock_inner(archive, false, true, || {
             let prepared = prepare()?;
             #[cfg(test)]
             if let Some(hook) =
@@ -9809,13 +10299,26 @@ fn with_prepared_message_publication<P, T>(
             }
             let _mutation = match ArchiveMutationGuard::try_begin_repair(repo_root, || false) {
                 Ok(mutation) => mutation,
-                Err(StorageError::LockContention { .. }) => return Ok(None),
+                Err(StorageError::LockContention { .. }) => {
+                    return Ok(PreparedPublicationTry::Deferred {
+                        prepared,
+                        lock_generation: active_project_lock_generation(&project_root),
+                        messages_root_stamp: current_path_stamp(&messages_root),
+                    });
+                }
                 Err(error) => return Err(error),
             };
-            publish(prepared).map(Some)
+            publish(prepared).map(PreparedPublicationTry::Published)
         })?;
-        if let Some(result) = published {
-            return Ok(result);
+        match outcome {
+            PreparedPublicationTry::Published(result) => return Ok(result),
+            PreparedPublicationTry::Deferred {
+                prepared,
+                lock_generation,
+                messages_root_stamp,
+            } => {
+                deferred_prepared = Some((prepared, lock_generation, messages_root_stamp));
+            }
         }
         #[cfg(test)]
         if let Some(hook) =
@@ -9826,7 +10329,22 @@ fn with_prepared_message_publication<P, T>(
     }
 
     let _mutation = ArchiveMutationGuard::begin_at(repo_root);
-    with_project_lock(archive, || publish(prepare()?))
+    with_project_lock(archive, || {
+        let fallback_gen = active_project_lock_generation(&project_root);
+        let prepared = match deferred_prepared.take() {
+            Some((prepared, Some(try_gen), try_root_stamp))
+                if fallback_gen == Some(try_gen.saturating_add(1))
+                    && current_path_stamp(&messages_root) == try_root_stamp =>
+            {
+                if let Some(generation) = fallback_gen {
+                    advance_canonical_id_cache_lock_generation(&messages_root, generation);
+                }
+                prepared
+            }
+            _ => prepare()?,
+        };
+        publish(prepared)
+    })
 }
 
 fn reject_duplicate_message_ids_in_batch(entries: &[MessageBundleBatchEntry<'_>]) -> Result<()> {
@@ -9949,15 +10467,25 @@ fn append_message_bundle_files(
     let mut writes = StagedArchiveWrites::default();
     let mut targets = Vec::new();
     prepared.stage(&mut writes, &mut targets)?;
-    writes.publish_immutable_messages()?;
+    writes.publish_immutable_messages().inspect_err(|_| {
+        invalidate_canonical_id_cache_for_archive(archive);
+    })?;
     record_published_paths(archive, &targets, rel_paths)?;
-    finish_message_bundle(
+    let finish_res = finish_message_bundle(
         archive,
         entry,
         &prepared.paths.canonical,
         &prepared.timestamp_str,
         rel_paths,
-    )
+    );
+    record_published_canonical_messages(
+        archive,
+        &[(
+            prepared.paths.canonical.as_path(),
+            positive_message_id(entry.message),
+        )],
+    );
+    finish_res
 }
 
 /// One message's canonical, outbox and inbox copies, rendered and checked for
@@ -10267,9 +10795,11 @@ pub fn write_message_batch_bundle(
                     bundle.stage(&mut writes, &mut targets)?;
                     published.push((&bundle.paths.canonical, &bundle.timestamp_str));
                 }
-                writes.publish_immutable_messages()?;
+                writes.publish_immutable_messages().inspect_err(|_| {
+                    invalidate_canonical_id_cache_for_archive(archive);
+                })?;
                 record_published_paths(archive, &targets, &mut rel_paths)?;
-                entries
+                let finish_res = entries
                     .iter()
                     .zip(published)
                     .map(|(entry, (canonical, timestamp_str))| {
@@ -10281,7 +10811,19 @@ pub fn write_message_batch_bundle(
                             &mut rel_paths,
                         )
                     })
-                    .collect::<Result<Vec<_>>>()
+                    .collect::<Result<Vec<_>>>();
+                let published_canonicals: Vec<(&Path, Option<i64>)> = entries
+                    .iter()
+                    .zip(&bundles)
+                    .map(|(entry, bundle)| {
+                        (
+                            bundle.paths.canonical.as_path(),
+                            positive_message_id(entry.message),
+                        )
+                    })
+                    .collect();
+                record_published_canonical_messages(archive, &published_canonicals);
+                finish_res
             })();
             let commit_metas = match written {
                 Ok(metas) => metas,
@@ -16927,6 +17469,312 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed, 2);
+    }
+
+    #[test]
+    fn canonical_id_single_writer_index_refuses_duplicate_path_and_in_place_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj-single-writer").unwrap();
+        let recipients = vec!["RecipientAgent".to_string()];
+
+        for (id, day) in [(1_i64, "15"), (2, "16"), (3, "17")] {
+            let message = serde_json::json!({
+                "id": id,
+                "subject": format!("Message {id}"),
+                "created_ts": format!("2026-01-{day}T10:00:00Z"),
+                "project": "proj-single-writer",
+            });
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                &format!("body {id}"),
+                "SenderAgent",
+                &recipients,
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+
+        // 1. Duplicate canonical ID at a different path is refused in O(batch) without read_dir.
+        reset_canonical_id_check_fs_counts();
+        let duplicate = serde_json::json!({
+            "id": 2,
+            "subject": "Different path duplicate",
+            "created_ts": "2026-01-20T10:00:00Z",
+            "project": "proj-single-writer",
+        });
+        let dup_err = write_message_bundle(
+            &archive,
+            &config,
+            &duplicate,
+            "duplicate body",
+            "SenderAgent",
+            &recipients,
+            &[],
+            None,
+        )
+        .expect_err("duplicate canonical id at different path must be refused");
+        assert!(
+            dup_err
+                .to_string()
+                .contains("canonical message id 2 already exists"),
+            "unexpected error: {dup_err}"
+        );
+        let (dup_read_dirs, _) = canonical_id_check_fs_counts();
+        assert_eq!(
+            dup_read_dirs, 0,
+            "single-writer index must reject duplicate id without directory walks"
+        );
+
+        // 2. In-place rewrite of an existing canonical file to claim id 99 is detected and refused.
+        let msg2 = serde_json::json!({
+            "id": 2,
+            "subject": "Message 2",
+            "created_ts": "2026-01-16T10:00:00Z",
+            "project": "proj-single-writer",
+        });
+        let (msg2_paths, _, _) =
+            message_paths_for_bundle(&archive, &msg2, "SenderAgent", &recipients).unwrap();
+        let rewritten_frontmatter = serde_json::json!({
+            "id": 99,
+            "subject": "Message 2 rewritten in place to claim id 99",
+            "created_ts": "2026-01-16T10:00:00Z",
+            "project": "proj-single-writer",
+        });
+        fs::write(
+            &msg2_paths.canonical,
+            render_message_bundle_content(&rewritten_frontmatter, "rewritten body in place")
+                .unwrap(),
+        )
+        .unwrap();
+
+        let claim_99 = serde_json::json!({
+            "id": 99,
+            "subject": "Colliding with in-place rewrite",
+            "created_ts": "2026-01-21T10:00:00Z",
+            "project": "proj-single-writer",
+        });
+        let rewrite_err = write_message_bundle(
+            &archive,
+            &config,
+            &claim_99,
+            "new body for 99",
+            "SenderAgent",
+            &recipients,
+            &[],
+            None,
+        )
+        .expect_err("in-place rewrite claiming id 99 must be detected and refused");
+        assert!(
+            rewrite_err
+                .to_string()
+                .contains("canonical message id 99 already exists"),
+            "unexpected error: {rewrite_err}"
+        );
+    }
+
+    #[test]
+    fn canonical_id_check_per_batch_fs_work_is_bounded_at_100_vs_10k_files_and_full_walk_fails_bound()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let recipients = vec!["RecipientAgent".to_string()];
+
+        let populate_history = |slug: &str, count: usize| -> ProjectArchive {
+            let archive = ensure_archive(&config, slug).unwrap();
+            let messages_root = archive.root.join("messages");
+            for month_idx in 1..=10 {
+                fs::create_dir_all(messages_root.join("2025").join(format!("{month_idx:02}")))
+                    .unwrap();
+            }
+            for i in 1..=count {
+                let month_idx = ((i - 1) % 10) + 1;
+                let path = messages_root
+                    .join("2025")
+                    .join(format!("{month_idx:02}"))
+                    .join(format!("2025-{month_idx:02}-01T00-00-00Z__hist__{i}.md"));
+                let content = format!("---json\n{{\"id\": {i}}}\n---\n\nhistory {i}");
+                fs::write(path, content).unwrap();
+            }
+            // Warm the project's single-writer index with one initial publication.
+            let warmup = serde_json::json!({
+                "id": 100_000,
+                "subject": "Warmup",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": slug,
+            });
+            write_message_bundle(
+                &archive,
+                &config,
+                &warmup,
+                "warmup body",
+                "SenderAgent",
+                &recipients,
+                &[],
+                None,
+            )
+            .unwrap();
+            archive
+        };
+
+        let archive_100 = populate_history("proj-100", 100);
+        let archive_10k = populate_history("proj-10k", 10_000);
+
+        let publish_measured = |archive: &ProjectArchive, slug: &str, id: i64| -> (usize, usize) {
+            let message = serde_json::json!({
+                "id": id,
+                "subject": format!("Measured {id}"),
+                "created_ts": "2026-01-16T10:00:00Z",
+                "project": slug,
+            });
+            let entry = MessageBundleBatchEntry {
+                message: &message,
+                body_md: "measured batch body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            };
+            reset_canonical_id_check_fs_counts();
+            write_message_batch_bundle(archive, &config, std::slice::from_ref(&entry), None)
+                .unwrap();
+            canonical_id_check_fs_counts()
+        };
+
+        let (read_dirs_100, metadatas_100) = publish_measured(&archive_100, "proj-100", 100_001);
+        let (read_dirs_10k, metadatas_10k) = publish_measured(&archive_10k, "proj-10k", 100_001);
+
+        assert_eq!(
+            read_dirs_100, 0,
+            "100-file project must do 0 read_dir calls"
+        );
+        assert_eq!(
+            read_dirs_10k, 0,
+            "10k-file project must do 0 read_dir calls"
+        );
+        assert_eq!(
+            metadatas_100, metadatas_10k,
+            "per-batch metadata count must be identical at 100 vs 10k existing files"
+        );
+        assert!(
+            metadatas_10k <= 16,
+            "per-batch metadata calls must be bounded by a small constant, got {metadatas_10k}"
+        );
+
+        // Colliding against an arbitrary historical id (5_432) in the 10k-file project
+        // is also refused in O(batch) without walking the directory tree.
+        reset_canonical_id_check_fs_counts();
+        let colliding = serde_json::json!({
+            "id": 5_432,
+            "subject": "Historical duplicate",
+            "created_ts": "2026-01-17T10:00:00Z",
+            "project": "proj-10k",
+        });
+        let colliding_entry = MessageBundleBatchEntry {
+            message: &colliding,
+            body_md: "colliding body",
+            sender: "SenderAgent",
+            recipients: &recipients,
+            extra_paths: &[],
+        };
+        let err = write_message_batch_bundle(
+            &archive_10k,
+            &config,
+            std::slice::from_ref(&colliding_entry),
+            None,
+        )
+        .expect_err("collision with historical id 5432 must be refused");
+        assert!(
+            err.to_string()
+                .contains("canonical message id 5432 already exists"),
+            "unexpected error: {err}"
+        );
+        let (collision_read_dirs, collision_metadatas) = canonical_id_check_fs_counts();
+        assert_eq!(collision_read_dirs, 0);
+        assert!(collision_metadatas <= 16);
+
+        // Negative proof: the uncached full walk (`collect_canonical_message_id_index_with_window`)
+        // scales with project history and fails the small-constant bound by ~9,900 metadata calls.
+        let wanted = HashSet::from([100_002_i64]);
+        reset_canonical_id_check_fs_counts();
+        let _ = collect_canonical_message_id_index_with_window(
+            &archive_100.root.join("messages"),
+            &wanted,
+            RACY_STAMP_WINDOW,
+        )
+        .unwrap();
+        let (walk_read_dirs_100, walk_metadatas_100) = canonical_id_check_fs_counts();
+
+        reset_canonical_id_check_fs_counts();
+        let _ = collect_canonical_message_id_index_with_window(
+            &archive_10k.root.join("messages"),
+            &wanted,
+            RACY_STAMP_WINDOW,
+        )
+        .unwrap();
+        let (walk_read_dirs_10k, walk_metadatas_10k) = canonical_id_check_fs_counts();
+
+        assert!(walk_read_dirs_100 >= 12 && walk_read_dirs_10k >= 12);
+        assert!(
+            walk_metadatas_10k.saturating_sub(walk_metadatas_100) >= 9_900,
+            "full walk must fail the O(batch) bound: 100={walk_metadatas_100}, 10k={walk_metadatas_10k}"
+        );
+    }
+
+    #[test]
+    fn message_publication_fallback_reuses_prepared_proof_when_project_lock_uncontended() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "fallback-proof-reuse").unwrap();
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let prepare_calls_clone = Arc::clone(&prepare_calls);
+
+        let (deferred_tx, deferred_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+        let writer_archive = archive.clone();
+
+        let writer = std::thread::spawn(move || {
+            MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    deferred_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+            });
+            with_prepared_message_publication(
+                &writer_archive,
+                || {
+                    prepare_calls_clone.fetch_add(1, Ordering::AcqRel);
+                    Ok(42_u64)
+                },
+                |prepared| {
+                    assert_eq!(prepared, 42);
+                    Ok(())
+                },
+            )
+        });
+
+        deferred_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // While deferred on the global fence, a non-message project lock
+        // (such as a reservation lock) does not invalidate the message proof.
+        {
+            let mut non_msg_lock = FileLock::new(archive.root.join(".archive.lock"))
+                .with_timeout(Duration::ZERO)
+                .with_max_retries(0)
+                .without_message_tree_mutation();
+            non_msg_lock.acquire().unwrap();
+            non_msg_lock.release().unwrap();
+        }
+        drop(fence);
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            prepare_calls.load(Ordering::Acquire),
+            1,
+            "fallback must reuse the try-path proof when no message-affecting lock intervened"
+        );
     }
 
     #[test]

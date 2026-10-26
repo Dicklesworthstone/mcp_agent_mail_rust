@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::env;
 use std::fmt::Write as _;
 use std::io::{self, Read};

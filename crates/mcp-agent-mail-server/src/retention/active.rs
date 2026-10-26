@@ -21,7 +21,7 @@ use asupersync::Cx;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use mcp_agent_mail_storage::recovery::active_reservations::{
-    ActiveReservationCursor, ActiveReservationReport,
+    self, ActiveReservationCursor, ActiveReservationProgress, ActiveReservationReport,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -184,6 +184,8 @@ fn run_with(
 ) {
     let mut pool: Option<DbPool> = None;
     let mut cursor = ActiveReservationCursor::default();
+    let mut last_repair_us: Option<i64> = None;
+    let mut progress_warned = false;
     if wait(CATCH_UP_INTERVAL) {
         return;
     }
@@ -225,6 +227,29 @@ fn run_with(
                                     retry_len = report.retry_len, more = report.more,
                                     interrupted = report.interrupted,
                                     "create-only active reservation repair pass completed");
+                            }
+                            if !report.interrupted {
+                                let pass_us = mcp_agent_mail_db::now_micros();
+                                if report.repaired > 0 {
+                                    last_repair_us = Some(pass_us);
+                                }
+                                let progress = ActiveReservationProgress {
+                                    pid: std::process::id(),
+                                    pass_us,
+                                    last_repair_us,
+                                };
+                                match active_reservations::record_progress(
+                                    &config.storage_root,
+                                    &progress,
+                                ) {
+                                    Ok(()) => progress_warned = false,
+                                    Err(error) if !progress_warned => {
+                                        progress_warned = true;
+                                        tracing::warn!(target: "maintenance", event = "active_reservation_reconcile_progress_unrecorded",
+                                            error = %error, "could not record active reservation reconciliation progress for doctor health");
+                                    }
+                                    Err(_) => {}
+                                }
                             }
                         },
                         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),

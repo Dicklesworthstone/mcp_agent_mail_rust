@@ -61,7 +61,9 @@ pub const IDEMPOTENCY_RETENTION_ENV: &str = "AM_IDEMPOTENCY_RETENTION_SECS";
 /// fall back to [`DEFAULT_IDEMPOTENCY_RETENTION_SECS`].
 #[must_use]
 pub fn idempotency_retention_secs() -> i64 {
-    parse_retention_secs(std::env::var(IDEMPOTENCY_RETENTION_ENV).ok().as_deref())
+    parse_retention_secs(
+        mcp_agent_mail_core::config::env_value(IDEMPOTENCY_RETENTION_ENV).as_deref(),
+    )
 }
 
 /// Pure parse of a retention override value (the testable core, so unit tests

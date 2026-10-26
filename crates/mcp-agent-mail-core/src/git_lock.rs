@@ -412,8 +412,7 @@ impl Drop for RepoFlock {
 }
 
 pub(crate) fn flock_timeout_secs() -> u64 {
-    std::env::var("AM_GIT_FLOCK_TIMEOUT_SECS")
-        .ok()
+    crate::config::env_value("AM_GIT_FLOCK_TIMEOUT_SECS")
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_FLOCK_TIMEOUT_SECS)
 }

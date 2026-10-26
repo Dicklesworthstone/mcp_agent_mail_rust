@@ -12,7 +12,7 @@ mod retry;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -21,7 +21,7 @@ use fastmcp_core::block_on;
 use git2::{ObjectType, Oid, Repository};
 use mcp_agent_mail_core::{Config, reservation_artifact::reservation_artifact_filename};
 use mcp_agent_mail_db::{DbConn, DbError, DbPool, corruption_circuit_breaker};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::agent_reconcile::{committed_artifact, head_tree, read_artifact};
@@ -32,6 +32,173 @@ const WRITES_PER_PASS: usize = 4;
 const SOURCE_BYTES: i64 = 32 * 1024;
 const ARTIFACT_BYTES: usize = 128 * 1024;
 const GRANT_GRACE_US: i64 = 30 * 1_000_000;
+const PROGRESS_FILE: &str = "active-reservation-reconcile.json";
+const MAX_PROGRESS_BYTES: u64 = 4096;
+/// How far in the future a recorded progress time may lie and still count:
+/// beyond it the clock moved backwards, and a future time must not read as
+/// recent progress (or survive the max-merge) indefinitely.
+pub const PROGRESS_CLOCK_SKEW_US: i64 = 60 * 1_000_000;
+
+/// What `am doctor health` needs to tell a converging active-reservation
+/// reconciler from a stuck or absent one: when the last pass completed and
+/// when one last republished a missing active artifact (br-kp1in.19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveReservationProgress {
+    pub pid: u32,
+    /// Completion of the last pass, microseconds since the epoch.
+    pub pass_us: i64,
+    /// The last pass, by any owner of this mailbox, that republished at least
+    /// one missing active artifact.
+    pub last_repair_us: Option<i64>,
+}
+
+#[must_use]
+pub fn progress_path(storage_root: &Path) -> PathBuf {
+    storage_root.join("doctor").join(PROGRESS_FILE)
+}
+
+/// Replace the progress record atomically. When several processes own
+/// reconcilers for one mailbox, the latest repair any of them recorded is
+/// kept, so one idle owner cannot hide another's progress. A `doctor` path
+/// that is not a plain directory is refused, never followed.
+pub fn record_progress(
+    storage_root: &Path,
+    progress: &ActiveReservationProgress,
+) -> std::io::Result<()> {
+    let dir = storage_root.join("doctor");
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "{} is not a plain directory",
+                dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&dir)?,
+        Err(error) => return Err(error),
+    }
+    let mut merged = progress.clone();
+    if let Some(previous) = read_progress(storage_root) {
+        let previous_repair = previous
+            .last_repair_us
+            .filter(|ts_us| *ts_us <= progress.pass_us.saturating_add(PROGRESS_CLOCK_SKEW_US));
+        merged.last_repair_us = merged.last_repair_us.max(previous_repair);
+    }
+    let body = serde_json::to_vec(&merged).map_err(std::io::Error::other)?;
+    let tmp = dir.join(format!(".{PROGRESS_FILE}.{}.tmp", std::process::id()));
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, progress_path(storage_root))
+}
+
+/// The last recorded progress; `None` when absent, oversized, or unreadable.
+#[must_use]
+pub fn read_progress(storage_root: &Path) -> Option<ActiveReservationProgress> {
+    let path = progress_path(storage_root);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PROGRESS_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// Read-only candidate view used by `reservation_parity` to check whether a
+/// missing active artifact row satisfies the exact source and destination
+/// invariants required by [`reconcile_active_reservations`] (br-kp1in.19).
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveReservationCandidate<'a> {
+    pub id: i64,
+    pub project_id: i64,
+    pub agent_id: i64,
+    pub slug: &'a str,
+    pub human_key: &'a str,
+    pub resolved_agent_name: Option<&'a str>,
+    pub path_pattern: &'a str,
+    pub reason: &'a str,
+    pub exclusive: i64,
+    pub created_ts: i64,
+    pub expires_ts: i64,
+    pub hot_release_ts: Option<i64>,
+    pub ledger_release_ts: Option<i64>,
+    pub live_generation: Option<&'a str>,
+}
+
+/// Whether [`reconcile_active_reservations`] can reconstruct the missing
+/// generation-stamped artifact for `candidate` once its 30s grace window
+/// elapses. Rows with missing generation authority, missing holder agents,
+/// invalid archive components/patterns, expired leases, or an occupied/symlinked
+/// destination are permanently deferred by the reconciler and must not be
+/// counted as converging.
+#[must_use]
+pub fn is_reconcilable_missing_active_reservation(
+    candidate: &ActiveReservationCandidate<'_>,
+    storage_root: &Path,
+    now_us: i64,
+) -> bool {
+    let Some(generation) = candidate.live_generation else {
+        return false;
+    };
+    if generation.is_empty()
+        || generation.len() > 128
+        || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let Some(agent_name) = candidate.resolved_agent_name else {
+        return false;
+    };
+    if candidate.hot_release_ts.is_some_and(|ts| ts > 0) || candidate.ledger_release_ts.is_some() {
+        return false;
+    }
+    if candidate.id <= 0 || candidate.project_id <= 0 || candidate.agent_id <= 0 {
+        return false;
+    }
+    if crate::validate_archive_component("project slug", candidate.slug).is_err()
+        || crate::validate_archive_component("agent name", agent_name).is_err()
+    {
+        return false;
+    }
+    let pattern = candidate.path_pattern.trim();
+    let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
+    if !Path::new(candidate.human_key).is_absolute()
+        || pattern.is_empty()
+        || candidate.path_pattern.contains("..")
+        || Path::new(pattern).is_absolute()
+        || !compiled.is_matchable()
+        || !matches!(candidate.exclusive, 0 | 1)
+        || candidate.created_ts <= 0
+        || candidate.expires_ts <= candidate.created_ts
+        || candidate.expires_ts <= now_us
+        || [candidate.created_ts, candidate.expires_ts]
+            .into_iter()
+            .any(|ts| chrono::DateTime::from_timestamp_micros(ts).is_none())
+    {
+        return false;
+    }
+    let source_bytes = candidate
+        .path_pattern
+        .len()
+        .saturating_add(candidate.reason.len())
+        .saturating_add(candidate.slug.len())
+        .saturating_add(candidate.human_key.len())
+        .saturating_add(agent_name.len())
+        .saturating_add(generation.len())
+        .saturating_add(64);
+    if i64::try_from(source_bytes).is_err_and(|_| true)
+        || i64::try_from(source_bytes).unwrap_or(i64::MAX) > SOURCE_BYTES
+    {
+        return false;
+    }
+    let target = storage_root
+        .join("projects")
+        .join(candidate.slug)
+        .join("file_reservations")
+        .join(reservation_artifact_filename(
+            Some(generation),
+            candidate.id,
+        ));
+    !crate::path_existing_prefix_has_symlink(&target).unwrap_or(true)
+        && fs::symlink_metadata(&target).is_err()
+}
 
 /// Finite ID rounds keep older missing artifacts reachable under new grants.
 /// Retry IDs belong to the same source identity and share the original pass
@@ -1778,5 +1945,57 @@ mod tests {
             })
             .transient
         );
+    }
+
+    #[test]
+    fn active_progress_round_trips_and_keeps_the_latest_repair_across_owners() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(read_progress(root.path()), None);
+        let repaired = ActiveReservationProgress {
+            pid: 1,
+            pass_us: 100,
+            last_repair_us: Some(90),
+        };
+        record_progress(root.path(), &repaired).unwrap();
+        assert_eq!(read_progress(root.path()), Some(repaired));
+
+        let idle_other_owner = ActiveReservationProgress {
+            pid: 2,
+            pass_us: 200,
+            last_repair_us: None,
+        };
+        record_progress(root.path(), &idle_other_owner).unwrap();
+        assert_eq!(
+            read_progress(root.path()),
+            Some(ActiveReservationProgress {
+                pid: 2,
+                pass_us: 200,
+                last_repair_us: Some(90),
+            })
+        );
+
+        let stepped_back_clock = ActiveReservationProgress {
+            pid: 3,
+            pass_us: 10,
+            last_repair_us: None,
+        };
+        record_progress(root.path(), &stepped_back_clock).unwrap();
+        assert_eq!(
+            read_progress(root.path()),
+            Some(ActiveReservationProgress {
+                pid: 3,
+                pass_us: 10,
+                last_repair_us: Some(90),
+            })
+        );
+
+        let far_future = ActiveReservationProgress {
+            pid: 4,
+            pass_us: 10 + PROGRESS_CLOCK_SKEW_US + 1_000,
+            last_repair_us: Some(10 + PROGRESS_CLOCK_SKEW_US + 1_000),
+        };
+        record_progress(root.path(), &far_future).unwrap();
+        record_progress(root.path(), &stepped_back_clock).unwrap();
+        assert_eq!(read_progress(root.path()), Some(stepped_back_clock));
     }
 }

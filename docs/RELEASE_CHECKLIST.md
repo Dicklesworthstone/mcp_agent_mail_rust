@@ -33,8 +33,9 @@ commit, dependency revisions, exact commands, binary hashes, and terminal result
   receipt's `server_exe_sha256` equals the candidate's SHA-256.
 - [ ] Update the changelog from verified commits and synchronize the version
   only after the candidate gates pass. Keep the gated sibling dependency revision.
-- [ ] Verify archive contents, checksums, `release-manifest.json`, signed
-  `SHA256SUMS`, and installation using the actual packaged binaries.
+- [ ] Verify archive contents, checksums, `SHA256SUMS`, `SHA256SUMS.minisig`
+  (verified against the embedded minisign public key), and installation using
+  the actual packaged binaries.
 - [ ] Publish and verify the GitHub assets, Homebrew formula, and applicable
   container images. Workspace crates currently declare `publish = false`;
   crates.io publication is inapplicable unless that product decision changes.

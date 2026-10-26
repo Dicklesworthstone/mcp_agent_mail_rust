@@ -252,7 +252,7 @@ Parallel agent work changes the economics of supervision. One human operator can
 
 ## Rust vs. Python: Stress Test Results
 
-The Python implementation had three recurring failure modes under real multi-agent workloads: Git lock file contention from concurrent writes, SQLite pool exhaustion under sustained load, and cascading failures when many agents hit the server simultaneously. The Rust rewrite addresses these through batching, bounded pools, and backpressure. The measurements below are retained results from the original stress campaign, not a passing verdict for the current release candidate or a guarantee for every workload.
+The Python implementation had three recurring failure modes under real multi-agent workloads: Git lock file contention from concurrent writes, SQLite pool exhaustion under sustained load, and cascading failures when many agents hit the server simultaneously. The Rust rewrite addresses these through batching, bounded pools, and backpressure. The measurements below are retained results from the original stress campaign, not a passing verdict for the current release candidate or a guarantee for every workload (the heavy multi-agent stress tests in `crates/mcp-agent-mail-storage/tests/stress_pipeline.rs` are marked `#[ignore]` for explicit `-- --ignored` stress runs and currently enforce a 120s release-host ceiling, measured at 38–47s after durable archive-fsync hardening).
 
 ### The 10-Test Gauntlet
 

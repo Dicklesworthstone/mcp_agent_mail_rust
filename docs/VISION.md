@@ -42,6 +42,8 @@ $ am
 
 No subcommands needed for the default flow. Subcommands exist for targeted operations (`am setup --dry-run`, `am serve-http --no-tui`, `am robot inbox`, etc.) but the bare `am` command does everything.
 
+> **Reality note (2026-10-08):** Since GH#318, bare `am` starts the HTTP server and TUI without rewriting coding-agent MCP config files on every launch. Agent discovery and MCP config mutation run only when `am setup` (`am setup run`) is invoked explicitly.
+
 ### Two Audiences, One Binary
 
 | Audience | Interface | Design Goal |
@@ -130,6 +132,8 @@ am robot thread br-123 --include-bodies --format md
 # Default format: JSON. Also supports: toon, md, yaml
 ```
 
+> **Reality note (2026-10-08):** `am robot` supports `--format toon|json|md`. When `--format` is omitted, `am robot` defaults to `toon` on non-TTY stdout (for token-efficient agent consumption) and `json` on an interactive TTY.
+
 ---
 
 ## Auto-Setup: Agent Discovery & MCP Configuration
@@ -177,7 +181,7 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 **Current state:** Runtime `DbConn` uses `sqlmodel-frankensqlite`. Canonical verification and recovery cross-checks use the statically bundled C SQLite driver; they are separate from runtime mailbox queries.
 
-> **Reality note (2026-09-01; configuration updated 2026-09-20):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in for explicit transactions (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix. Autocommit statements (writes outside an explicit `BEGIN`) are different: they run in MVCC concurrent mode, which Agent Mail now sets explicitly on every runtime connection (`PRAGMA fsqlite.concurrent_mode = ON`, `AUTOCOMMIT_CONCURRENT_MODE_PRAGMA` in `crates/mcp-agent-mail-db/src/pool.rs`) instead of inheriting the engine default, and `health_check` reports it as `sqlite_autocommit_write_mode` (br-kp1in.16, 2026-09-24). The choice keeps the mode the release smoke qualified (16-client storm with zero `RESOURCE_BUSY`, independent `integrity_check` ok); a serialized-autocommit A/B has not been run. Agent Mail exposes no erasure-coded WAL self-healing setting; the unused option was removed in `br-of0ra`.
+> **Reality note (2026-09-01; configuration updated 2026-10-08):** the runtime mailbox path is FrankenSQLite (`DbConn`, test-enforced), while the binaries statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import) and the isolated ATC experience-ledger sidecar (`atc_open_sidecar_conn` in `crates/mcp-agent-mail-db/src/queries.rs`). `BEGIN CONCURRENT` is implemented but opt-in for explicit transactions (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix. Autocommit statements (writes outside an explicit `BEGIN`) are different: they run in MVCC concurrent mode, which Agent Mail now sets explicitly on every runtime connection (`PRAGMA fsqlite.concurrent_mode = ON`, `AUTOCOMMIT_CONCURRENT_MODE_PRAGMA` in `crates/mcp-agent-mail-db/src/pool.rs`) instead of inheriting the engine default, and `health_check` reports it as `sqlite_autocommit_write_mode` (br-kp1in.16, 2026-09-24). The choice keeps the mode the release smoke qualified (16-client storm with zero `RESOURCE_BUSY`, independent `integrity_check` ok); a serialized-autocommit A/B has not been run. Agent Mail exposes no erasure-coded WAL self-healing setting; the unused option was removed in `br-of0ra`.
 
 **Next hardening work:**
 - Close runtime engine gaps in FrankenSQLite while retaining independent canonical recovery checks.
@@ -227,6 +231,8 @@ VS16 (U+FE0F) variation selectors must be stripped before width calculation in `
 - **Property tests** — Fuzzing for edge cases in parsing, validation, serialization
 - **Every test must pass** — Zero known failures, zero flaky tests, zero ignored tests
 
+> **Reality note (2026-10-08):** Long-running multi-minute stress, soak, and external-fixture campaigns use `#[ignore]` so the default `cargo nextest run --workspace` gate remains bounded on a single host; those ignored suites are invoked explicitly with `-- --ignored` during stress and release qualification.
+
 ---
 
 ## What's NOT Part of This Vision
@@ -235,6 +241,8 @@ VS16 (U+FE0F) variation selectors must be stripped before width calculation in `
 - WASM/JS frankentui mode (mentioned but deprioritized vs core TUI quality)
 - Multi-machine federation (single-machine, multi-agent coordination only)
 - Backwards compatibility shims (no users yet, do it right with zero tech debt)
+
+> **Reality note (2026-10-08):** The server ships a server-rendered `/mail` HTML inspection/overseer UI (`crates/mcp-agent-mail-server/src/mail_ui.rs`), while the browser WASM live-mirroring console (`crates/mcp-agent-mail-wasm`) remains deferred outside the active Cargo workspace.
 
 ---
 

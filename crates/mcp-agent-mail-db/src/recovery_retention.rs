@@ -327,13 +327,22 @@ pub fn enumerate_forensic_bundles(storage_root: &Path) -> Vec<DebrisArtifact> {
     out
 }
 
-/// Recognize the complete legacy `corrupt<N>` suffix (br-kp1in.36).
+/// Recognize the legacy `corrupt<N>` and `corrupt<N>-<ts>` suffixes (br-kp1in.36).
 /// Callers must first establish the exact database/companion namespace. Do
 /// not accept a bare `corrupt`, appended metadata, or Unicode digit lookalikes.
 fn is_numbered_corrupt_suffix(suffix: &[u8]) -> bool {
-    suffix
-        .strip_prefix(b"corrupt")
-        .is_some_and(|ordinal| !ordinal.is_empty() && ordinal.iter().all(u8::is_ascii_digit))
+    let Some(rest) = suffix.strip_prefix(b"corrupt") else {
+        return false;
+    };
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    match &rest[digits..] {
+        b"" => true,
+        [b'-', payload @ ..] => !payload.is_empty(),
+        _ => false,
+    }
 }
 
 /// Classify only an artifact suffix of this exact configured database family.
@@ -1030,18 +1039,23 @@ mod tests {
                 ".lock",
             ] {
                 for ordinal in ["0", "1", "70", "18446744073709551615"] {
-                    let name = format!("{database}{companion}.corrupt{ordinal}");
-                    assert_eq!(
-                        classify_recovery_debris_file(OsStr::new(database), OsStr::new(&name)),
-                        Some(DebrisCategory::CorruptQuarantine),
-                        "{name}"
-                    );
-                    if matches!(companion, "" | "-wal" | "-shm") {
+                    for suffix in [
+                        format!("corrupt{ordinal}"),
+                        format!("corrupt{ordinal}-20260929"),
+                    ] {
+                        let name = format!("{database}{companion}.{suffix}");
                         assert_eq!(
-                            classify_backup_file(OsStr::new(database), OsStr::new(&name)),
-                            Some(BackupKind::Corrupt),
+                            classify_recovery_debris_file(OsStr::new(database), OsStr::new(&name)),
+                            Some(DebrisCategory::CorruptQuarantine),
                             "{name}"
                         );
+                        if matches!(companion, "" | "-wal" | "-shm") {
+                            assert_eq!(
+                                classify_backup_file(OsStr::new(database), OsStr::new(&name)),
+                                Some(BackupKind::Corrupt),
+                                "{name}"
+                            );
+                        }
                     }
                 }
             }
@@ -1056,6 +1070,7 @@ mod tests {
         }
         for name in [
             "mail.db.corrupt",
+            "mail.db.corrupt1-",
             "mail.db.corrupt1.meta.json",
             "mail.db.corrupt1notes",
             "mail.db.corrupt1.bak",

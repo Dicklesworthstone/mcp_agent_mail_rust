@@ -93,6 +93,11 @@ pub struct ReservationParityDriftSummary {
     pub release_pending_rows: usize,
     /// The share of `total()` those rows account for.
     pub release_pending_mismatches: usize,
+    /// Active `SQLite` rows counted in `missing_archive_artifacts` that meet
+    /// every source and destination invariant required by
+    /// `active_reservations::reconcile_active_reservations` (br-kp1in.19).
+    /// A sub-count of `missing_archive_artifacts`, not additional drift.
+    pub active_pending_rows: usize,
 }
 
 impl ReservationParityDriftSummary {
@@ -251,11 +256,21 @@ impl ReservationParityReport {
             .collect::<Vec<_>>()
             .join(",");
 
-        let pending = if self.drift.release_pending_rows > 0 {
-            format!(" release_pending_rows={}", self.drift.release_pending_rows)
-        } else {
-            String::new()
-        };
+        let mut pending = String::new();
+        if self.drift.release_pending_rows > 0 {
+            let _ = write!(
+                pending,
+                " release_pending_rows={}",
+                self.drift.release_pending_rows
+            );
+        }
+        if self.drift.active_pending_rows > 0 {
+            let _ = write!(
+                pending,
+                " active_pending_rows={}",
+                self.drift.active_pending_rows
+            );
+        }
         format!(
             "reservation_parity: drift total={} db={} archive={} fields=[{}] examples=[{}]{pending}",
             self.drift.total(),
@@ -270,11 +285,18 @@ impl ReservationParityReport {
 #[derive(Debug, Clone)]
 struct DbReservationState {
     reservation_id: i64,
+    project_id: i64,
+    agent_id: i64,
     project_slug: String,
+    project_human_key: String,
+    resolved_agent_name: Option<String>,
     agent_name: String,
     reason: String,
     path_pattern: String,
+    raw_exclusive: i64,
     exclusive: bool,
+    created_ts: i64,
+    expires_ts: i64,
     reservation_released_ts: Option<i64>,
     ledger_released_ts: Option<i64>,
 }
@@ -366,11 +388,17 @@ where
 {
     let rows = query(
         "SELECT fr.id AS reservation_id,
+                fr.project_id AS project_id,
+                fr.agent_id AS agent_id,
                 p.slug AS project_slug,
+                p.human_key AS project_human_key,
+                a.name AS resolved_agent_name,
                 COALESCE(a.name, '<missing-agent-id:' || fr.agent_id || '>') AS agent_name,
                 COALESCE(fr.reason, '') AS reason,
                 COALESCE(fr.path_pattern, '') AS path_pattern,
                 fr.exclusive AS exclusive,
+                fr.created_ts AS created_ts,
+                fr.expires_ts AS expires_ts,
                 fr.released_ts AS reservation_released_ts,
                 rr.released_ts AS ledger_released_ts
          FROM file_reservations fr
@@ -383,12 +411,27 @@ where
 
     rows.into_iter()
         .map(|row| {
+            let raw_exclusive = row
+                .get_named::<i64>("exclusive")
+                .map_err(|error| error.to_string())?;
             Ok(DbReservationState {
                 reservation_id: row
                     .get_named::<i64>("reservation_id")
                     .map_err(|error| error.to_string())?,
+                project_id: row
+                    .get_named::<i64>("project_id")
+                    .map_err(|error| error.to_string())?,
+                agent_id: row
+                    .get_named::<i64>("agent_id")
+                    .map_err(|error| error.to_string())?,
                 project_slug: row
                     .get_named::<String>("project_slug")
+                    .map_err(|error| error.to_string())?,
+                project_human_key: row
+                    .get_named::<String>("project_human_key")
+                    .map_err(|error| error.to_string())?,
+                resolved_agent_name: row
+                    .get_named::<Option<String>>("resolved_agent_name")
                     .map_err(|error| error.to_string())?,
                 agent_name: row
                     .get_named::<String>("agent_name")
@@ -399,10 +442,14 @@ where
                 path_pattern: row
                     .get_named::<String>("path_pattern")
                     .map_err(|error| error.to_string())?,
-                exclusive: row
-                    .get_named::<i64>("exclusive")
-                    .map_err(|error| error.to_string())?
-                    != 0,
+                raw_exclusive,
+                exclusive: raw_exclusive != 0,
+                created_ts: row
+                    .get_named::<i64>("created_ts")
+                    .map_err(|error| error.to_string())?,
+                expires_ts: row
+                    .get_named::<i64>("expires_ts")
+                    .map_err(|error| error.to_string())?,
                 reservation_released_ts: row
                     .get_named::<Option<i64>>("reservation_released_ts")
                     .map_err(|error| error.to_string())?,
@@ -437,6 +484,16 @@ pub fn check_reservation_parity_with_db_conn(
     conn: &mcp_agent_mail_db::DbConn,
     storage_root: &Path,
 ) -> Result<ReservationParityReport, String> {
+    check_reservation_parity_with_sync_query(conn, storage_root)
+}
+
+pub fn check_reservation_parity_with_sync_query<Q>(
+    conn: &Q,
+    storage_root: &Path,
+) -> Result<ReservationParityReport, String>
+where
+    Q: mcp_agent_mail_db::pool::SyncQuery,
+{
     check_reservation_parity_with_query(
         |sql, params| {
             conn.query_sync(sql, params)
@@ -640,8 +697,32 @@ where
                 } else {
                     // An *active* reservation invisible to the archive is
                     // genuine drift: the durable ledger cannot vouch for a
-                    // live lock. Self-heals via F1 reconcile-on-read.
+                    // live lock. Self-heals via F1 reconcile-on-read and
+                    // background `active_reservations` reconciliation.
                     drift.missing_archive_artifacts += 1;
+                    let candidate = mcp_agent_mail_storage::recovery::active_reservations::ActiveReservationCandidate {
+                        id: db.reservation_id,
+                        project_id: db.project_id,
+                        agent_id: db.agent_id,
+                        slug: &db.project_slug,
+                        human_key: &db.project_human_key,
+                        resolved_agent_name: db.resolved_agent_name.as_deref(),
+                        path_pattern: &db.path_pattern,
+                        reason: &db.reason,
+                        exclusive: db.raw_exclusive,
+                        created_ts: db.created_ts,
+                        expires_ts: db.expires_ts,
+                        hot_release_ts: db.reservation_released_ts,
+                        ledger_release_ts: db.ledger_released_ts,
+                        live_generation: current_generation.as_deref(),
+                    };
+                    if mcp_agent_mail_storage::recovery::active_reservations::is_reconcilable_missing_active_reservation(
+                        &candidate,
+                        storage_root,
+                        mcp_agent_mail_db::now_micros(),
+                    ) {
+                        drift.active_pending_rows += 1;
+                    }
                     examples.push(ReservationParityExample {
                         reservation_id,
                         project_slug,
@@ -1217,11 +1298,18 @@ mod tests {
     fn db_state(path: &str, exclusive: bool) -> DbReservationState {
         DbReservationState {
             reservation_id: 1,
+            project_id: 1,
+            agent_id: 1,
             project_slug: "proj".to_string(),
+            project_human_key: "/proj".to_string(),
+            resolved_agent_name: Some("Agent".to_string()),
             agent_name: "Agent".to_string(),
             reason: "r".to_string(),
             path_pattern: path.to_string(),
+            raw_exclusive: i64::from(exclusive),
             exclusive,
+            created_ts: 100,
+            expires_ts: 9_999_999_999_999_999,
             reservation_released_ts: None,
             ledger_released_ts: None,
         }
@@ -1554,10 +1642,46 @@ mod tests {
 
         let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
         assert_eq!(report.drift.missing_archive_artifacts, 1);
+        assert_eq!(report.drift.active_pending_rows, 1);
         assert_eq!(report.drift.reconstructed_prior_generation_rows, 0);
         assert_eq!(report.drift.released_rows_without_artifacts, 0);
         assert_eq!(report.drift.total(), 1);
         assert!(!report.ok);
+        assert!(report.health_line().contains("active_pending_rows=1"));
+    }
+
+    #[test]
+    fn active_pending_rows_excludes_expired_orphan_and_unversioned_missing_artifacts() {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("beef2222");
+        conn.execute_raw("PRAGMA foreign_keys = OFF").unwrap();
+        // Row 2: expired (not eligible for active_reservations reconciler).
+        conn.execute_raw(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (2, 1, 1, 'src/expired.rs', 1, 'expired', 100, 200, NULL)",
+        )
+        .unwrap();
+        // Row 3: missing holder agent in `agents`.
+        conn.execute_raw(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (3, 1, 999, 'src/orphan.rs', 1, 'orphan', 100, 9999999999999999, NULL)",
+        )
+        .unwrap();
+
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(report.drift.missing_archive_artifacts, 3);
+        assert_eq!(
+            report.drift.active_pending_rows, 1,
+            "only the live, valid row 1 is reconcilable by active_reservations"
+        );
+
+        // Removing the live generation makes even row 1 unreconcilable by the
+        // generation-stamped active reconciler.
+        conn.execute_raw("DELETE FROM db_identity").unwrap();
+        let unversioned =
+            check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(unversioned.drift.missing_archive_artifacts, 3);
+        assert_eq!(unversioned.drift.active_pending_rows, 0);
     }
 
     #[test]

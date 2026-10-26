@@ -237,7 +237,9 @@ fn parse_thread_page_size(raw: Option<&str>) -> usize {
 
 /// Get the configured thread page size from environment or default.
 fn get_thread_page_size() -> usize {
-    parse_thread_page_size(std::env::var("AM_TUI_THREAD_PAGE_SIZE").ok().as_deref())
+    parse_thread_page_size(
+        mcp_agent_mail_core::config::env_value("AM_TUI_THREAD_PAGE_SIZE").as_deref(),
+    )
 }
 
 /// Deterministically map an agent name to one of eight theme-safe colors.

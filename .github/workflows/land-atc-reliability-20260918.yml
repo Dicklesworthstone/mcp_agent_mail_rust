@@ -1,9 +1,8 @@
+# Historical one-shot patch-landing workflow (br-kp1in.27); retained pending RULE 1 removal approval.
 name: Land and verify message-first unified inbox
 
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/land-atc-reliability-20260918.yml]
+  workflow_dispatch:
 permissions: {}
 concurrency:
   group: land-unified-inbox-20261019

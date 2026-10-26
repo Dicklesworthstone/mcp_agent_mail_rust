@@ -8709,4 +8709,57 @@ fn after() { var("KEEP_AFTER"); }
         assert!(!log_level_silences_dependency_warnings("warn"));
         assert!(!log_level_silences_dependency_warnings("debug"));
     }
+
+    /// br-kp1in.20: auxiliary runtime knobs (`AM_GIT_FLOCK_TIMEOUT_SECS`,
+    /// `AM_GIT_BINARY`, `AM_IDEMPOTENCY_RETENTION_SECS`, `STARTUP_READINESS_BIND_TIMEOUT_SECS`,
+    /// `AM_TUI_THREAD_PAGE_SIZE`, `AM_TUI_FULL_REDRAW_MAX_SECS`) route through
+    /// `env_value` / `infra_env_value` so `config.env` reaches them.
+    #[test]
+    fn user_config_env_reaches_flock_timeout_and_git_binary_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg_config = tmp.path().join("xdg-config");
+        let app_config_dir = xdg_config.join(XDG_APP_DIR);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&app_config_dir).expect("create app config dir");
+        std::fs::write(
+            app_config_dir.join("config.env"),
+            "AM_GIT_FLOCK_TIMEOUT_SECS=77\n\
+             AM_GIT_BINARY=/custom/git/from/user/config/env\n\
+             AM_IDEMPOTENCY_RETENTION_SECS=3600\n\
+             STARTUP_READINESS_BIND_TIMEOUT_SECS=45\n\
+             AM_TUI_THREAD_PAGE_SIZE=150\n\
+             AM_TUI_FULL_REDRAW_MAX_SECS=12.5\n",
+        )
+        .expect("write config.env");
+
+        let home_str = home.to_string_lossy().into_owned();
+        let xdg_str = xdg_config.to_string_lossy().into_owned();
+        with_process_env_overrides_for_test(
+            &[
+                ("HOME", home_str.as_str()),
+                ("XDG_CONFIG_HOME", xdg_str.as_str()),
+            ],
+            || {
+                assert_eq!(crate::git_lock::flock_timeout_secs(), 77);
+                assert_eq!(
+                    infra_env_value("AM_GIT_BINARY").as_deref(),
+                    Some("/custom/git/from/user/config/env")
+                );
+                assert_eq!(
+                    env_value("AM_IDEMPOTENCY_RETENTION_SECS").as_deref(),
+                    Some("3600")
+                );
+                assert_eq!(
+                    env_value("STARTUP_READINESS_BIND_TIMEOUT_SECS").as_deref(),
+                    Some("45")
+                );
+                assert_eq!(env_value("AM_TUI_THREAD_PAGE_SIZE").as_deref(), Some("150"));
+                assert_eq!(
+                    env_value("AM_TUI_FULL_REDRAW_MAX_SECS").as_deref(),
+                    Some("12.5")
+                );
+            },
+        );
+    }
 }

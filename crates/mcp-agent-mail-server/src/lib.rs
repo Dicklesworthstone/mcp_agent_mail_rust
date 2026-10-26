@@ -3103,8 +3103,8 @@ impl ArchiveDbDriftSummary {
 }
 
 fn archive_inventory_has_state(storage_root: &Path) -> bool {
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
+    let archive = mcp_agent_mail_tools::tool_util::read_archive_inventory(storage_root);
+    mcp_agent_mail_tools::tool_util::read_archive_inventory_has_state(&archive)
 }
 
 fn archive_storage_root_is_authoritative_for_sqlite_path(
@@ -3131,8 +3131,8 @@ fn inspect_archive_db_drift(
         return Ok(None);
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+    let archive = mcp_agent_mail_tools::tool_util::read_archive_inventory(storage_root);
+    if !mcp_agent_mail_tools::tool_util::read_archive_inventory_has_state(&archive) {
         return Ok(None);
     }
 
@@ -3554,15 +3554,16 @@ pub(crate) fn open_observability_sync_db_connection(
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state =
+    let archive_has_state = || {
         archive_storage_root_is_authoritative_for_sqlite_path(storage_root, &resolved_path)
-            && archive_inventory_has_state(storage_root);
+            && archive_inventory_has_state(storage_root)
+    };
 
     // Observability must not initialize a configured fresh-start target merely
     // to render counts. If durable archive state exists, derive a private
     // snapshot from it; otherwise report that no read source is available.
     if !resolved_path.exists() {
-        return if archive_has_state {
+        return if archive_has_state() {
             ObservabilitySyncDb::archive_snapshot(storage_root, None, context).map(Some)
         } else {
             Ok(None)
@@ -3604,7 +3605,7 @@ pub(crate) fn open_observability_sync_db_connection(
                 .map(Some)
             }
             Ok(None) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
-            Err(error) if archive_has_state => {
+            Err(error) if archive_has_state() => {
                 // #219: same failure backoff as the drift arm — the probe
                 // failing does not make an O(archive) rebuild per dashboard
                 // tick any cheaper. Serving the (openable) live connection
@@ -3639,7 +3640,7 @@ pub(crate) fn open_observability_sync_db_connection(
             }
             Err(_) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
         },
-        Err(error) if archive_has_state => {
+        Err(error) if archive_has_state() => {
             // #219: no live connection exists to fall back on here, but a
             // rebuild that just failed will fail again — surface a fast
             // error instead of replaying the archive every ~1.2 s tick.
@@ -3934,9 +3935,7 @@ fn spawn_tui_readiness_warmup(
 /// the installer (br-5mnkl). Overridable via `STARTUP_READINESS_BIND_TIMEOUT_SECS`.
 fn startup_readiness_bind_deadline() -> Duration {
     Duration::from_secs(parse_startup_readiness_bind_deadline_secs(
-        std::env::var("STARTUP_READINESS_BIND_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
+        mcp_agent_mail_core::config::env_value("STARTUP_READINESS_BIND_TIMEOUT_SECS").as_deref(),
     ))
 }
 
@@ -9418,7 +9417,9 @@ const DEFAULT_FULL_REDRAW_MAX_SECS: f64 = 30.0;
 /// Wall-clock bound between forced physical full redraws (see
 /// [`stable_tui_diff_config`]), from `AM_TUI_FULL_REDRAW_MAX_SECS`.
 fn full_redraw_max_interval_from_env() -> Option<Duration> {
-    full_redraw_max_interval_from(std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS").ok().as_deref())
+    full_redraw_max_interval_from(
+        mcp_agent_mail_core::config::env_value("AM_TUI_FULL_REDRAW_MAX_SECS").as_deref(),
+    )
 }
 
 /// Parse floating-point seconds. Unset or unparseable falls back to

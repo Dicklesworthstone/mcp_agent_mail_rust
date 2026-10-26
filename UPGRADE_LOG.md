@@ -1,6 +1,14 @@
 # Dependency Upgrade Log
 
-## September 17, 2026 — FrankenSQLite 0.4.4 migration (in progress)
+## October 2026 — FrankenSQLite 0.4.10, FastMCP 0.10.0, and v0.3.37–v0.3.39 release status
+
+This section supersedes the September status notes below:
+- **Published releases:** `v0.3.37` (2026-10-05), `v0.3.38` (2026-10-08), and `v0.3.39` (2026-10-13) are published on GitHub Releases (`CHANGELOG.md`).
+- **FrankenSQLite (`=0.4.10`):** Completed (`br-5lgwn`). The runtime mailbox `DbConn` uses registry `sqlmodel =0.5.0` + `sqlmodel-frankensqlite =0.5.0` backed by FrankenSQLite `=0.4.10` (`fsqlite-* =0.4.10`, `fsqlite-vfs =0.4.11`). The `[patch]` git revision `2633b38a` in `Cargo.toml` applies only to `beads_rust =0.6.0`'s separate `0.3.18` engine.
+- **FastMCP (`0.10.0`, rev `1c2e5e4b`) & FrankenSearch (`0.6.1`, rev `616c9a7a`):** Reconciled on `asupersync =0.5.0` and `rustix 1.1.5` (`br-rch-frankensearch-closure-jdgvg`), preserving legacy stdio version negotiation.
+- **`franken-agent-detection` (`0.3.7`):** Updated from `0.2.2` to `0.3.7`.
+
+## September 17, 2026 — FrankenSQLite 0.4.4 migration (historical)
 
 Tracked by `br-5lgwn`. This section supersedes historical current-status
 statements below; v0.3.36 is published and this work targets unreleased main.
