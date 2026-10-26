@@ -547,6 +547,36 @@ mod tests {
     }
 
     #[test]
+    fn receipt_continuation_seeks_past_previous_message_populations() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = open(&directory.path().join("receipt-seek.sqlite3"));
+        seed(&source);
+        let table = &TABLES[1];
+        let (sql, params) = page_query(table, Some((101, 12)));
+        let plan = source
+            .query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+            .unwrap();
+        assert!(
+            plan.iter().any(|row| {
+                let detail = row.get_named::<String>("detail").unwrap();
+                detail.contains("SEARCH") && detail.contains("project_mailbox_receipts")
+            }),
+            "continuation must seek into the real primary-key index: {plan:?}"
+        );
+        let rows = source.query_sync(&sql, &params).unwrap();
+        let keys = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<i64>("message_id").unwrap(),
+                    row.get_named::<i64>("agent_id").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, [(101, 13), (102, 12), (201, 22)]);
+    }
+
+    #[test]
     fn shared_receipts_and_messages_observe_one_real_wal_snapshot() {
         struct RacingSource<'a> {
             reader: &'a CanonicalDbConn,

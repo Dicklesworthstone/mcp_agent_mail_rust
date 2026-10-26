@@ -1028,7 +1028,18 @@ fn snapshot_page_query(
             })
             .collect::<Vec<_>>()
             .join(" OR ");
-        sql.push_str(&format!(" WHERE {continuation}"));
+        if keys.len() > 1 {
+            // The disjunction alone can make SQLite walk the index from its
+            // beginning on every page. Every matching tuple has its first
+            // key >= the cursor's first key; expose that range explicitly so
+            // the planner can seek past already-copied message populations.
+            sql.push_str(&format!(
+                " WHERE {} >= ?1 AND ({continuation})",
+                order_keys[0]
+            ));
+        } else {
+            sql.push_str(&format!(" WHERE {continuation}"));
+        }
         params.extend(after.iter().map(|key| match key {
             SnapshotKey::Integer(value) => Value::BigInt(*value),
             SnapshotKey::Text(value) => Value::Text(value.clone()),
@@ -1974,6 +1985,62 @@ mod tests {
             );
             assert_eq!(row.get_named::<Option<i64>>("ack_ts").unwrap(), None);
         }
+    }
+
+    #[test]
+    fn recipient_continuation_seeks_past_previous_message_populations() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("recipient-seek.sqlite3"));
+        source
+            .execute_raw(
+                "CREATE TABLE message_recipients(message_id INTEGER NOT NULL, \
+             agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, \
+             ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); BEGIN IMMEDIATE",
+            )
+            .unwrap();
+        for id in 1..=2007 {
+            source
+                .execute_sync(
+                    "INSERT INTO message_recipients VALUES(?1,1,'to',?2,?3)",
+                    &[
+                        Value::BigInt(id),
+                        Value::BigInt(id * 2),
+                        Value::BigInt(id * 3),
+                    ],
+                )
+                .unwrap();
+        }
+        source.execute_raw("COMMIT").unwrap();
+        let table = KNOWN_TABLES
+            .iter()
+            .find(|table| table.name == "message_recipients")
+            .unwrap();
+        let (sql, params) = snapshot_page_query(
+            table,
+            table.columns,
+            table.primary_key_columns,
+            Some(&[
+                SnapshotKey::Integer(1000),
+                SnapshotKey::Integer(1),
+                SnapshotKey::Text("to".into()),
+            ]),
+        );
+        let plan = source
+            .query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+            .unwrap();
+        assert!(
+            plan.iter().any(|row| {
+                let detail = row.get_named::<String>("detail").unwrap();
+                detail.contains("SEARCH") && detail.contains("message_recipients")
+            }),
+            "continuation must seek into the real primary-key index: {plan:?}"
+        );
+        let rows = source.query_sync(&sql, &params).unwrap();
+        let ids = rows
+            .iter()
+            .map(|row| row.get_named::<i64>("message_id").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, (1001..=2000).collect::<Vec<_>>());
     }
 
     #[test]
