@@ -1098,7 +1098,8 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
 /// 1. Create snapshot
 /// 2. Apply project scope
 /// 3. Scrub data
-/// 4. Finalize (FTS, materialized views, performance indexes, VACUUM)
+/// 4. Rebuild a compact standalone database; published bundles also receive
+///    FTS, materialized views, and viewer performance indexes.
 ///
 /// The source assumptions are the same as [`create_sqlite_snapshot`]: a
 /// complete, valid `FrankenSQLite` namespace pair is mandatory and the source
@@ -1129,7 +1130,7 @@ pub enum SnapshotPhase {
     Filter,
     /// Apply the preset and publication-specific credential redaction.
     Scrub,
-    /// Rebuild storage, search indexes, materialized views, and statistics.
+    /// Rebuild storage; published bundles also receive viewer search artifacts.
     Finalize,
 }
 
@@ -1182,6 +1183,7 @@ pub enum SnapshotPurpose {
     Publish,
     /// A private archive (`am archive save`): the preset alone decides, so the
     /// lossless `archive` preset keeps tokens and a restore can still send.
+    /// Keeps restore state without building disposable viewer search artifacts.
     PrivateArchive,
 }
 
@@ -1273,14 +1275,26 @@ fn finish_snapshot_context(
     }
     observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Scrub));
     observer(SnapshotPhaseEvent::Started(SnapshotPhase::Finalize));
-    let finalize = crate::finalize_export_db(snapshot_path)?;
+    let fts_enabled = match purpose {
+        SnapshotPurpose::Publish => crate::finalize_export_db(snapshot_path)?.fts_enabled,
+        SnapshotPurpose::PrivateArchive => {
+            // Restore consumes the base mailbox tables and builds runtime
+            // indexes itself. Building FTS and viewer materialized tables here
+            // adds mailbox-wide joins and per-attachment writes to every backup
+            // without preserving any additional mailbox authority (GH#365).
+            // Keep the compact canonical rebuild: scoping/scrubbing can leave
+            // private data in freed pages or committed data in SQLite sidecars.
+            crate::finalize_snapshot_for_export(snapshot_path)?;
+            false
+        }
+    };
     observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize));
 
     Ok(SnapshotContext {
         snapshot_path: snapshot_path.to_path_buf(),
         scope,
         scrub_summary,
-        fts_enabled: finalize.fts_enabled,
+        fts_enabled,
     })
 }
 
@@ -1607,8 +1621,14 @@ mod tests {
                 let snapshot = dir.path().join("context-copy.sqlite3");
                 seed_reply_metadata_source(&private_source(&source), false);
                 let original = reply_metadata(&private_source(&source));
-                create_private_canonical_snapshot_context(&source, &snapshot, &[], preset, purpose)
-                    .unwrap();
+                let context = create_private_canonical_snapshot_context(
+                    &source,
+                    &snapshot,
+                    &[],
+                    preset,
+                    purpose,
+                )
+                .unwrap();
                 let expected = if purpose == SnapshotPurpose::PrivateArchive
                     && matches!(preset, crate::ScrubPreset::Archive)
                 {
@@ -1618,7 +1638,170 @@ mod tests {
                 };
                 assert_eq!(reply_metadata(&private_source(&snapshot)), expected);
                 assert_eq!(reply_metadata(&private_source(&source)), original);
+                let copied = private_source(&snapshot);
+                let derived = copied
+                    .query_sync(
+                        "SELECT name FROM sqlite_master WHERE name IN \
+                         ('fts_messages', 'message_overview_mv', 'attachments_by_message_mv', \
+                          'fts_search_overview_mv') ORDER BY name",
+                        &[],
+                    )
+                    .unwrap();
+                if purpose == SnapshotPurpose::PrivateArchive {
+                    assert!(!context.fts_enabled);
+                    assert!(derived.is_empty(), "backups do not need viewer artifacts");
+                } else {
+                    assert!(context.fts_enabled);
+                    assert_eq!(derived.len(), 4, "published bundles keep their viewer data");
+                    let overview = copied
+                        .query_sync("SELECT id FROM message_overview_mv ORDER BY id", &[])
+                        .unwrap();
+                    assert_eq!(overview.len(), original.len());
+                }
             }
+        }
+    }
+
+    #[test]
+    fn private_archive_context_keeps_restore_authority_without_viewer_work() {
+        fn seed(conn: &impl SnapshotSource) {
+            for sql in [
+                "CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+                "CREATE TABLE agents(id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, reaper_exempt INTEGER, registration_token TEXT, retired_at INTEGER)",
+                "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, body_md TEXT, ack_required INTEGER, recipients_json TEXT, attachments TEXT, archive_metadata_json TEXT)",
+                "CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind))",
+                "CREATE TABLE file_reservations(id INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, path_pattern TEXT, released_ts INTEGER)",
+                "CREATE TABLE file_reservation_releases(reservation_id INTEGER PRIMARY KEY, released_ts INTEGER)",
+                "CREATE TABLE agent_deregistrations(agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER)",
+                "CREATE TABLE project_mailbox_deliveries(message_id INTEGER PRIMARY KEY, project_id INTEGER, kind TEXT, delivered_ts INTEGER)",
+                "CREATE TABLE project_mailbox_receipts(message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id))",
+                "INSERT INTO projects VALUES(1,'restore-state','/restore-state',1707000000000000)",
+                "INSERT INTO agents VALUES(-9,1,'RetiredLake',1,'retired-secret',800),(0,1,'BlueLake',1,'blue-secret',NULL),(1,1,'RedLake',0,'red-secret',NULL)",
+                r#"INSERT INTO messages VALUES(-7,1,1,'private body',1,'{"to":["BlueLake"],"cc":["BlueLake"],"bcc":[]}','[{"path":"private.txt"}]',' { "reply_to" : 0 } '),(0,1,1,'zero identity',0,'{}','[]','{}'),(1,1,1,'shared body',1,'{"to":["project:restore-state"],"cc":[],"bcc":[]}','[]',NULL)"#,
+                "INSERT INTO message_recipients VALUES(-7,0,'cc',NULL,222),(-7,0,'to',111,NULL),(0,1,'to',333,444)",
+                "INSERT INTO file_reservations VALUES(-3,1,0,'src/**',900)",
+                "INSERT INTO file_reservation_releases VALUES(-3,900)",
+                "INSERT INTO agent_deregistrations VALUES(-9,800)",
+                "INSERT INTO project_mailbox_deliveries VALUES(1,1,'to',500)",
+                "INSERT INTO project_mailbox_receipts VALUES(1,0,100,110)",
+            ] {
+                conn.execute_snapshot(sql).unwrap();
+            }
+        }
+
+        fn restore_state(conn: &impl SnapshotSource) -> Vec<Vec<Value>> {
+            let mut result = Vec::new();
+            for (sql, columns) in [
+                (
+                    "SELECT id,slug,human_key,CAST(created_at AS TEXT) AS created_at FROM projects ORDER BY id",
+                    &["id", "slug", "human_key", "created_at"][..],
+                ),
+                (
+                    "SELECT id,name,reaper_exempt,registration_token,CAST(retired_at AS TEXT) AS retired_at FROM agents ORDER BY id",
+                    &[
+                        "id",
+                        "name",
+                        "reaper_exempt",
+                        "registration_token",
+                        "retired_at",
+                    ][..],
+                ),
+                (
+                    "SELECT id,body_md,ack_required,recipients_json,attachments,archive_metadata_json FROM messages ORDER BY id",
+                    &[
+                        "id",
+                        "body_md",
+                        "ack_required",
+                        "recipients_json",
+                        "attachments",
+                        "archive_metadata_json",
+                    ][..],
+                ),
+                (
+                    "SELECT message_id,agent_id,kind,CAST(read_ts AS TEXT) AS read_ts,CAST(ack_ts AS TEXT) AS ack_ts FROM message_recipients ORDER BY message_id,agent_id,kind",
+                    &["message_id", "agent_id", "kind", "read_ts", "ack_ts"][..],
+                ),
+                (
+                    "SELECT id,path_pattern,CAST(released_ts AS TEXT) AS released_ts FROM file_reservations ORDER BY id",
+                    &["id", "path_pattern", "released_ts"][..],
+                ),
+                (
+                    "SELECT reservation_id,CAST(released_ts AS TEXT) AS released_ts FROM file_reservation_releases ORDER BY reservation_id",
+                    &["reservation_id", "released_ts"][..],
+                ),
+                (
+                    "SELECT agent_id,CAST(deregistered_at AS TEXT) AS deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                    &["agent_id", "deregistered_at"][..],
+                ),
+                (
+                    "SELECT message_id,project_id,kind,delivered_ts FROM project_mailbox_deliveries ORDER BY message_id",
+                    &["message_id", "project_id", "kind", "delivered_ts"][..],
+                ),
+                (
+                    "SELECT message_id,agent_id,read_ts,ack_ts FROM project_mailbox_receipts ORDER BY message_id,agent_id",
+                    &["message_id", "agent_id", "read_ts", "ack_ts"][..],
+                ),
+            ] {
+                for row in conn.query_snapshot(sql, &[]).unwrap() {
+                    result.push(
+                        columns
+                            .iter()
+                            .map(|column| match row.get_by_name(column).unwrap() {
+                                Value::Int(value) => Value::BigInt(i64::from(*value)),
+                                value => value.clone(),
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            result
+        }
+
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.sqlite3");
+            let snapshot = directory.path().join("archive.sqlite3");
+            let original = if live {
+                let conn = DbConn::open_file(source.to_str().unwrap()).unwrap();
+                seed(&conn);
+                restore_state(&conn)
+            } else {
+                let conn = private_source(&source);
+                seed(&conn);
+                restore_state(&conn)
+            };
+            let context = if live {
+                create_snapshot_context(
+                    &source,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                )
+            } else {
+                create_private_canonical_snapshot_context(
+                    &source,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                )
+            }
+            .unwrap();
+            assert!(!context.fts_enabled);
+            assert_eq!(context.scope.remaining.messages, 3);
+            assert!(!sqlite_sidecar_artifacts_exist(&snapshot).unwrap());
+            let copied = private_source(&snapshot);
+            assert_eq!(restore_state(&copied), original);
+            let integrity = copied.query_sync("PRAGMA integrity_check", &[]).unwrap();
+            assert_eq!(integrity.len(), 1);
+            assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+            let unchanged = if live {
+                restore_state(&DbConn::open_file(source.to_str().unwrap()).unwrap())
+            } else {
+                restore_state(&private_source(&source))
+            };
+            assert_eq!(unchanged, original, "the source remains authoritative");
         }
     }
 
