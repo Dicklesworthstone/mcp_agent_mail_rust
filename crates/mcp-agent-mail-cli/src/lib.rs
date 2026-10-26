@@ -31951,10 +31951,30 @@ fn server_write_mode_probe(health: Option<&serde_json::Value>) -> (&'static str,
             "live server health reported no write mode".to_string(),
         );
     };
+    let retry_suffix = health
+        .and_then(|h| h.get("mvcc_retries"))
+        .map(|retries| {
+            let retries_last_min = retries
+                .get("retries_last_minute")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let retries_total = retries
+                .get("retries_total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let exhausted_total = retries
+                .get("exhausted_total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                " (mvcc_retries_last_minute={retries_last_min}, mvcc_retries_total={retries_total}, exhausted_total={exhausted_total})"
+            )
+        })
+        .unwrap_or_default();
     match mode {
         "mvcc_concurrent" => (
             "ok",
-            "autocommit writes pinned to MVCC concurrent".to_string(),
+            format!("autocommit writes pinned to MVCC concurrent{retry_suffix}"),
         ),
         "" | "not_observed" => (
             "skip",
@@ -31962,7 +31982,9 @@ fn server_write_mode_probe(health: Option<&serde_json::Value>) -> (&'static str,
         ),
         other => (
             "degraded",
-            format!("autocommit write mode is {other}; the runtime pins mvcc_concurrent"),
+            format!(
+                "autocommit write mode is {other}; the runtime pins mvcc_concurrent{retry_suffix}"
+            ),
         ),
     }
 }
@@ -61179,6 +61201,21 @@ startup_timeout_sec = 42
             "skip"
         );
         assert_eq!(server_write_mode_probe(None).0, "skip");
+        let with_retries = serde_json::json!({
+            "sqlite_autocommit_write_mode": "mvcc_concurrent",
+            "mvcc_retries": {
+                "retries_last_minute": 3,
+                "retries_total": 12,
+                "exhausted_total": 0
+            }
+        });
+        let (status, detail) = server_write_mode_probe(Some(&with_retries));
+        assert_eq!(status, "ok");
+        assert!(
+            detail.contains("mvcc_retries_last_minute=3")
+                && detail.contains("mvcc_retries_total=12"),
+            "{detail}"
+        );
     }
 
     #[test]

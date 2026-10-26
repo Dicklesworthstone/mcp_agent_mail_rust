@@ -1543,6 +1543,10 @@ pub struct HealthCheckResponse {
     /// `not_observed` before the first pooled write connection opened.
     #[serde(default)]
     pub sqlite_autocommit_write_mode: String,
+    /// MVCC and write-contention conflict/retry telemetry, including per-minute
+    /// rolling rates (br-kp1in.16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mvcc_retries: Option<mcp_agent_mail_db::MvccRetryMetrics>,
     pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
@@ -2407,6 +2411,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                 None => "not_observed",
             }
             .to_string(),
+        mvcc_retries: Some(mcp_agent_mail_db::mvcc_retry_metrics()),
         semantic_readiness,
         pool_utilization: pool.as_ref().map(|_| PoolUtilizationResponse {
             active: metrics.db.pool_active_connections,
@@ -5327,6 +5332,7 @@ mod tests {
             database_url: "sqlite:///data/test.db".into(),
             storage_root: "/data".into(),
             sqlite_autocommit_write_mode: "mvcc_concurrent".into(),
+            mvcc_retries: None,
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "aligned".into(),
@@ -5880,6 +5886,7 @@ mod tests {
             database_url: "sqlite:///:memory:".into(),
             storage_root: "/tmp/agent-mail-test".into(),
             sqlite_autocommit_write_mode: "not_observed".into(),
+            mvcc_retries: None,
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "memory".into(),

@@ -4178,6 +4178,66 @@ static MVCC_RETRIES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Global counter: MVCC conflicts that exhausted all retries.
 static MVCC_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Global counter: total plain SQLite write-contention retries performed.
+static WRITE_CONTENTION_RETRIES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Global counter: plain SQLite write-contention conflicts that exhausted all retries.
+static WRITE_CONTENTION_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+struct RollingMinuteCounter {
+    timestamps_ms: std::sync::Mutex<std::collections::VecDeque<u64>>,
+}
+
+impl RollingMinuteCounter {
+    const fn new() -> Self {
+        Self {
+            timestamps_ms: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    fn current_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    fn record(&self) {
+        let now_ms = Self::current_epoch_ms();
+        let cutoff_ms = now_ms.saturating_sub(60_000);
+        let mut guard = self
+            .timestamps_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while guard.front().is_some_and(|ts| *ts < cutoff_ms) {
+            guard.pop_front();
+        }
+        if guard.len() >= 16_384 {
+            guard.pop_front();
+        }
+        guard.push_back(now_ms);
+    }
+
+    fn count_last_minute(&self) -> u64 {
+        let now_ms = Self::current_epoch_ms();
+        let cutoff_ms = now_ms.saturating_sub(60_000);
+        let mut guard = self
+            .timestamps_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while guard.front().is_some_and(|ts| *ts < cutoff_ms) {
+            guard.pop_front();
+        }
+        u64::try_from(guard.len()).unwrap_or(u64::MAX)
+    }
+}
+
+static MVCC_RETRIES_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+static MVCC_EXHAUSTED_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+static WRITE_CONTENTION_RETRIES_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+static WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+
 /// Check if a [`DbError`] is an MVCC write conflict.
 ///
 /// `BusySnapshot` arrives from frankensqlite as a lock-classified
@@ -4310,6 +4370,7 @@ where
         match op().await {
             Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
                 MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MVCC_RETRIES_LAST_MINUTE.record();
                 tracing::warn!(
                     attempt,
                     max_retries = max,
@@ -4322,6 +4383,8 @@ where
                 }
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) && attempt < max => {
+                WRITE_CONTENTION_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                WRITE_CONTENTION_RETRIES_LAST_MINUTE.record();
                 tracing::warn!(
                     attempt,
                     max_retries = max,
@@ -4335,6 +4398,7 @@ where
             }
             Outcome::Err(e) if is_mvcc_error(&e) => {
                 MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MVCC_EXHAUSTED_LAST_MINUTE.record();
                 tracing::error!(
                     attempts = max + 1,
                     error = %e,
@@ -4344,6 +4408,8 @@ where
                 return Outcome::Err(exhausted(e));
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) => {
+                WRITE_CONTENTION_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE.record();
                 tracing::error!(
                     attempts = max + 1,
                     error = %e,
@@ -4426,15 +4492,27 @@ fn mvcc_backoff(cx: &Cx, attempt: u32) -> std::result::Result<(), CancelReason> 
     }
 }
 
-/// Snapshot of MVCC retry metrics for health/diagnostics.
-#[derive(Debug, Clone, serde::Serialize)]
+/// Snapshot of MVCC and write-contention retry metrics for health/diagnostics (br-kp1in.16).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MvccRetryMetrics {
     pub max_retries: u32,
     pub retries_total: u64,
     pub exhausted_total: u64,
+    #[serde(default)]
+    pub retries_last_minute: u64,
+    #[serde(default)]
+    pub exhausted_last_minute: u64,
+    #[serde(default)]
+    pub write_contention_retries_total: u64,
+    #[serde(default)]
+    pub write_contention_exhausted_total: u64,
+    #[serde(default)]
+    pub write_contention_retries_last_minute: u64,
+    #[serde(default)]
+    pub write_contention_exhausted_last_minute: u64,
 }
 
-/// Get current MVCC retry metrics.
+/// Get current MVCC and write-contention retry metrics, including per-minute rolling rates.
 #[must_use]
 pub fn mvcc_retry_metrics() -> MvccRetryMetrics {
     use std::sync::atomic::Ordering;
@@ -4442,6 +4520,14 @@ pub fn mvcc_retry_metrics() -> MvccRetryMetrics {
         max_retries: *MVCC_MAX_RETRIES,
         retries_total: MVCC_RETRIES_TOTAL.load(Ordering::Relaxed),
         exhausted_total: MVCC_EXHAUSTED_TOTAL.load(Ordering::Relaxed),
+        retries_last_minute: MVCC_RETRIES_LAST_MINUTE.count_last_minute(),
+        exhausted_last_minute: MVCC_EXHAUSTED_LAST_MINUTE.count_last_minute(),
+        write_contention_retries_total: WRITE_CONTENTION_RETRIES_TOTAL.load(Ordering::Relaxed),
+        write_contention_exhausted_total: WRITE_CONTENTION_EXHAUSTED_TOTAL.load(Ordering::Relaxed),
+        write_contention_retries_last_minute: WRITE_CONTENTION_RETRIES_LAST_MINUTE
+            .count_last_minute(),
+        write_contention_exhausted_last_minute: WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE
+            .count_last_minute(),
     }
 }
 
@@ -32974,10 +33060,23 @@ mod tests {
                 min_connections: 1,
                 max_connections: writers,
                 run_migrations: true,
-                warmup_connections: 0,
+                warmup_connections: 1,
                 ..Default::default()
             };
             let pool = crate::create_pool(&cfg).expect("create pool");
+            // Ensure schema initialization completes before the writer threads
+            // race at the barrier so host load cannot trip the 10s init_gate
+            // before the first autocommit write is issued.
+            let warmup_rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("warmup runtime");
+            warmup_rt.block_on(async {
+                let cx = Cx::current().expect("warmup cx");
+                assert!(
+                    matches!(acquire_conn(&cx, &pool).await, Outcome::Ok(_)),
+                    "warmup acquire_conn failed"
+                );
+            });
             let per_writer = 8_usize;
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
             // Spawn every writer before joining any: they meet at the barrier.
@@ -33050,6 +33149,137 @@ mod tests {
                 .collect();
             assert_eq!(integrity, vec!["ok".to_string()], "{writers} writers");
         }
+    }
+
+    #[test]
+    fn autocommit_writer_storm_compares_mvcc_and_serialized_modes_and_records_retry_metrics() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let writers = 16_usize;
+        let per_writer = 6_usize;
+        for concurrent_mode_on in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mode_name = if concurrent_mode_on {
+                "mvcc_concurrent"
+            } else {
+                "serialized"
+            };
+            let db_path = dir.path().join(format!("autocommit_ab_{mode_name}.db"));
+            let cfg = crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: writers,
+                run_migrations: true,
+                warmup_connections: 1,
+                ..Default::default()
+            };
+            let pool = crate::create_pool(&cfg).expect("create pool");
+            let warmup_rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("warmup runtime");
+            warmup_rt.block_on(async {
+                let cx = Cx::current().expect("warmup cx");
+                assert!(
+                    matches!(acquire_conn(&cx, &pool).await, Outcome::Ok(_)),
+                    "warmup acquire_conn failed"
+                );
+            });
+
+            let before_metrics = mvcc_retry_metrics();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
+            let mut handles = Vec::with_capacity(writers);
+            for writer in 0..writers {
+                let pool = pool.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("writer runtime");
+                    barrier.wait();
+                    let mut failures = Vec::new();
+                    for row in 0..per_writer {
+                        let slug = format!("ab-{mode_name}-{writer}-{row}");
+                        let outcome = rt.block_on(async {
+                            let cx = Cx::current().expect("runtime installs a context");
+                            run_with_mvcc_retry(&cx, "autocommit ab insert", || async {
+                                let conn = match acquire_conn(&cx, &pool).await {
+                                    Outcome::Ok(conn) => conn,
+                                    Outcome::Err(error) => return Outcome::Err(error),
+                                    Outcome::Cancelled(reason) => {
+                                        return Outcome::Cancelled(reason);
+                                    }
+                                    Outcome::Panicked(payload) => {
+                                        return Outcome::Panicked(payload);
+                                    }
+                                };
+                                let pragma = if concurrent_mode_on {
+                                    "PRAGMA fsqlite.concurrent_mode = ON"
+                                } else {
+                                    "PRAGMA fsqlite.concurrent_mode = OFF"
+                                };
+                                let _ = conn.execute_raw(pragma);
+                                match conn.execute_raw(&format!(
+                                    "INSERT INTO projects (slug, human_key, created_at) \
+                                         VALUES ('{slug}', '/tmp/{slug}', 0)"
+                                )) {
+                                    Ok(()) => Outcome::Ok(()),
+                                    Err(error) => Outcome::Err(map_sql_error(&error)),
+                                }
+                            })
+                            .await
+                        });
+                        if !matches!(outcome, Outcome::Ok(())) {
+                            failures.push(format!("{slug}: {outcome:?}"));
+                        }
+                    }
+                    failures
+                }));
+            }
+            let failures: Vec<String> = handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("writer thread"))
+                .collect();
+            let after_metrics = mvcc_retry_metrics();
+            assert!(
+                failures.is_empty(),
+                "mode={mode_name}: expected zero lost rows / RESOURCE_BUSY failures, got {failures:?}"
+            );
+            assert!(
+                after_metrics.retries_total >= before_metrics.retries_total
+                    && after_metrics.write_contention_retries_total
+                        >= before_metrics.write_contention_retries_total,
+                "mode={mode_name}: retry counters must be monotonic ({before_metrics:?} -> {after_metrics:?})"
+            );
+            drop(pool);
+
+            let verify = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+                .expect("independent C SQLite connection");
+            let count = verify
+                .query_sync("SELECT count(*) FROM projects", &[])
+                .expect("count projects")
+                .first()
+                .and_then(|row| row.get_as::<i64>(0).ok());
+            assert_eq!(
+                count,
+                Some(i64::try_from(writers * per_writer).expect("row count fits")),
+                "mode={mode_name}: autocommit writers must lose no rows"
+            );
+            let integrity: Vec<String> = verify
+                .query_sync("PRAGMA integrity_check", &[])
+                .expect("integrity_check")
+                .iter()
+                .filter_map(|row| row.get_as::<String>(0).ok())
+                .collect();
+            assert_eq!(integrity, vec!["ok".to_string()], "mode={mode_name}");
+        }
+
+        // Also verify the rolling per-minute counter directly when an MVCC conflict is retried.
+        let before = mvcc_retry_metrics();
+        MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MVCC_RETRIES_LAST_MINUTE.record();
+        let after = mvcc_retry_metrics();
+        assert!(after.retries_total > before.retries_total);
+        assert!(after.retries_last_minute >= 1);
     }
 
     #[test]
