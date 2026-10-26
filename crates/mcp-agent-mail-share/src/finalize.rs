@@ -8,6 +8,7 @@ use mcp_agent_mail_db::queries::UNKNOWN_SENDER_DISPLAY;
 use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
 
 use crate::ShareError;
+use crate::snapshot::{SnapshotObserver, SnapshotProgress, SnapshotProgressPhase};
 
 type Conn = DbConn;
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
@@ -662,10 +663,20 @@ fn create_performance_indexes_with_conn(conn: &Conn) -> Result<Vec<String>, Shar
 /// This rebuilds the snapshot into a compact fresh database with the export
 /// page size, then applies the final journal mode and statistics pragmas.
 pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareError> {
+    finalize_snapshot_with_progress(snapshot_path, &mut |_| Ok(()))
+}
+
+pub(crate) fn finalize_snapshot_with_progress(
+    snapshot_path: &Path,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<(), ShareError> {
+    observer(SnapshotProgress::phase(SnapshotProgressPhase::Compact))?;
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
-    let (_temp_dir, rebuilt_path, backup_path) = prepare_rebuilt_snapshot_storage(&snapshot_path)?;
+    let (_temp_dir, rebuilt_path, backup_path) =
+        prepare_rebuilt_snapshot_storage(&snapshot_path, observer)?;
 
     apply_export_finalize_pragmas(&rebuilt_path)?;
+    observer(SnapshotProgress::phase(SnapshotProgressPhase::Compact))?;
     replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
     cleanup_snapshot_sidecars(&snapshot_path)?;
 
@@ -674,8 +685,16 @@ pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareErr
 
 /// Run steps 4–7 in sequence on a scoped+scrubbed snapshot.
 pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareError> {
+    finalize_export_with_progress(snapshot_path, &mut |_| Ok(()))
+}
+
+pub(crate) fn finalize_export_with_progress(
+    snapshot_path: &Path,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<FinalizeResult, ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
-    finalize_snapshot_for_export(&snapshot_path)?;
+    finalize_snapshot_with_progress(&snapshot_path, observer)?;
+    observer(SnapshotProgress::phase(SnapshotProgressPhase::Viewer))?;
     let (_rollback_stage, rollback_source_path, rollback_backup_path) =
         prepare_post_finalize_rollback_snapshot(&snapshot_path)?;
 
@@ -723,6 +742,7 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
 
 fn prepare_rebuilt_snapshot_storage(
     snapshot_path: &Path,
+    observer: &mut SnapshotObserver<'_>,
 ) -> Result<(tempfile::TempDir, std::path::PathBuf, std::path::PathBuf), ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let parent = snapshot_path
@@ -735,12 +755,14 @@ fn prepare_rebuilt_snapshot_storage(
     stage_snapshot_source(&snapshot_path, &source_copy)?;
     let rebuilt_path = temp_dir.path().join("mailbox.sqlite3");
 
-    crate::snapshot::rebuild_sqlite_snapshot_with_profiles(
+    crate::snapshot::rebuild_sqlite_snapshot_with_progress(
         &source_copy,
         &rebuilt_path,
         false,
         crate::snapshot::SnapshotSourceProfile::CanonicalExport,
         crate::snapshot::SnapshotDestinationProfile::PortableExport,
+        SnapshotProgressPhase::Compact,
+        observer,
     )?;
 
     let backup_path = temp_dir.path().join("mailbox.backup.sqlite3");
@@ -819,7 +841,8 @@ fn prepare_post_finalize_rollback_snapshot(
 #[cfg(test)]
 fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
-    let (_temp_dir, rebuilt_path, backup_path) = prepare_rebuilt_snapshot_storage(&snapshot_path)?;
+    let (_temp_dir, rebuilt_path, backup_path) =
+        prepare_rebuilt_snapshot_storage(&snapshot_path, &mut |_| Ok(()))?;
     replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
     cleanup_snapshot_sidecars(&snapshot_path)?;
     Ok(())

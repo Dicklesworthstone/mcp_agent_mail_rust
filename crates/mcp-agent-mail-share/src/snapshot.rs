@@ -18,6 +18,65 @@ mod shared;
 
 const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
+/// A measured stage of snapshot preparation, independent of archive packaging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotProgressPhase {
+    Copy,
+    Scope,
+    Scrub,
+    Compact,
+    Viewer,
+}
+
+/// Progress contains schema names and counts only, never mailbox contents.
+///
+/// `rows_copied` is cumulative within `table` for the current phase. A `None`
+/// table marks a phase boundary; a table with zero rows marks its start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotProgress {
+    pub phase: SnapshotProgressPhase,
+    pub table: Option<&'static str>,
+    pub rows_copied: u64,
+}
+
+impl SnapshotProgress {
+    pub(crate) const fn phase(phase: SnapshotProgressPhase) -> Self {
+        Self {
+            phase,
+            table: None,
+            rows_copied: 0,
+        }
+    }
+}
+
+/// Returning an error stops at the current checkpoint. Copy checkpoints occur
+/// between bounded pages; a single database statement is not preempted.
+pub type SnapshotObserver<'a> = dyn FnMut(SnapshotProgress) -> Result<(), ShareError> + 'a;
+
+/// A bounded, content-free description of work in the snapshot pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhase {
+    /// Create the private database copy through the appropriate source engine.
+    Snapshot,
+    /// Resolve project selectors and remove out-of-scope rows from the copy.
+    Filter,
+    /// Apply the preset and publication-specific credential redaction.
+    Scrub,
+    /// Rebuild storage; published bundles also receive viewer search artifacts.
+    Finalize,
+}
+
+/// Phase boundaries only: no database paths, selectors, SQL, or mailbox data.
+///
+/// A failed phase emits `Started` but not `Finished`; the returned error keeps
+/// its existing type and is handled by the caller. Observers should perform
+/// only bounded diagnostic work and must not mutate snapshot state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhaseEvent {
+    Started(SnapshotPhase),
+    Finished(SnapshotPhase),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum SnapshotDestinationProfile {
     #[default]
@@ -286,6 +345,27 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
     source_profile: SnapshotSourceProfile,
     destination_profile: SnapshotDestinationProfile,
 ) -> Result<PathBuf, ShareError> {
+    rebuild_sqlite_snapshot_with_progress(
+        source,
+        destination,
+        checkpoint,
+        source_profile,
+        destination_profile,
+        SnapshotProgressPhase::Copy,
+        &mut |_| Ok(()),
+    )
+}
+
+pub(crate) fn rebuild_sqlite_snapshot_with_progress(
+    source: &Path,
+    destination: &Path,
+    checkpoint: bool,
+    source_profile: SnapshotSourceProfile,
+    destination_profile: SnapshotDestinationProfile,
+    phase: SnapshotProgressPhase,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<PathBuf, ShareError> {
+    observer(SnapshotProgress::phase(phase))?;
     let source = crate::resolve_share_sqlite_path(source);
 
     match std::fs::symlink_metadata(&source) {
@@ -378,7 +458,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
                     source.display()
                 ),
             })?;
-            transfer_tables_in_consistent_read(&src, &dst_conn)?;
+            transfer_tables_with_progress(&src, &dst_conn, phase, observer)?;
             // A true read-only observer must use ordinary Drop. Checkpointing
             // close helpers are writer teardown and may mutate a live WAL.
             drop(src);
@@ -395,7 +475,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
                         ),
                     })?;
             }
-            transfer_tables_in_consistent_read(&src, &dst_conn)?;
+            transfer_tables_with_progress(&src, &dst_conn, phase, observer)?;
         }
     }
     // Use the existing canonical staging connection for any destination
@@ -410,6 +490,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
             ),
         })?;
     drop(dst_conn);
+    observer(SnapshotProgress::phase(phase))?;
     publish_sqlite_snapshot(stage_dir, &staged_dest, &dest, sync_snapshot_parent)?;
 
     Ok(dest)
@@ -747,16 +828,26 @@ impl SnapshotSource for CanonicalDbConn {
 /// snapshot. In WAL mode, separate queries without this transaction can each
 /// observe a different commit and produce a cross-table or cross-page state
 /// that never existed in the source.
+#[cfg(test)]
 fn transfer_tables_in_consistent_read<S: SnapshotSource>(
     src: &S,
     dst: &CanonicalDbConn,
+) -> Result<(), ShareError> {
+    transfer_tables_with_progress(src, dst, SnapshotProgressPhase::Copy, &mut |_| Ok(()))
+}
+
+fn transfer_tables_with_progress<S: SnapshotSource>(
+    src: &S,
+    dst: &CanonicalDbConn,
+    phase: SnapshotProgressPhase,
+    observer: &mut SnapshotObserver<'_>,
 ) -> Result<(), ShareError> {
     src.execute_snapshot("BEGIN")
         .map_err(|e| ShareError::Sqlite {
             message: format!("cannot begin consistent source snapshot read: {e}"),
         })?;
 
-    match transfer_tables(src, dst) {
+    match transfer_tables(src, dst, phase, observer) {
         Ok(()) => match src.execute_snapshot("COMMIT") {
             Ok(()) => Ok(()),
             Err(commit_error) => {
@@ -783,8 +874,19 @@ fn transfer_tables_in_consistent_read<S: SnapshotSource>(
 }
 
 /// Transfer tables from a source snapshot to a fresh destination database.
-fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<(), ShareError> {
+fn transfer_tables<S: SnapshotSource>(
+    src: &S,
+    dst: &CanonicalDbConn,
+    phase: SnapshotProgressPhase,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<(), ShareError> {
     for table in KNOWN_TABLES {
+        let mut progress = SnapshotProgress {
+            phase,
+            table: Some(table.name),
+            rows_copied: 0,
+        };
+        observer(progress)?;
         create_dst_table(dst, table)?;
         let source_columns = source_columns(src, table.name)?;
         if source_columns.is_empty() {
@@ -856,11 +958,15 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                 .map_err(|e| ShareError::Sqlite {
                     message: format!("COMMIT for {} page failed: {e}", table.name),
                 })?;
+            progress.rows_copied = progress
+                .rows_copied
+                .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            observer(progress)?;
         }
     }
     // Shared deliveries and lazy receipts are part of the same source read
     // transaction, including the finalization rebuild of a prepared snapshot.
-    shared::transfer(src, dst)
+    shared::transfer(src, dst, phase, observer)
 }
 
 /// Create a table in the destination database.
@@ -1109,8 +1215,7 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
 /// 1. Create snapshot
 /// 2. Apply project scope
 /// 3. Scrub data
-/// 4. Rebuild a compact standalone database; published bundles also receive
-///    FTS, materialized views, and viewer performance indexes.
+/// 4. Compact storage; published shares also build viewer/search derivatives
 ///
 /// The source assumptions are the same as [`create_sqlite_snapshot`]: a
 /// complete, valid `FrankenSQLite` namespace pair is mandatory and the source
@@ -1130,30 +1235,6 @@ pub fn create_snapshot_context(
         purpose,
         &mut |_| {},
     )
-}
-
-/// A bounded, content-free description of work in the snapshot pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotPhase {
-    /// Create the private database copy through the appropriate source engine.
-    Snapshot,
-    /// Resolve project selectors and remove out-of-scope rows from the copy.
-    Filter,
-    /// Apply the preset and publication-specific credential redaction.
-    Scrub,
-    /// Rebuild storage; published bundles also receive viewer search artifacts.
-    Finalize,
-}
-
-/// Phase boundaries only: no database paths, selectors, SQL, or mailbox data.
-///
-/// A failed phase emits `Started` but not `Finished`; the returned error keeps
-/// its existing type and is handled by the caller. Observers should perform
-/// only bounded diagnostic work and must not mutate snapshot state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotPhaseEvent {
-    Started(SnapshotPhase),
-    Finished(SnapshotPhase),
 }
 
 /// Prepare a live-mailbox snapshot while observing its phase boundaries.
@@ -1183,6 +1264,44 @@ pub fn create_snapshot_context_with_observer(
         scrub_preset,
         purpose,
         observer,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Prepare a live snapshot with phase and bounded-copy progress checkpoints.
+///
+/// The observer can cancel by returning an error. It runs synchronously, never
+/// receives mailbox contents, and cannot interrupt an individual DB statement.
+/// As with [`create_snapshot_context`], the destination is caller-owned staging
+/// until the entire function succeeds and must not be published on an error.
+///
+/// # Errors
+///
+/// Returns snapshot preparation errors or the observer's cancellation error.
+pub fn create_snapshot_context_with_progress(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    rebuild_sqlite_snapshot_with_progress(
+        source,
+        snapshot_path,
+        true,
+        SnapshotSourceProfile::Runtime,
+        SnapshotDestinationProfile::Default,
+        SnapshotProgressPhase::Copy,
+        observer,
+    )?;
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        &mut |_| {},
+        observer,
     )
 }
 
@@ -1194,7 +1313,7 @@ pub enum SnapshotPurpose {
     Publish,
     /// A private archive (`am archive save`): the preset alone decides, so the
     /// lossless `archive` preset keeps tokens and a restore can still send.
-    /// Keeps restore state without building disposable viewer search artifacts.
+    /// Viewer-only search indexes and materialized tables are not built.
     PrivateArchive,
 }
 
@@ -1252,6 +1371,41 @@ pub fn create_private_canonical_snapshot_context_with_observer(
         scrub_preset,
         purpose,
         observer,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Prepare a private canonical snapshot with the same progress/cancellation
+/// contract as [`create_snapshot_context_with_progress`]. Live mailbox paths
+/// still require the guarded runtime-source API.
+///
+/// # Errors
+///
+/// Returns snapshot preparation errors or the observer's cancellation error.
+pub fn create_private_canonical_snapshot_context_with_progress(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    rebuild_sqlite_snapshot_with_progress(
+        source,
+        snapshot_path,
+        true,
+        SnapshotSourceProfile::CanonicalExport,
+        SnapshotDestinationProfile::Default,
+        SnapshotProgressPhase::Copy,
+        observer,
+    )?;
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        &mut |_| {},
+        observer,
     )
 }
 
@@ -1260,9 +1414,11 @@ fn finish_snapshot_context(
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
     purpose: SnapshotPurpose,
-    observer: &mut dyn FnMut(SnapshotPhaseEvent),
+    phase_observer: &mut dyn FnMut(SnapshotPhaseEvent),
+    observer: &mut SnapshotObserver<'_>,
 ) -> Result<SnapshotContext, ShareError> {
-    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Filter));
+    phase_observer(SnapshotPhaseEvent::Started(SnapshotPhase::Filter));
+    observer(SnapshotProgress::phase(SnapshotProgressPhase::Scope))?;
     // Scoping deletes the other projects first; keep their paths so the scrub
     // still redacts them where kept rows mention them.
     let all_project_paths = if project_filters.is_empty() {
@@ -1271,8 +1427,9 @@ fn finish_snapshot_context(
         crate::scope::project_paths_before_scope(snapshot_path)?
     };
     let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
-    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Filter));
-    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Scrub));
+    phase_observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Filter));
+    phase_observer(SnapshotPhaseEvent::Started(SnapshotPhase::Scrub));
+    observer(SnapshotProgress::phase(SnapshotProgressPhase::Scrub))?;
     let mut scrub_summary =
         crate::scrub::scrub_snapshot_redacting(snapshot_path, scrub_preset, &all_project_paths)?;
     if purpose == SnapshotPurpose::Publish {
@@ -1284,22 +1441,22 @@ fn finish_snapshot_context(
     if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
         crate::scrub::redact_scope_project_human_keys(&mut scope);
     }
-    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Scrub));
-    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Finalize));
+    phase_observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Scrub));
+    phase_observer(SnapshotPhaseEvent::Started(SnapshotPhase::Finalize));
+    // A restorable private archive needs the authoritative tables, not the
+    // static viewer's correlated recipient projections, attachment expansion,
+    // FTS index or analysis pass. Still rebuild the scoped/scrubbed image so
+    // deleted rows and redacted payload bytes cannot remain in free pages.
     let fts_enabled = match purpose {
-        SnapshotPurpose::Publish => crate::finalize_export_db(snapshot_path)?.fts_enabled,
         SnapshotPurpose::PrivateArchive => {
-            // Restore consumes the base mailbox tables and builds runtime
-            // indexes itself. Building FTS and viewer materialized tables here
-            // adds mailbox-wide joins and per-attachment writes to every backup
-            // without preserving any additional mailbox authority (GH#365).
-            // Keep the compact canonical rebuild: scoping/scrubbing can leave
-            // private data in freed pages or committed data in SQLite sidecars.
-            crate::finalize_snapshot_for_export(snapshot_path)?;
+            crate::finalize::finalize_snapshot_with_progress(snapshot_path, observer)?;
             false
         }
+        SnapshotPurpose::Publish => {
+            crate::finalize::finalize_export_with_progress(snapshot_path, observer)?.fts_enabled
+        }
     };
-    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize));
+    phase_observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize));
 
     Ok(SnapshotContext {
         snapshot_path: snapshot_path.to_path_buf(),
@@ -1669,6 +1826,16 @@ mod tests {
                         .unwrap();
                     assert_eq!(overview.len(), original.len());
                 }
+                let bytes = std::fs::read(&snapshot).unwrap();
+                let private_payload = b"private recovery payload";
+                assert_eq!(
+                    bytes
+                        .windows(private_payload.len())
+                        .any(|part| part == private_payload),
+                    purpose == SnapshotPurpose::PrivateArchive
+                        && matches!(preset, crate::ScrubPreset::Archive),
+                    "compaction must remove scrubbed payload bytes for {purpose:?}/{preset:?}",
+                );
             }
         }
     }
@@ -1814,6 +1981,332 @@ mod tests {
             };
             assert_eq!(unchanged, original, "the source remains authoritative");
         }
+    }
+
+    fn seed_large_private_archive(path: &Path) -> usize {
+        let conn = private_source(path);
+        seed_reply_metadata_source(&conn, false);
+        conn.execute_raw(
+            "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+             UPDATE agents SET registration_token='restorable-registration-token'; \
+             CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, \
+                 read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); \
+             BEGIN IMMEDIATE",
+        )
+        .unwrap();
+        let count = 2 * SNAPSHOT_PAGE_ROWS + 7;
+        for id in 1..=i64::try_from(count).unwrap() {
+            if id > 6 {
+                conn.execute_sync(
+                    "INSERT INTO messages(id,project_id,sender_id,body_md,attachments,archive_metadata_json) \
+                     VALUES(?1,1,1,?2,?3,?4)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(format!("message body {id}")),
+                        Value::Text(format!("[{{\"path\":\"attachments/item-{id}.bin\"}}]")),
+                        Value::Text(format!("{{\"reply_to\":{}}}", id - 1)),
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute_sync(
+                "INSERT INTO message_recipients VALUES(?1,1,'to',?2,?3)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(id * 2),
+                    Value::BigInt(id * 3),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        count
+    }
+
+    #[test]
+    fn private_archive_progress_bounds_copy_pages_without_building_viewer_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("large-source.sqlite3");
+        let snapshot = dir.path().join("large-archive.sqlite3");
+        let count = seed_large_private_archive(&source);
+        let original = std::fs::read(&source).unwrap();
+        let mut events = Vec::new();
+        let context = create_private_canonical_snapshot_context_with_progress(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!context.fts_enabled);
+        let mut phases = events.iter().map(|event| event.phase).collect::<Vec<_>>();
+        phases.dedup();
+        assert_eq!(
+            phases,
+            [
+                SnapshotProgressPhase::Copy,
+                SnapshotProgressPhase::Scope,
+                SnapshotProgressPhase::Scrub,
+                SnapshotProgressPhase::Compact
+            ]
+        );
+        for phase in [SnapshotProgressPhase::Copy, SnapshotProgressPhase::Compact] {
+            for table in ["messages", "message_recipients"] {
+                let counts = events
+                    .iter()
+                    .filter(|event| event.phase == phase && event.table == Some(table))
+                    .map(|event| event.rows_copied)
+                    .collect::<Vec<_>>();
+                assert_eq!(counts, [0, 1000, 2000, 2007]);
+            }
+        }
+        let conn = private_source(&snapshot);
+        let rows = conn
+            .query_sync(
+                "SELECT id,body_md,attachments,archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), count);
+        for (index, row) in rows.iter().enumerate().skip(6) {
+            let id = i64::try_from(index + 1).unwrap();
+            assert_eq!(row.get_named::<i64>("id").unwrap(), id);
+            assert_eq!(
+                row.get_named::<String>("body_md").unwrap(),
+                format!("message body {id}")
+            );
+            assert_eq!(
+                row.get_named::<String>("attachments").unwrap(),
+                format!("[{{\"path\":\"attachments/item-{id}.bin\"}}]"),
+            );
+            assert_eq!(
+                row.get_named::<String>("archive_metadata_json").unwrap(),
+                format!("{{\"reply_to\":{}}}", id - 1),
+            );
+        }
+        let receipts = conn
+            .query_sync(
+                "SELECT message_id, read_ts, ack_ts FROM message_recipients ORDER BY message_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(receipts.len(), count);
+        for (index, row) in receipts.iter().enumerate() {
+            let id = i64::try_from(index + 1).unwrap();
+            assert_eq!(row.get_named::<i64>("message_id").unwrap(), id);
+            assert_eq!(
+                row.get_named::<String>("read_ts").unwrap(),
+                (id * 2).to_string()
+            );
+            assert_eq!(
+                row.get_named::<String>("ack_ts").unwrap(),
+                (id * 3).to_string()
+            );
+        }
+        assert_eq!(
+            conn.query_sync("SELECT registration_token FROM agents WHERE id=1", &[])
+                .unwrap()[0]
+                .get_named::<String>("registration_token")
+                .unwrap(),
+            "restorable-registration-token",
+        );
+        assert!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'fts_%' OR name LIKE '%_mv'",
+                &[],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA quick_check", &[]).unwrap()[0]
+                .get_as::<String>(0)
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn snapshot_cancel_after_copy_page_does_not_publish_and_releases_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cancel-source.sqlite3");
+        let snapshot = dir.path().join("cancel-copy.sqlite3");
+        seed_large_private_archive(&source);
+        let original = std::fs::read(&source).unwrap();
+        let mut stopped = false;
+        let error = create_private_canonical_snapshot_context_with_progress(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+            &mut |event| {
+                if event.phase == SnapshotProgressPhase::Copy
+                    && event.table == Some("messages")
+                    && event.rows_copied == 1000
+                {
+                    stopped = true;
+                    return Err(ShareError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled by test observer",
+                    )));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(stopped);
+        assert!(
+            matches!(error, ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert!(!snapshot.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        private_source(&source)
+            .execute_raw("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+        // The same destination can be used after cancellation; no partial
+        // image or transaction from the cancelled attempt is reusable authority.
+        create_private_canonical_sqlite_snapshot(&source, &snapshot, false).unwrap();
+        assert_eq!(
+            private_source(&snapshot)
+                .query_sync("SELECT count(*) AS n FROM messages", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            2007,
+        );
+    }
+
+    #[test]
+    fn snapshot_cancel_during_compaction_preserves_the_prepared_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("compact-source.sqlite3");
+        let snapshot = dir.path().join("compact-copy.sqlite3");
+        seed_large_private_archive(&source);
+        create_private_canonical_sqlite_snapshot(&source, &snapshot, false).unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        let error = crate::finalize::finalize_snapshot_with_progress(&snapshot, &mut |event| {
+            if event.table == Some("messages") && event.rows_copied == 1000 {
+                return Err(ShareError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled while compacting",
+                )));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_observer_cancellation_rolls_back_the_source_read_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("held-source.sqlite3"));
+        seed_reply_metadata_source(&source, false);
+        let destination = private_source(&dir.path().join("held-copy.sqlite3"));
+        let error = transfer_tables_with_progress(
+            &source,
+            &destination,
+            SnapshotProgressPhase::Copy,
+            &mut |event| {
+                if event.table == Some("messages") && event.rows_copied > 0 {
+                    return Err(ShareError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled source read",
+                    )));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        // Keep the source connection alive: Drop cannot mask a leaked read
+        // transaction. A fresh transaction must work immediately after cancel.
+        source.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!(reply_metadata(&source).len(), 6);
+    }
+
+    #[test]
+    #[ignore = "manual same-fixture private archive versus previous viewer-finalization path"]
+    fn private_archive_and_viewer_baseline_performance() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("benchmark-source.sqlite3");
+        let archive = dir.path().join("benchmark-archive.sqlite3");
+        let baseline = dir.path().join("benchmark-viewer-baseline.sqlite3");
+        let messages = seed_large_private_archive(&source);
+
+        // The incumbent archive path in the same invocation: snapshot, scope,
+        // archive scrub and the full static-viewer finalization. This preserves
+        // private fields exactly; using Publish would clear credentials and
+        // would not be an equivalent baseline.
+        let started = std::time::Instant::now();
+        create_private_canonical_sqlite_snapshot(&source, &baseline, true).unwrap();
+        crate::apply_project_scope(&baseline, &[]).unwrap();
+        crate::scrub_snapshot(&baseline, crate::ScrubPreset::Archive).unwrap();
+        let old_finalize = crate::finalize_export_db(&baseline).unwrap();
+        let baseline_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let context = create_private_canonical_snapshot_context(
+            &source,
+            &archive,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+        )
+        .unwrap();
+        let archive_elapsed = started.elapsed();
+        assert!(old_finalize.fts_enabled);
+        assert!(!context.fts_enabled);
+        let previous = private_source(&baseline);
+        let current = private_source(&archive);
+        for table in KNOWN_TABLES {
+            let sql = format!(
+                "SELECT {} FROM \"{}\" ORDER BY {}",
+                quoted_column_list(table.columns),
+                table.name,
+                quoted_column_list(table.primary_key_columns),
+            );
+            let values = |connection: &CanonicalDbConn| {
+                connection
+                    .query_sync(&sql, &[])
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                row.get_by_name(column)
+                                    .cloned()
+                                    .expect("known snapshot column")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values(&current), values(&previous), "{}", table.name);
+        }
+        eprintln!(
+            "archive snapshot comparison: messages={messages} baseline_ms={} archive_ms={} baseline_bytes={} archive_bytes={}",
+            baseline_elapsed.as_millis(),
+            archive_elapsed.as_millis(),
+            std::fs::metadata(&baseline).unwrap().len(),
+            std::fs::metadata(&archive).unwrap().len(),
+        );
+        // No wall-time threshold: record both measurements; correctness and
+        // elimination of unnecessary derivatives are deterministic assertions.
     }
 
     #[test]

@@ -7,7 +7,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use super::{CanonicalDbConn, KnownTable, ShareError, SnapshotSource, Value, create_dst_table};
+use super::{
+    CanonicalDbConn, KnownTable, ShareError, SnapshotObserver, SnapshotProgress,
+    SnapshotProgressPhase, SnapshotSource, Value, create_dst_table,
+};
 
 const PAGE_SIZE: usize = 1000;
 const TABLES: &[KnownTable] = &[
@@ -229,11 +232,22 @@ fn values_and_key(
 /// The parent owns one source read transaction and publishes only on success.
 /// Each page holds at most 1000 compact rows; the composite cursor can resume
 /// inside a single delivery's receipt population. No source write is performed.
-pub(super) fn transfer(src: &impl SnapshotSource, dst: &CanonicalDbConn) -> Result<(), ShareError> {
+pub(super) fn transfer(
+    src: &impl SnapshotSource,
+    dst: &CanonicalDbConn,
+    phase: SnapshotProgressPhase,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<(), ShareError> {
     if !source_has_shared_schema(src)? {
         return Ok(());
     }
     for table in TABLES {
+        let mut progress = SnapshotProgress {
+            phase,
+            table: Some(table.name),
+            rows_copied: 0,
+        };
+        observer(progress)?;
         create_dst_table(dst, table)?;
         let columns = super::quoted_column_list(table.columns);
         // Never replace an already-copied receipt: a duplicate is evidence of
@@ -271,6 +285,10 @@ pub(super) fn transfer(src: &impl SnapshotSource, dst: &CanonicalDbConn) -> Resu
                 .map_err(|error| ShareError::Sqlite {
                     message: format!("commit shared snapshot page: {error}"),
                 })?;
+            progress.rows_copied = progress
+                .rows_copied
+                .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            observer(progress)?;
         }
     }
     Ok(())
@@ -390,6 +408,8 @@ mod tests {
             (ScrubPreset::Standard, SnapshotPurpose::Publish),
             (ScrubPreset::Strict, SnapshotPurpose::Publish),
             (ScrubPreset::Archive, SnapshotPurpose::Publish),
+            (ScrubPreset::Standard, SnapshotPurpose::PrivateArchive),
+            (ScrubPreset::Strict, SnapshotPurpose::PrivateArchive),
             (ScrubPreset::Archive, SnapshotPurpose::PrivateArchive),
         ] {
             let directory = tempfile::tempdir().unwrap();
@@ -439,7 +459,7 @@ mod tests {
                     &copied,
                     "SELECT COUNT(*) FROM agents WHERE registration_token IS NOT NULL"
                 ),
-                if purpose == SnapshotPurpose::PrivateArchive {
+                if purpose == SnapshotPurpose::PrivateArchive && archive {
                     3
                 } else {
                     0
