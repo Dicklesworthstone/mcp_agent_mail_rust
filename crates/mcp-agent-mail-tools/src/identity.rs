@@ -1576,7 +1576,7 @@ pub struct HealthCheckResponse {
     pub verdicts: HealthVerdicts,
     /// Names of the verdicts that are not green, worst-first, so consumers can
     /// point directly at the failing subsystem.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failing_verdicts: Vec<String>,
     /// Every input that can raise `health_level` beyond the verdict roll-up
     /// (GH#300): the roll-up itself, live pressure, archive materialization
@@ -1691,7 +1691,7 @@ pub struct DiskHealthResponse {
     pub warning_threshold_mb: u64,
     pub critical_threshold_mb: u64,
     pub fatal_threshold_mb: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
 }
 
