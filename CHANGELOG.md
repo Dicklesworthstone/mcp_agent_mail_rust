@@ -173,12 +173,14 @@ workspace test suite is not green on `main` (see Known issues).
   - **On `main` at 05af6966 with the 5 s wait,** three paired runs at host load 7–14 refused none of
     2,658 grants (v0.3.39: none). Reservation p99 was 0.9–2.2 s, against 12.1–15.4 s for v0.3.39.
     No fence hold reached 2 s.
-  - **At saturation,** paced 60 agents at a 2 s period, still about 7.6% of grants are refused.
+  - **At saturation,** paced 60 agents at a 2 s period, about 4–7% of grants are refused.
     - In those runs the fence is busy about 97% of the time, in holds of at most about 220 ms. Refusals
       there are a matter of admission fairness, not of long holds.
     - On beb193c5 two such runs refused 16.5% and 23.7%, failing br-9ott5's 1% probe.
     - Give-way (gw29, three paired windows) cut that from 202.9 to 75.7 per 1,000. Sends, send latency
       and the below-saturation refusal rate did not get worse.
+    - On 98c7a0e4, with give-way, br-9ott5's own probe (one 60-agent arm, 2 s period) refused 5.4% and
+      7.2% (p2probe2), and three more such runs 4.1–7.0% (df26's control arm).
   - **Not yet re-measured:** the heavily loaded host on the newer base.
   - **Tracked in** br-9ott5 and br-kp1in.47.
 - **Swarm load.** Archive convergence after load and write-behind progress are still open
