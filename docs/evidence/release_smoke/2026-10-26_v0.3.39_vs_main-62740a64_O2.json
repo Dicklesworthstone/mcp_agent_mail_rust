@@ -1,0 +1,892 @@
+{
+  "schema_version": 3,
+  "started_at": "2026-10-26T02:48:33Z",
+  "host": "thinkstation1",
+  "cpu_governors": [
+    "powersave"
+  ],
+  "soak_secs": 300,
+  "converge_secs": 300,
+  "fetch_inbox_p99_budget_s": 2.0,
+  "swarm_agents": 60,
+  "swarm_secs": 480,
+  "swarm_tool_p99_budget_s": 5.0,
+  "loadavg_start": [
+    "8.99",
+    "14.87",
+    "21.38"
+  ],
+  "arms": [
+    {
+      "arm": "candidate",
+      "binary": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rel0339/am",
+      "binary_sha256": "aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805",
+      "binary_target": "x86_64-static",
+      "loadavg_start": [
+        "8.99",
+        "14.87",
+        "21.38"
+      ],
+      "phases": {
+        "flow": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "ensure_project",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "register two agents",
+              "ok": true,
+              "detail": "['FuchsiaWren', 'RoseAspen']"
+            },
+            {
+              "name": "invalid agent name refused",
+              "ok": true,
+              "detail": "{'error': {'type': 'INVALID_AGENT_NAME', 'message': \"Invalid agent name format: 'not a valid name!'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name.\", 'recoverable': True, 'data': {'provided': 'not a valid name!'}}}"
+            },
+            {
+              "name": "reserve src/auth/**",
+              "ok": true,
+              "detail": "{'granted': [{'id': 1, 'path_pattern': 'src/auth/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-26T03:48:36.182511Z'}], 'conflicts': []}"
+            },
+            {
+              "name": "symmetric glob conflict",
+              "ok": true,
+              "detail": "{'granted': [], 'conflicts': [{'path': 'src/auth/login.rs', 'holders': [{'agent': 'FuchsiaWren', 'path_pattern': 'src/auth/**', 'exclusive': True, 'expires_ts': '2026-10-26T03:48:36.182511Z'}]}]}"
+            },
+            {
+              "name": "send_message",
+              "ok": true,
+              "detail": "{'deliveries': [{'project': '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/candidate-20261025T224833-1780220/proj1', 'payload': {'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'body_md': 'hi', 'importance': 'normal', 'ack_required': True, 'created_ts': '2026-10-26T02:48:36.40525"
+            },
+            {
+              "name": "fetch_inbox sees message",
+              "ok": true,
+              "detail": "[{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'FuchsiaWren', 'created_ts': '2026-10-26T02:48:36.405250Z', 'read_ts': '2026-10-26T02:48:36.489903Z', 'kind': 'to', 'attachments': []}, {'id': 1, 'project_id': 1, 'sender_id': 1, 'thread_id': None, 'topic': None, 'subject': 'Contact approved: "
+            },
+            {
+              "name": "acknowledge_message",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "reply_message",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "delivery receipt persisted",
+              "ok": true,
+              "detail": "{'message_id': 2, 'project_id': 1, 'persisted': True, 'persisted_at': '2026-10-26T02:48:36.405250Z', 'recipients': [{'recipient': 'RoseAspen', 'kind': 'to', 'persisted': True, 'signaled': False, 'signal_receipts': [], 'acknowledged': True, 'acknowledged_at': '2026-10-26T02:48:36.542795Z'}]}"
+            },
+            {
+              "name": "search_messages finds the message",
+              "ok": true,
+              "detail": "{'result': [{'id': 2, 'subject': 'smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-26T02:48:36.405250Z', 'thread_id': 'smoke-1', 'from': 'FuchsiaWren', 'to': ['RoseAspen'], 'cc': []}, {'id': 3, 'subject': 'Re: smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-26T02:48:36.578887Z', 'thread_id': 'smoke-1', 'from': 'RoseAspen', 'to': ['FuchsiaWren'], '"
+            },
+            {
+              "name": "summarize_thread",
+              "ok": true,
+              "detail": "{'thread_id': 'smoke-1', 'summary': {'participants': ['FuchsiaWren', 'RoseAspen'], 'key_points': [], 'action_items': [], 'total_messages': 2, 'open_actions': 0, 'done_actions': 0, 'mentions': []}, 'examples': []}"
+            },
+            {
+              "name": "resource://inbox lists the message",
+              "ok": true,
+              "detail": "{'agent': 'RoseAspen', 'count': 2, 'messages': [{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'FuchsiaWren', 'created_ts': '2026-10-26T02:48:36.405250Z', 'kind': 'to', 'attachments': [], 'commit': {'authored_ts': None, 'deletions': 0, 'diff_summary': {'excerpt': [], 'hunks': 0}, 'hexsha': "
+            },
+            {
+              "name": "broadcast refused",
+              "ok": true,
+              "detail": "{'code': -32000, 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'data': {'error': {'type': 'BROADCAST_DISABLED', 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'recoverable': True, 'data': {'argument': 'broadcast'}}}}"
+            },
+            {
+              "name": "idempotent replay",
+              "ok": true,
+              "detail": "{'granted': [{'id': 2, 'path_pattern': 'docs/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-26T02:58:37.205748Z'}], 'conflicts': [], 'idempotent_replay': True}"
+            },
+            {
+              "name": "idempotency key conflict",
+              "ok": true,
+              "detail": "{'error': {'type': 'IDEMPOTENCY_KEY_CONFLICT', 'message': \"idempotency_key 'smoke-k1' for tool 'file_reservation_paths' was already used with a different payload. The original request stands; do not retry a changed payload under the same key. Use a fresh idempotency_key for a genuinely new request.\", 'recoverable': False, 'data': {'tool': 'file_reservation_paths', 'idempotency_key': 'smoke-k1', 'o"
+            },
+            {
+              "name": "release",
+              "ok": true,
+              "detail": "{'released': 1, 'released_at': '2026-10-26T02:48:37.340540Z', 'released_ids': [1]}"
+            },
+            {
+              "name": "re-grant after release",
+              "ok": true,
+              "detail": "{'granted': [{'id': 3, 'path_pattern': 'src/auth/login.rs', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-26T02:58:37.349608Z'}], 'conflicts': []}"
+            },
+            {
+              "name": "inbox events cursor",
+              "ok": true,
+              "detail": "{'events': [{'cursor': 1, 'message_id': 1, 'kind': 'to', 'delivered_ts': '2026-10-26T02:48:36.361237Z', 'subject': 'Contact approved: FuchsiaWren -> RoseAspen', 'from': 'FuchsiaWren', 'importance': 'normal', 'ack_required': False}, {'cursor': 2, 'message_id': 2, 'kind': 'to', 'delivered_ts': '2026-10-26T02:48:36.405250Z', 'subject': 'smoke', 'from': 'FuchsiaWren', 'importance': 'normal', 'ack_requ"
+            }
+          ]
+        },
+        "cross_project": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "register peer in the second project",
+              "ok": true,
+              "detail": "{'id': 3, 'name': 'PurpleBridge', 'program': 'gemini-cli', 'model': 'smoke', 'task_description': '', 'inception_ts': '2026-10-26T02:48:37.474290Z', 'last_active_ts': '2026-10-26T02:48:37.474290Z', 'project_id': 2, 'attachments_policy': 'auto', 'reaper_exempt': False, 'capabilities': ['send_message', 'fetch_inbox', 'file_reservation_paths', 'acknowledge_message'], 'registration_token': '<redacted>'"
+            },
+            {
+              "name": "cross-project contact handshake",
+              "ok": true,
+              "detail": "{'request': {'from': 'FuchsiaWren', 'from_project': '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/candidate-20261025T224833-1780220/proj1', 'to': 'PurpleBridge', 'to_project': '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/candidate-20261025T224833-1780220/proj2', "
+            },
+            {
+              "name": "no same-name placeholder in the sender's project",
+              "ok": true,
+              "detail": "['RoseAspen', 'FuchsiaWren']"
+            },
+            {
+              "name": "delivered to the peer's project or refused with CROSS_PROJECT_RECIPIENT",
+              "ok": true,
+              "detail": "{'send': {'error': {'type': 'CROSS_PROJECT_RECIPIENT', 'message': \"Recipient 'PurpleBridge' is not registered in this project; it is your contact in project '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/candidate-20261025T224833-1780220/proj2'. A plain agent name only addresses this project, so nothing was sent (auto-registering a"
+            }
+          ],
+          "outcome": "refused"
+        },
+        "storm": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "all storm sends acknowledged",
+              "ok": true,
+              "detail": "240/240 errors=[]"
+            },
+            {
+              "name": "acknowledged ids distinct",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "zero RESOURCE_BUSY",
+              "ok": true,
+              "detail": "0/240"
+            }
+          ],
+          "offered": 240,
+          "p50_s": 0.3503148555755615,
+          "p99_s": 0.8517377376556396,
+          "errors": []
+        },
+        "crash": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "all 266 acknowledged ids survive SIGKILL",
+              "ok": true,
+              "detail": "missing=[]"
+            },
+            {
+              "name": "archive converges to DB without client reads (<= 300s)",
+              "ok": true,
+              "detail": "archive=513 db=513"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            }
+          ],
+          "acked": 266,
+          "server_integrity_verdict_after_restart": {
+            "status": "green",
+            "detail": "full integrity_check passed at 1792982930573067; latest integrity_check also passed",
+            "critical": true
+          }
+        },
+        "soak": {
+          "verdict": "FAIL",
+          "checks": [
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no EMFILE (server log and client responses)",
+              "ok": true,
+              "detail": "[]"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": false,
+              "detail": "samples=30 bad=[{'t': 1792983074, 'drained_total': 134, 'depth_at_open': 72, 'depth_at_close': 399}, {'t': 1792983094, 'drained_total': 388, 'depth_at_open': 468, 'depth_at_close': 868}, {'t': 1792983115, 'drained_total': 644, 'depth_at_open': 955, 'depth_at_close': 1286}, {'t': 1792983135, 'drained_total': 900, 'depth_at_open': 1367, 'depth_at_close': 1698}, {'t': 1792983155, 'drained_total': 115"
+            },
+            {
+              "name": "health archive_lag stall verdict agrees with the WBQ counters",
+              "ok": false,
+              "detail": "lag_samples=30 disagree=[{'t': 1792983176, 'want': 'not stalled', 'drained': [1156, 1412]}, {'t': 1792983267, 'want': 'not stalled', 'drained': [2436, 2692]}]"
+            },
+            {
+              "name": "fetch_inbox p99 <= 2.0s under write load",
+              "ok": true,
+              "detail": "p99=0.19800543785095215 n=13473"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "zero HTTP server restarts",
+              "ok": true,
+              "detail": "{'alive': True, 'markers': []}"
+            },
+            {
+              "name": "no archive re-root",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "archive converges after load stops",
+              "ok": true,
+              "detail": "archive=8779 db=8779"
+            }
+          ],
+          "counts": {
+            "send": 8266,
+            "read": 13473,
+            "search": 648,
+            "health": 270,
+            "err": 1
+          },
+          "sqlite_fds_max": 2,
+          "fetch_inbox_p99_s": 0.19800543785095215,
+          "fetch_inbox_samples": 13473,
+          "wbq_samples": 30,
+          "server_threads_end": 70
+        },
+        "swarm": {
+          "verdict": "FAIL",
+          "checks": [
+            {
+              "name": "register 60 swarm agents",
+              "ok": true,
+              "detail": "60/60"
+            },
+            {
+              "name": "send_message p99 <= 5.0s at 60 agents",
+              "ok": true,
+              "detail": "{'n': 7587, 'p50_s': 0.9128272533416748, 'p99_s': 3.666224241256714, 'max_s': 5.56639289855957}"
+            },
+            {
+              "name": "file_reservation_paths p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 2237, 'p50_s': 3.1614270210266113, 'p99_s': 10.377390384674072, 'max_s': 14.131672143936157}"
+            },
+            {
+              "name": "release_file_reservations p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 2202, 'p50_s': 3.16232967376709, 'p99_s': 11.348722696304321, 'max_s': 16.580440759658813}"
+            },
+            {
+              "name": "zero 30 s dispatch timeouts",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "zero tool errors",
+              "ok": false,
+              "detail": "{'fetch_inbox': {'RESOURCE_BUSY': 1}, 'file_reservation_paths': {'RESOURCE_BUSY': 1}}"
+            },
+            {
+              "name": "no connection errors outside the SIGKILL window",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": false,
+              "detail": "samples=[23, 22] unobserved=0 stalled=[{'t': 1792983528, 'drained_total': 8585, 'depth_at_open': 159, 'depth_at_close': 385}, {'t': 1792983549, 'drained_total': 8841, 'depth_at_open': 385, 'depth_at_close': 609}, {'t': 1792983569, 'drained_total': 9097, 'depth_at_open': 582, 'depth_at_close': 756}, {'t': 1792983590, 'drained_total': 9353, 'depth_at_open': 742, 'depth_at_close': 947}, {'t': 1792983"
+            },
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "archive converges to DB after the swarm without client reads (<= 300s)",
+              "ok": false,
+              "detail": "archive=15244 db=16844 last=sqlite is ahead of the archive by 1600 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=5, agents=63, messages=15244, db projects=5, agents=63, messages=16844"
+            },
+            {
+              "name": "zero HTTP server restarts and no EMFILE",
+              "ok": true,
+              "detail": "{'markers': [], 'emfile': False}"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            },
+            {
+              "name": "all 7587 acknowledged swarm sends survive SIGKILL",
+              "ok": true,
+              "detail": "lost=[]"
+            }
+          ],
+          "agents": 60,
+          "secs": 480,
+          "agents_registered": 60,
+          "load_secs": 490.0,
+          "kill_at_s": 246.3,
+          "restart_s": 6.19,
+          "acked_sends": 7587,
+          "sends_per_s": 15.48,
+          "tools": {
+            "send_message": {
+              "n": 7587,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 8,
+              "p50_s": 0.9128272533416748,
+              "p99_s": 3.666224241256714,
+              "max_s": 5.56639289855957
+            },
+            "fetch_inbox": {
+              "n": 7585,
+              "timeouts": 0,
+              "tool_errors": {
+                "RESOURCE_BUSY": 1
+              },
+              "conn_errors": 0,
+              "kill_window": 2,
+              "p50_s": 0.19460320472717285,
+              "p99_s": 1.1441082954406738,
+              "max_s": 3.064455270767212
+            },
+            "acknowledge_message": {
+              "n": 2656,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 0,
+              "p50_s": 0.03207898139953613,
+              "p99_s": 0.9898333549499512,
+              "max_s": 3.6138052940368652
+            },
+            "search_messages": {
+              "n": 756,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 6,
+              "p50_s": 0.45664095878601074,
+              "p99_s": 2.5491364002227783,
+              "max_s": 4.4395856857299805
+            },
+            "file_reservation_paths": {
+              "n": 2237,
+              "timeouts": 0,
+              "tool_errors": {
+                "RESOURCE_BUSY": 1
+              },
+              "conn_errors": 0,
+              "kill_window": 15,
+              "p50_s": 3.1614270210266113,
+              "p99_s": 10.377390384674072,
+              "max_s": 14.131672143936157
+            },
+            "release_file_reservations": {
+              "n": 2202,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 50,
+              "p50_s": 3.16232967376709,
+              "p99_s": 11.348722696304321,
+              "max_s": 16.580440759658813
+            }
+          },
+          "sqlite_fds_max": 2,
+          "zombies_max": 0,
+          "wbq_samples": [
+            23,
+            22
+          ],
+          "stalled_windows": 22
+        }
+      },
+      "binary_version": "am 0.3.39",
+      "server_exe_sha256": "aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805",
+      "server_nofile_soft_hard": [
+        "65536",
+        "1048576"
+      ],
+      "server_threads_start": 24,
+      "clean_shutdown": true,
+      "server_log_walfec_lines": 6,
+      "loadavg_end": [
+        "8.97",
+        "13.09",
+        "16.34"
+      ],
+      "verdict": "FAIL"
+    },
+    {
+      "arm": "control",
+      "binary": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/main_62740a64/am",
+      "binary_sha256": "0180807ecf0804c305a797a2c886ef563ddc8930bcb04efea03d16a6ad91c5ec",
+      "binary_target": "x86_64-dynamic",
+      "loadavg_start": [
+        "8.97",
+        "13.09",
+        "16.34"
+      ],
+      "phases": {
+        "flow": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "ensure_project",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "register two agents",
+              "ok": true,
+              "detail": "['GoldenTower', 'SandySwan']"
+            },
+            {
+              "name": "invalid agent name refused",
+              "ok": true,
+              "detail": "{'error': {'type': 'INVALID_AGENT_NAME', 'message': \"Invalid agent name format: 'not a valid name!'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name.\", 'recoverable': True, 'data': {'provided': 'not a valid name!'}}}"
+            },
+            {
+              "name": "reserve src/auth/**",
+              "ok": true,
+              "detail": "{'granted': [{'id': 1, 'path_pattern': 'src/auth/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-26T04:11:56.622218Z'}], 'conflicts': []}"
+            },
+            {
+              "name": "symmetric glob conflict",
+              "ok": true,
+              "detail": "{'granted': [], 'conflicts': [{'path': 'src/auth/login.rs', 'holders': [{'agent': 'GoldenTower', 'path_pattern': 'src/auth/**', 'exclusive': True, 'expires_ts': '2026-10-26T04:11:56.622218Z'}]}]}"
+            },
+            {
+              "name": "send_message",
+              "ok": true,
+              "detail": "{'deliveries': [{'project': '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/control-20261025T231154-1780220/proj1', 'payload': {'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'body_md': 'hi', 'importance': 'normal', 'ack_required': True, 'created_ts': '2026-10-26T03:11:56.841112Z"
+            },
+            {
+              "name": "fetch_inbox sees message",
+              "ok": true,
+              "detail": "[{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'GoldenTower', 'created_ts': '2026-10-26T03:11:56.841112Z', 'read_ts': '2026-10-26T03:11:56.905380Z', 'kind': 'to', 'attachments': []}, {'id': 1, 'project_id': 1, 'sender_id': 1, 'thread_id': None, 'topic': None, 'subject': 'Contact approved: "
+            },
+            {
+              "name": "acknowledge_message",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "reply_message",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "delivery receipt persisted",
+              "ok": true,
+              "detail": "{'message_id': 2, 'project_id': 1, 'persisted': True, 'persisted_at': '2026-10-26T03:11:56.841112Z', 'recipients': [{'recipient': 'SandySwan', 'kind': 'to', 'persisted': True, 'signaled': False, 'signal_receipts': [], 'acknowledged': True, 'acknowledged_at': '2026-10-26T03:11:56.940327Z'}]}"
+            },
+            {
+              "name": "search_messages finds the message",
+              "ok": true,
+              "detail": "{'result': [{'id': 2, 'subject': 'smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-26T03:11:56.841112Z', 'thread_id': 'smoke-1', 'from': 'GoldenTower', 'to': ['SandySwan'], 'cc': []}, {'id': 3, 'subject': 'Re: smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-26T03:11:56.978212Z', 'thread_id': 'smoke-1', 'from': 'SandySwan', 'to': ['GoldenTower'], '"
+            },
+            {
+              "name": "summarize_thread",
+              "ok": true,
+              "detail": "{'thread_id': 'smoke-1', 'summary': {'participants': ['GoldenTower', 'SandySwan'], 'key_points': [], 'action_items': [], 'total_messages': 2, 'open_actions': 0, 'done_actions': 0, 'mentions': []}, 'examples': []}"
+            },
+            {
+              "name": "resource://inbox lists the message",
+              "ok": true,
+              "detail": "{'agent': 'SandySwan', 'count': 2, 'messages': [{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'GoldenTower', 'created_ts': '2026-10-26T03:11:56.841112Z', 'kind': 'to', 'attachments': [], 'commit': {'authored_ts': None, 'deletions': 0, 'diff_summary': {'excerpt': [], 'hunks': 0}, 'hexsha': "
+            },
+            {
+              "name": "broadcast refused",
+              "ok": true,
+              "detail": "{'code': -32000, 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'data': {'error': {'type': 'BROADCAST_DISABLED', 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'recoverable': True, 'data': {'argument': 'broadcast'}}}}"
+            },
+            {
+              "name": "idempotent replay",
+              "ok": true,
+              "detail": "{'granted': [{'id': 2, 'path_pattern': 'docs/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-26T03:21:57.247648Z'}], 'conflicts': [], 'idempotent_replay': True}"
+            },
+            {
+              "name": "idempotency key conflict",
+              "ok": true,
+              "detail": "{'error': {'type': 'IDEMPOTENCY_KEY_CONFLICT', 'message': \"idempotency_key 'smoke-k1' for tool 'file_reservation_paths' was already used with a different payload. The original request stands; do not retry a changed payload under the same key. Use a fresh idempotency_key for a genuinely new request.\", 'recoverable': False, 'data': {'tool': 'file_reservation_paths', 'idempotency_key': 'smoke-k1', 'o"
+            },
+            {
+              "name": "release",
+              "ok": true,
+              "detail": "{'released': 1, 'released_at': '2026-10-26T03:11:57.371495Z', 'released_ids': [1]}"
+            },
+            {
+              "name": "re-grant after release",
+              "ok": true,
+              "detail": "{'granted': [{'id': 3, 'path_pattern': 'src/auth/login.rs', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-26T03:21:57.377260Z'}], 'conflicts': []}"
+            },
+            {
+              "name": "inbox events cursor",
+              "ok": true,
+              "detail": "{'events': [{'cursor': 1, 'message_id': 1, 'kind': 'to', 'delivered_ts': '2026-10-26T03:11:56.797008Z', 'subject': 'Contact approved: GoldenTower -> SandySwan', 'from': 'GoldenTower', 'importance': 'normal', 'ack_required': False}, {'cursor': 2, 'message_id': 2, 'kind': 'to', 'delivered_ts': '2026-10-26T03:11:56.841112Z', 'subject': 'smoke', 'from': 'GoldenTower', 'importance': 'normal', 'ack_requ"
+            }
+          ]
+        },
+        "cross_project": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "register peer in the second project",
+              "ok": true,
+              "detail": "{'id': 3, 'name': 'SilverKite', 'program': 'gemini-cli', 'model': 'smoke', 'task_description': '', 'inception_ts': '2026-10-26T03:11:57.492002Z', 'last_active_ts': '2026-10-26T03:11:57.492002Z', 'project_id': 2, 'attachments_policy': 'auto', 'reaper_exempt': False, 'capabilities': ['send_message', 'fetch_inbox', 'file_reservation_paths', 'acknowledge_message'], 'registration_token': '<redacted>'}"
+            },
+            {
+              "name": "cross-project contact handshake",
+              "ok": true,
+              "detail": "{'request': {'from': 'GoldenTower', 'from_project': '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/control-20261025T231154-1780220/proj1', 'to': 'SilverKite', 'to_project': '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/control-20261025T231154-1780220/proj2', 'statu"
+            },
+            {
+              "name": "no same-name placeholder in the sender's project",
+              "ok": true,
+              "detail": "['SandySwan', 'GoldenTower']"
+            },
+            {
+              "name": "delivered to the peer's project or refused with CROSS_PROJECT_RECIPIENT",
+              "ok": true,
+              "detail": "{'send': {'error': {'type': 'CROSS_PROJECT_RECIPIENT', 'message': \"Recipient 'SilverKite' is not registered in this project; it is your contact in project '/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/rs26/O2/control-20261025T231154-1780220/proj2'. A plain agent name only addresses this project, so nothing was sent (auto-registering a sam"
+            }
+          ],
+          "outcome": "refused"
+        },
+        "storm": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "all storm sends acknowledged",
+              "ok": true,
+              "detail": "240/240 errors=[]"
+            },
+            {
+              "name": "acknowledged ids distinct",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "zero RESOURCE_BUSY",
+              "ok": true,
+              "detail": "0/240"
+            }
+          ],
+          "offered": 240,
+          "p50_s": 0.27170705795288086,
+          "p99_s": 1.812075138092041,
+          "errors": []
+        },
+        "crash": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "all 320 acknowledged ids survive SIGKILL",
+              "ok": true,
+              "detail": "missing=[]"
+            },
+            {
+              "name": "archive converges to DB without client reads (<= 300s)",
+              "ok": true,
+              "detail": "archive=567 db=567"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            }
+          ],
+          "acked": 320,
+          "server_integrity_verdict_after_restart": {
+            "status": "green",
+            "detail": "full integrity_check passed at 1792984331033849; latest integrity_check also passed",
+            "critical": true
+          }
+        },
+        "soak": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no EMFILE (server log and client responses)",
+              "ok": true,
+              "detail": "[]"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": true,
+              "detail": "samples=30 bad=[]"
+            },
+            {
+              "name": "health archive_lag stall verdict agrees with the WBQ counters",
+              "ok": true,
+              "detail": "lag_samples=30 disagree=[]"
+            },
+            {
+              "name": "fetch_inbox p99 <= 2.0s under write load",
+              "ok": true,
+              "detail": "p99=0.01721024513244629 n=87422"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "zero HTTP server restarts",
+              "ok": true,
+              "detail": "{'alive': True, 'markers': []}"
+            },
+            {
+              "name": "no archive re-root",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "archive converges after load stops",
+              "ok": true,
+              "detail": "archive=12754 db=12754"
+            }
+          ],
+          "counts": {
+            "send": 12187,
+            "read": 87422,
+            "search": 964,
+            "health": 256,
+            "err": 1
+          },
+          "sqlite_fds_max": 2,
+          "fetch_inbox_p99_s": 0.01721024513244629,
+          "fetch_inbox_samples": 87422,
+          "wbq_samples": 30,
+          "server_threads_end": 70
+        },
+        "swarm": {
+          "verdict": "FAIL",
+          "checks": [
+            {
+              "name": "register 60 swarm agents",
+              "ok": true,
+              "detail": "60/60"
+            },
+            {
+              "name": "send_message p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 8703, 'p50_s': 0.4826030731201172, 'p99_s': 5.19244384765625, 'max_s': 7.356086492538452}"
+            },
+            {
+              "name": "file_reservation_paths p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 2546, 'p50_s': 3.028778076171875, 'p99_s': 11.317930459976196, 'max_s': 15.795034885406494}"
+            },
+            {
+              "name": "release_file_reservations p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 2527, 'p50_s': 3.0558063983917236, 'p99_s': 11.43019723892212, 'max_s': 15.562297344207764}"
+            },
+            {
+              "name": "zero 30 s dispatch timeouts",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "zero tool errors",
+              "ok": false,
+              "detail": "{'send_message': {'RESOURCE_BUSY': 4}, 'file_reservation_paths': {'RESERVATION_ARCHIVE_UNAVAILABLE': 144}}"
+            },
+            {
+              "name": "no connection errors outside the SIGKILL window",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": false,
+              "detail": "samples=[23, 22] unobserved=0 stalled=[{'t': 1792984780, 'drained_total': 14714, 'depth_at_open': 57, 'depth_at_close': 291}, {'t': 1792984811, 'drained_total': 15226, 'depth_at_open': 229, 'depth_at_close': 449}, {'t': 1792984842, 'drained_total': 15738, 'depth_at_open': 338, 'depth_at_close': 580}, {'t': 1792984873, 'drained_total': 16250, 'depth_at_open': 532, 'depth_at_close': 730}, {'t': 1792"
+            },
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=3"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "archive converges to DB after the swarm without client reads (<= 300s)",
+              "ok": false,
+              "detail": "archive=21108 db=21961 last=sqlite is ahead of the archive by 853 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=5, agents=63, messages=21108, db projects=5, agents=63, messages=21961"
+            },
+            {
+              "name": "zero HTTP server restarts and no EMFILE",
+              "ok": true,
+              "detail": "{'markers': [], 'emfile': False}"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            },
+            {
+              "name": "all 8699 acknowledged swarm sends survive SIGKILL",
+              "ok": true,
+              "detail": "lost=[]"
+            }
+          ],
+          "agents": 60,
+          "secs": 480,
+          "agents_registered": 60,
+          "load_secs": 492.2,
+          "kill_at_s": 247.9,
+          "restart_s": 8.25,
+          "acked_sends": 8699,
+          "sends_per_s": 17.67,
+          "tools": {
+            "send_message": {
+              "n": 8703,
+              "timeouts": 0,
+              "tool_errors": {
+                "RESOURCE_BUSY": 4
+              },
+              "conn_errors": 0,
+              "kill_window": 8,
+              "p50_s": 0.4826030731201172,
+              "p99_s": 5.19244384765625,
+              "max_s": 7.356086492538452
+            },
+            "fetch_inbox": {
+              "n": 8703,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 0,
+              "p50_s": 0.03427600860595703,
+              "p99_s": 0.5376508235931396,
+              "max_s": 1.604121446609497
+            },
+            "file_reservation_paths": {
+              "n": 2546,
+              "timeouts": 0,
+              "tool_errors": {
+                "RESERVATION_ARCHIVE_UNAVAILABLE": 144
+              },
+              "conn_errors": 0,
+              "kill_window": 30,
+              "p50_s": 3.028778076171875,
+              "p99_s": 11.317930459976196,
+              "max_s": 15.795034885406494
+            },
+            "release_file_reservations": {
+              "n": 2527,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 49,
+              "p50_s": 3.0558063983917236,
+              "p99_s": 11.43019723892212,
+              "max_s": 15.562297344207764
+            },
+            "search_messages": {
+              "n": 873,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 7,
+              "p50_s": 0.48389577865600586,
+              "p99_s": 2.4350202083587646,
+              "max_s": 5.569417476654053
+            },
+            "acknowledge_message": {
+              "n": 2694,
+              "timeouts": 0,
+              "tool_errors": {},
+              "conn_errors": 0,
+              "kill_window": 0,
+              "p50_s": 0.029273033142089844,
+              "p99_s": 0.6272628307342529,
+              "max_s": 1.617689847946167
+            }
+          },
+          "sqlite_fds_max": 3,
+          "zombies_max": 0,
+          "wbq_samples": [
+            23,
+            22
+          ],
+          "stalled_windows": 11
+        }
+      },
+      "binary_version": "am 0.3.39",
+      "server_exe_sha256": "0180807ecf0804c305a797a2c886ef563ddc8930bcb04efea03d16a6ad91c5ec",
+      "server_nofile_soft_hard": [
+        "65536",
+        "1048576"
+      ],
+      "server_threads_start": 25,
+      "clean_shutdown": true,
+      "server_log_walfec_lines": 5,
+      "loadavg_end": [
+        "6.56",
+        "10.07",
+        "14.45"
+      ],
+      "verdict": "FAIL"
+    }
+  ],
+  "finished_at": "2026-10-26T03:31:10Z",
+  "loadavg_end": [
+    "6.56",
+    "10.07",
+    "14.45"
+  ],
+  "candidate_verdict": "FAIL"
+}
