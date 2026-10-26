@@ -1559,12 +1559,19 @@ where
     primary_anchor.verify_unchanged(action).map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
-    let _breaker_file_lock = crate::recovery_breaker::try_acquire_file_lock(primary_path)
-        .map_err(|error| {
+    let _breaker_file_lock =
+        crate::recovery_breaker::try_acquire_file_lock(primary_path).map_err(|error| {
+            let reason = if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+            {
+                "another process owns the durable recovery-breaker election lock"
+            } else {
+                "the durable recovery-breaker election lock could not be acquired"
+            };
             AutomaticRecoveryRunError::admission(
                 AutomaticRecoveryAdmissionFailureKind::Other,
                 SqlError::Custom(format!(
-                    "{action} for {} was deferred because another process owns the durable recovery-breaker election lock: {error}",
+                    "{action} for {} was deferred because {reason}: {error}",
                     primary_path.display()
                 )),
             )
@@ -34174,6 +34181,13 @@ mod tests {
 
         ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
             .expect("a healthy primary must keep serving when the archive-drift reconcile fails");
+        let direct_err = reconcile_archive_state_before_init(&primary, &storage_root)
+            .expect_err("direct reconcile must report the uncreatable election lock")
+            .to_string();
+        assert!(
+            direct_err.contains("the durable recovery-breaker election lock could not be acquired"),
+            "EACCES on the election lock directory must not claim another process owns the lock: {direct_err}"
+        );
         assert!(
             has_pending_archive_drift(&primary),
             "the failed reconcile must leave the drift pending for the periodic retry"
@@ -34191,6 +34205,44 @@ mod tests {
         drop(restore);
         retry_archive_drift_reconcile(&primary, &storage_root)
             .expect("once the environment is writable again the pending drift reconciles");
+        assert_eq!(count_messages(&primary), 2);
+        assert!(!has_pending_archive_drift(&primary));
+    }
+
+    #[test]
+    fn archive_drift_reconcile_keeps_healthy_primary_serving_when_election_lock_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        assert_eq!(count_messages(&primary), 1);
+        push_archive_ahead(&msg_dir);
+        clear_pending_archive_drift(&primary);
+
+        let held_election_lock = crate::recovery_breaker::try_acquire_file_lock(&primary)
+            .expect("hold durable recovery-breaker election lock");
+
+        let direct_err = reconcile_archive_state_before_init(&primary, &storage_root)
+            .expect_err("direct reconcile must defer while the election lock is held")
+            .to_string();
+        assert!(
+            direct_err.contains("another process owns the durable recovery-breaker election lock"),
+            "contended election lock must report lock ownership: {direct_err}"
+        );
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).expect(
+            "a healthy primary must keep serving when another owner holds the election lock",
+        );
+        assert!(
+            has_pending_archive_drift(&primary),
+            "held election lock must leave archive drift pending for periodic retry"
+        );
+        assert_eq!(count_messages(&primary), 1);
+        assert!(matches!(sqlite_file_is_healthy(&primary), Ok(true)));
+
+        drop(held_election_lock);
+        retry_archive_drift_reconcile(&primary, &storage_root)
+            .expect("once the election lock is released the pending drift reconciles");
         assert_eq!(count_messages(&primary), 2);
         assert!(!has_pending_archive_drift(&primary));
     }
