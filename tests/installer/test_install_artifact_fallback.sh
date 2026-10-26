@@ -1246,6 +1246,44 @@ if run_minisign_case tampered-comment v0.3.33 "$minisign_root/tampered-comment" 
 fi
 assert_minisign_rejected_before_checksum tampered-comment 'Minisign verification FAILED'
 
+mkdir -p "$minisign_root/missing-minisig"
+cp "$minisign_root/exact-manifest/SHA256SUMS" "$minisign_root/missing-minisig/SHA256SUMS"
+if run_minisign_case missing-minisig v9.9.9 "$minisign_root/missing-minisig" \
+    "$stable_minisign_archive" "$fixture_minisign_key"; then
+    echo "FAIL: missing SHA256SUMS.minisig was accepted" >&2
+    exit 1
+fi
+assert_minisign_rejected_before_checksum missing-minisig 'Release manifest signature not found'
+
+mkdir -p "$minisign_root/empty-minisig"
+cp "$minisign_root/exact-manifest/SHA256SUMS" "$minisign_root/empty-minisig/SHA256SUMS"
+: >"$minisign_root/empty-minisig/SHA256SUMS.minisig"
+if run_minisign_case empty-minisig v9.9.9 "$minisign_root/empty-minisig" \
+    "$stable_minisign_archive" "$fixture_minisign_key"; then
+    echo "FAIL: empty SHA256SUMS.minisig was accepted" >&2
+    exit 1
+fi
+assert_minisign_rejected_before_checksum empty-minisig 'Release manifest signature not found'
+
+mkdir -p "$minisign_root/tampered-manifest"
+printf '0000000000000000000000000000000000000000000000000000000000000000  %s\n' \
+    "$minisign_artifact_name" >"$minisign_root/tampered-manifest/SHA256SUMS"
+cp "$minisign_root/exact-manifest/SHA256SUMS.minisig" \
+    "$minisign_root/tampered-manifest/SHA256SUMS.minisig"
+if run_minisign_case tampered-manifest v9.9.9 "$minisign_root/tampered-manifest" \
+    "$stable_minisign_archive" "$fixture_minisign_key"; then
+    echo "FAIL: tampered SHA256SUMS body bypassed cryptographic verification" >&2
+    exit 1
+fi
+assert_minisign_rejected_before_checksum tampered-manifest 'Minisign verification FAILED'
+
+if run_minisign_case untrusted-signer v9.9.9 "$minisign_root/exact-manifest" \
+    "$stable_minisign_archive"; then
+    echo "FAIL: signature from an untrusted minisign key was accepted by the pinned release key" >&2
+    exit 1
+fi
+assert_minisign_rejected_before_checksum untrusted-signer 'Minisign verification FAILED'
+
 step "scenario K: Unix pair journal converges old-old or new-new across every durable phase"
 transaction_root="$tmp/transaction-fixtures"
 mkdir -p "$transaction_root/old" "$transaction_root/new" \
