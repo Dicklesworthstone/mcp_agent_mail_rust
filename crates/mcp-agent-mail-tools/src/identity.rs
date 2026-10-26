@@ -1314,7 +1314,7 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(&config.storage_root);
+    let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
     let rows = match conn.query_sync(
         "SELECT \
             (SELECT COUNT(*) FROM projects) AS project_count, \
@@ -6634,6 +6634,139 @@ body
             type_name.contains("FrankenConnection"),
             "health_check must use the FrankenSQLite connection type on the normal path: {type_name}"
         );
+    }
+
+    #[test]
+    fn health_check_archive_inventory_is_amortized_o1_via_epoch_cache() {
+        let _guard = crate::tool_util::READ_POOL_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tool_util::reset_read_archive_inventory_cache();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("health-cache.sqlite3");
+        let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+
+        let project_dir = storage_root.join("projects").join("cache-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let message_dir = project_dir.join("messages").join("2026").join("07");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"cache-project","human_key":"/cache-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-07-01T12:00:00Z","last_active_ts":"2026-07-01T12:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-07-01T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .expect("write first message");
+
+        {
+            let mut index = repo.index().expect("open git index");
+            index
+                .add_all(["projects"], git2::IndexAddOption::DEFAULT, None)
+                .expect("stage archive tree");
+            index.write().expect("write git index");
+            let tree_id = index.write_tree().expect("write git tree");
+            let tree = repo.find_tree(tree_id).expect("load git tree");
+            let sig = git2::Signature::now("test", "test@example.com").expect("git signature");
+            repo.commit(Some("HEAD"), &sig, &sig, "seed archive", &tree, &[])
+                .expect("commit archive tree");
+        }
+        std::fs::write(
+            storage_root
+                .join(".git")
+                .join(mcp_agent_mail_storage::ARCHIVE_EPOCH_FILE_NAME),
+            format!("1{}", "aa".repeat(16)),
+        )
+        .expect("write epoch token");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'cache-project', '/cache-project', 0)",
+            &[],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (1, 1, 'Alice', 'coder', 'test', '', 0, 0, 'auto', 'auto')",
+            &[],
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+             VALUES (1, 1, 1, 'First', 'body', 'normal', 0, 0, '[]')",
+            &[],
+        )
+        .expect("insert message");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                crate::tool_util::reset_read_archive_inventory_cache();
+                let cx = Cx::for_testing();
+                let ctx = McpContext::new(cx, 1);
+                for call_idx in 0..5 {
+                    let raw = health_check(&ctx).expect("health_check ok");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&raw).expect("parse health_check json");
+                    assert_eq!(value["status"], "ok", "call {call_idx}: {value}");
+                    assert_eq!(
+                        value["semantic_readiness"]["status"], "ok",
+                        "call {call_idx}: {value}"
+                    );
+                }
+                assert_eq!(
+                    crate::tool_util::read_archive_inventory_scan_count(),
+                    1,
+                    "repeated health_check calls on an unchanged epoch-stamped archive must scan only once (O(1) amortized)"
+                );
+
+                // Simulate a new archive message landing with an epoch token advance while SQLite lags.
+                std::fs::write(
+                    message_dir.join("2026-07-01T12-01-00Z__second__2.md"),
+                    "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[],\"subject\":\"Second\"}\n---\nbody\n",
+                )
+                .expect("write second message");
+                std::fs::write(
+                    storage_root
+                        .join(".git")
+                        .join(mcp_agent_mail_storage::ARCHIVE_EPOCH_FILE_NAME),
+                    format!("1{}", "bb".repeat(16)),
+                )
+                .expect("advance epoch token");
+
+                let raw = health_check(&ctx).expect("health_check after drift");
+                let value: serde_json::Value =
+                    serde_json::from_str(&raw).expect("parse health_check json");
+                assert_eq!(
+                    crate::tool_util::read_archive_inventory_scan_count(),
+                    2,
+                    "epoch token advance must invalidate cached archive inventory on next health_check"
+                );
+                assert_eq!(
+                    value["status"], "error",
+                    "health_check must report error when archive advances ahead of SQLite: {value}"
+                );
+            },
+        );
+        crate::tool_util::reset_read_archive_inventory_cache();
     }
 
     #[test]

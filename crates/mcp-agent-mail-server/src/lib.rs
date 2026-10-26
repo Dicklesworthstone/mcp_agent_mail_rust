@@ -3103,8 +3103,8 @@ impl ArchiveDbDriftSummary {
 }
 
 fn archive_inventory_has_state(storage_root: &Path) -> bool {
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
+    let archive = mcp_agent_mail_tools::tool_util::read_archive_inventory(storage_root);
+    mcp_agent_mail_tools::tool_util::read_archive_inventory_has_state(&archive)
 }
 
 fn archive_storage_root_is_authoritative_for_sqlite_path(
@@ -3131,8 +3131,8 @@ fn inspect_archive_db_drift(
         return Ok(None);
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+    let archive = mcp_agent_mail_tools::tool_util::read_archive_inventory(storage_root);
+    if !mcp_agent_mail_tools::tool_util::read_archive_inventory_has_state(&archive) {
         return Ok(None);
     }
 
@@ -3554,15 +3554,16 @@ pub(crate) fn open_observability_sync_db_connection(
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state =
+    let archive_has_state = || {
         archive_storage_root_is_authoritative_for_sqlite_path(storage_root, &resolved_path)
-            && archive_inventory_has_state(storage_root);
+            && archive_inventory_has_state(storage_root)
+    };
 
     // Observability must not initialize a configured fresh-start target merely
     // to render counts. If durable archive state exists, derive a private
     // snapshot from it; otherwise report that no read source is available.
     if !resolved_path.exists() {
-        return if archive_has_state {
+        return if archive_has_state() {
             ObservabilitySyncDb::archive_snapshot(storage_root, None, context).map(Some)
         } else {
             Ok(None)
@@ -3604,7 +3605,7 @@ pub(crate) fn open_observability_sync_db_connection(
                 .map(Some)
             }
             Ok(None) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
-            Err(error) if archive_has_state => {
+            Err(error) if archive_has_state() => {
                 // #219: same failure backoff as the drift arm — the probe
                 // failing does not make an O(archive) rebuild per dashboard
                 // tick any cheaper. Serving the (openable) live connection
@@ -3639,7 +3640,7 @@ pub(crate) fn open_observability_sync_db_connection(
             }
             Err(_) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
         },
-        Err(error) if archive_has_state => {
+        Err(error) if archive_has_state() => {
             // #219: no live connection exists to fall back on here, but a
             // rebuild that just failed will fail again — surface a fast
             // error instead of replaying the archive every ~1.2 s tick.

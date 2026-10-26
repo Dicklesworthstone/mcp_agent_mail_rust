@@ -1366,7 +1366,8 @@ pub mod tool_util {
         drop(cache);
     }
 
-    pub(crate) fn read_archive_inventory(
+    #[must_use]
+    pub fn read_archive_inventory(
         storage_root: &Path,
     ) -> mcp_agent_mail_db::ArchiveMessageInventory {
         let Some(signature_before) = clean_read_archive_signature(storage_root) else {
@@ -1388,7 +1389,11 @@ pub mod tool_util {
     }
 
     #[cfg(test)]
-    fn reset_read_archive_inventory_cache() {
+    pub(crate) static READ_POOL_TEST_LOCK: std::sync::OnceLock<Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    #[cfg(test)]
+    pub(crate) fn reset_read_archive_inventory_cache() {
         READ_ARCHIVE_INVENTORY_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1397,7 +1402,7 @@ pub mod tool_util {
     }
 
     #[cfg(test)]
-    fn read_archive_inventory_scan_count() -> usize {
+    pub(crate) fn read_archive_inventory_scan_count() -> usize {
         READ_ARCHIVE_INVENTORY_SCAN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1480,7 +1485,8 @@ pub mod tool_util {
         })
     }
 
-    pub(crate) const fn read_archive_inventory_has_state(
+    #[must_use]
+    pub const fn read_archive_inventory_has_state(
         archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> bool {
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
@@ -2133,9 +2139,7 @@ pub mod tool_util {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::sync::{Mutex, OnceLock};
-
-        static READ_POOL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        use std::sync::Mutex;
 
         fn run_async<F, Fut, T>(f: F) -> T
         where
