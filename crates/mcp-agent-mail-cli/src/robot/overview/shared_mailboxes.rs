@@ -395,6 +395,11 @@ impl ScopedPopulation {
         scope: &HashSet<i64>,
         work: &mut ScanWork,
     ) -> Result<Option<Population>, CliError> {
+        if full_index_with_prefix(conn, "agents", &["project_id"])?.as_deref()
+            != Some(self.agent_index.as_str())
+        {
+            return Err(failed("verified scoped agent index is no longer available"));
+        }
         let mut viewers = HashMap::new();
         let mut inception: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut project_ids: Vec<_> = scope.iter().copied().collect();

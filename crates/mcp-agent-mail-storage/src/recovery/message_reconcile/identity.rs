@@ -69,9 +69,9 @@ fn canonical_is_committed(
         {
             Ok(true)
         }
-        Ok(_) => Err(invalid(
-            "committed canonical payload conflicts with authoritative message; preserved",
-        )),
+        Ok(_) => Err(invalid(format!(
+            "committed archive artifact {canonical} conflicts with authoritative message; preserved"
+        ))),
         Err(error) if error.code() == ErrorCode::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
@@ -665,12 +665,11 @@ mod tests {
             assert!(error.to_string().contains("budget"), "{error}");
         }
         // Retain the same HEAD allowance after charging the real index snapshot.
+        // Only the one canonical source is enumerated in the index, not
+        // bootstrap files elsewhere in the repository-wide index.
         let index_path = repo.path().join("index");
         let (index_bytes, index_entries) = if index_path.exists() {
-            (
-                std::fs::metadata(&index_path).unwrap().len(),
-                repo.index().unwrap().len(),
-            )
+            (std::fs::metadata(&index_path).unwrap().len(), 1)
         } else {
             (0, 0)
         };
