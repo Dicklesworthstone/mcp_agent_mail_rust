@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
 
+mod archive_diagnostics;
 pub mod bench;
 pub mod ci;
 pub mod context;
@@ -57,6 +58,8 @@ use mcp_agent_mail_db::archive_anomaly::{
 };
 use mcp_agent_mail_share as share;
 use serde::{Deserialize, Serialize};
+
+use archive_diagnostics::{ArchiveDiagnostics, ArchivePhase};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -1778,6 +1781,9 @@ pub enum ArchiveCommand {
         scrub_preset: String,
         #[arg(long, short = 'l')]
         label: Option<String>,
+        /// Emit content-free phase timings and file/byte counters to stderr.
+        #[arg(long)]
+        diagnostics: bool,
     },
     List {
         #[arg(long, short = 'n', default_value_t = 0)]
@@ -16340,23 +16346,44 @@ impl CanonicalSnapshotSource {
         scrub_preset: share::ScrubPreset,
         purpose: share::SnapshotPurpose,
     ) -> Result<share::SnapshotContext, share::ShareError> {
+        self.create_share_snapshot_context_with_observer(
+            snapshot_path,
+            project_filters,
+            scrub_preset,
+            purpose,
+            &mut |_| {},
+        )
+    }
+
+    fn create_share_snapshot_context_with_observer(
+        &self,
+        snapshot_path: &Path,
+        project_filters: &[String],
+        scrub_preset: share::ScrubPreset,
+        purpose: share::SnapshotPurpose,
+        observer: &mut dyn FnMut(share::SnapshotPhaseEvent),
+    ) -> Result<share::SnapshotContext, share::ShareError> {
         match self.kind {
-            CanonicalSnapshotSourceKind::LiveSqlite => share::create_snapshot_context(
-                &self.actual_path,
-                snapshot_path,
-                project_filters,
-                scrub_preset,
-                purpose,
-            ),
-            CanonicalSnapshotSourceKind::LiveSnapshot
-            | CanonicalSnapshotSourceKind::ArchiveSnapshot
-            | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
-                share::create_private_canonical_snapshot_context(
+            CanonicalSnapshotSourceKind::LiveSqlite => {
+                share::create_snapshot_context_with_observer(
                     &self.actual_path,
                     snapshot_path,
                     project_filters,
                     scrub_preset,
                     purpose,
+                    observer,
+                )
+            }
+            CanonicalSnapshotSourceKind::LiveSnapshot
+            | CanonicalSnapshotSourceKind::ArchiveSnapshot
+            | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
+                share::create_private_canonical_snapshot_context_with_observer(
+                    &self.actual_path,
+                    snapshot_path,
+                    project_filters,
+                    scrub_preset,
+                    purpose,
+                    observer,
                 )
             }
         }
@@ -53276,11 +53303,13 @@ http_headers = { Authorization = "Bearer secret" }
                         projects,
                         scrub_preset,
                         label,
+                        diagnostics,
                     },
             } => {
                 assert!(projects.is_empty());
                 assert_eq!(scrub_preset, "archive");
                 assert!(label.is_none());
+                assert!(!diagnostics);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -53300,6 +53329,7 @@ http_headers = { Authorization = "Bearer secret" }
             "strict",
             "-l",
             "nightly",
+            "--diagnostics",
         ])
         .expect("failed to parse archive save flags");
         match cli.command.expect("expected command") {
@@ -53309,11 +53339,13 @@ http_headers = { Authorization = "Bearer secret" }
                         projects,
                         scrub_preset,
                         label,
+                        diagnostics,
                     },
             } => {
                 assert_eq!(projects, vec!["proj1".to_string(), "proj2".to_string()]);
                 assert_eq!(scrub_preset, "strict");
                 assert_eq!(label.as_deref(), Some("nightly"));
+                assert!(diagnostics);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -56309,6 +56341,93 @@ http_headers = { Authorization = "Bearer secret" }
 
         assert!(!db_path.exists());
         assert!(!storage_root.exists());
+    }
+
+    fn capture_archive_diagnostics() -> (ArchiveDiagnostics, Arc<std::sync::Mutex<Vec<String>>>) {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&records);
+        let diagnostics = ArchiveDiagnostics::with_test_sink(move |line| {
+            sink.lock().unwrap().push(line.to_owned());
+        });
+        (diagnostics, records)
+    }
+
+    #[test]
+    fn archive_diagnostics_enumeration_failure_preserves_fixture_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let obstruction = root.path().join("not-a-directory");
+        std::fs::write(&obstruction, b"preserve recovery evidence").unwrap();
+        let (diagnostics, records) = capture_archive_diagnostics();
+        diagnostics.start(ArchivePhase::Enumerate);
+        let mut files = Vec::new();
+        let result = collect_files_with_exclusions(
+            root.path(),
+            &obstruction,
+            &BTreeSet::new(),
+            &mut files,
+            &diagnostics,
+        );
+        assert!(matches!(result, Err(CliError::Io(_))));
+        drop(diagnostics);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].contains("phase=storage_enumeration status=failed"));
+        assert!(records[1].contains("storage_files=0 storage_bytes=0"));
+        assert!(!records[1].contains("not-a-directory"));
+        assert!(files.is_empty());
+        assert_eq!(
+            std::fs::read(obstruction).unwrap(),
+            b"preserve recovery evidence"
+        );
+    }
+
+    #[test]
+    fn archive_diagnostics_publication_failure_keeps_zip_and_destination() {
+        use std::io::{Read, Write};
+
+        let root = tempfile::tempdir().unwrap();
+        let temporary = root.path().join("temporary.zip");
+        let destination = root.path().join("destination.zip");
+        let file = std::fs::File::create(&temporary).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("payload", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"retained archive payload").unwrap();
+        zip.finish().unwrap();
+        let original_zip = std::fs::read(&temporary).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let evidence = destination.join("keep.txt");
+        std::fs::write(&evidence, b"original evidence").unwrap();
+
+        let (diagnostics, records) = capture_archive_diagnostics();
+        assert!(publish_archive_zip(&temporary, &destination, &diagnostics).is_err());
+        drop(diagnostics);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].contains("phase=publication status=failed"));
+        assert!(!records.iter().any(|line| line.contains("status=completed")));
+        assert_eq!(std::fs::read(&evidence).unwrap(), b"original evidence");
+        assert_eq!(std::fs::read(&temporary).unwrap(), original_zip);
+
+        // The very same prepared ZIP remains usable after the failed attempt;
+        // publish it elsewhere without touching the obstructing evidence.
+        let published = root.path().join("published.zip");
+        let (diagnostics, records) = capture_archive_diagnostics();
+        let bytes = publish_archive_zip(&temporary, &published, &diagnostics).unwrap();
+        drop(diagnostics);
+        assert_eq!(bytes, original_zip.len() as u64);
+        let records = records.lock().unwrap();
+        assert!(records[1].contains("phase=publication status=completed"));
+        assert!(records[1].contains(&format!("archive_bytes={bytes}")));
+        assert!(!temporary.exists());
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(published).unwrap()).unwrap();
+        let mut payload = Vec::new();
+        zip.by_name("payload")
+            .unwrap()
+            .read_to_end(&mut payload)
+            .unwrap();
+        assert_eq!(payload, b"retained archive payload");
+        assert_eq!(std::fs::read(evidence).unwrap(), b"original evidence");
     }
 
     #[cfg(unix)]
@@ -86171,6 +86290,7 @@ fn collect_files_with_exclusions(
     dir: &Path,
     excluded_rel_paths: &std::collections::BTreeSet<PathBuf>,
     out: &mut Vec<PathBuf>,
+    diagnostics: &ArchiveDiagnostics,
 ) -> CliResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -86187,8 +86307,13 @@ fn collect_files_with_exclusions(
             continue;
         }
         if file_type.is_dir() {
-            collect_files_with_exclusions(base, &path, excluded_rel_paths, out)?;
+            collect_files_with_exclusions(base, &path, excluded_rel_paths, out, diagnostics)?;
         } else if file_type.is_file() {
+            if diagnostics.enabled() {
+                // Counter-only metadata is best effort. It must neither add
+                // I/O to the default path nor make an otherwise valid save fail.
+                diagnostics.discovered(entry.metadata().ok().map(|metadata| metadata.len()));
+            }
             out.push(rel);
         }
     }
@@ -86197,7 +86322,13 @@ fn collect_files_with_exclusions(
 
 #[cfg(test)]
 fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<()> {
-    collect_files_with_exclusions(base, dir, &std::collections::BTreeSet::new(), out)
+    collect_files_with_exclusions(
+        base,
+        dir,
+        &std::collections::BTreeSet::new(),
+        out,
+        &ArchiveDiagnostics::disabled(),
+    )
 }
 
 fn archive_storage_excluded_relative_paths(
@@ -86304,7 +86435,15 @@ fn archive_save_state(
     scrub_preset: String,
     label: Option<String>,
 ) -> CliResult<PathBuf> {
-    archive_save_state_internal(source_db, storage_root, projects, scrub_preset, label, true)
+    archive_save_state_internal(
+        source_db,
+        storage_root,
+        projects,
+        scrub_preset,
+        label,
+        true,
+        &ArchiveDiagnostics::disabled(),
+    )
 }
 
 fn archive_save_state_locked(
@@ -86321,6 +86460,7 @@ fn archive_save_state_locked(
         scrub_preset,
         label,
         false,
+        &ArchiveDiagnostics::disabled(),
     )
 }
 
@@ -86331,10 +86471,11 @@ fn archive_save_state_internal(
     scrub_preset: String,
     label: Option<String>,
     acquire_mailbox_read_lock: bool,
+    diagnostics: &ArchiveDiagnostics,
 ) -> CliResult<PathBuf> {
     use chrono::Timelike;
-    use std::io::Write;
 
+    diagnostics.start(ArchivePhase::Prepare);
     let source_db = PathBuf::from(resolve_sqlite_runtime_path(&source_db.to_string_lossy()));
 
     let preset = match share::normalize_scrub_preset(&scrub_preset) {
@@ -86364,6 +86505,8 @@ fn archive_save_state_internal(
     } else {
         None
     };
+    diagnostics.finish();
+    diagnostics.start(ArchivePhase::SnapshotSource);
     let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
     let source = resolve_canonical_snapshot_source_path(
         &source_db,
@@ -86381,18 +86524,36 @@ fn archive_save_state_internal(
         .prefix("mailbox-archive-")
         .tempdir()?;
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
+    diagnostics.finish();
 
     ftui_runtime::ftui_println!("Creating mailbox archive...");
     // A private save: the preset alone decides (the lossless `archive`
     // preset keeps registration tokens so a restore can still send).
-    let context = source.create_share_snapshot_context(
+    let context = source.create_share_snapshot_context_with_observer(
         &snapshot_path,
         &projects,
         preset,
         share::SnapshotPurpose::PrivateArchive,
+        &mut |event| match event {
+            share::SnapshotPhaseEvent::Started(phase) => diagnostics.start(phase.into()),
+            share::SnapshotPhaseEvent::Finished(phase) => {
+                if diagnostics.enabled()
+                    && matches!(
+                        phase,
+                        share::SnapshotPhase::Snapshot | share::SnapshotPhase::Finalize
+                    )
+                    && let Ok(metadata) = std::fs::metadata(&snapshot_path)
+                {
+                    diagnostics.snapshot_bytes(metadata.len());
+                }
+                diagnostics.finish();
+            }
+        },
     )?;
 
+    diagnostics.start(ArchivePhase::Metadata);
     let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
+    diagnostics.snapshot_bytes(snapshot_size);
     let destination_name = destination
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -86458,10 +86619,12 @@ fn archive_save_state_internal(
         .prefix("mailbox-archive-zip-")
         .tempdir_in(&archive_dir)?;
     let temp_zip_path = zip_dir.path().join("mailbox-state.zip");
+    diagnostics.finish();
 
     use zip::DateTime;
     use zip::write::SimpleFileOptions;
 
+    diagnostics.start(ArchivePhase::Zip);
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -86477,7 +86640,7 @@ fn archive_save_state_internal(
     // metadata.json
     zip.start_file(ARCHIVE_METADATA_FILENAME, base_options)
         .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
-    zip.write_all(metadata_json.as_bytes())?;
+    diagnostics.write_entry(&mut zip, metadata_json.as_bytes())?;
 
     // snapshot/mailbox.sqlite3
     let snapshot_zip_name = ARCHIVE_SNAPSHOT_RELATIVE.replace('\\', "/");
@@ -86488,9 +86651,11 @@ fn archive_save_state_internal(
     )
     .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
     let mut snapshot_file = std::fs::File::open(&snapshot_path)?;
-    std::io::copy(&mut snapshot_file, &mut zip)?;
+    diagnostics.copy_entry(&mut snapshot_file, &mut zip)?;
+    diagnostics.finish();
 
     // storage_repo/*
+    diagnostics.start(ArchivePhase::Enumerate);
     let mut files = Vec::new();
     let excluded_storage_paths =
         archive_storage_excluded_relative_paths(storage_root, source.reported_path());
@@ -86499,8 +86664,12 @@ fn archive_save_state_internal(
         storage_root,
         &excluded_storage_paths,
         &mut files,
+        diagnostics,
     )?;
     files.sort();
+    diagnostics.finish();
+    // Keep the existing write/enumerate/write order and compression settings.
+    diagnostics.start(ArchivePhase::Zip);
     for rel in files {
         let full_path = storage_root.join(&rel);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -86510,17 +86679,19 @@ fn archive_save_state_internal(
         zip.start_file(zip_name, base_options.unix_permissions(mode))
             .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
         let mut f = std::fs::File::open(&full_path)?;
-        std::io::copy(&mut f, &mut zip)?;
+        diagnostics.copy_entry(&mut f, &mut zip)?;
     }
 
     zip.finish()
         .map_err(|e| CliError::Other(format!("zip finalize error: {e}")))?;
+    if diagnostics.enabled()
+        && let Ok(metadata) = std::fs::metadata(&temp_zip_path)
+    {
+        diagnostics.archive_bytes(metadata.len());
+    }
+    diagnostics.finish();
 
-    std::fs::rename(&temp_zip_path, &destination)?;
-
-    let size_bytes = std::fs::metadata(&destination)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size_bytes = publish_archive_zip(&temp_zip_path, &destination, diagnostics)?;
     let projects_desc = if projects.is_empty() {
         vec!["all".to_string()]
     } else {
@@ -86540,6 +86711,22 @@ fn archive_save_state_internal(
     );
 
     Ok(destination)
+}
+
+fn publish_archive_zip(
+    temp_zip_path: &Path,
+    destination: &Path,
+    diagnostics: &ArchiveDiagnostics,
+) -> CliResult<u64> {
+    diagnostics.start(ArchivePhase::Publish);
+    // Keep publication on the existing same-filesystem atomic rename path.
+    std::fs::rename(temp_zip_path, destination)?;
+    let size_bytes = std::fs::metadata(destination).map(|metadata| metadata.len());
+    if let Ok(bytes) = size_bytes {
+        diagnostics.archive_bytes(bytes);
+    }
+    diagnostics.finish();
+    Ok(size_bytes.unwrap_or(0))
 }
 
 #[allow(dead_code)]
@@ -86870,6 +87057,7 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             projects,
             scrub_preset,
             label,
+            diagnostics,
         } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             let source_path = cfg
@@ -86885,8 +87073,16 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             let config = Config::from_env();
             let storage_root = config.storage_root;
 
-            let _path =
-                archive_save_state(&source_db, &storage_root, projects, scrub_preset, label)?;
+            let diagnostics = ArchiveDiagnostics::new(diagnostics);
+            let _path = archive_save_state_internal(
+                &source_db,
+                &storage_root,
+                projects,
+                scrub_preset,
+                label,
+                true,
+                &diagnostics,
+            )?;
             Ok(())
         }
         ArchiveCommand::List {

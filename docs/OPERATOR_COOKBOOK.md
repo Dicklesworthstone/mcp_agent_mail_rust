@@ -636,3 +636,108 @@ saved baseline file you can compare later.
 **Troubleshooting:** If you only care about a subset, rerun with `--filter`.
 For release-signoff performance work, capture the baseline on a machine that is
 not already saturated by other agent builds.
+
+## 16. Diagnose archive save phases [stateful]
+
+**Goal:** Locate time spent in `archive save` using elapsed times and aggregate
+file/byte counters, without adding mailbox contents or credentials to diagnostic
+records. This addresses the missing phase visibility reported in
+[GH#365](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/365);
+it does not establish the cause of that report's slow saves.
+
+**Build requirement:** `--diagnostics` requires a build containing this change.
+The installed v0.3.39 from the issue does not support the option. Source builds
+may still report package version `0.3.39`, so check the actual binary's command
+help instead of relying on its version string:
+
+```bash
+# From a checkout containing the archive diagnostics change:
+cargo build --locked --release -p mcp-agent-mail-cli --features portable --bin am
+./target/release/am archive save --help
+```
+
+Confirm that the help lists `--diagnostics`. Help does not create an archive.
+Use that exact binary with the existing save command only against a disposable
+replica or within the already approved offline run. Keep its working directory,
+mailbox configuration, supervisor recovery procedure, and timeout unchanged;
+this recipe does not require an additional live-mailbox outage.
+
+```bash
+# Existing offline run or isolated replica only; replace these placeholders.
+/abs/path/checkout/target/release/am archive save \
+  --project /abs/path/project \
+  --scrub-preset archive \
+  --label nightly \
+  --diagnostics 2>/abs/path/archive-save.stderr.log
+```
+
+Keep the archive output directory and the captured log outside `STORAGE_ROOT`.
+The option is off by default. Existing stdout and exit behavior are preserved;
+additional records are written to stderr with the prefix
+`archive_save_diagnostic`. Phase start, completion, and failure records are
+immediate. While a phase is running, there is at most one periodic record per
+five seconds on the reporter's cadence, rather than a line for each file. A
+periodic record may occur close to a phase boundary. `heartbeat=1` means the
+periodic worker started; `heartbeat=0` means it could not start and only phase
+boundaries are available. Times use a monotonic clock: total elapsed
+milliseconds since the save began and elapsed milliseconds in the current
+phase occurrence. Numeric counters and elapsed times saturate rather than
+wrapping on overflow.
+
+| Phase | Work being measured |
+|---|---|
+| `prepare` | Argument, path, and mailbox-lock preparation |
+| `snapshot_source` | Resolve the canonical source, including any existing private-source fallback |
+| `snapshot` | Create the private SQLite snapshot |
+| `filter` | Select projects and remove out-of-scope rows from the snapshot |
+| `scrub` | Apply the requested scrub preset and snapshot-purpose policy |
+| `finalize` | Rebuild snapshot storage, search indexes, views, and statistics |
+| `archive_metadata` | Prepare the existing archive metadata |
+| `zip_writing` | Write and compress ZIP members, then finish the ZIP |
+| `storage_enumeration` | Walk the existing storage selection and sort members |
+| `publication` | Atomically rename the completed temporary ZIP into place |
+
+`zip_writing` can appear before and after `storage_enumeration`: the existing
+save order writes metadata and the snapshot before enumerating the storage
+tree. Elapsed time for each occurrence starts at that occurrence's start.
+
+File and byte-work counters are cumulative within one invocation.
+`snapshot_bytes` and `archive_bytes` are size gauges, reporting the most recent
+observation rather than adding repeated measurements; a snapshot can shrink
+during finalization. A zero size gauge can mean it has not yet been measured.
+Interpret all values with the current phase:
+
+| Counter | Meaning |
+|---|---|
+| `storage_files` | Regular storage files selected by the existing traversal |
+| `storage_bytes` | Sum of known selected-file sizes; incomplete when `storage_size_unknown` is nonzero |
+| `storage_size_unknown` | Selected files whose size could not be obtained for diagnostics |
+| `zip_files` | ZIP entries whose input payload was fully accepted, including metadata and snapshot entries |
+| `zip_bytes` | Uncompressed bytes accepted by the ZIP writer, including a partially written current entry |
+| `snapshot_bytes` | Observed snapshot file size |
+| `archive_bytes` | Observed compressed size of the completed ZIP |
+
+Even after an entry's input is fully accepted, final compression and the ZIP
+central directory may still be pending until `zip_writing` completes.
+
+These are observations, not a completion percentage or an ETA. SQLite work can
+continue while file/byte counters stay unchanged. A heartbeat indicates that
+the diagnostic reporter is running; it does not prove that the current
+operation is advancing, and silence after forced termination cannot produce a
+failure record. Phase timing alone does not prove deadlock, establish a
+reconciliation backlog, or attribute cost to recovery-directory size.
+
+Only the prefixed diagnostic records have the content-free contract: fixed
+phase/status names and numeric times/counters, with no file paths, project
+selectors, labels, message bodies, credentials, SQL, or raw error strings.
+Normal command output and existing errors can still contain paths and other
+operator details. To retain just the phase records for review:
+
+```bash
+rg '^archive_save_diagnostic ' /abs/path/archive-save.stderr.log \
+  > /abs/path/archive-save.diagnostics.log
+```
+
+The flag does not alter locking, project filtering, scrub semantics, compression
+settings, archive members, restore format, or atomic publication. It does not
+exclude or delete recovery evidence, and it does not change the offline limit.
