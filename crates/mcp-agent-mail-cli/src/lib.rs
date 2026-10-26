@@ -28,6 +28,7 @@ pub mod legacy;
 pub mod output;
 mod release_signing;
 pub mod reliability_coverage;
+mod reservation_read;
 pub mod robot;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -491,6 +492,9 @@ pub enum Commands {
         /// Warn about reservations expiring within N minutes.
         #[arg(long)]
         expiring: Option<u32>,
+        /// Read the configured MCP server without opening the local database.
+        #[arg(long)]
+        server: bool,
     },
     /// Direct alias for `am robot health`.
     #[command(name = "health")]
@@ -1869,18 +1873,27 @@ pub enum FileReservationsCommand {
         active_only: bool,
         #[arg(long = "all", default_value_t = false)]
         all: bool,
+        /// Read the configured MCP server without opening the local database.
+        #[arg(long)]
+        server: bool,
     },
     /// Show active reservations with lock type.
     Active {
         project: String,
         #[arg(long)]
         limit: Option<i64>,
+        /// Read the configured MCP server without opening the local database.
+        #[arg(long)]
+        server: bool,
     },
     /// Show reservations expiring soon.
     Soon {
         project: String,
         #[arg(long)]
         minutes: Option<i64>,
+        /// Read the configured MCP server without opening the local database.
+        #[arg(long)]
+        server: bool,
     },
     /// Create file reservations for an agent.
     Reserve {
@@ -1934,6 +1947,9 @@ pub enum FileReservationsCommand {
         /// Path patterns to check for conflicts.
         #[arg(required = true)]
         paths: Vec<String>,
+        /// Read the configured MCP server without opening the local database.
+        #[arg(long)]
+        server: bool,
     },
 }
 
@@ -4037,6 +4053,7 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             all,
             conflicts,
             expiring,
+            server,
         } => robot::handle_robot(robot_alias_args(
             format,
             json,
@@ -4047,6 +4064,7 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
                 all,
                 conflicts,
                 expiring,
+                server,
             },
         )),
         Commands::Health {
@@ -20007,6 +20025,36 @@ fn flake_triage_missing_artifact_hint(path: &Path) -> String {
 }
 
 fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
+    let server_read = match &action {
+        FileReservationsCommand::List {
+            project,
+            active_only,
+            all,
+            server: true,
+        } => Some((project.as_str(), *active_only || !all)),
+        FileReservationsCommand::Active {
+            project,
+            server: true,
+            ..
+        }
+        | FileReservationsCommand::Soon {
+            project,
+            server: true,
+            ..
+        }
+        | FileReservationsCommand::Conflicts {
+            project,
+            server: true,
+            ..
+        } => Some((project.as_str(), true)),
+        _ => None,
+    };
+    if let Some((project, active_only)) = server_read {
+        let read = reservation_read::read_server(&Config::from_env(), project, active_only)?;
+        render_server_file_reservations(&action, read.reservations)?;
+        emit_cli_reservation_read_attestation(&robot::server_reservation_read_attestation());
+        return Ok(());
+    }
     if matches!(
         &action,
         FileReservationsCommand::Reserve { .. }
@@ -20053,12 +20101,127 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
         &config.database_url,
         Some(&config.storage_root),
         "file reservations",
-    )?;
+    )
+    .map_err(reservation_server_read_error)?;
     let result = handle_file_reservations_with_conn(opened.conn(), action);
     if result.is_ok() {
         emit_cli_reservation_read_attestation(&read_attestation);
     }
     result
+}
+
+/// Keep failed direct admission fail-closed while naming the supported read
+/// path. This hint never probes an endpoint or opens a different database.
+fn reservation_server_read_error(error: CliError) -> CliError {
+    CliError::Other(format!(
+        "{error}\nFor a reservation read from an already running MCP server, retry this command \
+         with --server (AGENT_MAIL_URL selects the endpoint). Server mode verifies the project \
+         and never opens or repairs the local mailbox."
+    ))
+}
+
+fn render_server_file_reservations(
+    action: &FileReservationsCommand,
+    mut rows: Vec<reservation_read::ServerReservation>,
+) -> CliResult<()> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    if !matches!(
+        action,
+        FileReservationsCommand::List {
+            active_only: false,
+            all: true,
+            ..
+        }
+    ) {
+        rows.retain(|row| row.released_ts.is_none_or(|ts| ts <= 0) && row.expires_ts > now_us);
+    }
+    match action {
+        FileReservationsCommand::List { .. } => {
+            rows.sort_by_key(|row| row.id);
+            if rows.is_empty() {
+                output::empty_result(false, "No file reservations found.");
+                return Ok(());
+            }
+            let mut table =
+                output::CliTable::new(vec!["ID", "PATTERN", "AGENT", "EXPIRES", "REASON"]);
+            for row in rows {
+                let expires = mcp_agent_mail_db::micros_to_iso(row.expires_ts);
+                table.add_row(vec![
+                    row.id.to_string(),
+                    row.path_pattern,
+                    row.agent,
+                    expires.get(..20).unwrap_or(&expires).to_string(),
+                    row.reason,
+                ]);
+            }
+            table.render();
+        }
+        FileReservationsCommand::Active { limit, .. } => {
+            rows.sort_by_key(|row| (row.expires_ts, row.id));
+            rows.truncate(usize::try_from(limit.unwrap_or(50)).unwrap_or(usize::MAX));
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No active reservations.");
+                return Ok(());
+            }
+            for row in rows {
+                let lock_type = if row.exclusive { "excl" } else { "shared" };
+                ftui_runtime::ftui_println!(
+                    "  {} [{}] by {}",
+                    row.path_pattern,
+                    lock_type,
+                    row.agent
+                );
+            }
+        }
+        FileReservationsCommand::Soon { minutes, .. } => {
+            let minutes = minutes.unwrap_or(30);
+            let threshold = now_us.saturating_add(saturating_minutes_to_micros(minutes));
+            rows.retain(|row| row.expires_ts <= threshold);
+            rows.sort_by_key(|row| (row.expires_ts, row.id));
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No reservations expiring within {} minutes.", minutes);
+                return Ok(());
+            }
+            output::section(&format!("Reservations expiring within {minutes} minutes:"));
+            let mut table = output::CliTable::new(vec!["PATTERN", "AGENT", "REMAINING"]);
+            for row in rows {
+                let remaining = row.expires_ts.saturating_sub(now_us) / 60_000_000;
+                table.add_row(vec![row.path_pattern, row.agent, format!("{remaining}min")]);
+            }
+            table.render();
+        }
+        FileReservationsCommand::Conflicts { paths, .. } => {
+            rows.sort_by_key(|row| row.id);
+            let mut table = output::CliTable::new(vec!["PATH", "HOLDER", "PATTERN", "EXPIRES"]);
+            let mut count = 0;
+            for path in paths {
+                for row in &rows {
+                    if row.exclusive && reservation_patterns_overlap(path, &row.path_pattern) {
+                        count += 1;
+                        let expires = mcp_agent_mail_db::micros_to_iso(row.expires_ts);
+                        table.add_row(vec![
+                            path.clone(),
+                            row.agent.clone(),
+                            row.path_pattern.clone(),
+                            expires.get(..20).unwrap_or(&expires).to_string(),
+                        ]);
+                    }
+                }
+            }
+            if count == 0 {
+                output::success("No conflicts detected.");
+            } else {
+                output::warn(&format!("{count} conflict(s) found:"));
+                table.render();
+            }
+        }
+        _ => {
+            return Err(CliError::InvalidArgument(
+                "--server is only supported for reservation reads".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Run one mutating reservation verb through a live daemon when one owns the
@@ -20647,6 +20810,7 @@ fn handle_file_reservations_with_conn(
             project,
             active_only,
             all,
+            ..
         } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
                 warn_unregistered_reservation_project(&project);
@@ -20740,7 +20904,7 @@ fn handle_file_reservations_with_conn(
             table.render();
             Ok(())
         }
-        FileReservationsCommand::Active { project, limit } => {
+        FileReservationsCommand::Active { project, limit, .. } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
                 warn_unregistered_reservation_project(&project);
                 ftui_runtime::ftui_println!("No active reservations.");
@@ -20794,7 +20958,9 @@ fn handle_file_reservations_with_conn(
             }
             Ok(())
         }
-        FileReservationsCommand::Soon { project, minutes } => {
+        FileReservationsCommand::Soon {
+            project, minutes, ..
+        } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
                 warn_unregistered_reservation_project(&project);
                 ftui_runtime::ftui_println!(
@@ -20862,7 +21028,7 @@ fn handle_file_reservations_with_conn(
         | FileReservationsCommand::Release { .. } => Err(CliError::InvalidArgument(
             "reservation mutations require the archive-aware command path".into(),
         )),
-        FileReservationsCommand::Conflicts { project, paths } => {
+        FileReservationsCommand::Conflicts { project, paths, .. } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
                 warn_unregistered_reservation_project(&project);
                 output::success("No conflicts detected.");
@@ -70251,11 +70417,13 @@ startup_timeout_sec = 42
                         project,
                         active_only,
                         all,
+                        server,
                     },
             } => {
                 assert_eq!(project, "my-project");
                 assert!(!active_only);
                 assert!(!all);
+                assert!(!server);
             }
             other => panic!("expected FileReservations List, got {other:?}"),
         }
@@ -70291,10 +70459,16 @@ startup_timeout_sec = 42
         let cli = Cli::try_parse_from(["am", "file_reservations", "active", "proj"]).unwrap();
         match cli.command.expect("expected command") {
             Commands::FileReservations {
-                action: FileReservationsCommand::Active { project, limit },
+                action:
+                    FileReservationsCommand::Active {
+                        project,
+                        limit,
+                        server,
+                    },
             } => {
                 assert_eq!(project, "proj");
                 assert!(limit.is_none());
+                assert!(!server);
             }
             other => panic!("expected FileReservations Active, got {other:?}"),
         }
@@ -70307,10 +70481,16 @@ startup_timeout_sec = 42
                 .unwrap();
         match cli.command.expect("expected command") {
             Commands::FileReservations {
-                action: FileReservationsCommand::Soon { project, minutes },
+                action:
+                    FileReservationsCommand::Soon {
+                        project,
+                        minutes,
+                        server,
+                    },
             } => {
                 assert_eq!(project, "proj");
                 assert_eq!(minutes, Some(15));
+                assert!(!server);
             }
             other => panic!("expected FileReservations Soon, got {other:?}"),
         }
@@ -70620,13 +70800,116 @@ startup_timeout_sec = 42
         .unwrap();
         match cli.command.expect("expected command") {
             Commands::FileReservations {
-                action: FileReservationsCommand::Conflicts { project, paths },
+                action:
+                    FileReservationsCommand::Conflicts {
+                        project,
+                        paths,
+                        server,
+                    },
             } => {
                 assert_eq!(project, "proj");
                 assert_eq!(paths, vec!["src/**", "Cargo.toml"]);
+                assert!(!server);
             }
             other => panic!("expected Conflicts, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_reservation_server_read_mode_is_explicit_on_all_read_surfaces() {
+        for args in [
+            vec!["am", "reservations", "--project", "proj", "--all", "--json"],
+            vec![
+                "am",
+                "robot",
+                "reservations",
+                "--project",
+                "proj",
+                "--all",
+                "--json",
+            ],
+            vec![
+                "am",
+                "robot",
+                "navigate",
+                "resource://file_reservations/proj?active_only=true",
+                "--project",
+                "proj",
+                "--json",
+            ],
+            vec!["am", "file_reservations", "list", "proj"],
+            vec!["am", "file_reservations", "active", "proj"],
+            vec!["am", "file_reservations", "soon", "proj"],
+            vec!["am", "file_reservations", "conflicts", "proj", "src/**"],
+        ] {
+            for requested in [false, true] {
+                let mut args = args.clone();
+                if requested {
+                    args.push("--server");
+                }
+                let command = Cli::try_parse_from(&args)
+                    .unwrap_or_else(|error| panic!("{args:?}: {error}"))
+                    .command
+                    .expect("reservation command");
+                let server = match &command {
+                    Commands::Reservations { server, .. } => *server,
+                    Commands::Robot(robot::RobotArgs {
+                        command:
+                            robot::RobotSubcommand::Reservations { server, .. }
+                            | robot::RobotSubcommand::Navigate { server, .. },
+                        ..
+                    }) => *server,
+                    Commands::FileReservations { action } => {
+                        assert!(command_is_read_only(&command));
+                        match action {
+                            FileReservationsCommand::List { server, .. }
+                            | FileReservationsCommand::Active { server, .. }
+                            | FileReservationsCommand::Soon { server, .. }
+                            | FileReservationsCommand::Conflicts { server, .. } => *server,
+                            other => panic!("expected read command, got {other:?}"),
+                        }
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                };
+                assert_eq!(server, requested, "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn clap_reservation_mutations_reject_server_read_flag() {
+        for mut args in [
+            vec![
+                "am",
+                "file_reservations",
+                "reserve",
+                "proj",
+                "BlueLake",
+                "src/**",
+            ],
+            vec!["am", "file_reservations", "renew", "proj", "BlueLake"],
+            vec!["am", "file_reservations", "release", "proj", "BlueLake"],
+        ] {
+            args.push("--server");
+            let error = Cli::try_parse_from(&args).expect_err("--server is a read mode only");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_recovery_busy_admission_error_keeps_cause_and_server_read_guidance() {
+        let cause = "cannot open fixture.sqlite3 read-only: Connection error: database is busy (recovery in progress)";
+        let error = reservation_server_read_error(CliError::Other(cause.to_string()));
+        assert!(matches!(error, CliError::Other(_)));
+        let detail = error.to_string();
+        assert!(detail.contains(cause));
+        assert!(detail.contains("--server"));
+        assert!(detail.contains("AGENT_MAIL_URL"));
+        assert!(detail.contains("never opens or repairs the local mailbox"));
     }
 
     #[test]
@@ -74052,6 +74335,7 @@ startup_timeout_sec = 42
                 project: "test-proj".to_string(),
                 active_only: false,
                 all: false,
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -74083,6 +74367,7 @@ startup_timeout_sec = 42
                 project: "test-proj".to_string(),
                 active_only: false,
                 all: false,
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -74114,6 +74399,7 @@ startup_timeout_sec = 42
                 project: "[unknown-project-1]".to_string(),
                 active_only: false,
                 all: false,
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -74140,6 +74426,7 @@ startup_timeout_sec = 42
                 project: "/tmp/test-proj".to_string(),
                 active_only: false,
                 all: false,
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -74168,6 +74455,7 @@ startup_timeout_sec = 42
             FileReservationsCommand::Active {
                 project: "test-proj".to_string(),
                 limit: None,
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -74197,6 +74485,7 @@ startup_timeout_sec = 42
                 project: "nonexistent-proj".to_string(),
                 active_only: false,
                 all: false,
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -75205,6 +75494,7 @@ startup_timeout_sec = 42
             FileReservationsCommand::Conflicts {
                 project: "test-proj".to_string(),
                 paths: vec!["src/api/*.rs".to_string()],
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -75230,6 +75520,7 @@ startup_timeout_sec = 42
             FileReservationsCommand::Conflicts {
                 project: "test-proj".to_string(),
                 paths: vec!["src/**/*.rs".to_string()],
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -75262,6 +75553,7 @@ startup_timeout_sec = 42
             FileReservationsCommand::Conflicts {
                 project: "test-proj".to_string(),
                 paths: vec!["src/auth/*".to_string()],
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -75295,6 +75587,7 @@ startup_timeout_sec = 42
             FileReservationsCommand::Conflicts {
                 project: "test-proj".to_string(),
                 paths: vec!["src/*.txt".to_string()],
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -75323,6 +75616,7 @@ startup_timeout_sec = 42
             FileReservationsCommand::Conflicts {
                 project: "test-proj".to_string(),
                 paths: vec!["docs/README.md".to_string()],
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -75352,6 +75646,7 @@ startup_timeout_sec = 42
             FileReservationsCommand::Conflicts {
                 project: "missing-proj".to_string(),
                 paths: vec!["src/api/*.rs".to_string()],
+                server: false,
             },
         );
         let output = capture.drain_to_string();
@@ -94683,6 +94978,25 @@ async fn post_jsonrpc_request(
     payload: &serde_json::Value,
     timeout_seconds: u64,
 ) -> CliResult<serde_json::Value> {
+    post_jsonrpc_request_with_client(
+        server_url,
+        bearer,
+        payload,
+        timeout_seconds,
+        products_http_client(),
+    )
+    .await
+}
+
+/// Share the established HTTP/TLS transport while allowing a safety-critical
+/// read to pin its authority by disabling automatic HTTPS redirects.
+async fn post_jsonrpc_request_with_client(
+    server_url: &str,
+    bearer: Option<&str>,
+    payload: &serde_json::Value,
+    timeout_seconds: u64,
+    client: &asupersync::http::h1::HttpClient,
+) -> CliResult<serde_json::Value> {
     use asupersync::http::h1::Method;
     use asupersync::time::{timeout, wall_now};
     use std::time::Duration;
@@ -94710,8 +95024,7 @@ async fn post_jsonrpc_request(
     // Production request-scoped Cx minted from the running runtime (asupersync
     // 0.5 makes both `Cx::for_testing()` and `Cx::for_request()` test-only).
     let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
-    let request =
-        Box::pin(products_http_client().request(&cx, Method::Post, server_url, headers, body));
+    let request = Box::pin(client.request(&cx, Method::Post, server_url, headers, body));
     let response = match timeout(wall_now(), Duration::from_secs(timeout_seconds), request).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {

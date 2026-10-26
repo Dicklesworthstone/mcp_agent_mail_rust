@@ -3082,6 +3082,9 @@ pub enum RobotSubcommand {
     Navigate {
         /// Resource URI (e.g. resource://inbox/AgentName).
         uri: String,
+        /// Read a reservation resource from the configured MCP server, without local DB access.
+        #[arg(long)]
+        server: bool,
     },
 
     // ── Track 4: Monitoring & Analytics ─────────────────────────────────
@@ -3100,6 +3103,9 @@ pub enum RobotSubcommand {
         /// Warn about reservations expiring within N minutes.
         #[arg(long)]
         expiring: Option<u32>,
+        /// Read the configured MCP server without opening the local database.
+        #[arg(long)]
+        server: bool,
     },
 
     /// Tool performance summary (calls, errors, error%, latency percentiles).
@@ -9036,11 +9042,6 @@ fn build_reservations_at(
     conflicts_only: bool,
     expiring_minutes: Option<u32>,
 ) -> Result<(ReservationsData, Vec<String>), CliError> {
-    let expiring_threshold = now_us.saturating_add(
-        i64::from(expiring_minutes.unwrap_or(10))
-            .saturating_mul(60)
-            .saturating_mul(1_000_000),
-    );
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let release_ledger = release_ledger_index(conn, has_release_ledger)?;
@@ -9064,23 +9065,77 @@ fn build_reservations_at(
         )
         .map_err(|e| CliError::Other(format!("reservations query failed: {e}")))?;
 
+    let records = all_rows
+        .iter()
+        .filter(|row| {
+            !row.get_named::<i64>("id")
+                .is_ok_and(|id| release_ledger.contains(id))
+        })
+        .map(|row| crate::reservation_read::ServerReservation {
+            id: row.get_named("id").unwrap_or(0),
+            agent: row.get_named("agent_name").unwrap_or_default(),
+            path_pattern: row.get_named("path_pattern").unwrap_or_default(),
+            exclusive: row.get_named::<i64>("exclusive").unwrap_or(1) != 0,
+            reason: String::new(),
+            created_ts: row.get_named("created_ts").unwrap_or(0),
+            expires_ts: row.get_named("expires_ts").unwrap_or(0),
+            released_ts: None,
+        })
+        .collect::<Vec<_>>();
+    // Preserve holder-ID scoping on direct reads, including a malformed
+    // cross-project holder reference with the same display name.
+    let my_reservation_ids: HashSet<i64> = all_rows
+        .iter()
+        .filter_map(|row| {
+            let (agent_id, _) = agent.as_ref()?;
+            (row.get_named::<i64>("agent_id").ok() == Some(*agent_id))
+                .then(|| row.get_named::<i64>("id").ok())
+                .flatten()
+        })
+        .collect();
+    build_reservations_from_records(
+        &records,
+        now_us,
+        project_slug,
+        agent.map(|(_, name)| name),
+        &my_reservation_ids,
+        show_all,
+        conflicts_only,
+        expiring_minutes,
+    )
+}
+
+/// Both read authorities use the same projection, conflict analysis and output
+/// contract. Server rows never pass through a temporary or competing database.
+fn build_reservations_from_records(
+    records: &[crate::reservation_read::ServerReservation],
+    now_us: i64,
+    project_slug: &str,
+    agent: Option<String>,
+    my_reservation_ids: &HashSet<i64>,
+    show_all: bool,
+    conflicts_only: bool,
+    expiring_minutes: Option<u32>,
+) -> Result<(ReservationsData, Vec<String>), CliError> {
+    let expiring_threshold = now_us.saturating_add(
+        i64::from(expiring_minutes.unwrap_or(10))
+            .saturating_mul(60)
+            .saturating_mul(1_000_000),
+    );
     let mut all_active = Vec::new();
     let mut my_reservations = Vec::new();
     let mut expiring_soon = Vec::new();
 
-    for row in &all_rows {
-        if row
-            .get_named::<i64>("id")
-            .is_ok_and(|id| release_ledger.contains(id))
-        {
+    for row in records {
+        // A lease may expire while the three server reads are in flight.
+        if row.expires_ts <= now_us || reservation_is_released(row.released_ts) {
             continue;
         }
-        let path: String = row.get_named("path_pattern").unwrap_or_default();
-        let exclusive: bool = row.get_named::<i64>("exclusive").unwrap_or(1) != 0;
-        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
-        let expires_ts: i64 = row.get_named("expires_ts").unwrap_or(0);
-        let agent_name: String = row.get_named("agent_name").unwrap_or_default();
-        let agent_id_row: i64 = row.get_named("agent_id").unwrap_or(0);
+        let path = row.path_pattern.clone();
+        let exclusive = row.exclusive;
+        let created_ts = row.created_ts;
+        let expires_ts = row.expires_ts;
+        let agent_name = row.agent.clone();
 
         let remaining_seconds = remaining_seconds_from_micros(now_us, expires_ts);
         let created_age = age_seconds_from_micros(now_us, created_ts);
@@ -9099,9 +9154,7 @@ fn build_reservations_at(
 
         all_active.push(entry.clone());
 
-        if let Some((my_id, _)) = &agent
-            && agent_id_row == *my_id
-        {
+        if my_reservation_ids.contains(&row.id) {
             my_reservations.push(entry.clone());
         }
 
@@ -9162,11 +9215,7 @@ fn build_reservations_at(
             && left.path_b == right.path_b
     });
 
-    let scoped_agent_name = if !show_all {
-        agent.as_ref().map(|(_, name)| name.as_str())
-    } else {
-        None
-    };
+    let scoped_agent_name = if !show_all { agent.as_deref() } else { None };
     let scoped_conflicts: Vec<_> = if let Some(agent_name) = scoped_agent_name {
         conflicts
             .iter()
@@ -9196,7 +9245,7 @@ fn build_reservations_at(
 
     // Build actions
     let mut actions = Vec::new();
-    if let Some((_, ref agent_name)) = agent {
+    if let Some(ref agent_name) = agent {
         let project_arg = robot_shell_arg(project_slug);
         let agent_arg = robot_shell_arg(agent_name);
         for entry in &scoped_expiring_soon {
@@ -9347,6 +9396,32 @@ fn build_reservations_with_snapshot_cache(
         },
     );
     Ok((data, actions))
+}
+
+fn resolve_server_reservation_agent(
+    read: &crate::reservation_read::ServerReservationRead,
+    explicit_flag: Option<&str>,
+) -> Result<Option<String>, CliError> {
+    let Some(name) = resolved_agent_flag_or_env(explicit_flag) else {
+        return Ok(None);
+    };
+    let mut matching = read
+        .agent_names
+        .iter()
+        .filter(|candidate| candidate.eq_ignore_ascii_case(&name));
+    let first = matching.next();
+    if matching.next().is_some() {
+        return Err(CliError::InvalidArgument(format!(
+            "ambiguous agent name: {name}"
+        )));
+    }
+    match first {
+        Some(canonical) => Ok(Some(canonical.clone())),
+        None if explicit_flag.is_none() => Ok(None),
+        None => Err(CliError::InvalidArgument(format!(
+            "agent not found in server project roster: {name}"
+        ))),
+    }
 }
 
 /// Check whether two reservation path patterns can overlap.
@@ -12861,7 +12936,7 @@ fn build_navigate_from_canonical_resource(
             })
         }
         ["file_reservations", project_key] | ["reservations", project_key] => {
-            let conn = crate::open_db_sync_robot()?;
+            let conn = crate::open_db_sync_robot().map_err(crate::reservation_server_read_error)?;
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(&conn, project_key)?;
             build_navigate_file_reservations(
@@ -12882,7 +12957,7 @@ fn build_navigate_from_canonical_resource(
                     "project query parameter is required".to_string(),
                 ));
             };
-            let conn = crate::open_db_sync_robot()?;
+            let conn = crate::open_db_sync_robot().map_err(crate::reservation_server_read_error)?;
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(&conn, &project_key)?;
             build_navigate_file_reservations(
@@ -13000,6 +13075,81 @@ fn build_navigate_file_reservations(
             data: serde_json::json!({ "reservations": reservations }),
         },
         Some(project_slug.to_string()),
+    ))
+}
+
+fn build_navigate_server_reservations(
+    uri: &str,
+    project_flag: Option<&str>,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let (path, query) = split_resource_path_and_query(uri)?;
+    let parts: Vec<String> = path
+        .split('/')
+        .map(percent_decode_resource_path_component)
+        .collect();
+    let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let project_key = match parts_ref.as_slice() {
+        ["file_reservations", key] | ["reservations", key] if !key.trim().is_empty() => key.to_string(),
+        ["file_reservations"] | ["reservations"] => {
+            match query.get("project").filter(|value| !value.trim().is_empty()) {
+                Some(key) => key.clone(),
+                None => robot_server_project_key(project_flag)?,
+            }
+        }
+        _ => return Err(CliError::InvalidArgument(
+            "--server navigation supports only resource://file_reservations/<project> (or resource://reservations/<project>)"
+                .to_string(),
+        )),
+    };
+    let active_only = query
+        .get("active_only")
+        .is_none_or(|value| parse_resource_bool(Some(value)));
+    let limit = parse_resource_limit(query.get("limit"), 50);
+    let offset = query
+        .get("offset")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let read = crate::reservation_read::read_server(
+        &mcp_agent_mail_core::Config::from_env(),
+        &project_key,
+        active_only,
+    )?;
+    // A URI must not silently override a conflicting explicit/environment
+    // project selector. Both slug and canonical human key can name the same
+    // verified project, so compare identities rather than literal selectors.
+    if let Some(expected) = resolved_project_flag_or_env(project_flag) {
+        crate::reservation_read::verify_project_selector(&read.project, &expected)?;
+    }
+    if let Some(expected) = query.get("project") {
+        crate::reservation_read::verify_project_selector(&read.project, expected)?;
+    }
+    let now = mcp_agent_mail_db::now_micros();
+    // Native navigation pages newest-first, whereas the MCP resource pages
+    // oldest-first. Require one complete read, then sort and slice locally;
+    // forwarding OFFSET would silently return a different set of leases.
+    let mut records = read.reservations;
+    records.sort_by_key(|row| (std::cmp::Reverse(row.created_ts), row.id));
+    let reservations: Vec<_> = records
+        .iter()
+        .filter(|row| !active_only || row.expires_ts > now)
+        .skip(offset)
+        .take(limit)
+        .map(|row| {
+            serde_json::json!({
+                "path": row.path_pattern,
+                "agent": row.agent,
+                "exclusive": row.exclusive,
+                "expires_ts": row.expires_ts,
+                "released": reservation_is_released(row.released_ts),
+            })
+        })
+        .collect();
+    Ok((
+        NavigateResult::Generic {
+            resource_type: "file_reservations".to_string(),
+            data: serde_json::json!({ "reservations": reservations }),
+        },
+        Some(read.project.slug),
     ))
 }
 
@@ -13334,6 +13484,21 @@ pub(crate) fn reservation_read_attestation(
                 "live server mailbox configuration unavailable: {error}; local reservation read cannot attest freshness"
             )),
         ),
+    }
+}
+
+/// Only constructed after a successful, identity-checked MCP resource read.
+/// The user explicitly chose this server as the authority; no comparison with
+/// a local database or archive was needed or performed.
+pub(crate) fn server_reservation_read_attestation() -> ReservationReadAttestation {
+    ReservationReadAttestation {
+        state: "current",
+        source: "mcp_server",
+        database_matches_server: None,
+        storage_root_matches_server: None,
+        detail: "Reservations read through the explicitly selected MCP server; stored project identity verified before and after the read"
+            .to_string(),
+        action: None,
     }
 }
 
@@ -15889,21 +16054,53 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             all,
             conflicts,
             expiring,
+            server,
         } => {
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
             let config = mcp_agent_mail_core::Config::from_env();
-            let read_attestation = reservation_read_attestation(&config);
-            let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)?;
-            let agent = scope.agent.clone();
-            let (data, actions) = build_reservations_with_snapshot_cache(
-                scope.conn(),
-                scope.project_id,
-                &scope.project_slug,
-                agent,
-                all,
-                conflicts,
-                expiring,
-            )?;
+            let (data, actions, project_slug, read_attestation) = if server {
+                let project_key = robot_server_project_key(args.project.as_deref())?;
+                let mut read = crate::reservation_read::read_server(&config, &project_key, true)?;
+                let agent = resolve_server_reservation_agent(&read, agent_flag)?;
+                let my_reservation_ids: HashSet<i64> = read
+                    .reservations
+                    .iter()
+                    .filter(|row| agent.as_deref() == Some(row.agent.as_str()))
+                    .map(|row| row.id)
+                    .collect();
+                read.reservations
+                    .sort_by_key(|row| (row.expires_ts, row.id));
+                let (data, actions) = build_reservations_from_records(
+                    &read.reservations,
+                    mcp_agent_mail_db::now_micros(),
+                    &read.project.slug,
+                    agent,
+                    &my_reservation_ids,
+                    all,
+                    conflicts,
+                    expiring,
+                )?;
+                (
+                    data,
+                    actions,
+                    read.project.slug,
+                    server_reservation_read_attestation(),
+                )
+            } else {
+                let read_attestation = reservation_read_attestation(&config);
+                let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)
+                    .map_err(crate::reservation_server_read_error)?;
+                let (data, actions) = build_reservations_with_snapshot_cache(
+                    scope.conn(),
+                    scope.project_id,
+                    &scope.project_slug,
+                    scope.agent.clone(),
+                    all,
+                    conflicts,
+                    expiring,
+                )?;
+                (data, actions, scope.project_slug, read_attestation)
+            };
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
@@ -15912,7 +16109,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     reservation_read_attestation: read_attestation.clone(),
                 },
             );
-            env._meta.project = Some(scope.project_slug);
+            env._meta.project = Some(project_slug);
             if read_attestation.state != "current" {
                 env = env.with_alert("warn", read_attestation.detail, read_attestation.action);
             }
@@ -16970,8 +17167,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             env._meta.project = Some(scope.project_slug);
             format_output(&env, format)?
         }
-        RobotSubcommand::Navigate { uri } => {
-            let (result, resolved_project) = if navigate_should_use_canonical_resource(&uri) {
+        RobotSubcommand::Navigate { uri, server } => {
+            let (result, resolved_project) = if server {
+                build_navigate_server_reservations(&uri, args.project.as_deref())?
+            } else if navigate_should_use_canonical_resource(&uri) {
                 // Same fallback as every other robot verb: --project, then
                 // AGENT_MAIL_PROJECT, then the working directory.
                 let default_project = robot_server_project_key(args.project.as_deref()).ok();

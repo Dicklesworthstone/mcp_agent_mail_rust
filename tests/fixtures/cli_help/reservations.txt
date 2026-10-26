@@ -10,4 +10,5 @@ Options:
       --all                  Show reservations for all agents, not just the selected agent
       --conflicts            Add the overlapping subset (`conflicting_active`) to the view; `all_active`, conflicts and expiring reservations stay listed
       --expiring <EXPIRING>  Warn about reservations expiring within N minutes
+      --server               Read the configured MCP server without opening the local database
   -h, --help                 Print help

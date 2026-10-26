@@ -284,6 +284,61 @@ for the named paths, and a broader list of active reservations in the project.
 coordinate in-thread with the holder before editing. Do not work around the
 reservation by touching the file anyway.
 
+### Read reservations through an already running server
+
+A healthy server can keep serving its admitted database connections while a
+new CLI read-only connection is refused with `database is busy (recovery in
+progress)` (GH#368). Select the existing server's authoritative MCP resource
+with `--server`; this read mode never opens, migrates, repairs, or reconstructs
+the local mailbox and does not require restarting the owner.
+
+```bash
+PROJECT=/abs/path/project
+export AGENT_MAIL_URL=http://127.0.0.1:8765/mcp/
+# Supply the existing server credential through AGENT_MAIL_TOKEN or
+# HTTP_BEARER_TOKEN when authentication is enabled; do not disable server auth.
+
+am reservations --project "$PROJECT" --all --json --server
+am file_reservations active "$PROJECT" --server
+am robot navigate "resource://file_reservations?project=$PROJECT&active_only=true" \
+  --project "$PROJECT" --json --server
+```
+
+`--server` is also supported by `am robot reservations` and by
+`am file_reservations list`, `soon`, and `conflicts`. JSON fields, table columns,
+agent filtering, expiry warnings, conflict detection, and navigation ordering
+remain the same. Reservation attestation identifies `source: "mcp_server"`;
+the database/archive comparison fields are null because no local database was
+read. Without `--server`, the commands retain their direct-read behavior.
+
+The endpoint follows the existing client configuration (`AGENT_MAIL_URL`, or
+the configured `HTTP_HOST`, `HTTP_PORT`, and `HTTP_PATH` with existing local
+owner discovery). `AGENT_MAIL_TOKEN` takes precedence over the existing
+configured/service bearer token. Select the intended endpoint explicitly when
+more than one mailbox is available. The CLI verifies the stored project ID,
+slug, human key, creation timestamp, and agent roster before and after reading;
+an absolute project path must match the stored path, including canonical path
+aliases. Navigation rejects a URI project that disagrees with `--project` or
+`AGENT_MAIL_PROJECT`. It does not infer a different project from a colliding
+slug or create a missing project. An explicit `--agent` must be present in the
+server's available-agent roster.
+
+Authentication failure, an unavailable server, changed/mismatched identity,
+redirects, malformed responses, and incomplete lists exit nonzero without
+printing a reservation result or falling back to local/archive data. Automation
+must check the exit status before using stdout or deciding that no leases exist.
+
+**Completeness limit:** The existing reservation resource caps a response at
+250 rows and has no multi-page snapshot token. Server mode accepts only a
+short page (at most 249 matching reservations) and refuses a full 250-row page,
+even for a smaller CLI `--limit` or navigation page. This prevents independent
+OFFSET requests from skipping live leases during concurrent changes. Navigation
+sorts the verified complete result into its existing newest-first order before
+applying `limit`/`offset`. For larger projects, use a successful direct read for
+a complete safety decision. The documented MCP resource's paged reads remain
+available for manual inspection, but independently fetched pages are not an
+atomic reservation snapshot.
+
 ## 9. Release a crashed agent's reservations [stateful]
 
 **Goal:** Clean up stale reservations after confirming an agent is no longer
