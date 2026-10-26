@@ -437,6 +437,16 @@ pub fn check_reservation_parity_with_db_conn(
     conn: &mcp_agent_mail_db::DbConn,
     storage_root: &Path,
 ) -> Result<ReservationParityReport, String> {
+    check_reservation_parity_with_sync_query(conn, storage_root)
+}
+
+pub fn check_reservation_parity_with_sync_query<Q>(
+    conn: &Q,
+    storage_root: &Path,
+) -> Result<ReservationParityReport, String>
+where
+    Q: mcp_agent_mail_db::pool::SyncQuery,
+{
     check_reservation_parity_with_query(
         |sql, params| {
             conn.query_sync(sql, params)

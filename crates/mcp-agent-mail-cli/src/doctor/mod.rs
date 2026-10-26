@@ -33,6 +33,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_storage::recovery::reservation_reconcile;
 use mcp_agent_mail_tools::reservation_parity::{
     ReservationParityReport, check_reservation_parity_with_canonical_conn,
+    check_reservation_parity_with_sync_query,
 };
 use serde::Serialize;
 use std::fs;
@@ -2709,34 +2710,33 @@ fn support_schema_versions(
     database_url: &str,
     redaction: &SupportRedactionContext,
 ) -> serde_json::Value {
-    let conn = match crate::open_db_for_doctor_check(database_url) {
-        Ok(conn) => conn,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "unavailable",
-                "detail": redact_support_text(&err.to_string(), redaction),
+    let sample_from_query =
+        |query_fn: &dyn Fn(&str) -> Option<Vec<mcp_agent_mail_db::sqlmodel_core::Row>>| {
+            let user_version = query_fn("PRAGMA user_version").and_then(|rows| {
+                rows.first()
+                    .and_then(|row| row.get_named::<i64>("user_version").ok())
             });
-        }
-    };
-    let user_version = conn
-        .query_sync("PRAGMA user_version", &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<i64>("user_version").ok())
-        });
-    let sqlite_version = conn
-        .query_sync("SELECT sqlite_version() AS sqlite_version", &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<String>("sqlite_version").ok())
-        });
-    serde_json::json!({
-        "status": "captured",
-        "database_user_version": user_version,
-        "sqlite_version": sqlite_version,
-    })
+            let sqlite_version =
+                query_fn("SELECT sqlite_version() AS sqlite_version").and_then(|rows| {
+                    rows.first()
+                        .and_then(|row| row.get_named::<String>("sqlite_version").ok())
+                });
+            serde_json::json!({
+                "status": "captured",
+                "database_user_version": user_version,
+                "sqlite_version": sqlite_version,
+            })
+        };
+    if let Ok(conn) = crate::open_db_sync_read_only_with_database_url(database_url) {
+        return sample_from_query(&|sql| conn.query_sync(sql, &[]).ok());
+    }
+    match crate::open_db_for_doctor_check_read_only_with_context(database_url) {
+        Ok(opened) => sample_from_query(&|sql| opened.conn.query_sync(sql, &[]).ok()),
+        Err(err) => serde_json::json!({
+            "status": "unavailable",
+            "detail": redact_support_text(&err.to_string(), redaction),
+        }),
+    }
 }
 
 fn support_sqlite_sidecar_metadata(database_path: &Path) -> serde_json::Value {
@@ -3436,10 +3436,21 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         );
     }
     let mut live_mailbox_degraded = false;
-    match crate::doctor_database_fix_strategy_read_only(
+    let fix_strategy = if crate::robot::live_server_proves_mailbox_healthy(
+        &config,
         &probe_target.database_url,
         &probe_target.storage_root,
     ) {
+        Ok(crate::DoctorDatabaseFixStrategy::None(
+            "Database passed live server health_check probes".to_string(),
+        ))
+    } else {
+        crate::doctor_database_fix_strategy_read_only(
+            &probe_target.database_url,
+            &probe_target.storage_root,
+        )
+    };
+    match fix_strategy {
         Ok(crate::DoctorDatabaseFixStrategy::None(_)) => {}
         Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => {
             ftui_runtime::ftui_println!(
@@ -3599,13 +3610,26 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
-    match crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
-        .and_then(|opened| {
-            check_reservation_parity_with_canonical_conn(&opened.conn, &probe_target.storage_root)
+    let reservation_parity =
+        match crate::open_db_sync_read_only_with_database_url(&probe_target.database_url) {
+            Ok(conn) => check_reservation_parity_with_sync_query(&conn, &probe_target.storage_root)
                 .map_err(|error| {
                     CliError::Other(format!("reservation parity check failed: {error}"))
-                })
-        }) {
+                }),
+            Err(_) => {
+                crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
+                    .and_then(|opened| {
+                        check_reservation_parity_with_canonical_conn(
+                            &opened.conn,
+                            &probe_target.storage_root,
+                        )
+                        .map_err(|error| {
+                            CliError::Other(format!("reservation parity check failed: {error}"))
+                        })
+                    })
+            }
+        };
+    match reservation_parity {
         Ok(report) => {
             ftui_runtime::ftui_println!("{}", report.health_line());
             if !report.ok {

@@ -8740,6 +8740,298 @@ fn summarize_archive_db_parity_probe(
     }
 }
 
+#[derive(Debug)]
+struct LiveServerRobotHealthProbes {
+    db_file: String,
+    db_connectivity: HealthProbe,
+    db_file_sanity: HealthProbeAssessment,
+    db_schema: HealthProbeAssessment,
+    archive_db_parity: HealthProbeAssessment,
+    search_index_snapshot: LexicalBackfillHealth,
+    search_index_probe: HealthProbe,
+    search_index_unhealthy: bool,
+    search_index_degraded: bool,
+    integrity_metrics: Option<mcp_agent_mail_db::IntegrityMetrics>,
+}
+
+fn live_server_archive_parity_probe_from_health(
+    storage_root: &Path,
+    typed: &mcp_agent_mail_tools::identity::HealthCheckResponse,
+) -> HealthProbeAssessment {
+    let projects_root = storage_root.join("projects");
+    if !storage_root.exists() {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "Skipped: storage root missing at {}",
+                    storage_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+    if !crate::path_is_real_directory(&projects_root) {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "Skipped: no canonical archive projects directory found under {}",
+                    projects_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+    if typed
+        .semantic_readiness
+        .detail
+        .contains("archive projects=0, agents=0, messages=0")
+    {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "No canonical archive content found under {}",
+                    projects_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+
+    let parity_degraded = typed.verdicts.archive_db_parity.status != "green"
+        || typed.semantic_readiness.status != "ok";
+    HealthProbeAssessment {
+        probe: HealthProbe {
+            name: "archive_db_parity".into(),
+            status: if parity_degraded { "warn" } else { "ok" }.into(),
+            latency_ms: 0.0,
+            detail: typed.verdicts.archive_db_parity.detail.clone(),
+        },
+        unhealthy: false,
+        degraded: parity_degraded,
+    }
+}
+
+fn parse_health_check_response(
+    server_health: &serde_json::Value,
+) -> Option<mcp_agent_mail_tools::identity::HealthCheckResponse> {
+    let mut normalized = server_health.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.entry("failing_verdicts")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(disk) = obj
+            .get_mut("disk")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            disk.entry("errors")
+                .or_insert_with(|| serde_json::json!([]));
+        }
+    }
+    serde_json::from_value(normalized).ok()
+}
+
+fn synthesize_robot_health_probes_from_server(
+    config: &mcp_agent_mail_core::Config,
+    server_health: &serde_json::Value,
+    rpc_latency_ms: f64,
+) -> Option<LiveServerRobotHealthProbes> {
+    let typed = parse_health_check_response(server_health)?;
+    if mailbox_database_identity(&config.database_url)
+        != mailbox_database_identity(&typed.database_url)
+        || mailbox_storage_identity(&config.storage_root)
+            != mailbox_storage_identity(Path::new(&typed.storage_root))
+    {
+        return None;
+    }
+
+    if typed.verdicts.db_health.status != "green"
+        || typed.verdicts.write_health.status != "green"
+        || typed.verdicts.integrity_check.status == "red"
+        || typed.verdicts.archive_db_parity.status == "red"
+        || typed.semantic_readiness.status == "fail"
+    {
+        return None;
+    }
+    if typed
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.mode != "healthy")
+    {
+        return None;
+    }
+
+    let resolved =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    if resolved.canonical_path == ":memory:" {
+        return None;
+    }
+    let db_path = Path::new(&resolved.canonical_path);
+    let file_size = db_path.metadata().ok().filter(|m| m.is_file())?.len();
+    if file_size == 0 || crate::doctor_truncated_wal_sidecar_detail(db_path).is_some() {
+        return None;
+    }
+
+    let archive_db_parity =
+        live_server_archive_parity_probe_from_health(&config.storage_root, &typed);
+    let search_index_snapshot = server_health
+        .get("lexical_backfill")
+        .and_then(|value| serde_json::from_value::<LexicalBackfillHealth>(value.clone()).ok())
+        .or_else(|| robot_search_index_health_from_config(config).ok())?;
+    let search_status = search_index_probe_status(&search_index_snapshot);
+    let search_index_probe = HealthProbe {
+        name: "search_index".into(),
+        status: search_status.into(),
+        latency_ms: 0.0,
+        detail: search_index_probe_detail(&search_index_snapshot),
+    };
+
+    let db_connectivity = HealthProbe {
+        name: "db_connectivity".into(),
+        status: "ok".into(),
+        latency_ms: (rpc_latency_ms * 100.0).round() / 100.0,
+        detail: format!(
+            "SQLite read-only connection healthy at {} (attested by live server: {})",
+            resolved.canonical_path, typed.verdicts.db_health.detail
+        ),
+    };
+
+    let db_file_sanity = HealthProbeAssessment {
+        probe: HealthProbe {
+            name: "db_file_sanity".into(),
+            status: "ok".into(),
+            latency_ms: 0.0,
+            detail: format!("quick_check OK ({file_size} bytes; attested by live server)"),
+        },
+        unhealthy: false,
+        degraded: false,
+    };
+
+    let db_schema = HealthProbeAssessment {
+        probe: HealthProbe {
+            name: "db_schema".into(),
+            status: "ok".into(),
+            latency_ms: 0.0,
+            detail: "Core SQLite schema tables are present".into(),
+        },
+        unhealthy: false,
+        degraded: false,
+    };
+
+    let integrity_metrics =
+        typed
+            .integrity
+            .map(|server_integrity| mcp_agent_mail_db::IntegrityMetrics {
+                last_ok_ts: server_integrity.last_ok_ts,
+                last_check_ts: server_integrity.last_check_ts,
+                last_full_check_ts: server_integrity.last_full_check_ts,
+                last_check_kind: server_integrity.last_check_kind,
+                last_check_outcome: server_integrity.last_check_outcome,
+                last_full_check_outcome: server_integrity.last_full_check_outcome,
+                checks_total: server_integrity.checks_total,
+                failures_total: server_integrity.failures_total,
+                failures_since_last_ok: 0,
+                never_written_orphan_pages: 0,
+            });
+
+    Some(LiveServerRobotHealthProbes {
+        db_file: resolved.canonical_path,
+        db_connectivity,
+        db_file_sanity,
+        db_schema,
+        archive_db_parity,
+        search_index_snapshot,
+        search_index_probe,
+        search_index_unhealthy: search_status == "fail",
+        search_index_degraded: search_status != "ok",
+        integrity_metrics,
+    })
+}
+
+fn live_server_health_payload_proves_mailbox_healthy(
+    target_database_url: &str,
+    target_storage_root: &Path,
+    server_health: &serde_json::Value,
+) -> bool {
+    let Some(typed) = parse_health_check_response(server_health) else {
+        return false;
+    };
+    if mailbox_database_identity(target_database_url)
+        != mailbox_database_identity(&typed.database_url)
+        || mailbox_storage_identity(target_storage_root)
+            != mailbox_storage_identity(Path::new(&typed.storage_root))
+    {
+        return false;
+    }
+    if typed.verdicts.db_health.status != "green"
+        || typed.verdicts.write_health.status != "green"
+        || typed.verdicts.archive_db_parity.status == "red"
+        || typed.semantic_readiness.status != "ok"
+        || typed.verdicts.integrity_check.status == "red"
+        || typed
+            .verdicts
+            .integrity_check
+            .detail
+            .contains("orphan page")
+    {
+        return false;
+    }
+    if typed
+        .integrity
+        .as_ref()
+        .is_some_and(|integrity| integrity.failures_total > 0)
+    {
+        return false;
+    }
+    if typed
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.mode != "healthy")
+    {
+        return false;
+    }
+    let Ok(resolved) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(target_database_url)
+    else {
+        return false;
+    };
+    if resolved.canonical_path == ":memory:" {
+        return false;
+    }
+    let db_path = Path::new(&resolved.canonical_path);
+    let Ok(meta) = db_path.metadata() else {
+        return false;
+    };
+    meta.is_file()
+        && meta.len() > 0
+        && crate::doctor_truncated_wal_sidecar_detail(db_path).is_none()
+}
+
+pub(crate) fn live_server_proves_mailbox_healthy(
+    config: &mcp_agent_mail_core::Config,
+    target_database_url: &str,
+    target_storage_root: &Path,
+) -> bool {
+    let Some((server_health, _latency_ms)) = crate::probe_local_jsonrpc_health_with_latency(config)
+    else {
+        return false;
+    };
+    live_server_health_payload_proves_mailbox_healthy(
+        target_database_url,
+        target_storage_root,
+        &server_health,
+    )
+}
+
 // ── Reservations command implementation ─────────────────────────────────────
 
 /// Conflict between two reservations.
@@ -16042,94 +16334,147 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // E4 (br-bvq1x.5.4): on a DB failure, classify it (A2) and attach the
             // safe-remediation contract so an agent knows what is safe to do.
             let mut db_error_message: Option<String> = None;
+            let live_server_health = crate::probe_local_jsonrpc_health_with_latency(&config);
+            let mut integrity_override: Option<mcp_agent_mail_db::IntegrityMetrics> = None;
 
-            // 1. DB connectivity probe
-            let db_start = std::time::Instant::now();
-            let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
-                &config.database_url,
-            ) {
-                Ok((conn, opened_path)) => {
-                    // Verify canonical DB reachability with a lightweight query.
-                    let query_ok = conn.query_sync("SELECT 1", &[]).is_ok();
-                    db_file = Some(opened_path.clone());
-                    if query_ok {
-                        db_conn = Some(conn);
-                    }
-                    let detail = if query_ok {
-                        format!("SQLite read-only connection healthy at {opened_path}")
-                    } else {
-                        db_error_message =
-                            Some(format!("SQLite read-only query failed at {opened_path}"));
-                        format!("SQLite read-only query failed at {opened_path}")
-                    };
-                    probes.push(HealthProbe {
-                        name: "db_connectivity".into(),
-                        status: if query_ok { "ok" } else { "fail" }.into(),
-                        latency_ms: 0.0,
-                        detail,
-                    });
-                    query_ok
-                }
-                Err(error) => {
-                    db_error_message = Some(error.to_string());
-                    probes.push(HealthProbe {
-                        name: "db_connectivity".into(),
-                        status: "fail".into(),
-                        latency_ms: 0.0,
-                        detail: format!("Cannot open database read-only: {error}"),
-                    });
-                    false
-                }
-            };
-            let db_ms = db_start.elapsed().as_secs_f64() * 1000.0;
-            if let Some(probe) = probes.last_mut()
-                && probe.name == "db_connectivity"
-            {
-                probe.latency_ms = (db_ms * 100.0).round() / 100.0;
-            }
-
-            // 1b. Live sqlite file sanity probe (non-mutating).
-            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
-            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
-            let db_file_sanity_degraded = db_file_sanity.degraded;
-            probes.push(db_file_sanity.probe);
-
-            // 1c. Core schema presence probe.
-            let db_schema = summarize_db_schema_probe(db_conn.as_ref());
-            let db_schema_unhealthy = db_schema.unhealthy;
-            probes.push(db_schema.probe);
-
-            // 1d. Canonical archive inventory vs SQLite inventory.
-            let archive_db_parity =
-                summarize_archive_db_parity_probe(db_conn.as_ref(), &config.storage_root);
-            let archive_db_parity_unhealthy = archive_db_parity.unhealthy;
-            let archive_db_parity_degraded = archive_db_parity.degraded;
-            probes.push(archive_db_parity.probe);
-
-            // 1e. Search V3 lexical index/backfill state (read-only).
-            let search_index = robot_search_index_health_from_config(&config);
-            let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
-                match search_index {
-                    Ok(snapshot) => {
-                        let status = search_index_probe_status(&snapshot);
+            let (
+                db_ok,
+                db_file_sanity_unhealthy,
+                db_file_sanity_degraded,
+                db_schema_unhealthy,
+                archive_db_parity_unhealthy,
+                archive_db_parity_degraded,
+                search_index_snapshot,
+                search_index_unhealthy,
+                search_index_degraded,
+            ) = if let Some(live) = live_server_health
+                .as_ref()
+                .and_then(|(payload, latency_ms)| {
+                    synthesize_robot_health_probes_from_server(&config, payload, *latency_ms)
+                }) {
+                db_file = Some(live.db_file);
+                probes.push(live.db_connectivity);
+                let db_file_sanity_unhealthy = live.db_file_sanity.unhealthy;
+                let db_file_sanity_degraded = live.db_file_sanity.degraded;
+                probes.push(live.db_file_sanity.probe);
+                let db_schema_unhealthy = live.db_schema.unhealthy;
+                probes.push(live.db_schema.probe);
+                let archive_db_parity_unhealthy = live.archive_db_parity.unhealthy;
+                let archive_db_parity_degraded = live.archive_db_parity.degraded;
+                probes.push(live.archive_db_parity.probe);
+                probes.push(live.search_index_probe);
+                integrity_override = live.integrity_metrics;
+                (
+                    true,
+                    db_file_sanity_unhealthy,
+                    db_file_sanity_degraded,
+                    db_schema_unhealthy,
+                    archive_db_parity_unhealthy,
+                    archive_db_parity_degraded,
+                    Some(live.search_index_snapshot),
+                    live.search_index_unhealthy,
+                    live.search_index_degraded,
+                )
+            } else {
+                // 1. DB connectivity probe
+                let db_start = std::time::Instant::now();
+                let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
+                    &config.database_url,
+                ) {
+                    Ok((conn, opened_path)) => {
+                        // Verify canonical DB reachability with a lightweight query.
+                        let query_ok = conn.query_sync("SELECT 1", &[]).is_ok();
+                        db_file = Some(opened_path.clone());
+                        if query_ok {
+                            db_conn = Some(conn);
+                        }
+                        let detail = if query_ok {
+                            format!("SQLite read-only connection healthy at {opened_path}")
+                        } else {
+                            db_error_message =
+                                Some(format!("SQLite read-only query failed at {opened_path}"));
+                            format!("SQLite read-only query failed at {opened_path}")
+                        };
                         probes.push(HealthProbe {
-                            name: "search_index".into(),
-                            status: status.into(),
+                            name: "db_connectivity".into(),
+                            status: if query_ok { "ok" } else { "fail" }.into(),
                             latency_ms: 0.0,
-                            detail: search_index_probe_detail(&snapshot),
+                            detail,
                         });
-                        (Some(snapshot), status == "fail", status != "ok")
+                        query_ok
                     }
                     Err(error) => {
+                        db_error_message = Some(error.to_string());
                         probes.push(HealthProbe {
-                            name: "search_index".into(),
+                            name: "db_connectivity".into(),
                             status: "fail".into(),
                             latency_ms: 0.0,
-                            detail: format!("Cannot inspect Search V3 lexical index: {error}"),
+                            detail: format!("Cannot open database read-only: {error}"),
                         });
-                        (None, true, true)
+                        false
                     }
                 };
+                let db_ms = db_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(probe) = probes.last_mut()
+                    && probe.name == "db_connectivity"
+                {
+                    probe.latency_ms = (db_ms * 100.0).round() / 100.0;
+                }
+
+                // 1b. Live sqlite file sanity probe (non-mutating).
+                let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
+                let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
+                let db_file_sanity_degraded = db_file_sanity.degraded;
+                probes.push(db_file_sanity.probe);
+
+                // 1c. Core schema presence probe.
+                let db_schema = summarize_db_schema_probe(db_conn.as_ref());
+                let db_schema_unhealthy = db_schema.unhealthy;
+                probes.push(db_schema.probe);
+
+                // 1d. Canonical archive inventory vs SQLite inventory.
+                let archive_db_parity =
+                    summarize_archive_db_parity_probe(db_conn.as_ref(), &config.storage_root);
+                let archive_db_parity_unhealthy = archive_db_parity.unhealthy;
+                let archive_db_parity_degraded = archive_db_parity.degraded;
+                probes.push(archive_db_parity.probe);
+
+                // 1e. Search V3 lexical index/backfill state (read-only).
+                let search_index = robot_search_index_health_from_config(&config);
+                let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
+                    match search_index {
+                        Ok(snapshot) => {
+                            let status = search_index_probe_status(&snapshot);
+                            probes.push(HealthProbe {
+                                name: "search_index".into(),
+                                status: status.into(),
+                                latency_ms: 0.0,
+                                detail: search_index_probe_detail(&snapshot),
+                            });
+                            (Some(snapshot), status == "fail", status != "ok")
+                        }
+                        Err(error) => {
+                            probes.push(HealthProbe {
+                                name: "search_index".into(),
+                                status: "fail".into(),
+                                latency_ms: 0.0,
+                                detail: format!("Cannot inspect Search V3 lexical index: {error}"),
+                            });
+                            (None, true, true)
+                        }
+                    };
+                (
+                    db_ok,
+                    db_file_sanity_unhealthy,
+                    db_file_sanity_degraded,
+                    db_schema_unhealthy,
+                    archive_db_parity_unhealthy,
+                    archive_db_parity_degraded,
+                    search_index_snapshot,
+                    search_index_unhealthy,
+                    search_index_degraded,
+                )
+            };
 
             // 2. Circuit breaker status
             let db_health = mcp_agent_mail_db::db_health_status();
@@ -16205,7 +16550,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             });
 
             // 4. Integrity metrics
-            let integrity = mcp_agent_mail_db::integrity_metrics();
+            let integrity = integrity_override.unwrap_or_else(mcp_agent_mail_db::integrity_metrics);
             let (integrity_probe, integrity_ok) = summarize_integrity_probe(&integrity);
             probes.push(integrity_probe);
 
@@ -16344,11 +16689,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let descriptors = (!owner_pids.is_empty())
                 .then(|| crate::doctor_server_descriptor_check(&owner_pids));
             let server_health = descriptors.as_ref().and_then(|_| {
-                let port_status = mcp_agent_mail_server::startup_checks::check_port_status(
-                    &config.http_host,
-                    config.http_port,
-                );
-                crate::probe_local_jsonrpc_health(&config, &port_status).payload
+                live_server_health.map(|(payload, _)| payload).or_else(|| {
+                    let port_status = mcp_agent_mail_server::startup_checks::check_port_status(
+                        &config.http_host,
+                        config.http_port,
+                    );
+                    crate::probe_local_jsonrpc_health(&config, &port_status).payload
+                })
             });
             // The server's own leak detector sees growth over time, which a
             // point-in-time /proc sample cannot: relay its verdict too.
@@ -27299,6 +27646,191 @@ mod tests {
             "detail should name the hygiene class: {}",
             assessment.probe.detail
         );
+    }
+
+    #[test]
+    fn robot_and_doctor_health_use_live_server_payload_and_fall_back_on_mismatch_or_fault() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("live_server_health.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        crate::handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("demo-project"))
+            .expect("create project dir");
+
+        let config = mcp_agent_mail_core::Config {
+            database_url: db_url.clone(),
+            storage_root: storage_root.clone(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+
+        let sample_server_health = |db_url: &str,
+                                    storage_root: &Path,
+                                    db_status: &str,
+                                    write_status: &str,
+                                    parity_status: &str,
+                                    integrity_status: &str,
+                                    integrity_detail: &str| {
+            serde_json::json!({
+                "status": "ok",
+                "health_level": "green",
+                "environment": "test",
+                "http_host": "127.0.0.1",
+                "http_port": 8765,
+                "database_url": db_url,
+                "storage_root": storage_root.display().to_string(),
+                "sqlite_autocommit_write_mode": "mvcc_concurrent",
+                "semantic_readiness": {
+                    "status": if parity_status == "red" { "fail" } else { "ok" },
+                    "detail": "Archive and sqlite inventory are aligned: archive projects=1, agents=1, messages=10, db projects=1, agents=1, messages=10"
+                },
+                "timeout_diagnostics": {
+                    "client_deadline_ms": 30000,
+                    "coalescer_degraded_p99_bound_ms": 15000,
+                    "contended_path": "none",
+                    "stage_exceeded_client_deadline": false,
+                    "p99_window_secs": 300,
+                    "pool_acquire_p99_ms": 0,
+                    "database_write_p99_ms": 0,
+                    "archive_wbq_p99_ms": 0,
+                    "archive_commit_queue_p99_ms": 0,
+                    "git_commit_p99_ms": 0,
+                    "blocking_dispatch_inflight": 0,
+                    "blocking_dispatch_zombies": 0,
+                    "blocking_dispatch_timeouts_total": 0
+                },
+                "integrity": {
+                    "last_ok_ts": 100,
+                    "last_check_ts": 100,
+                    "last_full_check_ts": 100,
+                    "last_check_kind": "Full",
+                    "last_check_outcome": "passed",
+                    "last_full_check_outcome": "passed",
+                    "checks_total": 3,
+                    "failures_total": 0
+                },
+                "lexical_backfill": {
+                    "state": "fresh",
+                    "db_identity": db_path.display().to_string(),
+                    "index_dir": storage_root.join("search_index").display().to_string(),
+                    "indexed_messages": 10,
+                    "source_messages": 10,
+                    "skipped_messages": 0,
+                    "rebuild_in_progress": false
+                },
+                "verdicts": {
+                    "transport_health": { "status": "green", "detail": "ok", "critical": true },
+                    "db_health": { "status": db_status, "detail": "database open/connectivity healthy", "critical": true },
+                    "write_health": { "status": write_status, "detail": "write path schema present and writable", "critical": true },
+                    "semantic_readiness": { "status": "green", "detail": "aligned", "critical": false },
+                    "archive_db_parity": { "status": parity_status, "detail": "git archive/sqlite index within write-behind tolerance", "critical": true },
+                    "doctor_readiness": { "status": "green", "detail": "ok", "critical": false },
+                    "integrity_check": { "status": integrity_status, "detail": integrity_detail, "critical": true }
+                }
+            })
+        };
+
+        let healthy_payload = sample_server_health(
+            &db_url,
+            &storage_root,
+            "green",
+            "green",
+            "green",
+            "green",
+            "full integrity_check passed",
+        );
+        let synthesized =
+            synthesize_robot_health_probes_from_server(&config, &healthy_payload, 2.345)
+                .expect("healthy live server payload should synthesize robot probes");
+        assert_eq!(synthesized.db_connectivity.status, "ok");
+        assert!((synthesized.db_connectivity.latency_ms - 2.35).abs() < f64::EPSILON);
+        assert_eq!(synthesized.db_file_sanity.probe.status, "ok");
+        assert!(!synthesized.db_file_sanity.unhealthy);
+        assert_eq!(synthesized.db_schema.probe.status, "ok");
+        assert_eq!(synthesized.archive_db_parity.probe.status, "ok");
+        assert_eq!(synthesized.search_index_probe.status, "ok");
+        assert!(!synthesized.search_index_unhealthy);
+        assert!(!synthesized.search_index_degraded);
+        assert_eq!(
+            synthesized
+                .integrity_metrics
+                .expect("integrity")
+                .checks_total,
+            3
+        );
+        assert!(live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &healthy_payload
+        ));
+
+        // Different mailbox on the server must fall back to local probes.
+        let other_db = temp_dir.path().join("other.sqlite3");
+        let other_payload = sample_server_health(
+            &format!("sqlite:///{}", other_db.display()),
+            &storage_root,
+            "green",
+            "green",
+            "green",
+            "green",
+            "full integrity_check passed",
+        );
+        assert!(synthesize_robot_health_probes_from_server(&config, &other_payload, 1.0).is_none());
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &other_payload
+        ));
+
+        // Red parity or integrity on the server must fall back to local probes.
+        let red_parity = sample_server_health(
+            &db_url,
+            &storage_root,
+            "green",
+            "green",
+            "red",
+            "green",
+            "full integrity_check passed",
+        );
+        assert!(synthesize_robot_health_probes_from_server(&config, &red_parity, 1.0).is_none());
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &red_parity
+        ));
+
+        // Leaked orphan pages must fall back in `doctor health` so the
+        // `leaked_pages_only` classification line is emitted.
+        let orphan_pages = sample_server_health(
+            &db_url,
+            &storage_root,
+            "green",
+            "green",
+            "green",
+            "yellow",
+            "full integrity_check passed at 100; 4 never-written orphan page(s) are leaked space",
+        );
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &orphan_pages
+        ));
+
+        // A truncated WAL sidecar on disk must force fallback even if the
+        // server's cached verdicts look green.
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = std::path::PathBuf::from(wal_os);
+        std::fs::write(&wal_path, [0_u8; 16]).expect("write truncated wal");
+        assert!(
+            synthesize_robot_health_probes_from_server(&config, &healthy_payload, 1.0).is_none()
+        );
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &healthy_payload
+        ));
     }
 
     #[test]

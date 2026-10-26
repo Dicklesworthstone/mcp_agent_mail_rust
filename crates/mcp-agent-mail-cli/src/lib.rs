@@ -27756,8 +27756,16 @@ fn parse_schema_version_detail(detail: String) -> String {
 }
 
 fn query_database_schema_version(database_url: &str) -> Option<String> {
-    let conn = open_db_for_doctor_check(database_url).ok()?;
-    let rows = conn.query_sync("PRAGMA user_version", &[]).ok()?;
+    if let Ok(conn) = open_db_sync_read_only_with_database_url(database_url)
+        && let Ok(rows) = conn.query_sync("PRAGMA user_version", &[])
+        && let Some(version) = rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("user_version").ok())
+    {
+        return Some(version.to_string());
+    }
+    let opened = open_db_for_doctor_check_read_only_with_context(database_url).ok()?;
+    let rows = opened.conn.query_sync("PRAGMA user_version", &[]).ok()?;
     rows.first()
         .and_then(|row| row.get_named::<i64>("user_version").ok())
         .map(|version| version.to_string())
@@ -30348,10 +30356,15 @@ fn doctor_default_project_search_roots() -> std::collections::BTreeSet<PathBuf> 
 fn doctor_collect_normalization_db_project_identities()
 -> std::collections::BTreeSet<DoctorProjectIdentity> {
     let config = Config::from_env();
-    let Ok(opened) = open_db_for_doctor_check_with_context(&config.database_url) else {
+    if let Ok(conn) = open_db_sync_read_only_with_database_url(&config.database_url)
+        && let Ok(inventory) = collect_doctor_db_inventory(&conn)
+    {
+        return inventory.project_identities;
+    }
+    let Ok(opened) = open_db_for_doctor_check_read_only_with_context(&config.database_url) else {
         return std::collections::BTreeSet::new();
     };
-    collect_doctor_db_inventory(&opened.conn)
+    collect_doctor_db_inventory_canonical(&opened.conn)
         .map(|inventory| inventory.project_identities)
         .unwrap_or_default()
 }
@@ -32131,6 +32144,49 @@ fn probe_local_jsonrpc_health(
             truncate_doctor_command(&error.to_string())
         ))),
     }
+}
+
+pub(crate) fn probe_local_jsonrpc_health_with_latency(
+    config: &Config,
+) -> Option<(serde_json::Value, f64)> {
+    let urls = check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path);
+    if urls.is_empty() {
+        return None;
+    }
+    let bearer = local_server_bearer_token(config);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "doctor-health-check",
+        "method": "tools/call",
+        "params": {
+            "name": "health_check",
+            "arguments": {},
+        }
+    });
+
+    context::run_async(async {
+        for url in &urls {
+            let start = std::time::Instant::now();
+            let response = post_jsonrpc_request(
+                url,
+                bearer.as_deref(),
+                &request,
+                DOCTOR_RUNTIME_JSONRPC_TIMEOUT_SECS,
+            )
+            .await;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            if let Ok(payload) = response
+                && parse_jsonrpc_error(&payload).is_none()
+                && let Some(result_payload) = payload.get("result").cloned()
+                && let Some(parsed) = coerce_tool_result_json(result_payload)
+            {
+                return Ok(Some((parsed, elapsed_ms)));
+            }
+        }
+        Ok(None)
+    })
+    .ok()
+    .flatten()
 }
 
 fn sample_agent_mail_process_cpu(pids: &[u32]) -> (Vec<DoctorProcessSample>, Option<String>) {
