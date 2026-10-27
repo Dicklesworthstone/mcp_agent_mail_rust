@@ -5871,6 +5871,16 @@ fn reservation_read_resource_reply(request: &Value, payload: Value) -> Value {
     })
 }
 
+fn reservation_read_snapshot(project: &str, slug: &str, rows: Vec<Value>) -> Value {
+    json!({
+        "schema_version": 1, "complete": true,
+        "project": {"id": 1, "slug": slug, "human_key": project, "created_at": "2024-01-01T00:00:00Z"},
+        "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}],
+        "active_only": true, "captured_ts": "2024-02-01T00:00:00Z",
+        "count": rows.len(), "reservations": rows,
+    })
+}
+
 #[test]
 fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
     for failure in [
@@ -5882,7 +5892,13 @@ fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
         "missing-released",
         "invalid-exclusive",
         "invalid-timestamp",
-        "full-page",
+        "legacy-array",
+        "incomplete-snapshot",
+        "wrong-count",
+        "foreign-project",
+        "unknown-holder",
+        "snapshot-identity",
+        "wrong-active-filter",
         "rpc-error",
     ] {
         let env = TestEnv::new();
@@ -5907,27 +5923,31 @@ fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
                 return reservation_read_resource_reply(request, descriptor);
             }
             assert!(uri.starts_with("resource://file_reservations/gh368-project?"));
-            let mut row = json!({"id": 1, "agent": "RusticGlen", "path_pattern": "src/**", "exclusive": true, "reason": "gh368", "created_ts": "2024-01-01T00:00:00Z", "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null});
+            assert!(uri.contains("snapshot=true"));
+            let mut row = json!({"id": 1, "project_id": 1, "agent_id": 1, "agent": "RusticGlen", "path_pattern": "src/**", "exclusive": true, "reason": "gh368", "created_ts": "2024-01-01T00:00:00Z", "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null});
             match failure {
                 "missing-released" => {
                     row.as_object_mut().unwrap().remove("released_ts");
                 }
                 "invalid-exclusive" => row["exclusive"] = json!("true"),
                 "invalid-timestamp" => row["expires_ts"] = json!("not-a-time"),
+                "foreign-project" => row["project_id"] = json!(2),
+                "unknown-holder" => row["agent_id"] = json!(2),
                 _ => {}
             }
-            let rows = if failure == "full-page" {
-                (1..=250)
-                    .map(|id| {
-                        let mut row = row.clone();
-                        row["id"] = json!(id);
-                        row
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vec![row]
-            };
-            let mut reply = reservation_read_resource_reply(request, json!(rows));
+            let mut snapshot =
+                reservation_read_snapshot(&expected_project, "gh368-project", vec![row]);
+            match failure {
+                "legacy-array" => snapshot = snapshot["reservations"].clone(),
+                "incomplete-snapshot" => snapshot["complete"] = json!(false),
+                "wrong-count" => snapshot["count"] = json!(2),
+                "snapshot-identity" => {
+                    snapshot["project"]["created_at"] = json!("2025-01-01T00:00:00Z")
+                }
+                "wrong-active-filter" => snapshot["active_only"] = json!(false),
+                _ => {}
+            }
+            let mut reply = reservation_read_resource_reply(request, snapshot);
             match failure {
                 "wrong-id" => reply["id"] = json!("another-request"),
                 "wrong-uri" => {
@@ -5995,24 +6015,32 @@ fn reservation_server_reads_accept_verified_empty_results_and_preserve_navigatio
         } else {
             assert!(uri.starts_with("resource://file_reservations/gh368-project?"));
             assert!(
-                uri.contains("&limit=250&offset=0&"),
-                "unexpected page: {uri}"
+                uri.contains("snapshot=true&active_only=true&format=json")
+                    && !uri.contains("limit=")
+                    && !uri.contains("offset="),
+                "expected a complete snapshot before applying local navigation: {uri}"
             );
             reservation_reads += 1;
-            if reservation_reads == 1 {
-                json!([])
+            let rows = if reservation_reads == 1 {
+                Vec::new()
             } else {
                 // The MCP resource returns ascending creation order. Native
                 // navigate uses descending creation order, then applies its
                 // page. Passing limit/offset straight through selects the
                 // wrong leases even if the JSON shape remains the same.
-                json!((1..=9).map(|id| json!({
-                    "id": id, "agent": "RusticGlen", "path_pattern": format!("page-{id}/**"),
-                    "exclusive": id % 2 == 0, "reason": "gh368",
-                    "created_ts": format!("2024-01-{id:02}T00:00:00Z"),
-                    "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null
-                })).collect::<Vec<_>>())
-            }
+                (1..=9)
+                    .map(|id| {
+                        json!({
+                            "id": id, "project_id": 1, "agent_id": 1,
+                            "agent": "RusticGlen", "path_pattern": format!("page-{id}/**"),
+                            "exclusive": id % 2 == 0, "reason": "gh368",
+                            "created_ts": format!("2024-01-{id:02}T00:00:00Z"),
+                            "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            reservation_read_snapshot(&expected_project, "gh368-project", rows)
         };
         reservation_read_resource_reply(request, payload)
     });
@@ -6059,6 +6087,72 @@ fn reservation_server_reads_accept_verified_empty_results_and_preserve_navigatio
     assert!(!env.db_path.exists());
     assert!(snapshot_tree(&env.storage_root).is_empty());
     assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 6);
+}
+
+#[test]
+fn reservation_server_reads_return_more_than_one_resource_page() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                "created_at": "2024-01-01T00:00:00Z",
+                "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert_eq!(
+                uri,
+                "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+            );
+            let rows = (1..=301).map(|id| json!({
+                "id": id, "project_id": 1, "agent_id": 1, "agent": "RusticGlen",
+                "path_pattern": format!("src/lease-{id}/**"), "exclusive": true, "reason": "complete snapshot",
+                "created_ts": "2024-01-01T00:00:00Z", "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null,
+            })).collect();
+            reservation_read_snapshot(&expected_project, "gh368-project", rows)
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let out = run_am_hermetic(
+        &reservation_read_env(&env, peer.port, &env.database_url()),
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let rows = data["all_active"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        301,
+        "complete results must cross the old 250-row cap"
+    );
+    let paths: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|row| row["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        (1..=301).map(|id| format!("src/lease-{id}/**")).collect()
+    );
+    assert_eq!(
+        peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "one complete reservation read must suffice, regardless of row count"
+    );
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
 }
 
 #[test]
@@ -6132,7 +6226,7 @@ fn reservation_server_reads_escape_project_paths_and_use_explicit_client_token()
             json!({"id": 1, "slug": "gh368-escaped-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
         } else {
             assert!(uri.starts_with("resource://file_reservations/gh368-escaped-project?"));
-            json!([])
+            reservation_read_snapshot(&expected_project, "gh368-escaped-project", Vec::new())
         };
         reservation_read_resource_reply(request, payload)
     });

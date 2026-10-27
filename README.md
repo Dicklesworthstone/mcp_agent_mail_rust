@@ -993,6 +993,33 @@ inspection does. `AGENT_MAIL_GUARD_MODE=warn` turns that into a warning.
 | TUI | `crates/mcp-agent-mail-server/src/tui_*.rs` |
 | CLI/launcher | `crates/mcp-agent-mail-cli/src/**` |
 
+### Complete Reservation Reads Through the Server
+
+Use `--server` to read reservations through the configured authenticated MCP
+endpoint while the server owns the mailbox:
+
+```bash
+am reservations --project /abs/path --all --json --server
+am file_reservations active /abs/path --server
+am file_reservations list /abs/path --all --server
+```
+
+These reads now use a complete database snapshot and can return more than the
+resource's normal 250-row page. Project identity, holder identities, lease rows,
+and the active-lease cutoff come from the same read snapshot. Historical leases
+retain their holder names even when those agents have retired. Navigation still
+applies the requested ordering and page after obtaining the complete set.
+
+MCP clients can request the same envelope with
+`resource://file_reservations/<slug>?snapshot=true&active_only=true&format=json`.
+It includes `schema_version`, `complete`, `project`, `agents`, `captured_ts`,
+`active_only`, `count`, and `reservations`. Set `active_only=false` to include
+released and expired leases. Snapshot mode accepts no `limit` or `offset` and
+refuses results exceeding 10,000 reservations, 10,000 holder identities, or
+4 MiB of JSON. The CLI rejects incomplete snapshots and older servers that only
+return pages; it does not display a truncated set as complete. Explicit resource
+reads without `snapshot=true` retain their existing pagination behavior.
+
 ---
 
 ## Multi-Agent Coordination Workflows

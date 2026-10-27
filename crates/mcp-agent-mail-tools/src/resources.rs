@@ -5281,7 +5281,7 @@ fn reservation_row_is_active_at(
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://file_reservations/{slug}",
-    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), only returns file_reservations with no `released_ts`.\n\nReturns\n-------\nlist[dict]\n    Each file_reservation with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=true\"}}\n```\n\nAlso see all historical (including released) file_reservations:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=false\"}}\n```"
+    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), returns only unreleased, unexpired reservations.\nsnapshot : bool\n    If true, returns the complete bounded reservation set and project/holder identities from one database read snapshot. Retired holders remain resolvable. Does not accept limit or offset. Refuses more than 10000 reservations or holder identities, or more than 4 MiB JSON.\nlimit, offset : int\n    Pagination for ordinary reads; each page is capped at 250 rows. Independent pages are not a consistent snapshot.\n\nReturns\n-------\nWithout snapshot=true: list[dict], each with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts } and activity hints.\nWith snapshot=true: { schema_version: 1, complete: true, project, agents, active_only, captured_ts, count, reservations }. Each reservation also includes project_id and agent_id. Activity hints are omitted.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?snapshot=true&active_only=true&format=json\"}}\n```\n\nAlso see historical (including released) file_reservations in explicit pages:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=false&limit=250&offset=0\"}}\n```"
 )]
 pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug_str, query) = split_param_and_query(&slug);
@@ -5292,6 +5292,28 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let project = resolve_existing_resource_project(ctx, &pool, &slug_str).await?;
 
     let project_id = project.id.unwrap_or(0);
+
+    if query
+        .get("snapshot")
+        .is_some_and(|value| parse_bool_param(value))
+    {
+        if query.contains_key("limit") || query.contains_key("offset") {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "complete reservation snapshots do not accept limit or offset",
+            ));
+        }
+        let snapshot = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::file_reservation_snapshot(
+                ctx.cx(),
+                &pool,
+                &project,
+                active_only,
+            )
+            .await,
+        )?;
+        return reservation_snapshot_json(snapshot);
+    }
 
     let config = &Config::get();
     let now_micros = mcp_agent_mail_db::now_micros();
@@ -5477,6 +5499,54 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+/// Snapshot mode intentionally omits filesystem/git activity enrichment: its
+/// authority is the database read scope, and its bounded wire contract is
+/// consumed by CLI clients that need the complete reservation set.
+fn reservation_snapshot_json(
+    snapshot: mcp_agent_mail_db::queries::FileReservationSnapshot,
+) -> McpResult<String> {
+    let agents: HashMap<_, _> = snapshot
+        .agents
+        .iter()
+        .map(|agent| (agent.id, agent.name.as_str()))
+        .collect();
+    let reservations: Vec<_> = snapshot.reservations.iter().map(|row| {
+        let name = agents.get(&row.agent_id).ok_or_else(|| McpError::new(
+            McpErrorCode::InternalError, "reservation snapshot has no authoritative holder"))?;
+        Ok(serde_json::json!({
+            "id": row.id, "project_id": row.project_id, "agent_id": row.agent_id,
+            "agent": name, "path_pattern": row.path_pattern, "exclusive": row.exclusive != 0,
+            "reason": row.reason, "created_ts": micros_to_iso(row.created_ts),
+            "expires_ts": micros_to_iso(row.expires_ts), "released_ts": row.released_ts.map(micros_to_iso),
+        }))
+    }).collect::<McpResult<Vec<_>>>()?;
+    let value = serde_json::json!({
+        "schema_version": 1,
+        "complete": true,
+        "project": {
+            "id": snapshot.project.id, "slug": snapshot.project.slug,
+            "human_key": snapshot.project.human_key, "created_at": micros_to_iso(snapshot.project.created_at),
+        },
+        "agents": snapshot.agents.iter().map(|agent| serde_json::json!({
+            "id": agent.id, "project_id": agent.project_id, "name": agent.name,
+        })).collect::<Vec<_>>(),
+        "active_only": snapshot.active_only,
+        "captured_ts": micros_to_iso(snapshot.captured_ts),
+        "count": reservations.len(),
+        "reservations": reservations,
+    });
+    let json = serde_json::to_string(&value).map_err(|error| {
+        McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}"))
+    })?;
+    if json.len() > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "complete reservation snapshot exceeds the 4 MiB JSON limit; narrow to active_only=true or use explicit resource pages",
+        ));
+    }
+    Ok(json)
+}
+
 #[cfg(test)]
 mod resource_shape_tests {
     use super::*;
@@ -5491,6 +5561,93 @@ mod resource_shape_tests {
 
     static RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static RESOURCE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn reservation_snapshot_fixture(count: usize) -> queries::FileReservationSnapshot {
+        queries::FileReservationSnapshot {
+            project: ProjectRow {
+                id: Some(7),
+                slug: "snapshot-project".to_string(),
+                human_key: "/tmp/snapshot-project".to_string(),
+                created_at: 1_000_000,
+            },
+            agents: vec![
+                queries::FileReservationSnapshotAgent {
+                    id: 11,
+                    project_id: 7,
+                    name: "CurrentAgent".to_string(),
+                },
+                // Historical holders remain authoritative even when they
+                // are no longer advertised by the active agent directory.
+                queries::FileReservationSnapshotAgent {
+                    id: 12,
+                    project_id: 7,
+                    name: "RetiredHolder".to_string(),
+                },
+            ],
+            reservations: (0..count)
+                .map(|index| mcp_agent_mail_db::FileReservationRow {
+                    id: Some(i64::try_from(index + 1).unwrap()),
+                    project_id: 7,
+                    agent_id: 12,
+                    path_pattern: format!("src/file-{index}.rs"),
+                    exclusive: 1,
+                    reason: "historical ownership".to_string(),
+                    created_ts: 2_000_000,
+                    expires_ts: 4_000_000,
+                    released_ts: Some(3_000_000),
+                })
+                .collect(),
+            captured_ts: 5_000_000,
+            active_only: false,
+        }
+    }
+
+    #[test]
+    fn complete_reservation_snapshot_encodes_all_rows_and_historical_holders() {
+        let json = reservation_snapshot_json(reservation_snapshot_fixture(257)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["active_only"], false);
+        assert_eq!(value["count"], 257);
+        assert_eq!(value["project"]["id"], 7);
+        assert_eq!(value["project"]["created_at"], micros_to_iso(1_000_000));
+        assert_eq!(value["captured_ts"], micros_to_iso(5_000_000));
+        assert_eq!(value["agents"].as_array().unwrap().len(), 2);
+        let rows = value["reservations"].as_array().unwrap();
+        assert_eq!(rows.len(), 257);
+        assert_eq!(rows[256]["id"], 257);
+        assert!(rows.iter().all(|row| {
+            row["agent_id"] == 12
+                && row["agent"] == "RetiredHolder"
+                && row["project_id"] == 7
+                && row["released_ts"] == micros_to_iso(3_000_000)
+        }));
+    }
+
+    #[test]
+    fn complete_reservation_snapshot_refuses_missing_holder_authority() {
+        let mut snapshot = reservation_snapshot_fixture(1);
+        snapshot.agents.retain(|agent| agent.id != 12);
+        let error = reservation_snapshot_json(snapshot)
+            .expect_err("a complete snapshot cannot silently omit or invent a holder");
+        assert!(error.to_string().contains("no authoritative holder"));
+    }
+
+    #[test]
+    fn complete_reservation_snapshot_limits_serialized_escape_expansion() {
+        let mut snapshot = reservation_snapshot_fixture(1);
+        // Each control byte becomes a six-byte JSON escape. The raw database
+        // strings fit under 4 MiB, while their complete wire encoding does not.
+        snapshot.reservations[0].reason =
+            "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 6 + 1);
+        assert!(
+            snapshot.reservations[0].reason.len() < queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        );
+        let error = reservation_snapshot_json(snapshot)
+            .expect_err("JSON escaping must not bypass the response byte budget");
+        assert!(error.to_string().contains("4 MiB JSON limit"));
+    }
 
     fn unique_suffix() -> u64 {
         let micros = SystemTime::now()

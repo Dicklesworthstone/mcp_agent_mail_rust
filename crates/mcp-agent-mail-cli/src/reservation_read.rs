@@ -18,9 +18,11 @@ use serde_json::Value;
 use crate::context::ResolvedProject;
 use crate::{CliError, CliResult};
 
-// The existing MCP resource caps pages at 250. An unpaged CLI listing must
-// never mistake a capped page for the complete set of live reservations.
-const RESOURCE_PAGE_MAX: usize = 250;
+// The opt-in snapshot resource proves completeness in one database read scope.
+// Its bounds are shared with the server; independent pages cannot prove this.
+use mcp_agent_mail_db::queries::{
+    FILE_RESERVATION_SNAPSHOT_MAX_BYTES, FILE_RESERVATION_SNAPSHOT_MAX_ROWS,
+};
 const RESOURCE_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone)]
@@ -94,12 +96,20 @@ pub(crate) fn read_server(
         let agent_roster = validate_agent_roster(&before, project.id)?;
 
         let reservation_uri = format!(
-            "resource://file_reservations/{}?active_only={active_only}&limit={RESOURCE_PAGE_MAX}&offset=0&format=json",
+            "resource://file_reservations/{}?snapshot=true&active_only={active_only}&format=json",
             encode_resource_component(&project.slug)
         );
         let payload =
             read_resource_json(&client, &server_url, bearer.as_deref(), &reservation_uri).await?;
-        let reservations = validate_reservations(&payload, active_only)?;
+        let (holder_roster, reservations) = validate_snapshot(&payload, &project, active_only)?;
+        if agent_roster
+            .iter()
+            .any(|agent| holder_roster.binary_search(agent).is_err())
+        {
+            return Err(invalid_response(
+                "snapshot omits a registered project identity",
+            ));
+        }
 
         // The identity resource computes a filesystem identity even for an
         // unregistered path. Re-read the actual stored project descriptor,
@@ -118,7 +128,7 @@ pub(crate) fn read_server(
 
         Ok(ServerReservationRead {
             project,
-            agent_names: agent_roster.into_iter().map(|(_, name)| name).collect(),
+            agent_names: holder_roster.into_iter().map(|(_, name)| name).collect(),
             reservations,
         })
     })
@@ -258,6 +268,11 @@ fn validate_resource_response(response: &Value, id: &str, uri: &str) -> CliResul
         .get("text")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_response("missing resource text"))?;
+    if text.len() > FILE_RESERVATION_SNAPSHOT_MAX_BYTES {
+        return Err(invalid_response(
+            "resource text exceeds the 4 MiB snapshot limit",
+        ));
+    }
     serde_json::from_str(text).map_err(|_| invalid_response("resource text is not valid JSON"))
 }
 
@@ -338,7 +353,17 @@ fn same_project(left: &ResolvedProject, right: &ResolvedProject) -> bool {
         && left.created_at == right.created_at
 }
 
-fn validate_agent_roster(value: &Value, project_id: i64) -> CliResult<Vec<(i64, String)>> {
+type AgentRoster = Vec<(i64, String)>;
+
+fn validate_agent_roster(value: &Value, project_id: i64) -> CliResult<AgentRoster> {
+    validate_roster(value, project_id, false)
+}
+
+fn validate_roster(
+    value: &Value,
+    project_id: i64,
+    allow_legacy_ids: bool,
+) -> CliResult<AgentRoster> {
     // Unlike the reservation resource, project details returns its entire
     // registered-agent roster. Validate this authority separately from lease
     // holders: an agent with no reservations is still a valid --agent scope.
@@ -354,7 +379,14 @@ fn validate_agent_roster(value: &Value, project_id: i64) -> CliResult<Vec<(i64, 
                 "agent roster belongs to a different project",
             ));
         }
-        let id = positive_id(agent)?;
+        let id = if allow_legacy_ids {
+            agent
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| invalid_response("missing or invalid holder id"))?
+        } else {
+            positive_id(agent)?
+        };
         if !ids.insert(id) {
             return Err(invalid_response("duplicate agent id in project roster"));
         }
@@ -368,15 +400,10 @@ fn validate_reservations(value: &Value, active_only: bool) -> CliResult<Vec<Serv
     let rows = value
         .as_array()
         .ok_or_else(|| invalid_response("reservation content is not an array"))?;
-    if rows.len() > RESOURCE_PAGE_MAX {
+    if rows.len() > FILE_RESERVATION_SNAPSHOT_MAX_ROWS {
         return Err(invalid_response(
-            "reservation response exceeds the requested page",
+            "reservation snapshot exceeds the row limit",
         ));
-    }
-    if rows.len() == RESOURCE_PAGE_MAX {
-        return Err(CliError::Other(format!(
-            "server reservation resource returned a full {RESOURCE_PAGE_MAX}-row page; a complete reservation list cannot be verified. Use a direct CLI read when admission is available, or inspect manual MCP resource pages without treating them as a complete snapshot"
-        )));
     }
     let mut ids = HashSet::with_capacity(rows.len());
     let mut reservations = Vec::with_capacity(rows.len());
@@ -417,6 +444,81 @@ fn validate_reservations(value: &Value, active_only: bool) -> CliResult<Vec<Serv
     Ok(reservations)
 }
 
+fn validate_snapshot(
+    value: &Value,
+    project: &ResolvedProject,
+    active_only: bool,
+) -> CliResult<(AgentRoster, Vec<ServerReservation>)> {
+    if value.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || value.get("complete").and_then(Value::as_bool) != Some(true)
+        || value.get("active_only").and_then(Value::as_bool) != Some(active_only)
+    {
+        return Err(invalid_response(
+            "server did not return a complete reservation snapshot; upgrade the server if it only supports resource pages",
+        ));
+    }
+    let snapshot_project = validate_project(
+        value
+            .get("project")
+            .ok_or_else(|| invalid_response("missing snapshot project"))?,
+        &project.slug,
+    )?;
+    if !same_project(project, &snapshot_project) {
+        return Err(invalid_response("snapshot project identity mismatch"));
+    }
+    let captured_ts = timestamp(value, "captured_ts")?;
+    let agents = value
+        .get("agents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_response("missing snapshot holder identities"))?;
+    if agents.len() > FILE_RESERVATION_SNAPSHOT_MAX_ROWS {
+        return Err(invalid_response(
+            "snapshot holder count exceeds the row limit",
+        ));
+    }
+    // The project directory advertises active recipients; this authority also
+    // includes retired holders so historical leases keep their original names.
+    let roster = validate_roster(value, project.id, true)?;
+    let rows = value
+        .get("reservations")
+        .ok_or_else(|| invalid_response("missing snapshot reservations"))?;
+    let reservations = validate_reservations(rows, active_only)?;
+    if value.get("count").and_then(Value::as_u64) != u64::try_from(reservations.len()).ok() {
+        return Err(invalid_response(
+            "snapshot count does not match its complete row set",
+        ));
+    }
+    let holders: std::collections::HashMap<_, _> = roster
+        .iter()
+        .map(|(id, name)| (*id, name.as_str()))
+        .collect();
+    for (row, reservation) in rows
+        .as_array()
+        .expect("validated reservation array")
+        .iter()
+        .zip(&reservations)
+    {
+        if row.get("project_id").and_then(Value::as_i64) != Some(project.id) {
+            return Err(invalid_response(
+                "reservation belongs to a different project",
+            ));
+        }
+        let holder = row
+            .get("agent_id")
+            .and_then(Value::as_i64)
+            .and_then(|id| holders.get(&id));
+        if holder.copied() != Some(reservation.agent.as_str()) {
+            return Err(invalid_response("reservation holder identity mismatch"));
+        }
+        if active_only && reservation.expires_ts <= captured_ts {
+            return Err(invalid_response(
+                "expired reservation in active-only snapshot",
+            ));
+        }
+    }
+    Ok((roster, reservations))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +536,8 @@ mod tests {
     fn reservation(id: i64) -> Value {
         serde_json::json!({
             "id": id,
+            "project_id": 7,
+            "agent_id": 12,
             "agent": "BlueLake",
             "path_pattern": "src/**",
             "exclusive": true,
@@ -441,6 +545,15 @@ mod tests {
             "created_ts": "2026-10-26T01:00:00Z",
             "expires_ts": "2026-10-26T02:00:00Z",
             "released_ts": null,
+        })
+    }
+
+    fn snapshot(rows: Vec<Value>, active_only: bool) -> Value {
+        serde_json::json!({
+            "schema_version": 1, "complete": true, "project": project(),
+            "agents": [{"id": 12, "project_id": 7, "name": "BlueLake"}],
+            "captured_ts": "2026-10-26T01:15:00Z", "active_only": active_only,
+            "count": rows.len(), "reservations": rows,
         })
     }
 
@@ -729,20 +842,66 @@ mod tests {
     }
 
     #[test]
-    fn complete_lists_reject_saturated_and_oversized_pages() {
-        let values = (1..=250).map(reservation).collect::<Vec<_>>();
-        let value = serde_json::json!(values);
-        let error = validate_reservations(&value, true).unwrap_err().to_string();
-        assert!(error.contains("complete reservation list cannot be verified"));
-        let mut values = value.as_array().unwrap().clone();
-        values.push(reservation(251));
-        assert!(validate_reservations(&serde_json::json!(values), true).is_err());
-        let short = (1..250).map(reservation).collect::<Vec<_>>();
-        assert_eq!(
-            validate_reservations(&serde_json::json!(short), true)
-                .unwrap()
-                .len(),
-            249
-        );
+    fn complete_snapshots_cross_the_page_limit_and_keep_retired_holders() {
+        let project = validate_project(&project(), "test-project").unwrap();
+        let mut value = snapshot((1..=300).map(reservation).collect(), false);
+        // The active directory omits this retired identity, but the atomic
+        // snapshot still resolves its historical lease by the original ID.
+        value["agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": 13, "project_id": 7, "name": "RetiredHolder",
+            }));
+        value["reservations"][299]["agent_id"] = serde_json::json!(13);
+        value["reservations"][299]["agent"] = serde_json::json!("RetiredHolder");
+        value["reservations"][299]["released_ts"] = serde_json::json!("2026-10-26T01:10:00Z");
+        let (holders, rows) = validate_snapshot(&value, &project, false).unwrap();
+        assert_eq!(holders.len(), 2);
+        assert_eq!(rows.len(), 300);
+        assert_eq!(rows[299].agent, "RetiredHolder");
+        for legacy_id in [0, -1] {
+            value["agents"][1]["id"] = serde_json::json!(legacy_id);
+            value["reservations"][299]["agent_id"] = serde_json::json!(legacy_id);
+            assert!(validate_snapshot(&value, &project, false).is_ok());
+        }
+        let oversized = snapshot((1..=10_001).map(reservation).collect(), true);
+        assert!(validate_snapshot(&oversized, &project, true).is_err());
+    }
+
+    #[test]
+    fn snapshot_authority_rejects_partial_foreign_and_stale_rows() {
+        let project = validate_project(&project(), "test-project").unwrap();
+        let valid = snapshot(vec![reservation(1)], true);
+        assert!(validate_snapshot(&valid, &project, true).is_ok());
+        assert!(validate_snapshot(&serde_json::json!([reservation(1)]), &project, true).is_err());
+        for (pointer, replacement) in [
+            ("/schema_version", serde_json::json!(2)),
+            ("/complete", serde_json::json!(false)),
+            ("/active_only", serde_json::json!(false)),
+            ("/count", serde_json::json!(2)),
+            ("/captured_ts", serde_json::json!("not-a-timestamp")),
+            ("/captured_ts", serde_json::json!("2026-10-26T02:00:00Z")),
+            (
+                "/project/created_at",
+                serde_json::json!("2026-10-26T02:00:00Z"),
+            ),
+            ("/agents/0/project_id", serde_json::json!(8)),
+            ("/reservations/0/project_id", serde_json::json!(8)),
+            ("/reservations/0/agent_id", serde_json::json!(99)),
+            ("/reservations/0/agent", serde_json::json!("AnotherHolder")),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                validate_snapshot(&invalid, &project, true).is_err(),
+                "{pointer}"
+            );
+        }
+        let uri = "resource://file_reservations/test-project?snapshot=true";
+        let mut oversized = response(uri, &valid);
+        oversized["result"]["contents"][0]["text"] =
+            serde_json::json!(" ".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1));
+        assert!(validate_resource_response(&oversized, "request-1", uri).is_err());
     }
 }

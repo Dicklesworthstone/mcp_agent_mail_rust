@@ -16375,6 +16375,244 @@ pub async fn list_file_reservations(
     .await
 }
 
+/// Maximum rows (and holder identities) in one complete reservation snapshot.
+pub const FILE_RESERVATION_SNAPSHOT_MAX_ROWS: usize = 10_000;
+/// Maximum raw string bytes and serialized JSON bytes for the snapshot resource.
+pub const FILE_RESERVATION_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct FileReservationSnapshotAgent {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+}
+
+/// Project authority, holder identities, and leases observed in one read scope.
+/// Retired identities remain available to resolve historical reservations.
+#[derive(Debug)]
+pub struct FileReservationSnapshot {
+    pub project: ProjectRow,
+    pub agents: Vec<FileReservationSnapshotAgent>,
+    pub reservations: Vec<FileReservationRow>,
+    pub captured_ts: i64,
+    pub active_only: bool,
+}
+
+/// Read the complete bounded reservation set through an already-admitted pool.
+pub async fn file_reservation_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    active_only: bool,
+) -> Outcome<FileReservationSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "file_reservation_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match file_reservation_snapshot_from_conn(&*conn, project, active_only, now_micros()) {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
+/// A read savepoint keeps preflight bounds, identity, release state, and rows
+/// together even when another connection grants/releases leases concurrently.
+#[allow(clippy::too_many_lines)]
+pub fn file_reservation_snapshot_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    expected_project: &ProjectRow,
+    active_only: bool,
+    captured_ts: i64,
+) -> std::result::Result<FileReservationSnapshot, DbError> {
+    crate::sync::with_read_snapshot(conn, || {
+        let project_id = expected_project.id.ok_or_else(|| {
+            DbError::invalid("project", "reservation snapshot requires a stored project")
+        })?;
+        let query = |sql: &str, params: &[Value]| {
+            conn.query_sync(sql, params)
+                .map_err(|error| map_sql_error(&error))
+        };
+        let project_params = [Value::BigInt(project_id)];
+        let predicate = if active_only {
+            format!(
+                " AND {} AND fr.expires_ts > ?",
+                active_reservation_predicate_for("fr")
+            )
+        } else {
+            String::new()
+        };
+        let mut reservation_params = vec![Value::BigInt(project_id)];
+        if active_only {
+            reservation_params.push(Value::BigInt(captured_ts));
+        }
+        // Preflight before materializing ANY project strings or lease bodies.
+        // COUNT alone does not bound a single pathological path/reason/name.
+        let reservation_bounds = query(
+            &format!(
+                "SELECT COUNT(*) AS row_count, COALESCE(SUM(\
+                COALESCE(length(CAST(fr.path_pattern AS BLOB)), 0) + COALESCE(length(CAST(fr.reason AS BLOB)), 0)), 0) AS raw_bytes \
+                FROM file_reservations fr WHERE fr.project_id = ?{predicate}"
+            ),
+            &reservation_params,
+        )?;
+        let agent_bounds = query(
+            "SELECT COUNT(*) AS row_count, COALESCE(SUM(length(CAST(name AS BLOB))), 0) AS raw_bytes \
+             FROM agents WHERE project_id = ?",
+            &project_params,
+        )?;
+        let project_bounds = query(
+            "SELECT COUNT(*) AS row_count, COALESCE(SUM(COALESCE(length(CAST(slug AS BLOB)), 0) + \
+             COALESCE(length(CAST(human_key AS BLOB)), 0)), 0) AS raw_bytes FROM projects WHERE id = ?",
+            &project_params,
+        )?;
+        let mut raw_bytes = 0_i64;
+        let mut expected_counts = Vec::with_capacity(3);
+        for bounds in [&reservation_bounds, &agent_bounds, &project_bounds] {
+            let row = bounds.first().ok_or_else(|| {
+                DbError::Internal("missing reservation snapshot bounds".to_string())
+            })?;
+            let count = row
+                .get_named::<i64>("row_count")
+                .map_err(|error| map_sql_error(&error))?;
+            let bytes = row
+                .get_named::<i64>("raw_bytes")
+                .map_err(|error| map_sql_error(&error))?;
+            raw_bytes = raw_bytes.checked_add(bytes).ok_or_else(|| {
+                DbError::invalid("snapshot", "reservation snapshot byte limit exceeded")
+            })?;
+            if count < 0
+                || count > i64::try_from(FILE_RESERVATION_SNAPSHOT_MAX_ROWS).unwrap_or(i64::MAX)
+                || bytes < 0
+                || raw_bytes
+                    > i64::try_from(FILE_RESERVATION_SNAPSHOT_MAX_BYTES).unwrap_or(i64::MAX)
+            {
+                return Err(DbError::invalid(
+                    "snapshot",
+                    "complete reservation snapshot exceeds the 10000-row or 4 MiB limit; narrow to active_only=true or use explicit resource pages",
+                ));
+            }
+            expected_counts.push(
+                usize::try_from(count)
+                    .map_err(|_| DbError::Internal("invalid snapshot count".to_string()))?,
+            );
+        }
+        let projects = query(
+            "SELECT id, slug, human_key, created_at FROM projects WHERE id = ?",
+            &project_params,
+        )?;
+        let project = projects
+            .first()
+            .ok_or_else(|| DbError::not_found("Project", project_id.to_string()))?;
+        let project = ProjectRow::from_row(project).map_err(|error| map_sql_error(&error))?;
+        if project.id != expected_project.id
+            || project.slug != expected_project.slug
+            || project.human_key != expected_project.human_key
+            || project.created_at != expected_project.created_at
+        {
+            return Err(DbError::invalid(
+                "project",
+                "project identity changed during reservation snapshot",
+            ));
+        }
+        let agents = query(
+            "SELECT id, project_id, name FROM agents WHERE project_id = ? ORDER BY id LIMIT 10001",
+            &project_params,
+        )?
+        .iter()
+        .map(|row| {
+            Ok(FileReservationSnapshotAgent {
+                id: row.get_named("id").map_err(|error| map_sql_error(&error))?,
+                project_id: row
+                    .get_named("project_id")
+                    .map_err(|error| map_sql_error(&error))?,
+                name: row
+                    .get_named("name")
+                    .map_err(|error| map_sql_error(&error))?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, DbError>>()?;
+        let released = if active_only {
+            "NULL"
+        } else {
+            // Match the historical resource's sidecar-first legacy timestamp conversion.
+            "COALESCE(rr.released_ts, CASE WHEN fr.released_ts IS NULL THEN NULL \
+             WHEN typeof(fr.released_ts) = 'text' THEN CAST(strftime('%s', fr.released_ts) AS INTEGER) * 1000000 + \
+             CASE WHEN instr(fr.released_ts, '.') > 0 \
+                  THEN CAST(substr(REPLACE(fr.released_ts, 'Z', '') || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
+                  ELSE 0 END ELSE fr.released_ts END)"
+        };
+        let release_join = if active_only {
+            ""
+        } else {
+            " LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id"
+        };
+        let rows = query(
+            &format!(
+                "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+             fr.created_ts, fr.expires_ts, {released} AS released_ts \
+             FROM file_reservations fr{release_join} WHERE fr.project_id = ?{predicate} \
+             ORDER BY fr.created_ts, fr.id LIMIT 10001"
+            ),
+            &reservation_params,
+        )?;
+        let reservations = rows
+            .iter()
+            .map(decode_file_reservation_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if reservations.len() != expected_counts[0]
+            || agents.len() != expected_counts[1]
+            || projects.len() != 1
+            || expected_counts[2] != 1
+        {
+            return Err(DbError::Internal(
+                "reservation snapshot row count changed or exceeded its bound".to_string(),
+            ));
+        }
+        // Keep the release anti-join out of a holder join: the pinned planner
+        // otherwise rescans the release ledger for every candidate (GH#180).
+        // The initial preflight already bounds all materialized strings; now
+        // bound repeated holder names before the resource clones them per row.
+        let holders: HashMap<_, _> = agents
+            .iter()
+            .map(|agent| (agent.id, agent.name.as_str()))
+            .collect();
+        for row in &reservations {
+            let name = holders
+                .get(&row.agent_id)
+                .filter(|_| row.project_id == project_id)
+                .ok_or_else(|| {
+                    DbError::invalid(
+                        "snapshot",
+                        "reservation holder is missing or belongs to another project",
+                    )
+                })?;
+            raw_bytes = raw_bytes
+                .checked_add(i64::try_from(name.len()).unwrap_or(i64::MAX))
+                .ok_or_else(|| {
+                    DbError::invalid("snapshot", "reservation snapshot byte limit exceeded")
+                })?;
+            if raw_bytes > i64::try_from(FILE_RESERVATION_SNAPSHOT_MAX_BYTES).unwrap_or(i64::MAX) {
+                return Err(DbError::invalid(
+                    "snapshot",
+                    "complete reservation snapshot exceeds the 4 MiB limit",
+                ));
+            }
+        }
+        Ok(FileReservationSnapshot {
+            project,
+            agents,
+            reservations,
+            captured_ts,
+            active_only,
+        })
+    })
+}
+
 /// List one deterministically ordered page of file reservations.
 ///
 /// Resource handlers must use this instead of loading the historical table
@@ -20207,6 +20445,82 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Id, Metadata, Subscriber, span};
+
+    #[test]
+    fn reservation_snapshot_is_complete_readonly_and_preserves_retired_holders() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_snapshot.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-snapshot")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) \
+                 VALUES (1, {project_id}, 'RetiredHolder', 'test', 'test', 1, 1, 2); BEGIN"
+            )).unwrap();
+            for id in 1..=300 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     VALUES ({id}, {project_id}, 1, 'src/{id}.rs', 1, 'snapshot', {id}, 1000)"
+                )).unwrap();
+            }
+            conn.execute_raw("INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 450); COMMIT; PRAGMA query_only=ON; BEGIN").unwrap();
+            let active = file_reservation_snapshot_from_conn(&*conn, &project, true, 500).unwrap();
+            assert_eq!(active.reservations.len(), 299);
+            assert_eq!(active.agents[0].name, "RetiredHolder");
+            assert!(active.reservations.iter().all(|row| row.id != Some(1)));
+            let history = file_reservation_snapshot_from_conn(&*conn, &project, false, 500).unwrap();
+            assert_eq!(history.reservations.len(), 300);
+            assert_eq!(history.reservations[0].released_ts, Some(450));
+            // The nested read savepoint releases only itself, preserving the
+            // caller's transaction and query-only setting.
+            conn.execute_raw("ROLLBACK; PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            let mut rebound = project.clone();
+            rebound.created_at += 1;
+            assert!(file_reservation_snapshot_from_conn(&*conn, &rebound, false, 500).is_err());
+            conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (99, 'foreign-snapshot', '/tmp/foreign-snapshot', 1); \
+                INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (99, 99, 'ForeignHolder', 'test', 'test', 1, 1); \
+                UPDATE file_reservations SET agent_id = 99 WHERE id = 2").unwrap();
+            assert!(file_reservation_snapshot_from_conn(&*conn, &project, false, 500).is_err());
+        });
+    }
+
+    #[test]
+    fn reservation_snapshot_bounds_payloads_before_returning_rows() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_snapshot_bounds.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-snapshot-bounds")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (1, {project_id}, 1, 'src/**', 1, '', 1, 1000)"
+            )).unwrap();
+            conn.execute_sync("UPDATE file_reservations SET reason = ? WHERE id = 1",
+                &[Value::Text("x".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1))]).unwrap();
+            assert!(file_reservation_snapshot_from_conn(&*conn, &project, true, 500).unwrap_err().to_string().contains("4 MiB"));
+            conn.execute_raw("UPDATE file_reservations SET reason = ''; BEGIN").unwrap();
+            for _ in 0..14 {
+                conn.execute_raw(
+                    "INSERT INTO file_reservations (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     SELECT project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts FROM file_reservations"
+                ).unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+            assert!(file_reservation_snapshot_from_conn(&*conn, &project, true, 500).unwrap_err().to_string().contains("10000-row"));
+        });
+    }
 
     #[cfg(unix)]
     #[test]
