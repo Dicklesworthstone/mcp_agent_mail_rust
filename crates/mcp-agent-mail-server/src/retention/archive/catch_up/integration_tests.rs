@@ -404,7 +404,9 @@ fn restored_forward_tail_reaches_orphan_after_history_ends_without_client_reads(
     )
     .unwrap();
     assert!(reports[0].3, "the real durable cursor must be restored");
-    assert_eq!(reports[0].0, 16);
+    // Startup priority checks sixteen newest settled rows alongside the
+    // original sixteen forward rows; neither page contains orphan 9042.
+    assert_eq!(reports[0].0, 32);
     assert_eq!(reports[0].1, 0);
     assert!(
         reports[0].2,

@@ -56,6 +56,19 @@ struct DeferredRetry {
 }
 
 #[derive(Debug)]
+struct StartupTail {
+    after: i64,
+    ceiling: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanLane {
+    Tail,
+    History,
+    StartupTail,
+}
+
+#[derive(Debug)]
 struct ReconcileFailure {
     detail: String,
     transient: bool,
@@ -130,6 +143,13 @@ pub struct ReconcileCursor {
     // process-local: checkpoint restore keeps its scan position and retry debt,
     // but cannot claim that this worker has already completed that round.
     startup_backfill_complete: bool,
+    // A restored forward cursor may lag far below the crash window while its
+    // history cursor is already below it. Give that process's newest settled
+    // rows a finite descending lane without throwing away either checkpoint.
+    // These are process-local hints; every restart captures its own upper bound.
+    startup_tail: Option<StartupTail>,
+    startup_tail_initialized: bool,
+    next_lane_is_startup: bool,
     // Only IDs are retained. Every retry rereads the current live source and
     // repeats the ordinary authority/no-clobber checks before publication.
     retries: VecDeque<DeferredRetry>,
@@ -167,6 +187,22 @@ impl ReconcileCursor {
             self.backfill_ceiling = Some(id.saturating_sub(1));
         }
         self.next_lane_is_history = tail;
+    }
+
+    fn advance_scan(&mut self, id: i64, lane: ScanLane) {
+        match lane {
+            ScanLane::Tail => self.advance(id, true),
+            ScanLane::History => self.advance(id, false),
+            ScanLane::StartupTail => {
+                if let Some(range) = &mut self.startup_tail {
+                    range.ceiling = id.saturating_sub(1);
+                    if range.ceiling <= range.after {
+                        self.startup_tail = None;
+                    }
+                }
+            }
+        }
+        self.next_lane_is_startup = lane != ScanLane::StartupTail;
     }
 
     fn forget_retry(&mut self, id: i64) {
@@ -371,6 +407,33 @@ fn interleave_ids(tail: &[i64], history: &[i64], history_first: bool) -> Vec<(i6
     selected
 }
 
+fn interleave_startup_ids(
+    normal: &[(i64, bool)],
+    startup: &[i64],
+    startup_first: bool,
+) -> Vec<(i64, ScanLane)> {
+    let mut selected = Vec::with_capacity(normal.len() + startup.len());
+    for index in 0..normal.len().max(startup.len()) {
+        let ordinary = normal.get(index).map(|&(id, tail)| {
+            (
+                id,
+                if tail {
+                    ScanLane::Tail
+                } else {
+                    ScanLane::History
+                },
+            )
+        });
+        let recent = startup.get(index).map(|&id| (id, ScanLane::StartupTail));
+        selected.extend(if startup_first {
+            [recent, ordinary].into_iter().flatten()
+        } else {
+            [ordinary, recent].into_iter().flatten()
+        });
+    }
+    selected
+}
+
 fn normal_archive_cutoff(now_us: i64, settled_before_us: i64, archive_lag_us: u64) -> i64 {
     // A fixed grace mistakes still-queued mail for lost mail when WBQ falls
     // behind. Its repair then competes for the publication fence with the
@@ -389,7 +452,7 @@ fn normal_archive_cutoff(now_us: i64, settled_before_us: i64, archive_lag_us: u6
 }
 
 struct SelectedIds {
-    ids: Vec<(i64, bool)>,
+    ids: Vec<(i64, ScanLane)>,
     tail_started_after: Option<i64>,
     // This one-ID lookahead is never admitted to payload or publication work.
     // It witnesses remaining eligible forward work after a consumed page.
@@ -436,6 +499,28 @@ fn select_ids(
         cursor.backfill_ceiling = None;
         cursor.next_lane_is_history = false;
         cursor.startup_backfill_complete = false;
+        cursor.startup_tail = None;
+        cursor.startup_tail_initialized = false;
+    }
+    if !cursor.startup_tail_initialized {
+        if cursor.persist_progress
+            && cursor.settled_before_us > 0
+            && let Some(after) = cursor.tail_after
+        {
+            let rows = conn
+                .query_sync(
+                    "SELECT id FROM messages WHERE id > ? AND created_ts <= ? ORDER BY id DESC LIMIT 1",
+                    &[after.into(), cursor.settled_before_us.into()],
+                )
+                .map_err(source_error)?;
+            cursor.startup_tail = rows
+                .first()
+                .map(|row| row.get_named::<i64>("id").map_err(source_error))
+                .transpose()?
+                .map(|ceiling| StartupTail { after, ceiling });
+        }
+        cursor.startup_tail_initialized = true;
+        cursor.next_lane_is_startup = cursor.startup_tail.is_some();
     }
     let tail_started_after = cursor.tail_after;
     let mut tail = if let Some(after) = tail_started_after {
@@ -480,10 +565,36 @@ fn select_ids(
         // Keep its next ordinary wrap, but stop startup-only acceleration.
         cursor.startup_backfill_complete = true;
     }
+    let startup = if let Some(range) = &cursor.startup_tail {
+        conn.query_sync(
+            "SELECT id FROM messages WHERE id > ? AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
+            &[
+                range.after.into(),
+                range.ceiling.into(),
+                cursor.settled_before_us.into(),
+                IDS_PER_LANE.into(),
+            ],
+        )
+        .map_err(source_error)?
+        .into_iter()
+        .map(|row| row.get_named::<i64>("id").map_err(source_error))
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    if startup.is_empty() {
+        cursor.startup_tail = None;
+    }
     // Interleave within a pass AND retain lane priority across budget-limited
     // passes. Fixed tail-first ordering starves history at one payload per pass.
+    // Startup inspection never advances tail_after: skipped young timestamps
+    // and intervening old work still belong to the ordinary durable scan.
     Ok(SelectedIds {
-        ids: interleave_ids(&tail, &history, cursor.next_lane_is_history),
+        ids: interleave_startup_ids(
+            &interleave_ids(&tail, &history, cursor.next_lane_is_history),
+            &startup,
+            cursor.next_lane_is_startup,
+        ),
         tail_started_after,
         tail_next_id,
     })
@@ -1003,6 +1114,9 @@ impl CommittedMessages {
 /// page, including already-archived pages. It resumes the checkpoint's position
 /// rather than restarting at the newest ID. Once that round reaches its end,
 /// subsequent healthy history rounds return to the ordinary polling cadence.
+/// A restored, lagging tail also receives a finite newest-first startup lane,
+/// restricted to rows predating this process. It interleaves with the original
+/// scans without advancing their durable watermarks or enlarging pass budgets.
 /// Independently, a consumed forward page with a witnessed eligible successor
 /// requests catch-up until that backlog is reached, including after a restored
 /// history round finishes. Exactly-full tail pages without a successor stay idle.
@@ -1072,7 +1186,7 @@ fn reconcile_message_batch_inner(
         .map(|retry| (retry.id, None))
         .collect::<Vec<_>>()
         .into_iter();
-    let mut selected = selected.ids.into_iter().map(|(id, tail)| (id, Some(tail)));
+    let mut selected = selected.ids.into_iter().map(|(id, lane)| (id, Some(lane)));
     let mut seen = HashSet::new();
     loop {
         // At saturation only a retained item can free capacity. Do not let
@@ -1082,7 +1196,7 @@ fn reconcile_message_batch_inner(
         } else {
             selected.next().or_else(|| retries.next())
         };
-        let Some((id, tail)) = next else {
+        let Some((id, lane)) = next else {
             break;
         };
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
@@ -1108,10 +1222,10 @@ fn reconcile_message_batch_inner(
                 .any(|(known, until)| *known == id && *until > now);
         // A retained ID belongs to the retry lane. Consuming its scan-lane
         // duplicate must not steal the normal lane's turn or byte allowance.
-        let retained_scan = tail.is_some() && cursor.retries.iter().any(|retry| retry.id == id);
+        let retained_scan = lane.is_some() && cursor.retries.iter().any(|retry| retry.id == id);
         if seen.contains(&id) || cooling_down || retained_scan {
-            if let Some(tail) = tail {
-                cursor.advance(id, tail);
+            if let Some(lane) = lane {
+                cursor.advance_scan(id, lane);
             }
             continue;
         }
@@ -1191,7 +1305,7 @@ fn reconcile_message_batch_inner(
             break;
         }
         report.scanned += 1;
-        cursor.next_lane_is_retry = tail.is_some();
+        cursor.next_lane_is_retry = lane.is_some();
         match result {
             Ok(result) if result.files_created > 0 || result.git_commit_needed => {
                 report.repaired += 1;
@@ -1204,8 +1318,8 @@ fn reconcile_message_batch_inner(
             }
             Err(error) => record_failure(id, error, cursor, &mut report, now),
         }
-        if let Some(tail) = tail {
-            cursor.advance(id, tail);
+        if let Some(lane) = lane {
+            cursor.advance_scan(id, lane);
         }
     }
     // Finding no missing files on the newest page does not establish that a
@@ -1214,7 +1328,7 @@ fn reconcile_message_batch_inner(
     // repair count, payload bound, retry cooldown, or publication guard changes.
     // A cancelled or wholly blocked pass does not request extra polling here.
     if cursor.persist_progress
-        && !cursor.startup_backfill_complete
+        && (!cursor.startup_backfill_complete || cursor.startup_tail.is_some())
         && report.scanned > 0
         && !report.interrupted
     {
@@ -2207,6 +2321,55 @@ mod tests {
     }
 
     #[test]
+    fn startup_priority_preserves_both_normal_lanes_when_one_payload_fills_a_pass() {
+        let mut cursor = ReconcileCursor {
+            tail_after: Some(999),
+            backfill_ceiling: Some(999),
+            startup_tail: Some(StartupTail {
+                after: 2000,
+                ceiling: 9000,
+            }),
+            startup_tail_initialized: true,
+            next_lane_is_startup: true,
+            ..Default::default()
+        };
+        let mut counts = [0; 3];
+        let mut seen = HashSet::new();
+        for _ in 0..100 {
+            let normal = interleave_ids(
+                &[cursor.tail_after.unwrap() + 1],
+                &[cursor.backfill_ceiling.unwrap()],
+                cursor.next_lane_is_history,
+            );
+            let selected = interleave_startup_ids(
+                &normal,
+                &[cursor.startup_tail.as_ref().unwrap().ceiling],
+                cursor.next_lane_is_startup,
+            );
+            let (id, lane) = selected[0];
+            assert!(seen.insert(id));
+            assert_eq!(
+                payload_admission(0, MAX_BATCH_PAYLOAD_BYTES),
+                PayloadAdmission::Fits
+            );
+            assert_eq!(
+                payload_admission(MAX_BATCH_PAYLOAD_BYTES, 1),
+                PayloadAdmission::NextBatch
+            );
+            cursor.advance_scan(id, lane);
+            counts[match lane {
+                ScanLane::Tail => 0,
+                ScanLane::History => 1,
+                ScanLane::StartupTail => 2,
+            }] += 1;
+        }
+        assert_eq!(counts, [25, 25, 50]);
+        assert_eq!(cursor.tail_after, Some(1024));
+        assert_eq!(cursor.backfill_ceiling, Some(974));
+        assert_eq!(cursor.startup_tail.unwrap().ceiling, 8950);
+    }
+
+    #[test]
     fn interleaving_preserves_each_lane_and_duplicate_cursor_updates() {
         assert_eq!(
             interleave_ids(&[10, 11], &[9, 8, 7], true),
@@ -2866,6 +3029,66 @@ mod tests {
             let end = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
             assert!(!end.budget_exhausted);
             assert!(restarted.startup_backfill_complete);
+        });
+    }
+
+    #[test]
+    fn startup_priority_has_a_fixed_bound_and_cannot_advance_over_young_tail_rows() {
+        retention_fixture(40, |cx, pool, _config| {
+            let anchor = 2_000_000;
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET created_ts = 2000001 WHERE id = 938")
+                .unwrap();
+            drop(conn);
+            let mut cursor = ReconcileCursor::settled_before(anchor);
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(905);
+            cursor.backfill_ceiling = Some(904);
+            let first = select_ids(cx, pool, &mut cursor, anchor).unwrap();
+            assert_eq!(first.ids[0], (940, ScanLane::StartupTail));
+            let mut recent = HashSet::new();
+            for (id, lane) in first.ids {
+                if lane == ScanLane::StartupTail {
+                    assert!(recent.insert(id));
+                    cursor.advance_scan(id, lane);
+                }
+            }
+            // A late commit may carry a timestamp predating this process. It
+            // must remain normal tail work, not extend the finite priority lane.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES (941, 101, 101, 'late commit', 'keep later mail', 1000000)",
+            )
+            .unwrap();
+            drop(conn);
+            for _ in 0..4 {
+                for (id, lane) in select_ids(cx, pool, &mut cursor, anchor).unwrap().ids {
+                    if lane == ScanLane::StartupTail {
+                        assert!(recent.insert(id));
+                        cursor.advance_scan(id, lane);
+                    }
+                }
+            }
+            assert!(cursor.startup_tail.is_none());
+            assert_eq!(recent.len(), 34);
+            assert!(!recent.contains(&938));
+            assert!(!recent.contains(&941));
+            assert_eq!(cursor.tail_after, Some(905));
+            assert_eq!(cursor.backfill_ceiling, Some(904));
+
+            let mut forward = HashSet::new();
+            for _ in 0..4 {
+                for (id, lane) in select_ids(cx, pool, &mut cursor, anchor + 1).unwrap().ids {
+                    assert_ne!(lane, ScanLane::StartupTail);
+                    if lane == ScanLane::Tail {
+                        assert!(forward.insert(id));
+                    }
+                    cursor.advance_scan(id, lane);
+                }
+            }
+            assert_eq!(forward, (906..942).collect());
+            assert_eq!(cursor.tail_after, Some(941));
         });
     }
 
