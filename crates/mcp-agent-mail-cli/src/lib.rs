@@ -51179,6 +51179,170 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn setup_self_heal_fingerprints_omp_configured_extension_changes() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, ConfigDriftReason, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let home_dir = temp.path().join("home");
+        let project_mcp = project_dir.join(".omp/mcp.json");
+        let settings = project_dir.join(".omp/config.yml");
+        let extension = project_dir.join("mail-extension");
+        let extension_mcp = extension.join(".mcp.json");
+        let native = r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}}}"#;
+        std::fs::create_dir_all(project_mcp.parent().expect("project MCP parent"))
+            .expect("create project MCP parent");
+        std::fs::create_dir_all(&home_dir).expect("create home fixture");
+        std::fs::create_dir(&extension).expect("create extension fixture");
+        std::fs::write(&project_mcp, native).expect("write healthy project config");
+        std::fs::write(&settings, "extensions: [./mail-extension]\n")
+            .expect("write extension settings");
+        let mut params = SetupParams {
+            token: "tok".to_string(),
+            project_dir,
+            home_dir_override: Some(home_dir),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+
+        let (drift, absent) = verify_setup_status_snapshot(&params, &[AgentPlatform::Omp])
+            .expect("stable status with an extension awaiting installation");
+        assert!(drift.is_empty());
+        let missing = absent
+            .iter()
+            .find(|file| file.path == extension_mcp.display().to_string())
+            .expect("absent extension MCP remains a cache authority");
+        assert!(!missing.exists);
+
+        let equivalent = native.replace("mcp-agent-mail", "mcp_agent_mail");
+        std::fs::write(&extension_mcp, &equivalent).expect("install equivalent extension provider");
+        let (drift, installed) = verify_setup_status_snapshot(&params, &[AgentPlatform::Omp])
+            .expect("stable status with equivalent extension provider");
+        assert!(drift.is_empty());
+        assert_ne!(
+            absent, installed,
+            "installing an extension invalidates the cache"
+        );
+
+        let modified = std::fs::metadata(&extension_mcp)
+            .expect("extension metadata")
+            .modified()
+            .expect("extension modification time");
+        let stale = equivalent.replace("127.0.0.1", "127.0.0.2");
+        assert_eq!(equivalent.len(), stale.len());
+        std::fs::write(&extension_mcp, &stale).expect("replace extension endpoint");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&extension_mcp)
+            .expect("open extension to restore timestamp")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore original timestamp");
+        let replaced = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        let previous = installed
+            .iter()
+            .find(|file| file.path == extension_mcp.display().to_string())
+            .expect("installed extension fingerprint");
+        let current = replaced
+            .iter()
+            .find(|file| file.path == extension_mcp.display().to_string())
+            .expect("replaced extension fingerprint");
+        assert_eq!(previous.len, current.len);
+        assert_eq!(previous.modified_micros, current.modified_micros);
+        assert_ne!(previous.content_sha256, current.content_sha256);
+        assert_ne!(installed, replaced);
+        let statuses = mcp_agent_mail_core::setup::check_status(&params);
+        assert!(
+            statuses[0].config_files[0]
+                .drift_reasons
+                .contains(&ConfigDriftReason::DuplicateServerEntries)
+        );
+
+        params.skip_user_config = false;
+        let all_scopes = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        for path in [&settings, &extension_mcp, &extension.join("plugin.json")] {
+            assert!(
+                all_scopes
+                    .iter()
+                    .any(|file| file.path == path.display().to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn setup_self_heal_rejects_omp_extension_manifest_aba_snapshot() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let home_dir = temp.path().join("home");
+        let project_mcp = project_dir.join(".omp/mcp.json");
+        let extension = project_dir.join("mail-extension");
+        let manifest = extension.join("plugin.json");
+        std::fs::create_dir_all(project_mcp.parent().expect("project MCP parent"))
+            .expect("create project MCP parent");
+        std::fs::create_dir_all(&home_dir).expect("create home fixture");
+        std::fs::create_dir(&extension).expect("create extension fixture");
+        std::fs::write(
+            &project_mcp,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","enabled":true}}}"#,
+        )
+        .expect("write healthy project config");
+        std::fs::write(
+            project_dir.join(".omp/config.yml"),
+            "extensions: [./mail-extension]\n",
+        )
+        .expect("write extension settings");
+        std::fs::write(
+            extension.join(".mcp.json"),
+            r#"{"mcpServers":{"agent-mail":{"url":"http://stale.example/mcp"}}}"#,
+        )
+        .expect("write conflicting legacy extension provider");
+        let standard = r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"mail-extension"}"#;
+        let legacy = format!("{{}}{}", " ".repeat(standard.len() - 2));
+        std::fs::write(&manifest, &legacy).expect("write legacy manifest");
+        let modified = std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .modified()
+            .expect("manifest modification time");
+        let params = SetupParams {
+            project_dir,
+            home_dir_override: Some(home_dir),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        let before = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+
+        let error = verify_setup_status_snapshot_with(&params, &[AgentPlatform::Omp], || {
+            std::fs::write(&manifest, standard).expect("temporarily suppress legacy providers");
+            let statuses = mcp_agent_mail_core::setup::check_status(&params);
+            assert!(setup_status_drift_summaries(&statuses, None).is_empty());
+            std::fs::write(&manifest, &legacy).expect("restore legacy manifest");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&manifest)
+                .expect("open manifest to restore timestamp")
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .expect("restore original timestamp");
+            statuses
+        })
+        .expect_err("transiently healthy extension authority must not enter the cache");
+        let after = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        assert_eq!(
+            before, after,
+            "the restored snapshot deliberately has identical metadata and bytes"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cache an unstable snapshot")
+        );
+    }
+
+    #[test]
     fn setup_self_heal_legacy_cache_cannot_take_verified_fast_path() {
         let expected = SetupSelfHealCache {
             schema_version: SETUP_SELF_HEAL_CACHE_VERSION,
