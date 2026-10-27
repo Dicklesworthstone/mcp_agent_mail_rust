@@ -29287,18 +29287,20 @@ mod tests {
 
     #[test]
     fn robot_search_cursor_traverses_real_results_without_skipping_filtered_matches() {
+        use mcp_agent_mail_db::sqlmodel_core::Value as DbValue;
+
         let (temp_dir, conn) = setup_robot_thread_message_test_db();
         conn.execute_raw("BEGIN IMMEDIATE").expect("begin corpus");
         for id in 1_i64..=13 {
             conn.execute_sync(
                 "INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts) VALUES (?,1,1,'pagewalk','pagewalk',?)",
-                &[Value::BigInt(id), Value::BigInt(id * 1_000_000)],
+                &[DbValue::BigInt(id), DbValue::BigInt(id * 1_000_000)],
             ).expect("insert search corpus");
             conn.execute_sync(
                 "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,2,?)",
                 &[
-                    Value::BigInt(id),
-                    Value::Text(if id % 3 == 0 { "cc" } else { "to" }.to_string()),
+                    DbValue::BigInt(id),
+                    DbValue::Text(if id % 3 == 0 { "cc" } else { "to" }.to_string()),
                 ],
             )
             .expect("insert recipient");

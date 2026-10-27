@@ -5,6 +5,10 @@
 #   am e2e run --project . share
 # Compatibility fallback:
 #   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh share
+# Required real-crypto lane against an already built candidate (no build):
+#   bash scripts/e2e_share.sh --crypto-only all /absolute/path/to/am
+# Optional local dependency absence only: AM_SHARE_REQUIRE_AGE=0. A present
+# dependency failing is always a failure, never a skip (br-kp1in.48).
 #
 # This suite verifies:
 # - Export creates a bundle with manifest.json, mailbox.sqlite3, viewer/
@@ -28,8 +32,363 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
+# Shared real-age fixture/CLI runner. Secrets travel over a no-echo PTY to age
+# and stdin to am; neither secrets nor raw child output enter evidence files.
+share_crypto_matrix() {
+    local am_binary="$1"
+    local selected_case="$2"
+    local workspace="$3"
+    if ! command -v python3 >/dev/null 2>&1; then
+        if [ "${AM_SHARE_REQUIRE_AGE:-1}" != "0" ]; then
+            e2e_fail "required real-age lane: python3 is absent"
+            return 1
+        fi
+        e2e_skip "optional real-age lane: python3 is absent"
+        return 77
+    fi
+    AM_SHARE_REQUIRE_AGE="${AM_SHARE_REQUIRE_AGE:-1}" python3 - \
+        "${am_binary}" "${selected_case}" "${workspace}" "${E2E_ARTIFACT_DIR}" <<'PY'
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+am, selected, workspace, artifact_dir = sys.argv[1:]
+root = Path(workspace)
+report_path = Path(artifact_dir) / "crypto.json"
+report = {
+    "schema": "am-share-crypto-v1",
+    "claim": "real-age to real-am interoperability and pre-existing output refusal",
+    "concurrent_publication": "not tested; separately owned by br-kp1in.49",
+    "selected_case": selected,
+    "workspace": str(root),
+    "tools": {},
+    "commands": [],
+    "cases": [],
+}
+secret_values = []
+required = os.environ.get("AM_SHARE_REQUIRE_AGE", "1") != "0"
+environment = dict(os.environ, AM_INTERFACE_MODE="cli", NO_COLOR="1")
+
+
+class Failure(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Failure(message)
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def witness(path):
+    path = Path(path)
+    if not path.exists():
+        return {"exists": False}
+    metadata = path.stat()
+    return {
+        "exists": True,
+        "sha256": digest(path),
+        "size": metadata.st_size,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def no_secret_output(stdout, stderr):
+    require(not any(secret in stdout or secret in stderr for secret in secret_values),
+            "a subprocess exposed secret material; its output was suppressed")
+
+
+def run(argv, secret=None):
+    argv = [str(arg) for arg in argv]
+    receipt = {"argv": argv, "secret_input": "stdin" if secret else None}
+    report["commands"].append(receipt)
+    started = time.monotonic()
+    child = subprocess.Popen(argv, stdin=subprocess.PIPE if secret else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=environment, start_new_session=True)
+    try:
+        stdout, stderr = child.communicate(secret + b"\n" if secret else None, timeout=45)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.communicate()
+        receipt.update(status="timeout", completed=False)
+        raise Failure("crypto subprocess exceeded 45 seconds") from None
+    receipt.update(status=child.returncode, completed=True,
+                   elapsed_ms=round((time.monotonic() - started) * 1000),
+                   stdout_bytes=len(stdout), stderr_bytes=len(stderr))
+    no_secret_output(stdout, stderr)
+    return child.returncode, stdout, stderr
+
+
+def encrypt_passphrase(age, source, destination, secret, armored=False):
+    # age uses terminal stdin in this fresh session. Wait for each prompt and
+    # disabled echo; pipe input cannot satisfy its terminal protocol.
+    import pty
+    import select
+    import termios
+
+    argv = [age, "-p"] + (["-a"] if armored else [])
+    argv += ["-o", str(destination), str(source)]
+    receipt = {"argv": argv, "secret_input": "terminal, echo disabled"}
+    report["commands"].append(receipt)
+    terminal, slave = pty.openpty()
+    child = None
+    captured = bytearray()
+    pending = bytearray()
+    prompts = [b"Enter passphrase", b"Confirm passphrase"]
+    phase = 0
+    started = time.monotonic()
+    try:
+        child = subprocess.Popen(argv, stdin=slave, stdout=subprocess.DEVNULL, stderr=slave,
+                                 env=environment, start_new_session=True)
+        deadline = started + 45
+        while child.poll() is None:
+            if time.monotonic() >= deadline:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+                receipt.update(status="timeout", completed=False)
+                raise Failure("age terminal encryption exceeded 45 seconds")
+            readable, _, _ = select.select([terminal], [], [], 0.05)
+            if readable:
+                try:
+                    chunk = os.read(terminal, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    chunk = b""
+                captured.extend(chunk)
+                pending.extend(chunk)
+            if phase < len(prompts) and prompts[phase] in pending:
+                if not termios.tcgetattr(slave)[3] & termios.ECHO:
+                    os.write(terminal, secret + b"\n")
+                    phase += 1
+                    pending.clear()
+        receipt.update(status=child.returncode, completed=True,
+                       elapsed_ms=round((time.monotonic() - started) * 1000),
+                       terminal_bytes=len(captured), prompts_answered=phase)
+        no_secret_output(bytes(captured), b"")
+        require(child.returncode == 0 and phase == 2,
+                "real age passphrase encryption failed; terminal output suppressed")
+    finally:
+        if child is not None and child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+        os.close(terminal)
+        os.close(slave)
+
+
+def perform_case(name, encrypted, destination, identity=None, secret=None,
+                 expect_success=True, default_output=False):
+    identity_before = identity.read_bytes() if identity is not None else None
+    before = {"original": witness(original), "ciphertext": witness(encrypted),
+              "destination": witness(destination)}
+    case = {"name": name, "before": before}
+    report["cases"].append(case)
+    argv = [am, "share", "decrypt", encrypted]
+    if identity is not None:
+        argv += ["--identity", identity]
+    else:
+        argv += ["--passphrase"]
+    if not default_output:
+        argv += ["--output", destination]
+    status, _, _ = run(argv, secret)
+    after = {"original": witness(original), "ciphertext": witness(encrypted),
+             "destination": witness(destination)}
+    case.update(status=status, after=after)
+    require(before["original"] == after["original"], "original fixture changed")
+    require(before["ciphertext"] == after["ciphertext"], "ciphertext fixture changed")
+    if identity is not None:
+        require(identity.read_bytes() == identity_before, "identity file changed")
+        case["identity_preserved"] = True
+    if expect_success:
+        require(status == 0, name + ": am did not decrypt successfully")
+        require(not before["destination"]["exists"], "positive destination was not distinct")
+        require(after["destination"].get("sha256") == before["original"]["sha256"],
+                name + ": plaintext bytes differ")
+        require(after["destination"]["mode"] == 0o600,
+                name + ": plaintext is not private (0600)")
+    else:
+        require(status == 1, name + ": expected decryption refusal (exit 1)")
+        require(before["destination"] == after["destination"],
+                name + ": failed decryption published or changed plaintext")
+    case["passed"] = True
+
+
+exit_code = 0
+try:
+    cases = ["identity-default", "identity-explicit", "passphrase", "passphrase-armored",
+             "wrong-passphrase", "wrong-identity", "tampered-passphrase", "tampered-identity",
+             "existing-output"]
+    require(selected == "all" or selected in cases, "unknown crypto scenario")
+    missing = [tool for tool in ("age", "age-keygen") if shutil.which(tool) is None]
+    if os.name != "posix":
+        missing.append("Unix PTY support")
+    if missing:
+        report.update(status="failed" if required else "skipped",
+                      reason="missing dependencies: " + ", ".join(missing))
+        exit_code = 1 if required else 77
+    else:
+        age = shutil.which("age")
+        keygen = shutil.which("age-keygen")
+        for label, executable in (("age", age), ("age-keygen", keygen), ("am", am)):
+            status, stdout, stderr = run([executable, "--version"])
+            require(status == 0, label + " --version failed")
+            report["tools"][label] = {
+                "path": str(Path(executable).resolve()),
+                "sha256": digest(Path(executable).resolve()),
+                "version": (stdout + stderr).decode("utf-8", "replace").strip()[:200],
+            }
+        for directory in ("original", "ciphertext", "outputs", "identities"):
+            (root / directory).mkdir(mode=0o700)
+        original = root / "original" / "bundle.zip"
+        # More than two age payload chunks: late corruption must not publish
+        # the already-decrypted prefix. The unique source is never overwritten.
+        original.write_bytes(secrets.token_bytes(2 * 65536 + 73))
+        original_before = witness(original)
+        passphrase = b"  " + secrets.token_hex(24).encode("ascii") + b" \t"
+        wrong_passphrase = b"wrong-" + secrets.token_hex(24).encode("ascii")
+        secret_values.extend([passphrase, passphrase.strip(), wrong_passphrase])
+        identity = root / "identities" / "identity.txt"
+        wrong_identity = root / "identities" / "wrong-identity.txt"
+        identity_cipher = root / "ciphertext" / "identity.zip.age"
+        passphrase_cipher = root / "ciphertext" / "passphrase.zip.age"
+        armored_cipher = root / "ciphertext" / "armored.zip.age"
+
+        def need_identity():
+            if identity_cipher.exists():
+                return
+            for key_path in (identity, wrong_identity):
+                status, _, _ = run([keygen, "-o", key_path])
+                require(status == 0, "real age-keygen failed")
+                secret_values.extend(line for line in key_path.read_bytes().splitlines()
+                                     if line.startswith(b"AGE-SECRET-KEY-"))
+            status, public_key, _ = run([keygen, "-y", identity])
+            require(status == 0 and public_key.strip().startswith(b"age1"),
+                    "real age-keygen did not return an age recipient")
+            status, _, _ = run([age, "-r", public_key.decode("ascii").strip(),
+                                "-o", identity_cipher, original])
+            require(status == 0, "real age recipient encryption failed")
+
+        def need_passphrase(armored=False):
+            destination = armored_cipher if armored else passphrase_cipher
+            if not destination.exists():
+                encrypt_passphrase(age, original, destination, passphrase, armored)
+            return destination
+
+        for case_name in cases if selected == "all" else [selected]:
+            output = root / "outputs" / (case_name + ".zip")
+            if case_name.startswith("identity-"):
+                need_identity()
+                use_default = case_name == "identity-default"
+                if use_default:
+                    output = identity_cipher.with_suffix("")
+                perform_case(case_name, identity_cipher, output, identity=identity,
+                             default_output=use_default)
+            elif case_name in ("passphrase", "passphrase-armored"):
+                encrypted = need_passphrase(case_name == "passphrase-armored")
+                perform_case(case_name, encrypted, output, secret=passphrase)
+            elif case_name == "wrong-passphrase":
+                perform_case(case_name, need_passphrase(), output, secret=wrong_passphrase,
+                             expect_success=False)
+            elif case_name == "wrong-identity":
+                need_identity()
+                perform_case(case_name, identity_cipher, output, identity=wrong_identity,
+                             expect_success=False)
+            elif case_name.startswith("tampered-"):
+                passphrase_mode = case_name == "tampered-passphrase"
+                if passphrase_mode:
+                    encrypted = need_passphrase()
+                else:
+                    need_identity()
+                    encrypted = identity_cipher
+                pristine = witness(encrypted)
+                for mutation in ("corrupted", "truncated"):
+                    damaged = root / "ciphertext" / (case_name + "-" + mutation + ".age")
+                    data = bytearray(encrypted.read_bytes())
+                    if mutation == "corrupted":
+                        data[-1] ^= 1
+                    else:
+                        data = data[:-1]
+                    damaged.write_bytes(data)
+                    destination = root / "outputs" / (case_name + "-" + mutation + ".zip")
+                    perform_case(case_name + "-" + mutation, damaged, destination,
+                                 identity=None if passphrase_mode else identity,
+                                 secret=passphrase if passphrase_mode else None,
+                                 expect_success=False)
+                require(pristine == witness(encrypted), "pristine ciphertext changed")
+            elif case_name == "existing-output":
+                need_identity()
+                need_passphrase()
+                for mode, encrypted in (("identity", identity_cipher),
+                                        ("passphrase", passphrase_cipher)):
+                    destination = root / "outputs" / ("existing-" + mode + ".zip")
+                    destination.write_bytes(b"pre-existing destination must survive\x00" +
+                                            secrets.token_bytes(32))
+                    perform_case(case_name + "-" + mode, encrypted, destination,
+                                 identity=identity if mode == "identity" else None,
+                                 secret=passphrase if mode == "passphrase" else None,
+                                 expect_success=False)
+        require(original_before == witness(original), "original fixture changed across matrix")
+        report.update(status="passed", original_preserved=True)
+except Failure as error:
+    report.update(status="failed", reason=str(error))
+    exit_code = 1
+except Exception as error:
+    # Arbitrary exception text/captured output may expose secrets.
+    report.update(status="failed", reason="runner exception: " + type(error).__name__)
+    exit_code = 1
+finally:
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+print("crypto " + report["status"] + ": " + str(report_path))
+if report.get("reason"):
+    print(report["reason"])
+sys.exit(exit_code)
+PY
+}
+
 e2e_init_artifacts
 e2e_banner "Share / Export Bundle E2E Test Suite"
+
+# This entrypoint deliberately precedes SQLite/server setup and all build
+# helpers. Qualification must pass the exact prepared candidate executable.
+if [ "${1:-}" = "--crypto-only" ]; then
+    if [ "$#" -ne 3 ] || [ ! -x "$3" ]; then
+        e2e_fail "usage: --crypto-only CASE /absolute/path/to/built/am"
+        e2e_summary || true
+        exit 1
+    fi
+    CRYPTO_WORK="$(e2e_mktemp "e2e_share_crypto")"
+    e2e_case_banner "real age CLI crypto: $2"
+    if share_crypto_matrix "$3" "$2" "${CRYPTO_WORK}"; then
+        e2e_pass "real age CLI crypto: $2"
+        e2e_summary
+    else
+        CRYPTO_STATUS=$?
+        if [ "${CRYPTO_STATUS}" -eq 77 ]; then
+            e2e_skip "optional real-age dependency absent (see crypto.json when Python is available)"
+        else
+            e2e_fail "required real-age crypto case failed (see crypto.json)"
+        fi
+        e2e_summary || true
+        exit "${CRYPTO_STATUS}"
+    fi
+    exit 0
+fi
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 
@@ -58,6 +417,16 @@ MCP_BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 e2e_log "am binary: ${AM_BIN}"
 e2e_log "mcp-agent-mail binary: ${MCP_BIN}"
+
+# Full share qualification always requires the real dependencies, regardless
+# of the optional-local setting used by individual Cargo tests.
+e2e_case_banner "real age passphrase and identity interoperability"
+CRYPTO_WORK="$(e2e_mktemp "e2e_share_crypto")"
+if AM_SHARE_REQUIRE_AGE=1 share_crypto_matrix "${AM_BIN}" all "${CRYPTO_WORK}"; then
+    e2e_pass "real age CLI crypto matrix"
+else
+    e2e_fatal "real age CLI crypto matrix failed (see crypto.json)"
+fi
 
 # ---------------------------------------------------------------------------
 # Workspace
