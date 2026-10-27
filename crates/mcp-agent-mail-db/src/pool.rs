@@ -8946,6 +8946,48 @@ fn with_recovery_promotion_after_validation_hook<R>(
     body()
 }
 
+#[cfg(all(test, unix))]
+type AnchoredRecoveryRenameHook =
+    Box<dyn FnMut(&str, &std::ffi::OsStr, &std::ffi::OsStr) -> Option<rustix::io::Errno>>;
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static ANCHORED_RECOVERY_RENAME_HOOK: std::cell::RefCell<Option<AnchoredRecoveryRenameHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn run_anchored_recovery_rename_hook(
+    context: &str,
+    from_name: &std::ffi::OsStr,
+    to_name: &std::ffi::OsStr,
+) -> Option<rustix::io::Errno> {
+    ANCHORED_RECOVERY_RENAME_HOOK.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|hook| hook(context, from_name, to_name))
+    })
+}
+
+#[cfg(all(test, unix))]
+fn with_anchored_recovery_rename_hook<R>(
+    hook: impl FnMut(&str, &std::ffi::OsStr, &std::ffi::OsStr) -> Option<rustix::io::Errno> + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct ResetGuard(Option<AnchoredRecoveryRenameHook>);
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            ANCHORED_RECOVERY_RENAME_HOOK.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous =
+        ANCHORED_RECOVERY_RENAME_HOOK.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+    let _guard = ResetGuard(previous);
+    body()
+}
+
 #[cfg(unix)]
 struct AnchoredRecoveryParent {
     target_path: PathBuf,
@@ -9292,7 +9334,7 @@ impl AnchoredRecoveryParent {
         to_name: &std::ffi::OsStr,
         context: &str,
     ) -> Result<(), SqlError> {
-        use rustix::fs::{AtFlags, RenameFlags, renameat, renameat_with, statat};
+        use rustix::fs::{AtFlags, RenameFlags, renameat_with, statat};
 
         match statat(to_parent, to_name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(_) => {
@@ -9309,46 +9351,33 @@ impl AnchoredRecoveryParent {
                 )));
             }
         }
-        match renameat_with(
-            from_parent,
-            from_name,
-            to_parent,
-            to_name,
-            RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => Ok(()),
-            Err(error)
-                if error == rustix::io::Errno::NOSYS || error == rustix::io::Errno::INVAL =>
-            {
-                match statat(to_parent, to_name, AtFlags::SYMLINK_NOFOLLOW) {
-                    Ok(_) => {
-                        return Err(SqlError::Custom(format!(
-                            "{context}: refusing no-replace rename because destination leaf {} became occupied",
-                            Path::new(to_name).display()
-                        )));
-                    }
-                    Err(err) if err == rustix::io::Errno::NOENT => {}
-                    Err(err) => {
-                        return Err(SqlError::Custom(format!(
-                            "{context}: failed to recheck destination leaf {}: {err}",
-                            Path::new(to_name).display()
-                        )));
-                    }
-                }
-                renameat(from_parent, from_name, to_parent, to_name).map_err(|rename_error| {
-                    SqlError::Custom(format!(
-                        "{context}: failed to rename anchored leaf {} -> {}: {rename_error}",
-                        Path::new(from_name).display(),
-                        Path::new(to_name).display()
-                    ))
-                })
-            }
-            Err(error) => Err(SqlError::Custom(format!(
-                "{context}: failed to rename anchored leaf {} -> {}: {error}",
+        // The inspection above is diagnostic only: a destination can appear
+        // immediately afterwards. Even with retained parent descriptors, an
+        // ordinary rename would replace that evidence. If the kernel or
+        // filesystem rejects NOREPLACE, preserve the original error and fail
+        // closed instead of substituting a check-then-replace operation.
+        #[cfg(test)]
+        let injected_error = run_anchored_recovery_rename_hook(context, from_name, to_name);
+        #[cfg(not(test))]
+        let injected_error: Option<rustix::io::Errno> = None;
+        injected_error
+            .map_or_else(
+                || {
+                    renameat_with(
+                        from_parent,
+                        from_name,
+                        to_parent,
+                        to_name,
+                        RenameFlags::NOREPLACE,
+                    )
+                },
+                Err,
+            )
+            .map_err(|error| SqlError::Custom(format!(
+                "{context}: atomic no-replace rename of anchored leaf {} -> {} failed: {error}; refusing a replacing rename",
                 Path::new(from_name).display(),
                 Path::new(to_name).display()
-            ))),
-        }
+            )))
     }
 
     #[allow(clippy::result_large_err)]
@@ -26658,6 +26687,333 @@ mod tests {
             receipt_text.contains("source_snapshot_failure_sha256"),
             "the second receipt must disclose that source continuity was unreadable"
         );
+    }
+
+    #[cfg(unix)]
+    fn recovery_promotion_receipt_artifacts(directory: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let receipts_root = directory.join(".mcp-agent-mail-recovery-receipts");
+        for authority in std::fs::read_dir(receipts_root).expect("read receipt authorities") {
+            let authority = authority.expect("read receipt authority").path();
+            for entry in std::fs::read_dir(authority).expect("read receipt artifacts") {
+                let path = entry.expect("read receipt artifact").path();
+                if matches!(
+                    path.extension().and_then(OsStr::to_str),
+                    Some("pending" | "aborted" | "json")
+                ) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    #[cfg(unix)]
+    struct RecoveryPromotionRenameWitness {
+        candidate_bytes: Vec<u8>,
+        intent_bytes: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    fn capture_recovery_promotion_rename_witness(
+        directory: &Path,
+        candidate: &Path,
+    ) -> RecoveryPromotionRenameWitness {
+        let receipts = recovery_promotion_receipt_artifacts(directory);
+        assert_eq!(receipts.len(), 1, "one prepared intent: {receipts:?}");
+        assert_eq!(receipts[0].extension(), Some(OsStr::new("pending")));
+        // Preparation legitimately writes the receipt marker into the
+        // candidate. Preserve those exact bytes at the rename boundary.
+        RecoveryPromotionRenameWitness {
+            candidate_bytes: std::fs::read(candidate).expect("read prepared candidate witness"),
+            intent_bytes: std::fs::read(&receipts[0]).expect("read prepared intent witness"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_recovery_promotion_aborted(
+        directory: &Path,
+        primary: &Path,
+        candidate: &Path,
+        witness: &RecoveryPromotionRenameWitness,
+    ) {
+        assert_eq!(
+            std::fs::read(candidate).expect("read retained candidate"),
+            witness.candidate_bytes,
+            "a refused rename must retain the complete prepared candidate"
+        );
+        let receipts = recovery_promotion_receipt_artifacts(directory);
+        assert_eq!(receipts.len(), 1, "one terminal intent: {receipts:?}");
+        assert_eq!(
+            receipts[0].extension(),
+            Some(OsStr::new("aborted")),
+            "safe refusal or rollback must leave neither a pending nor a committed receipt"
+        );
+        assert!(
+            std::fs::symlink_metadata(&receipts[0])
+                .expect("inspect aborted intent")
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read(&receipts[0]).expect("read aborted intent"),
+            witness.intent_bytes,
+            "abort must retain the exact durable intent evidence"
+        );
+        crate::forensics::verify_recovery_receipt_state(directory, primary)
+            .expect("safe rollback and durable abort must leave receipt admission clear");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_refuses_unsupported_anchored_noreplace_without_losing_generations() {
+        use std::rc::Rc;
+
+        for failed_phase in [
+            "quarantine live database",
+            "activate reconstructed candidate",
+        ] {
+            for errno in [rustix::io::Errno::NOSYS, rustix::io::Errno::INVAL] {
+                let directory = tempfile::tempdir()
+                    .expect("retained recovery fixture")
+                    .keep();
+                let primary = directory.join("storage.sqlite3");
+                let candidate = directory.join("storage.sqlite3.candidate");
+                write_marker_db(&primary, "original-generation");
+                write_marker_db(&candidate, "candidate-generation");
+                let primary_bytes = std::fs::read(&primary).expect("read original generation");
+                let primary_inode = primary_identity(&primary);
+                let candidate_inode = primary_identity(&candidate);
+                let witness = Rc::new(RefCell::new(None));
+                let quarantine = Rc::new(RefCell::new(None));
+                let calls = Rc::new(Cell::new(0_usize));
+                let hook_witness = Rc::clone(&witness);
+                let hook_quarantine = Rc::clone(&quarantine);
+                let hook_calls = Rc::clone(&calls);
+                let hook_directory = directory.clone();
+                let hook_candidate = candidate.clone();
+                let error = with_anchored_recovery_rename_hook(
+                    move |context, _from_name, to_name| {
+                        hook_calls.set(hook_calls.get() + 1);
+                        let destination = hook_directory.join(to_name);
+                        assert!(
+                            std::fs::symlink_metadata(&destination)
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                            "the injected unsupported call must have an absent destination"
+                        );
+                        if context == "quarantine live database" {
+                            *hook_quarantine.borrow_mut() = Some(destination);
+                        }
+                        if context == failed_phase {
+                            *hook_witness.borrow_mut() =
+                                Some(capture_recovery_promotion_rename_witness(
+                                    &hook_directory,
+                                    &hook_candidate,
+                                ));
+                            Some(errno)
+                        } else {
+                            None
+                        }
+                    },
+                    || promote_recovery_candidate(&primary, &candidate, &directory),
+                )
+                .expect_err("unsupported no-replace must refuse instead of replacing");
+                let error_text = error.to_string();
+                assert!(
+                    error_text.contains(failed_phase)
+                        && error_text.contains("atomic no-replace")
+                        && error_text.contains(&errno.to_string()),
+                    "the original phase and errno must survive rollback: {error_text}"
+                );
+                assert_eq!(
+                    calls.get(),
+                    if failed_phase == "quarantine live database" {
+                        1
+                    } else {
+                        2
+                    },
+                    "activation refusal must follow a successful real source quarantine"
+                );
+                assert_eq!(std::fs::read(&primary).unwrap(), primary_bytes);
+                assert_eq!(primary_identity(&primary), primary_inode);
+                assert_eq!(primary_identity(&candidate), candidate_inode);
+                assert_eq!(
+                    sqlite_marker_value(&primary).as_deref(),
+                    Some("original-generation")
+                );
+                assert_eq!(
+                    sqlite_marker_value(&candidate).as_deref(),
+                    Some("candidate-generation")
+                );
+                let quarantine = quarantine.borrow_mut().take().expect("quarantine path");
+                assert!(
+                    std::fs::symlink_metadata(&quarantine)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                    "the source must be restored from quarantine before aborting the intent"
+                );
+                let witness = witness
+                    .borrow_mut()
+                    .take()
+                    .expect("rename boundary reached");
+                assert_recovery_promotion_aborted(&directory, &primary, &candidate, &witness);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_anchored_noreplace_preserves_raced_quarantine_destinations() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::rc::Rc;
+
+        for dangling_symlink in [false, true] {
+            let directory = tempfile::tempdir()
+                .expect("retained quarantine collision fixture")
+                .keep();
+            let primary = directory.join("storage.sqlite3");
+            let candidate = directory.join("storage.sqlite3.candidate");
+            let missing_target = directory.join("absent-symlink-target");
+            write_marker_db(&primary, "original-generation");
+            write_marker_db(&candidate, "candidate-generation");
+            let primary_bytes = std::fs::read(&primary).expect("read original generation");
+            let primary_inode = primary_identity(&primary);
+            let candidate_inode = primary_identity(&candidate);
+            let witness = Rc::new(RefCell::new(None));
+            let collision = Rc::new(RefCell::new(None));
+            let hook_witness = Rc::clone(&witness);
+            let hook_collision = Rc::clone(&collision);
+            let hook_directory = directory.clone();
+            let hook_candidate = candidate.clone();
+            let hook_missing_target = missing_target.clone();
+            let error = with_anchored_recovery_rename_hook(
+                move |context, _from_name, to_name| {
+                    assert_eq!(context, "quarantine live database");
+                    *hook_witness.borrow_mut() = Some(capture_recovery_promotion_rename_witness(
+                        &hook_directory,
+                        &hook_candidate,
+                    ));
+                    let destination = hook_directory.join(to_name);
+                    assert!(!path_is_occupied(&destination));
+                    // This runs after the helper's last statat. Return None
+                    // so the actual kernel NOREPLACE operation decides the race.
+                    let retained_file = if dangling_symlink {
+                        std::os::unix::fs::symlink(&hook_missing_target, &destination)
+                            .expect("race a dangling destination symlink");
+                        None
+                    } else {
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&destination)
+                            .expect("race a regular destination");
+                        file.write_all(b"independent-quarantine-collision-witness")
+                            .expect("write raced destination bytes");
+                        file.sync_all().expect("sync raced destination");
+                        Some(same_file::Handle::from_file(file).expect("retain collided inode"))
+                    };
+                    let metadata = std::fs::symlink_metadata(&destination)
+                        .expect("capture collided leaf identity");
+                    *hook_collision.borrow_mut() = Some((destination, metadata, retained_file));
+                    None
+                },
+                || promote_recovery_candidate(&primary, &candidate, &directory),
+            )
+            .expect_err("a destination created after inspection must not be replaced");
+            assert!(
+                error.to_string().contains("atomic no-replace"),
+                "the real syscall must reject the collision: {error}"
+            );
+            assert_eq!(std::fs::read(&primary).unwrap(), primary_bytes);
+            assert_eq!(primary_identity(&primary), primary_inode);
+            assert_eq!(primary_identity(&candidate), candidate_inode);
+            let (destination, before, retained_file) = collision
+                .borrow_mut()
+                .take()
+                .expect("destination collision injected");
+            let after = std::fs::symlink_metadata(&destination).expect("raced leaf survives");
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            if dangling_symlink {
+                assert!(after.file_type().is_symlink());
+                assert_eq!(std::fs::read_link(&destination).unwrap(), missing_target);
+                assert!(!path_is_occupied(&missing_target));
+            } else {
+                assert_eq!(
+                    primary_identity(&destination),
+                    retained_file.expect("retained regular collision witness")
+                );
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    b"independent-quarantine-collision-witness"
+                );
+            }
+            let witness = witness
+                .borrow_mut()
+                .take()
+                .expect("rename boundary reached");
+            assert_recovery_promotion_aborted(&directory, &primary, &candidate, &witness);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_real_anchored_noreplace_preserves_quarantine_and_receipt() {
+        use std::rc::Rc;
+
+        let directory = tempfile::tempdir()
+            .expect("retained successful promotion fixture")
+            .keep();
+        let primary = directory.join("storage.sqlite3");
+        let candidate = directory.join("storage.sqlite3.candidate");
+        write_marker_db(&primary, "original-generation");
+        write_marker_db(&candidate, "candidate-generation");
+        let primary_bytes = std::fs::read(&primary).expect("read original generation");
+        let primary_inode = primary_identity(&primary);
+        let candidate_inode = primary_identity(&candidate);
+        let quarantine = Rc::new(RefCell::new(None));
+        let witness = Rc::new(RefCell::new(None));
+        let hook_quarantine = Rc::clone(&quarantine);
+        let hook_witness = Rc::clone(&witness);
+        let hook_directory = directory.clone();
+        let hook_candidate = candidate.clone();
+        with_anchored_recovery_rename_hook(
+            move |context, _from_name, to_name| {
+                if context == "quarantine live database" {
+                    *hook_quarantine.borrow_mut() = Some(hook_directory.join(to_name));
+                    *hook_witness.borrow_mut() = Some(capture_recovery_promotion_rename_witness(
+                        &hook_directory,
+                        &hook_candidate,
+                    ));
+                }
+                None
+            },
+            || promote_recovery_candidate(&primary, &candidate, &directory),
+        )
+        .expect("real no-replace promotion succeeds on an unoccupied destination");
+        let quarantine = quarantine.borrow_mut().take().expect("quarantined source");
+        let witness = witness
+            .borrow_mut()
+            .take()
+            .expect("rename boundary reached");
+        assert_eq!(std::fs::read(&quarantine).unwrap(), primary_bytes);
+        assert_eq!(primary_identity(&quarantine), primary_inode);
+        assert_eq!(primary_identity(&primary), candidate_inode);
+        assert_eq!(std::fs::read(&primary).unwrap(), witness.candidate_bytes);
+        assert!(
+            std::fs::symlink_metadata(&candidate)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("candidate-generation")
+        );
+        let receipts = recovery_promotion_receipt_artifacts(&directory);
+        assert_eq!(receipts.len(), 1, "one committed receipt: {receipts:?}");
+        assert_eq!(receipts[0].extension(), Some(OsStr::new("json")));
+        assert_eq!(std::fs::read(&receipts[0]).unwrap(), witness.intent_bytes);
+        crate::forensics::verify_recovery_receipt_state(&directory, &primary)
+            .expect("the committed receipt must attest the activated generation");
     }
 
     /// Regression for the GH#364 non-converging heal loop (2026-08-18):

@@ -187,6 +187,36 @@ Each bead embeds source context, reasoning, implementation scope, realistic posi
 a negative a naive fix fails, E2E logging, and closure evidence. Implementation and tests
 stay in one logical bead, as the suite's scope-splitting prohibition requires.
 
+#### Recovery promotion follow-up (`br-8asz3`, October 27)
+
+At `629d9acfe7458fd281b349a2cbe40a75f0a61cdc`, the retained-parent recovery helper
+still handled an unsupported atomic no-replace rename by checking absence again and
+using an ordinary replacing rename. A competing destination could appear after that
+second check. This remaining source defect is separate from the already implemented
+directory anchoring and hard-link-alias rejection recorded on the bead.
+
+The commit containing this note removes that fallback for primary quarantine and
+candidate activation. The anchored atomic operation now either succeeds or propagates
+its original error and context. Existing rollback, receipt and admission rules retain
+control after refusal; no replacing rename is substituted when the primitive fails.
+
+Three public `promote_recovery_candidate` tests cover seven disposable fixture cases:
+`NOSYS` and `INVAL` selectively injected at quarantine and activation, real-kernel
+regular-file and dangling-symlink collisions after the last destination inspection,
+and successful real-kernel promotion. They retain source/candidate inode witnesses,
+the exact candidate bytes after receipt preparation, and the pending intent bytes.
+Safe refusal/rollback must preserve that intent as aborted; successful promotion must
+retain the original generation in quarantine and commit a verifiable receipt. Fixtures
+are retained. Selective syscall injection is not native unsupported-platform proof.
+
+**Validation remains OPEN.** The pinned nightly formatter parsed/formatted `pool.rs`
+and its scoped `--check` passed, as did `git diff --check`. Source review found no further
+concrete blocker. Strict RCH attempts for both compiler graphs, Clippy, workspace
+formatting, focused promotion tests and full workspace nextest all stopped with exit
+127 because `rch` is absent. UBS and `br sync --import-only` likewise could not run.
+No compilation, runtime test or native-platform qualification is claimed; the bead
+remains open. No live mailbox or recovery family was modified during implementation.
+
 #### Crypto publication implementation follow-up (`br-kp1in.49`, October 27)
 
 The implementation in the commit containing this note replaces crypto output
