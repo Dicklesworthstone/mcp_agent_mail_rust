@@ -187,6 +187,42 @@ Each bead embeds source context, reasoning, implementation scope, realistic posi
 a negative a naive fix fails, E2E logging, and closure evidence. Implementation and tests
 stay in one logical bead, as the suite's scope-splitting prohibition requires.
 
+#### Restored forward-tail catch-up (`br-kp1in.35`, October 27)
+
+Source review at `629d9acfe7458fd281b349a2cbe40a75f0a61cdc` found a remaining
+scheduling gap alongside the existing retry/checkpoint/startup-history machinery.
+A saved descending history cursor can finish its round while the saved forward cursor
+is still far behind newer eligible mail. A full healthy forward page then reported no
+backlog, returning the worker to minute-long polling before it reached unseen orphans.
+This is a source-supported interleaving, not attribution of the historical swarm IDs.
+
+Forward selection now reads at most 17 eligible IDs and admits the original 16. The
+extra ID is only a lookahead; it authorizes no payload read or archive publication.
+When the tail watermark actually advances but that successor remains ahead, the
+existing catch-up hint stays set independently of history completion. Exactly-full
+terminal pages, initial newest-page selection, cancellation and blocked admission
+do not invent forward backlog. Cooling duplicate IDs can advance the cursor without
+another repair attempt. The 32-attempt, four-repair, 16 MiB batch bounds, retry backoff,
+normal grace, server turn limits, publication checks and checkpoint schema remain.
+
+Four new tests cover this change. The server test uses real mailbox and Git operations
+to publish a checkpoint at tail 9009/history 9000, builds a healthy higher-ID backlog
+without altering that checkpoint, adds DB-only orphan 9042, and reconstructs the cursor.
+The first two healthy forward pages must continue before the orphan is repaired, and
+the finite backlog must return to idle. It compares every message/recipient column,
+including read/ack state, and all 74 canonical/outbox/inbox copies against raw Git HEAD
+blobs. Three storage controls cover initial/exact-end pages, cooling cursor progress,
+and cancelled, saturated-retry and grace-only passes. This is an authored cursor-restart
+regression; it does not claim an executed process-crash or release-smoke result.
+
+**Validation remains OPEN.** Pinned nightly formatting and scoped `--check` passed for
+both changed Rust files, along with `git diff --check` and independent source review.
+Strict RCH attempts for both compiler graphs, Clippy, workspace formatting, storage
+reconciler tests, server catch-up tests and full workspace nextest all stopped with
+exit 127 (`rch` absent). UBS and Beads import were also unavailable. No Rust compilation
+or runtime test ran. The named release-build swarm/SIGKILL/300-second convergence
+acceptance remains unrun, and `.35` and its broader convergence owners remain open.
+
 #### Recovery promotion follow-up (`br-8asz3`, October 27)
 
 At `629d9acfe7458fd281b349a2cbe40a75f0a61cdc`, the retained-parent recovery helper

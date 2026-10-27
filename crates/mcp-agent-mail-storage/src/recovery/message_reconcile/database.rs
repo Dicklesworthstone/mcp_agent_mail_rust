@@ -223,7 +223,8 @@ pub struct ReconcileReport {
     pub interrupted: bool,
     /// More bounded work should follow at catch-up cadence: an execution limit
     /// was reached, or a consumed startup history page has not yet proved the
-    /// end of its round. This is not a count of missing archive messages.
+    /// end of its round, or a consumed forward page has an eligible successor.
+    /// This is not a count of missing archive messages.
     pub budget_exhausted: bool,
     /// Scheduling hints were restored, not archive authority or read/ack state.
     pub checkpoint_restored: bool,
@@ -387,12 +388,20 @@ fn normal_archive_cutoff(now_us: i64, settled_before_us: i64, archive_lag_us: u6
         .max(settled_before_us)
 }
 
+struct SelectedIds {
+    ids: Vec<(i64, bool)>,
+    tail_started_after: Option<i64>,
+    // This one-ID lookahead is never admitted to payload or publication work.
+    // It witnesses remaining eligible forward work after a consumed page.
+    tail_next_id: Option<i64>,
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
     cursor: &mut ReconcileCursor,
     cutoff: i64,
-) -> Result<Vec<(i64, bool)>, String> {
+) -> Result<SelectedIds, String> {
     let identity = pool.sqlite_identity_key();
     if identity != cursor.source_identity {
         *cursor = ReconcileCursor {
@@ -428,10 +437,11 @@ fn select_ids(
         cursor.next_lane_is_history = false;
         cursor.startup_backfill_complete = false;
     }
-    let mut tail = if let Some(after) = cursor.tail_after {
+    let tail_started_after = cursor.tail_after;
+    let mut tail = if let Some(after) = tail_started_after {
         conn.query_sync(
             "SELECT id FROM messages WHERE id > ? AND created_ts <= ? ORDER BY id ASC LIMIT ?",
-            &[after.into(), cutoff.into(), IDS_PER_LANE.into()],
+            &[after.into(), cutoff.into(), (IDS_PER_LANE + 1).into()],
         )
     } else {
         conn.query_sync(
@@ -444,6 +454,13 @@ fn select_ids(
     .map(|row| row.get_named::<i64>("id").map_err(source_error))
     .collect::<Result<Vec<_>, _>>()?;
     tail.sort_unstable();
+    let tail_next_id = if tail_started_after.is_some()
+        && i64::try_from(tail.len()).is_ok_and(|len| len > IDS_PER_LANE)
+    {
+        tail.pop()
+    } else {
+        None
+    };
     let history = conn
         .query_sync(
             "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
@@ -465,7 +482,11 @@ fn select_ids(
     }
     // Interleave within a pass AND retain lane priority across budget-limited
     // passes. Fixed tail-first ordering starves history at one payload per pass.
-    Ok(interleave_ids(&tail, &history, cursor.next_lane_is_history))
+    Ok(SelectedIds {
+        ids: interleave_ids(&tail, &history, cursor.next_lane_is_history),
+        tail_started_after,
+        tail_next_id,
+    })
 }
 
 struct PreparedMessage {
@@ -956,7 +977,9 @@ impl CommittedMessages {
 
 /// Reconcile a bounded pass against the server's live mailbox pool.
 ///
-/// Recent catch-up and rotating history each select at most 16 IDs. At most
+/// Recent catch-up and rotating history each admit at most 16 IDs. Forward
+/// catch-up reads one additional ID to distinguish a full page from its end;
+/// this lookahead performs no payload or archive work in the pass. At most
 /// four successful repairs and 16 MiB of serialized payload are admitted to
 /// archive work per pass. SQL projections are separately bounded before JSON
 /// serialization; an expanded payload that cannot fit any batch is deferred
@@ -980,6 +1003,9 @@ impl CommittedMessages {
 /// page, including already-archived pages. It resumes the checkpoint's position
 /// rather than restarting at the newest ID. Once that round reaches its end,
 /// subsequent healthy history rounds return to the ordinary polling cadence.
+/// Independently, a consumed forward page with a witnessed eligible successor
+/// requests catch-up until that backlog is reached, including after a restored
+/// history round finishes. Exactly-full tail pages without a successor stay idle.
 ///
 /// # Errors
 ///
@@ -1035,6 +1061,8 @@ fn reconcile_message_batch_inner(
         selected
     };
     let selected_identity = cursor.source_identity.clone();
+    let tail_started_after = selected.tail_started_after;
+    let tail_next_id = selected.tail_next_id;
     let now = Instant::now();
     let mut retries = cursor
         .retries
@@ -1044,7 +1072,7 @@ fn reconcile_message_batch_inner(
         .map(|retry| (retry.id, None))
         .collect::<Vec<_>>()
         .into_iter();
-    let mut selected = selected.into_iter().map(|(id, tail)| (id, Some(tail)));
+    let mut selected = selected.ids.into_iter().map(|(id, tail)| (id, Some(tail)));
     let mut seen = HashSet::new();
     loop {
         // At saturation only a retained item can free capacity. Do not let
@@ -1189,6 +1217,22 @@ fn reconcile_message_batch_inner(
         && !cursor.startup_backfill_complete
         && report.scanned > 0
         && !report.interrupted
+    {
+        report.budget_exhausted = true;
+    }
+    // A restored history round can finish long before its forward cursor has
+    // reached crash-lost mail. Keep the existing bounded catch-up schedule while
+    // a consumed tail page still has an observed eligible successor. Cursor-only
+    // progress through cooling duplicates also counts; a wholly blocked or
+    // cancelled pass must not manufacture progress or consume the lookahead.
+    if !report.interrupted
+        && tail_started_after
+            .zip(tail_next_id)
+            .is_some_and(|(before, next)| {
+                cursor
+                    .tail_after
+                    .is_some_and(|after| after > before && after < next)
+            })
     {
         report.budget_exhausted = true;
     }
@@ -2822,6 +2866,155 @@ mod tests {
             let end = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
             assert!(!end.budget_exhausted);
             assert!(restarted.startup_backfill_complete);
+        });
+    }
+
+    #[test]
+    fn forward_tail_lookahead_distinguishes_more_work_from_newest_and_exact_end_pages() {
+        retention_fixture(32, |cx, pool, config| {
+            archive_fixture_range(cx, pool, config, 901..933);
+            let stop = AtomicBool::new(false);
+            let mut newest = ReconcileCursor::default();
+            let recent = reconcile_message_batch(cx, pool, config, &mut newest, &stop).unwrap();
+            assert_eq!(recent.unchanged, 16);
+            assert!(!recent.budget_exhausted);
+            assert_eq!(newest.tail_after, Some(932));
+
+            // An already-restored forward watermark has different semantics
+            // from the initial newest-page query. History is at its end, so
+            // only witnessed forward work may request the short follow-up.
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                backfill_ceiling: Some(900),
+                ..ReconcileCursor::default()
+            };
+            let first = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(first.unchanged, 16);
+            assert!(first.budget_exhausted);
+            assert!(cursor.startup_backfill_complete);
+            assert_eq!(cursor.tail_after, Some(916), "lookahead is not consumed");
+
+            let exact_end = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(exact_end.unchanged, 16);
+            assert_eq!(exact_end.repaired, 0);
+            assert!(!exact_end.budget_exhausted);
+            assert_eq!(cursor.tail_after, Some(932));
+            assert!(exact_end.scanned <= MAX_IDS_PER_PASS);
+            assert!(exact_end.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..933).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn cooling_tail_page_advances_without_retrying_and_reaches_the_next_orphan() {
+        retention_fixture(17, |cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                backfill_ceiling: Some(900),
+                conflict_backoff: (901..917)
+                    .map(|id| (id, Instant::now() + MAX_RETRY_BACKOFF))
+                    .collect(),
+                ..ReconcileCursor::default()
+            };
+            let cooling = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(cooling.scanned, 0);
+            assert_eq!(cooling.repaired, 0);
+            assert_eq!(cooling.deferred, 0);
+            assert_eq!(cooling.retry_len, 0);
+            assert!(cooling.budget_exhausted);
+            assert_eq!(cursor.tail_after, Some(916));
+
+            // The unconsumed sentinel is an actual DB-only message, not proof
+            // of a repair. Its following pass still performs all live-source,
+            // archive and Git checks before publication.
+            let next = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(next.scanned, 1);
+            assert_eq!(next.repaired, 1);
+            assert_eq!(next.files_created, 4);
+            assert_eq!(next.deferred, 0);
+            assert!(!next.budget_exhausted);
+            let original = prepare_message(cx, pool, 917).unwrap();
+            assert!(
+                verify_retention_archive(
+                    &crate::open_archive(config, "project").unwrap().unwrap(),
+                    &original,
+                    &mut 0,
+                )
+                .unwrap()
+                .is_some()
+            );
+            let idle = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(idle.scanned, 0);
+            assert!(!idle.budget_exhausted);
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..918).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn forward_tail_lookahead_does_not_accelerate_cancelled_blocked_or_grace_only_passes() {
+        retention_fixture(17, |cx, pool, config| {
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                backfill_ceiling: Some(900),
+                retries: (0..MAX_RETRY_IDS)
+                    .map(|index| DeferredRetry {
+                        id: 10_000 + i64::try_from(index).unwrap(),
+                        attempts: 1,
+                        ready_at: Instant::now() + MAX_RETRY_BACKOFF,
+                    })
+                    .collect(),
+                ..ReconcileCursor::default()
+            };
+            let cancelled =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(true))
+                    .unwrap();
+            assert!(cancelled.interrupted);
+            assert!(!cancelled.budget_exhausted);
+            assert_eq!(cursor.tail_after, Some(900));
+
+            let stop = AtomicBool::new(false);
+            for _ in 0..2 {
+                let blocked =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(blocked.scanned, 0);
+                assert_eq!(blocked.repaired, 0);
+                assert_eq!(blocked.retry_len, MAX_RETRY_IDS);
+                assert!(!blocked.budget_exhausted);
+                assert_eq!(cursor.tail_after, Some(900));
+            }
+
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(&format!("UPDATE messages SET created_ts = {}", i64::MAX,))
+                .unwrap();
+            drop(conn);
+            let mut grace_only = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                backfill_ceiling: Some(900),
+                ..ReconcileCursor::default()
+            };
+            for _ in 0..2 {
+                let shielded =
+                    reconcile_message_batch(cx, pool, config, &mut grace_only, &stop).unwrap();
+                assert_eq!(shielded.scanned, 0);
+                assert_eq!(shielded.repaired, 0);
+                assert!(!shielded.budget_exhausted);
+                assert_eq!(grace_only.tail_after, Some(900));
+            }
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..918).collect::<Vec<_>>()
+            );
         });
     }
 
