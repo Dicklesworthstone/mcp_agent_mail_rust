@@ -6945,11 +6945,7 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 .unwrap_or_else(|| share::default_decrypt_output(&args.encrypted_path));
             let passphrase_str = if args.passphrase {
                 ftui_runtime::ftui_eprintln!("Enter passphrase:");
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_line(&mut buf)
-                    .map_err(|e| CliError::Other(format!("failed to read passphrase: {e}")))?;
-                Some(buf.trim_end().to_string())
+                Some(read_share_passphrase()?)
             } else {
                 None
             };
@@ -6957,7 +6953,9 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 &args.encrypted_path,
                 &output,
                 args.identity.as_deref(),
-                passphrase_str.as_deref(),
+                passphrase_str
+                    .as_ref()
+                    .map(|passphrase| passphrase.as_str()),
             )?;
             ftui_runtime::ftui_println!("Decrypted to: {}", output.display());
             Ok(())
@@ -6986,6 +6984,48 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
         }
         ShareCommand::Deploy { action } => handle_deploy(action),
     }
+}
+
+fn read_share_passphrase() -> CliResult<zeroize::Zeroizing<String>> {
+    use std::io::IsTerminal;
+
+    // Never fall back to an echoing terminal read if the no-echo reader fails.
+    // A non-terminal stdin remains available for secret pipes without putting
+    // the passphrase in argv, the environment, or a plaintext secret file.
+    let passphrase = if std::io::stdin().is_terminal() {
+        rpassword::read_password().map(zeroize::Zeroizing::new)
+    } else {
+        read_share_passphrase_line(&mut std::io::stdin().lock())
+    }
+    .map_err(|_| CliError::Other("failed to read passphrase".to_string()))?;
+
+    if passphrase.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "passphrase must not be empty".to_string(),
+        ));
+    }
+    Ok(passphrase)
+}
+
+fn read_share_passphrase_line(
+    reader: &mut impl std::io::BufRead,
+) -> std::io::Result<zeroize::Zeroizing<String>> {
+    let mut passphrase = zeroize::Zeroizing::new(String::new());
+    if reader.read_line(&mut passphrase)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "passphrase input ended before a value was read",
+        ));
+    }
+    // Only the line terminator is framing. Spaces, tabs, and other trailing
+    // whitespace are part of the secret and must survive unchanged.
+    if passphrase.ends_with('\n') {
+        passphrase.pop();
+        if passphrase.ends_with('\r') {
+            passphrase.pop();
+        }
+    }
+    Ok(passphrase)
 }
 
 fn handle_deploy(action: DeployCommand) -> CliResult<()> {
@@ -53428,6 +53468,40 @@ http_headers = { Authorization = "Bearer secret" }
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn share_passphrase_pipe_preserves_significant_whitespace() {
+        for input in [
+            "  pass phrase \t\n",
+            "  pass phrase \t\r\n",
+            "  pass phrase \t",
+        ] {
+            let passphrase = read_share_passphrase_line(&mut input.as_bytes()).unwrap();
+            assert_eq!(passphrase.as_str(), "  pass phrase \t");
+        }
+
+        let passphrase = read_share_passphrase_line(&mut "雪\rword\n".as_bytes()).unwrap();
+        assert_eq!(passphrase.as_str(), "雪\rword");
+    }
+
+    #[test]
+    fn share_passphrase_pipe_reads_one_line() {
+        let mut input = &b"first\nsecond\n"[..];
+        assert_eq!(
+            read_share_passphrase_line(&mut input).unwrap().as_str(),
+            "first"
+        );
+        assert_eq!(
+            read_share_passphrase_line(&mut input).unwrap().as_str(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn share_passphrase_pipe_rejects_missing_input() {
+        let error = read_share_passphrase_line(&mut &b""[..]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

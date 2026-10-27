@@ -1,7 +1,8 @@
 //! Cryptographic operations for bundle signing and encryption.
 //!
 //! - Ed25519 manifest signing via `ed25519-dalek`
-//! - Age encryption/decryption via CLI shelling
+//! - Age recipient encryption and identity-file decryption via the CLI
+//! - In-process age passphrase decryption with authenticated private staging
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -683,6 +684,9 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
 /// Decrypt an age-encrypted file.
 ///
 /// Provide either `identity` (path to age identity file) or `passphrase`.
+/// Passphrases stay in-process; identity files retain the `age` CLI's support
+/// for identity formats and plugins. Plaintext is published only after the
+/// entire authenticated stream has been read successfully.
 pub fn decrypt_with_age(
     encrypted_path: &Path,
     output_path: &Path,
@@ -709,19 +713,34 @@ pub fn decrypt_with_age(
     }
     validate_crypto_output_path(output_path, "decryption output")?;
 
-    check_age_available()?;
+    if identity.is_some() {
+        check_age_available()?;
+    }
 
     let (staging_dir, staged_output) =
         create_staged_crypto_output_path(output_path, "decryption output", ".age-decrypt.")?;
 
-    let mut cmd = age_command();
-    cmd.arg("-d");
-
     if let Some(id_path) = identity {
-        cmd.arg("-i").arg(id_path);
-    } else if let Some(_pass) = passphrase {
-        // age reads passphrase from stdin when -p is used
-        cmd.arg("-p");
+        let status = age_command()
+            .arg("-d")
+            .arg("-i")
+            .arg(id_path)
+            .arg("-o")
+            .arg(&staged_output)
+            .arg(encrypted_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            // Malformed identities and plugins may include secret material in
+            // diagnostics. Keep the CLI's identity support without relaying it.
+            return Err(ShareError::Io(std::io::Error::other(
+                "age decryption failed (check identity and file integrity)",
+            )));
+        }
+    } else if let Some(pass) = passphrase {
+        decrypt_age_passphrase_to_staging(encrypted_path, &staged_output, pass)?;
     } else {
         // Unreachable because we validated inputs above, but keep a defensive branch.
         return Err(ShareError::Io(std::io::Error::new(
@@ -730,41 +749,56 @@ pub fn decrypt_with_age(
         )));
     }
 
-    cmd.arg("-o").arg(&staged_output).arg(encrypted_path);
-
-    if let Some(pass) = passphrase {
-        use std::io::Write;
-        cmd.stdin(std::process::Stdio::piped());
-        // To prevent deadlock during write_all if age produces unexpected output on stdout/stderr,
-        // we map them to null since we output to a file and don't log them for passphrase runs.
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let mut child = cmd.spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(pass.as_bytes())?;
-            stdin.write_all(b"\n")?;
-        }
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            // Do NOT include stderr when a passphrase was involved —
-            // error output could leak passphrase-related diagnostics.
-            return Err(ShareError::Io(std::io::Error::other(
-                "age decryption failed (check passphrase and file integrity)".to_string(),
-            )));
-        }
-    } else {
-        let result = cmd.output()?;
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            return Err(ShareError::Io(std::io::Error::other(format!(
-                "age decryption failed: {stderr}"
-            ))));
-        }
-    }
-
     std::fs::rename(&staged_output, output_path)?;
     drop(staging_dir);
     Ok(())
+}
+
+fn decrypt_age_passphrase_to_staging(
+    encrypted_path: &Path,
+    staged_output: &Path,
+    passphrase: &str,
+) -> ShareResult<()> {
+    let input = std::fs::File::open(encrypted_path)?;
+    // ArmoredReader accepts both binary age files and ASCII-armored files,
+    // matching the external CLI. No secret ever crosses a subprocess boundary.
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(input))
+        .map_err(|_| age_passphrase_decryption_error())?;
+    if !decryptor.is_scrypt() {
+        return Err(age_passphrase_decryption_error());
+    }
+
+    let mut identity =
+        age::scrypt::Identity::new(age::secrecy::SecretString::from(passphrase.to_owned()));
+    // Match official age's maximum, bounding an untrusted header's CPU/memory
+    // request independently of the library's machine-speed calibration.
+    identity.set_max_work_factor(22);
+    let mut plaintext = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|_| age_passphrase_decryption_error())?;
+    drop(identity);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Preserve the CLI's private plaintext mode after publication, too.
+        options.mode(0o600);
+    }
+    let mut output = options.open(staged_output)?;
+    // Authenticating the header is insufficient: a late corrupt/truncated
+    // chunk must fail before the caller publishes any plaintext. The private
+    // staging directory contains any partial bytes until it is dropped.
+    std::io::copy(&mut plaintext, &mut output).map_err(|_| age_passphrase_decryption_error())?;
+    Ok(())
+}
+
+fn age_passphrase_decryption_error() -> ShareError {
+    // Do not expose dependency diagnostics or any secret-bearing input.
+    ShareError::Io(std::io::Error::other(
+        "age decryption failed (check passphrase and file integrity)",
+    ))
 }
 
 fn create_staged_crypto_output_path(
@@ -910,10 +944,17 @@ fn ensure_real_crypto_directory(path: &Path) -> ShareResult<()> {
 fn check_age_available() -> ShareResult<()> {
     match age_command().arg("--version").output() {
         Ok(output) if output.status.success() => Ok(()),
-        _ => Err(ShareError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "age CLI not found in PATH. Install from https://github.com/FiloSottile/age",
-        ))),
+        Ok(output) => Err(ShareError::Io(std::io::Error::other(format!(
+            "age CLI --version failed ({})",
+            output.status
+        )))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(ShareError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "age CLI not found in PATH. Install from https://github.com/FiloSottile/age",
+            )))
+        }
+        Err(error) => Err(ShareError::Io(error)),
     }
 }
 
@@ -973,26 +1014,75 @@ fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 mod tests {
     use super::*;
 
+    fn real_age_dependency_available(tool: &str, result: ShareResult<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(ShareError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::env::var("AM_SHARE_REQUIRE_AGE").is_ok_and(|value| value == "0") =>
+            {
+                eprintln!(
+                    "SKIP: {tool} is absent; optional local lane explicitly selected with AM_SHARE_REQUIRE_AGE=0"
+                );
+                false
+            }
+            Err(error) => panic!("required real-age dependency {tool} failed: {error}"),
+        }
+    }
+
     fn try_generate_age_identity(dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
+        if !real_age_dependency_available("age", check_age_available()) {
+            return None;
+        }
+        let keygen_version = std::process::Command::new("age-keygen")
+            .arg("--version")
+            .output()
+            .map_err(ShareError::Io)
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(ShareError::Io(std::io::Error::other(format!(
+                        "age-keygen --version failed ({})",
+                        output.status
+                    ))))
+                }
+            });
+        if !real_age_dependency_available("age-keygen", keygen_version) {
+            return None;
+        }
+
         let identity_path = dir.join("age_identity.txt");
         let output = std::process::Command::new("age-keygen")
             .arg("-o")
             .arg(&identity_path)
             .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            .expect("age-keygen must run after its dependency probe succeeded");
+        assert!(
+            output.status.success(),
+            "real age identity generation failed ({})",
+            output.status
         );
-        let recipient = combined
-            .lines()
-            .find(|line| line.to_ascii_lowercase().contains("public key:"))
-            .and_then(|line| line.split_whitespace().last())
-            .map(std::string::ToString::to_string)?;
+        // Ask the real tool for the public recipient. Never print keygen's raw
+        // output, which might contain identity material on an unexpected path.
+        let output = std::process::Command::new("age-keygen")
+            .arg("-y")
+            .arg(&identity_path)
+            .output()
+            .expect("age-keygen must derive the generated identity's public recipient");
+        assert!(
+            output.status.success(),
+            "real age public-recipient derivation failed ({})",
+            output.status
+        );
+        let recipient = String::from_utf8(output.stdout)
+            .unwrap_or_else(|_| panic!("age-keygen returned a non-UTF-8 public recipient"))
+            .trim()
+            .to_owned();
+        assert!(
+            recipient.parse::<age::x25519::Recipient>().is_ok(),
+            "age-keygen returned an invalid public recipient"
+        );
         Some((identity_path, recipient))
     }
 
@@ -1006,6 +1096,32 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script_path, permissions).unwrap();
         script_path
+    }
+
+    fn passphrase_ciphertext(plaintext: &[u8], passphrase: &str, armored: bool) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut recipient =
+            age::scrypt::Recipient::new(age::secrecy::SecretString::from(passphrase.to_owned()));
+        // Unit fixtures use the real format/crypto with a cheap KDF. The CLI
+        // interoperability lane separately encrypts with official age defaults.
+        recipient.set_work_factor(10);
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .unwrap();
+        let mut ciphertext = Vec::new();
+        let mut writer = encryptor.wrap_output(&mut ciphertext).unwrap();
+        writer.write_all(plaintext).unwrap();
+        writer.finish().unwrap();
+        if armored {
+            let mut writer =
+                age::armor::ArmoredWriter::wrap_output(Vec::new(), age::armor::Format::AsciiArmor)
+                    .unwrap();
+            writer.write_all(&ciphertext).unwrap();
+            writer.finish().unwrap()
+        } else {
+            ciphertext
+        }
     }
 
     fn extract_zip_archive(zip_path: &Path, output_dir: &Path) {
@@ -1796,13 +1912,8 @@ mod tests {
 
     #[test]
     fn age_encrypt_decrypt_roundtrip() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -1816,6 +1927,151 @@ mod tests {
         let original = std::fs::read(&input).unwrap();
         let decrypted = std::fs::read(&output).unwrap();
         assert_eq!(original, decrypted);
+    }
+
+    #[test]
+    fn age_availability_reports_missing_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = with_age_command_override(&dir.path().join("missing-age"), || {
+            check_age_available().unwrap_err()
+        });
+        assert!(matches!(
+            error,
+            ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_availability_does_not_treat_failed_version_as_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = write_fake_age_script(
+            dir.path(),
+            "#!/bin/sh\nprintf 'private diagnostic must be suppressed' >&2\nexit 19\n",
+        );
+        let error = with_age_command_override(&command, || check_age_available().unwrap_err());
+        assert!(matches!(
+            error,
+            ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::Other
+        ));
+        assert!(error.to_string().contains("--version failed"));
+        assert!(!error.to_string().contains("private diagnostic"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_availability_preserves_launch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = dir.path().join("non-executable-age");
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        let error = with_age_command_override(&command, || check_age_available().unwrap_err());
+        assert!(matches!(
+            error,
+            ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn age_passphrase_roundtrip_binary_and_armored_without_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cli = dir.path().join("no-age-executable");
+        let passphrase = "  fixture passphrase with trailing whitespace\t ";
+        let multiple_chunks: Vec<u8> = (0..150_000).map(|i| (i % 251) as u8).collect();
+
+        for (case, plaintext) in [
+            ("empty", &[][..]),
+            ("multiple-chunks", &multiple_chunks[..]),
+        ] {
+            let original = dir.path().join(format!("original-{case}.bin"));
+            std::fs::write(&original, plaintext).unwrap();
+            for armored in [false, true] {
+                let ciphertext = passphrase_ciphertext(plaintext, passphrase, armored);
+                let encrypted = dir.path().join(format!("{case}-{armored}.age"));
+                let output = dir.path().join(format!("{case}-{armored}.decrypted"));
+                std::fs::write(&encrypted, &ciphertext).unwrap();
+
+                with_age_command_override(&missing_cli, || {
+                    decrypt_with_age(&encrypted, &output, None, Some(passphrase)).unwrap();
+                });
+
+                assert_eq!(std::fs::read(&output).unwrap(), plaintext);
+                assert_eq!(std::fs::read(&original).unwrap(), plaintext);
+                assert_eq!(std::fs::read(&encrypted).unwrap(), ciphertext);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                        0o600,
+                        "published plaintext must remain private"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn age_passphrase_wrong_secret_and_late_damage_publish_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase = "correct fixture passphrase";
+        let plaintext = vec![0xA5; 150_000];
+        let ciphertext = passphrase_ciphertext(&plaintext, passphrase, false);
+        let original = dir.path().join("original.bin");
+        let encrypted = dir.path().join("original.age");
+        std::fs::write(&original, &plaintext).unwrap();
+        std::fs::write(&encrypted, &ciphertext).unwrap();
+
+        let mut corrupted = ciphertext.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        let truncated = ciphertext[..ciphertext.len() - 1].to_vec();
+        for (case, bytes, secret) in [
+            (
+                "wrong-secret",
+                ciphertext.clone(),
+                "wrong fixture passphrase",
+            ),
+            ("late-corruption", corrupted, passphrase),
+            ("late-truncation", truncated, passphrase),
+        ] {
+            let input = dir.path().join(format!("{case}.age"));
+            let output = dir.path().join(format!("{case}.decrypted"));
+            std::fs::write(&input, &bytes).unwrap();
+            let error = decrypt_with_age(&input, &output, None, Some(secret)).unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("check passphrase and file integrity"));
+            assert!(!diagnostic.contains(secret));
+            assert!(!diagnostic.contains(passphrase));
+            assert!(!output.exists());
+            assert_eq!(std::fs::read(&input).unwrap(), bytes);
+            assert_eq!(std::fs::read(&original).unwrap(), plaintext);
+            assert_eq!(std::fs::read(&encrypted).unwrap(), ciphertext);
+            assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".age-decrypt.")
+            }));
+        }
+    }
+
+    #[test]
+    fn age_passphrase_refuses_existing_output_without_modifying_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase = "fixture passphrase";
+        let ciphertext = passphrase_ciphertext(b"original plaintext", passphrase, false);
+        let encrypted = dir.path().join("original.age");
+        let output = dir.path().join("existing.bin");
+        std::fs::write(&encrypted, &ciphertext).unwrap();
+        std::fs::write(&output, b"keep existing output").unwrap();
+
+        let error = decrypt_with_age(&encrypted, &output, None, Some(passphrase)).unwrap_err();
+        assert!(matches!(
+            error,
+            ShareError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep existing output");
+        assert_eq!(std::fs::read(&encrypted).unwrap(), ciphertext);
     }
 
     // =====================================================================
@@ -2094,13 +2350,8 @@ mod tests {
 
     #[test]
     fn age_encrypts_same_plaintext_differently_each_time() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((_identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2200,13 +2451,8 @@ mod tests {
 
     #[test]
     fn age_roundtrip_empty_file() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2223,13 +2469,8 @@ mod tests {
 
     #[test]
     fn age_roundtrip_large_payload() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2259,13 +2500,8 @@ mod tests {
 
     #[test]
     fn age_roundtrip_binary_data() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2284,13 +2520,8 @@ mod tests {
 
     #[test]
     fn age_roundtrip_zip_bundle() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2315,13 +2546,8 @@ mod tests {
 
     #[test]
     fn age_roundtrip_full_bundle_zip_preserves_manifest_and_verification() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2365,13 +2591,8 @@ mod tests {
 
     #[test]
     fn age_roundtrip_privacy_proof_bundle_preserves_redacted_replay_artifacts() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2477,13 +2698,8 @@ mod tests {
 
     #[test]
     fn age_roundtrip_incremental_bundle_zip_preserves_manifest_and_verification() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2529,24 +2745,18 @@ mod tests {
 
     #[test]
     fn age_decrypt_with_wrong_identity_fails() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
 
         // Generate two separate identities
         let id_dir_a = dir.path().join("id_a");
         std::fs::create_dir_all(&id_dir_a).unwrap();
         let Some((_identity_a, recipient_a)) = try_generate_age_identity(&id_dir_a) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
         let id_dir_b = dir.path().join("id_b");
         std::fs::create_dir_all(&id_dir_b).unwrap();
         let Some((identity_b, _recipient_b)) = try_generate_age_identity(&id_dir_b) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2568,13 +2778,8 @@ mod tests {
 
     #[test]
     fn age_corrupted_ciphertext_fails_decrypt() {
-        if check_age_available().is_err() {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-            eprintln!("Skipping: age-keygen not available");
             return;
         };
 
@@ -2716,7 +2921,8 @@ mod tests {
             decrypt_with_age(&encrypted, &output, Some(&identity), None)
                 .expect_err("fake age failure should surface")
         });
-        assert!(format!("{err}").contains("simulated decryption failure"));
+        assert!(format!("{err}").contains("check identity and file integrity"));
+        assert!(!format!("{err}").contains("simulated decryption failure"));
         assert!(
             !output.exists(),
             "failed decryption should not strand a partial output at the final path"
