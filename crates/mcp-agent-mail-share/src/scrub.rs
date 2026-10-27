@@ -730,6 +730,9 @@ fn clear_private_runtime_state(
         "message_delivery_signal_receipts",
         "project_mailbox_receipts",
         "project_mailbox_deliveries",
+        // Deleting delivery events can create loss markers. Clear these last:
+        // they expose recipient activity even after the events are gone.
+        "inbox_delivery_cursor_state",
     ] {
         if table == "project_mailbox_deliveries" && !drop_recipient_metadata {
             continue;
@@ -1648,6 +1651,19 @@ mod tests {
         conn.execute_raw("CREATE TABLE idempotency_keys (project_id INTEGER NOT NULL, tool TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, PRIMARY KEY (project_id, tool, idempotency_key))").unwrap();
         conn.execute_raw("CREATE TABLE proof_gate_consumed_nonces (issuer_key TEXT NOT NULL, nonce TEXT NOT NULL, retain_until INTEGER NOT NULL, consumed_at INTEGER NOT NULL, PRIMARY KEY (issuer_key, nonce))").unwrap();
         conn.execute_raw("CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, message_id INTEGER, kind TEXT, delivered_ts INTEGER)").unwrap();
+        conn.execute_raw(
+            "CREATE TABLE inbox_delivery_cursor_state (
+                project_id INTEGER NOT NULL, scope TEXT NOT NULL, scope_id INTEGER NOT NULL,
+                tail_seq INTEGER NOT NULL, pruned_through_seq INTEGER NOT NULL,
+                PRIMARY KEY(project_id, scope, scope_id));
+             INSERT INTO inbox_delivery_cursor_state VALUES (1,'agent',1,7,3), (1,'project',1,9,0);
+             CREATE TRIGGER record_scrubbed_event_cursor AFTER DELETE ON inbox_delivery_events
+             BEGIN
+                 INSERT OR REPLACE INTO inbox_delivery_cursor_state
+                 VALUES(OLD.project_id,'agent',OLD.agent_id,OLD.seq,OLD.seq);
+             END",
+        )
+        .unwrap();
         conn.execute_raw("ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT")
             .unwrap();
         conn.execute_sync(
@@ -1667,6 +1683,65 @@ mod tests {
         .unwrap();
         conn.execute_raw("INSERT INTO inbox_delivery_events VALUES (1, 1, 1, 1, 'bcc', 1)")
             .unwrap();
+    }
+
+    #[test]
+    fn cursor_cleanup_refusal_rolls_back_the_entire_sharing_scrub() {
+        for preset in [ScrubPreset::Standard, ScrubPreset::Strict] {
+            for ignored_delete in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                seed_private_runtime_state(&db);
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                if ignored_delete {
+                    conn.execute_raw(
+                        "CREATE TRIGGER preserve_cursor BEFORE DELETE ON inbox_delivery_cursor_state
+                         BEGIN SELECT RAISE(IGNORE); END",
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute_raw(
+                        "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state;
+                         CREATE VIEW inbox_delivery_cursor_state AS SELECT * FROM retained_cursor_state",
+                    )
+                    .unwrap();
+                    // Keep event deletion functional so the refusal comes from
+                    // inspecting the cursor authority, not a fixture trigger.
+                    conn.execute_raw("DROP TRIGGER record_scrubbed_event_cursor")
+                        .unwrap();
+                }
+                drop(conn);
+                let error = scrub_snapshot(&db, preset).unwrap_err();
+                assert!(matches!(error, ShareError::Validation { .. }));
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                assert_eq!(
+                    count_scalar(
+                        &conn,
+                        "SELECT COUNT(*) AS cnt FROM inbox_delivery_cursor_state"
+                    )
+                    .unwrap(),
+                    2
+                );
+                assert_eq!(
+                    count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM inbox_delivery_events")
+                        .unwrap(),
+                    1
+                );
+                let rows = conn
+                    .query_sync(
+                        "SELECT tail_seq, pruned_through_seq FROM inbox_delivery_cursor_state
+                         WHERE project_id=1 AND scope='agent' AND scope_id=1",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("tail_seq").unwrap(), 7);
+                assert_eq!(rows[0].get_named::<i64>("pruned_through_seq").unwrap(), 3);
+                assert_eq!(
+                    message_text(&conn, "archive_metadata_json"),
+                    PRIVATE_ATTACHMENT
+                );
+            }
+        }
     }
 
     #[test]
@@ -2082,6 +2157,7 @@ mod tests {
                 ("idempotency_keys", 2),
                 ("proof_gate_consumed_nonces", 1),
                 ("inbox_delivery_events", 1),
+                ("inbox_delivery_cursor_state", 2),
             ] {
                 assert_eq!(
                     count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(),

@@ -11,6 +11,7 @@ use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 use sqlmodel_core::Value;
 
 pub(crate) mod inbox;
+pub(crate) use inbox::with_snapshot as with_read_snapshot;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
@@ -424,7 +425,7 @@ fn fetch_inbox_rows_from_conn_impl(
     options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
-    inbox::with_snapshot(conn, || {
+    with_read_snapshot(conn, || {
         let direct = inbox::fetch_direct(conn, project_id, agent_id, since_ts, limit, options)?;
         let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
             conn, project_id, agent_id, since_ts, limit, options,
@@ -591,7 +592,7 @@ pub fn inbox_delivery_events_from_conn(
     // our advertised tail, remove retained events, or mix membership eras.
     // The inner result preserves typed cursor errors; the outer result
     // admits/cleans up only our nested read scope, including on error.
-    inbox::with_snapshot(conn, || {
+    with_read_snapshot(conn, || {
         Ok(inbox_delivery_events_in_snapshot(
             conn, project_id, agent_id, after, limit,
         ))
@@ -627,58 +628,70 @@ fn inbox_delivery_events_in_snapshot(
 
     let range_rows = conn
         .query_sync(
-            // GH#282: the project's shared-mailbox cursor events (no agent)
-            // share this recipient's cursor space.
-            "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor, \
-                    (SELECT MIN(seq) FROM inbox_delivery_events) AS global_oldest \
+            // The retained range is useful page metadata, but cannot prove
+            // loss: gaps in global seq usually belong to other recipients.
+            "SELECT MIN(seq) AS oldest_cursor \
              FROM inbox_delivery_events WHERE project_id = ? \
                AND (agent_id = ? OR (agent_id IS NULL AND kind = 'project'))",
             &[Value::BigInt(project_id), Value::BigInt(agent_id)],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
-    let (oldest_available_cursor, tail_cursor, global_oldest_cursor) = range_rows
+    let oldest_available_cursor = range_rows
         .first()
-        .map(
-            |row| -> Result<(Option<i64>, i64, Option<i64>), InboxDeliveryEventError> {
-                let oldest = row
-                    .get_named::<Option<i64>>("oldest_cursor")
-                    .map_err(|error| {
-                        InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
-                    })?;
-                let tail = row
-                    .get_named::<Option<i64>>("tail_cursor")
-                    .map_err(|error| {
-                        InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
-                    })?
-                    .unwrap_or(0);
-                let global_oldest =
-                    row.get_named::<Option<i64>>("global_oldest")
-                        .map_err(|error| {
-                            InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
-                        })?;
-                Ok((oldest, tail, global_oldest))
-            },
-        )
+        .map(|row| {
+            row.get_named::<Option<i64>>("oldest_cursor")
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })
+        })
         .transpose()?
-        .unwrap_or((None, 0, None));
+        .flatten();
+    let state_rows = conn
+        .query_sync(
+            "SELECT COALESCE(MAX(tail_seq), 0) AS tail_cursor, \
+                    COALESCE(MAX(CASE WHEN scope = 'agent' THEN pruned_through_seq ELSE 0 END), 0) AS pruned_through_cursor \
+             FROM inbox_delivery_cursor_state WHERE project_id = ? \
+               AND ((scope = 'agent' AND scope_id = ?) OR (scope = 'project' AND scope_id = ?))",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+            ],
+        )
+        .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
+    let (tail_cursor, pruned_through_cursor) = state_rows
+        .first()
+        .map(|row| -> Result<(i64, i64), InboxDeliveryEventError> {
+            let tail = row.get_named::<i64>("tail_cursor").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?;
+            let pruned = row
+                .get_named::<i64>("pruned_through_cursor")
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })?;
+            Ok((tail, pruned))
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            InboxDeliveryEventError::Database(DbError::Sqlite(
+                "inbox delivery cursor state aggregate returned no row".to_string(),
+            ))
+        })?;
 
     if let Some(after) = after {
-        // `seq` is a GLOBAL AUTOINCREMENT shared by every recipient, so a gap
-        // between `after` and this recipient's oldest event normally consists
-        // of other recipients' deliveries — NOT lost history. A monitor that
-        // called `--position-now` on an empty inbox (cursor 0) must still
-        // receive its first delivery even when that lands at a high global
-        // seq (GH#238). A cursor is only genuinely expired when retention has
-        // actually removed rows, which is observable while global seq 1 is
-        // gone from the ledger.
-        let retention_has_pruned = global_oldest_cursor.is_some_and(|global| global > 1);
-        if let Some(oldest) = oldest_available_cursor
-            && retention_has_pruned
-            && after < oldest.saturating_sub(1)
-        {
+        // AFTER is the last processed event, so losing that event is harmless.
+        // Only a later lost event expires it. The watermark also catches holes
+        // inside retained history, even while another recipient keeps seq 1.
+        // Shared losses are recorded only for viewers eligible at deletion;
+        // an unrelated project delivery cannot expire a newcomer's cursor.
+        if after < pruned_through_cursor {
             return Err(InboxDeliveryEventError::CursorExpired {
                 after,
-                oldest_available: oldest,
+                // The error advertises a safe resume floor. The page's oldest
+                // retained event can precede a hole and cause an expiry loop.
+                // At the i64 ceiling, position_now is the recovery operation.
+                oldest_available: pruned_through_cursor.saturating_add(1),
             });
         }
         if after > tail_cursor {
@@ -1734,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_event_snapshot_legacy_absence_requires_no_shared_ledger_evidence() {
+    fn delivery_event_snapshot_refuses_missing_shared_schema_after_pruning() {
         event_snapshot_fixture(|reader, _, project, viewer| {
             reader
                 .execute_raw(
@@ -1748,17 +1761,20 @@ mod tests {
                     .to_string()
                     .contains("incomplete project mailbox schema")
             );
-            // A genuine pre-upgrade database contains only direct ledger events.
+            // Removing the last shared event does not make an upgraded
+            // database legacy: the durable cursor state preserves that proof.
             reader
                 .execute_raw(
                     "DELETE FROM inbox_delivery_events WHERE kind='project'; PRAGMA query_only=ON",
                 )
                 .unwrap();
-            let legacy =
-                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
-            assert_eq!(legacy.events.len(), 1);
-            assert_eq!(legacy.events[0].kind, "to");
-            assert_eq!(legacy.tail_cursor, legacy.next_cursor);
+            let error = inbox_delivery_events_from_conn(reader, project, viewer, None, 10)
+                .expect_err("pruning cannot authorize a partial direct-only cursor page");
+            assert!(
+                error
+                    .to_string()
+                    .contains("durable inbox delivery cursor state")
+            );
             reader
                 .execute_raw("PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK")
                 .unwrap();
@@ -2065,6 +2081,136 @@ mod tests {
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].message_id, handoff_id);
         assert!(page.oldest_available_cursor.expect("own oldest") > 1);
+
+        // Retaining no unrelated events must not turn that same valid
+        // bootstrap cursor into a false expiry for this recipient.
+        conn.execute_sync(
+            "DELETE FROM inbox_delivery_events WHERE agent_id = ?",
+            &[Value::BigInt(other_id)],
+        )
+        .expect("prune only another recipient's history");
+        assert_eq!(
+            inbox_delivery_events_from_conn(&conn, project_id, late_id, Some(0), 5)
+                .expect("unrelated retention cannot expire a valid recipient cursor"),
+            page
+        );
+    }
+
+    #[test]
+    fn delivery_cursor_records_own_holes_and_preserves_a_fully_pruned_tail() {
+        let conn = test_conn();
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let other = insert_agent(&conn, project, "Other");
+        let viewer = insert_agent(&conn, project, "Viewer");
+        for recipient in [other, viewer, viewer] {
+            let message = insert_message(&conn, project, sender, "retention");
+            conn.execute_sync(
+                "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                &[Value::BigInt(message), Value::BigInt(recipient)],
+            )
+            .unwrap();
+        }
+        let before = inbox_delivery_events_from_conn(&conn, project, viewer, None, 10).unwrap();
+        assert_eq!(before.events.len(), 2);
+        let lost = before.events[0].seq;
+        conn.execute_sync(
+            "DELETE FROM inbox_delivery_events WHERE seq = ?",
+            &[Value::BigInt(lost)],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_sync("SELECT MIN(seq) FROM inbox_delivery_events", &[])
+                .unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1,
+            "another recipient still retains the global first event"
+        );
+        let error = inbox_delivery_events_from_conn(&conn, project, viewer, Some(0), 10)
+            .expect_err("a recipient loss is observable despite retained global seq 1");
+        assert!(matches!(
+            error,
+            InboxDeliveryEventError::CursorExpired { oldest_available, .. }
+                if oldest_available == lost + 1
+        ));
+        let resumed = inbox_delivery_events_from_conn(&conn, project, viewer, Some(lost), 10)
+            .expect("the advertised recovery boundary can be used exactly once");
+        assert_eq!(resumed.events, before.events[1..]);
+
+        conn.execute_sync(
+            "DELETE FROM inbox_delivery_events WHERE agent_id = ?",
+            &[Value::BigInt(viewer)],
+        )
+        .unwrap();
+        let empty =
+            inbox_delivery_events_from_conn(&conn, project, viewer, Some(before.tail_cursor), 10)
+                .expect("processing an event before retention keeps its cursor valid");
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.oldest_available_cursor, None);
+        assert_eq!(empty.tail_cursor, before.tail_cursor);
+        assert_eq!(empty.next_cursor, before.tail_cursor);
+        assert!(!empty.has_more);
+    }
+
+    #[test]
+    fn shared_cursor_loss_uses_viewer_visibility_and_rolls_back_with_message_deletion() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            let before =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            let shared = before
+                .events
+                .iter()
+                .find(|event| event.kind == "project")
+                .unwrap();
+            let sender = reader
+                .query_sync(
+                    "SELECT sender_id FROM messages WHERE id = ?",
+                    &[Value::BigInt(shared.message_id)],
+                )
+                .unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap();
+            let late = insert_agent(reader, project, "Latecomer");
+            let blocked = insert_agent(reader, project, "Blocked");
+            reader
+                .execute_sync(
+                    "UPDATE agents SET inception_ts = 2000000 WHERE id = ?",
+                    &[Value::BigInt(late)],
+                )
+                .unwrap();
+            reader
+                .execute_sync(
+                    "UPDATE agents SET contact_policy = 'block_all' WHERE id = ?",
+                    &[Value::BigInt(blocked)],
+                )
+                .unwrap();
+
+            reader.execute_raw("BEGIN IMMEDIATE").unwrap();
+            reader
+                .execute_sync(
+                    "DELETE FROM messages WHERE id = ?",
+                    &[Value::BigInt(shared.message_id)],
+                )
+                .unwrap();
+            assert!(matches!(
+                inbox_delivery_events_from_conn(reader, project, viewer, Some(0), 10),
+                Err(InboxDeliveryEventError::CursorExpired { oldest_available, .. })
+                    if oldest_available == shared.seq + 1
+            ));
+            for excluded in [sender, late, blocked] {
+                let page = inbox_delivery_events_from_conn(reader, project, excluded, Some(0), 10)
+                    .expect("an invisible shared delivery cannot expire this viewer's cursor");
+                assert!(page.events.is_empty());
+                assert_eq!(page.tail_cursor, before.tail_cursor);
+            }
+            reader.execute_raw("ROLLBACK").unwrap();
+            assert_eq!(
+                inbox_delivery_events_from_conn(reader, project, viewer, Some(0), 10)
+                    .expect("rollback must restore event rows and their loss watermark"),
+                before
+            );
+        });
     }
 
     #[test]

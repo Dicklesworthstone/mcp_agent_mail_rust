@@ -755,11 +755,25 @@ am inbox-events --project /abs/path --agent BlueLake --after 42 --limit 100 --fo
 ```
 
 Each page includes `events`, `next_cursor`, `has_more`,
-`oldest_available_cursor`, and `tail_cursor`. A cursor below retained history
-fails with code `cursor_expired` (the `fetch_inbox_events` tool reports
-`CURSOR_EXPIRED`); a cursor beyond the tail fails with `cursor_ahead`
-(`CURSOR_AHEAD`). Restart from the error's `oldest_available_cursor` or
-`tail_cursor`.
+`oldest_available_cursor`, and `tail_cursor`. Retention records durable loss
+markers for the affected recipient. Deleting another recipient's mail does
+not expire your cursor, and deleting the newest or every retained event does
+not move your durable tail backwards.
+
+If retention removed a delivery after your saved position, the read fails
+with code `cursor_expired` (the `fetch_inbox_events` tool reports
+`CURSOR_EXPIRED`). This also detects holes inside retained history, even when
+older events remain. The error's `oldest_available_cursor` identifies the first
+position after the lost history; after handling the loss according to your
+recovery policy, resume with `--after` set to that value minus one. The page's
+`oldest_available_cursor` still describes its oldest retained event. To
+intentionally start monitoring only future mail, use `--position-now`.
+
+A cursor beyond the durable tail fails with `cursor_ahead` (`CURSOR_AHEAD`);
+check that the cursor belongs to this mailbox and recipient before choosing a
+new position. The migration preserves the database's existing issued-cursor
+ceiling, including when all events were already deleted. It cannot reconstruct
+which recipients lost events before durable retention markers were introduced.
 
 ---
 

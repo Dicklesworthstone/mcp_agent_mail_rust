@@ -120,8 +120,8 @@ fn missing_table_name(message: &str) -> Option<&str> {
 
 /// Only a genuinely pre-upgrade shared schema may use the empty-mailbox
 /// fallback. Run this catalog check on a missing-table error, not on healthy
-/// reads. Surviving project delivery events prove this is an upgraded mailbox
-/// even when both shared tables are gone. An incomplete schema, failed
+/// reads. Surviving project delivery events or durable cursor state prove this
+/// is an upgraded mailbox even when both shared tables are gone. An incomplete schema, failed
 /// inspection or broken view stays an error; callers must not mistake it for
 /// a successfully observed empty inbox.
 pub(crate) fn allow_absent_shared_schema(
@@ -138,17 +138,22 @@ pub(crate) fn allow_absent_shared_schema(
     let objects = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE name COLLATE NOCASE \
-             IN ('project_mailbox_deliveries', 'project_mailbox_receipts', 'inbox_delivery_events')",
+             IN ('project_mailbox_deliveries', 'project_mailbox_receipts', 'inbox_delivery_events', 'inbox_delivery_cursor_state')",
             &[],
         )
         .map_err(|failure| DbError::Sqlite(failure.to_string()))?;
     let mut has_events = false;
+    let mut has_cursor_state = false;
     for row in objects {
         let name = row
             .get_named::<String>("name")
             .map_err(|failure| DbError::Sqlite(failure.to_string()))?;
         if name.eq_ignore_ascii_case("inbox_delivery_events") {
             has_events = true;
+            continue;
+        }
+        if name.eq_ignore_ascii_case("inbox_delivery_cursor_state") {
+            has_cursor_state = true;
             continue;
         }
         // Do not echo a missing-table signature that an outer legacy reader
@@ -172,6 +177,15 @@ pub(crate) fn allow_absent_shared_schema(
         // The explicit kind also recognizes historical agent_id=0 events.
         return Err(DbError::Sqlite(
             "incomplete project mailbox schema; retained project delivery events require delivery and receipt tables to be repaired"
+                .to_string(),
+        ));
+    }
+    if has_cursor_state {
+        // Retention may remove every shared event. The durable cursor-state
+        // catalog entry still proves that shared authority was installed;
+        // even an empty or malformed object cannot justify legacy fallback.
+        return Err(DbError::Sqlite(
+            "incomplete project mailbox schema; durable inbox delivery cursor state requires delivery and receipt tables to be repaired"
                 .to_string(),
         ));
     }
@@ -1577,6 +1591,7 @@ mod tests {
              VALUES (1, 20, 100, 'to', 100);
              ALTER TABLE project_mailbox_receipts RENAME TO retained_empty_receipts;
              ALTER TABLE project_mailbox_deliveries RENAME TO retained_empty_deliveries;
+             ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state;
              PRAGMA query_only = ON;",
         )
         .unwrap();
@@ -1594,6 +1609,32 @@ mod tests {
             project_mailbox_delivery_from_conn(&*conn, 100).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn durable_cursor_schema_refuses_legacy_fallback_after_all_events_are_pruned() {
+        for object in [
+            "CREATE TABLE inbox_delivery_cursor_state (tail_seq INTEGER)",
+            "CREATE VIEW inbox_delivery_cursor_state AS SELECT 0 AS tail_seq",
+        ] {
+            let conn = crate::guard_db_conn(
+                DbConn::open_memory().unwrap(),
+                "durable cursor schema authority regression",
+            );
+            let missing = "no such table: project_mailbox_deliveries";
+            allow_absent_shared_schema(&*conn, missing)
+                .expect("a genuinely pre-upgrade catalog can use the legacy fallback");
+            conn.execute_raw(object).unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            let error = allow_absent_shared_schema(&*conn, missing)
+                .expect_err("cursor authority survives even completely pruned event history");
+            assert!(
+                error
+                    .to_string()
+                    .contains("durable inbox delivery cursor state")
+            );
+            assert!(!is_missing_project_mailbox_table_error(&error.to_string()));
+        }
     }
 
     #[test]

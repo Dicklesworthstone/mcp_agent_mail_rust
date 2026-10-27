@@ -2675,6 +2675,103 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // Event sequences are global, while retained history is recipient-scoped.
+    // Keep issued tails and observed losses independently of retained events.
+    // These durable observations deliberately have no live-row foreign keys:
+    // removing identity metadata must not erase a monitor's cursor history.
+    migrations.push(Migration::new(
+        "v34_create_inbox_delivery_cursor_state".to_string(),
+        "retain recipient delivery tails and loss watermarks across retention".to_string(),
+        "CREATE TABLE IF NOT EXISTS inbox_delivery_cursor_state (\
+            project_id INTEGER NOT NULL,\
+            scope TEXT NOT NULL CHECK (scope IN ('agent', 'project')),\
+            scope_id INTEGER NOT NULL,\
+            tail_seq INTEGER NOT NULL CHECK (tail_seq >= 0),\
+            pruned_through_seq INTEGER NOT NULL CHECK (pruned_through_seq >= 0 AND pruned_through_seq <= tail_seq),\
+            PRIMARY KEY (project_id, scope, scope_id),\
+            CHECK (scope = 'agent' OR (scope = 'project' AND scope_id = project_id))\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_backfill_inbox_delivery_cursor_state".to_string(),
+        "preserve issued pre-upgrade cursors without inventing recipient history loss".to_string(),
+        // Before v34, retention did not record who lost an event. The global
+        // AUTOINCREMENT ceiling still bounds every issued cursor, even after
+        // complete pruning. Seed existing scopes at that known ceiling, with
+        // no invented loss. Fresh scopes continue tracking their exact tails.
+        "INSERT OR IGNORE INTO inbox_delivery_cursor_state \
+            (project_id, scope, scope_id, tail_seq, pruned_through_seq) \
+         SELECT a.project_id, 'agent', a.id, \
+                COALESCE((SELECT MAX(seq) FROM sqlite_sequence WHERE name = 'inbox_delivery_events'), 0), 0 \
+         FROM agents a \
+         UNION ALL \
+         SELECT p.id, 'project', p.id, \
+                COALESCE((SELECT MAX(seq) FROM sqlite_sequence WHERE name = 'inbox_delivery_events'), 0), 0 \
+         FROM projects p"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_trg_inbox_delivery_cursor_insert".to_string(),
+        "advance the durable delivery tail in the event insertion transaction".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_inbox_delivery_cursor_insert \
+         AFTER INSERT ON inbox_delivery_events BEGIN \
+             INSERT INTO inbox_delivery_cursor_state \
+                 (project_id, scope, scope_id, tail_seq, pruned_through_seq) \
+             VALUES (NEW.project_id, CASE WHEN NEW.agent_id IS NULL THEN 'project' ELSE 'agent' END, \
+                     COALESCE(NEW.agent_id, NEW.project_id), NEW.seq, 0) \
+             ON CONFLICT (project_id, scope, scope_id) DO UPDATE SET \
+                 tail_seq = MAX(inbox_delivery_cursor_state.tail_seq, excluded.tail_seq); \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_trg_inbox_delivery_cursor_delete".to_string(),
+        "record lost deliveries only for their direct or visible shared recipients".to_string(),
+        concat!(
+            "CREATE TRIGGER IF NOT EXISTS trg_inbox_delivery_cursor_delete ",
+            "AFTER DELETE ON inbox_delivery_events BEGIN ",
+                "INSERT INTO inbox_delivery_cursor_state ",
+                    "(project_id, scope, scope_id, tail_seq, pruned_through_seq) ",
+                "VALUES (OLD.project_id, CASE WHEN OLD.agent_id IS NULL THEN 'project' ELSE 'agent' END, ",
+                        "COALESCE(OLD.agent_id, OLD.project_id), OLD.seq, ",
+                        "CASE WHEN OLD.agent_id IS NULL THEN 0 ELSE OLD.seq END) ",
+                "ON CONFLICT (project_id, scope, scope_id) DO UPDATE SET ",
+                    "tail_seq = MAX(inbox_delivery_cursor_state.tail_seq, excluded.tail_seq), ",
+                    "pruned_through_seq = MAX(inbox_delivery_cursor_state.pruned_through_seq, excluded.pruned_through_seq); ",
+                // Only deletion records per-viewer loss; shared deliveries
+                // still have one event, with no send/registration fanout.
+                // Membership is evaluated before message authority is removed.
+                "INSERT INTO inbox_delivery_cursor_state ",
+                    "(project_id, scope, scope_id, tail_seq, pruned_through_seq) ",
+                "SELECT OLD.project_id, 'agent', viewer.id, OLD.seq, OLD.seq ",
+                "FROM agents AS viewer ",
+                "JOIN messages AS m ON m.id = OLD.message_id ",
+                "JOIN project_mailbox_deliveries AS d ON d.message_id = m.id ",
+                "WHERE OLD.agent_id IS NULL AND OLD.kind = 'project' AND ",
+                crate::project_mailbox::visible_to_viewer_sql!(),
+                " ON CONFLICT (project_id, scope, scope_id) DO UPDATE SET ",
+                    "tail_seq = MAX(inbox_delivery_cursor_state.tail_seq, excluded.tail_seq), ",
+                    "pruned_through_seq = MAX(inbox_delivery_cursor_state.pruned_through_seq, excluded.pruned_through_seq); ",
+            "END"
+        )
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_trg_messages_cascade_inbox_delivery_events".to_string(),
+        "record cursor loss before deleting message visibility authority".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_messages_cascade_inbox_delivery_events \
+         BEFORE DELETE ON messages BEGIN \
+             DELETE FROM inbox_delivery_events WHERE message_id = OLD.id; \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
     // however, their columns do not exist until the explicit evolution
@@ -3346,6 +3443,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "messages",
         "message_recipients",
         "inbox_delivery_events",
+        "inbox_delivery_cursor_state",
         "message_delivery_signal_receipts",
         "file_reservations",
         "file_reservation_releases",
@@ -3366,6 +3464,9 @@ pub async fn validate_startup_schema_gate<C: Connection>(
     const REQUIRED_TRIGGERS: &[&str] = &[
         "trg_messages_default_recipients_json",
         "trg_inbox_delivery_events_recipient_insert",
+        "trg_inbox_delivery_cursor_insert",
+        "trg_inbox_delivery_cursor_delete",
+        "trg_messages_cascade_inbox_delivery_events",
     ];
     const FORBIDDEN_FTS_TABLES: &[&str] = &["fts_messages", "fts_agents", "fts_projects"];
     const FORBIDDEN_FTS_TRIGGERS: &[&str] = &[
@@ -3428,6 +3529,16 @@ pub async fn validate_startup_schema_gate<C: Connection>(
                 "message_id",
                 "kind",
                 "delivered_ts",
+            ],
+        ),
+        (
+            "inbox_delivery_cursor_state",
+            &[
+                "project_id",
+                "scope",
+                "scope_id",
+                "tail_seq",
+                "pruned_through_seq",
             ],
         ),
         (
@@ -5000,6 +5111,7 @@ mod tests {
             .position(|migration| migration.id == PROJECT_EVENT_SCOPE_MIGRATION)
             .expect("v33 migration");
         let migration = migrations.remove(position);
+        migrations.retain(|migration| !migration.id.starts_with("v34_"));
         run_specific_migrations(cx, conn, migrations)
             .await
             .into_result()
@@ -5052,6 +5164,25 @@ mod tests {
                 .expect("idempotent restart migration"),
             Vec::<String>::new()
         );
+        let cursor_migrations: Vec<_> = schema_migrations_base()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v34_"))
+            .collect();
+        run_specific_migrations(cx, conn, cursor_migrations.clone())
+            .await
+            .into_result()
+            .expect("upgrade durable cursor state after the historical event rebuild");
+        assert_eq!(
+            run_specific_migrations(cx, conn, cursor_migrations)
+                .await
+                .into_result()
+                .expect("cursor state migration is idempotent"),
+            Vec::<String>::new()
+        );
+        let upgraded_tail = crate::sync::inbox_delivery_events_from_conn(conn, 1, 2, Some(700), 10)
+            .expect("an issued cursor remains valid even when its old event was pruned");
+        assert_eq!(upgraded_tail.tail_cursor, 700);
+        assert!(upgraded_tail.events.is_empty());
         let rows = conn
             .query_sync(
                 "SELECT seq, agent_id FROM inbox_delivery_events ORDER BY seq",
@@ -5184,19 +5315,17 @@ mod tests {
             drop(conn);
             let reopened =
                 DbConn::open_file(path.display().to_string()).expect("reopen runtime database");
-            let after_cursor = if prune_all {
-                let expired =
-                    crate::sync::inbox_delivery_events_from_conn(&reopened, 1, 2, Some(700), 10)
-                        .expect_err("cursor before pruned cascade deletion is expired");
-                match expired {
-                    crate::sync::InboxDeliveryEventError::CursorExpired {
-                        after: 700,
-                        oldest_available,
-                    } => oldest_available.saturating_sub(1),
-                    other => panic!("expected CursorExpired, got {other:?}"),
-                }
-            } else {
-                700
+            // The shared event for message 4 was deleted after v34, so
+            // cursor 700 missed it even if older direct events still survive.
+            let expired =
+                crate::sync::inbox_delivery_events_from_conn(&reopened, 1, 2, Some(700), 10)
+                    .expect_err("cursor before pruned cascade deletion is expired");
+            let after_cursor = match expired {
+                crate::sync::InboxDeliveryEventError::CursorExpired {
+                    after: 700,
+                    oldest_available,
+                } => oldest_available.saturating_sub(1),
+                other => panic!("expected CursorExpired, got {other:?}"),
             };
             let page = crate::sync::inbox_delivery_events_from_conn(
                 &reopened,

@@ -68,6 +68,14 @@ const PHASES: &[(&str, &str, bool)] = &[
     ("file_reservations", "project_id IN ($ids)", false),
     ("messages", "project_id IN ($ids)", false),
     (
+        // Event/message deletion records retention loss. Clear excluded cursor
+        // authorities after those triggers have run, while agent ownership is
+        // still available for cross-project recipient scopes.
+        "inbox_delivery_cursor_state",
+        "project_id IN ($ids) OR (scope = 'agent' AND scope_id IN (SELECT id FROM agents WHERE project_id IN ($ids)))",
+        true,
+    ),
+    (
         "agent_deregistrations",
         "agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
         true,
@@ -359,6 +367,124 @@ mod tests {
         let result = apply_project_scope(&path, &["keep".to_string()]).unwrap();
         assert_eq!(result.removed_count, 2);
         assert_kept_scope(&path, false);
+    }
+
+    fn add_cursor_state(path: &Path) {
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE inbox_delivery_cursor_state (
+                project_id INTEGER NOT NULL, scope TEXT NOT NULL, scope_id INTEGER NOT NULL,
+                tail_seq INTEGER NOT NULL, pruned_through_seq INTEGER NOT NULL,
+                PRIMARY KEY(project_id, scope, scope_id));
+             INSERT INTO inbox_delivery_cursor_state VALUES
+                (1,'agent',11,100,17), (1,'project',1,120,0),
+                (1,'agent',22,105,19), (2,'agent',11,110,20),
+                (2,'project',2,130,0), (3,'agent',33,140,21);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cursor_scope_preserves_selected_history_and_unscoped_archives() {
+        for scoped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fixture(dir.path());
+            add_cursor_state(&path);
+            let identifiers = if scoped {
+                vec!["keep".to_string()]
+            } else {
+                Vec::new()
+            };
+            apply_project_scope(&path, &identifiers).unwrap();
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_cursor_state"),
+                if scoped { 2 } else { 6 }
+            );
+            assert_eq!(
+                scalar(
+                    &conn,
+                    "SELECT tail_seq FROM inbox_delivery_cursor_state
+                     WHERE project_id=1 AND scope='agent' AND scope_id=11"
+                ),
+                100
+            );
+            assert_eq!(
+                scalar(
+                    &conn,
+                    "SELECT pruned_through_seq FROM inbox_delivery_cursor_state
+                     WHERE project_id=1 AND scope='agent' AND scope_id=11"
+                ),
+                17
+            );
+            if scoped {
+                assert_kept_scope(&path, false);
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_scope_clears_state_created_by_message_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path());
+        add_cursor_state(&path);
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TRIGGER record_deleted_message_cursor AFTER DELETE ON messages
+             BEGIN
+                 INSERT OR REPLACE INTO inbox_delivery_cursor_state
+                 VALUES(OLD.project_id,'agent',OLD.sender_id,900,900);
+             END",
+        )
+        .unwrap();
+        drop(conn);
+        apply_project_scope(&path, &["keep".to_string()]).unwrap();
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_cursor_state"),
+            2
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM inbox_delivery_cursor_state WHERE project_id <> 1"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn cursor_scope_refuses_unverifiable_cleanup_and_rolls_back() {
+        for ignored_delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fixture(dir.path());
+            add_cursor_state(&path);
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            if ignored_delete {
+                conn.execute_raw(
+                    "CREATE TRIGGER preserve_cursor BEFORE DELETE ON inbox_delivery_cursor_state
+                     BEGIN SELECT RAISE(IGNORE); END",
+                )
+                .unwrap();
+            } else {
+                conn.execute_raw(
+                    "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state;
+                     CREATE VIEW inbox_delivery_cursor_state AS SELECT * FROM retained_cursor_state",
+                )
+                .unwrap();
+            }
+            drop(conn);
+            let error = apply_project_scope(&path, &["keep".to_string()]).unwrap_err();
+            assert!(matches!(error, ShareError::Validation { .. }));
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_cursor_state"),
+                6
+            );
+            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 3);
+            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 3);
+            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_links"), 2);
+        }
     }
 
     fn add_signal_receipts(path: &Path) {
