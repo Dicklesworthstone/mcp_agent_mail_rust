@@ -1,0 +1,219 @@
+{
+  "experiment": "sh27: short direct reservation holds. A request-path reservation write stages and fsyncs its artifacts outside the archive publication fence, peeks the project lock without the fence while it is busy, and admits to the fence (same 5 s budget) only to publish. A cold project's first write keeps the bounded window around the directories it creates.",
+  "rule": "scratchpad sh27_rule.txt, written before any code (2026-10-26 ~17:40Z); revised twice before any SH run (GH#351 cold-project regression caught by its own test; fence churn while the project is busy). FROZEN 2026-10-27T01:43:48Z: MAIN 94467e6249f598b07320d13b7240d7e0513bd7194669cb4155611376b5d62429; SH e4ab5eb516e18f8224da01e89d54dc34fd27839086bab8d74d32b6e067bc0482",
+  "arms": {
+    "MAIN": "release build of origin/main 98c7a0e4 (crates identical to f9032a16), --no-default-features --features portable",
+    "SH": "release build of f9032a16 + this change (production code identical to the landing diff)"
+  },
+  "harness": "paced_swarm.py single arm (br-9ott5's probe shape): 60 agents, 3 projects, period 2 s, 300 s; three windows, both arms per window, order alternating (W1 MAIN,SH; W2 SH,MAIN; W3 MAIN,SH), each run under one host lock",
+  "windows": [
+    {
+      "window": 1,
+      "arm": "MAIN",
+      "start": "2026-10-27T01:43:48Z",
+      "end": "2026-10-27T01:52:37Z",
+      "load_start": "9.07 11.97 12.91",
+      "load_end": "18.48 18.76 16.12",
+      "min_free_kb": 126646992,
+      "valid": true,
+      "file_reservation_paths": {
+        "n": 2633,
+        "errors": 190,
+        "p50_s": 3.542,
+        "p99_s": 11.073
+      },
+      "release_file_reservations": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 3.625,
+        "p99_s": 12.211
+      },
+      "send_message": {
+        "n": 9000,
+        "ok": 9000,
+        "p50_s": 0.252,
+        "p99_s": 6.122
+      },
+      "other_tool_errors": 2,
+      "completion_s": 489.0
+    },
+    {
+      "window": 1,
+      "arm": "SH",
+      "start": "2026-10-27T01:52:49Z",
+      "end": "2026-10-27T02:00:07Z",
+      "load_start": "17.96 18.64 16.11",
+      "load_end": "19.05 19.43 17.45",
+      "min_free_kb": 124193440,
+      "valid": true,
+      "file_reservation_paths": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 0.228,
+        "p99_s": 1.349
+      },
+      "release_file_reservations": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 0.33,
+        "p99_s": 1.641
+      },
+      "send_message": {
+        "n": 9000,
+        "ok": 9000,
+        "p50_s": 2.404,
+        "p99_s": 5.279
+      },
+      "other_tool_errors": 2,
+      "completion_s": 428.7
+    },
+    {
+      "window": 2,
+      "arm": "MAIN",
+      "start": "2026-10-27T02:08:04Z",
+      "end": "2026-10-27T02:17:46Z",
+      "load_start": "24.82 26.35 21.35",
+      "load_end": "23.34 30.13 26.34",
+      "min_free_kb": 85698928,
+      "valid": true,
+      "file_reservation_paths": {
+        "n": 2633,
+        "errors": 249,
+        "p50_s": 3.24,
+        "p99_s": 15.761
+      },
+      "release_file_reservations": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 3.038,
+        "p99_s": 16.25
+      },
+      "send_message": {
+        "n": 9000,
+        "ok": 9000,
+        "p50_s": 0.514,
+        "p99_s": 5.026
+      },
+      "other_tool_errors": 3,
+      "completion_s": 542.5
+    },
+    {
+      "window": 2,
+      "arm": "SH",
+      "start": "2026-10-27T02:00:19Z",
+      "end": "2026-10-27T02:07:58Z",
+      "load_start": "17.81 19.15 17.38",
+      "load_end": "26.03 26.61 21.41",
+      "min_free_kb": 122464668,
+      "valid": true,
+      "file_reservation_paths": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 0.245,
+        "p99_s": 1.465
+      },
+      "release_file_reservations": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 0.349,
+        "p99_s": 1.883
+      },
+      "send_message": {
+        "n": 9000,
+        "ok": 9000,
+        "p50_s": 2.424,
+        "p99_s": 5.603
+      },
+      "other_tool_errors": 1,
+      "completion_s": 449.6
+    },
+    {
+      "window": 3,
+      "arm": "MAIN",
+      "start": "2026-10-27T02:17:50Z",
+      "end": "2026-10-27T02:26:28Z",
+      "load_start": "23.34 30.13 26.34",
+      "load_end": "15.99 24.06 25.29",
+      "min_free_kb": 83548384,
+      "valid": true,
+      "file_reservation_paths": {
+        "n": 2633,
+        "errors": 171,
+        "p50_s": 3.21,
+        "p99_s": 11.506
+      },
+      "release_file_reservations": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 3.425,
+        "p99_s": 11.827
+      },
+      "send_message": {
+        "n": 9000,
+        "ok": 9000,
+        "p50_s": 0.216,
+        "p99_s": 5.526
+      },
+      "other_tool_errors": 0,
+      "completion_s": 477.1
+    },
+    {
+      "window": 3,
+      "arm": "SH",
+      "start": "2026-10-27T02:26:36Z",
+      "end": "2026-10-27T02:32:50Z",
+      "load_start": "15.35 23.79 25.20",
+      "load_end": "18.19 20.63 23.26",
+      "min_free_kb": 211866308,
+      "valid": true,
+      "file_reservation_paths": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 0.201,
+        "p99_s": 1.167
+      },
+      "release_file_reservations": {
+        "n": 2633,
+        "errors": 0,
+        "p50_s": 0.311,
+        "p99_s": 1.394
+      },
+      "send_message": {
+        "n": 9000,
+        "ok": 9000,
+        "p50_s": 2.015,
+        "p99_s": 4.72
+      },
+      "other_tool_errors": 1,
+      "completion_s": 365.4
+    }
+  ],
+  "pooled_reservation_errors_per_1000": {
+    "MAIN": 77.22,
+    "SH": 0.0
+  },
+  "pooled_reservation_errors": {
+    "MAIN": "610 of 7899",
+    "SH": "0 of 7899"
+  },
+  "pooled_sends_ok": {
+    "MAIN": 27000,
+    "SH": 27000
+  },
+  "median_send_p99_s": {
+    "MAIN": 5.526,
+    "SH": 5.279
+  },
+  "median_completion_s": {
+    "MAIN": 489.0,
+    "SH": 428.7
+  },
+  "criteria": {
+    "decidability: MAIN refusals >= 10 per 1,000": "77.22",
+    "primary: SH <= 0.5x MAIN and <= 10 per 1,000": "PASS (0.00 vs 77.22)",
+    "sends ok SH >= 0.99x MAIN": "PASS (27000 vs 27000)",
+    "median completion SH <= 1.10x MAIN": "PASS (428.7 vs 489.0 s)",
+    "median send p99 SH <= 1.15x MAIN": "PASS (5.28 vs 5.53 s)"
+  },
+  "verdict": "WIN under the frozen rule. A refusal fix measured against our own main (maintenance), not a vs-incumbent result; br-9ott5 closes only on its own closing probe on the landed main."
+}

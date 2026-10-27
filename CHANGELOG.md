@@ -181,6 +181,9 @@ workspace test suite is not green on `main` (see Known issues).
       and the below-saturation refusal rate did not get worse.
     - On 98c7a0e4, with give-way, br-9ott5's own probe (one 60-agent arm, 2 s period) refused 5.4% and
       7.2% (p2probe2), and three more such runs 4.1–7.0% (df26's control arm).
+    - With short direct holds (below), three such windows refused none of 7,899 grants, against 610
+      for the same base without them (sh27). br-9ott5's own closing probe on the landed build is
+      still to run.
   - **Not yet re-measured:** the heavily loaded host on the newer base.
   - **Tracked in** br-9ott5 and br-kp1in.47.
 - **Swarm load.** Archive convergence after load and write-behind progress are still open
@@ -204,6 +207,16 @@ workspace test suite is not green on `main` (see Known issues).
   - **Give-way.** While such a write waits, the background writers that block on the fence (the
     write-behind drain, the commit coalescer, archive repair) pause for up to 5 ms before taking it.
     Back-to-back short holds can otherwise keep the fence busy almost all the time.
+  - **Short holds.** The write stages and fsyncs its artifacts before it waits for the fence, and holds
+    the fence only for the project locks, validation and renames. While the project's archive lock is
+    busy it waits without the fence. A project's first write, which creates directories, still keeps
+    the fence for the whole write.
+    - At br-9ott5's probe load (one 60-agent arm, 2 s period, three alternating windows) grants were
+      refused 0 times in 7,899, against 610 without this change. Reservation p50 fell from about
+      3.2 s to 0.2 s and p99 from 11–16 s to 1.2–1.5 s. Median completion was 0.88x and median send
+      p99 0.95x (sh27).
+    - A reservation refused for contention no longer counts toward the archive circuit breaker.
+    - `archive_direct_write_latency_us` for reservations now includes the wait for the fence.
   - **The error.** A fence that stays busy, a failed write or critical disk pressure ends the call
     with `RESERVATION_ARCHIVE_UNAVAILABLE`. It carries:
     - `db_committed: true` and `guard_coverage_confirmed: false`;
@@ -234,8 +247,8 @@ workspace test suite is not green on `main` (see Known issues).
       `send_message` timeouts.
     - Receipts: `docs/evidence/release_smoke/2026-10-22_fl23-l2-on-fg_ab.json`,
       `2026-10-23_fb25-fence-admission-levers_ab.json`, `2026-10-24_b5c28-fence-budget-confirmation_ab.json`
-      `2026-10-25_kp48-main-b5-vs-v0339_ab.json` and `2026-10-25_gw29-give-way-on-b5_ab.json`. See Known
-      issues.
+      `2026-10-25_kp48-main-b5-vs-v0339_ab.json`, `2026-10-25_gw29-give-way-on-b5_ab.json` and
+      `2026-10-27_sh27-short-direct-holds_ab.json`. See Known issues.
 - **A late reservation write cannot undo a newer one.** Before renaming a generation-stamped artifact
   into place, the writer reads the published one under the fence and the project's archive lock. It
   refuses the whole batch, changing no file, if the batch would:

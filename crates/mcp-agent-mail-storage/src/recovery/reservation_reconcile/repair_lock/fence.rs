@@ -223,11 +223,16 @@ mod tests {
             storage_root: root.path().to_path_buf(),
             ..Default::default()
         };
+        // A warm project takes the short-hold path; a cold one's first write
+        // keeps the bounded window around the directories it creates (sh27).
+        // Warm it before the fence is held: creating a directory takes it.
+        let warm = crate::ensure_archive(&config, "fence-repair").unwrap();
+        crate::ensure_dir(&warm.root.join("file_reservations")).unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        // The owner must outlast the writer's whole admission budget, so the
-        // refusal comes from the budget, never from the owner timing out.
-        let owner_patience = crate::DIRECT_FENCE_ADMISSION_BUDGET + Duration::from_secs(15);
+        // The owner must outlast both writers' admission budgets, so each
+        // refusal comes from a budget, never from the owner timing out.
+        let owner_patience = crate::DIRECT_FENCE_ADMISSION_BUDGET * 2 + Duration::from_secs(15);
         let owner = std::thread::spawn(move || {
             crate::with_archive_snapshot_publication_fence(|| {
                 ready_tx.send(()).unwrap();
@@ -236,14 +241,23 @@ mod tests {
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let op = crate::WriteOp::FileReservation {
-            project_slug: "fence-repair".to_string(),
-            config,
-            reservations: Vec::new(),
-        };
-        let started = Instant::now();
-        let outcome = crate::write_op_sync_direct(&op);
-        let elapsed = started.elapsed();
+        let outcomes = ["fence-repair", "fence-cold"].map(|slug| {
+            // A reservation with something to publish: an empty batch needs
+            // no fence at all.
+            let op = crate::WriteOp::FileReservation {
+                project_slug: slug.to_string(),
+                config: config.clone(),
+                reservations: vec![serde_json::json!({
+                    "id": 3,
+                    "agent": "GreenCastle",
+                    "path_pattern": "src/**",
+                    "exclusive": true,
+                })],
+            };
+            let started = Instant::now();
+            let outcome = crate::write_op_sync_direct(&op);
+            (slug, outcome, started.elapsed())
+        });
         let still_held = crate::archive_publication_fence_holder().is_some();
 
         let _ = release_tx.send(());
@@ -252,20 +266,89 @@ mod tests {
             explicitly_released.is_ok(),
             "direct writer waited for the owner's cleanup timeout"
         );
-        assert!(
-            matches!(
-                outcome,
-                crate::DirectArchiveWrite::Failed(crate::StorageError::LockContention {
-                    ref message
-                }) if message.contains("publication fence busy")
-            ),
-            "busy direct writer must fail with publication-fence contention"
-        );
-        assert!(
-            elapsed < crate::DIRECT_FENCE_ADMISSION_BUDGET + Duration::from_secs(2),
-            "busy direct writer blocked past its admission budget: {elapsed:?}"
-        );
+        for (slug, outcome, elapsed) in outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    crate::DirectArchiveWrite::Failed(crate::StorageError::LockContention {
+                        ref message
+                    }) if message.contains("publication fence busy")
+                ),
+                "{slug}: busy direct writer must fail with publication-fence contention"
+            );
+            assert!(
+                elapsed < crate::DIRECT_FENCE_ADMISSION_BUDGET + Duration::from_secs(2),
+                "{slug}: busy direct writer blocked past its admission budget: {elapsed:?}"
+            );
+        }
         assert!(still_held, "writer returned only after the owner released");
+    }
+
+    /// sh27: a direct reservation writer that finds the project's archive lock
+    /// busy gives the fence back while it waits, instead of sleeping on it,
+    /// and publishes once the project frees within its budget.
+    #[test]
+    fn direct_reservation_writer_releases_the_fence_while_the_project_is_busy() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let config = mcp_agent_mail_core::Config {
+            storage_root: root.path().to_path_buf(),
+            ..Default::default()
+        };
+        let archive = crate::ensure_archive(&config, "fence-repair").unwrap();
+        // A warm project: a first write keeps the bounded window around the
+        // directories it creates.
+        crate::ensure_dir(&archive.root.join("file_reservations")).unwrap();
+        let project = crate::archive_process_lock(&archive).unwrap();
+        let held = project.lock().unwrap();
+        let op = crate::WriteOp::FileReservation {
+            project_slug: "fence-repair".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 4,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            })],
+        };
+        let writer = std::thread::spawn(move || crate::write_op_sync_direct(&op));
+
+        std::thread::sleep(Duration::from_millis(50));
+        // While the writer waits for the project, asking for the fence gets it
+        // at once, and no mutation window opens: the epoch token, rewritten on
+        // both edges of every window, stays put.
+        let token_before = token(root.path());
+        let mut slowest = Duration::ZERO;
+        for _ in 0..20 {
+            let asked = Instant::now();
+            while crate::ARCHIVE_PUBLICATION_FENCE.try_lock().is_err() {
+                assert!(
+                    asked.elapsed() < Duration::from_secs(2),
+                    "the fence never came free"
+                );
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            slowest = slowest.max(asked.elapsed());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let token_after = token(root.path());
+        drop(held);
+        let result = writer.join().unwrap();
+
+        assert!(
+            slowest < Duration::from_millis(50),
+            "the writer waiting for the project must not hold the fence: slowest acquisition {slowest:?}"
+        );
+        assert_eq!(
+            token_after, token_before,
+            "the writer must wait for the project without opening a mutation window"
+        );
+        assert!(
+            matches!(result, crate::DirectArchiveWrite::Written),
+            "{result:?}"
+        );
     }
 
     #[test]

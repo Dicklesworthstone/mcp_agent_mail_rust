@@ -1647,15 +1647,15 @@ const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
 const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
 
 /// Admit a direct write to the publication fence. Contention is retried with a
-/// doubling pause until [`DIRECT_FENCE_ADMISSION_BUDGET`] runs out; every
-/// attempt checks `cancelled` first, and any other error returns at once.
-/// While it retries, the writer is registered so blocking acquirers give way
-/// to it ([`give_way_to_direct_writers`]).
+/// doubling pause until `deadline` (normally [`DIRECT_FENCE_ADMISSION_BUDGET`]
+/// after the write began); every attempt checks `cancelled` first, and any
+/// other error returns at once. While it retries, the writer is registered so
+/// blocking acquirers give way to it ([`give_way_to_direct_writers`]).
 fn admit_direct_publication(
     path: &Path,
+    deadline: Instant,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<ArchiveMutationGuard> {
-    let deadline = Instant::now() + DIRECT_FENCE_ADMISSION_BUDGET;
     let mut pause = Duration::from_micros(200);
     let mut waiting = None;
     loop {
@@ -1688,9 +1688,51 @@ fn admit_direct_publication(
 /// can never be coupled to another agent's archive-drain latency.
 fn write_op_sync_direct_with_cancel(
     op: &WriteOp,
-    cancelled: impl FnMut() -> bool,
+    mut cancelled: impl FnMut() -> bool,
 ) -> DirectArchiveWrite {
+    if let WriteOp::FileReservation {
+        project_slug,
+        config,
+        reservations,
+    } = op
+        && reservation_archive_prepared(config, project_slug)
+    {
+        if direct_write_skipped_for_disk_pressure() {
+            return DirectArchiveWrite::SkippedDiskCritical;
+        }
+        // A reservation stages and syncs its artifacts outside the fence and
+        // holds it only to publish (sh27). Holding it across the fsyncs and
+        // the project-lock retries made direct writes about a fifth of all
+        // fence time at swarm load (kp50). A project's first write creates
+        // directories under the blocking fence, so it keeps the bounded
+        // window of the path below.
+        let started = Instant::now();
+        let mut admission = ReservationAdmission::Direct {
+            deadline: started + DIRECT_FENCE_ADMISSION_BUDGET,
+            cancelled: &mut cancelled,
+        };
+        let result = ensure_archive(config, project_slug).and_then(|archive| {
+            write_file_reservation_records_admitted(&archive, config, reservations, &mut admission)
+        });
+        return finish_direct_write(op, started, result);
+    }
     write_archive_sync_direct_with_cancel(op, cancelled, || wbq_execute_op(op, "archive-direct"))
+}
+
+/// Count and report a direct write skipped for critical disk pressure.
+fn direct_write_skipped_for_disk_pressure() -> bool {
+    let metrics = mcp_agent_mail_core::global_metrics();
+    let disk_pressure = metrics.system.disk_pressure_level.load();
+    if disk_pressure < mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return false;
+    }
+    // Host-level pressure, not an archive failure: count the skip but do not
+    // feed the per-archive circuit breaker.
+    metrics
+        .storage
+        .archive_direct_skips_disk_critical_total
+        .add(1);
+    true
 }
 
 /// Share direct-write admission and accounting with narrow metadata updates.
@@ -1699,15 +1741,7 @@ fn write_archive_sync_direct_with_cancel(
     mut cancelled: impl FnMut() -> bool,
     write: impl FnOnce() -> Result<()>,
 ) -> DirectArchiveWrite {
-    let metrics = mcp_agent_mail_core::global_metrics();
-    let disk_pressure = metrics.system.disk_pressure_level.load();
-    if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
-        // Host-level pressure, not an archive failure: count the skip but do
-        // not feed the per-archive circuit breaker.
-        metrics
-            .storage
-            .archive_direct_skips_disk_critical_total
-            .add(1);
+    if direct_write_skipped_for_disk_pressure() {
         return DirectArchiveWrite::SkippedDiskCritical;
     }
 
@@ -1718,22 +1752,38 @@ fn write_archive_sync_direct_with_cancel(
     // contention before any mutation bookkeeping changes. wbq_execute_op's
     // guards are then nested on this thread and therefore reuse this
     // already-held publication window.
-    let _publication = match admit_direct_publication(write_op_storage_root(op), &mut cancelled) {
-        Ok(guard) => guard,
-        Err(error) => return DirectArchiveWrite::Failed(error),
-    };
+    let deadline = Instant::now() + DIRECT_FENCE_ADMISSION_BUDGET;
+    let _publication =
+        match admit_direct_publication(write_op_storage_root(op), deadline, &mut cancelled) {
+            Ok(guard) => guard,
+            Err(error) => return DirectArchiveWrite::Failed(error),
+        };
 
     let started = Instant::now();
-    let result = write();
+    finish_direct_write(op, started, write())
+}
+
+/// Record a direct write's metrics and archive outcome.
+fn finish_direct_write(op: &WriteOp, started: Instant, result: Result<()>) -> DirectArchiveWrite {
+    let metrics = mcp_agent_mail_core::global_metrics();
     metrics.storage.archive_direct_writes_total.add(1);
     metrics
         .storage
         .archive_direct_write_latency_us
         .record(duration_as_micros_u64(started.elapsed()));
-    if !matches!(
-        &result,
-        Err(StorageError::ReservationPublicationConflict { .. })
-    ) {
+    // A reservation refused for contention changed nothing and, like a refused
+    // admission of any other op, is not an archive failure.
+    let contended_reservation = matches!(op, WriteOp::FileReservation { .. })
+        && matches!(
+            &result,
+            Err(StorageError::LockContention { .. } | StorageError::LockTimeout(_))
+        );
+    if !contended_reservation
+        && !matches!(
+            &result,
+            Err(StorageError::ReservationPublicationConflict { .. })
+        )
+    {
         note_archive_write_outcome(op, result.is_err());
     }
     match result {
@@ -8417,6 +8467,26 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Create a directory (and parents) only if we haven't already created it.
+/// Whether a reservation write for `slug` would create nothing before its
+/// publication: the archive root, its repository, the project root and the
+/// reservation directory are all cached, so preparing the write takes no
+/// fence. Otherwise preparation takes the blocking fence, which a request path
+/// may only do inside a bounded window (GH#351).
+fn reservation_archive_prepared(config: &Config, slug: &str) -> bool {
+    let root = archive_storage_root(config);
+    let project_root = root.join("projects").join(slug);
+    let reservation_dir = project_root.join("file_reservations");
+    let dirs_cached = {
+        let cache = DIR_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        [&root, &project_root, &reservation_dir]
+            .iter()
+            .all(|dir| cache.contains(dir.as_path()))
+    };
+    dirs_cached && repo_cache_contains(&root)
+}
+
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     {
         let cache = DIR_CACHE
@@ -9208,35 +9278,94 @@ fn validate_reservation_publications(checks: &[(PathBuf, i64, serde_json::Value)
     Ok(())
 }
 
+/// How a reservation publication takes the archive publication fence.
+enum ReservationAdmission<'a> {
+    /// Background writers wait for the fence as long as it takes.
+    Blocking,
+    /// A request-path writer (GH#351) waits for the fence only until
+    /// `deadline`, checking `cancelled` while it waits.
+    Direct {
+        deadline: Instant,
+        cancelled: &'a mut dyn FnMut() -> bool,
+    },
+}
+
+/// Pause before a direct reservation writer that found the project's archive
+/// lock busy checks it again. It holds no fence meanwhile.
+const DIRECT_RESERVATION_LOCK_BUSY_PAUSE: Duration = Duration::from_millis(2);
+
+/// Rename staged reservation artifacts into place under the fence and the
+/// project's archive locks. Staging and its fsyncs happen before, outside the
+/// fence, so the fence is held only for the locks, validation and renames.
 fn publish_reservation_writes(
     archive: &ProjectArchive,
     staged: StagedArchiveWrites,
     checks: &[(PathBuf, i64, serde_json::Value)],
+    admission: &mut ReservationAdmission<'_>,
 ) -> Result<()> {
     let root = archive_project_root_checked(archive)?;
-    let _mutation = ArchiveMutationGuard::begin_at(&root);
-    // The fence serializes threads in this process; the ordinary project
-    // lock also excludes a terminal reconciler or writer in another process.
-    // Never add a 60-second project-lock wait to the direct request path.
     let process_lock = archive_process_lock(archive)?;
-    let _process = match process_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            return Err(StorageError::LockContention {
-                message: "reservation publication project lock busy".to_string(),
-            });
+    loop {
+        // A direct writer waits out a busy project without the fence. This
+        // only peeks: the lock is released at once and taken again below, in
+        // the fence-then-project order. Admitting just to find the project
+        // busy held the fence and rewrote the epoch token on every retry.
+        if let ReservationAdmission::Direct { deadline, .. } = admission {
+            // A statement of its own: a successful peek's guard drops here.
+            let project_busy = matches!(
+                process_lock.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            if project_busy {
+                if Instant::now() >= *deadline {
+                    return Err(StorageError::LockContention {
+                        message: "reservation publication project lock busy".to_string(),
+                    });
+                }
+                std::thread::sleep(DIRECT_RESERVATION_LOCK_BUSY_PAUSE);
+                continue;
+            }
         }
-    };
-    let mut lock = FileLock::new(root.join(".archive.lock"))
-        .with_timeout(Duration::ZERO)
-        .with_max_retries(0)
-        .without_message_tree_mutation();
-    lock.acquire()?;
-    validate_reservation_publications(checks)?;
-    let result = staged.publish();
-    lock.release()?;
-    result
+        let mutation = match admission {
+            ReservationAdmission::Blocking => ArchiveMutationGuard::begin_at(&root),
+            ReservationAdmission::Direct {
+                deadline,
+                cancelled,
+            } => admit_direct_publication(&root, *deadline, cancelled)?,
+        };
+        // The fence serializes threads in this process; the ordinary project
+        // lock also excludes a terminal reconciler or writer in another process.
+        // Never add a 60-second project-lock wait to the direct request path.
+        let process = match process_lock.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => Err(StorageError::LockContention {
+                message: "reservation publication project lock busy".to_string(),
+            }),
+        };
+        let mut lock = FileLock::new(root.join(".archive.lock"))
+            .with_timeout(Duration::ZERO)
+            .with_max_retries(0)
+            .without_message_tree_mutation();
+        match process.and_then(|process| lock.acquire().map(|()| process)) {
+            Ok(_process) => {
+                validate_reservation_publications(checks)?;
+                let result = staged.publish();
+                lock.release()?;
+                return result;
+            }
+            // A direct writer gives the fence back while the project is busy,
+            // then queues again within its budget, rather than sleeping on it.
+            Err(StorageError::LockContention { .. } | StorageError::LockTimeout(_))
+                if matches!(admission, ReservationAdmission::Direct { deadline, .. }
+                    if Instant::now() < *deadline) =>
+            {
+                drop(mutation);
+                std::thread::sleep(DIRECT_RESERVATION_LOCK_BUSY_PAUSE);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Write file reservation records to the archive and commit.
@@ -9255,6 +9384,20 @@ pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
     reservations: &[serde_json::Value],
+) -> Result<()> {
+    write_file_reservation_records_admitted(
+        archive,
+        config,
+        reservations,
+        &mut ReservationAdmission::Blocking,
+    )
+}
+
+fn write_file_reservation_records_admitted(
+    archive: &ProjectArchive,
+    config: &Config,
+    reservations: &[serde_json::Value],
+    admission: &mut ReservationAdmission<'_>,
 ) -> Result<()> {
     if reservations.is_empty() {
         return Ok(());
@@ -9358,7 +9501,7 @@ pub fn write_file_reservation_records(
         entries.push((agent_name, path_pattern));
     }
     let staged = StagedArchiveWrites::stage(files)?;
-    publish_reservation_writes(archive, staged, &publication_checks)?;
+    publish_reservation_writes(archive, staged, &publication_checks, admission)?;
 
     let commit_msg = build_file_reservation_commit_message(&entries);
     enqueue_async_commit(repo_root, config, &commit_msg, &rel_paths);
@@ -17542,6 +17685,55 @@ mod tests {
             staged_temp_files(&reservation_dir).is_empty(),
             "publication leaves no temp file"
         );
+    }
+
+    /// sh27: a request-path reservation write also stages and syncs outside
+    /// the fence and admits to it only to publish, so a held fence costs it the
+    /// hold plus its renames, and its fsyncs never extend another's wait.
+    #[test]
+    fn direct_reservation_writes_stage_outside_the_fence() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let op = WriteOp::FileReservation {
+            project_slug: "proj".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 8,
+                "agent": "GreenCastle",
+                "path_pattern": "docs/**",
+                "exclusive": true,
+            })],
+        };
+        let (release, holder) = hold_publication_fence();
+        let writer = std::thread::spawn(move || write_op_sync_direct(&op));
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut staged = staged_temp_files(&reservation_dir);
+        while staged.len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            staged = staged_temp_files(&reservation_dir);
+        }
+        let published_while_held = reservation_dir.join("id-8.json").exists();
+        release.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        let result = writer.join().expect("writer thread");
+
+        assert_eq!(
+            staged.len(),
+            2,
+            "both artifacts must sync before the direct write takes the fence: {staged:?}"
+        );
+        assert!(
+            !published_while_held,
+            "publication must wait for the held fence"
+        );
+        assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+        assert!(reservation_dir.join("id-8.json").exists());
+        assert!(staged_temp_files(&reservation_dir).is_empty());
     }
 
     /// br-9bwnb: a staged temp file is no archive state. The overload
