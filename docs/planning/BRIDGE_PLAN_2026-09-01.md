@@ -220,6 +220,48 @@ gates. Suite guidance at `/data/projects/AGENTS.md` was absent in this environme
 Keep `.50` open until the named gates and real fixture tests pass on the exact candidate.
 No live mailbox or existing sidecar was modified during this implementation session.
 
+##### Atomic message-feedback follow-up (`br-kp1in.50`)
+
+Source review of `a03883ffff666cb4ff43c5c681c8f671c9e0139a` found a remaining
+lifecycle race: an acknowledgement could fetch an Executed/Open row, lose to a read or
+overdue resolution, then receive a successful no-op from the generic resolver. The
+server's separate resolved-row branch never ran, so its documented acknowledgement
+precedence could be lost. This is a source-confirmed interleaving, not an executed
+current-binary reproduction.
+
+The follow-up in the commit containing this note adds `resolve_atc_message_outcome`.
+Both storage implementations select, validate and decide precedence in the same write
+transaction. Acknowledgements upgrade read/overdue outcomes; duplicate acknowledgements
+preserve the first accepted timestamp/evidence; late reads and overdue observations
+cannot downgrade them. Unrelated resolved outcomes retain their existing semantics.
+The generic resolution APIs remain first-resolution-wins. The shared bounded validator
+also checks the complete replacement candidate before replay/no-op decisions.
+
+The server feedback and overdue sweep consume the committed effect receipt. Only an
+initial resolution updates the resolved/open counters; upgrades and no-ops do not count
+another lifecycle completion. Incoming feedback content is checked before shadow,
+lookup-retry, missing-row or terminal diagnostics, and failure logs retain static
+categories instead of supplied metadata or opaque errors. Tests force competing writes
+between the server fetch and mutation, exercise both database implementations directly,
+and reopen the private sidecar to compare stored outcomes, timestamps and rollups.
+
+There are six additional authored regressions: four paired file/memory database tests
+and two server tests. The server interleaving matrix uses separate mailbox directories
+for all eight cases because ATC uses a fixed sidecar basename within each directory.
+The diagnostic regression captures tracing fields for synthetic agent/project canaries
+against missing/resolved rows in live/shadow mode. These tests have not executed here.
+
+**Validation remains OPEN.** `git diff --check` passed, and the pinned nightly
+formatter parsed/formatted the three changed Rust files. Ten fresh strict
+`RCH_REQUIRE_REMOTE=1 rch exec -- ...`
+attempts stopped with exit 127 (`rch: command not found`): production and all-target
+compiler graphs, Clippy, workspace formatting, core validator tests, DB lifecycle/rollup
+tests, server feedback tests, the prior server content-boundary test, opt-in HTTP test,
+and full workspace nextest. UBS also stopped with exit 127. No compilation or runtime
+test result is claimed. Suite guidance at `/data/projects/AGENTS.md` and the `br`
+executable are absent here. This follow-up does not close `.50` or change ATC defaults. Only
+disposable fixtures are used by the regressions; no live mailbox was accessed.
+
 **Would finishing all pre-existing open/in-progress beads close the gap? No.** It would
 leave `.48/.49/.50/.52/.53` and the current guidance errors uncovered; literal execution of stale
 release tasks would also keep targeting the wrong publication path. After these additions

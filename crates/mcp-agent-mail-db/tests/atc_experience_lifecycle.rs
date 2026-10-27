@@ -23,8 +23,9 @@ use mcp_agent_mail_core::experience::{
     MAX_ATC_CONTENT_STRING_BYTES, NonExecutionReason, ResolutionKind,
 };
 use mcp_agent_mail_db::queries::{
-    append_atc_experience, fetch_open_atc_experiences, overwrite_resolved_atc_experience_outcome,
-    record_atc_execution_outcome, resolve_atc_experience, resolve_atc_observed_outcome,
+    AtcMessageOutcomeUpdate, append_atc_experience, fetch_open_atc_experiences,
+    overwrite_resolved_atc_experience_outcome, record_atc_execution_outcome,
+    resolve_atc_experience, resolve_atc_message_outcome, resolve_atc_observed_outcome,
     resolve_experience, transition_atc_experience, update_atc_experience_rollup,
 };
 use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig, create_pool};
@@ -1689,4 +1690,406 @@ fn valid_metrics_lifecycle_and_idempotency_survive_sidecar_reopen() {
 #[test]
 fn valid_metrics_lifecycle_and_idempotency_work_in_memory() {
     check_valid_metrics_and_idempotency(PrivacyStorage::Memory);
+}
+
+fn make_message_experience(decision_id: u64) -> ExperienceRow {
+    let mut row = make_probe_experience(decision_id, decision_id + 1, "GreenCastle");
+    // Production send observations are already executed when appended.
+    row.state = ExperienceState::Executed;
+    row.subsystem = ExperienceSubsystem::Synthesis;
+    row.decision_class = "message_sent".to_string();
+    row.effect_kind = EffectKind::Advisory;
+    row.action = "MessageSent".to_string();
+    row.evidence_summary = "observed send_message success".to_string();
+    row.dispatched_ts_micros = Some(1_700_000_000_100_000);
+    row.executed_ts_micros = Some(1_700_000_000_200_000);
+    row.context = Some(serde_json::json!({
+        "message_id": decision_id,
+        "recipient_count": 1,
+        "ack_required": true,
+        "token_count": 12,
+        "status": "token_bucket"
+    }));
+    row
+}
+
+fn message_outcome(label: &str, observed_ts_micros: i64) -> ExperienceOutcome {
+    let mut outcome = privacy_outcome();
+    outcome.label = label.to_string();
+    outcome.observed_ts_micros = observed_ts_micros;
+    outcome.correct = label != "ack_overdue";
+    outcome.actual_loss = Some(if outcome.correct { 0.0 } else { 1.0 });
+    outcome
+}
+
+async fn assert_stored_message_outcome(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    expected: &ExperienceOutcome,
+) {
+    let rows = privacy_query_rows(
+        cx,
+        pool,
+        &format!(
+            "SELECT state, created_ts, dispatched_ts, executed_ts, resolved_ts, outcome_json \
+             FROM atc_experiences WHERE experience_id = {experience_id}"
+        ),
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.get_named::<String>("state").expect("state"), "resolved");
+    for (field, timestamp) in [
+        ("created_ts", 1_700_000_000_000_000_i64),
+        ("dispatched_ts", 1_700_000_000_100_000),
+        ("executed_ts", 1_700_000_000_200_000),
+        ("resolved_ts", expected.observed_ts_micros),
+    ] {
+        assert_eq!(row.get_named::<i64>(field).expect("timestamp"), timestamp);
+    }
+    let stored: ExperienceOutcome =
+        serde_json::from_str(&row.get_named::<String>("outcome_json").expect("outcome"))
+            .expect("stored outcome JSON");
+    assert!(
+        stored == *expected,
+        "stored outcome does not match the winning observation"
+    );
+}
+
+fn check_message_outcome_ack_dominance(storage: PrivacyStorage) {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_privacy_db(&rt, storage);
+    rt.block_on(async {
+        // Keep a nonempty rollup witness: resolving or upgrading a row must not
+        // independently count a second observation or alter accumulated losses.
+        seed_privacy_rollup(&cx, &pool).await;
+        let rollups_before = format!(
+            "{:?}",
+            privacy_query_rows(
+                &cx,
+                &pool,
+                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key"
+            )
+            .await
+        );
+        let mut decision_id = 7000;
+        for initial_state in [ExperienceState::Executed, ExperienceState::Open] {
+            for earlier_label in ["read", "ack_overdue"] {
+                for ack_first in [false, true] {
+                    decision_id += 2;
+                    let mut row = make_message_experience(decision_id);
+                    row.state = initial_state;
+                    let id = append_atc_experience(&cx, &pool, &row)
+                        .await
+                        .into_result()
+                        .expect("append message observation")
+                        .experience_id;
+                    let ack = message_outcome(
+                        "acknowledged",
+                        if ack_first {
+                            1_700_000_000_500_000
+                        } else {
+                            1_700_000_000_600_000
+                        },
+                    );
+                    let earlier = message_outcome(
+                        earlier_label,
+                        if ack_first {
+                            1_700_000_000_600_000
+                        } else {
+                            1_700_000_000_500_000
+                        },
+                    );
+                    let (first, second) = if ack_first {
+                        (&ack, &earlier)
+                    } else {
+                        (&earlier, &ack)
+                    };
+                    assert_eq!(
+                        resolve_atc_message_outcome(&cx, &pool, id, first)
+                            .await
+                            .into_result()
+                            .expect("resolve first observation"),
+                        AtcMessageOutcomeUpdate::Resolved
+                    );
+                    assert_stored_message_outcome(&cx, &pool, id, first).await;
+                    let before_second = privacy_snapshot(&cx, &pool).await;
+                    let update = resolve_atc_message_outcome(&cx, &pool, id, second)
+                        .await
+                        .into_result()
+                        .expect("apply competing observation from fresh durable state");
+                    if ack_first {
+                        assert_eq!(update, AtcMessageOutcomeUpdate::Unchanged);
+                        assert_privacy_snapshot_unchanged(&cx, &pool, &before_second).await;
+                    } else {
+                        let expected = if earlier_label == "read" {
+                            AtcMessageOutcomeUpdate::AcknowledgedAfterRead
+                        } else {
+                            AtcMessageOutcomeUpdate::AcknowledgedAfterOverdue
+                        };
+                        assert_eq!(update, expected);
+                    }
+                    assert_stored_message_outcome(&cx, &pool, id, &ack).await;
+
+                    // A different, valid retry cannot replace the first ACK's
+                    // timestamp or evidence, and later lower-priority events lose.
+                    let before_replay = privacy_snapshot(&cx, &pool).await;
+                    let mut replay = ack.clone();
+                    replay.observed_ts_micros += 10_000;
+                    replay.evidence = Some(serde_json::json!({"retry_count": 2}));
+                    for candidate in [&replay, &earlier] {
+                        assert_eq!(
+                            resolve_atc_message_outcome(&cx, &pool, id, candidate)
+                                .await
+                                .into_result()
+                                .expect("valid losing observation is a no-op"),
+                            AtcMessageOutcomeUpdate::Unchanged
+                        );
+                        assert_privacy_snapshot_unchanged(&cx, &pool, &before_replay).await;
+                    }
+                }
+            }
+        }
+
+        // Generic resolution deliberately retains first-resolution-wins, even
+        // when a caller supplies a later ACK. Message precedence is opt-in.
+        let mut generic = make_message_experience(7100);
+        generic.state = ExperienceState::Open;
+        let generic_id = append_atc_experience(&cx, &pool, &generic)
+            .await
+            .into_result()
+            .expect("append generic resolver fixture")
+            .experience_id;
+        let read = message_outcome("read", 1_700_000_000_500_000);
+        let ack = message_outcome("acknowledged", 1_700_000_000_600_000);
+        resolve_atc_experience(&cx, &pool, generic_id, &read)
+            .await
+            .into_result()
+            .expect("generic initial resolution");
+        let before_generic_replay = privacy_snapshot(&cx, &pool).await;
+        resolve_atc_experience(&cx, &pool, generic_id, &ack)
+            .await
+            .into_result()
+            .expect("generic replay");
+        assert_privacy_snapshot_unchanged(&cx, &pool, &before_generic_replay).await;
+        assert_stored_message_outcome(&cx, &pool, generic_id, &read).await;
+
+        let unrelated_id = append_atc_experience(&cx, &pool, &make_message_experience(7102))
+            .await
+            .into_result()
+            .expect("append unrelated outcome fixture")
+            .experience_id;
+        let unrelated = privacy_outcome();
+        resolve_atc_observed_outcome(&cx, &pool, unrelated_id, &unrelated)
+            .await
+            .into_result()
+            .expect("record unrelated terminal outcome");
+        let before_unrelated_ack = privacy_snapshot(&cx, &pool).await;
+        assert_eq!(
+            resolve_atc_message_outcome(&cx, &pool, unrelated_id, &ack)
+                .await
+                .into_result()
+                .expect("ACK must preserve unrelated terminal result"),
+            AtcMessageOutcomeUpdate::Unchanged
+        );
+        assert_privacy_snapshot_unchanged(&cx, &pool, &before_unrelated_ack).await;
+        assert_stored_message_outcome(&cx, &pool, unrelated_id, &unrelated).await;
+        let rollups_after = format!(
+            "{:?}",
+            privacy_query_rows(
+                &cx,
+                &pool,
+                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key"
+            )
+            .await
+        );
+        assert!(
+            rollups_before == rollups_after,
+            "message resolution changed rollups"
+        );
+    });
+}
+
+#[test]
+fn message_outcome_ack_dominance_after_sidecar_reopen() {
+    check_message_outcome_ack_dominance(PrivacyStorage::File);
+}
+
+#[test]
+fn message_outcome_ack_dominance_in_memory() {
+    check_message_outcome_ack_dominance(PrivacyStorage::Memory);
+}
+
+fn check_message_outcome_rejections(storage: PrivacyStorage) {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_privacy_db(&rt, storage);
+    rt.block_on(async {
+        seed_privacy_rollup(&cx, &pool).await;
+        let ack = message_outcome("acknowledged", 1_700_000_000_600_000);
+        let mut context = serde_json::Map::new();
+        for index in 0..12 {
+            context.insert(
+                format!("metric_{index}"),
+                serde_json::json!("x".repeat(3000)),
+            );
+        }
+        let large_context = serde_json::Value::Object(context);
+        let mut decision_id = 7200;
+        for prior_label in [
+            None,
+            Some("read"),
+            Some("ack_overdue"),
+            Some("acknowledged"),
+        ] {
+            decision_id += 2;
+            let mut row = make_message_experience(decision_id);
+            row.context = Some(large_context.clone());
+            assert!(
+                row.validate().is_empty(),
+                "large context fixture must be valid alone"
+            );
+            let id = append_atc_experience(&cx, &pool, &row)
+                .await
+                .into_result()
+                .expect("append bounded message context")
+                .experience_id;
+            if let Some(label) = prior_label {
+                resolve_atc_message_outcome(
+                    &cx,
+                    &pool,
+                    id,
+                    &message_outcome(label, 1_700_000_000_500_000),
+                )
+                .await
+                .into_result()
+                .expect("seed first observation");
+            }
+            let before = privacy_snapshot(&cx, &pool).await;
+            let mut canary = ack.clone();
+            canary.evidence =
+                Some(serde_json::json!({"observations": [{"nested": [PRIVACY_CANARY]}]}));
+            let mut key_canary = message_outcome("read", 1_700_000_000_700_000);
+            key_canary.evidence =
+                Some(serde_json::json!({"observations": [{(PRIVACY_CANARY): 0}]}));
+            let mut oversized_ack = ack.clone();
+            oversized_ack.evidence = Some(large_context.clone());
+            assert!(
+                oversized_ack.validate_content().is_ok(),
+                "outcome alone fits its budget"
+            );
+            let mut oversized_overdue = oversized_ack.clone();
+            oversized_overdue.label = "ack_overdue".to_string();
+            for candidate in [&canary, &key_canary, &oversized_ack, &oversized_overdue] {
+                // Even if this candidate would lose to the stored ACK, content
+                // validation must run before the precedence/no-op decision.
+                assert_content_rejected(
+                    resolve_atc_message_outcome(&cx, &pool, id, candidate).await,
+                    "resolve_atc_message_outcome",
+                );
+                assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+            }
+            let update = resolve_atc_message_outcome(&cx, &pool, id, &ack)
+                .await
+                .into_result()
+                .expect("small valid ACK still works after rejected observations");
+            let expected = match prior_label {
+                None => AtcMessageOutcomeUpdate::Resolved,
+                Some("read") => AtcMessageOutcomeUpdate::AcknowledgedAfterRead,
+                Some("ack_overdue") => AtcMessageOutcomeUpdate::AcknowledgedAfterOverdue,
+                Some("acknowledged") => AtcMessageOutcomeUpdate::Unchanged,
+                Some(_) => unreachable!("fixture labels"),
+            };
+            assert_eq!(update, expected);
+            if prior_label == Some("acknowledged") {
+                assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+            } else {
+                assert_stored_message_outcome(&cx, &pool, id, &ack).await;
+            }
+        }
+
+        for state in [
+            ExperienceState::Planned,
+            ExperienceState::Dispatched,
+            ExperienceState::Failed,
+            ExperienceState::Throttled,
+            ExperienceState::Suppressed,
+            ExperienceState::Skipped,
+            ExperienceState::Censored,
+            ExperienceState::Expired,
+        ] {
+            decision_id += 2;
+            let mut row = make_message_experience(decision_id);
+            row.state = state;
+            row.executed_ts_micros = None;
+            if state == ExperienceState::Planned {
+                row.dispatched_ts_micros = None;
+            }
+            if state.is_non_execution() {
+                row.non_execution_reason = Some(NonExecutionReason::DeliberateInaction {
+                    no_action_loss: 0.0,
+                    best_action_loss: 1.0,
+                });
+            }
+            if matches!(state, ExperienceState::Censored | ExperienceState::Expired) {
+                row.executed_ts_micros = Some(1_700_000_000_200_000);
+                row.resolved_ts_micros = Some(1_700_000_000_500_000);
+            }
+            assert!(
+                row.validate().is_empty(),
+                "state guard fixture must be valid"
+            );
+            let id = append_atc_experience(&cx, &pool, &row)
+                .await
+                .into_result()
+                .expect("append state guard fixture")
+                .experience_id;
+            let before = privacy_snapshot(&cx, &pool).await;
+            let result = resolve_atc_message_outcome(&cx, &pool, id, &ack).await;
+            assert!(
+                matches!(
+                    result,
+                    asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument { .. })
+                ),
+                "message resolution must refuse incompatible lifecycle states"
+            );
+            assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+        }
+
+        let mut other_class = make_message_experience(7300);
+        other_class.decision_class = "message_received".to_string();
+        let other_class_id = append_atc_experience(&cx, &pool, &other_class)
+            .await
+            .into_result()
+            .expect("append class guard fixture")
+            .experience_id;
+        let message_id = append_atc_experience(&cx, &pool, &make_message_experience(7302))
+            .await
+            .into_result()
+            .expect("append label guard fixture")
+            .experience_id;
+        let unrelated = privacy_outcome();
+        for (id, outcome) in [(other_class_id, &ack), (message_id, &unrelated)] {
+            let before = privacy_snapshot(&cx, &pool).await;
+            let result = resolve_atc_message_outcome(&cx, &pool, id, outcome).await;
+            assert!(
+                matches!(
+                    result,
+                    asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument { .. })
+                ),
+                "message resolution must reject unsupported classes and outcome labels"
+            );
+            assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+        }
+    });
+}
+
+#[test]
+fn message_outcome_rejections_preserve_sidecar() {
+    check_message_outcome_rejections(PrivacyStorage::File);
+}
+
+#[test]
+fn message_outcome_rejections_preserve_memory() {
+    check_message_outcome_rejections(PrivacyStorage::Memory);
 }

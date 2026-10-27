@@ -7674,6 +7674,22 @@ fn sweep_open_experiences_for_resolution(
     now_micros: i64,
     resolution_window_micros: i64,
 ) {
+    sweep_open_experiences_with_before_message_mutation(
+        pool,
+        now_micros,
+        resolution_window_micros,
+        |_| {},
+    );
+}
+
+fn sweep_open_experiences_with_before_message_mutation(
+    pool: &mcp_agent_mail_db::DbPool,
+    now_micros: i64,
+    resolution_window_micros: i64,
+    mut before_message_mutation: impl FnMut(&ExperienceRow),
+) {
+    use mcp_agent_mail_db::queries::AtcMessageOutcomeUpdate;
+
     let config = mcp_agent_mail_core::Config::get();
     if config.atc_write_mode.is_off()
         || atc::atc_kill_switch_active()
@@ -7743,7 +7759,6 @@ fn sweep_open_experiences_for_resolution(
                     event = "atc.sweep.ack_overdue_shadow",
                     experience_id = experience.experience_id,
                     message_id = ack_overdue_candidate.map(|candidate| candidate.message_id),
-                    agent_name = %experience.subject,
                     "shadow: would resolve ack-overdue ATC outcome"
                 );
             }
@@ -7751,82 +7766,52 @@ fn sweep_open_experiences_for_resolution(
         }
 
         if let Some(candidate) = ack_overdue_candidate {
-            let current_row = match block_on(
-                mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(
-                    &cx,
-                    pool,
-                    candidate.message_id,
-                ),
-            ) {
-                asupersync::Outcome::Ok(Some(row)) => row,
-                asupersync::Outcome::Ok(None) => {
+            let outcome = build_ack_overdue_message_resolution(experience, candidate, now_micros);
+            if !atc_resolution_content_is_valid(experience, &outcome, "ack_overdue_sweep") {
+                ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
+                continue;
+            }
+            before_message_mutation(experience);
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_message_outcome(
+                &cx,
+                pool,
+                experience.experience_id,
+                &outcome,
+            )) {
+                asupersync::Outcome::Ok(AtcMessageOutcomeUpdate::Resolved) => {
+                    rows_resolved = rows_resolved.saturating_add(1);
+                    ack_overdue_rows_resolved = ack_overdue_rows_resolved.saturating_add(1);
+                    let stratum_key = atc_experience_stratum_key(experience);
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_experience_resolved("ack_overdue", &stratum_key);
+                    tracing::info!(
+                        event = "atc.sweep.ack_race_detected",
+                        action = "sweep_won",
+                        message_id = candidate.message_id,
+                        experience_id = experience.experience_id,
+                        "ack-overdue sweep resolved before an ack/read race"
+                    );
+                    tracing::info!(
+                        event = "atc.sweep.ack_overdue_resolved",
+                        message_id = candidate.message_id,
+                        experience_id = experience.experience_id,
+                        age_micros = candidate.age_micros,
+                        attribution_window_micros = candidate.window_micros,
+                        "resolved ack-overdue ATC outcome"
+                    );
+                }
+                asupersync::Outcome::Ok(_) => {
                     ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
                     tracing::debug!(
                         event = "atc.sweep.ack_race_detected",
-                        action = "row_missing",
+                        action = "already_resolved",
                         message_id = candidate.message_id,
                         experience_id = experience.experience_id,
-                        "message_sent ATC row missing during ack-overdue sweep"
+                        "message outcome resolved before ack-overdue mutation"
                     );
-                    continue;
                 }
-                asupersync::Outcome::Err(error) => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("ack_overdue_fetch");
-                    tracing::warn!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "fetch_failed",
-                        message_id = candidate.message_id,
-                        experience_id = experience.experience_id,
-                        %error,
-                        "failed to fetch message_sent ATC row for ack-overdue sweep"
-                    );
-                    continue;
-                }
-                _ => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    continue;
-                }
-            };
-
-            if current_row.state == ExperienceState::Resolved {
-                let existing = current_row
-                    .outcome
-                    .as_ref()
-                    .map(|outcome| outcome.label.as_str())
-                    .unwrap_or("resolved");
-                ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                let action = if matches!(existing, "acknowledged" | "read") {
-                    "ack_won"
-                } else {
-                    "already_resolved"
-                };
-                tracing::debug!(
-                    event = "atc.sweep.ack_race_detected",
-                    action,
-                    message_id = candidate.message_id,
-                    experience_id = current_row.experience_id,
-                    outcome = existing,
-                    "ack-overdue sweep saw message outcome already resolved"
-                );
-                continue;
-            }
-
-            let outcome = build_ack_overdue_message_resolution(&current_row, candidate, now_micros);
-            if !atc_resolution_content_is_valid(&current_row, &outcome, "ack_overdue_sweep") {
-                ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                continue;
-            }
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
-                &cx,
-                pool,
-                current_row.experience_id,
-                &outcome,
-            )) {
-                asupersync::Outcome::Ok(()) => {}
-                asupersync::Outcome::Err(error) => {
+                asupersync::Outcome::Err(_) => {
                     ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
                     mcp_agent_mail_core::global_metrics()
                         .atc
@@ -7835,98 +7820,12 @@ fn sweep_open_experiences_for_resolution(
                         event = "atc.sweep.ack_race_detected",
                         action = "resolve_failed",
                         message_id = candidate.message_id,
-                        experience_id = current_row.experience_id,
-                        %error,
+                        experience_id = experience.experience_id,
                         "failed to resolve ack-overdue ATC outcome"
                     );
-                    continue;
                 }
                 _ => {
                     ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    continue;
-                }
-            }
-
-            let updated_row = match block_on(
-                mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(
-                    &cx,
-                    pool,
-                    candidate.message_id,
-                ),
-            ) {
-                asupersync::Outcome::Ok(Some(row)) => row,
-                asupersync::Outcome::Err(error) => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("ack_overdue_refetch");
-                    tracing::warn!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "refetch_failed",
-                        message_id = candidate.message_id,
-                        experience_id = current_row.experience_id,
-                        %error,
-                        "failed to refetch message_sent ATC row after ack-overdue resolution"
-                    );
-                    continue;
-                }
-                _ => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    continue;
-                }
-            };
-
-            let resolved_label = updated_row
-                .outcome
-                .as_ref()
-                .map(|outcome| outcome.label.as_str());
-            match resolved_label {
-                Some("ack_overdue") => {
-                    rows_resolved = rows_resolved.saturating_add(1);
-                    ack_overdue_rows_resolved = ack_overdue_rows_resolved.saturating_add(1);
-                    let stratum_key = atc_experience_stratum_key(&updated_row);
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_experience_resolved("ack_overdue", &stratum_key);
-                    tracing::info!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "sweep_won",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        "ack-overdue sweep resolved before an ack/read race"
-                    );
-                    tracing::info!(
-                        event = "atc.sweep.ack_overdue_resolved",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        age_micros = candidate.age_micros,
-                        attribution_window_micros = candidate.window_micros,
-                        importance = candidate.importance,
-                        agent_name = %updated_row.subject,
-                        "resolved ack-overdue ATC outcome"
-                    );
-                }
-                Some("acknowledged" | "read") => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    tracing::info!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "ack_won",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        outcome = resolved_label.unwrap_or("unknown"),
-                        "late ack/read won the race against ack-overdue sweep"
-                    );
-                }
-                _ => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    tracing::debug!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "unexpected_terminal_state",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        outcome = resolved_label.unwrap_or("unknown"),
-                        "ack-overdue sweep observed unexpected terminal state"
-                    );
                 }
             }
             continue;
@@ -14993,6 +14892,28 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
     agent_hint: Option<&str>,
     atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
 ) {
+    record_atc_message_outcome_with_before_mutation(
+        tool_name,
+        call_args,
+        payload,
+        project_hint,
+        agent_hint,
+        atc_db_pool,
+        |_| {},
+    );
+}
+
+fn record_atc_message_outcome_with_before_mutation(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+    before_mutation: impl FnOnce(&ExperienceRow),
+) {
+    use mcp_agent_mail_db::queries::AtcMessageOutcomeUpdate;
+
     let config = mcp_agent_mail_core::Config::get();
     let Some(target_label) = atc_message_resolution_label(tool_name) else {
         return;
@@ -15006,10 +14927,28 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         return;
     };
 
-    let agent_opt = ctx.agent.as_deref();
-    let project_opt = ctx.project.as_deref();
-    let agent = agent_opt.unwrap_or("unknown");
-    let project = project_opt.unwrap_or("unknown");
+    let outcome = build_message_outcome_resolution(
+        target_label,
+        tool_name,
+        message_id,
+        ctx.agent.as_deref(),
+        ctx.project.as_deref(),
+        mcp_agent_mail_db::now_micros(),
+        "message_outcome_signal",
+    );
+    if let Err(category) = outcome.validate_content() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_derivation_error("resolution_content_rejected");
+        tracing::warn!(
+            event = "atc.content_rejected",
+            api = "message_outcome",
+            state = "unfetched",
+            category,
+            "ATC message outcome rejected before lookup or diagnostics"
+        );
+        return;
+    }
     let write_mode = atc_write_mode_label(&config);
     if config.atc_write_mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
@@ -15018,8 +14957,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         tracing::trace!(
             event = "atc.hot_path.note_ack",
             tool = %tool_name,
-            agent,
-            project,
             message_id,
             outcome = target_label,
             write_mode,
@@ -15050,42 +14987,34 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::debug!(
                     event = "atc.hot_path.ack_race_retry",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     attempt_n = attempt,
                     "message outcome row not visible yet; retrying once"
                 );
             }
             asupersync::Outcome::Ok(None) => break,
-            asupersync::Outcome::Err(error) => {
+            asupersync::Outcome::Err(_) => {
                 mcp_agent_mail_core::global_metrics()
                     .atc
                     .record_derivation_error("message_outcome_fetch");
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    %error,
                     "failed to fetch message_sent ATC experience"
                 );
                 return;
             }
-            asupersync::Outcome::Cancelled(reason) => {
+            asupersync::Outcome::Cancelled(_) => {
                 mcp_agent_mail_core::global_metrics()
                     .atc
                     .record_derivation_error("message_outcome_fetch_cancelled");
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    reason = ?reason,
                     "message outcome lookup cancelled"
                 );
                 return;
@@ -15097,8 +15026,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
                     "message outcome lookup panicked"
@@ -15116,8 +15043,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::debug!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     outcome = target_label,
                     write_mode,
@@ -15128,37 +15053,29 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::warn!(
                     event = "atc.hot_path.ack_for_unknown_message",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
                     "message outcome resolution skipped for unknown message"
                 );
             }
-            asupersync::Outcome::Err(error) => {
+            asupersync::Outcome::Err(_) => {
                 mcp_agent_mail_core::global_metrics()
                     .atc
                     .record_derivation_error("message_outcome_preflight");
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    %error,
                     "failed to classify missing message outcome row"
                 );
             }
-            asupersync::Outcome::Cancelled(reason) => {
+            asupersync::Outcome::Cancelled(_) => {
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    reason = ?reason,
                     "message existence preflight cancelled"
                 );
             }
@@ -15166,8 +15083,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
                     "message existence preflight panicked"
@@ -15177,333 +15092,108 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         return;
     };
 
-    let now_micros = mcp_agent_mail_db::now_micros();
+    if !atc_resolution_content_is_valid(&experience, &outcome, "message_outcome") {
+        return;
+    }
     let stratum_key = atc_experience_stratum_key(&experience);
-    let existing_label = experience
-        .outcome
-        .as_ref()
-        .map(|outcome| outcome.label.to_ascii_lowercase());
-
-    let apply_outcome = |note: &str| {
-        build_message_outcome_resolution(
-            target_label,
-            tool_name,
-            message_id,
-            agent_opt,
-            project_opt,
-            now_micros,
-            note,
-        )
-    };
-
-    match experience.state {
-        ExperienceState::Executed => {
-            let outcome = apply_outcome("resolved_after_execute_promote");
-            if !atc_resolution_content_is_valid(&experience, &outcome, "message_outcome") {
-                return;
-            }
-            let experience_id = experience.experience_id;
-            match atc_ledger_block_on(|cx| {
-                let outcome = &outcome;
-                async move {
-                    mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
-                        &cx,
-                        pool,
-                        experience_id,
-                        outcome,
-                    )
-                    .await
-                }
-            }) {
-                asupersync::Outcome::Ok(()) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_experience_resolved(target_label, &stratum_key);
-                    tracing::info!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        latency_micros = atc_elapsed_micros(started_at),
-                        "resolved message_sent ATC experience from ack/read signal"
-                    );
-                }
-                asupersync::Outcome::Err(error) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("message_outcome_resolve");
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        %error,
-                        "failed to resolve promoted message outcome"
-                    );
-                }
-                asupersync::Outcome::Cancelled(reason) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        reason = ?reason,
-                        "message outcome resolve cancelled"
-                    );
-                }
-                asupersync::Outcome::Panicked(_) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        "message outcome resolve panicked"
-                    );
-                }
-            }
+    let experience_id = experience.experience_id;
+    // The lookup identifies the row only. Its state can change before this
+    // transaction, so the DB chooses resolution, ACK upgrade, or no-op from
+    // the current stored outcome while holding the write transaction.
+    before_mutation(&experience);
+    match atc_ledger_block_on(|cx| {
+        let outcome = &outcome;
+        async move {
+            mcp_agent_mail_db::queries::resolve_atc_message_outcome(
+                &cx,
+                pool,
+                experience_id,
+                outcome,
+            )
+            .await
         }
-        ExperienceState::Open => {
-            let outcome = apply_outcome("resolved_from_open");
-            if !atc_resolution_content_is_valid(&experience, &outcome, "message_outcome") {
-                return;
-            }
-            let experience_id = experience.experience_id;
-            match atc_ledger_block_on(|cx| {
-                let outcome = &outcome;
-                async move {
-                    mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
-                        &cx,
-                        pool,
-                        experience_id,
-                        outcome,
-                    )
-                    .await
-                }
-            }) {
-                asupersync::Outcome::Ok(()) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_experience_resolved(target_label, &stratum_key);
-                    tracing::info!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        latency_micros = atc_elapsed_micros(started_at),
-                        "resolved open message_sent ATC experience from ack/read signal"
-                    );
-                }
-                asupersync::Outcome::Err(error) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("message_outcome_resolve");
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        %error,
-                        "failed to resolve open message outcome"
-                    );
-                }
-                asupersync::Outcome::Cancelled(reason) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        reason = ?reason,
-                        "open message outcome resolve cancelled"
-                    );
-                }
-                asupersync::Outcome::Panicked(_) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        "open message outcome resolve panicked"
-                    );
-                }
-            }
-        }
-        ExperienceState::Resolved => {
-            let existing = existing_label.as_deref();
-            if target_label == "acknowledged" && matches!(existing, Some("read" | "ack_overdue")) {
-                let (note, event_name, upgrade_reason) = if existing == Some("ack_overdue") {
-                    (
-                        "upgrade_ack_overdue_to_acknowledged",
-                        "atc.hot_path.ack_upgrade_overdue_to_acked",
-                        "upgraded resolved message outcome from ack_overdue to acknowledged",
-                    )
-                } else {
-                    (
-                        "upgrade_read_to_acknowledged",
-                        "atc.hot_path.ack_upgrade_read_to_acked",
-                        "upgraded resolved message outcome from read to acknowledged",
-                    )
-                };
-                let outcome = apply_outcome(note);
-                if !atc_resolution_content_is_valid(
-                    &experience,
-                    &outcome,
-                    "message_outcome_upgrade",
-                ) {
-                    return;
-                }
-                let experience_id = experience.experience_id;
-                match atc_ledger_block_on(|cx| {
-                    let outcome = &outcome;
-                    async move {
-                        mcp_agent_mail_db::queries::overwrite_resolved_atc_experience_outcome(
-                            &cx,
-                            pool,
-                            experience_id,
-                            outcome,
-                        )
-                        .await
-                    }
-                }) {
-                    asupersync::Outcome::Ok(()) => {
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_experience_resolved(target_label, &stratum_key);
-                        tracing::info!(
-                            event = event_name,
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id = experience.experience_id,
-                            write_mode,
-                            latency_micros = atc_elapsed_micros(started_at),
-                            upgrade_reason,
-                            "upgraded resolved message outcome"
-                        );
-                    }
-                    asupersync::Outcome::Err(error) => {
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_derivation_error("message_outcome_upgrade");
-                        tracing::warn!(
-                            event = "atc.hot_path.note_ack",
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id_resolved = experience.experience_id,
-                            outcome = target_label,
-                            write_mode,
-                            %error,
-                            "failed to upgrade resolved message outcome"
-                        );
-                    }
-                    asupersync::Outcome::Cancelled(reason) => {
-                        tracing::warn!(
-                            event = "atc.hot_path.note_ack",
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id_resolved = experience.experience_id,
-                            outcome = target_label,
-                            write_mode,
-                            reason = ?reason,
-                            "message outcome upgrade cancelled"
-                        );
-                    }
-                    asupersync::Outcome::Panicked(_) => {
-                        tracing::warn!(
-                            event = "atc.hot_path.note_ack",
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id_resolved = experience.experience_id,
-                            outcome = target_label,
-                            write_mode,
-                            "message outcome upgrade panicked"
-                        );
-                    }
-                }
-                return;
-            }
-
-            if existing == Some(target_label)
-                || (target_label == "read" && existing == Some("acknowledged"))
-            {
-                tracing::debug!(
-                    event = "atc.hot_path.note_ack",
-                    tool = %tool_name,
-                    agent,
-                    project,
-                    message_id,
-                    experience_id_resolved = experience.experience_id,
-                    outcome = existing.unwrap_or("resolved"),
-                    write_mode,
-                    latency_micros = atc_elapsed_micros(started_at),
-                    "message outcome already resolved; leaving terminal state unchanged"
-                );
-                return;
-            }
-
-            tracing::debug!(
+    }) {
+        asupersync::Outcome::Ok(AtcMessageOutcomeUpdate::Resolved) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_experience_resolved(target_label, &stratum_key);
+            tracing::info!(
                 event = "atc.hot_path.note_ack",
                 tool = %tool_name,
-                agent,
-                project,
                 message_id,
-                experience_id_resolved = experience.experience_id,
-                prior_outcome = existing.unwrap_or("unknown"),
+                experience_id_resolved = experience_id,
                 outcome = target_label,
                 write_mode,
-                "resolved message outcome not rewritten for incompatible terminal label"
+                latency_micros = atc_elapsed_micros(started_at),
+                "resolved message_sent ATC experience from ack/read signal"
             );
         }
-        state => {
+        asupersync::Outcome::Ok(
+            update @ (AtcMessageOutcomeUpdate::AcknowledgedAfterRead
+            | AtcMessageOutcomeUpdate::AcknowledgedAfterOverdue),
+        ) => {
+            let event_name = if update == AtcMessageOutcomeUpdate::AcknowledgedAfterRead {
+                "atc.hot_path.ack_upgrade_read_to_acked"
+            } else {
+                "atc.hot_path.ack_upgrade_overdue_to_acked"
+            };
+            // An ACK upgrade corrects a terminal outcome; it does not resolve
+            // another open row or decrement the open-stratum gauge again.
+            tracing::info!(
+                event = event_name,
+                tool = %tool_name,
+                message_id,
+                experience_id,
+                write_mode,
+                latency_micros = atc_elapsed_micros(started_at),
+                "upgraded resolved message outcome to acknowledged"
+            );
+        }
+        asupersync::Outcome::Ok(AtcMessageOutcomeUpdate::Unchanged) => {
             tracing::debug!(
                 event = "atc.hot_path.note_ack",
                 tool = %tool_name,
-                agent,
-                project,
                 message_id,
-                experience_id_resolved = experience.experience_id,
+                experience_id_resolved = experience_id,
                 outcome = target_label,
                 write_mode,
-                state = %state,
-                "message outcome resolution ignored for non-open terminal state"
+                "message outcome already resolved; leaving terminal state unchanged"
+            );
+        }
+        asupersync::Outcome::Err(_) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("message_outcome_resolve");
+            tracing::warn!(
+                event = "atc.hot_path.note_ack",
+                tool = %tool_name,
+                message_id,
+                experience_id_resolved = experience_id,
+                outcome = target_label,
+                write_mode,
+                "failed to resolve or upgrade message outcome"
+            );
+        }
+        asupersync::Outcome::Cancelled(_) => {
+            tracing::warn!(
+                event = "atc.hot_path.note_ack",
+                tool = %tool_name,
+                message_id,
+                experience_id_resolved = experience_id,
+                outcome = target_label,
+                write_mode,
+                "message outcome resolve cancelled"
+            );
+        }
+        asupersync::Outcome::Panicked(_) => {
+            tracing::warn!(
+                event = "atc.hot_path.note_ack",
+                tool = %tool_name,
+                message_id,
+                experience_id_resolved = experience_id,
+                outcome = target_label,
+                write_mode,
+                "message outcome resolve panicked"
             );
         }
     }
@@ -23923,6 +23613,83 @@ first body
             )
             .expect("read persisted ATC rollups");
         format!("{rows:?}\n{rollups:?}")
+    }
+
+    fn reopened_atc_message_outcome(primary_path: &str) -> ExperienceOutcome {
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary_path);
+        let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+            .expect("independently reopen message outcome sidecar");
+        let rows = verify
+            .query_sync("SELECT state, outcome_json FROM atc_experiences", &[])
+            .expect("read persisted message outcome");
+        assert_eq!(rows.len(), 1, "message feedback must not duplicate the row");
+        assert_eq!(
+            rows[0].get_named::<String>("state").expect("stored state"),
+            "resolved"
+        );
+        let outcome_json = rows[0]
+            .get_named::<String>("outcome_json")
+            .expect("stored outcome JSON");
+        serde_json::from_str(&outcome_json).expect("decode persisted message outcome")
+    }
+
+    #[derive(Clone, Default)]
+    struct AtcFeedbackLogCapture {
+        events: Arc<Mutex<Vec<String>>>,
+        next_span_id: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[derive(Default)]
+    struct AtcFeedbackLogFields(String);
+
+    impl tracing::field::Visit for AtcFeedbackLogFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+
+            write!(&mut self.0, "{}={value:?} ", field.name()).expect("format captured field");
+        }
+    }
+
+    impl tracing::Subscriber for AtcFeedbackLogCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = self
+                .next_span_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = AtcFeedbackLogFields::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("feedback log capture lock")
+                .push(fields.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     #[test]
@@ -34424,6 +34191,296 @@ first body
 
         mcp_agent_mail_core::Config::reset_cached();
         reset_atc_message_observation_cache_for_test();
+    }
+
+    #[test]
+    fn message_feedback_interleavings_keep_ack_and_count_one_resolution() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("message feedback race fixtures");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("AM_ATC_EXECUTOR_MODE", "canary"),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let cx = Cx::for_testing();
+                for initial_state in [ExperienceState::Executed, ExperienceState::Open] {
+                    for (incoming, competing) in [
+                        ("acknowledged", "read"),
+                        ("acknowledged", "ack_overdue"),
+                        ("read", "acknowledged"),
+                        ("ack_overdue", "acknowledged"),
+                    ] {
+                        // ATC uses a fixed sidecar name within the mailbox
+                        // directory, so each interleaving needs its own parent.
+                        let case_dir = dir
+                            .path()
+                            .join(format!("{initial_state}-{incoming}-{competing}"));
+                        std::fs::create_dir(&case_dir).expect("isolated feedback case directory");
+                        let db_path = case_dir.join("storage.sqlite3");
+                        let db_path_str = db_path.to_string_lossy().into_owned();
+                        let pool = create_pool(&DbPoolConfig {
+                            database_url: format!("sqlite:///{db_path_str}"),
+                            min_connections: 0,
+                            max_connections: 1,
+                            warmup_connections: 0,
+                            ..Default::default()
+                        })
+                        .expect("file-backed message feedback fixture");
+                        let now = mcp_agent_mail_db::now_micros();
+                        let observation = build_message_sent_observation_row(
+                            "feedback-race-project",
+                            8401,
+                            "RedFox",
+                            &["BlueLake".to_string()],
+                            Some("feedback-race"),
+                            &serde_json::json!({
+                                "ack_required": true,
+                                "importance": "urgent",
+                            }),
+                            now - ACK_OVERDUE_WINDOW_URGENT_MICROS - 10,
+                        );
+                        append_atc_hot_path_observation_row(&pool, &observation, "message_sent");
+                        let stored = block_on(
+                            mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(
+                                &cx, &pool, 8401,
+                            ),
+                        )
+                        .into_result()
+                        .expect("fetch race fixture")
+                        .expect("send observation exists");
+                        if initial_state == ExperienceState::Open {
+                            block_on(mcp_agent_mail_db::queries::transition_atc_experience_state(
+                                &cx,
+                                &pool,
+                                stored.experience_id,
+                                ExperienceState::Open,
+                                stored.created_ts_micros + 1,
+                                None,
+                                None,
+                            ))
+                            .into_result()
+                            .expect("prepare open message feedback fixture");
+                        }
+                        let args = serde_json::json!({
+                            "project_key": "feedback-race-project",
+                            "agent_name": "BlueLake",
+                            "message_id": 8401,
+                        });
+                        let payload = serde_json::json!({ "message_id": 8401 });
+                        let before_metrics = mcp_agent_mail_core::global_metrics().atc.snapshot();
+                        let mut competing_snapshot = None;
+                        let mut before_mutation = |prefetched: &ExperienceRow| {
+                            assert_eq!(prefetched.state, initial_state);
+                            assert!(competing_snapshot.is_none(), "race hook must run once");
+                            if competing == "ack_overdue" {
+                                sweep_open_experiences_for_resolution(&pool, now, i64::MAX / 4);
+                            } else {
+                                let tool = if competing == "read" {
+                                    "mark_message_read"
+                                } else {
+                                    "acknowledge_message"
+                                };
+                                record_atc_message_outcome_from_tool_payload_with_pool(
+                                    tool,
+                                    Some(&args),
+                                    &payload,
+                                    None,
+                                    None,
+                                    Some(&pool),
+                                );
+                            }
+                            assert_eq!(reopened_atc_message_outcome(&db_path_str).label, competing);
+                            competing_snapshot = Some(reopened_atc_content_snapshot(&db_path_str));
+                        };
+                        if incoming == "ack_overdue" {
+                            sweep_open_experiences_with_before_message_mutation(
+                                &pool,
+                                now,
+                                i64::MAX / 4,
+                                &mut before_mutation,
+                            );
+                        } else {
+                            let tool = if incoming == "read" {
+                                "mark_message_read"
+                            } else {
+                                "acknowledge_message"
+                            };
+                            record_atc_message_outcome_with_before_mutation(
+                                tool,
+                                Some(&args),
+                                &payload,
+                                None,
+                                None,
+                                Some(&pool),
+                                &mut before_mutation,
+                            );
+                        }
+                        let competing_snapshot = competing_snapshot.expect("race hook ran");
+                        let final_outcome = reopened_atc_message_outcome(&db_path_str);
+                        assert_eq!(final_outcome.label, "acknowledged");
+                        assert!(final_outcome.correct);
+                        let acknowledged_snapshot = reopened_atc_content_snapshot(&db_path_str);
+                        if competing == "acknowledged" {
+                            assert_eq!(acknowledged_snapshot, competing_snapshot);
+                        } else {
+                            assert_ne!(acknowledged_snapshot, competing_snapshot);
+                        }
+                        let resolved_count = before_metrics.experiences_resolved_total + 1;
+                        let after_metrics = mcp_agent_mail_core::global_metrics().atc.snapshot();
+                        assert_eq!(after_metrics.experiences_resolved_total, resolved_count);
+                        let stratum = atc_experience_stratum_key(&stored);
+                        let open_before = before_metrics
+                            .experiences_open_by_stratum
+                            .get(&stratum)
+                            .copied()
+                            .unwrap_or_default();
+                        assert_eq!(
+                            after_metrics
+                                .experiences_open_by_stratum
+                                .get(&stratum)
+                                .copied()
+                                .unwrap_or_default(),
+                            open_before.saturating_sub(1)
+                        );
+
+                        for tool in ["acknowledge_message", "mark_message_read"] {
+                            record_atc_message_outcome_from_tool_payload_with_pool(
+                                tool,
+                                Some(&args),
+                                &payload,
+                                None,
+                                None,
+                                Some(&pool),
+                            );
+                        }
+                        sweep_open_experiences_for_resolution(&pool, now, i64::MAX / 4);
+                        assert_eq!(
+                            reopened_atc_content_snapshot(&db_path_str),
+                            acknowledged_snapshot,
+                            "replayed feedback must preserve persisted rows and rollups"
+                        );
+                        assert_eq!(
+                            mcp_agent_mail_core::global_metrics()
+                                .atc
+                                .snapshot()
+                                .experiences_resolved_total,
+                            resolved_count,
+                            "replayed signals must not count another resolution"
+                        );
+                    }
+                }
+            },
+        );
+        mcp_agent_mail_core::Config::reset_cached();
+    }
+
+    #[test]
+    fn message_feedback_rejects_metadata_before_missing_terminal_or_shadow_logs() {
+        const CANARY: &str = "ghp_ATC_SYNTHETIC_FEEDBACK_LOG_CANARY_20261027";
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("feedback log privacy fixtures");
+        for mode in ["live", "shadow"] {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("AM_ATC_WRITE_MODE", mode),
+                    ("AM_ATC_EXECUTOR_MODE", "canary"),
+                ],
+                || {
+                    mcp_agent_mail_core::Config::reset_cached();
+                    let case_dir = dir.path().join(format!("feedback-log-{mode}"));
+                    std::fs::create_dir(&case_dir).expect("isolated feedback privacy directory");
+                    let db_path = case_dir.join("storage.sqlite3");
+                    let db_path_str = db_path.to_string_lossy().into_owned();
+                    let pool = create_pool(&DbPoolConfig {
+                        database_url: format!("sqlite:///{db_path_str}"),
+                        min_connections: 0,
+                        max_connections: 1,
+                        warmup_connections: 0,
+                        ..Default::default()
+                    })
+                    .expect("file-backed feedback privacy fixture");
+                    let cx = Cx::for_testing();
+                    let now = mcp_agent_mail_db::now_micros();
+                    let observation = build_message_sent_observation_row(
+                        "feedback-privacy-project",
+                        8501,
+                        "RedFox",
+                        &["BlueLake".to_string()],
+                        Some("feedback-privacy"),
+                        &serde_json::json!({ "ack_required": true }),
+                        now,
+                    );
+                    let stored = block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                        &cx,
+                        &pool,
+                        &observation,
+                    ))
+                    .into_result()
+                    .expect("prepare privacy observation");
+                    let acknowledged = build_message_outcome_resolution(
+                        "acknowledged",
+                        "acknowledge_message",
+                        8501,
+                        Some("BlueLake"),
+                        Some("feedback-privacy-project"),
+                        now + 1,
+                        "privacy fixture",
+                    );
+                    block_on(mcp_agent_mail_db::queries::resolve_atc_message_outcome(
+                        &cx,
+                        &pool,
+                        stored.experience_id,
+                        &acknowledged,
+                    ))
+                    .into_result()
+                    .expect("prepare terminal privacy observation");
+                    let baseline = reopened_atc_content_snapshot(&db_path_str);
+                    let capture = AtcFeedbackLogCapture::default();
+                    tracing::subscriber::with_default(capture.clone(), || {
+                        for message_id in [8501, 8502] {
+                            for metadata_field in ["agent_name", "project_key"] {
+                                let mut args = serde_json::json!({
+                                    "project_key": "feedback-privacy-project",
+                                    "agent_name": "BlueLake",
+                                    "message_id": message_id,
+                                });
+                                args[metadata_field] = serde_json::json!(CANARY);
+                                record_atc_message_outcome_from_tool_payload_with_pool(
+                                    "acknowledge_message",
+                                    Some(&args),
+                                    &serde_json::json!({ "message_id": message_id }),
+                                    None,
+                                    None,
+                                    Some(&pool),
+                                );
+                            }
+                        }
+                    });
+                    let events = capture.events.lock().expect("captured feedback events");
+                    assert!(events.iter().all(|event| !event.contains(CANARY)));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| {
+                                event.contains("atc.content_rejected")
+                                    && event
+                                        .contains("outcome.evidence contains a suspected secret")
+                            })
+                            .count(),
+                        4,
+                        "each rejected signal must report only its static category"
+                    );
+                    assert_eq!(reopened_atc_content_snapshot(&db_path_str), baseline);
+                },
+            );
+        }
+        mcp_agent_mail_core::Config::reset_cached();
     }
 
     #[test]

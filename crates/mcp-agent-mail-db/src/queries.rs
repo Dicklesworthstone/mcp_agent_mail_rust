@@ -3096,8 +3096,8 @@ fn resolve_atc_experience_file_backed(
     pool: &DbPool,
     experience_id: u64,
     outcome: &ExperienceOutcome,
-    open_if_executed: bool,
-) -> std::result::Result<(), DbError> {
+    policy: AtcOutcomeResolutionPolicy,
+) -> std::result::Result<AtcMessageOutcomeUpdate, DbError> {
     let id = i64::try_from(experience_id).map_err(|_| {
         DbError::Internal(format!(
             "experience_id exceeds SQLite INTEGER range: {experience_id}"
@@ -3105,7 +3105,7 @@ fn resolve_atc_experience_file_backed(
     })?;
     let outcome_json = encode_json(outcome, "outcome_json")?;
 
-    let conn = open_canonical_atc_conn(pool, "resolve_atc_experience")?;
+    let conn = open_canonical_atc_conn(pool, policy.api())?;
     let result = (|| {
         begin_canonical_atc_write_tx(&conn)?;
         let select_sql =
@@ -3116,21 +3116,16 @@ fn resolve_atc_experience_file_backed(
             &[Value::BigInt(id)],
             "resolve_atc_experience select",
         )?;
-        let experience = rows.first().map(decode_atc_experience_row).transpose()?;
-        let current_state = experience.as_ref().map(|row| row.state);
-        if current_state != Some(ExperienceState::Open)
-            && !(open_if_executed && current_state == Some(ExperienceState::Executed))
-        {
-            resolve_atc_experience_noop_result(experience.map(|row| row.state), experience_id)?;
-            return commit_canonical_atc_write_tx(&conn);
-        }
-        let experience = experience
+        let experience = rows
+            .first()
+            .map(decode_atc_experience_row)
+            .transpose()?
             .ok_or_else(|| DbError::not_found("experience", experience_id.to_string()))?;
-        validate_atc_content(
-            "resolve_atc_experience",
-            Some(experience.state),
-            experience.validate_content_with_outcome(outcome),
-        )?;
+        let update = atc_outcome_resolution_update(&experience, outcome, policy)?;
+        if update == AtcMessageOutcomeUpdate::Unchanged {
+            commit_canonical_atc_write_tx(&conn)?;
+            return Ok(update);
+        }
         let sql = "UPDATE atc_experiences \
                    SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
                    WHERE experience_id = ? AND state = ?";
@@ -3141,7 +3136,8 @@ fn resolve_atc_experience_file_backed(
             Value::Text(experience.state.to_string()),
         ];
         canonical_execute_atc(&conn, sql, &params, "resolve_atc_experience update")?;
-        commit_canonical_atc_write_tx(&conn)
+        commit_canonical_atc_write_tx(&conn)?;
+        Ok(update)
     })();
     if result.is_err() {
         rollback_canonical_atc_write_tx(&conn);
@@ -3210,20 +3206,6 @@ fn overwrite_resolved_atc_experience_outcome_file_backed(
     }
     close_canonical_db_conn(conn, "canonical ATC overwrite-resolved connection");
     result
-}
-
-fn resolve_atc_experience_noop_result(
-    current_state: Option<ExperienceState>,
-    experience_id: u64,
-) -> std::result::Result<(), DbError> {
-    match current_state {
-        Some(ExperienceState::Resolved) => Ok(()),
-        Some(current_state) => Err(DbError::invalid(
-            "state",
-            format!("experience {experience_id} is {current_state}, must be open to resolve"),
-        )),
-        None => Err(DbError::not_found("experience", experience_id.to_string())),
-    }
 }
 
 fn validate_atc_resolution(
@@ -19586,6 +19568,93 @@ pub async fn fetch_message_sent_atc_experience(
     }
 }
 
+/// The durable effect of applying one message acknowledgement/read observation.
+/// Callers must use this receipt, rather than a previously fetched row, when
+/// recording resolution metrics or reporting an acknowledgement upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtcMessageOutcomeUpdate {
+    /// The experience entered Resolved for the first time.
+    Resolved,
+    /// Acknowledgement replaced a resolved read observation.
+    AcknowledgedAfterRead,
+    /// Acknowledgement replaced a resolved overdue observation.
+    AcknowledgedAfterOverdue,
+    /// A replay or lower-priority observation left the row untouched.
+    Unchanged,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtcOutcomeResolutionPolicy {
+    OpenOnly,
+    Observed,
+    Message,
+}
+
+impl AtcOutcomeResolutionPolicy {
+    const fn api(self) -> &'static str {
+        match self {
+            Self::OpenOnly => "resolve_atc_experience",
+            Self::Observed => "resolve_atc_observed_outcome",
+            Self::Message => "resolve_atc_message_outcome",
+        }
+    }
+}
+
+/// Decide from the same transaction snapshot that will receive the outcome.
+/// Generic resolvers retain first-resolution-wins; only message feedback can
+/// upgrade read/overdue to acknowledged, and an acknowledged replay is a no-op.
+fn atc_outcome_resolution_update(
+    experience: &ExperienceRow,
+    outcome: &ExperienceOutcome,
+    policy: AtcOutcomeResolutionPolicy,
+) -> std::result::Result<AtcMessageOutcomeUpdate, DbError> {
+    validate_atc_content(
+        policy.api(),
+        Some(experience.state),
+        experience.validate_content_with_outcome(outcome),
+    )?;
+    if policy == AtcOutcomeResolutionPolicy::Message && experience.decision_class != "message_sent"
+    {
+        return Err(DbError::invalid(
+            "decision_class",
+            "message outcome requires a message_sent experience",
+        ));
+    }
+
+    match experience.state {
+        ExperienceState::Open => Ok(AtcMessageOutcomeUpdate::Resolved),
+        ExperienceState::Executed if policy != AtcOutcomeResolutionPolicy::OpenOnly => {
+            Ok(AtcMessageOutcomeUpdate::Resolved)
+        }
+        ExperienceState::Resolved => {
+            if policy == AtcOutcomeResolutionPolicy::Message
+                && outcome.label == "acknowledged"
+                && let Some(previous) = &experience.outcome
+            {
+                if previous.label.eq_ignore_ascii_case("read") {
+                    return Ok(AtcMessageOutcomeUpdate::AcknowledgedAfterRead);
+                }
+                if previous.label.eq_ignore_ascii_case("ack_overdue") {
+                    return Ok(AtcMessageOutcomeUpdate::AcknowledgedAfterOverdue);
+                }
+            }
+            Ok(AtcMessageOutcomeUpdate::Unchanged)
+        }
+        current_state => Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {} is {current_state}, must be open{} to resolve",
+                experience.experience_id,
+                if policy == AtcOutcomeResolutionPolicy::OpenOnly {
+                    ""
+                } else {
+                    " or executed"
+                },
+            ),
+        )),
+    }
+}
+
 /// Resolve an ATC experience with an observed outcome.
 ///
 /// Transitions the experience from `open` to `resolved` and stores the
@@ -19601,7 +19670,15 @@ pub async fn resolve_atc_experience(
     experience_id: u64,
     outcome: &ExperienceOutcome,
 ) -> Outcome<(), DbError> {
-    resolve_atc_experience_inner(cx, pool, experience_id, outcome, false).await
+    resolve_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        outcome,
+        AtcOutcomeResolutionPolicy::OpenOnly,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Persist an observed outcome, including Executed → Open when needed, in one
@@ -19613,7 +19690,40 @@ pub async fn resolve_atc_observed_outcome(
     experience_id: u64,
     outcome: &ExperienceOutcome,
 ) -> Outcome<(), DbError> {
-    resolve_atc_experience_inner(cx, pool, experience_id, outcome, true).await
+    resolve_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        outcome,
+        AtcOutcomeResolutionPolicy::Observed,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Apply `read`, `acknowledged`, or `ack_overdue` to a `message_sent` experience.
+///
+/// The transaction both selects the current row and decides precedence:
+/// Executed/Open resolve, and acknowledged upgrades a resolved read/overdue.
+/// A later read, overdue observation, or duplicate acknowledgement cannot
+/// replace the first acknowledged payload or its timestamp. Other terminal
+/// outcomes retain their original result; non-resolvable states are refused.
+/// Content and aggregate bounds apply before precedence, including no-op
+/// candidates. Returned effects describe committed changes only.
+pub async fn resolve_atc_message_outcome(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    outcome: &ExperienceOutcome,
+) -> Outcome<AtcMessageOutcomeUpdate, DbError> {
+    resolve_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        outcome,
+        AtcOutcomeResolutionPolicy::Message,
+    )
+    .await
 }
 
 async fn resolve_atc_experience_inner(
@@ -19621,14 +19731,25 @@ async fn resolve_atc_experience_inner(
     pool: &DbPool,
     experience_id: u64,
     outcome: &ExperienceOutcome,
-    open_if_executed: bool,
-) -> Outcome<(), DbError> {
+    policy: AtcOutcomeResolutionPolicy,
+) -> Outcome<AtcMessageOutcomeUpdate, DbError> {
     if let Err(error) = validate_atc_content(
-        "resolve_atc_experience",
+        policy.api(),
         Some(ExperienceState::Resolved),
         outcome.validate_content(),
     ) {
         return Outcome::Err(error);
+    }
+    if policy == AtcOutcomeResolutionPolicy::Message
+        && !matches!(
+            outcome.label.as_str(),
+            "read" | "acknowledged" | "ack_overdue"
+        )
+    {
+        return Outcome::Err(DbError::invalid(
+            "outcome",
+            "unsupported message outcome label",
+        ));
     }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
@@ -19637,13 +19758,8 @@ async fn resolve_atc_experience_inner(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
-        return match resolve_atc_experience_file_backed(
-            pool,
-            experience_id,
-            outcome,
-            open_if_executed,
-        ) {
-            Ok(()) => Outcome::Ok(()),
+        return match resolve_atc_experience_file_backed(pool, experience_id, outcome, policy) {
+            Ok(update) => Outcome::Ok(update),
             Err(error) => Outcome::Err(error),
         };
     }
@@ -19662,7 +19778,7 @@ async fn resolve_atc_experience_inner(
         Err(error) => return Outcome::Err(error),
     };
 
-    run_with_mvcc_retry(cx, "resolve_atc_experience", || async {
+    run_with_mvcc_retry(cx, policy.api(), || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -19685,28 +19801,20 @@ async fn resolve_atc_experience_inner(
                 return Outcome::Err(error);
             }
         };
-        let current_state = experience.as_ref().map(|row| row.state);
-        if current_state != Some(ExperienceState::Open)
-            && !(open_if_executed && current_state == Some(ExperienceState::Executed))
-        {
-            if let Err(error) = resolve_atc_experience_noop_result(current_state, experience_id) {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(error);
-            }
-            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-            return Outcome::Ok(());
-        }
         let Some(experience) = experience else {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::not_found("experience", experience_id.to_string()));
         };
-        if let Err(error) = validate_atc_content(
-            "resolve_atc_experience",
-            Some(experience.state),
-            experience.validate_content_with_outcome(outcome),
-        ) {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(error);
+        let update = match atc_outcome_resolution_update(&experience, outcome, policy) {
+            Ok(update) => update,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        if update == AtcMessageOutcomeUpdate::Unchanged {
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            return Outcome::Ok(update);
         }
         // The aggregate budget is checked against the same snapshot that is
         // updated, so concurrent context amendments cannot bypass it.
@@ -19725,7 +19833,7 @@ async fn resolve_atc_experience_inner(
             map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
         );
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        Outcome::Ok(())
+        Outcome::Ok(update)
     })
     .await
 }
