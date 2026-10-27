@@ -938,6 +938,14 @@ fn crypto_named_witness(
     crypto_file_witness(&open_crypto_leaf(directory, name)?)
 }
 
+#[cfg(unix)]
+fn sync_crypto_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+    // cap-std directory authorities use O_PATH on Linux, which cannot be
+    // fsynced. Open a readable descriptor relative to that same authority;
+    // reopening its ambient pathname could synchronize a substituted parent.
+    directory.open(".")?.sync_all()
+}
+
 /// Open each component relative to its retained predecessor. Windows directory
 /// handles omit FILE_SHARE_DELETE; retaining every ancestor also pins their names.
 fn open_crypto_directory(
@@ -985,7 +993,13 @@ fn open_crypto_directory(
                     Ok(next) => next,
                     Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
                         match current.create_dir(name) {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                // Persist the new directory's name before
+                                // descending: syncing the child alone cannot
+                                // make this entry durable in its parent.
+                                #[cfg(unix)]
+                                sync_crypto_directory(&current)?;
+                            }
                             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                             Err(error) => return Err(error),
                         }
@@ -1165,8 +1179,8 @@ impl CryptoOutput {
     fn sync_directories(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            self.stage.try_clone()?.into_std_file().sync_all()?;
-            self.parent.try_clone()?.into_std_file().sync_all()?;
+            sync_crypto_directory(&self.stage)?;
+            sync_crypto_directory(&self.parent)?;
         }
         Ok(())
     }
@@ -1501,6 +1515,55 @@ fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn crypto_directory_sync_accepts_retained_nofollow_handles() {
+        use cap_fs_ext::DirExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("original-parent");
+        let moved = root.path().join("moved-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let root_authority =
+            cap_std::fs::Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+        let retained = root_authority.open_dir_nofollow("original-parent").unwrap();
+
+        // These are the exact authority handles used for publication, not
+        // ordinary std::fs::File directory descriptors. Fsyncing a clone of
+        // the authority itself fails with EBADF on Linux.
+        sync_crypto_directory(&root_authority).unwrap();
+        sync_crypto_directory(&retained).unwrap();
+
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        sync_crypto_directory(&retained).unwrap();
+        assert!(
+            same_file::Handle::from_file(retained.into_std_file()).unwrap()
+                == same_file::Handle::from_path(&moved).unwrap(),
+            "directory synchronization must retain the original authority"
+        );
+    }
+
+    #[test]
+    fn sign_publishes_into_new_nested_parent_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest_bytes = br#"{"nested_parent":"durable signature"}"#;
+        let manifest = root.path().join("manifest.json");
+        let key = root.path().join("signing.key");
+        std::fs::write(&manifest, manifest_bytes).unwrap();
+        std::fs::write(&key, test_key_bytes()).unwrap();
+        let parent = root.path().join("new").join("nested").join("bundle");
+        let output = parent.join("manifest.sig.json");
+        assert!(!parent.exists());
+
+        let signed = sign_manifest(&manifest, &key, &output, false).unwrap();
+        assert!(output.is_file());
+        assert_eq!(std::fs::read(&manifest).unwrap(), manifest_bytes);
+        std::fs::write(parent.join("manifest.json"), manifest_bytes).unwrap();
+        let verified = verify_bundle(&parent, Some(&signed.public_key)).unwrap();
+        assert!(verified.signature_checked && verified.signature_verified);
+    }
 
     fn real_age_dependency_available(tool: &str, result: ShareResult<()>) -> bool {
         match result {
