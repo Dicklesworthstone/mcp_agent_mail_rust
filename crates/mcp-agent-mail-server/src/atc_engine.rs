@@ -16,7 +16,7 @@
 //! are built on top of these two primitives.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
@@ -3974,7 +3974,7 @@ pub struct AtcEngine {
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
     /// Projects whose conflict state has changed since the last cached render.
     dirty_projects: HashSet<String>,
-    /// Monotone communication/session synthesis for operator summaries.
+    /// Lifetime communication totals with bounded recent entity detail.
     session_summary: SessionSummary,
     /// Cross-thread participation graph for communication-aware coordination.
     thread_participation: ThreadParticipationGraph,
@@ -6766,13 +6766,72 @@ mod engine_tests {
 // Session Synthesizer (Track 7)
 // ──────────────────────────────────────────────────────────────────────
 
-/// Monotonically-growing session summary.
+// These are observation budgets, not limits on mailbox identities or threads.
+// Never retain arbitrary lifetime traffic in the daemon's in-memory summaries.
+const MAX_SESSION_AGENTS: usize = 1024;
+const MAX_SESSION_THREADS: usize = 4096;
+const MAX_OBSERVATION_KEY_BYTES: usize = 512;
+
+/// One recency entry per retained key, including under repeated observations.
+/// Unlike an append-only access queue, hot keys cannot grow this index forever.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ObservationRecency {
+    order: BTreeMap<u64, String>,
+    by_key: HashMap<String, u64>,
+    sequence: u64,
+}
+
+impl ObservationRecency {
+    fn touch(&mut self, key: &str, capacity: usize) -> Option<String> {
+        let retained_key = self
+            .by_key
+            .get(key)
+            .and_then(|previous| self.order.remove(previous));
+        if self.sequence == u64::MAX {
+            // Keep relative order even after sequence exhaustion. The index is
+            // bounded, so rebasing never reintroduces lifetime-sized work.
+            self.sequence = 0;
+            for (_, retained) in std::mem::take(&mut self.order) {
+                self.sequence += 1;
+                if let Some(sequence) = self.by_key.get_mut(&retained) {
+                    *sequence = self.sequence;
+                }
+                self.order.insert(self.sequence, retained);
+            }
+        }
+        self.sequence += 1;
+        if let Some(sequence) = self.by_key.get_mut(key) {
+            *sequence = self.sequence;
+        } else {
+            self.by_key.insert(key.to_owned(), self.sequence);
+        }
+        self.order.insert(
+            self.sequence,
+            retained_key.unwrap_or_else(|| key.to_owned()),
+        );
+        if self.by_key.len() > capacity
+            && let Some((_, evicted)) = self.order.pop_first()
+        {
+            self.by_key.remove(&evicted);
+            Some(evicted)
+        } else {
+            None
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(sequence) = self.by_key.remove(key) {
+            self.order.remove(&sequence);
+        }
+    }
+}
+
+/// Lifetime event totals with bounded, recently observed entity detail.
 ///
-/// Every field only increases — counters increment, sets grow, timestamps
-/// advance.  This guarantees two consecutive reads always see the same or
-/// more information (no regressions).
-///
-/// NOT a pure join-semilattice (counters use increment, not max).
+/// Counters and timestamps never regress. Agent/thread sets and their counters
+/// describe at most the most recently observed 1,024 agents and 4,096 threads;
+/// an evicted entity starts fresh if observed again. The durable mailbox keeps
+/// the complete history. Eviction is visible in the rendered summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSummary {
     // ── Monotone Counters (increment only) ──
@@ -6789,9 +6848,14 @@ pub struct SessionSummary {
     pub conflicts_resolved: u64,
     pub atc_interventions: u64,
 
-    // ── Sets (union only) ──
+    // ── Bounded recent entity detail ──
     pub active_agents: HashSet<String>,
     pub active_threads: HashSet<String>,
+    pub evicted_agent_details: u64,
+    pub evicted_thread_details: u64,
+    pub skipped_detail_observations: u64,
+    agent_recency: ObservationRecency,
+    thread_recency: ObservationRecency,
 
     // ── Timestamps (max only) ──
     /// First event ever absorbed (set once, never changes).
@@ -6901,7 +6965,35 @@ impl SynthesisEvent {
 }
 
 impl SessionSummary {
-    /// Absorb a single event.  O(1) per event.
+    fn observe_agent(&mut self, agent: &str) -> bool {
+        if agent.len() > MAX_OBSERVATION_KEY_BYTES {
+            self.skipped_detail_observations = self.skipped_detail_observations.saturating_add(1);
+            return false;
+        }
+        if let Some(evicted) = self.agent_recency.touch(agent, MAX_SESSION_AGENTS) {
+            self.active_agents.remove(&evicted);
+            self.agent_message_counts.remove(&evicted);
+            self.evicted_agent_details = self.evicted_agent_details.saturating_add(1);
+        }
+        self.active_agents.insert(agent.to_owned());
+        true
+    }
+
+    fn observe_thread(&mut self, thread: &str) -> bool {
+        if thread.len() > MAX_OBSERVATION_KEY_BYTES {
+            self.skipped_detail_observations = self.skipped_detail_observations.saturating_add(1);
+            return false;
+        }
+        if let Some(evicted) = self.thread_recency.touch(thread, MAX_SESSION_THREADS) {
+            self.active_threads.remove(&evicted);
+            self.thread_message_counts.remove(&evicted);
+            self.evicted_thread_details = self.evicted_thread_details.saturating_add(1);
+        }
+        self.active_threads.insert(thread.to_owned());
+        true
+    }
+
+    /// Absorb an event in O(log budget) per observed agent/thread.
     pub fn absorb(&mut self, event: &SynthesisEvent) {
         let ts = event.timestamp_micros();
         self.last_event_ts = self.last_event_ts.max(ts);
@@ -6918,47 +7010,51 @@ impl SessionSummary {
                 ..
             } => {
                 self.messages_sent += 1;
-                self.active_agents.insert(from.clone());
                 for recipient in to {
-                    self.active_agents.insert(recipient.clone());
+                    self.observe_agent(recipient);
                 }
-                *self.agent_message_counts.entry(from.clone()).or_insert(0) += 1;
-                if let Some(tid) = thread_id {
-                    self.active_threads.insert(tid.clone());
+                // Observe the sender last so even an oversized recipient list
+                // cannot leave a counter whose identity was just evicted.
+                if self.observe_agent(from) {
+                    *self.agent_message_counts.entry(from.clone()).or_insert(0) += 1;
+                }
+                if let Some(tid) = thread_id
+                    && self.observe_thread(tid)
+                {
                     *self.thread_message_counts.entry(tid.clone()).or_insert(0) += 1;
                 }
             }
             SynthesisEvent::MessageReceived { agent, .. } => {
                 self.messages_received += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::BuildSlotAcquired { agent, .. } => {
                 self.build_slots_acquired += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::BuildSlotRenewed { agent, .. } => {
                 self.build_slots_renewed += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::BuildSlotReleased { agent, .. } => {
                 self.build_slots_released += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationGranted { agent, .. } => {
                 self.reservations_granted += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationReleased { agent, .. } => {
                 self.reservations_released += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationRenewed { agent, .. } => {
                 self.reservations_renewed += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationForceReleased { agent, .. } => {
                 self.reservations_force_released += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ConflictDetected { .. } => {
                 self.conflicts_detected += 1;
@@ -6988,7 +7084,7 @@ impl SessionSummary {
         let mut lines = Vec::new();
 
         lines.push(format!(
-            "Messages: {} sent, {} received across {} threads",
+            "Messages: {} sent, {} received; {} retained threads",
             self.messages_sent,
             self.messages_received,
             self.active_threads.len(),
@@ -7000,7 +7096,7 @@ impl SessionSummary {
             .iter()
             .map(|(a, c)| (a.as_str(), *c))
             .collect();
-        agent_counts.sort_by_key(|entry| Reverse(entry.1));
+        agent_counts.sort_by_key(|entry| (Reverse(entry.1), entry.0));
         if !agent_counts.is_empty() {
             let top: Vec<String> = agent_counts
                 .iter()
@@ -7016,7 +7112,7 @@ impl SessionSummary {
             .iter()
             .map(|(t, c)| (t.as_str(), *c))
             .collect();
-        thread_counts.sort_by_key(|entry| Reverse(entry.1));
+        thread_counts.sort_by_key(|entry| (Reverse(entry.1), entry.0));
         if !thread_counts.is_empty() {
             let top: Vec<String> = thread_counts
                 .iter()
@@ -7061,12 +7157,28 @@ impl SessionSummary {
             lines.push(format!("ATC interventions: {}", self.atc_interventions));
         }
 
-        lines.push(format!("Active agents: {}", self.active_agents.len()));
+        lines.push(format!(
+            "Recent agents retained: {}",
+            self.active_agents.len()
+        ));
+        if self.evicted_agent_details > 0
+            || self.evicted_thread_details > 0
+            || self.skipped_detail_observations > 0
+        {
+            lines.push(format!(
+                "Detail window: {} agent evictions, {} thread evictions, {} oversized observations skipped; lifetime event totals preserved",
+                self.evicted_agent_details,
+                self.evicted_thread_details,
+                self.skipped_detail_observations,
+            ));
+        }
 
         lines.join("\n")
     }
 
-    /// Check monotonicity: every field in `self` is >= `previous`.
+    /// Check counters and pre-eviction entity detail for monotonicity.
+    /// Tests that cross a detail budget separately assert lifetime totals and
+    /// recent-window semantics; detail sets cannot remain monotone after eviction.
     #[cfg(test)]
     fn is_monotone_vs(&self, previous: &Self) -> bool {
         self.messages_sent >= previous.messages_sent
@@ -7146,6 +7258,125 @@ mod synthesis_tests {
         assert_eq!(summary.active_threads.len(), 2);
         assert_eq!(summary.first_event_ts, 1_000_000);
         assert_eq!(summary.last_event_ts, 3_000_000);
+    }
+
+    #[test]
+    fn observation_churn_preserves_lifetime_totals_and_recent_detail() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("LiveAgent", "codex-cli", Some("/project"));
+        engine.observe_activity("LiveAgent", Some("/project"), 1);
+        let events = MAX_SESSION_THREADS + MAX_SESSION_AGENTS;
+        for index in 0..events {
+            let agent = format!("Agent{index}");
+            let thread = format!("thread-{index}");
+            let timestamp = i64::try_from(index).unwrap() + 1;
+            engine.note_message_sent(&agent, &["Anchor".to_owned()], Some(&thread), timestamp);
+            engine.note_message_sent("Anchor", &[], Some("hot-thread"), timestamp);
+        }
+
+        let summary = &mut engine.session_summary;
+        assert_eq!(summary.messages_sent, u64::try_from(events * 2).unwrap());
+        assert_eq!(summary.first_event_ts, 1);
+        assert_eq!(summary.last_event_ts, i64::try_from(events).unwrap());
+        assert_eq!(summary.active_agents.len(), MAX_SESSION_AGENTS);
+        assert_eq!(summary.active_threads.len(), MAX_SESSION_THREADS);
+        assert_eq!(
+            summary.agent_message_counts.get("Anchor"),
+            Some(&u64::try_from(events).unwrap())
+        );
+        assert_eq!(
+            summary.thread_message_counts.get("hot-thread"),
+            Some(&u64::try_from(events).unwrap())
+        );
+        assert!(!summary.active_agents.contains("Agent0"));
+        assert!(!summary.agent_message_counts.contains_key("Agent0"));
+        assert!(!summary.active_threads.contains("thread-0"));
+        assert!(!summary.thread_message_counts.contains_key("thread-0"));
+        assert!(
+            summary
+                .active_agents
+                .contains(&format!("Agent{}", events - 1))
+        );
+        assert!(summary.evicted_agent_details > 0);
+        assert!(summary.evicted_thread_details > 0);
+        assert!(
+            summary
+                .formatted()
+                .contains("lifetime event totals preserved")
+        );
+        assert_eq!(
+            summary.agent_recency.by_key.len(),
+            summary.active_agents.len()
+        );
+        assert_eq!(
+            summary.agent_recency.order.len(),
+            summary.active_agents.len()
+        );
+        assert_eq!(
+            summary.thread_recency.by_key.len(),
+            summary.active_threads.len()
+        );
+        assert_eq!(
+            summary.thread_recency.order.len(),
+            summary.active_threads.len()
+        );
+        assert!(
+            summary
+                .agent_message_counts
+                .keys()
+                .all(|name| summary.active_agents.contains(name))
+        );
+        assert!(
+            summary
+                .thread_message_counts
+                .keys()
+                .all(|name| summary.active_threads.contains(name))
+        );
+
+        // Observational eviction must never evict liveness/authorization state.
+        assert_eq!(
+            engine.agent_liveness("LiveAgent"),
+            Some(LivenessState::Alive)
+        );
+        assert!(engine.thread_participation.participation_count() <= MAX_PARTICIPATION_EDGES);
+        assert!(engine.thread_participation.evicted_participations() > 0);
+    }
+
+    #[test]
+    fn detail_eviction_restarts_entity_counts_without_resetting_totals() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&msg_sent("Returning", &[], None, 1));
+        for index in 0..MAX_SESSION_AGENTS {
+            summary.absorb(&msg_sent(&format!("Agent{index}"), &[], None, 2));
+        }
+        assert!(!summary.agent_message_counts.contains_key("Returning"));
+        summary.absorb(&msg_sent("Returning", &[], None, 3));
+        assert_eq!(summary.agent_message_counts.get("Returning"), Some(&1));
+        assert_eq!(
+            summary.messages_sent,
+            u64::try_from(MAX_SESSION_AGENTS + 2).unwrap()
+        );
+        assert_eq!(summary.active_agents.len(), MAX_SESSION_AGENTS);
+    }
+
+    #[test]
+    fn oversized_detail_is_omitted_without_aliasing_or_losing_events() {
+        let mut summary = SessionSummary::default();
+        let oversized = "x".repeat(MAX_OBSERVATION_KEY_BYTES + 1);
+        summary.absorb(&msg_sent(&oversized, &["Recipient"], Some(&oversized), 1));
+        assert_eq!(summary.messages_sent, 1);
+        assert_eq!(
+            summary.active_agents,
+            HashSet::from(["Recipient".to_owned()])
+        );
+        assert!(summary.agent_message_counts.is_empty());
+        assert!(summary.active_threads.is_empty());
+        assert_eq!(summary.skipped_detail_observations, 2);
+        assert!(
+            summary
+                .render()
+                .contains("2 oversized observations skipped")
+        );
     }
 
     #[test]
@@ -7699,14 +7930,30 @@ mod load_routing_tests {
 // Predictive Coordination Intelligence (Track 12)
 // ──────────────────────────────────────────────────────────────────────
 
-/// Thread participation graph — tracks which agents are active in which
-/// threads.  Agents sharing multiple threads are at higher conflict risk.
+const MAX_PARTICIPATION_AGENTS: usize = 1024;
+const MAX_PARTICIPATION_THREADS: usize = 1024;
+const MAX_PARTICIPATION_EDGES: usize = 4096;
+const MAX_PARTICIPANTS_PER_THREAD: usize = 128;
+
+/// Recent thread participation, bounded independently of daemon uptime.
+///
+/// Retains at most 1,024 agents, 1,024 threads, and 4,096 unique participation
+/// edges, with at most 128 recently observed participants per thread. Repeated
+/// observations refresh recency; pressure evicts the oldest detail from both
+/// indexes. This observational graph never grants lifecycle/release authority.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadParticipationGraph {
-    /// `thread_id` → set of participating agent names.
-    thread_agents: HashMap<String, HashSet<String>>,
+    /// `thread_id` → participating agent names and their observation sequence.
+    thread_agents: HashMap<String, HashMap<String, u64>>,
     /// `agent` → set of `thread_id` values they are active in.
     agent_threads: HashMap<String, HashSet<String>>,
+    agent_recency: ObservationRecency,
+    thread_recency: ObservationRecency,
+    /// One entry per edge; repeated participation replaces the old entry.
+    edge_recency: BTreeMap<u64, (String, String)>,
+    sequence: u64,
+    evicted_participations: u64,
+    skipped_participations: u64,
 }
 
 impl ThreadParticipationGraph {
@@ -7715,14 +7962,121 @@ impl ThreadParticipationGraph {
         if agent == ATC_AGENT_NAME {
             return;
         }
-        self.thread_agents
-            .entry(thread_id.to_string())
-            .or_default()
-            .insert(agent.to_string());
-        self.agent_threads
-            .entry(agent.to_string())
-            .or_default()
-            .insert(thread_id.to_string());
+        if agent.len() > MAX_OBSERVATION_KEY_BYTES || thread_id.len() > MAX_OBSERVATION_KEY_BYTES {
+            self.skipped_participations = self.skipped_participations.saturating_add(1);
+            return;
+        }
+        if self.sequence == u64::MAX {
+            self.sequence = 0;
+            for (_, (retained_agent, retained_thread)) in std::mem::take(&mut self.edge_recency) {
+                self.sequence += 1;
+                if let Some(agents) = self.thread_agents.get_mut(&retained_thread)
+                    && let Some(sequence) = agents.get_mut(&retained_agent)
+                {
+                    *sequence = self.sequence;
+                }
+                self.edge_recency
+                    .insert(self.sequence, (retained_agent, retained_thread));
+            }
+        }
+        self.sequence += 1;
+        let retained_edge = if let Some(previous) = self
+            .thread_agents
+            .get_mut(thread_id)
+            .and_then(|agents| agents.get_mut(agent))
+        {
+            let old_sequence = std::mem::replace(previous, self.sequence);
+            self.edge_recency.remove(&old_sequence)
+        } else {
+            self.thread_agents
+                .entry(thread_id.to_owned())
+                .or_default()
+                .insert(agent.to_owned(), self.sequence);
+            self.agent_threads
+                .entry(agent.to_owned())
+                .or_default()
+                .insert(thread_id.to_owned());
+            None
+        };
+        self.edge_recency.insert(
+            self.sequence,
+            retained_edge.unwrap_or_else(|| (agent.to_owned(), thread_id.to_owned())),
+        );
+        self.enforce_participation_budgets(agent, thread_id);
+    }
+
+    fn enforce_participation_budgets(&mut self, agent: &str, thread_id: &str) {
+        if let Some(evicted) = self.agent_recency.touch(agent, MAX_PARTICIPATION_AGENTS) {
+            let threads: Vec<String> = self
+                .agent_threads
+                .get(&evicted)
+                .into_iter()
+                .flat_map(|threads| threads.iter().cloned())
+                .collect();
+            for thread in threads {
+                self.evict_participation(&evicted, &thread);
+            }
+        }
+        if let Some(evicted) = self
+            .thread_recency
+            .touch(thread_id, MAX_PARTICIPATION_THREADS)
+        {
+            let agents: Vec<String> = self
+                .thread_agents
+                .get(&evicted)
+                .into_iter()
+                .flat_map(|agents| agents.keys().cloned())
+                .collect();
+            for agent in agents {
+                self.evict_participation(&agent, &evicted);
+            }
+        }
+        let oldest_participant = self.thread_agents.get(thread_id).and_then(|agents| {
+            if agents.len() <= MAX_PARTICIPANTS_PER_THREAD {
+                return None;
+            }
+            agents
+                .iter()
+                .min_by(|(left_name, left_order), (right_name, right_order)| {
+                    left_order
+                        .cmp(right_order)
+                        .then_with(|| left_name.cmp(right_name))
+                })
+                .map(|(name, _)| name.clone())
+        });
+        if let Some(oldest) = oldest_participant {
+            self.evict_participation(&oldest, thread_id);
+        }
+        if self.edge_recency.len() > MAX_PARTICIPATION_EDGES
+            && let Some((oldest_agent, oldest_thread)) = self
+                .edge_recency
+                .first_key_value()
+                .map(|(_, edge)| edge.clone())
+        {
+            self.evict_participation(&oldest_agent, &oldest_thread);
+        }
+    }
+
+    fn evict_participation(&mut self, agent: &str, thread: &str) {
+        let Some(agents) = self.thread_agents.get_mut(thread) else {
+            return;
+        };
+        let Some(sequence) = agents.remove(agent) else {
+            return;
+        };
+        self.edge_recency.remove(&sequence);
+        if agents.is_empty() {
+            self.thread_agents.remove(thread);
+            self.thread_recency.remove(thread);
+        }
+        if let Some(threads) = self.agent_threads.get_mut(agent) {
+            threads.remove(thread);
+            if threads.is_empty() {
+                self.agent_threads.remove(agent);
+                self.agent_recency.remove(agent);
+            }
+        }
+        self.evicted_participations = self.evicted_participations.saturating_add(1);
     }
 
     /// Count how many threads two agents share.
@@ -7737,22 +8091,59 @@ impl ThreadParticipationGraph {
         threads_a.intersection(threads_b).count()
     }
 
-    /// Find all agent pairs that share >= `min_shared` threads.
-    /// These pairs are at elevated conflict risk.
+    /// Find retained agent pairs that share at least `min_shared` threads.
+    ///
+    /// Enumerate pairs inside each retained thread, never every pair in the
+    /// lifetime roster. For a positive threshold, work is at most
+    /// edges × (participants-per-thread - 1)/2 pair observations, and disjoint
+    /// single-participant threads do no pair work. A zero threshold preserves
+    /// the explicit request for every retained pair, including no overlap.
     #[must_use]
     pub fn high_risk_pairs(&self, min_shared: usize) -> Vec<(String, String, usize)> {
-        let agents: Vec<&str> = self.agent_threads.keys().map(String::as_str).collect();
-        let mut pairs = Vec::new();
-        for i in 0..agents.len() {
-            for j in (i + 1)..agents.len() {
-                let count = self.shared_thread_count(agents[i], agents[j]);
-                if count >= min_shared {
-                    pairs.push((agents[i].to_string(), agents[j].to_string(), count));
+        self.high_risk_pairs_with_work(min_shared).0
+    }
+
+    fn high_risk_pairs_with_work(
+        &self,
+        min_shared: usize,
+    ) -> (Vec<(String, String, usize)>, usize) {
+        let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+        let mut pair_observations = 0;
+        for agents in self.thread_agents.values() {
+            let mut agents: Vec<&str> = agents.keys().map(String::as_str).collect();
+            agents.sort_unstable();
+            for (index, &left) in agents.iter().enumerate() {
+                for &right in &agents[index + 1..] {
+                    *counts.entry((left, right)).or_default() += 1;
+                    pair_observations += 1;
                 }
             }
         }
-        pairs.sort_by_key(|pair| Reverse(pair.2));
-        pairs
+        if min_shared == 0 {
+            // Preserve the caller's explicit zero-overlap query. Only this
+            // branch needs all pairs, bounded by the retained agent budget.
+            let mut agents: Vec<&str> = self.agent_threads.keys().map(String::as_str).collect();
+            agents.sort_unstable();
+            for (index, &left) in agents.iter().enumerate() {
+                for &right in &agents[index + 1..] {
+                    counts.entry((left, right)).or_default();
+                    pair_observations += 1;
+                }
+            }
+        }
+        let mut pairs: Vec<_> = counts
+            .into_iter()
+            .filter(|(_, count)| *count >= min_shared)
+            .map(|((left, right), count)| (left.to_owned(), right.to_owned(), count))
+            .collect();
+        pairs.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        (pairs, pair_observations)
     }
 
     /// Number of tracked agents.
@@ -7765,6 +8156,24 @@ impl ThreadParticipationGraph {
     #[must_use]
     pub fn thread_count(&self) -> usize {
         self.thread_agents.len()
+    }
+
+    /// Number of retained unique agent/thread edges.
+    #[must_use]
+    pub fn participation_count(&self) -> usize {
+        self.edge_recency.len()
+    }
+
+    /// Lifetime edges evicted by the recent-detail budgets.
+    #[must_use]
+    pub const fn evicted_participations(&self) -> u64 {
+        self.evicted_participations
+    }
+
+    /// Oversized observations omitted without truncating or aliasing identity.
+    #[must_use]
+    pub const fn skipped_participations(&self) -> u64 {
+        self.skipped_participations
     }
 }
 
@@ -7811,6 +8220,177 @@ pub fn rank_probe_targets<S: BuildHasher>(
 #[cfg(test)]
 mod predictive_tests {
     use super::*;
+
+    fn assert_consistent_participation_indexes(graph: &ThreadParticipationGraph) {
+        let forward: usize = graph.thread_agents.values().map(HashMap::len).sum();
+        let reverse: usize = graph.agent_threads.values().map(HashSet::len).sum();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward, graph.participation_count());
+        assert!(forward <= MAX_PARTICIPATION_EDGES);
+        assert!(graph.agent_count() <= MAX_PARTICIPATION_AGENTS);
+        assert!(graph.thread_count() <= MAX_PARTICIPATION_THREADS);
+        assert_eq!(graph.agent_recency.order.len(), graph.agent_count());
+        assert_eq!(graph.agent_recency.by_key.len(), graph.agent_count());
+        assert_eq!(graph.thread_recency.order.len(), graph.thread_count());
+        assert_eq!(graph.thread_recency.by_key.len(), graph.thread_count());
+        for (thread, agents) in &graph.thread_agents {
+            assert!(!agents.is_empty());
+            assert!(agents.len() <= MAX_PARTICIPANTS_PER_THREAD);
+            for (agent, sequence) in agents {
+                assert!(graph.agent_threads[agent].contains(thread));
+                assert_eq!(
+                    graph.edge_recency.get(sequence),
+                    Some(&(agent.clone(), thread.clone()))
+                );
+            }
+        }
+        for (agent, threads) in &graph.agent_threads {
+            assert!(!threads.is_empty());
+            for thread in threads {
+                assert!(graph.thread_agents[thread].contains_key(agent));
+            }
+        }
+    }
+
+    #[test]
+    fn participation_churn_retains_recent_intersections_and_no_orphan_edges() {
+        let mut graph = ThreadParticipationGraph::default();
+        for index in 0..MAX_PARTICIPATION_THREADS * 2 {
+            graph.record_participation(&format!("Old{index}"), &format!("thread-{index}"));
+            for thread in ["hot-1", "hot-2"] {
+                graph.record_participation("RecentA", thread);
+                graph.record_participation("RecentB", thread);
+            }
+        }
+        assert_consistent_participation_indexes(&graph);
+        assert_eq!(graph.shared_thread_count("RecentA", "RecentB"), 2);
+        assert_eq!(
+            graph.high_risk_pairs(2),
+            vec![("RecentA".into(), "RecentB".into(), 2)]
+        );
+        assert!(!graph.agent_threads.contains_key("Old0"));
+        assert!(!graph.thread_agents.contains_key("thread-0"));
+        assert!(graph.evicted_participations() > 0);
+
+        // Repeated activity refreshes one entry rather than accumulating access
+        // records. This was a separate lifetime-growth trap for queue-based LRU.
+        let before = graph.participation_count();
+        for _ in 0..10_000 {
+            graph.record_participation("RecentA", "hot-1");
+        }
+        assert_eq!(graph.participation_count(), before);
+        assert_consistent_participation_indexes(&graph);
+    }
+
+    #[test]
+    fn participation_edge_and_fanout_budgets_bound_actual_pair_work() {
+        let mut graph = ThreadParticipationGraph::default();
+        let participants = MAX_PARTICIPANTS_PER_THREAD;
+        let threads = MAX_PARTICIPATION_EDGES / participants * 2;
+        for thread in 0..threads {
+            for agent in 0..participants {
+                graph
+                    .record_participation(&format!("Agent{agent:02}"), &format!("thread-{thread}"));
+            }
+        }
+        assert_consistent_participation_indexes(&graph);
+        assert_eq!(graph.participation_count(), MAX_PARTICIPATION_EDGES);
+        assert!(!graph.thread_agents.contains_key("thread-0"));
+        let retained_threads = MAX_PARTICIPATION_EDGES / participants;
+        assert_eq!(
+            graph.shared_thread_count("Agent00", "Agent01"),
+            retained_threads
+        );
+        let (pairs, observed) = graph.high_risk_pairs_with_work(retained_threads);
+        assert_eq!(pairs.len(), participants * (participants - 1) / 2);
+        assert!(pairs.iter().all(|(_, _, count)| *count == retained_threads));
+        assert_eq!(observed, MAX_PARTICIPATION_EDGES * (participants - 1) / 2);
+
+        for agent in 0..participants * 3 {
+            graph.record_participation(&format!("Wide{agent:02}"), "wide-thread");
+        }
+        assert_eq!(graph.thread_agents["wide-thread"].len(), participants);
+        assert!(!graph.agent_threads.contains_key("Wide00"));
+        assert_consistent_participation_indexes(&graph);
+        let (_, observed) = graph.high_risk_pairs_with_work(1);
+        assert!(observed <= MAX_PARTICIPATION_EDGES * (participants - 1) / 2);
+    }
+
+    #[test]
+    fn disjoint_threads_do_not_compare_the_whole_roster() {
+        let mut graph = ThreadParticipationGraph::default();
+        for index in 0..MAX_PARTICIPATION_AGENTS {
+            graph.record_participation(&format!("Agent{index}"), &format!("thread-{index}"));
+        }
+        let (pairs, observed) = graph.high_risk_pairs_with_work(1);
+        assert!(pairs.is_empty());
+        assert_eq!(observed, 0);
+        assert_consistent_participation_indexes(&graph);
+    }
+
+    #[test]
+    fn zero_overlap_query_preserves_all_retained_pairs() {
+        let mut graph = ThreadParticipationGraph::default();
+        graph.record_participation("A", "shared");
+        graph.record_participation("B", "shared");
+        graph.record_participation("C", "separate");
+        assert_eq!(
+            graph.high_risk_pairs(0),
+            vec![
+                ("A".into(), "B".into(), 1),
+                ("A".into(), "C".into(), 0),
+                ("B".into(), "C".into(), 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn observation_sequence_rebase_preserves_recent_keys_and_edges() {
+        let mut recency = ObservationRecency::default();
+        recency.touch("old", 2);
+        recency.touch("hot", 2);
+        recency.sequence = u64::MAX;
+        assert_eq!(recency.touch("hot", 2), None);
+        assert_eq!(recency.touch("new", 2), Some("old".to_owned()));
+        assert_eq!(recency.order.len(), 2);
+        assert_eq!(recency.by_key.len(), 2);
+
+        let mut graph = ThreadParticipationGraph::default();
+        graph.record_participation("Old", "shared");
+        graph.record_participation("Hot", "shared");
+        graph.sequence = u64::MAX;
+        graph.record_participation("Hot", "shared");
+        graph.record_participation("New", "shared");
+        assert_consistent_participation_indexes(&graph);
+        assert_eq!(graph.shared_thread_count("Old", "Hot"), 1);
+        assert_eq!(graph.participation_count(), 3);
+        assert_eq!(
+            graph
+                .edge_recency
+                .first_key_value()
+                .map(|(_, (name, _))| name.as_str()),
+            Some("Old")
+        );
+        assert_eq!(
+            graph
+                .edge_recency
+                .last_key_value()
+                .map(|(_, (name, _))| name.as_str()),
+            Some("New")
+        );
+    }
+
+    #[test]
+    fn oversized_participation_keeps_both_indexes_empty() {
+        let mut graph = ThreadParticipationGraph::default();
+        let oversized = "x".repeat(MAX_OBSERVATION_KEY_BYTES + 1);
+        graph.record_participation(&oversized, "thread");
+        graph.record_participation("Agent", &oversized);
+        assert_eq!(graph.skipped_participations(), 2);
+        assert_eq!(graph.agent_count(), 0);
+        assert_eq!(graph.thread_count(), 0);
+        assert_consistent_participation_indexes(&graph);
+    }
 
     #[test]
     fn empty_graph() {
