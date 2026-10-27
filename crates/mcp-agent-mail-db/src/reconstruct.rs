@@ -6341,6 +6341,19 @@ fn merge_salvaged_database(
         // recipient read/ack. Carry them over for deliveries the candidate
         // holds, so a rebuild neither loses reads nor revives acknowledged
         // project mail as unacknowledged.
+        // Replay order cannot reproduce issued delivery cursors. Restore the
+        // source ledger only after every identity/recipient mapping is settled,
+        // and before shared receipts rely on recovered delivery visibility.
+        for message_id in crate::reconstruct_delivery::preserve_delivery_history(
+            &target_conn,
+            &salvage_conn,
+            &project_id_map,
+            &agent_id_map,
+            &message_id_map,
+        )? {
+            recipient_json_updates.insert(message_id);
+        }
+
         if table_exists(&salvage_conn, "project_mailbox_receipts")? {
             let mut receipt_rowid_floor = 0i64;
             loop {
