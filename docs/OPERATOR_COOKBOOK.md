@@ -367,23 +367,48 @@ an absolute project path must match the stored path, including canonical path
 aliases. Navigation rejects a URI project that disagrees with `--project` or
 `AGENT_MAIL_PROJECT`. It does not infer a different project from a colliding
 slug or create a missing project. An explicit `--agent` must be present in the
-server's available-agent roster.
+verified roster. Complete snapshots include retired reservation holders; on
+older servers, explicit agent selection uses the available-agent directory.
+
+For project-wide automation, use `am reservations --all --json --server`:
+`--all` includes every agent's active reservations, not released history.
+`am file_reservations active` remains a text view with a default display limit
+of 50 rows.
 
 Authentication failure, an unavailable server, changed/mismatched identity,
 redirects, malformed responses, and incomplete lists exit nonzero without
 printing a reservation result or falling back to local/archive data. Automation
 must check the exit status before using stdout or deciding that no leases exist.
 
-**Completeness limit:** The existing reservation resource caps a response at
-250 rows and has no multi-page snapshot token. Server mode accepts only a
-short page (at most 249 matching reservations) and refuses a full 250-row page,
-even for a smaller CLI `--limit` or navigation page. This prevents independent
-OFFSET requests from skipping live leases during concurrent changes. Navigation
-sorts the verified complete result into its existing newest-first order before
-applying `limit`/`offset`. For larger projects, use a successful direct read for
-a complete safety decision. The documented MCP resource's paged reads remain
-available for manual inspection, but independently fetched pages are not an
-atomic reservation snapshot.
+**Server protocol and completeness:** A snapshot-capable server returns the
+project, holder identities, and complete reservation set from one database
+read scope. The client validates the snapshot's version, completeness marker,
+row count, project and holder IDs, timestamps, and requested active/history
+scope. A snapshot is bounded to 10,000 reservations and holder identities and
+4 MiB of JSON; exceeding a bound is an error, never a truncated success.
+
+An already-running v0.3.39 server supports only ordinary resource pages and
+ignores the newer `snapshot` parameter. A newer client recognizes only a
+successful, well-formed array response as that older protocol. It discards
+this initial response, which may contain only the default 20 rows, then reads
+the same resource from the same authenticated endpoint with explicit
+`limit=250&offset=0`. Only a short page (at most 249 matching reservations) is
+accepted as complete. A full 250-row page is refused even when a smaller CLI
+display or navigation limit was requested. The project and available-agent
+roster are still verified before and after the read. This path needs a client
+containing the server-read implementation, but no server restart or mailbox
+change. The released v0.3.39 CLI itself does not have `--server`.
+
+An authentication/transport/RPC error, an invalid envelope, or a malformed
+snapshot object never causes negotiation to the older protocol. The client
+does not combine independent OFFSET pages, change endpoints, or read local
+storage after a refusal. Keep automation blocked if it cannot establish a
+complete result. For larger sets on an older server, a successful direct read
+or snapshot-capable server is needed for a complete safety decision.
+
+Navigation sorts the verified complete result into its existing newest-first
+order before applying `limit`/`offset`. These reads observe reservation state;
+they do not prevent later lease changes or make subsequent cleanup atomic.
 
 ## 9. Release a crashed agent's reservations [stateful]
 

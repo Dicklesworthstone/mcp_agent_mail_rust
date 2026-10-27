@@ -23,6 +23,9 @@ use crate::{CliError, CliResult};
 use mcp_agent_mail_db::queries::{
     FILE_RESERVATION_SNAPSHOT_MAX_BYTES, FILE_RESERVATION_SNAPSHOT_MAX_ROWS,
 };
+// Older running servers expose only capped resource pages. A short first page
+// can prove completeness, but a full page cannot distinguish 250 from 251 rows.
+const LEGACY_RESOURCE_PAGE_MAX: usize = 250;
 const RESOURCE_TIMEOUT_SECONDS: u64 = 30;
 
 /// A pinned, authenticated resource authority shared by explicit server reads.
@@ -100,7 +103,7 @@ pub(crate) fn read_server(
         ));
     }
 
-    // Pin the endpoint and credential for all three reads. In particular, never
+    // Pin the endpoint and credential for every read. In particular, never
     // retry an authentication rejection on a different endpoint or in SQLite.
     let session = ServerResourceSession::new(config)?;
     crate::context::run_async(async {
@@ -117,7 +120,27 @@ pub(crate) fn read_server(
             encode_resource_component(&project.slug)
         );
         let payload = session.read(&reservation_uri).await?;
-        let (holder_roster, reservations) = validate_snapshot(&payload, &project, active_only)?;
+        let (holder_roster, reservations) = if payload.is_array() {
+            // v0.3.39 ignores the unknown snapshot parameter and returns its
+            // ordinary default page (20 rows). That page is only a protocol
+            // signal, never evidence of a complete listing. Validate it before
+            // negotiating, then discard it and request the explicit page bound
+            // from the same authenticated authority. Do not negotiate after an
+            // HTTP/RPC error, invalid envelope, or malformed snapshot object.
+            validate_legacy_reservation_page(&payload, active_only)?;
+            let legacy_uri = format!(
+                "resource://file_reservations/{}?active_only={active_only}&limit={LEGACY_RESOURCE_PAGE_MAX}&offset=0&format=json",
+                encode_resource_component(&project.slug)
+            );
+            let legacy_payload = session.read(&legacy_uri).await?;
+            let reservations = validate_complete_legacy_reservations(&legacy_payload, active_only)?;
+            // Legacy pages identify holders by name, not ID. Preserve those
+            // names in the rows, while explicit --agent resolution continues
+            // to use the independently verified available-agent directory.
+            (agent_roster.clone(), reservations)
+        } else {
+            validate_snapshot(&payload, &project, active_only)?
+        };
         if agent_roster
             .iter()
             .any(|agent| holder_roster.binary_search(agent).is_err())
@@ -458,6 +481,37 @@ fn validate_reservations(value: &Value, active_only: bool) -> CliResult<Vec<Serv
     Ok(reservations)
 }
 
+fn validate_legacy_reservation_page(
+    value: &Value,
+    active_only: bool,
+) -> CliResult<Vec<ServerReservation>> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| invalid_response("legacy reservation content is not an array"))?;
+    if rows.len() > LEGACY_RESOURCE_PAGE_MAX {
+        return Err(invalid_response(
+            "legacy reservation response exceeds the requested page",
+        ));
+    }
+    validate_reservations(value, active_only)
+}
+
+fn validate_complete_legacy_reservations(
+    value: &Value,
+    active_only: bool,
+) -> CliResult<Vec<ServerReservation>> {
+    let reservations = validate_legacy_reservation_page(value, active_only)?;
+    if reservations.len() == LEGACY_RESOURCE_PAGE_MAX {
+        return Err(CliError::Other(format!(
+            "server returned a full {LEGACY_RESOURCE_PAGE_MAX}-row legacy reservation page; \
+             a complete reservation list cannot be verified. A successful direct CLI read \
+             or a server with complete snapshot support is required; independent resource \
+             pages are not a complete snapshot"
+        )));
+    }
+    Ok(reservations)
+}
+
 fn validate_snapshot(
     value: &Value,
     project: &ResolvedProject,
@@ -468,7 +522,7 @@ fn validate_snapshot(
         || value.get("active_only").and_then(Value::as_bool) != Some(active_only)
     {
         return Err(invalid_response(
-            "server did not return a complete reservation snapshot; upgrade the server if it only supports resource pages",
+            "server did not return a valid complete reservation snapshot",
         ));
     }
     let snapshot_project = validate_project(
@@ -881,6 +935,57 @@ mod tests {
         }
         let oversized = snapshot((1..=10_001).map(reservation).collect(), true);
         assert!(validate_snapshot(&oversized, &project, true).is_err());
+    }
+
+    #[test]
+    fn legacy_complete_reads_require_a_short_explicit_page() {
+        for count in [0, 20, 27, LEGACY_RESOURCE_PAGE_MAX - 1] {
+            let value = serde_json::json!(
+                (1..=i64::try_from(count).unwrap())
+                    .map(reservation)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                validate_complete_legacy_reservations(&value, true)
+                    .unwrap()
+                    .len(),
+                count
+            );
+        }
+        let full = serde_json::json!((1..=250).map(reservation).collect::<Vec<_>>());
+        assert!(validate_legacy_reservation_page(&full, true).is_ok());
+        let error = validate_complete_legacy_reservations(&full, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("full 250-row legacy reservation page")
+        );
+        let oversized = serde_json::json!((1..=251).map(reservation).collect::<Vec<_>>());
+        assert!(validate_legacy_reservation_page(&oversized, true).is_err());
+        assert!(validate_complete_legacy_reservations(&oversized, true).is_err());
+    }
+
+    #[test]
+    fn legacy_protocol_requires_valid_rows_and_never_accepts_an_envelope_as_a_page() {
+        let mut row = reservation(1);
+        // The released server does not return snapshot-only holder/project IDs.
+        let fields = row.as_object_mut().unwrap();
+        fields.remove("agent_id");
+        fields.remove("project_id");
+        row["agent"] = serde_json::json!("RetiredHolder");
+        let rows =
+            validate_complete_legacy_reservations(&serde_json::json!([row.clone()]), true).unwrap();
+        assert_eq!(rows[0].agent, "RetiredHolder");
+        row["exclusive"] = serde_json::json!("true");
+        assert!(validate_legacy_reservation_page(&serde_json::json!([row]), true).is_err());
+        for value in [
+            serde_json::json!(null),
+            snapshot(vec![reservation(1)], true),
+            serde_json::json!({"reservations": []}),
+            serde_json::json!([reservation(1), reservation(1)]),
+        ] {
+            assert!(validate_complete_legacy_reservations(&value, true).is_err());
+        }
     }
 
     #[test]

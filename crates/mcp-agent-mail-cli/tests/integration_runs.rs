@@ -5783,6 +5783,10 @@ struct ReservationReadPeer {
 
 impl ReservationReadPeer {
     fn start(mut reply: impl FnMut(&Value) -> Value + Send + 'static) -> Self {
+        Self::start_with_status(move |request| (200, reply(request)))
+    }
+
+    fn start_with_status(mut reply: impl FnMut(&Value) -> (u16, Value) + Send + 'static) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -5839,8 +5843,9 @@ impl ReservationReadPeer {
                 let request: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(request["method"], "resources/read");
                 worker_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let body = reply(&request).to_string();
-                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                let (status, payload) = reply(&request);
+                let body = payload.to_string();
+                write!(socket, "HTTP/1.1 {status} Test response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
         Self {
@@ -5879,6 +5884,25 @@ fn reservation_read_snapshot(project: &str, slug: &str, rows: Vec<Value>) -> Val
         "active_only": true, "captured_ts": "2024-02-01T00:00:00Z",
         "count": rows.len(), "reservations": rows,
     })
+}
+
+fn reservation_read_legacy_rows(count: usize) -> Vec<Value> {
+    (1..=count)
+        .map(|id| {
+            // v0.3.39 returns holder names, not project_id/agent_id. A retired
+            // holder can retain a lease despite being absent from the directory.
+            json!({
+                "id": id,
+                "agent": if id == 27 { "RetiredVale" } else { "RusticGlen" },
+                "path_pattern": format!("src/legacy-{id}/**"),
+                "exclusive": id % 2 != 0,
+                "reason": format!("legacy lease {id}"),
+                "created_ts": format!("2024-01-01T00:{:02}:{:02}Z", id / 60, id % 60),
+                "expires_ts": "2100-01-01T00:00:00Z",
+                "released_ts": null,
+            })
+        })
+        .collect()
 }
 
 fn conversation_read_message(id: i64, include_body: bool) -> Value {
@@ -6252,7 +6276,7 @@ fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
         "missing-released",
         "invalid-exclusive",
         "invalid-timestamp",
-        "legacy-array",
+        "malformed-legacy-array",
         "incomplete-snapshot",
         "wrong-count",
         "foreign-project",
@@ -6298,7 +6322,10 @@ fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
             let mut snapshot =
                 reservation_read_snapshot(&expected_project, "gh368-project", vec![row]);
             match failure {
-                "legacy-array" => snapshot = snapshot["reservations"].clone(),
+                "malformed-legacy-array" => {
+                    snapshot = snapshot["reservations"].clone();
+                    snapshot[0].as_object_mut().unwrap().remove("reason");
+                }
                 "incomplete-snapshot" => snapshot["complete"] = json!(false),
                 "wrong-count" => snapshot["count"] = json!(2),
                 "snapshot-identity" => {
@@ -6354,6 +6381,433 @@ fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
             snapshot_tree(&env.storage_root).is_empty(),
             "server read changed the local archive"
         );
+    }
+}
+
+#[test]
+fn reservation_server_reads_negotiate_legacy_pages_without_local_database_admission() {
+    // R3 protocol/fault fixture: the real CLI and HTTP transport run, but the
+    // peer substitutes the v0.3.39 resource contract. Compensating real-server
+    // coverage is reservation_reads_direct_and_real_server_preserve_output_without_local_admission.
+    // Complete native CLI/old-server qualification remains tracked by br-gh368.
+    for count in [0, 27, 249] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            let payload = if uri.starts_with("resource://project/") {
+                json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+            } else {
+                let rows = reservation_read_legacy_rows(count);
+                if uri.contains("snapshot=true") {
+                    assert_eq!(
+                        uri,
+                        "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                    );
+                    // v0.3.39 ignores snapshot=true and applies its default
+                    // twenty-row page. It is not a completeness witness.
+                    json!(rows.into_iter().take(20).collect::<Vec<_>>())
+                } else {
+                    assert_eq!(
+                        uri,
+                        "resource://file_reservations/gh368-project?active_only=true&limit=250&offset=0&format=json"
+                    );
+                    json!(rows)
+                }
+            };
+            reservation_read_resource_reply(request, payload)
+        });
+        let unavailable = env.tmp.path().join("legacy-client-unusable.sqlite3");
+        std::fs::write(
+            &unavailable,
+            b"The legacy server owns the reservation data.\n",
+        )
+        .unwrap();
+        let before = file_snapshot(&unavailable);
+        let vars = reservation_read_env(
+            &env,
+            peer.port,
+            &format!("sqlite:///{}", unavailable.display()),
+        );
+        let out = run_am_hermetic(
+            &vars,
+            Some(env.hostile_repo()),
+            &[
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+        );
+        let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+        let rows = data["all_active"].as_array().unwrap();
+        assert_eq!(rows.len(), count, "the twenty-row probe must be discarded");
+        let paths: std::collections::HashSet<_> = rows
+            .iter()
+            .map(|row| row["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            (1..=count)
+                .map(|id| format!("src/legacy-{id}/**"))
+                .collect()
+        );
+        assert_eq!(data["reservation_read_attestation"]["source"], "mcp_server");
+        assert_eq!(
+            data["reservation_read_attestation"]["database_matches_server"],
+            Value::Null
+        );
+
+        if count == 27 {
+            assert!(rows.iter().any(|row| row["agent"] == "RetiredVale"));
+            let out = run_am_hermetic(
+                &vars,
+                Some(env.hostile_repo()),
+                &["file_reservations", "active", &project, "--server"],
+            );
+            let text = reservation_read_success(&out);
+            assert!(text.contains("src/legacy-27/**"));
+            assert!(text.contains("RetiredVale"));
+
+            let out = run_am_hermetic(
+                &vars,
+                Some(env.hostile_repo()),
+                &[
+                    "robot",
+                    "navigate",
+                    "resource://file_reservations/gh368-project?active_only=true&limit=2&offset=1",
+                    "--project",
+                    &project,
+                    "--json",
+                    "--server",
+                ],
+            );
+            let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+            let page = data["data"]["reservations"].as_array().unwrap();
+            assert_eq!(page.len(), 2);
+            assert_eq!(page[0]["path"], "src/legacy-26/**");
+            assert_eq!(page[1]["path"], "src/legacy-25/**");
+
+            // A name in a legacy lease is not a substitute for the server's
+            // registered-agent authority when the caller explicitly scopes it.
+            let out = run_am_hermetic(
+                &vars,
+                Some(env.hostile_repo()),
+                &[
+                    "reservations",
+                    "--project",
+                    &project,
+                    "--agent",
+                    "RetiredVale",
+                    "--json",
+                    "--server",
+                ],
+            );
+            reservation_read_failed_closed(&out);
+        }
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            if count == 27 { 16 } else { 4 },
+            "each read must verify the project around one separate bounded legacy request"
+        );
+        assert_eq!(file_snapshot(&unavailable), before);
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
+fn reservation_server_legacy_history_preserves_released_and_expired_rows() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                "created_at": "2024-01-01T00:00:00Z",
+                "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert!(
+                uri == "resource://file_reservations/gh368-project?snapshot=true&active_only=false&format=json"
+                    || uri
+                        == "resource://file_reservations/gh368-project?active_only=false&limit=250&offset=0&format=json",
+                "history must keep active_only=false through negotiation: {uri}"
+            );
+            let mut rows = reservation_read_legacy_rows(3);
+            rows[1]["released_ts"] = json!("2024-02-01T00:00:00Z");
+            rows[2]["expires_ts"] = json!("2024-02-01T00:00:00Z");
+            json!(rows)
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let vars = reservation_read_env(&env, peer.port, &env.database_url());
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    let text = reservation_read_success(&out);
+    for id in 1..=3 {
+        assert!(text.contains(&format!("src/legacy-{id}/**")));
+    }
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "navigate",
+            "resource://file_reservations/gh368-project?active_only=false&limit=2",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let page = data["data"]["reservations"].as_array().unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0]["path"], "src/legacy-3/**");
+    assert_eq!(page[0]["released"], false);
+    assert_eq!(page[1]["path"], "src/legacy-2/**");
+    assert_eq!(page[1]["released"], true);
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 8);
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
+}
+
+#[test]
+fn reservation_server_legacy_auth_refusal_never_uses_readable_local_mailbox() {
+    let (env, project, slug) = reservation_read_fixture();
+    let args = ["reservations", "--project", &project, "--all", "--json"];
+    let direct = run_am_hermetic(
+        &reservation_read_env(&env, 1, &env.database_url()),
+        Some(env.hostile_repo()),
+        &args,
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&direct)).unwrap();
+    assert_eq!(data["all_active"].as_array().unwrap().len(), 3);
+    let before = file_snapshot(&env.db_path);
+    for status in [401, 403] {
+        let expected_project = project.clone();
+        let expected_slug = slug.clone();
+        let peer = ReservationReadPeer::start_with_status(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                return (
+                    200,
+                    reservation_read_resource_reply(
+                        request,
+                        json!({"id": 1, "slug": expected_slug, "human_key": expected_project,
+                            "created_at": "2024-01-01T00:00:00Z",
+                            "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]}),
+                    ),
+                );
+            }
+            if uri.contains("snapshot=true") {
+                assert_eq!(
+                    uri,
+                    format!(
+                        "resource://file_reservations/{expected_slug}?snapshot=true&active_only=true&format=json"
+                    )
+                );
+                return (
+                    200,
+                    reservation_read_resource_reply(
+                        request,
+                        json!(reservation_read_legacy_rows(1)),
+                    ),
+                );
+            }
+            assert_eq!(
+                uri,
+                format!(
+                    "resource://file_reservations/{expected_slug}?active_only=true&limit=250&offset=0&format=json"
+                )
+            );
+            (status, json!({"message": RESERVATION_READ_TEST_TOKEN}))
+        });
+        let mut server_args = args.to_vec();
+        server_args.push("--server");
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &server_args,
+        );
+        reservation_read_failed_closed(&out);
+        assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(file_snapshot(&env.db_path), before);
+    }
+}
+
+#[test]
+fn reservation_server_legacy_negotiation_fails_closed_without_retries_or_pagination() {
+    for failure in [
+        "malformed-probe",
+        "oversized-probe",
+        "malformed-page",
+        "duplicate-page",
+        "released-page",
+        "full-page",
+        "oversized-page",
+        "page-object",
+        "page-wrong-id",
+        "page-wrong-uri",
+        "page-rpc-error",
+        "page-unauthorized",
+        "page-forbidden",
+        "page-redirect",
+        "changed-project",
+        "changed-roster",
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let mut project_reads = 0;
+        let peer = ReservationReadPeer::start_with_status(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                project_reads += 1;
+                let mut descriptor = json!({"id": 1, "slug": "gh368-project",
+                    "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z",
+                    "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]});
+                if project_reads > 1 {
+                    if failure == "changed-project" {
+                        descriptor["created_at"] = json!("2025-01-01T00:00:00Z");
+                    } else if failure == "changed-roster" {
+                        descriptor["agents"][0]["id"] = json!(2);
+                    }
+                }
+                return (200, reservation_read_resource_reply(request, descriptor));
+            }
+            if uri.contains("snapshot=true") {
+                assert_eq!(
+                    uri,
+                    "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                );
+                let mut rows = reservation_read_legacy_rows(if failure == "oversized-probe" {
+                    251
+                } else {
+                    20
+                });
+                if failure == "malformed-probe" {
+                    rows[0].as_object_mut().unwrap().remove("released_ts");
+                }
+                return (200, reservation_read_resource_reply(request, json!(rows)));
+            }
+            assert_eq!(
+                uri,
+                "resource://file_reservations/gh368-project?active_only=true&limit=250&offset=0&format=json",
+                "negotiation must never request another page or a different resource"
+            );
+            let count = match failure {
+                "full-page" => 250,
+                "oversized-page" => 251,
+                _ => 27,
+            };
+            let mut rows = reservation_read_legacy_rows(count);
+            match failure {
+                "malformed-page" => rows[0]["exclusive"] = json!("true"),
+                "duplicate-page" => rows.push(rows[0].clone()),
+                "released-page" => rows[0]["released_ts"] = json!("2024-02-01T00:00:00Z"),
+                _ => {}
+            }
+            let payload = if failure == "page-object" {
+                reservation_read_snapshot(&expected_project, "gh368-project", rows)
+            } else {
+                json!(rows)
+            };
+            let mut reply = reservation_read_resource_reply(request, payload);
+            match failure {
+                "page-wrong-id" => reply["id"] = json!("unrelated-request"),
+                "page-wrong-uri" => {
+                    reply["result"]["contents"][0]["uri"] =
+                        json!("resource://file_reservations/another-project")
+                }
+                "page-rpc-error" => {
+                    reply = json!({"jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32603, "message": RESERVATION_READ_TEST_TOKEN}});
+                }
+                "page-unauthorized" | "page-forbidden" | "page-redirect" => {
+                    let status = match failure {
+                        "page-unauthorized" => 401,
+                        "page-forbidden" => 403,
+                        _ => 307,
+                    };
+                    return (status, json!({"message": RESERVATION_READ_TEST_TOKEN}));
+                }
+                _ => {}
+            }
+            (200, reply)
+        });
+        let mut commands = vec![vec![
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ]];
+        if failure == "full-page" {
+            commands.push(vec![
+                "file_reservations",
+                "active",
+                &project,
+                "--limit",
+                "1",
+                "--server",
+            ]);
+            commands.push(vec![
+                "robot",
+                "navigate",
+                "resource://file_reservations/gh368-project?active_only=true&limit=1",
+                "--project",
+                &project,
+                "--json",
+                "--server",
+            ]);
+        }
+        for args in &commands {
+            let out = run_am_hermetic(
+                &reservation_read_env(&env, peer.port, &env.database_url()),
+                Some(env.hostile_repo()),
+                args,
+            );
+            eprintln!("GH368 legacy failure scenario: {failure}, {args:?}");
+            reservation_read_failed_closed(&out);
+        }
+        let expected_reads = match failure {
+            "malformed-probe" | "oversized-probe" => 2,
+            "changed-project" | "changed-roster" => 4,
+            _ => 3,
+        };
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            expected_reads * commands.len(),
+            "{failure} must stop at its failing boundary without retries or OFFSET pages"
+        );
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
     }
 }
 
