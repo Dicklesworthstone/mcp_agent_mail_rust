@@ -7046,9 +7046,7 @@ fn atc_effect_kind(effect: &atc::AtcEffectPlan) -> Result<EffectKind, String> {
         "routing_suggestion" => Ok(EffectKind::RoutingSuggestion),
         "backpressure" => Ok(EffectKind::Backpressure),
         "no_action" => Ok(EffectKind::NoAction),
-        other => Err(format!(
-            "unsupported ATC effect kind for experience append: {other}"
-        )),
+        _ => Err("unsupported ATC effect kind for experience append".to_string()),
     }
 }
 
@@ -7103,20 +7101,6 @@ fn atc_effect_project_slug(project_key: Option<&str>) -> String {
 
 fn atc_elapsed_micros(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
-
-fn atc_effect_sampled_input(effect: &atc::AtcEffectPlan) -> serde_json::Value {
-    serde_json::json!({
-        "decision_id": effect.decision_id,
-        "effect_id": effect.effect_id,
-        "kind": effect.kind,
-        "category": effect.category,
-        "agent": effect.agent,
-        "project_key": effect.project_key,
-        "policy_id": effect.policy_id,
-        "policy_revision": effect.policy_revision,
-        "has_message": effect.message.as_deref().is_some_and(|message| !message.trim().is_empty()),
-    })
 }
 
 fn atc_experience_stratum_key(row: &ExperienceRow) -> String {
@@ -7223,9 +7207,7 @@ fn append_atc_experience_for_effect(
             tracing::warn!(
                 event = "atc.insert_experience",
                 error_kind = "build_experience_row",
-                agent_name = %effect.agent,
-                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
-                sampled_input = ?atc_effect_sampled_input(effect),
+                decision_id = effect.decision_id,
                 %error,
                 "failed to build ATC experience row"
             );
@@ -7263,9 +7245,7 @@ fn append_atc_experience_for_effect(
             tracing::warn!(
                 event = "atc.insert_experience",
                 error_kind = "append_experience",
-                agent_name = %effect.agent,
-                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
-                sampled_input = ?atc_effect_sampled_input(effect),
+                decision_id = effect.decision_id,
                 %error,
                 "failed to append ATC experience row"
             );
@@ -7485,40 +7465,11 @@ fn capture_atc_execution_result(
 
     let capture = atc_execution_capture(status);
 
-    // Transition: Planned → Dispatched (effect was handed to executor).
-    // If this fails, we still attempt the second transition because an
-    // orphaned experience stuck in Planned is worse than skipping a step.
-    let cx = runtime_request_cx(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
-        &cx,
-        pool,
-        exp_id,
-        ExperienceState::Dispatched,
-        ts_micros,
-        None,
-        None,
-    )) {
-        asupersync::Outcome::Ok(()) => {}
-        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
-            field: "state",
-            ..
-        }) => {}
-        asupersync::Outcome::Err(error) => {
-            mcp_agent_mail_core::global_metrics()
-                .atc
-                .record_derivation_error("transition_dispatched");
-            tracing::warn!(experience_id = exp_id, %error, "failed to mark experience dispatched, continuing to final state");
-            // Do NOT return — fall through to the second transition so the
-            // execution result is still captured. An experience in Planned state
-            // with no execution record is worse than a skipped Dispatched step.
-        }
-        _ => {}
-    }
-
-    // Transition: Dispatched → Executed/Failed/Throttled/Suppressed/Skipped.
+    // Validate and persist Planned → Dispatched → execution result atomically.
+    // A rejected context or reason must not leave an intermediate state behind.
     let context_patch = atc_execution_context_patch(&capture, execution_mode, status, ts_micros);
     let cx = runtime_request_cx(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+    match block_on(mcp_agent_mail_db::queries::record_atc_execution_outcome(
         &cx,
         pool,
         exp_id,
@@ -7616,6 +7567,33 @@ fn atc_resolution_outcome_from_activity(
             "latency_micros": agent_active_since - resolution_anchor_micros,
         })),
     })
+}
+
+/// Keep rejected outcome payloads out of request-specific diagnostics. The DB
+/// repeats this check against its current row and atomically promotes/resolves
+/// under the write transaction; this preflight is not the persistence gate.
+fn atc_resolution_content_is_valid(
+    experience: &ExperienceRow,
+    outcome: &ExperienceOutcome,
+    api: &'static str,
+) -> bool {
+    match experience.validate_content_with_outcome(outcome) {
+        Ok(()) => true,
+        Err(category) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("resolution_content_rejected");
+            tracing::warn!(
+                event = "atc.content_rejected",
+                api,
+                experience_id = experience.experience_id,
+                state = %experience.state,
+                category,
+                "ATC outcome rejected before lifecycle mutation"
+            );
+            false
+        }
+    }
 }
 
 fn promote_executed_experience_to_open_for_resolution(
@@ -7836,22 +7814,12 @@ fn sweep_open_experiences_for_resolution(
                 continue;
             }
 
-            if !promote_executed_experience_to_open_for_resolution(
-                pool,
-                current_row.experience_id,
-                current_row.state,
-                now_micros,
-                "failed to transition ack-overdue experience to open",
-            ) {
+            let outcome = build_ack_overdue_message_resolution(&current_row, candidate, now_micros);
+            if !atc_resolution_content_is_valid(&current_row, &outcome, "ack_overdue_sweep") {
                 ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                mcp_agent_mail_core::global_metrics()
-                    .atc
-                    .record_derivation_error("ack_overdue_promote");
                 continue;
             }
-
-            let outcome = build_ack_overdue_message_resolution(&current_row, candidate, now_micros);
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
                 &cx,
                 pool,
                 current_row.experience_id,
@@ -7964,76 +7932,89 @@ fn sweep_open_experiences_for_resolution(
             continue;
         }
 
-        // Ensure executed experiences transition to open before resolution.
-        // The state machine requires Executed → Open → Resolved.
-        if !promote_executed_experience_to_open_for_resolution(
-            pool,
-            experience.experience_id,
-            experience.state,
-            now_micros,
-            "failed to transition experience to open",
-        ) {
+        let resolution_anchor_micros = atc_resolution_anchor_micros(experience);
+        let age_micros = now_micros.saturating_sub(resolution_anchor_micros);
+        let reservation_outcome = if is_reservation_related_experience(experience) {
+            resolve_reservation_experience(experience, resolution_anchor_micros, now_micros)
+        } else {
+            None
+        };
+        let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
+        let activity_outcome = if reservation_outcome.is_none() {
+            atc_resolution_outcome_from_activity(experience, agent_active_since)
+        } else {
+            None
+        };
+        if let Some(outcome) = reservation_outcome.as_ref().or(activity_outcome.as_ref())
+            && !atc_resolution_content_is_valid(experience, outcome, "resolution_sweep")
+        {
             continue;
         }
 
-        let resolution_anchor_micros = atc_resolution_anchor_micros(experience);
-        let age_micros = now_micros.saturating_sub(resolution_anchor_micros);
+        // Observed outcomes promote and resolve in one DB transaction. With
+        // no outcome, retain the existing open/wait/expire lifecycle behavior.
+        if reservation_outcome.is_none()
+            && activity_outcome.is_none()
+            && !promote_executed_experience_to_open_for_resolution(
+                pool,
+                experience.experience_id,
+                experience.state,
+                now_micros,
+                "failed to transition experience to open",
+            )
+        {
+            continue;
+        }
 
         // Reservation-specific resolution: check the engine's reservation event
         // log for release/conflict/force-release events that followed this
         // experience's creation (br-bn0vb.10).
-        if is_reservation_related_experience(experience) {
-            if let Some(outcome) =
-                resolve_reservation_experience(experience, resolution_anchor_micros, now_micros)
-            {
-                let cx = runtime_request_cx(Budget::INFINITE);
-                match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                    &cx,
-                    pool,
-                    experience.experience_id,
-                    &outcome,
-                )) {
-                    asupersync::Outcome::Ok(()) => {
-                        rows_resolved = rows_resolved.saturating_add(1);
-                        let stratum_key = atc_experience_stratum_key(experience);
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_experience_resolved(&outcome.label, &stratum_key);
-                        tracing::debug!(
-                            event = "atc.sweep.reservation_resolved",
-                            experience_id = experience.experience_id,
-                            outcome = %outcome.label,
-                            age_micros,
-                            agent_name = %experience.subject,
-                            "resolved reservation experience"
-                        );
-                    }
-                    asupersync::Outcome::Err(error) => {
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_derivation_error("resolve_reservation");
-                        tracing::warn!(
-                            experience_id = experience.experience_id,
-                            %error,
-                            "failed to resolve reservation experience"
-                        );
-                    }
-                    _ => {}
+        if let Some(outcome) = reservation_outcome {
+            let cx = runtime_request_cx(Budget::INFINITE);
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
+                &cx,
+                pool,
+                experience.experience_id,
+                &outcome,
+            )) {
+                asupersync::Outcome::Ok(()) => {
+                    rows_resolved = rows_resolved.saturating_add(1);
+                    let stratum_key = atc_experience_stratum_key(experience);
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_experience_resolved(&outcome.label, &stratum_key);
+                    tracing::debug!(
+                        event = "atc.sweep.reservation_resolved",
+                        experience_id = experience.experience_id,
+                        outcome = %outcome.label,
+                        age_micros,
+                        agent_name = %experience.subject,
+                        "resolved reservation experience"
+                    );
                 }
-                continue;
+                asupersync::Outcome::Err(error) => {
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_derivation_error("resolve_reservation");
+                    tracing::warn!(
+                        experience_id = experience.experience_id,
+                        %error,
+                        "failed to resolve reservation experience"
+                    );
+                }
+                _ => {}
             }
+            continue;
         }
 
         // Check if the subject agent has been active since this effect was
         // actually dispatched/executed. Agent activity is tracked by the
         // ATC engine.
-        let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
-        if let Some(outcome) = atc_resolution_outcome_from_activity(experience, agent_active_since)
-        {
+        if let Some(outcome) = activity_outcome {
             // Positive resolution: the agent showed activity after the
             // advisory/probe, indicating the decision was correct.
             let cx = runtime_request_cx(Budget::INFINITE);
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
                 &cx,
                 pool,
                 experience.experience_id,
@@ -8240,6 +8221,15 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
         _ => return,
     };
 
+    let outcome = ExperienceOutcome {
+        observed_ts_micros: now_micros,
+        label: label.to_string(),
+        correct,
+        actual_loss: None,
+        regret: None,
+        evidence: Some(evidence),
+    };
+
     // Only resolve Conflict-subsystem experiences.
     for experience in &open_experiences {
         if experience.subsystem != ExperienceSubsystem::Conflict {
@@ -8255,28 +8245,12 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             }
         }
 
-        let outcome = ExperienceOutcome {
-            observed_ts_micros: now_micros,
-            label: label.to_string(),
-            correct,
-            actual_loss: None,
-            regret: None,
-            evidence: Some(evidence.clone()),
-        };
-
-        if !promote_executed_experience_to_open_for_resolution(
-            pool,
-            experience.experience_id,
-            experience.state,
-            now_micros,
-            "failed to transition conflict experience to open before resolution",
-        ) {
+        if !atc_resolution_content_is_valid(experience, &outcome, "reservation_event") {
             continue;
         }
-
         let cx2 = runtime_request_cx(Budget::INFINITE);
         if let asupersync::Outcome::Err(error) =
-            block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+            block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
                 &cx2,
                 pool,
                 experience.experience_id,
@@ -8286,8 +8260,6 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             tracing::warn!(
                 experience_id = experience.experience_id,
                 %error,
-                label,
-                agent,
                 "failed to resolve conflict experience on reservation event"
             );
         }
@@ -8811,7 +8783,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                         Err(error) => {
                             tracing::warn!(
                                 decision_id = effect.decision_id,
-                                effect_id = %effect.effect_id,
                                 %error,
                                 "failed to append ATC experience"
                             );
@@ -14125,9 +14096,8 @@ fn append_atc_hot_path_observation_row(
             tracing::warn!(
                 event = "atc.hot_path_observation.append",
                 observation_family,
-                decision_class = %row.decision_class,
-                subject = %row.subject,
-                project_slug = %atc_effect_project_slug(row.project_key.as_deref()),
+                decision_id = row.decision_id,
+                state = %row.state,
                 %error,
                 "failed to append ATC hot-path observation"
             );
@@ -15228,21 +15198,15 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
 
     match experience.state {
         ExperienceState::Executed => {
-            if !promote_executed_experience_to_open_for_resolution(
-                pool,
-                experience.experience_id,
-                experience.state,
-                now_micros,
-                "failed to transition message_sent experience to open before ack/read resolution",
-            ) {
+            let outcome = apply_outcome("resolved_after_execute_promote");
+            if !atc_resolution_content_is_valid(&experience, &outcome, "message_outcome") {
                 return;
             }
-            let outcome = apply_outcome("resolved_after_execute_promote");
             let experience_id = experience.experience_id;
             match atc_ledger_block_on(|cx| {
                 let outcome = &outcome;
                 async move {
-                    mcp_agent_mail_db::queries::resolve_atc_experience(
+                    mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
                         &cx,
                         pool,
                         experience_id,
@@ -15316,11 +15280,14 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         }
         ExperienceState::Open => {
             let outcome = apply_outcome("resolved_from_open");
+            if !atc_resolution_content_is_valid(&experience, &outcome, "message_outcome") {
+                return;
+            }
             let experience_id = experience.experience_id;
             match atc_ledger_block_on(|cx| {
                 let outcome = &outcome;
                 async move {
-                    mcp_agent_mail_db::queries::resolve_atc_experience(
+                    mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
                         &cx,
                         pool,
                         experience_id,
@@ -15409,6 +15376,13 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                     )
                 };
                 let outcome = apply_outcome(note);
+                if !atc_resolution_content_is_valid(
+                    &experience,
+                    &outcome,
+                    "message_outcome_upgrade",
+                ) {
+                    return;
+                }
                 let experience_id = experience.experience_id;
                 match atc_ledger_block_on(|cx| {
                     let outcome = &outcome;
@@ -23933,6 +23907,236 @@ first body
                 .and_then(serde_json::Value::as_str),
             Some("executed")
         );
+    }
+
+    fn reopened_atc_content_snapshot(primary_path: &str) -> String {
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary_path);
+        let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+            .expect("independently reopen ATC sidecar");
+        let rows = verify
+            .query_sync("SELECT * FROM atc_experiences ORDER BY experience_id", &[])
+            .expect("read all persisted ATC fields");
+        let rollups = verify
+            .query_sync(
+                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key",
+                &[],
+            )
+            .expect("read persisted ATC rollups");
+        format!("{rows:?}\n{rollups:?}")
+    }
+
+    #[test]
+    fn atc_server_content_rejection_preserves_sidecar_before_state_promotion() {
+        const CANARY: &str = "ghp_ATC_SYNTHETIC_SERVER_CANARY_20261027";
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("atc-content-boundary.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let database_url = format!("sqlite:///{db_path_str}");
+        let pool = create_pool(&DbPoolConfig {
+            database_url: database_url.clone(),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("file-backed ATC fixture");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("AM_ATC_EXECUTOR_MODE", "canary"),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let config = mcp_agent_mail_core::Config::get();
+                assert!(atc_durable_writes_enabled(
+                    config.atc_write_mode,
+                    AtcExecutorMode::from_env(),
+                    Some(&pool),
+                    false,
+                ));
+                let cx = Cx::for_testing();
+                let now = mcp_agent_mail_db::now_micros();
+                let observation = build_message_sent_observation_row(
+                    "privacy-project",
+                    7401,
+                    "BlueHarbor",
+                    &["GreenCanyon".to_string()],
+                    Some("privacy-canary"),
+                    &serde_json::json!({
+                        "subject": CANARY,
+                        "body_md": CANARY,
+                        "ack_required": true,
+                        "importance": "normal",
+                    }),
+                    now,
+                );
+                append_atc_hot_path_observation_row(&pool, &observation, "message_sent");
+                let stored = block_on(
+                    mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, &pool, 7401),
+                )
+                .into_result()
+                .expect("read server observation")
+                .expect("ordinary server metrics persist");
+                assert_eq!(stored.state, ExperienceState::Executed);
+                let baseline = reopened_atc_content_snapshot(&db_path_str);
+                assert!(
+                    !baseline.contains(CANARY),
+                    "message content must not enter ATC"
+                );
+
+                let mut rejected = observation.clone();
+                rejected.decision_id = 7402;
+                rejected.effect_id = 7402;
+                rejected.evidence_summary = CANARY.to_string();
+                append_atc_hot_path_observation_row(&pool, &rejected, "message_sent");
+                assert!(
+                    reopened_atc_content_snapshot(&db_path_str) == baseline,
+                    "rejected server append changed persisted rows or rollups"
+                );
+
+                let ack_payload = serde_json::json!({ "message_id": 7401 });
+                let rejected_ack_args = serde_json::json!({
+                    "project_key": "privacy-project",
+                    "agent_name": CANARY,
+                    "message_id": 7401,
+                });
+                record_atc_message_outcome_from_tool_payload_with_pool(
+                    "acknowledge_message",
+                    Some(&rejected_ack_args),
+                    &ack_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+                assert!(
+                    reopened_atc_content_snapshot(&db_path_str) == baseline,
+                    "rejected message outcome promoted or changed the stored row"
+                );
+                let valid_ack_args = serde_json::json!({
+                    "project_key": "privacy-project",
+                    "agent_name": "GreenCanyon",
+                    "message_id": 7401,
+                });
+                record_atc_message_outcome_from_tool_payload_with_pool(
+                    "acknowledge_message",
+                    Some(&valid_ack_args),
+                    &ack_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+                let resolved = block_on(
+                    mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, &pool, 7401),
+                )
+                .into_result()
+                .expect("read resolved server observation")
+                .expect("resolved observation exists");
+                assert_eq!(resolved.state, ExperienceState::Resolved);
+                assert_eq!(resolved.outcome.as_ref().unwrap().label, "acknowledged");
+
+                let mut conflict = sample_resolution_experience(now, Some(now), Some(now));
+                conflict.experience_id = 0;
+                conflict.decision_id = 7501;
+                conflict.effect_id = 7501;
+                conflict.state = ExperienceState::Executed;
+                conflict.subsystem = ExperienceSubsystem::Conflict;
+                let stored_conflict = block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                    &cx, &pool, &conflict,
+                ))
+                .into_result()
+                .expect("append conflict fixture");
+                let before_conflict = reopened_atc_content_snapshot(&db_path_str);
+                for (label, evidence) in [
+                    (CANARY, serde_json::json!({ "reservation_count": 1 })),
+                    (
+                        "reservation_granted",
+                        serde_json::json!({ "nested": [{ "credential": CANARY }] }),
+                    ),
+                ] {
+                    resolve_conflict_experiences_on_reservation_event(
+                        &pool,
+                        &stored_conflict.subject,
+                        stored_conflict.project_key.as_deref().unwrap(),
+                        label,
+                        true,
+                        evidence,
+                    );
+                    assert!(
+                        reopened_atc_content_snapshot(&db_path_str) == before_conflict,
+                        "rejected reservation outcome changed state or rollups"
+                    );
+                }
+                resolve_conflict_experiences_on_reservation_event(
+                    &pool,
+                    &stored_conflict.subject,
+                    stored_conflict.project_key.as_deref().unwrap(),
+                    "reservation_granted",
+                    true,
+                    serde_json::json!({ "reservation_count": 1, "conflict_count": 0 }),
+                );
+                let mut planned = sample_resolution_experience(now, None, None);
+                planned.experience_id = 0;
+                planned.decision_id = 7601;
+                planned.effect_id = 7601;
+                planned.state = ExperienceState::Planned;
+                let stored_planned = block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                    &cx, &pool, &planned,
+                ))
+                .into_result()
+                .expect("append planned execution fixture");
+                let before_execution = reopened_atc_content_snapshot(&db_path_str);
+                capture_atc_execution_result(
+                    &pool,
+                    Some(stored_planned.experience_id),
+                    "canary",
+                    &format!("failed:{CANARY}"),
+                    now + 1,
+                );
+                assert!(
+                    reopened_atc_content_snapshot(&db_path_str) == before_execution,
+                    "rejected execution context left a dispatched row behind"
+                );
+                capture_atc_execution_result(
+                    &pool,
+                    Some(stored_planned.experience_id),
+                    "canary",
+                    "executed",
+                    now + 2,
+                );
+                let open = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx, &pool, None, 10,
+                ))
+                .into_result()
+                .expect("read final execution state");
+                assert_eq!(open.len(), 1);
+                assert_eq!(open[0].experience_id, stored_planned.experience_id);
+                assert_eq!(open[0].state, ExperienceState::Executed);
+                assert_eq!(open[0].dispatched_ts_micros, Some(now + 2));
+                assert_eq!(open[0].executed_ts_micros, Some(now + 2));
+
+                let sample = HealthSample {
+                    observed_at: Instant::now(),
+                    value: fetch_atc_experience_health(&database_url)
+                        .expect("ATC health inventory"),
+                };
+                let health = atc_experience_health_json(
+                    &database_url,
+                    config.atc_experience_max_rows,
+                    config.atc_write_mode,
+                    Some(&sample),
+                );
+                assert_eq!(health["storage"], "sidecar");
+                assert_eq!(health["raw_row_count"], 3);
+                assert_eq!(health["quick_check"], "ok");
+                assert!(!health.to_string().contains(CANARY));
+                assert!(!reopened_atc_content_snapshot(&db_path_str).contains(CANARY));
+            },
+        );
+        mcp_agent_mail_core::Config::reset_cached();
     }
 
     #[test]

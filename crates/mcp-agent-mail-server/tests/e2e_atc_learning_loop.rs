@@ -914,3 +914,247 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
 
     Config::reset_cached();
 }
+
+#[test]
+fn e2e_opt_in_atc_rejects_content_on_real_http_observation_path() {
+    const CANARY: &str = "ghp_ATC_SYNTHETIC_HTTP_CANARY_20261027";
+    let _guard = ATC_LEARNING_LOOP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let storage_root = temp.path().join("storage-root");
+    let project_root = temp.path().join("project-root");
+    std::fs::create_dir_all(&storage_root).expect("create isolated storage");
+    std::fs::create_dir_all(&project_root).expect("create isolated project");
+    let database_path = temp.path().join("mailbox.sqlite3");
+    let database_path_str = path_string(&database_path);
+    let database_url = format!("sqlite:///{database_path_str}");
+    let storage_root_str = path_string(&storage_root);
+    let project_key = path_string(&project_root);
+    let port = free_loopback_port();
+    let port_str = port.to_string();
+
+    with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+            ("HTTP_HOST", "127.0.0.1"),
+            ("HTTP_PORT", port_str.as_str()),
+            ("HTTP_PATH", "/mcp/"),
+            ("HTTP_BEARER_TOKEN", ""),
+            ("TUI_ENABLED", "false"),
+            ("HTTP_RATE_LIMIT_ENABLED", "false"),
+            ("HTTP_RBAC_ENABLED", "false"),
+            ("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true"),
+            ("AM_ATC_ENABLED", "true"),
+            ("AM_ATC_WRITE_MODE", "live"),
+            ("AM_ATC_EXECUTOR_MODE", "canary"),
+            ("ATC_LEARNING_DISABLED", "0"),
+            ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ("DATABASE_POOL_SIZE", "1"),
+            ("DATABASE_MAX_OVERFLOW", "0"),
+            ("AM_ATC_PROBE_INTERVAL_SECS", "3600"),
+        ],
+        || {
+            Config::reset_cached();
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            let cx = Cx::for_testing();
+            let config = Config::from_env();
+            assert!(config.atc_write_mode.is_live());
+            let server = RunningServer::spawn(config);
+            wait_for_readiness(port, &server.result_rx);
+            let pool = get_or_create_pool(&DbPoolConfig::from_env()).expect("fixture mailbox pool");
+            tool_payload(
+                "ensure_project",
+                &call_tool(
+                    port,
+                    1,
+                    "ensure_project",
+                    json!({ "human_key": project_key }),
+                ),
+            );
+            for (id, name) in [(2, "BlueHarbor"), (3, "GreenCanyon")] {
+                tool_payload(
+                    "register_agent",
+                    &call_tool(
+                        port,
+                        id,
+                        "register_agent",
+                        json!({
+                            "project_key": project_key,
+                            "program": "codex-cli",
+                            "model": "fixture",
+                            "name": name,
+                            "task_description": "isolated ATC persistence regression",
+                        }),
+                    ),
+                );
+            }
+            tool_payload(
+                "set_contact_policy",
+                &call_tool(
+                    port,
+                    4,
+                    "set_contact_policy",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": "GreenCanyon",
+                        "policy": "open",
+                    }),
+                ),
+            );
+
+            // The mailbox legitimately carries arbitrary message content;
+            // ATC retains only the derived metrics and subject hash.
+            let sent = tool_payload(
+                "send_message.content",
+                &call_tool(
+                    port,
+                    5,
+                    "send_message",
+                    json!({
+                        "project_key": project_key,
+                        "sender_name": "BlueHarbor",
+                        "to": ["GreenCanyon"],
+                        "subject": CANARY,
+                        "body_md": CANARY,
+                        "thread_id": "atc-privacy-fixture",
+                        "ack_required": true,
+                    }),
+                ),
+            );
+            let message_id = sent["deliveries"][0]["payload"]["id"]
+                .as_i64()
+                .expect("sent message ID");
+            let observation = get_message_sent_row(&runtime, &cx, &pool, message_id);
+            assert_eq!(observation.state.to_string(), "executed");
+            assert_eq!(observation.context.as_ref().unwrap()["recipient_count"], 1);
+            assert!(observation.context.as_ref().unwrap()["subject_hash"].is_string());
+            assert!(observation.validate_content().is_ok());
+            assert!(
+                !serde_json::to_string(&observation)
+                    .expect("observation JSON")
+                    .contains(CANARY)
+            );
+
+            tool_payload(
+                "acknowledge_message",
+                &call_tool(
+                    port,
+                    6,
+                    "acknowledge_message",
+                    json!({
+                        "project_key": project_key,
+                        "agent_name": "GreenCanyon",
+                        "message_id": message_id,
+                    }),
+                ),
+            );
+            let resolved = get_message_sent_row(&runtime, &cx, &pool, message_id);
+            assert_eq!(resolved.state.to_string(), "resolved");
+            assert_eq!(resolved.outcome.as_ref().unwrap().label, "acknowledged");
+            let rollups_before = runtime
+                .block_on(query_rollups(&cx, &pool))
+                .into_result()
+                .expect("rollups after real acknowledgement");
+            assert!(
+                rollups_before
+                    .iter()
+                    .any(|rollup| rollup.resolved_count >= 1 && rollup.correct_count >= 1),
+                "ordinary HTTP acknowledgement must update the real rollup"
+            );
+
+            // Thread IDs enter generated observation context. This follows
+            // real HTTP post-processing directly into append_atc_experience.
+            let rejected = tool_payload(
+                "send_message.rejected_observation",
+                &call_tool(
+                    port,
+                    7,
+                    "send_message",
+                    json!({
+                        "project_key": project_key,
+                        "sender_name": "BlueHarbor",
+                        "to": ["GreenCanyon"],
+                        "subject": "ordinary fixture message",
+                        "body_md": "the mailbox delivery remains successful",
+                        "thread_id": CANARY,
+                    }),
+                ),
+            );
+            let rejected_message_id = rejected["deliveries"][0]["payload"]["id"]
+                .as_i64()
+                .expect("second delivered message ID");
+            assert!(
+                runtime
+                    .block_on(fetch_message_sent_atc_experience(
+                        &cx,
+                        &pool,
+                        rejected_message_id
+                    ))
+                    .into_result()
+                    .expect("check rejected observation")
+                    .is_none(),
+                "real server append persisted prohibited context"
+            );
+            assert!(get_message_sent_row(&runtime, &cx, &pool, message_id) == resolved);
+            let rollups_after = runtime
+                .block_on(query_rollups(&cx, &pool))
+                .into_result()
+                .expect("rollups after refused observation");
+            assert!(
+                rollups_after == rollups_before,
+                "rejected append changed rollups"
+            );
+
+            let (status, body) = http_request(port, "GET", "/health/readiness", None)
+                .expect("operator health endpoint");
+            assert_eq!(status, 200);
+            let health: Value = serde_json::from_slice(&body).expect("operator health JSON");
+            assert_eq!(health["atc_experience_store"]["write_mode"], "live");
+            assert!(!health["atc_experience_store"].to_string().contains(CANARY));
+
+            // Join every worker before restoring env, then independently
+            // reopen the physical sidecar instead of consulting a cache.
+            server.shutdown().expect("isolated server shutdown");
+            let sidecar_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&database_path_str);
+            let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path)
+                .expect("reopen actual server sidecar");
+            let stored = verify
+                .query_sync("SELECT * FROM atc_experiences ORDER BY experience_id", &[])
+                .expect("read persisted server rows");
+            assert_eq!(stored.len(), 1, "only the valid observation should persist");
+            assert!(!format!("{stored:?}").contains(CANARY));
+            let state: String = stored[0]
+                .get_named("state")
+                .expect("stored lifecycle state");
+            assert_eq!(state, "resolved");
+            let outcome_json: String = stored[0].get_named("outcome_json").expect("stored outcome");
+            let outcome: Value = serde_json::from_str(&outcome_json).expect("stored outcome JSON");
+            assert_eq!(outcome["label"], "acknowledged");
+            let persisted_rollups = verify
+                .query_sync(
+                    "SELECT SUM(resolved_count) AS resolved_count, SUM(correct_count) AS correct_count FROM atc_experience_rollups",
+                    &[],
+                )
+                .expect("independently read persisted rollups");
+            assert_eq!(
+                persisted_rollups[0]
+                    .get_named::<i64>("resolved_count")
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                persisted_rollups[0]
+                    .get_named::<i64>("correct_count")
+                    .unwrap(),
+                1
+            );
+            let inventory = mcp_agent_mail_db::pool::inspect_atc_sidecar_health(&database_path_str);
+            assert!(inventory.present);
+            assert_eq!(inventory.experience_rows, Some(1));
+            assert_eq!(inventory.quick_check_ok, Some(true));
+        },
+    );
+    Config::reset_cached();
+}

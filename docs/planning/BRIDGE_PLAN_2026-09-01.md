@@ -187,6 +187,39 @@ Each bead embeds source context, reasoning, implementation scope, realistic posi
 a negative a naive fix fails, E2E logging, and closure evidence. Implementation and tests
 stay in one logical bead, as the suite's scope-splitting prohibition requires.
 
+#### ATC persistence implementation follow-up (`br-kp1in.50`, October 27)
+
+Commit `2a31869504f045cd03e04997bf4782d7188eba30` adds the shared bounded content
+validator at direct append, outcome resolution/replacement and context/reason/state
+amendment boundaries in both storage implementations. Nested outcome evidence and
+decoded JSON keys/values are checked before serialization. Validation bounds dynamic
+content to 64 KiB, 4,096 visited fields/values, 16 JSON levels and 4,096 bytes per string
+(the existing 256-byte summary limit remains). Merged context and replacement outcomes
+are checked against the complete row inside the write transaction. Atomic execution
+capture and observed-outcome resolution prevent rejected content leaving an intermediate
+Dispatched or Open state. Valid first-insert-wins behavior and rollup APIs are retained.
+
+The server integration in the commit containing this note uses those atomic APIs and
+removes rejected input from diagnostics. Across the implementation there are 25 new
+test functions: 11 core validator tests, 12 file/memory public-entrypoint tests, a real
+server sidecar seam test and an opt-in HTTP test on disposable mailbox/storage fixtures.
+The persistence tests independently reopen the sidecar and compare all experience and
+rollup columns after rejection; positive metrics, outcomes and idempotent replays remain
+covered. The HTTP fixture also inspects the operator inventory. Default shadow/write-off
+configuration is unchanged. These are authored regressions, not executed runtime proof.
+
+**Validation status: OPEN, not closure evidence.** The pinned `nightly-2026-08-31`
+formatter (`rustfmt 1.10.0-nightly`, runtime `9085017724`) parsed/formatted all five
+changed Rust files; a subsequent direct `rustfmt --check` and `git diff --check` passed.
+Strict `RCH_REQUIRE_REMOTE=1 rch exec -- ...` attempts for the production compiler graph,
+all-target compiler graph, Clippy, workspace formatting, focused core tests, DB lifecycle
+and rollup tests, server seam test and HTTP test all stopped with exit 127 because `rch`
+is unavailable. UBS likewise stopped with exit 127 (`ubs` unavailable). No Rust compilation
+or runtime tests ran, and local formatting is not a substitute for the strict remote
+gates. Suite guidance at `/data/projects/AGENTS.md` was absent in this environment.
+Keep `.50` open until the named gates and real fixture tests pass on the exact candidate.
+No live mailbox or existing sidecar was modified during this implementation session.
+
 **Would finishing all pre-existing open/in-progress beads close the gap? No.** It would
 leave `.48/.49/.50/.52/.53` and the current guidance errors uncovered; literal execution of stale
 release tasks would also keep targeting the wrong publication path. After these additions
