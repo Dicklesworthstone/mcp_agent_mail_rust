@@ -6419,6 +6419,9 @@ const BROWSER_TUI_DEFERRED_HTML: &str = concat!(
 
 const ATC_OPERATOR_ACTION_CAPACITY: usize = 64;
 const ATC_OPERATOR_EXECUTION_CAPACITY: usize = 64;
+const ATC_OPERATOR_COOLDOWN_CAPACITY: usize = 4_096;
+const ATC_EXECUTOR_PROJECT_CAPACITY: usize = 1_024;
+const ATC_OPERATOR_CACHE_KEY_BYTES: usize = 8_192;
 const ATC_OPERATOR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const ATC_OPERATOR_MIN_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const ATC_ROLLUP_REFRESH_INTERVAL_MICROS: i64 = 300_000_000;
@@ -6768,6 +6771,120 @@ fn atc_status_consumes_cooldown(status: &str) -> bool {
 }
 
 const ATC_QUEUE_BACKPRESSURE_STATUS: &str = "throttled:pending_queue_capacity";
+
+/// Lifetime-bounded execution history. Expiration uses the longest configured
+/// effect interval, not the interval of the last effect: a later effect may use
+/// a longer interval for the same semantic key. The operator is restarted when
+/// its configuration changes, and every current effect family is bounded by
+/// the advisory, probe and summary intervals from that configuration.
+struct AtcOperatorCooldowns {
+    last_action_by_key: HashMap<String, i64>,
+    retention_micros: i64,
+    capacity: usize,
+}
+
+impl AtcOperatorCooldowns {
+    fn new(retention_micros: i64, capacity: usize) -> Self {
+        Self {
+            last_action_by_key: HashMap::new(),
+            retention_micros: retention_micros.max(0),
+            capacity,
+        }
+    }
+
+    /// Called once per operator tick; work is bounded by the retained capacity.
+    fn prune(&mut self, now_micros: i64) {
+        let retention_micros = self.retention_micros;
+        self.last_action_by_key
+            .retain(|_, last| now_micros.saturating_sub(*last) < retention_micros);
+    }
+
+    fn execute(
+        &mut self,
+        key: &str,
+        family: &str,
+        cooldown_micros: i64,
+        now_micros: i64,
+        execute: impl FnOnce() -> String,
+    ) -> String {
+        // Explicitly disabling a family's cooldown needs no retained history.
+        if cooldown_micros <= 0 {
+            return execute();
+        }
+        // Fail closed if a future policy emits an interval our expiration
+        // horizon cannot honor. Never silently shorten a requested cooldown.
+        if cooldown_micros > self.retention_micros {
+            return "throttled:cooldown_policy_horizon".to_string();
+        }
+        if key.len() > ATC_OPERATOR_CACHE_KEY_BYTES {
+            return "throttled:cooldown_key_capacity".to_string();
+        }
+        if let Some(last) = self.last_action_by_key.get(key) {
+            if now_micros.saturating_sub(*last) < cooldown_micros {
+                return format!("throttled:{family}");
+            }
+        } else if self.last_action_by_key.len() >= self.capacity {
+            // Evicting an unexpired key could allow more mail for that target.
+            // Preserve admitted history and suppress new keys until expiration.
+            return "throttled:cooldown_capacity".to_string();
+        }
+
+        let status = execute();
+        if atc_status_consumes_cooldown(&status) {
+            if let Some(last) = self.last_action_by_key.get_mut(key) {
+                *last = now_micros;
+            } else {
+                self.last_action_by_key.insert(key.to_string(), now_micros);
+            }
+        }
+        status
+    }
+}
+
+/// A bounded success cache for idempotent system-agent registration. Eviction
+/// only repeats the durable identity lookup; it does not remove an agent or
+/// authorize an effect. FIFO keeps hot cache hits allocation-free.
+struct AtcExecutorProjectCache {
+    projects: HashSet<String>,
+    insertion_order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for AtcExecutorProjectCache {
+    fn default() -> Self {
+        Self {
+            projects: HashSet::new(),
+            insertion_order: VecDeque::new(),
+            capacity: ATC_EXECUTOR_PROJECT_CAPACITY,
+        }
+    }
+}
+
+impl AtcExecutorProjectCache {
+    fn ensure(
+        &mut self,
+        project_key: &str,
+        register: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.projects.contains(project_key) {
+            return Ok(());
+        }
+        register()?;
+        // Large valid project keys still work, without defeating the cache's
+        // byte bound. A later use simply repeats the idempotent registration.
+        if self.capacity == 0 || project_key.len() > ATC_OPERATOR_CACHE_KEY_BYTES {
+            return Ok(());
+        }
+        if self.projects.len() >= self.capacity
+            && let Some(oldest) = self.insertion_order.pop_front()
+        {
+            self.projects.remove(&oldest);
+        }
+        self.projects.insert(project_key.to_string());
+        self.insertion_order.push_back(project_key.to_string());
+        Ok(())
+    }
+}
 
 fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
     match effect.semantics.family.as_str() {
@@ -8179,24 +8296,22 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
 
 fn ensure_atc_executor_identity(
     runtime: &Runtime,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     project_key: &str,
 ) -> Result<(), String> {
-    if ensured_projects.contains(project_key) {
-        return Ok(());
-    }
-    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
-    let ctx = McpContext::new(cx, 1);
-    runtime.block_on(async {
-        let pool =
-            mcp_agent_mail_tools::tool_util::get_db_pool().map_err(|error| error.to_string())?;
-        let project = mcp_agent_mail_tools::tool_util::resolve_project(&ctx, &pool, project_key)
-            .await
-            .map_err(|error| error.to_string())?;
-        register_atc_executor_identity(ctx.cx(), &pool, project.id.unwrap_or(0)).await
-    })?;
-    ensured_projects.insert(project_key.to_string());
-    Ok(())
+    ensured_projects.ensure(project_key, || {
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let ctx = McpContext::new(cx, 1);
+        runtime.block_on(async {
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool()
+                .map_err(|error| error.to_string())?;
+            let project =
+                mcp_agent_mail_tools::tool_util::resolve_project(&ctx, &pool, project_key)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            register_atc_executor_identity(ctx.cx(), &pool, project.id.unwrap_or(0)).await
+        })
+    })
 }
 
 /// Register the ATC control plane's own `AirTrafficControl` sender identity.
@@ -8235,7 +8350,7 @@ async fn register_atc_executor_identity(
 
 fn execute_atc_advisory_effect(
     runtime: &Runtime,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     effect: &atc::AtcEffectPlan,
     project_key: &str,
 ) -> Result<(), String> {
@@ -8272,7 +8387,7 @@ fn execute_atc_advisory_effect(
 
 fn execute_atc_probe_effect(
     runtime: &Runtime,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     effect: &atc::AtcEffectPlan,
     project_key: &str,
 ) -> Result<(), String> {
@@ -8332,7 +8447,7 @@ fn execute_atc_release_effect(
 fn execute_atc_effect(
     runtime: Option<&Runtime>,
     executor_mode: AtcExecutorMode,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     effect: &atc::AtcEffectPlan,
 ) -> String {
     match executor_mode {
@@ -8594,7 +8709,13 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     }
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
-    let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
+    let mut cooldowns = AtcOperatorCooldowns::new(
+        atc_config
+            .advisory_cooldown_micros
+            .max(atc_config.probe_interval_micros)
+            .max(atc_config.summary_interval_micros),
+        ATC_OPERATOR_COOLDOWN_CAPACITY,
+    );
     let mut last_summary_log_micros = 0_i64;
     // I3 (br-bvq1x.9.3) budget-overrun watchdog accumulators. Loop-local so they
     // persist across ticks and feed the published snapshot / health surface.
@@ -8609,7 +8730,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let mut pending_effects: VecDeque<atc::AtcEffectPlan> = VecDeque::new();
     let mut pending_effect_keys: HashSet<String> = HashSet::new();
     let mut atc_resolution_tick_counter: u64 = 0;
-    let mut executor_registered_projects: HashSet<String> = HashSet::new();
+    let mut executor_registered_projects = AtcExecutorProjectCache::default();
     let mut next_population_sync_micros = 0_i64;
     let mut next_rollup_refresh_micros = 0_i64;
 
@@ -8740,60 +8861,28 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
         }
 
+        cooldowns.prune(now_micros);
         let mut processed_this_tick = 0_usize;
         while processed_this_tick < ATC_OPERATOR_ACTION_CAPACITY {
-            let Some(effect) = pending_effects.front() else {
+            let Some(effect) = pending_effects.pop_front() else {
                 break;
             };
-            let cooldown_key = atc_effect_semantic_key(effect);
-            let cooldown_micros = effect.semantics.cooldown_micros.max(0);
-            let throttled = last_action_by_key
-                .get(&cooldown_key)
-                .copied()
-                .is_some_and(|last| {
-                    cooldown_micros > 0 && now_micros.saturating_sub(last) < cooldown_micros
-                });
-            if throttled {
-                let Some(effect) = pending_effects.pop_front() else {
-                    continue;
-                };
-                pending_effect_keys.remove(&cooldown_key);
-                let status = format!("throttled:{}", effect.semantics.family);
-                if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
-                    capture_atc_execution_result(
-                        pool,
-                        effect.experience_id,
-                        executor_mode.as_str(),
-                        &status,
-                        now_micros,
-                    );
-                }
-                let execution =
-                    atc_execution_snapshot(now_micros, &effect, executor_mode.as_str(), &status);
-                record_atc_operator_execution(
-                    &mut recent_executions,
-                    &mut recent_actions,
-                    &mut visible_actions,
-                    execution,
-                );
-                // Throttled outcomes still perform durable work, so they must
-                // count against the per-tick action budget.
-                processed_this_tick = processed_this_tick.saturating_add(1);
-                continue;
-            }
-            let Some(effect) = pending_effects.pop_front() else {
-                continue;
-            };
+            let cooldown_key = atc_effect_semantic_key(&effect);
             pending_effect_keys.remove(&cooldown_key);
-            let status = execute_atc_effect(
-                executor_runtime.as_ref(),
-                executor_mode,
-                &mut executor_registered_projects,
-                &effect,
+            let status = cooldowns.execute(
+                &cooldown_key,
+                &effect.semantics.family,
+                effect.semantics.cooldown_micros,
+                now_micros,
+                || {
+                    execute_atc_effect(
+                        executor_runtime.as_ref(),
+                        executor_mode,
+                        &mut executor_registered_projects,
+                        &effect,
+                    )
+                },
             );
-            if atc_status_consumes_cooldown(&status) {
-                last_action_by_key.insert(cooldown_key, now_micros);
-            }
             // Capture execution result into durable experience store (br-0qt6e.2.2).
             if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                 capture_atc_execution_result(
@@ -8812,6 +8901,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 &mut visible_actions,
                 execution,
             );
+            // Throttled outcomes also perform capture work and consume the
+            // same per-tick action budget as actual execution attempts.
             processed_this_tick = processed_this_tick.saturating_add(1);
         }
 
@@ -23336,7 +23427,7 @@ first body
         let mut effect = sample_probe_effect();
         effect.project_key = None;
         effect.semantics.cooldown_key = "liveness_probe:-:AlphaAgent".to_string();
-        let mut ensured_projects = HashSet::new();
+        let mut ensured_projects = AtcExecutorProjectCache::default();
 
         assert_eq!(
             execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect),
@@ -23349,7 +23440,7 @@ first body
         let mut effect = sample_probe_effect();
         effect.project_key = None;
         effect.semantics.cooldown_key = "liveness_probe:-:AlphaAgent".to_string();
-        let mut ensured_projects = HashSet::new();
+        let mut ensured_projects = AtcExecutorProjectCache::default();
 
         assert_eq!(
             execute_atc_effect(
@@ -23365,7 +23456,7 @@ first body
     #[test]
     fn execute_atc_effect_live_probe_requires_runtime_instead_of_probe_intent() {
         let effect = sample_probe_effect();
-        let mut ensured_projects = HashSet::new();
+        let mut ensured_projects = AtcExecutorProjectCache::default();
         assert_eq!(
             execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect),
             "failed:executor_unavailable"
@@ -38248,12 +38339,240 @@ first body
 }
 
 #[cfg(test)]
+mod atc_operator_cache_tests {
+    use super::{
+        ATC_EXECUTOR_PROJECT_CAPACITY, ATC_OPERATOR_CACHE_KEY_BYTES,
+        ATC_OPERATOR_COOLDOWN_CAPACITY, AtcExecutorProjectCache, AtcOperatorCooldowns,
+    };
+
+    #[test]
+    fn cooldown_churn_never_evicts_live_history_or_executes_overflow() {
+        let mut cache = AtcOperatorCooldowns::new(100, ATC_OPERATOR_COOLDOWN_CAPACITY);
+        let mut executions = 0;
+        for index in 0..ATC_OPERATOR_COOLDOWN_CAPACITY {
+            assert_eq!(
+                cache.execute(&format!("agent-{index}"), "advisory", 100, 0, || {
+                    executions += 1;
+                    "executed".to_string()
+                }),
+                "executed"
+            );
+        }
+        cache.prune(99);
+        for index in 0..20_000 {
+            assert_eq!(
+                cache.execute(&format!("overflow-{index}"), "advisory", 100, 99, || {
+                    executions += 1;
+                    "executed".to_string()
+                }),
+                "throttled:cooldown_capacity"
+            );
+            assert_eq!(
+                cache.execute("agent-0", "advisory", 100, 99, || {
+                    executions += 1;
+                    "executed".to_string()
+                }),
+                "throttled:advisory"
+            );
+        }
+        assert_eq!(executions, ATC_OPERATOR_COOLDOWN_CAPACITY);
+        assert_eq!(
+            cache.last_action_by_key.len(),
+            ATC_OPERATOR_COOLDOWN_CAPACITY
+        );
+        assert_eq!(cache.last_action_by_key["agent-0"], 0);
+
+        cache.prune(100);
+        assert!(cache.last_action_by_key.is_empty());
+        assert_eq!(
+            cache.execute("overflow-0", "advisory", 100, 100, || {
+                executions += 1;
+                "executed".to_string()
+            }),
+            "executed"
+        );
+        assert_eq!(executions, ATC_OPERATOR_COOLDOWN_CAPACITY + 1);
+    }
+
+    #[test]
+    fn cooldown_retention_preserves_later_longer_intervals_and_refreshes_existing_keys() {
+        let mut cache = AtcOperatorCooldowns::new(100, 1);
+        assert_eq!(
+            cache.execute("agent", "probe", 10, 0, || "executed".to_string()),
+            "executed"
+        );
+        cache.prune(11);
+        assert_eq!(cache.last_action_by_key.len(), 1);
+        assert_eq!(
+            cache.execute("agent", "probe", 50, 11, || panic!("too early")),
+            "throttled:probe"
+        );
+        assert_eq!(
+            cache.execute("other", "probe", 10, 11, || panic!("cache is full")),
+            "throttled:cooldown_capacity"
+        );
+        assert_eq!(
+            cache.execute("agent", "probe", 50, 50, || "executed".to_string()),
+            "executed",
+            "an existing key may refresh while all slots are occupied"
+        );
+        cache.prune(100);
+        assert_eq!(cache.last_action_by_key["agent"], 50);
+        cache.prune(149);
+        assert_eq!(cache.last_action_by_key.len(), 1);
+        cache.prune(150);
+        assert!(cache.last_action_by_key.is_empty());
+    }
+
+    #[test]
+    fn cooldown_failures_retry_without_consuming_capacity_and_zero_intervals_do_not_accumulate() {
+        let mut cache = AtcOperatorCooldowns::new(100, 1);
+        for status in [
+            "failed:executor_unavailable",
+            "suppressed:missing_project_precondition",
+        ] {
+            assert_eq!(
+                cache.execute("agent", "probe", 10, 0, || status.to_string()),
+                status
+            );
+            assert!(cache.last_action_by_key.is_empty());
+        }
+        assert_eq!(
+            cache.execute("agent", "probe", 10, 0, || {
+                "suppressed:executor_mode_shadow".to_string()
+            }),
+            "suppressed:executor_mode_shadow"
+        );
+        assert_eq!(
+            cache.execute("agent", "probe", 10, 1, || panic!(
+                "shadow history is retained"
+            )),
+            "throttled:probe"
+        );
+        for index in 0..10_000 {
+            assert_eq!(
+                cache.execute(&format!("no-cooldown-{index}"), "advisory", 0, 1, || {
+                    "executed".to_string()
+                }),
+                "executed"
+            );
+        }
+        assert_eq!(cache.last_action_by_key.len(), 1);
+    }
+
+    #[test]
+    fn cooldown_clock_reversal_overflow_and_unrepresentable_policy_fail_closed() {
+        let mut cache = AtcOperatorCooldowns::new(100, 1);
+        assert_eq!(
+            cache.execute("agent", "probe", 100, i64::MAX - 50, || "executed"
+                .to_string()),
+            "executed"
+        );
+        for now in [i64::MIN, i64::MAX] {
+            cache.prune(now);
+            assert_eq!(cache.last_action_by_key.len(), 1);
+            assert_eq!(
+                cache.execute("agent", "probe", 100, now, || panic!("cooldown still live")),
+                "throttled:probe"
+            );
+        }
+        assert_eq!(
+            cache.execute("agent", "probe", 101, 0, || panic!("unsupported horizon")),
+            "throttled:cooldown_policy_horizon"
+        );
+        assert_eq!(
+            cache.execute(
+                &"a".repeat(ATC_OPERATOR_CACHE_KEY_BYTES + 1),
+                "probe",
+                10,
+                0,
+                || panic!("oversized key"),
+            ),
+            "throttled:cooldown_key_capacity"
+        );
+    }
+
+    #[test]
+    fn executor_project_churn_bounds_cache_and_rechecks_evicted_identity() {
+        let mut cache = AtcExecutorProjectCache::default();
+        let mut registrations = 0;
+        cache
+            .ensure("first", || {
+                registrations += 1;
+                Ok(())
+            })
+            .unwrap();
+        for _ in 0..10_000 {
+            cache
+                .ensure("first", || panic!("cached registration"))
+                .unwrap();
+        }
+        for index in 0..ATC_EXECUTOR_PROJECT_CAPACITY {
+            cache
+                .ensure(&format!("project-{index}"), || {
+                    registrations += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(cache.projects.len() <= ATC_EXECUTOR_PROJECT_CAPACITY);
+            assert_eq!(cache.projects.len(), cache.insertion_order.len());
+        }
+        assert!(!cache.projects.contains("first"));
+        cache
+            .ensure("first", || {
+                registrations += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(registrations, ATC_EXECUTOR_PROJECT_CAPACITY + 2);
+        assert_eq!(cache.projects.len(), ATC_EXECUTOR_PROJECT_CAPACITY);
+        assert!(
+            cache
+                .insertion_order
+                .iter()
+                .all(|key| cache.projects.contains(key))
+        );
+    }
+
+    #[test]
+    fn executor_project_failures_do_not_evict_success_and_large_keys_are_not_retained() {
+        let mut cache = AtcExecutorProjectCache {
+            capacity: 1,
+            ..AtcExecutorProjectCache::default()
+        };
+        cache.ensure("live", || Ok(())).unwrap();
+        assert_eq!(
+            cache.ensure("failed", || Err("retry me".to_string())),
+            Err("retry me".to_string())
+        );
+        assert!(cache.projects.contains("live"));
+        let oversized = "p".repeat(ATC_OPERATOR_CACHE_KEY_BYTES + 1);
+        let mut registrations = 0;
+        for _ in 0..2 {
+            cache
+                .ensure(&oversized, || {
+                    registrations += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(registrations, 2);
+        assert_eq!(cache.projects.len(), 1);
+        assert!(cache.projects.contains("live"));
+        cache.ensure("failed", || Ok(())).unwrap();
+        assert!(!cache.projects.contains("live"));
+        assert!(cache.projects.contains("failed"));
+        assert_eq!(cache.projects.len(), cache.insertion_order.len());
+    }
+}
+
+#[cfg(test)]
 mod atc_identity_tests {
     //! GH#226: the ATC control plane must be able to register its own
     //! `AirTrafficControl` sender identity even though that name can never
     //! pass the adjective+noun `register_agent` validator.
 
-    use super::register_atc_executor_identity;
+    use super::{AtcExecutorProjectCache, register_atc_executor_identity};
     use asupersync::{Cx, Outcome};
     use fastmcp_core::block_on;
     use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, queries};
@@ -38287,6 +38606,77 @@ mod atc_identity_tests {
                 crate::atc::ATC_AGENT_NAME
             )
         );
+    }
+
+    #[test]
+    fn executor_project_cache_eviction_reuses_the_same_durable_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = make_test_pool(&tmp);
+        let cx = Cx::for_testing();
+        let mut cache = AtcExecutorProjectCache {
+            capacity: 1,
+            ..AtcExecutorProjectCache::default()
+        };
+        let projects: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let root = tmp.path().join(name);
+                std::fs::create_dir_all(&root).unwrap();
+                let key = root.to_string_lossy().into_owned();
+                let project = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                    &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+                    || match block_on(queries::ensure_project(&cx, &pool, &key)) {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure_project failed: {other:?}"),
+                    },
+                );
+                (key, project.id.expect("project id"))
+            })
+            .collect();
+        let first_key = &projects[0].0;
+        let first_id = projects[0].1;
+        cache
+            .ensure(first_key, || {
+                block_on(register_atc_executor_identity(&cx, &pool, first_id))
+            })
+            .unwrap();
+        let original = match block_on(queries::get_agent(
+            &cx,
+            &pool,
+            first_id,
+            crate::atc::ATC_AGENT_NAME,
+        )) {
+            Outcome::Ok(agent) => agent,
+            other => panic!("initial system agent missing: {other:?}"),
+        };
+
+        cache
+            .ensure(&projects[1].0, || {
+                block_on(register_atc_executor_identity(&cx, &pool, projects[1].1))
+            })
+            .unwrap();
+        assert!(!cache.projects.contains(first_key));
+        cache
+            .ensure(first_key, || {
+                block_on(register_atc_executor_identity(&cx, &pool, first_id))
+            })
+            .unwrap();
+        let repeated = match block_on(queries::get_agent(
+            &cx,
+            &pool,
+            first_id,
+            crate::atc::ATC_AGENT_NAME,
+        )) {
+            Outcome::Ok(agent) => agent,
+            other => panic!("re-registered system agent missing: {other:?}"),
+        };
+        assert_eq!(repeated.id, original.id);
+        assert_eq!(repeated.inception_ts, original.inception_ts);
+        assert_eq!(repeated.last_active_ts, original.last_active_ts);
+        assert_eq!(repeated.registration_token, original.registration_token);
+        assert_eq!(repeated.retired_at, original.retired_at);
+        assert_eq!(cache.projects.len(), 1);
+        assert_eq!(cache.insertion_order.len(), 1);
     }
 
     #[test]
