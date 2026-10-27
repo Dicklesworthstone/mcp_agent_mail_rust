@@ -1874,14 +1874,29 @@ fn reconstruct_from_archive_impl(
     }
     conn.execute_raw("COMMIT;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: commit transaction: {e}")))?;
-    drop(conn);
-    crate::pool::wal_checkpoint_truncate_path(db_path)
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: checkpoint: {e}")))?;
+    finalize_reconstruction_candidate(conn, db_path, "reconstruct")?;
 
     stats.finalize_duplicate_warnings();
     stats.finalize_cross_project_canonical_collision_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");
     Ok(stats)
+}
+
+/// Compact only the privately owned candidate, after its writes have committed
+/// and before callers can fingerprint it for promotion. Rebuilding the file
+/// reclaims both freelist pages and unreachable pages left by an index rebuild;
+/// a zero freelist alone does not prove that the image is compact (br-talqb).
+/// Any failure here makes the candidate ineligible for promotion.
+fn finalize_reconstruction_candidate(conn: DbConn, db_path: &Path, context: &str) -> DbResult<()> {
+    conn.execute_raw("VACUUM;").map_err(|error| {
+        DbError::Sqlite(format!(
+            "{context}: compact candidate before promotion: {error}"
+        ))
+    })?;
+    drop(conn);
+    crate::pool::wal_checkpoint_truncate_path(db_path)
+        .map_err(|error| DbError::Sqlite(format!("{context}: checkpoint candidate: {error}")))?;
+    Ok(())
 }
 
 struct MaterializedLiveSalvage {
@@ -2139,6 +2154,8 @@ pub fn reconstruct_from_archive_with_live_salvage(
 ///   `integrity_check`, degrades to archive-only (warned, still promotable)
 /// - a merge that fails with a corruption-class error also degrades; the
 ///   merge transaction is rolled back first
+/// - candidate compaction/checkpoint failures always refuse promotion, including
+///   after a successful salvage merge has committed
 ///
 /// Private implementation shared by the explicit public source-kind entry
 /// points and the module's focused salvage tests. Production callers must use
@@ -2175,24 +2192,32 @@ fn reconstruct_from_archive_with_salvage(
              rebuilt archive-only candidate so doctor can promote a heal"
         ));
     }
-    if let Some(salvage_db_path) = salvage_for_merge
-        && let Err(error) = merge_salvaged_database(db_path, salvage_db_path, &mut stats)
-    {
-        let message = error.to_string();
-        if crate::pool::is_corruption_error_message(&message) {
-            // Merge rolled back. Keep the archive-only candidate so
-            // `am doctor reconstruct` can promote a heal instead of
-            // leaving the mailbox wedged on a corrupt-but-openable source.
-            stats.push_warning(format!(
-                "salvage merge from {} failed with corruption ({message}); \
-                 keeping archive-only candidate so doctor can promote a heal",
-                salvage_db_path.display()
-            ));
-        } else {
-            return Err(DbError::Sqlite(format!(
-                "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
-                salvage_db_path.display()
-            )));
+    if let Some(salvage_db_path) = salvage_for_merge {
+        match merge_salvaged_database(db_path, salvage_db_path, &mut stats) {
+            Ok(conn) => {
+                // The merge is committed. A finalization failure must never be
+                // treated as source corruption with a rolled-back transaction:
+                // this candidate already carries DB-only coordination state.
+                finalize_reconstruction_candidate(conn, db_path, "reconstruct salvage")?;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if crate::pool::is_corruption_error_message(&message) {
+                    // Merge rolled back. Keep the archive-only candidate so
+                    // `am doctor reconstruct` can promote a heal instead of
+                    // leaving the mailbox wedged on a corrupt-but-openable source.
+                    stats.push_warning(format!(
+                        "salvage merge from {} failed with corruption ({message}); \
+                         keeping archive-only candidate so doctor can promote a heal",
+                        salvage_db_path.display()
+                    ));
+                } else {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
+                        salvage_db_path.display()
+                    )));
+                }
+            }
         }
     }
     Ok(stats)
@@ -4404,7 +4429,7 @@ fn merge_salvaged_database(
     target_db_path: &Path,
     salvage_db_path: &Path,
     stats: &mut ReconstructStats,
-) -> DbResult<()> {
+) -> DbResult<DbConn> {
     let target_path = target_db_path.to_str().ok_or_else(|| {
         DbError::Sqlite(format!(
             "reconstruct salvage: target path {} is not valid UTF-8",
@@ -4447,7 +4472,7 @@ fn merge_salvaged_database(
             "Salvage database {} contained none of the expected mail/product tables",
             salvage_db_path.display()
         ));
-        return Ok(());
+        return Ok(target_conn);
     }
 
     target_conn
@@ -6501,15 +6526,7 @@ fn merge_salvaged_database(
             "reconstruct salvage: commit transaction: {e}"
         )));
     }
-    drop(target_conn);
-    if let Err(e) = crate::pool::wal_checkpoint_truncate_path(target_db_path) {
-        stats.push_warning(format!(
-            "Salvage merge committed, but WAL checkpoint failed for {}: {e}",
-            target_db_path.display()
-        ));
-    }
-
-    Ok(())
+    Ok(target_conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -7248,6 +7265,186 @@ fn collect_message_files_with_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_compact_reconstruction_candidate(conn: &DbConn) {
+        assert_eq!(
+            conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
+                .get_named::<i64>("freelist_count")
+                .unwrap(),
+            0,
+            "recovery must not hand unused pages to promotion"
+        );
+        let integrity = conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
+        assert_eq!(integrity.len(), 1, "{integrity:?}");
+        assert_eq!(
+            integrity[0].get_named::<String>("integrity_check").unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_compacts_candidate_without_freelist_or_never_used_pages() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        // Exercise ordinary free pages and GH#289's more dangerous shape:
+        // pages unreachable from both b-trees and the freelist. Merely checking
+        // freelist_count would accept the latter without reclaiming anything.
+        for orphan_pages in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("candidate.sqlite3");
+            let atc_path = directory.path().join("atc.sqlite3");
+            std::fs::write(&atc_path, b"live telemetry must remain untouched").unwrap();
+            let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+            conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL).unwrap();
+            conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+            conn.execute_raw(&schema::schema_user_version_sql())
+                .unwrap();
+            conn.execute_raw(
+                "PRAGMA application_id = 1296124236;
+                 BEGIN IMMEDIATE;
+                 INSERT INTO projects(id, slug, human_key, created_at)
+                 VALUES(42, 'compaction', '/compaction', 1);
+                 INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES(5, 42, 'Alice', 'test', 'test', 1, 1),
+                       (6, 42, 'Bob', 'test', 'test', 1, 1);
+                 WITH RECURSIVE ids(id) AS (
+                     SELECT 1 UNION ALL SELECT id + 1 FROM ids WHERE id < 128
+                 ) INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts,
+                                        thread_id, archive_metadata_json)
+                   SELECT id, 42, 5, 'subject-' || id, hex(zeroblob(8192)), id,
+                          'thread', CASE WHEN id = 2 THEN '{\"reply_to\":1}' ELSE '{}' END
+                   FROM ids;
+                 DELETE FROM messages WHERE id > 2;
+                 INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES(1, 6, 'to', 101, 202), (2, 6, 'to', NULL, NULL);
+                 REINDEX;
+                 COMMIT;",
+            )
+            .unwrap();
+            let free_pages = conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
+                .get_named::<i64>("freelist_count")
+                .unwrap();
+            let page_count = conn.query_sync("PRAGMA page_count", &[]).unwrap()[0]
+                .get_named::<i64>("page_count")
+                .unwrap();
+            assert!(free_pages > page_count / 2, "fixture must be mostly unused");
+
+            let queries = [
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name",
+                "SELECT * FROM projects ORDER BY id",
+                "SELECT * FROM agents ORDER BY id",
+                "SELECT * FROM messages ORDER BY id",
+                "SELECT * FROM message_recipients ORDER BY message_id, agent_id",
+                "SELECT * FROM sqlite_sequence ORDER BY name",
+                "PRAGMA user_version",
+                "PRAGMA application_id",
+            ];
+            let snapshot = |conn: &DbConn| {
+                queries
+                    .iter()
+                    .map(|sql| {
+                        conn.query_sync(sql, &[])
+                            .unwrap()
+                            .iter()
+                            .map(|row| row.values().cloned().collect::<Vec<_>>())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = snapshot(&conn);
+            drop(conn);
+            let bytes_before = std::fs::metadata(&path).unwrap().len();
+            if orphan_pages {
+                // SQLite's database header stores the freelist head and count
+                // at offsets 32 and 36. Detach only already-free pages in this
+                // private fixture; every schema and application row stays live.
+                let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(32)).unwrap();
+                file.write_all(&[0; 8]).unwrap();
+                file.sync_all().unwrap();
+            }
+            let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+            if orphan_pages {
+                assert_eq!(
+                    conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
+                        .get_named::<i64>("freelist_count")
+                        .unwrap(),
+                    0
+                );
+                assert!(
+                    conn.query_sync("PRAGMA integrity_check", &[])
+                        .unwrap()
+                        .iter()
+                        .any(|row| row
+                            .get_named::<String>("integrity_check")
+                            .unwrap()
+                            .contains("never used"))
+                );
+            }
+
+            finalize_reconstruction_candidate(conn, &path, "reconstruct test").unwrap();
+
+            assert!(std::fs::metadata(&path).unwrap().len() < bytes_before / 2);
+            let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+            assert_compact_reconstruction_candidate(&conn);
+            assert_eq!(
+                snapshot(&conn),
+                before,
+                "all logical state must survive VACUUM"
+            );
+            conn.execute_raw(
+                "INSERT INTO messages(project_id, sender_id, subject, body_md, created_ts)
+                 VALUES(42, 5, 'after compaction', 'new body', 129)",
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT id FROM messages WHERE subject = 'after compaction'",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_named::<i64>("id")
+                    .unwrap(),
+                129,
+                "deleted message IDs must never be reused after compaction"
+            );
+            assert_eq!(
+                std::fs::read(&atc_path).unwrap(),
+                b"live telemetry must remain untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruct_candidate_compaction_refuses_read_only_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("candidate.sqlite3");
+        let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE committed_state(id INTEGER PRIMARY KEY, receipt TEXT);
+             INSERT INTO committed_state VALUES(42, 'durable salvage receipt');",
+        )
+        .unwrap();
+        drop(conn);
+        let before = exact_test_directory_files(directory.path());
+        let conn = open_read_only_salvage_db(&path).unwrap();
+        let error = finalize_reconstruction_candidate(conn, &path, "reconstruct salvage")
+            .expect_err("failed compaction cannot authorize promotion of committed salvage");
+        assert!(
+            error
+                .to_string()
+                .contains("compact candidate before promotion"),
+            "{error}"
+        );
+        assert_eq!(exact_test_directory_files(directory.path()), before);
+    }
 
     #[test]
     fn snapshot_project_event_migration_rolls_back_and_can_retry() {
@@ -9457,6 +9654,7 @@ body
 
         let target = SqliteDbConn::open_file(target_path.to_str().unwrap())
             .expect("open reconstructed target");
+        assert_compact_reconstruction_candidate(&target);
         let subjects = target
             .query_sync("SELECT subject FROM messages ORDER BY id", &[])
             .expect("query reconstructed messages")
@@ -10015,6 +10213,7 @@ Hello Bob, this is a test message.
 
         // Verify the message was inserted correctly
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        assert_compact_reconstruction_candidate(&conn);
         let rows = conn
             .query_sync(
                 "SELECT subject, body_md, thread_id, topic, recipients_json FROM messages LIMIT 1",
