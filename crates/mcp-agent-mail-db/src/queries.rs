@@ -16412,7 +16412,7 @@ pub async fn file_reservation_snapshot(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-        match file_reservation_snapshot_from_conn(&*conn, project, active_only, now_micros()) {
+        match file_reservation_snapshot_from_conn(&**conn, project, active_only, now_micros()) {
             Ok(snapshot) => Outcome::Ok(snapshot),
             Err(error) => Outcome::Err(error),
         }
