@@ -884,6 +884,7 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
         peers.setdefault(proj, []).append(name)
 
     records: list = []
+    error_samples: dict = {}  # "tool CODE" -> up to 3 truncated error payloads
     acked: list = []
     lock = threading.Lock()
     stop = threading.Event()
@@ -899,9 +900,13 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
                 records.append((tool, t0, time.time(), "conn_error", type(ex).__name__))
             return None
         outcome = classify_call(e, p)
+        code = error_code(p) if outcome != "ok" else ""
         with lock:
-            records.append((tool, t0, time.time(), outcome,
-                            error_code(p) if outcome != "ok" else ""))
+            records.append((tool, t0, time.time(), outcome, code))
+            if code:  # a code alone cannot name the failing site; keep a few payloads
+                kept = error_samples.setdefault(f"{tool} {code}", [])
+                if len(kept) < 3:
+                    kept.append(json.dumps(p, default=str)[:600])
         return e, p
 
     def agent_loop(idx: int) -> None:
@@ -979,6 +984,11 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
     for t in threads:
         t.join(timeout=120)
     load_secs = time.time() - started
+    # Every call, so a latency tail can be placed in time (restart, backup, checkpoint).
+    with (arm.root / "out" / "swarm_calls.jsonl").open("w") as f:
+        for tool, start, end, outcome, code in records:
+            f.write(json.dumps([tool, round(start - started, 3), round(end - start, 3),
+                                outcome, code]) + "\n")
     stats = swarm_tool_stats(records, clock["kill_t"], clock["restarted_t"])
     stalled = [w for seg in segments for w in drain_stalled_windows(seg)]
     for tool in SWARM_GATED_TOOLS:
@@ -1028,8 +1038,9 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
         "restart_s": (round(clock["restarted_t"] - clock["kill_t"], 2)
                       if clock["kill_t"] and clock["restarted_t"] else None),
         "acked_sends": len(acked), "sends_per_s": round(len(acked) / load_secs, 2),
-        "tools": stats, "sqlite_fds_max": fds_max, "zombies_max": zombies_max,
-        "wbq_samples": [len(s) for s in segments], "stalled_windows": len(stalled)})
+        "tools": stats, "tool_error_samples": error_samples, "sqlite_fds_max": fds_max,
+        "zombies_max": zombies_max, "wbq_samples": [len(s) for s in segments],
+        "stalled_windows": len(stalled)})
     if CONVERGE_SECS > RELEASE_CONVERGE_SECS:
         extra["cannot_pass"] = f"convergence bound {CONVERGE_SECS}s is looser than release"
     return extra
