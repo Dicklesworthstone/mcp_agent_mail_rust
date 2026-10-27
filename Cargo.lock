@@ -5853,6 +5853,8 @@ version = "0.3.39"
 dependencies = [
  "age",
  "base64 0.23.1",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "ed25519-dalek 3.0.0",
  "hex",
@@ -5860,12 +5862,15 @@ dependencies = [
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
  "regex",
+ "rustix 1.1.5",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "sqlmodel-core",
  "tempfile",
  "thiserror 2.0.21",
+ "winsafe",
  "zip",
 ]
 

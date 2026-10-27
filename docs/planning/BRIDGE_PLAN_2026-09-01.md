@@ -187,6 +187,52 @@ Each bead embeds source context, reasoning, implementation scope, realistic posi
 a negative a naive fix fails, E2E logging, and closure evidence. Implementation and tests
 stay in one logical bead, as the suite's scope-splitting prohibition requires.
 
+#### Crypto publication implementation follow-up (`br-kp1in.49`, October 27)
+
+The implementation in the commit containing this note replaces crypto output
+preflight-plus-rename/write with one retained publication boundary. Encryption,
+identity decryption, in-process passphrase decryption and signature creation retain
+the output parent and private staging handles. External age receives held input and
+output files through stdin/stdout. New outputs publish through an atomic no-replace
+hard link; a concurrently created regular file or symlink remains untouched. Private
+stages use mode 0700 with 0600 files on Unix and are retained on success and refusal.
+No temporary destructor follows an old pathname to remove artifacts after a parent
+substitution. A late namespace change or failed post-publication confirmation returns
+an explicit unconfirmed result and retains the original-directory artifacts.
+
+Authorized signature overwrite remains supported. Linux/macOS exchange and native
+Windows replacement retain the displaced object and compare its identity, streamed
+content hash, size, mode, modification time and link topology with the captured target.
+A separate candidate link survives replacement. Recovery detaches and inspects the
+current final object before restoring a retained object with no-replace semantics;
+it does not blindly overwrite a third writer. Unsupported replacement platforms fail
+closed. Windows replacement releases staged-file handles before the exclusive native
+open and reopens the retained candidate afterward; directory ancestors remain pinned.
+These platform implementations still require native execution evidence.
+
+Six new test functions exercise the public APIs across raced regular destinations,
+dangling/outside symlinks, bounded concurrent winner/loser ordering, early/late parent
+substitution with a recreated staging-path trap, changed authorized overwrite targets
+and Windows directory pinning. Existing child-failure and authenticated-stream negatives
+now assert retained private partial evidence. The ordinary overwrite positive independently
+verifies the new Ed25519 signature and retention of both candidate and displaced object.
+Unix child shims establish causal interleavings only; real-age positives remain required.
+The existing `e2e_share.sh --crypto-only` lane adds five real CLI/age publication cases,
+including two different completed ciphertexts, structured process completion receipts,
+no-follow inode/hash/link witnesses and bounded retained-artifact inventories.
+
+**Validation status: OPEN.** The pinned `nightly-2026-08-31` formatter parsed/formatted
+`crypto.rs`, and its subsequent scoped `--check` passed. `bash -n`, the crypto matrix
+and generated-wrapper Python AST checks, Cargo manifest/lock TOML dependency checks,
+and `git diff --check` passed. Seven strict `RCH_REQUIRE_REMOTE=1 rch exec -- ...`
+attempts stopped with exit 127 (`rch` absent): production and all-target compiler graphs,
+Clippy, workspace formatting, required real-age crypto tests, full workspace nextest,
+and the separate `.52` snapshot reproduction. UBS and `br sync --import-only` also
+stopped with exit 127. No Rust compilation, runtime tests, real CLI matrix or native
+Windows validation ran; no passing safety verdict or bead closure is claimed. The
+snapshot implementation is unchanged because its required current-candidate reproduction
+could not execute. Suite guidance at `/data/projects/AGENTS.md` is absent here.
+
 #### ATC persistence implementation follow-up (`br-kp1in.50`, October 27)
 
 Commit `2a31869504f045cd03e04997bf4782d7188eba30` adds the shared bounded content

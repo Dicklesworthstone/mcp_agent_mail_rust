@@ -32,6 +32,15 @@ mcp-agent-mail-core = { workspace = true }
 mcp-agent-mail-db = { workspace = true, default-features = false }
 sqlmodel-core.workspace = true
 tempfile.workspace = true
+cap-std.workspace = true
+cap-fs-ext.workspace = true
+same-file.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winsafe.workspace = true
 
 [features]
 default = ["mcp-agent-mail-db/default"]

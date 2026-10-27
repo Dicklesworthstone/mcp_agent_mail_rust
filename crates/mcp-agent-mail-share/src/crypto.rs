@@ -7,6 +7,7 @@
 #[cfg(test)]
 use std::cell::RefCell;
 use std::ffi::OsStr;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,46 @@ use crate::{ShareError, ShareResult};
 #[cfg(test)]
 thread_local! {
     static AGE_COMMAND_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static CRYPTO_PUBLICATION_HOOK: RefCell<Option<CryptoPublicationHook>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CryptoPublicationPhase {
+    Captured,
+    BeforePublish,
+}
+
+#[cfg(test)]
+type CryptoPublicationHook = Box<dyn FnMut(CryptoPublicationPhase, &Path, &Path)>;
+
+#[cfg(test)]
+fn with_crypto_publication_hook<R>(
+    hook: impl FnMut(CryptoPublicationPhase, &Path, &Path) + 'static,
+    operation: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<CryptoPublicationHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CRYPTO_PUBLICATION_HOOK.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous = CRYPTO_PUBLICATION_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+    let _restore = Restore(previous);
+    operation()
+}
+
+#[cfg(test)]
+fn crypto_publication_hook(phase: CryptoPublicationPhase, output: &Path, stage: &Path) {
+    CRYPTO_PUBLICATION_HOOK.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(mut hook) = hook {
+            hook(phase, output, stage);
+            *slot.borrow_mut() = Some(hook);
+        }
+    });
 }
 
 /// Signature metadata written to `manifest.sig.json`.
@@ -35,6 +76,8 @@ pub struct ManifestSignature {
 /// key — only first 32 bytes are used).
 ///
 /// Returns the signature metadata which is also written to `output_path`.
+/// Publication retains private staged bytes on refusal. An authorized overwrite
+/// replaces only the captured target; displaced files are retained for recovery.
 pub fn sign_manifest(
     manifest_path: &Path,
     signing_key_path: &Path,
@@ -49,78 +92,56 @@ pub fn sign_manifest(
         });
     }
     require_real_crypto_file(signing_key_path, "signing key")?;
-
-    if let Some(parent) = output_path.parent() {
-        ensure_real_crypto_directory(parent)?;
-    }
-
-    if let Ok(metadata) = std::fs::symlink_metadata(output_path) {
-        if metadata.file_type().is_symlink() {
+    let mut manifest_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(manifest_path)?;
+    let key_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(signing_key_path)?;
+    let mut publication = CryptoOutput::capture(output_path, ".age-sign.", overwrite)?;
+    let result = (|| {
+        // Read signing key (32-byte seed or 64-byte expanded — use first 32)
+        let mut key_bytes = Vec::new();
+        key_file.take(65).read_to_end(&mut key_bytes)?;
+        if key_bytes.len() != 32 && key_bytes.len() != 64 {
             return Err(ShareError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+                std::io::ErrorKind::InvalidData,
                 format!(
-                    "signature output path must not be a symlink: {}",
-                    output_path.display()
+                    "signing key must be 32 or 64 bytes, got {}",
+                    key_bytes.len()
                 ),
             )));
         }
-        if !metadata.file_type().is_file() {
-            return Err(ShareError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "signature output path must be a regular file: {}",
-                    output_path.display()
-                ),
-            )));
-        }
-        if !overwrite {
-            return Err(ShareError::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("signature file already exists: {}", output_path.display()),
-            )));
-        }
-    }
 
-    // Read signing key (32-byte seed or 64-byte expanded — use first 32)
-    let key_bytes = std::fs::read(signing_key_path)?;
-    if key_bytes.len() != 32 && key_bytes.len() != 64 {
-        return Err(ShareError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "signing key must be 32 or 64 bytes, got {}",
-                key_bytes.len()
-            ),
-        )));
-    }
+        let seed: [u8; 32] = key_bytes[..32]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
 
-    let seed: [u8; 32] = key_bytes[..32]
-        .try_into()
-        .unwrap_or_else(|_| unreachable!());
-    let signing_key = SigningKey::from_bytes(&seed);
-    let verifying_key = signing_key.verifying_key();
+        // Read and hash manifest
+        let mut manifest_bytes = Vec::new();
+        manifest_file.read_to_end(&mut manifest_bytes)?;
+        let manifest_sha256 = hex_sha256(&manifest_bytes);
 
-    // Read and hash manifest
-    let manifest_bytes = std::fs::read(manifest_path)?;
-    let manifest_sha256 = hex_sha256(&manifest_bytes);
+        // Sign
+        let signature = signing_key.sign(&manifest_bytes);
 
-    // Sign
-    let signature = signing_key.sign(&manifest_bytes);
+        let sig_meta = ManifestSignature {
+            algorithm: "ed25519".to_string(),
+            signature: base64_encode(signature.to_bytes().as_slice()),
+            manifest_sha256,
+            public_key: base64_encode(verifying_key.as_bytes()),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+        };
 
-    let sig_meta = ManifestSignature {
-        algorithm: "ed25519".to_string(),
-        signature: base64_encode(signature.to_bytes().as_slice()),
-        manifest_sha256,
-        public_key: base64_encode(verifying_key.as_bytes()),
-        generated_at: chrono::Utc::now().to_rfc3339(),
-    };
+        // Write signature file
+        let json =
+            serde_json::to_string_pretty(&sig_meta).map_err(|e| ShareError::ManifestParse {
+                message: e.to_string(),
+            })?;
+        publication.file_mut()?.write_all(json.as_bytes())?;
+        publication.publish()?;
 
-    // Write signature file
-    let json = serde_json::to_string_pretty(&sig_meta).map_err(|e| ShareError::ManifestParse {
-        message: e.to_string(),
-    })?;
-    std::fs::write(output_path, json)?;
-
-    Ok(sig_meta)
+        Ok(sig_meta)
+    })();
+    result.map_err(|error| publication.retained_error(error))
 }
 
 /// Verify SRI hashes and Ed25519 signature for a bundle.
@@ -649,35 +670,37 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
     }
 
     require_real_crypto_file(input, "encryption input")?;
+    let input_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(input)?;
 
     let output = input.with_extension(input.extension().map_or_else(
         || "age".to_string(),
         |e| format!("{}.age", e.to_string_lossy()),
     ));
 
-    validate_crypto_output_path(&output, "encrypted output")?;
-
-    check_age_available()?;
-
-    let (staging_dir, staged_output) =
-        create_staged_crypto_output_path(&output, "encrypted output", ".age-encrypt.")?;
-
-    let mut cmd = age_command();
-    for r in recipients {
-        cmd.arg("-r").arg(r);
-    }
-    cmd.arg("-o").arg(&staged_output).arg(input);
-
-    let result = cmd.output()?;
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(ShareError::Io(std::io::Error::other(format!(
-            "age encryption failed: {stderr}"
-        ))));
-    }
-
-    std::fs::rename(&staged_output, &output)?;
-    drop(staging_dir);
+    let mut publication = CryptoOutput::capture(&output, ".age-encrypt.", false)?;
+    let result = (|| {
+        check_age_available()?;
+        let mut cmd = age_command();
+        for recipient in recipients {
+            cmd.arg("-r").arg(recipient);
+        }
+        // The child inherits already-open objects. It never reopens an input
+        // or output pathname after its parent authority has been captured.
+        let status = cmd
+            .stdin(std::process::Stdio::from(input_file))
+            .stdout(std::process::Stdio::from(
+                publication.file_mut()?.try_clone()?,
+            ))
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(ShareError::Io(std::io::Error::other(
+                "age encryption failed (check recipient and input)",
+            )));
+        }
+        publication.publish()
+    })();
+    result.map_err(|error| publication.retained_error(error))?;
     Ok(output)
 }
 
@@ -711,55 +734,48 @@ pub fn decrypt_with_age(
     if let Some(id_path) = identity {
         require_real_crypto_file(id_path, "identity file")?;
     }
-    validate_crypto_output_path(output_path, "decryption output")?;
-
-    if identity.is_some() {
-        check_age_available()?;
-    }
-
-    let (staging_dir, staged_output) =
-        create_staged_crypto_output_path(output_path, "decryption output", ".age-decrypt.")?;
-
-    if let Some(id_path) = identity {
-        let status = age_command()
-            .arg("-d")
-            .arg("-i")
-            .arg(id_path)
-            .arg("-o")
-            .arg(&staged_output)
-            .arg(encrypted_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            // Malformed identities and plugins may include secret material in
-            // diagnostics. Keep the CLI's identity support without relaying it.
-            return Err(ShareError::Io(std::io::Error::other(
-                "age decryption failed (check identity and file integrity)",
+    let input_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(encrypted_path)?;
+    let mut publication = CryptoOutput::capture(output_path, ".age-decrypt.", false)?;
+    let result = (|| {
+        if let Some(id_path) = identity {
+            check_age_available()?;
+            let status = age_command()
+                .arg("-d")
+                .arg("-i")
+                .arg(id_path)
+                .stdin(std::process::Stdio::from(input_file))
+                .stdout(std::process::Stdio::from(
+                    publication.file_mut()?.try_clone()?,
+                ))
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if !status.success() {
+                // Malformed identities and plugins may include secret material in
+                // diagnostics. Keep the CLI's identity support without relaying it.
+                return Err(ShareError::Io(std::io::Error::other(
+                    "age decryption failed (check identity and file integrity)",
+                )));
+            }
+        } else if let Some(pass) = passphrase {
+            decrypt_age_passphrase_to_staging(input_file, publication.file_mut()?, pass)?;
+        } else {
+            // Unreachable because we validated inputs above, but keep a defensive branch.
+            return Err(ShareError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "either identity or passphrase required for decryption",
             )));
         }
-    } else if let Some(pass) = passphrase {
-        decrypt_age_passphrase_to_staging(encrypted_path, &staged_output, pass)?;
-    } else {
-        // Unreachable because we validated inputs above, but keep a defensive branch.
-        return Err(ShareError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "either identity or passphrase required for decryption",
-        )));
-    }
 
-    std::fs::rename(&staged_output, output_path)?;
-    drop(staging_dir);
-    Ok(())
+        publication.publish()
+    })();
+    result.map_err(|error| publication.retained_error(error))
 }
 
 fn decrypt_age_passphrase_to_staging(
-    encrypted_path: &Path,
-    staged_output: &Path,
+    input: std::fs::File,
+    output: &mut std::fs::File,
     passphrase: &str,
 ) -> ShareResult<()> {
-    let input = std::fs::File::open(encrypted_path)?;
     // ArmoredReader accepts both binary age files and ASCII-armored files,
     // matching the external CLI. No secret ever crosses a subprocess boundary.
     let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(input))
@@ -778,19 +794,10 @@ fn decrypt_age_passphrase_to_staging(
         .map_err(|_| age_passphrase_decryption_error())?;
     drop(identity);
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Preserve the CLI's private plaintext mode after publication, too.
-        options.mode(0o600);
-    }
-    let mut output = options.open(staged_output)?;
     // Authenticating the header is insufficient: a late corrupt/truncated
     // chunk must fail before the caller publishes any plaintext. The private
-    // staging directory contains any partial bytes until it is dropped.
-    std::io::copy(&mut plaintext, &mut output).map_err(|_| age_passphrase_decryption_error())?;
+    // retained staging directory contains any partial bytes for recovery.
+    std::io::copy(&mut plaintext, output).map_err(|_| age_passphrase_decryption_error())?;
     Ok(())
 }
 
@@ -801,29 +808,598 @@ fn age_passphrase_decryption_error() -> ShareError {
     ))
 }
 
-fn create_staged_crypto_output_path(
-    final_output: &Path,
-    label: &str,
-    temp_prefix: &str,
-) -> ShareResult<(tempfile::TempDir, PathBuf)> {
-    let parent = crypto_output_parent(final_output)?;
-    let staged_dir = tempfile::Builder::new()
-        .prefix(temp_prefix)
-        .tempdir_in(&parent)?;
-    let file_name = final_output
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("output"));
-    let staged_output = staged_dir.path().join(file_name);
-    if staged_output == final_output {
-        return Err(ShareError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{label} staging path must differ from {}",
-                final_output.display()
-            ),
-        )));
+fn crypto_refusal(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+}
+
+/// A captured regular file. Hashing is streamed and stops at the captured
+/// length plus one byte, even if another writer keeps extending the file.
+struct CryptoFileWitness {
+    #[cfg(not(windows))]
+    object: same_file::Handle,
+    #[cfg(windows)]
+    object: (u64, u64),
+    #[cfg(windows)]
+    retained: Option<std::fs::File>,
+    state: CryptoFileState,
+    sha256: [u8; 32],
+}
+
+#[derive(PartialEq, Eq)]
+struct CryptoFileState {
+    len: u64,
+    links: u64,
+    mode: u32,
+    modified: std::time::SystemTime,
+}
+
+fn crypto_file_state(file: &std::fs::File) -> std::io::Result<CryptoFileState> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(crypto_refusal("crypto artifact must be a regular file"));
     }
-    Ok((staged_dir, staged_output))
+    #[cfg(unix)]
+    let (links, mode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (metadata.nlink(), metadata.mode())
+    };
+    #[cfg(windows)]
+    let (links, mode) = {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(crypto_refusal(
+                "crypto artifact must not be a reparse point",
+            ));
+        }
+        (
+            mcp_agent_mail_core::disk::windows_file_link_count(file)?,
+            u32::from(metadata.permissions().readonly()),
+        )
+    };
+    #[cfg(not(any(unix, windows)))]
+    let (links, mode) = (1, u32::from(metadata.permissions().readonly()));
+    Ok(CryptoFileState {
+        len: metadata.len(),
+        links,
+        mode,
+        modified: metadata.modified()?,
+    })
+}
+
+fn crypto_file_witness(file: &std::fs::File) -> std::io::Result<CryptoFileWitness> {
+    let state = crypto_file_state(file)?;
+    #[cfg(not(windows))]
+    let object = same_file::Handle::from_file(file.try_clone()?)?;
+    #[cfg(windows)]
+    let object = {
+        let metadata = cap_std::fs::File::from_std(file.try_clone()?).metadata()?;
+        (
+            cap_fs_ext::MetadataExt::dev(&metadata),
+            cap_fs_ext::MetadataExt::ino(&metadata),
+        )
+    };
+    let mut reader = file.try_clone()?;
+    reader.rewind()?;
+    let mut reader = reader.take(state.len.saturating_add(1));
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut count = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        count = count.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        digest.update(&buffer[..read]);
+    }
+    if count != state.len || crypto_file_state(file)? != state {
+        return Err(crypto_refusal(
+            "crypto artifact changed while being inspected",
+        ));
+    }
+    Ok(CryptoFileWitness {
+        object,
+        #[cfg(windows)]
+        retained: Some(file.try_clone()?),
+        state,
+        sha256: digest.finalize().into(),
+    })
+}
+
+impl CryptoFileWitness {
+    fn matches(&self, other: &Self, additional_links: u64) -> bool {
+        self.object == other.object
+            && self.sha256 == other.sha256
+            && self.state.len == other.state.len
+            && self.state.mode == other.state.mode
+            && self.state.modified == other.state.modified
+            && self.state.links.checked_add(additional_links) == Some(other.state.links)
+    }
+}
+
+fn open_crypto_leaf(directory: &cap_std::fs::Dir, name: &OsStr) -> std::io::Result<std::fs::File> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+    }
+    let file = directory.open_with(name, &options)?.into_std();
+    crypto_file_state(&file)?;
+    Ok(file)
+}
+
+fn crypto_named_witness(
+    directory: &cap_std::fs::Dir,
+    name: &OsStr,
+) -> std::io::Result<CryptoFileWitness> {
+    crypto_file_witness(&open_crypto_leaf(directory, name)?)
+}
+
+/// Open each component relative to its retained predecessor. Windows directory
+/// handles omit FILE_SHARE_DELETE; retaining every ancestor also pins their names.
+fn open_crypto_directory(
+    path: &Path,
+    create: bool,
+) -> std::io::Result<(cap_std::fs::Dir, Vec<cap_std::fs::Dir>)> {
+    use cap_fs_ext::DirExt as _;
+    use std::path::Component;
+    let mut anchor = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            Component::RootDir => anchor.push(component.as_os_str()),
+            _ => break,
+        }
+    }
+    if !path.is_absolute() || anchor.as_os_str().is_empty() {
+        return Err(crypto_refusal("crypto output parent must be absolute"));
+    }
+    let mut current = cap_std::fs::Dir::open_ambient_dir(&anchor, cap_std::ambient_authority())?;
+    let mut ancestors = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(crypto_refusal(
+                    "crypto output path must not traverse a parent",
+                ));
+            }
+            Component::Normal(name) => {
+                match current.symlink_metadata(name) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(crypto_refusal(
+                            "crypto output directory must not be a symlink",
+                        ));
+                    }
+                    Ok(metadata) if !metadata.file_type().is_dir() => {
+                        return Err(crypto_refusal("crypto output parent must be a directory"));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                let next = match current.open_dir_nofollow(name) {
+                    Ok(next) => next,
+                    Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                        match current.create_dir(name) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(error),
+                        }
+                        current.open_dir_nofollow(name)?
+                    }
+                    Err(error) => return Err(error),
+                };
+                ancestors.push(current);
+                current = next;
+            }
+        }
+    }
+    Ok((current, ancestors))
+}
+
+fn absolute_crypto_output(path: &Path) -> std::io::Result<PathBuf> {
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(crypto_refusal(
+            "crypto output path must not traverse a parent",
+        ));
+    }
+    let absolute = std::path::absolute(path)?;
+    #[cfg(target_os = "macos")]
+    for (alias, target) in [
+        ("/tmp", "/private/tmp"),
+        ("/var", "/private/var"),
+        ("/etc", "/private/etc"),
+    ] {
+        let alias = Path::new(alias);
+        if absolute.starts_with(alias)
+            && mcp_agent_mail_core::disk::is_trusted_system_directory_alias(alias)
+        {
+            return Ok(Path::new(target).join(
+                absolute
+                    .strip_prefix(alias)
+                    .map_err(|_| crypto_refusal("invalid system-directory alias"))?,
+            ));
+        }
+    }
+    Ok(absolute)
+}
+
+/// All mutation stays under these retained directory/file handles. No destructor
+/// removes artifacts by pathname. A late parent substitution can leave a complete
+/// output in the original directory; it returns publication-unconfirmed and never
+/// touches the substitute directory or retries there.
+struct CryptoOutput {
+    output: PathBuf,
+    parent_path: PathBuf,
+    name: std::ffi::OsString,
+    parent: cap_std::fs::Dir,
+    _ancestors: Vec<cap_std::fs::Dir>,
+    stage: cap_std::fs::Dir,
+    stage_path: PathBuf,
+    file: Option<std::fs::File>,
+    expected: Option<CryptoFileWitness>,
+}
+
+impl CryptoOutput {
+    fn capture(output: &Path, prefix: &str, overwrite: bool) -> ShareResult<Self> {
+        use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+        let output = absolute_crypto_output(output)?;
+        let name = output
+            .file_name()
+            .ok_or_else(|| crypto_refusal("crypto output must name a file"))?
+            .to_os_string();
+        #[cfg(windows)]
+        mcp_agent_mail_core::journal_io::validate_entry_name(name.to_str().ok_or_else(|| {
+            crypto_refusal("Windows crypto output requires a Unicode file name")
+        })?)?;
+        let parent_path = output
+            .parent()
+            .ok_or_else(|| crypto_refusal("crypto output has no parent"))?
+            .to_path_buf();
+        let (parent, ancestors) = open_crypto_directory(&parent_path, true)?;
+        let expected = match parent.symlink_metadata(&name) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(crypto_refusal("crypto output must not be a symlink").into());
+                }
+                if !metadata.file_type().is_file() {
+                    return Err(crypto_refusal("crypto output must be a regular file").into());
+                }
+                if !overwrite {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "crypto output already exists",
+                    )
+                    .into());
+                }
+                Some(crypto_named_witness(&parent, &name)?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let temp = tempfile::Builder::new()
+            .prefix(prefix)
+            .rand_bytes(16)
+            .disable_cleanup(true)
+            .make_in(&parent_path, |candidate| {
+                let name = candidate
+                    .file_name()
+                    .ok_or_else(|| crypto_refusal("invalid staging name"))?;
+                let builder = cap_std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                let builder = {
+                    use cap_std::fs::DirBuilderExt as _;
+                    let mut builder = builder;
+                    builder.mode(0o700);
+                    builder
+                };
+                parent.create_dir_with(name, &builder)?;
+                let directory = parent.open_dir_nofollow(name)?;
+                let mut options = cap_std::fs::OpenOptions::new();
+                options
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .follow(FollowSymlinks::No);
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                let file = directory.open_with("payload", &options)?.into_std();
+                Ok((directory, file))
+            })?;
+        let stage_path = temp.path().to_path_buf();
+        let ((stage, file), _retained_path) = temp.into_parts();
+        let publication = Self {
+            output,
+            parent_path,
+            name,
+            parent,
+            _ancestors: ancestors,
+            stage,
+            stage_path,
+            file: Some(file),
+            expected,
+        };
+        #[cfg(test)]
+        crypto_publication_hook(
+            CryptoPublicationPhase::Captured,
+            &publication.output,
+            &publication.stage_path.join("payload"),
+        );
+        Ok(publication)
+    }
+
+    fn validate_parent(&self) -> std::io::Result<()> {
+        let (observed, _ancestors) = open_crypto_directory(&self.parent_path, false)?;
+        let captured = same_file::Handle::from_file(self.parent.try_clone()?.into_std_file())?;
+        let observed = same_file::Handle::from_file(observed.into_std_file())?;
+        if captured != observed {
+            return Err(crypto_refusal("crypto output parent changed identity"));
+        }
+        Ok(())
+    }
+
+    fn retained_error(&self, error: ShareError) -> ShareError {
+        let kind = match &error {
+            ShareError::Io(error) => error.kind(),
+            _ => std::io::ErrorKind::Other,
+        };
+        std::io::Error::new(kind, format!("{error}; crypto artifacts for {} retained under {} (under the original parent if it moved)", self.output.display(), self.stage_path.display())).into()
+    }
+
+    fn unconfirmed(&self) -> std::io::Error {
+        std::io::Error::other(
+            "crypto publication unconfirmed; original directory and all retained artifacts must be inspected before retrying",
+        )
+    }
+
+    fn sync_directories(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.stage.try_clone()?.into_std_file().sync_all()?;
+            self.parent.try_clone()?.into_std_file().sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn file_mut(&mut self) -> std::io::Result<&mut std::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("crypto staging handle unavailable"))
+    }
+
+    fn publish(&mut self) -> ShareResult<()> {
+        self.file_mut()?.sync_all()?;
+        self.validate_parent()?;
+        let staged = crypto_file_witness(self.file_mut()?)?;
+        if staged.state.links != 1
+            || !staged.matches(
+                &crypto_named_witness(&self.stage, OsStr::new("payload"))?,
+                0,
+            )
+        {
+            return Err(crypto_refusal("crypto staging identity or link topology changed").into());
+        }
+        // In particular, no shadowed witness may retain the replacement inode
+        // when Windows later opens it exclusively for ReplaceFile.
+        drop(staged);
+        if let Some(expected) = &self.expected {
+            let current = crypto_named_witness(&self.parent, &self.name)?;
+            if !expected.matches(&current, 0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "signature output changed before publication",
+                )
+                .into());
+            }
+            // Keep an independent name for the complete candidate before an
+            // exchange can displace either its payload name or final name.
+            self.stage.hard_link("payload", &self.stage, "candidate")?;
+        }
+        let mut staged = crypto_file_witness(self.file_mut()?)?;
+        #[cfg(windows)]
+        if self.expected.is_some() {
+            // Windows settles last-write time only after the last writer closes.
+            // Close both writable handles before capturing the comparison used
+            // across ReplaceFile; the private hardlink pins the candidate ID.
+            drop(self.file.take());
+            drop(staged.retained.take());
+            let file = open_crypto_leaf(&self.stage, OsStr::new("candidate"))?;
+            let settled = crypto_file_witness(&file)?;
+            staged.state.modified = settled.state.modified;
+            if !staged.matches(&settled, 0) {
+                return Err(crypto_refusal(
+                    "crypto staging changed while settling its write handle",
+                )
+                .into());
+            }
+            staged = settled;
+            self.file = Some(file);
+        }
+        if staged.state.links != if self.expected.is_some() { 2 } else { 1 } {
+            return Err(crypto_refusal("crypto staging link topology changed").into());
+        }
+        #[cfg(test)]
+        crypto_publication_hook(
+            CryptoPublicationPhase::BeforePublish,
+            &self.output,
+            &self.stage_path.join("payload"),
+        );
+        if self.expected.is_some() {
+            self.replace_expected(&mut staged)?;
+        } else {
+            // A single kernel operation decides the winner. Existing regular
+            // files and dangling symlinks are never replaced or followed.
+            self.stage.hard_link("payload", &self.parent, &self.name)?;
+        }
+        self.file_mut()?
+            .sync_all()
+            .map_err(|_| self.unconfirmed())?;
+        self.sync_directories().map_err(|_| self.unconfirmed())?;
+        self.validate_parent().map_err(|_| self.unconfirmed())?;
+        let observed =
+            crypto_named_witness(&self.parent, &self.name).map_err(|_| self.unconfirmed())?;
+        if !staged.matches(&observed, u64::from(self.expected.is_none())) {
+            return Err(self.unconfirmed().into());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+    fn replace_expected(&mut self, staged: &mut CryptoFileWitness) -> std::io::Result<()> {
+        #[cfg(unix)]
+        let displaced = {
+            rustix::fs::renameat_with(
+                &self.stage,
+                "payload",
+                &self.parent,
+                &self.name,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )
+            .map_err(std::io::Error::from)?;
+            "payload"
+        };
+        #[cfg(windows)]
+        let displaced = {
+            let replaced = crypto_windows_path(&self.output)?;
+            let replacement = crypto_windows_path(&self.stage_path.join("payload"))?;
+            let backup = crypto_windows_path(&self.stage_path.join("replaced"))?;
+            // ReplaceFile opens the replacement without sharing. The candidate
+            // hardlink keeps its file ID allocated while these handles close.
+            drop(self.file.take());
+            drop(staged.retained.take());
+            match winsafe::ReplaceFile(
+                &replaced,
+                &replacement,
+                Some(&backup),
+                winsafe::co::REPLACEFILE::default(),
+            ) {
+                Ok(()) => {}
+                Err(error) if error == winsafe::co::ERROR::UNABLE_TO_MOVE_REPLACEMENT_2 => {
+                    // Windows may have moved the old target into the backup
+                    // before failing. Restore only into an absent final name.
+                    self.move_retained_no_replace(false, "replaced")
+                        .map_err(|_| self.unconfirmed())?;
+                    return Err(std::io::Error::from_raw_os_error(error.raw().cast_signed()));
+                }
+                Err(error) => {
+                    return Err(std::io::Error::from_raw_os_error(error.raw().cast_signed()));
+                }
+            }
+            use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).write(true).follow(FollowSymlinks::No);
+            self.file = Some(
+                self.stage
+                    .open_with("candidate", &options)
+                    .map_err(|_| self.unconfirmed())?
+                    .into_std(),
+            );
+            "replaced"
+        };
+        let observed = crypto_named_witness(&self.stage, OsStr::new(displaced));
+        if observed.as_ref().is_ok_and(|observed| {
+            self.expected
+                .as_ref()
+                .is_some_and(|expected| expected.matches(observed, 0))
+        }) {
+            return Ok(());
+        }
+
+        // Never blindly exchange back: a third writer could have replaced the
+        // final name after our exchange. Detach it without replacement, inspect
+        // what was actually detached, and restore only to an absent final name.
+        self.move_retained_no_replace(true, "rejected")
+            .map_err(|_| self.unconfirmed())?;
+        let detached = crypto_named_witness(&self.stage, OsStr::new("rejected"));
+        if detached
+            .as_ref()
+            .is_ok_and(|detached| staged.matches(detached, 0))
+        {
+            self.move_retained_no_replace(false, displaced)
+                .map_err(|_| self.unconfirmed())?;
+            self.sync_directories().map_err(|_| self.unconfirmed())?;
+            self.validate_parent().map_err(|_| self.unconfirmed())?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "signature output changed during publication; raced output restored and candidate retained",
+            ));
+        }
+        self.move_retained_no_replace(false, "rejected")
+            .map_err(|_| self.unconfirmed())?;
+        self.sync_directories().map_err(|_| self.unconfirmed())?;
+        Err(self.unconfirmed())
+    }
+
+    #[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
+    fn replace_expected(&mut self, _staged: &mut CryptoFileWitness) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic signature replacement is unavailable on this platform; candidate retained",
+        ))
+    }
+
+    #[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+    fn move_retained_no_replace(&self, from_output: bool, retained: &str) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let (source, source_name, destination, destination_name) = if from_output {
+                (
+                    &self.parent,
+                    self.name.as_os_str(),
+                    &self.stage,
+                    OsStr::new(retained),
+                )
+            } else {
+                (
+                    &self.stage,
+                    OsStr::new(retained),
+                    &self.parent,
+                    self.name.as_os_str(),
+                )
+            };
+            rustix::fs::renameat_with(
+                source,
+                source_name,
+                destination,
+                destination_name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(std::io::Error::from)
+        }
+        #[cfg(windows)]
+        {
+            let retained = self.stage_path.join(retained);
+            let (source, destination) = if from_output {
+                (&self.output, &retained)
+            } else {
+                (&retained, &self.output)
+            };
+            mcp_agent_mail_core::disk::windows_rename_noreplace(source, destination)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn crypto_windows_path(path: &Path) -> std::io::Result<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| crypto_refusal("Windows crypto publication requires a Unicode path"))?;
+    if path.contains('\0') {
+        return Err(crypto_refusal(
+            "Windows crypto publication path must not contain a NUL byte",
+        ));
+    }
+    Ok(path.to_owned())
 }
 
 fn require_real_crypto_file(path: &Path, label: &str) -> ShareResult<()> {
@@ -851,94 +1427,6 @@ fn require_real_crypto_file(path: &Path, label: &str) -> ShareResult<()> {
         }
         Err(error) => Err(ShareError::Io(error)),
     }
-}
-
-fn validate_crypto_output_path(path: &Path, label: &str) -> ShareResult<()> {
-    let _ = crypto_output_parent(path)?;
-
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(ShareError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{label} path must not be a symlink: {}", path.display()),
-                )));
-            }
-            if !metadata.file_type().is_file() {
-                return Err(ShareError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{label} path must be a regular file: {}", path.display()),
-                )));
-            }
-            Err(ShareError::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("{label} already exists: {}", path.display()),
-            )))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ShareError::Io(error)),
-    }
-}
-
-fn crypto_output_parent(path: &Path) -> ShareResult<PathBuf> {
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => std::env::current_dir()?,
-    };
-    ensure_real_crypto_directory(&parent)?;
-    Ok(parent)
-}
-
-fn ensure_real_crypto_directory(path: &Path) -> ShareResult<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        use std::path::Component;
-
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(ShareError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "refusing to traverse crypto output path with parent traversal: {}",
-                        path.display()
-                    ),
-                )));
-            }
-            Component::Normal(segment) => {
-                current.push(segment);
-                match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) => {
-                        if metadata.file_type().is_symlink() {
-                            return Err(ShareError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!(
-                                    "crypto output directory must not be a symlink: {}",
-                                    current.display()
-                                ),
-                            )));
-                        }
-                        if !metadata.file_type().is_dir() {
-                            return Err(ShareError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!(
-                                    "crypto output parent must be a directory: {}",
-                                    current.display()
-                                ),
-                            )));
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        std::fs::create_dir(&current)?;
-                    }
-                    Err(error) => return Err(ShareError::Io(error)),
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn check_age_available() -> ShareResult<()> {
@@ -2024,6 +2512,7 @@ mod tests {
         let mut corrupted = ciphertext.clone();
         *corrupted.last_mut().unwrap() ^= 1;
         let truncated = ciphertext[..ciphertext.len() - 1].to_vec();
+        let mut retained_stages = 0;
         for (case, bytes, secret) in [
             (
                 "wrong-secret",
@@ -2045,13 +2534,36 @@ mod tests {
             assert_eq!(std::fs::read(&input).unwrap(), bytes);
             assert_eq!(std::fs::read(&original).unwrap(), plaintext);
             assert_eq!(std::fs::read(&encrypted).unwrap(), ciphertext);
-            assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".age-decrypt.")
-            }));
+            // Rejected authenticated streams retain their private stage for
+            // diagnosis; they must never publish partial plaintext publicly.
+            let stages: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".age-decrypt.")
+                })
+                .collect();
+            assert_eq!(stages.len(), retained_stages + 1);
+            retained_stages = stages.len();
+            for stage in stages {
+                assert!(stage.file_type().unwrap().is_dir());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        stage.metadata().unwrap().permissions().mode() & 0o777,
+                        0o700
+                    );
+                    let payload = stage.path().join("payload");
+                    assert_eq!(
+                        std::fs::metadata(payload).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+            }
         }
     }
 
@@ -2874,18 +3386,34 @@ mod tests {
         std::fs::write(&input, b"data").unwrap();
         let script_path = write_fake_age_script(
             dir.path(),
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"fake age 1.0\"\n  exit 0\nfi\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then\n    out=\"$2\"\n    shift 2\n    continue\n  fi\n  shift\ndone\nprintf 'partial-ciphertext' > \"$out\"\necho 'simulated encryption failure' >&2\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"fake age 1.0\"\n  exit 0\nfi\nprintf 'partial-ciphertext'\necho 'simulated encryption failure' >&2\nexit 1\n",
         );
 
         let err = with_age_command_override(&script_path, || {
             encrypt_with_age(&input, &["age1example".to_string()])
                 .expect_err("fake age failure should surface")
         });
-        assert!(format!("{err}").contains("simulated encryption failure"));
+        assert!(format!("{err}").contains("check recipient and input"));
+        assert!(!format!("{err}").contains("simulated encryption failure"));
         assert!(
             !input.with_extension("zip.age").exists(),
             "failed encryption should not strand a partial output at the final path"
         );
+        let stage = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".age-encrypt.")
+            })
+            .expect("failed child stage must be retained");
+        assert_eq!(
+            std::fs::read(stage.path().join("payload")).unwrap(),
+            b"partial-ciphertext"
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), b"data");
     }
 
     #[test]
@@ -2914,7 +3442,7 @@ mod tests {
         std::fs::write(&identity, b"identity").unwrap();
         let script_path = write_fake_age_script(
             dir.path(),
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"fake age 1.0\"\n  exit 0\nfi\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then\n    out=\"$2\"\n    shift 2\n    continue\n  fi\n  shift\ndone\nprintf 'partial-plaintext' > \"$out\"\necho 'simulated decryption failure' >&2\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"fake age 1.0\"\n  exit 0\nfi\nprintf 'partial-plaintext'\necho 'simulated decryption failure' >&2\nexit 1\n",
         );
 
         let err = with_age_command_override(&script_path, || {
@@ -2927,6 +3455,22 @@ mod tests {
             !output.exists(),
             "failed decryption should not strand a partial output at the final path"
         );
+        let stage = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".age-decrypt.")
+            })
+            .expect("failed child stage must be retained");
+        assert_eq!(
+            std::fs::read(stage.path().join("payload")).unwrap(),
+            b"partial-plaintext"
+        );
+        assert_eq!(std::fs::read(&encrypted).unwrap(), b"ciphertext");
+        assert_eq!(std::fs::read(&identity).unwrap(), b"identity");
     }
 
     #[cfg(unix)]
@@ -3058,6 +3602,7 @@ mod tests {
 
     #[test]
     fn sign_overwrite_produces_valid_signature() {
+        use std::rc::Rc;
         let dir = tempfile::tempdir().unwrap();
         let manifest_path = dir.path().join("manifest.json");
         let key_path = dir.path().join("test.key");
@@ -3068,10 +3613,32 @@ mod tests {
         // Sign first version
         std::fs::write(&manifest_path, r#"{"version": 1}"#).unwrap();
         sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+        let original_signature = PublicationFileWitness::capture(&sig_path);
 
         // Update manifest and re-sign with overwrite
         std::fs::write(&manifest_path, r#"{"version": 2}"#).unwrap();
-        let sig2 = sign_manifest(&manifest_path, &key_path, &sig_path, true).unwrap();
+        let staged = Rc::new(RefCell::new(None));
+        let recorded = Rc::clone(&staged);
+        let sig2 = with_crypto_publication_hook(
+            move |phase, _, candidate| {
+                if matches!(phase, CryptoPublicationPhase::BeforePublish) {
+                    *recorded.borrow_mut() = Some((
+                        candidate.to_path_buf(),
+                        PublicationFileWitness::capture(candidate),
+                    ));
+                }
+            },
+            || sign_manifest(&manifest_path, &key_path, &sig_path, true),
+        )
+        .unwrap();
+        let staged = staged.borrow();
+        let (candidate_path, candidate) = staged.as_ref().expect("overwrite reached publication");
+        candidate.assert_unchanged(&sig_path);
+        let stage_dir = candidate_path.parent().unwrap();
+        let retained_original = retained_publication_file(stage_dir, &original_signature.identity);
+        original_signature.assert_unchanged(&retained_original);
+        let retained_candidate = retained_publication_file(stage_dir, &candidate.identity);
+        candidate.assert_unchanged(&retained_candidate);
 
         // Verify the new signature matches the new manifest
         let result = verify_bundle(dir.path(), Some(&sig2.public_key)).unwrap();
@@ -3129,6 +3696,803 @@ mod tests {
         assert!(result.signature_verified, "signature should verify");
         assert!(result.error.is_none());
         assert_eq!(result.key_source.as_deref(), Some("explicit"));
+    }
+
+    // br-kp1in.49: child shims establish publication interleavings, not age
+    // interoperability. Existing real-age tests retain that separate gate.
+    #[derive(Clone, Copy, Debug)]
+    enum PublicationOperation {
+        Sign,
+        PassphraseDecrypt,
+        #[cfg(unix)]
+        EncryptChild,
+        #[cfg(unix)]
+        IdentityDecryptChild,
+    }
+
+    impl PublicationOperation {
+        fn all() -> &'static [Self] {
+            &[
+                Self::Sign,
+                Self::PassphraseDecrypt,
+                #[cfg(unix)]
+                Self::EncryptChild,
+                #[cfg(unix)]
+                Self::IdentityDecryptChild,
+            ]
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Sign => "ed25519-sign",
+                Self::PassphraseDecrypt => "passphrase-decrypt",
+                #[cfg(unix)]
+                Self::EncryptChild => "encrypt-child-shim",
+                #[cfg(unix)]
+                Self::IdentityDecryptChild => "identity-decrypt-child-shim",
+            }
+        }
+    }
+
+    const PUBLICATION_PASSPHRASE: &str = "synthetic publication fixture passphrase";
+
+    #[derive(Clone)]
+    struct PublicationFixture {
+        operation: PublicationOperation,
+        parent: PathBuf,
+        input: PathBuf,
+        output: PathBuf,
+        key: PathBuf,
+        expected: Vec<u8>,
+        #[cfg(unix)]
+        child: PathBuf,
+    }
+
+    impl PublicationFixture {
+        fn new(root: &Path, operation: PublicationOperation) -> Self {
+            let parent = root.join("outputs");
+            std::fs::create_dir(&parent).unwrap();
+            let mut input = root.join("input.bin");
+            let mut output = parent.join("result.bin");
+            let key = root.join("synthetic.key");
+            std::fs::write(&key, test_key_bytes()).unwrap();
+            let expected: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+            match operation {
+                PublicationOperation::Sign => {
+                    input = root.join("manifest.json");
+                    output = parent.join("manifest.sig.json");
+                    std::fs::write(&input, br#"{"synthetic_publication":true}"#).unwrap();
+                }
+                PublicationOperation::PassphraseDecrypt => {
+                    std::fs::write(
+                        &input,
+                        passphrase_ciphertext(&expected, PUBLICATION_PASSPHRASE, false),
+                    )
+                    .unwrap();
+                }
+                #[cfg(unix)]
+                PublicationOperation::EncryptChild => {
+                    input = parent.join("input.bin");
+                    output = parent.join("input.bin.age");
+                    std::fs::write(&input, &expected).unwrap();
+                }
+                #[cfg(unix)]
+                PublicationOperation::IdentityDecryptChild => {
+                    std::fs::write(&input, &expected).unwrap();
+                }
+            }
+            #[cfg(unix)]
+            let child = write_fake_age_script(
+                root,
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'publication I/O fixture'\n  exit 0\nfi\ncat\n",
+            );
+            Self {
+                operation,
+                parent,
+                input,
+                output,
+                key,
+                expected,
+                #[cfg(unix)]
+                child,
+            }
+        }
+
+        fn execute(&self, overwrite: bool) -> ShareResult<()> {
+            match self.operation {
+                PublicationOperation::Sign => {
+                    sign_manifest(&self.input, &self.key, &self.output, overwrite).map(|_| ())
+                }
+                PublicationOperation::PassphraseDecrypt => decrypt_with_age(
+                    &self.input,
+                    &self.output,
+                    None,
+                    Some(PUBLICATION_PASSPHRASE),
+                ),
+                #[cfg(unix)]
+                PublicationOperation::EncryptChild => {
+                    with_age_command_override(&self.child, || {
+                        encrypt_with_age(&self.input, &["synthetic-recipient".to_string()])
+                            .map(|_| ())
+                    })
+                }
+                #[cfg(unix)]
+                PublicationOperation::IdentityDecryptChild => {
+                    with_age_command_override(&self.child, || {
+                        decrypt_with_age(&self.input, &self.output, Some(&self.key), None)
+                    })
+                }
+            }
+        }
+
+        fn assert_complete(&self, path: &Path) {
+            let bytes = std::fs::read(path).unwrap();
+            if matches!(self.operation, PublicationOperation::Sign) {
+                let signature: ManifestSignature = serde_json::from_slice(&bytes).unwrap();
+                let manifest = std::fs::read(&self.input).unwrap();
+                let public_key =
+                    ed25519_dalek::SigningKey::from_bytes(&test_key_bytes()).verifying_key();
+                let raw_signature: [u8; 64] = base64_decode(&signature.signature)
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                assert_eq!(signature.public_key, base64_encode(public_key.as_bytes()));
+                assert_eq!(signature.manifest_sha256, hex_sha256(&manifest));
+                public_key
+                    .verify_strict(
+                        &manifest,
+                        &ed25519_dalek::Signature::from_bytes(&raw_signature),
+                    )
+                    .unwrap();
+            } else {
+                assert!(
+                    bytes == self.expected,
+                    "published or staged output is incomplete"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    type PublicationFileIdentity = same_file::Handle;
+    #[cfg(windows)]
+    type PublicationFileIdentity = (u64, u64);
+
+    struct PublicationFileWitness {
+        identity: PublicationFileIdentity,
+        size: u64,
+        sha256: String,
+        metadata: serde_json::Value,
+    }
+
+    impl PublicationFileWitness {
+        fn capture(path: &Path) -> Self {
+            use std::io::Read;
+            let mut file = std::fs::File::open(path).unwrap();
+            let metadata = file.metadata().unwrap();
+            assert!(metadata.is_file());
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            #[cfg(unix)]
+            let identity_metadata = {
+                use std::os::unix::fs::MetadataExt;
+                serde_json::json!({"device": metadata.dev(), "inode": metadata.ino(), "mode": metadata.mode() & 0o777})
+            };
+            #[cfg(windows)]
+            let capability_metadata = {
+                let retained = cap_std::fs::File::from_std(file.try_clone().unwrap());
+                retained.metadata().unwrap()
+            };
+            #[cfg(windows)]
+            let identity_metadata = serde_json::json!({
+                "device": cap_fs_ext::MetadataExt::dev(&capability_metadata),
+                "inode": cap_fs_ext::MetadataExt::ino(&capability_metadata),
+                "readonly": metadata.permissions().readonly()
+            });
+            #[cfg(not(any(unix, windows)))]
+            let identity_metadata =
+                serde_json::json!({"identity_check": "retained same_file handle"});
+            #[cfg(not(windows))]
+            let identity = same_file::Handle::from_file(file).unwrap();
+            // ReplaceFile opens its replacement exclusively. Keep numeric file
+            // identity on Windows so the test observer cannot block that API.
+            #[cfg(windows)]
+            let identity = (
+                cap_fs_ext::MetadataExt::dev(&capability_metadata),
+                cap_fs_ext::MetadataExt::ino(&capability_metadata),
+            );
+            Self {
+                identity,
+                size: metadata.len(),
+                sha256: hex_sha256(&bytes),
+                metadata: identity_metadata,
+            }
+        }
+
+        fn assert_unchanged(&self, path: &Path) -> Self {
+            let observed = Self::capture(path);
+            assert!(self.identity == observed.identity, "file identity changed");
+            assert_eq!(self.size, observed.size, "file length changed");
+            assert_eq!(self.sha256, observed.sha256, "file content changed");
+            assert_eq!(self.metadata, observed.metadata, "file metadata changed");
+            observed
+        }
+
+        fn json(&self) -> serde_json::Value {
+            serde_json::json!({"size": self.size, "sha256": self.sha256, "metadata": self.metadata})
+        }
+    }
+
+    fn retained_publication_fixture(case: &str, operation: PublicationOperation) -> PathBuf {
+        let path = tempfile::Builder::new()
+            .prefix(&format!("am-crypto-{case}-{}-", operation.label()))
+            .tempdir()
+            .unwrap()
+            .keep();
+        // Keep hook path comparisons stable across macOS /var and /tmp aliases.
+        let path = path.canonicalize().unwrap();
+        eprintln!("retained publication fixture: {}", path.display());
+        path
+    }
+
+    fn write_publication_receipt(
+        root: &Path,
+        operation: PublicationOperation,
+        details: serde_json::Value,
+    ) {
+        let receipt = serde_json::json!({
+            "schema": "am-crypto-publication-unit-v1",
+            "operation": operation.label(),
+            "public_call_completed": true,
+            "claim": "causal public API publication boundary; real-age interoperability is a separate lane",
+            "details": details
+        });
+        std::fs::write(
+            root.join("publication-receipt.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_publication_collision(result: ShareResult<()>) {
+        assert!(
+            matches!(result, Err(ShareError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "raced no-replace destination must produce AlreadyExists"
+        );
+    }
+
+    fn retained_publication_file(directory: &Path, identity: &PublicationFileIdentity) -> PathBuf {
+        for entry in std::fs::read_dir(directory).unwrap().map(Result::unwrap) {
+            if entry.file_type().unwrap().is_file() {
+                let observed = PublicationFileWitness::capture(&entry.path());
+                if observed.identity == *identity {
+                    return entry.path();
+                }
+            }
+        }
+        panic!("file identity was not retained in the private stage");
+    }
+
+    #[test]
+    fn crypto_publication_preserves_a_raced_regular_destination() {
+        use std::rc::Rc;
+        for &operation in PublicationOperation::all() {
+            let modes: &[bool] = if matches!(operation, PublicationOperation::Sign) {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &overwrite in modes {
+                let root = retained_publication_fixture("raced-regular", operation);
+                let fixture = PublicationFixture::new(&root, operation);
+                let source_before = PublicationFileWitness::capture(&fixture.input);
+                let key_before = PublicationFileWitness::capture(&fixture.key);
+                let witnessed = Rc::new(RefCell::new(None));
+                let recorded = Rc::clone(&witnessed);
+                let result = with_crypto_publication_hook(
+                    move |phase, destination, staged| {
+                        if matches!(phase, CryptoPublicationPhase::BeforePublish) {
+                            assert!(!destination.exists());
+                            let candidate = PublicationFileWitness::capture(staged);
+                            std::fs::write(destination, b"concurrent writer owns these bytes\0")
+                                .unwrap();
+                            let competitor = PublicationFileWitness::capture(destination);
+                            *recorded.borrow_mut() =
+                                Some((staged.to_path_buf(), candidate, competitor));
+                        }
+                    },
+                    || fixture.execute(overwrite),
+                );
+                assert_publication_collision(result);
+                let witnessed = witnessed.borrow();
+                let (staged, candidate, competitor) =
+                    witnessed.as_ref().expect("publication seam was reached");
+                let after = competitor.assert_unchanged(&fixture.output);
+                candidate.assert_unchanged(staged);
+                fixture.assert_complete(staged);
+                let source_after = source_before.assert_unchanged(&fixture.input);
+                key_before.assert_unchanged(&fixture.key);
+                write_publication_receipt(
+                    &root,
+                    operation,
+                    serde_json::json!({
+                        "case": "raced-regular", "overwrite_flag": overwrite, "result": "AlreadyExists",
+                        "output_parent": fixture.parent,
+                        "destination_before": competitor.json(), "destination_after": after.json(),
+                        "source_before": source_before.json(), "source_after": source_after.json(),
+                        "key_identity_preserved": true, "staged_path": staged, "staged_candidate": candidate.json()
+                    }),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn publication_symlink_witness(path: &Path) -> serde_json::Value {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        serde_json::json!({"device": metadata.dev(), "inode": metadata.ino(), "target": std::fs::read_link(path).unwrap()})
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crypto_publication_preserves_raced_dangling_and_outside_symlinks() {
+        use std::os::unix::fs::symlink;
+        use std::rc::Rc;
+        for &operation in PublicationOperation::all() {
+            for dangling in [false, true] {
+                let root = retained_publication_fixture("raced-symlink", operation);
+                let fixture = PublicationFixture::new(&root, operation);
+                let source_before = PublicationFileWitness::capture(&fixture.input);
+                let key_before = PublicationFileWitness::capture(&fixture.key);
+                let outside = root.join("outside-sentinel");
+                std::fs::write(&outside, b"outside sentinel must survive").unwrap();
+                let outside_before = PublicationFileWitness::capture(&outside);
+                let target = if dangling {
+                    root.join("absent-target")
+                } else {
+                    outside.clone()
+                };
+                let target_for_hook = target.clone();
+                let witnessed = Rc::new(RefCell::new(None));
+                let recorded = Rc::clone(&witnessed);
+                let result = with_crypto_publication_hook(
+                    move |phase, destination, staged| {
+                        if matches!(phase, CryptoPublicationPhase::BeforePublish) {
+                            let candidate = PublicationFileWitness::capture(staged);
+                            symlink(&target_for_hook, destination).unwrap();
+                            *recorded.borrow_mut() = Some((
+                                staged.to_path_buf(),
+                                candidate,
+                                publication_symlink_witness(destination),
+                            ));
+                        }
+                    },
+                    || fixture.execute(false),
+                );
+                assert_publication_collision(result);
+                let witnessed = witnessed.borrow();
+                let (staged, candidate, link_before) =
+                    witnessed.as_ref().expect("publication seam was reached");
+                let link_after = publication_symlink_witness(&fixture.output);
+                assert_eq!(*link_before, link_after);
+                outside_before.assert_unchanged(&outside);
+                if dangling {
+                    assert!(!target.exists(), "a raced dangling symlink was followed");
+                }
+                candidate.assert_unchanged(staged);
+                fixture.assert_complete(staged);
+                let source_after = source_before.assert_unchanged(&fixture.input);
+                key_before.assert_unchanged(&fixture.key);
+                write_publication_receipt(
+                    &root,
+                    operation,
+                    serde_json::json!({
+                        "case": "raced-symlink", "dangling": dangling, "result": "AlreadyExists",
+                        "link_before": link_before, "link_after": link_after,
+                        "outside_sentinel": outside_before.json(), "key_identity_preserved": true,
+                        "source_before": source_before.json(), "source_after": source_after.json(),
+                        "staged_path": staged, "staged_candidate": candidate.json()
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crypto_publication_concurrent_writers_have_one_complete_winner() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for &operation in PublicationOperation::all() {
+            let root = retained_publication_fixture("two-writers", operation);
+            let fixture = PublicationFixture::new(&root, operation);
+            let source_before = PublicationFileWitness::capture(&fixture.input);
+            let key_before = PublicationFileWitness::capture(&fixture.key);
+            let (ready_send, ready_receive) = mpsc::channel();
+            let (done_send, done_receive) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let mut releases = Vec::new();
+                for index in 0..2 {
+                    let worker_fixture = fixture.clone();
+                    let ready = ready_send.clone();
+                    let done = done_send.clone();
+                    let (release, resume) = mpsc::channel();
+                    releases.push(release);
+                    scope.spawn(move || {
+                        let result = with_crypto_publication_hook(
+                            move |phase, _, staged| {
+                                if matches!(phase, CryptoPublicationPhase::BeforePublish) {
+                                    ready.send((index, staged.to_path_buf())).unwrap();
+                                    resume
+                                        .recv_timeout(Duration::from_secs(15))
+                                        .expect("bounded publication release");
+                                }
+                            },
+                            || worker_fixture.execute(false),
+                        );
+                        done.send((index, result)).unwrap();
+                    });
+                }
+                let mut stages = Vec::new();
+                for _ in 0..2 {
+                    let (index, path) = ready_receive
+                        .recv_timeout(Duration::from_secs(15))
+                        .expect("both writers must finish staging before publication");
+                    let witness = PublicationFileWitness::capture(&path);
+                    fixture.assert_complete(&path);
+                    stages.push((index, path, witness));
+                }
+                assert!(
+                    !fixture.output.exists(),
+                    "no partial destination may be exposed while writers stage"
+                );
+                releases[0].send(()).unwrap();
+                let (winner, result) = done_receive
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("winner completion");
+                assert_eq!(winner, 0);
+                result.expect("first writer must publish successfully");
+                let winning_output = PublicationFileWitness::capture(&fixture.output);
+                fixture.assert_complete(&fixture.output);
+                releases[1].send(()).unwrap();
+                let (loser, result) = done_receive
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("loser completion");
+                assert_eq!(loser, 1);
+                assert_publication_collision(result);
+                let after = winning_output.assert_unchanged(&fixture.output);
+                for (index, path, candidate) in &stages {
+                    candidate.assert_unchanged(path);
+                    if *index == winner {
+                        assert!(
+                            candidate.identity == winning_output.identity,
+                            "published object must be the complete winning stage"
+                        );
+                    }
+                }
+                let source_after = source_before.assert_unchanged(&fixture.input);
+                key_before.assert_unchanged(&fixture.key);
+                write_publication_receipt(
+                    &root,
+                    operation,
+                    serde_json::json!({
+                        "case": "two-concurrent-writers", "winner": winner, "loser": loser,
+                        "winner_result": "success", "loser_result": "AlreadyExists",
+                        "both_producers_completed_before_publication": true,
+                        "source_before": source_before.json(), "source_after": source_after.json(), "key_identity_preserved": true,
+                        "winner_before_loser": winning_output.json(), "winner_after_loser": after.json(),
+                        "retained_stages": stages.iter().map(|(index, path, witness)| serde_json::json!({"writer": index, "path": path, "witness": witness.json()})).collect::<Vec<_>>()
+                    }),
+                );
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crypto_publication_parent_substitution_cannot_redirect_or_clean_up_unrelated_files() {
+        use std::os::unix::fs::symlink;
+        use std::rc::Rc;
+        for &operation in PublicationOperation::all() {
+            for late_swap in [false, true] {
+                for substitute_symlink in [false, true] {
+                    let root = retained_publication_fixture("parent-substitution", operation);
+                    let fixture = PublicationFixture::new(&root, operation);
+                    let source_before = PublicationFileWitness::capture(&fixture.input);
+                    let key_before = PublicationFileWitness::capture(&fixture.key);
+                    let retained_parent = root.join("retained-original-parent");
+                    let substitute = root.join("unrelated-directory");
+                    std::fs::create_dir(&substitute).unwrap();
+                    let substitute_output = substitute.join(fixture.output.file_name().unwrap());
+                    std::fs::write(&substitute_output, b"unrelated directory owner").unwrap();
+                    let substitute_before = PublicationFileWitness::capture(&substitute_output);
+                    let retained_for_hook = retained_parent.clone();
+                    let substitute_for_hook = substitute.clone();
+                    let parent_for_hook = fixture.parent.clone();
+                    let witnessed = Rc::new(RefCell::new(None));
+                    let recorded = Rc::clone(&witnessed);
+                    let result = with_crypto_publication_hook(
+                        move |phase, _, staged| {
+                            let selected = if late_swap {
+                                matches!(phase, CryptoPublicationPhase::BeforePublish)
+                            } else {
+                                matches!(phase, CryptoPublicationPhase::Captured)
+                            };
+                            if !selected {
+                                return;
+                            }
+                            let staged_relative =
+                                staged.strip_prefix(&parent_for_hook).unwrap().to_path_buf();
+                            let candidate_before = PublicationFileWitness::capture(staged);
+                            std::fs::rename(&parent_for_hook, &retained_for_hook).unwrap();
+                            if substitute_symlink {
+                                symlink(&substitute_for_hook, &parent_for_hook).unwrap();
+                            } else {
+                                std::fs::rename(&substitute_for_hook, &parent_for_hook).unwrap();
+                            }
+                            // A path-based TempDir destructor would delete this
+                            // unrelated tree after the original parent was moved.
+                            let trap = parent_for_hook.join(&staged_relative);
+                            std::fs::create_dir_all(trap.parent().unwrap()).unwrap();
+                            std::fs::write(&trap, b"unrelated staging-name cleanup trap").unwrap();
+                            let trap_before = PublicationFileWitness::capture(&trap);
+                            *recorded.borrow_mut() = Some((
+                                retained_for_hook.join(staged_relative),
+                                candidate_before,
+                                trap,
+                                trap_before,
+                            ));
+                        },
+                        || fixture.execute(false),
+                    );
+                    assert!(
+                        result.is_err(),
+                        "changed output pathname authority must report publication unconfirmed"
+                    );
+                    let witnessed = witnessed.borrow();
+                    let (staged, candidate_before, trap, trap_before) = witnessed
+                        .as_ref()
+                        .expect("parent substitution seam was reached");
+                    substitute_before.assert_unchanged(&fixture.output);
+                    trap_before.assert_unchanged(trap);
+                    let candidate_after = PublicationFileWitness::capture(staged);
+                    assert!(candidate_before.identity == candidate_after.identity);
+                    if late_swap {
+                        candidate_before.assert_unchanged(staged);
+                    }
+                    fixture.assert_complete(staged);
+                    let source_after_path =
+                        fixture.input.strip_prefix(&fixture.parent).map_or_else(
+                            |_| fixture.input.clone(),
+                            |relative| retained_parent.join(relative),
+                        );
+                    let source_after = source_before.assert_unchanged(&source_after_path);
+                    key_before.assert_unchanged(&fixture.key);
+                    let original_output = retained_parent.join(fixture.output.file_name().unwrap());
+                    let original_published = original_output.exists();
+                    if late_swap && original_published {
+                        // A late namespace swap may leave a complete output in
+                        // the retained original directory, but never success at
+                        // the substituted requested pathname.
+                        fixture.assert_complete(&original_output);
+                    } else {
+                        assert!(
+                            !original_published,
+                            "early parent substitution must refuse before publication"
+                        );
+                    }
+                    write_publication_receipt(
+                        &root,
+                        operation,
+                        serde_json::json!({
+                            "case": "parent-substitution", "phase": if late_swap { "BeforePublish" } else { "Captured" },
+                            "substitute_symlink": substitute_symlink, "result": "refused-or-publication-unconfirmed",
+                            "substitute_output": substitute_before.json(), "cleanup_trap": trap_before.json(),
+                            "retained_stage_path": staged, "retained_stage": candidate_after.json(),
+                            "original_directory_has_complete_output": original_published,
+                            "source_before": source_before.json(), "source_after": source_after.json(), "key_identity_preserved": true
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn crypto_publication_windows_parent_authority_blocks_rebinding() {
+        use std::rc::Rc;
+        for &operation in PublicationOperation::all() {
+            for late_swap in [false, true] {
+                let root = retained_publication_fixture("windows-parent-authority", operation);
+                let fixture = PublicationFixture::new(&root, operation);
+                let moved_parent = root.join("renamed-parent");
+                // The actor can rename this fixture before authority capture;
+                // a later refusal must come from the retained directory handles.
+                std::fs::rename(&fixture.parent, &moved_parent).unwrap();
+                std::fs::rename(&moved_parent, &fixture.parent).unwrap();
+                let source_before = PublicationFileWitness::capture(&fixture.input);
+                let key_before = PublicationFileWitness::capture(&fixture.key);
+                let moved_for_hook = moved_parent.clone();
+                let witnessed = Rc::new(RefCell::new(None));
+                let recorded = Rc::clone(&witnessed);
+                with_crypto_publication_hook(
+                    move |phase, destination, staged| {
+                        let selected = if late_swap {
+                            matches!(phase, CryptoPublicationPhase::BeforePublish)
+                        } else {
+                            matches!(phase, CryptoPublicationPhase::Captured)
+                        };
+                        if selected {
+                            let error =
+                                std::fs::rename(destination.parent().unwrap(), &moved_for_hook)
+                                    .expect_err(
+                                        "retained Windows directory authority must block rebinding",
+                                    );
+                            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                            *recorded.borrow_mut() =
+                                Some((staged.to_path_buf(), error.raw_os_error()));
+                        }
+                    },
+                    || fixture.execute(false),
+                )
+                .expect("refused parent rename must leave valid publication available");
+                let witnessed = witnessed.borrow();
+                let (stage_path, os_error) =
+                    witnessed.as_ref().expect("parent rename was attempted");
+                fixture.assert_complete(&fixture.output);
+                let candidate = PublicationFileWitness::capture(stage_path);
+                let published = candidate.assert_unchanged(&fixture.output);
+                let source_after = source_before.assert_unchanged(&fixture.input);
+                key_before.assert_unchanged(&fixture.key);
+                // Once the public operation returns, its directory authority
+                // is released; the fixture's positive rename control works again.
+                std::fs::rename(&fixture.parent, &moved_parent).unwrap();
+                std::fs::rename(&moved_parent, &fixture.parent).unwrap();
+                write_publication_receipt(
+                    &root,
+                    operation,
+                    serde_json::json!({
+                        "case": "windows-parent-authority", "phase": if late_swap { "BeforePublish" } else { "Captured" },
+                        "parent_rename_os_error": os_error, "public_result": "success",
+                        "published": published.json(), "retained_stage": stage_path,
+                        "source_before": source_before.json(), "source_after": source_after.json(), "key_identity_preserved": true
+                    }),
+                );
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SignatureTargetMutation {
+        ReplaceRegular,
+        ChangeInPlace,
+        #[cfg(unix)]
+        ReplaceSymlink,
+    }
+
+    #[test]
+    fn signature_overwrite_refuses_a_changed_authorized_target() {
+        use std::rc::Rc;
+        for mutation in [
+            SignatureTargetMutation::ReplaceRegular,
+            SignatureTargetMutation::ChangeInPlace,
+            #[cfg(unix)]
+            SignatureTargetMutation::ReplaceSymlink,
+        ] {
+            for late_change in [false, true] {
+                let root = retained_publication_fixture(
+                    "overwrite-changed-target",
+                    PublicationOperation::Sign,
+                );
+                let fixture = PublicationFixture::new(&root, PublicationOperation::Sign);
+                fixture.execute(false).unwrap();
+                let old_signature = PublicationFileWitness::capture(&fixture.output);
+                std::fs::write(
+                    &fixture.input,
+                    br#"{"synthetic_publication":true,"generation":2}"#,
+                )
+                .unwrap();
+                let source_before = PublicationFileWitness::capture(&fixture.input);
+                let key_before = PublicationFileWitness::capture(&fixture.key);
+                let displaced = root.join("original-signature-retained-by-other-writer");
+                let outside = root.join("outside-sentinel");
+                std::fs::write(&outside, b"outside signature sentinel").unwrap();
+                let outside_before = PublicationFileWitness::capture(&outside);
+                let displaced_for_hook = displaced.clone();
+                #[cfg(unix)]
+                let outside_for_hook = outside.clone();
+                let witnessed = Rc::new(RefCell::new(None));
+                let recorded = Rc::clone(&witnessed);
+                let result = with_crypto_publication_hook(
+                    move |phase, destination, staged| {
+                        let selected = if late_change {
+                            matches!(phase, CryptoPublicationPhase::BeforePublish)
+                        } else {
+                            matches!(phase, CryptoPublicationPhase::Captured)
+                        };
+                        if !selected {
+                            return;
+                        }
+                        let candidate = PublicationFileWitness::capture(staged);
+                        let (regular, link): (
+                            Option<PublicationFileWitness>,
+                            Option<serde_json::Value>,
+                        ) = match mutation {
+                            SignatureTargetMutation::ReplaceRegular => {
+                                std::fs::rename(destination, &displaced_for_hook).unwrap();
+                                std::fs::write(destination, b"concurrently replaced signature")
+                                    .unwrap();
+                                (Some(PublicationFileWitness::capture(destination)), None)
+                            }
+                            SignatureTargetMutation::ChangeInPlace => {
+                                std::fs::write(
+                                    destination,
+                                    b"concurrent same-inode signature edit",
+                                )
+                                .unwrap();
+                                (Some(PublicationFileWitness::capture(destination)), None)
+                            }
+                            #[cfg(unix)]
+                            SignatureTargetMutation::ReplaceSymlink => {
+                                std::fs::rename(destination, &displaced_for_hook).unwrap();
+                                std::os::unix::fs::symlink(&outside_for_hook, destination).unwrap();
+                                (None, Some(publication_symlink_witness(destination)))
+                            }
+                        };
+                        *recorded.borrow_mut() =
+                            Some((staged.to_path_buf(), candidate, regular, link));
+                    },
+                    || fixture.execute(true),
+                );
+                assert!(
+                    matches!(result, Err(ShareError::Io(_))),
+                    "changed overwrite authority must be refused"
+                );
+                let witnessed = witnessed.borrow();
+                let (staged, candidate, regular, link) = witnessed
+                    .as_ref()
+                    .expect("overwrite mutation seam was reached");
+                if let Some(regular) = regular {
+                    regular.assert_unchanged(&fixture.output);
+                    if matches!(mutation, SignatureTargetMutation::ChangeInPlace) {
+                        assert!(
+                            old_signature.identity == regular.identity,
+                            "in-place fixture must keep the captured inode"
+                        );
+                    }
+                }
+                #[cfg(unix)]
+                if let Some(link) = link {
+                    assert_eq!(*link, publication_symlink_witness(&fixture.output));
+                }
+                if !matches!(mutation, SignatureTargetMutation::ChangeInPlace) {
+                    old_signature.assert_unchanged(&displaced);
+                }
+                outside_before.assert_unchanged(&outside);
+                let source_after = source_before.assert_unchanged(&fixture.input);
+                key_before.assert_unchanged(&fixture.key);
+                let candidate_path =
+                    retained_publication_file(staged.parent().unwrap(), &candidate.identity);
+                if late_change {
+                    candidate.assert_unchanged(&candidate_path);
+                }
+                fixture.assert_complete(&candidate_path);
+                write_publication_receipt(
+                    &root,
+                    PublicationOperation::Sign,
+                    serde_json::json!({
+                        "case": "overwrite-changed-target", "mutation": format!("{mutation:?}"),
+                        "phase": if late_change { "BeforePublish" } else { "Captured" }, "result": "refused",
+                        "retained_attempted_signature": candidate_path,
+                        "replacement_regular": regular.as_ref().map(PublicationFileWitness::json), "replacement_link": link,
+                        "outside_sentinel": outside_before.json(),
+                        "source_before": source_before.json(), "source_after": source_after.json(), "key_identity_preserved": true
+                    }),
+                );
+            }
+        }
     }
 
     #[test]
