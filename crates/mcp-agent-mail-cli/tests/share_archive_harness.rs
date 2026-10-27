@@ -623,7 +623,7 @@ impl ArchiveFixture {
              COMMIT").expect("seed future durable schema");
         conn.execute_sync(
             "INSERT INTO operator_durable_state (id,payload,note) VALUES (1,?1,'opaque state')",
-            &[SqlValue::Blob(vec![0, 255, 17, 128, 0])],
+            &[SqlValue::Bytes(vec![0, 255, 17, 128, 0])],
         )
         .unwrap();
         conn.close_sync().unwrap();
@@ -770,7 +770,7 @@ fn assert_archive_rows(database: &Path, expected_messages: usize, durable_extens
         )
         .unwrap();
     assert_eq!(recipients.len(), expected_messages * 3);
-    for (ordinal, recipient_group) in recipients.chunks_exact(3).enumerate() {
+    for (ordinal, recipient_group) in recipients.as_chunks::<3>().0.iter().enumerate() {
         let id = i64::try_from(ordinal).unwrap() * 3 + 1;
         for (row, (agent_id, kind)) in
             recipient_group
@@ -816,7 +816,7 @@ fn assert_archive_rows(database: &Path, expected_messages: usize, durable_extens
         assert_eq!(state.len(), 1);
         assert_eq!(
             state[0].get_by_name("payload"),
-            Some(&SqlValue::Blob(vec![0, 255, 17, 128, 0]))
+            Some(&SqlValue::Bytes(vec![0, 255, 17, 128, 0]))
         );
         assert_eq!(
             state[0].get_named::<String>("note").unwrap(),

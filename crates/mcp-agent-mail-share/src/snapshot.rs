@@ -1617,16 +1617,16 @@ fn create_full_archive_snapshot(
         // engine-enforced read-only pager. VACUUM INTO takes one consistent
         // read of primary + committed WAL, writes a fresh private inode, and
         // neither checkpoints nor rewrites the source family.
+        let copy_error = |error| ShareError::Sqlite {
+            message: format!("full archive database copy failed: {error}"),
+        };
         conn.execute_raw("PRAGMA query_only = OFF")
-            .and_then(|()| {
-                conn.execute_raw(&format!(
-                    "VACUUM INTO '{}'",
-                    staged_text.replace('\'', "''")
-                ))
-            })
-            .map_err(|error| ShareError::Sqlite {
-                message: format!("full archive database copy failed: {error}"),
-            })
+            .map_err(copy_error)?;
+        conn.execute_raw(&format!(
+            "VACUUM INTO '{}'",
+            staged_text.replace('\'', "''")
+        ))
+        .map_err(copy_error)
     })?;
     drop(conn);
     full_archive_phase("snapshot_neutralize", progress, || {
@@ -1677,9 +1677,9 @@ fn full_archive_context(path: &Path) -> Result<SnapshotContext, ShareError> {
         .map(|row| {
             row.get_named::<String>("name")
                 .map(|name| name.to_ascii_lowercase())
+                .map_err(sql_error)
         })
-        .collect::<Result<_, _>>()
-        .map_err(sql_error)?;
+        .collect::<Result<_, _>>()?;
     let count = |table: &str| -> Result<i64, ShareError> {
         if !tables.contains(table) {
             return Ok(0);

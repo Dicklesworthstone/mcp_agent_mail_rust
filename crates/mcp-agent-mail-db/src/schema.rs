@@ -5182,7 +5182,10 @@ mod tests {
         let upgraded_tail = crate::sync::inbox_delivery_events_from_conn(conn, 1, 2, Some(700), 10)
             .expect("an issued cursor remains valid even when its old event was pruned");
         assert_eq!(upgraded_tail.tail_cursor, 700);
-        assert!(upgraded_tail.events.is_empty());
+        assert_eq!(
+            upgraded_tail.events,
+            [] as [crate::sync::InboxDeliveryEvent; 0]
+        );
         let rows = conn
             .query_sync(
                 "SELECT seq, agent_id FROM inbox_delivery_events ORDER BY seq",

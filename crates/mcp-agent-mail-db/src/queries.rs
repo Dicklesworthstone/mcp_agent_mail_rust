@@ -20469,11 +20469,11 @@ mod tests {
                 )).unwrap();
             }
             conn.execute_raw("INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 450); COMMIT; PRAGMA query_only=ON; BEGIN").unwrap();
-            let active = file_reservation_snapshot_from_conn(&*conn, &project, true, 500).unwrap();
+            let active = file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap();
             assert_eq!(active.reservations.len(), 299);
             assert_eq!(active.agents[0].name, "RetiredHolder");
             assert!(active.reservations.iter().all(|row| row.id != Some(1)));
-            let history = file_reservation_snapshot_from_conn(&*conn, &project, false, 500).unwrap();
+            let history = file_reservation_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
             assert_eq!(history.reservations.len(), 300);
             assert_eq!(history.reservations[0].released_ts, Some(450));
             // The nested read savepoint releases only itself, preserving the
@@ -20481,11 +20481,11 @@ mod tests {
             conn.execute_raw("ROLLBACK; PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK").unwrap();
             let mut rebound = project.clone();
             rebound.created_at += 1;
-            assert!(file_reservation_snapshot_from_conn(&*conn, &rebound, false, 500).is_err());
+            assert!(file_reservation_snapshot_from_conn(&**conn, &rebound, false, 500).is_err());
             conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (99, 'foreign-snapshot', '/tmp/foreign-snapshot', 1); \
                 INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (99, 99, 'ForeignHolder', 'test', 'test', 1, 1); \
                 UPDATE file_reservations SET agent_id = 99 WHERE id = 2").unwrap();
-            assert!(file_reservation_snapshot_from_conn(&*conn, &project, false, 500).is_err());
+            assert!(file_reservation_snapshot_from_conn(&**conn, &project, false, 500).is_err());
         });
     }
 
@@ -20509,7 +20509,7 @@ mod tests {
             )).unwrap();
             conn.execute_sync("UPDATE file_reservations SET reason = ? WHERE id = 1",
                 &[Value::Text("x".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1))]).unwrap();
-            assert!(file_reservation_snapshot_from_conn(&*conn, &project, true, 500).unwrap_err().to_string().contains("4 MiB"));
+            assert!(file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap_err().to_string().contains("4 MiB"));
             conn.execute_raw("UPDATE file_reservations SET reason = ''; BEGIN").unwrap();
             for _ in 0..14 {
                 conn.execute_raw(
@@ -20518,7 +20518,7 @@ mod tests {
                 ).unwrap();
             }
             conn.execute_raw("COMMIT").unwrap();
-            assert!(file_reservation_snapshot_from_conn(&*conn, &project, true, 500).unwrap_err().to_string().contains("10000-row"));
+            assert!(file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap_err().to_string().contains("10000-row"));
         });
     }
 

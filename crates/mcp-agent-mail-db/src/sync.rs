@@ -2146,7 +2146,7 @@ mod tests {
         let empty =
             inbox_delivery_events_from_conn(&conn, project, viewer, Some(before.tail_cursor), 10)
                 .expect("processing an event before retention keeps its cursor valid");
-        assert!(empty.events.is_empty());
+        assert_eq!(empty.events, [] as [InboxDeliveryEvent; 0]);
         assert_eq!(empty.oldest_available_cursor, None);
         assert_eq!(empty.tail_cursor, before.tail_cursor);
         assert_eq!(empty.next_cursor, before.tail_cursor);
@@ -2201,7 +2201,7 @@ mod tests {
             for excluded in [sender, late, blocked] {
                 let page = inbox_delivery_events_from_conn(reader, project, excluded, Some(0), 10)
                     .expect("an invisible shared delivery cannot expire this viewer's cursor");
-                assert!(page.events.is_empty());
+                assert_eq!(page.events, [] as [InboxDeliveryEvent; 0]);
                 assert_eq!(page.tail_cursor, before.tail_cursor);
             }
             reader.execute_raw("ROLLBACK").unwrap();

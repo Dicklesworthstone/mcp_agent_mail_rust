@@ -414,7 +414,7 @@ mod tests {
             "publication",
         ];
         assert_eq!(records.len(), phases.len() * 2);
-        for (phase, pair) in phases.iter().zip(records.chunks_exact(2)) {
+        for (phase, pair) in phases.iter().zip(records.as_chunks::<2>().0) {
             assert!(pair[0].contains(&format!("phase={phase} status=started")));
             assert!(pair[1].contains(&format!("phase={phase} status=completed")));
         }
