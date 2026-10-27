@@ -3262,6 +3262,31 @@ pub enum AgentsCommand {
         #[arg(long, default_value_t = true)]
         json: bool,
     },
+    /// Change only an existing agent's idle-reaper exemption (GH#367).
+    ///
+    /// Applying the change requires exclusive local mailbox ownership.
+    /// Use --dry-run to inspect the proposed change while a server is running.
+    #[command(name = "set-reaper-exempt")]
+    SetReaperExempt {
+        /// Existing project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Existing agent name (case-insensitive; ambiguous names are refused).
+        #[arg(long)]
+        agent: String,
+        /// Whether this agent is exempt from idle reaping.
+        #[arg(long, action = clap::ArgAction::Set, required = true, value_name = "BOOL")]
+        exempt: bool,
+        /// Preview the change without modifying the mailbox or archive.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Soft-retire agents idle past a threshold (operator/cron path; GH#275).
     ///
     /// No live agent identity or registration token is required: this is a
@@ -3817,6 +3842,7 @@ fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
             | AgentsCommand::ResolvePane { .. }
             // A dry-run reap is a SELECT-only candidate listing (GH#275).
             | AgentsCommand::Reap { dry_run: true, .. }
+            | AgentsCommand::SetReaperExempt { dry_run: true, .. }
     )
 }
 
@@ -41753,6 +41779,18 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
         }
 
+        AgentsCommand::SetReaperExempt {
+            project_key,
+            agent,
+            exempt,
+            dry_run,
+            format,
+            json,
+        } => {
+            handle_agents_set_reaper_exempt(&project_key, &agent, exempt, dry_run, format, json)
+                .await
+        }
+
         AgentsCommand::Reap {
             stale_days,
             project_key,
@@ -41761,6 +41799,199 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             json,
         } => handle_agents_reap(stale_days, project_key.as_deref(), dry_run, format, json).await,
     }
+}
+
+/// Change one operator-owned metadata flag without refreshing agent activity,
+/// replacing a credential, or touching pane identity files (GH#367).
+async fn handle_agents_set_reaper_exempt(
+    project_key: &str,
+    agent_name: &str,
+    exempt: bool,
+    dry_run: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
+    if project_key.trim().is_empty() || agent_name.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--project and --agent cannot be empty".into(),
+        ));
+    }
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let require_initialized_mailbox = || {
+        if read_verb_mailbox_is_initialized(&database_url) {
+            Ok(())
+        } else {
+            Err(CliError::InvalidArgument(
+                "agents set-reaper-exempt requires an existing, initialized mailbox".into(),
+            ))
+        }
+    };
+    require_initialized_mailbox()?;
+    let config = Config::from_env();
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
+    let payload = if dry_run {
+        // Unlike open_for_read, this path has no missing-mailbox fallback
+        // that could create a database if the source disappears after the check.
+        let snapshot = open_db_async_canonical_read_with_database_url(
+            &database_url,
+            Some(&config.storage_root),
+            "agents set-reaper-exempt --dry-run",
+        )?;
+        agents_reaper_exemption_payload(
+            &cx,
+            snapshot.pool(),
+            &config,
+            project_key,
+            agent_name,
+            exempt,
+            true,
+        )
+        .await?
+    } else {
+        // Keep both ownership locks until the database and archive agree.
+        // There is no credential-preserving server endpoint to delegate to.
+        let _mailbox_mutation_locks =
+            acquire_cli_mailbox_mutation_locks(&database_url, Some(&config.storage_root))?;
+        require_initialized_mailbox()?;
+        let ctx = context::AsyncCliContext::open()?;
+        agents_reaper_exemption_payload(
+            &cx,
+            &ctx.pool,
+            &ctx.config,
+            project_key,
+            agent_name,
+            exempt,
+            false,
+        )
+        .await?
+    };
+
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    output::emit_output(&payload, fmt, || {
+        output::section(if dry_run {
+            "Agent Reaper Exemption (dry run)"
+        } else {
+            "Agent Reaper Exemption"
+        });
+        output::kv(
+            "Project",
+            payload["project_slug"].as_str().unwrap_or(project_key),
+        );
+        output::kv(
+            "Agent",
+            payload["agent_name"].as_str().unwrap_or(agent_name),
+        );
+        output::kv("Before", &payload["before"]["reaper_exempt"].to_string());
+        output::kv("After", &payload["after"]["reaper_exempt"].to_string());
+        let result = if dry_run {
+            if payload["would_change"].as_bool().unwrap_or(false) {
+                "would change"
+            } else {
+                "no change needed"
+            }
+        } else if payload["changed"].as_bool().unwrap_or(false) {
+            "changed"
+        } else {
+            "already set; archive synchronized"
+        };
+        output::kv("Result", result);
+    });
+    Ok(())
+}
+
+/// Operator-only metadata update. Project resolution must not fabricate orphan
+/// placeholders or register an identity as a side effect of a miss.
+async fn agents_reaper_exemption_payload(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    exempt: bool,
+    dry_run: bool,
+) -> CliResult<serde_json::Value> {
+    if project_key.trim().is_empty() || agent_name.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--project and --agent cannot be empty".into(),
+        ));
+    }
+
+    let projects =
+        outcome_to_result(mcp_agent_mail_db::queries::list_project_rows(cx, pool).await)?;
+    let mut matches = projects.into_iter().filter(|project| {
+        project.slug.eq_ignore_ascii_case(project_key) || project.human_key == project_key
+    });
+    let project = matches
+        .next()
+        .ok_or_else(|| CliError::InvalidArgument(format!("project not found: {project_key}")))?;
+    if matches.next().is_some() {
+        return Err(CliError::InvalidArgument(format!(
+            "project key is ambiguous: {project_key}; use an exact, unique project key"
+        )));
+    }
+    let project_id = project
+        .id
+        .ok_or_else(|| CliError::Other("existing project has no database id".into()))?;
+
+    let (agent, previous_exempt, changed, deregistered_at) = if dry_run {
+        let (agent, deregistered_at) = outcome_to_result(
+            mcp_agent_mail_db::queries::get_agent_for_operator(cx, pool, project_id, agent_name)
+                .await,
+        )?;
+        let previous_exempt = agent.reaper_exempt != 0;
+        (agent, previous_exempt, false, deregistered_at)
+    } else {
+        let update = outcome_to_result(
+            mcp_agent_mail_db::queries::set_agent_reaper_exempt(
+                cx, pool, project_id, agent_name, exempt,
+            )
+            .await,
+        )?;
+        (
+            update.agent,
+            update.previous_exempt,
+            update.changed,
+            update.deregistered_at,
+        )
+    };
+
+    if !dry_run {
+        // Retry the archive on a database no-op as well: a previous attempt may
+        // have committed the flag and then failed to publish its profile.
+        let profile =
+            mcp_agent_mail_tools::identity::agent_archive_profile_json(&agent, deregistered_at);
+        let archive_error = match mcp_agent_mail_storage::write_agent_reaper_exemption_sync_direct(
+            config,
+            &project.slug,
+            &profile,
+        ) {
+            mcp_agent_mail_storage::DirectArchiveWrite::Written => None,
+            mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {
+                Some("archive publication skipped because disk pressure is critical".to_string())
+            }
+            mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => Some(error.to_string()),
+        };
+        if let Some(error) = archive_error {
+            return Err(CliError::Other(format!(
+                "reaper exemption database update committed (db_committed=true), but the archive \
+                 was not confirmed: {error}. Retry the same command to synchronize the profile."
+            )));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "schema_version": "am.agents.set-reaper-exempt.v1",
+        "project_key": project_key,
+        "project_slug": project.slug,
+        "agent_id": agent.id,
+        "agent_name": agent.name,
+        "dry_run": dry_run,
+        "before": { "reaper_exempt": previous_exempt },
+        "after": { "reaper_exempt": exempt },
+        "changed": changed,
+        "would_change": previous_exempt != exempt,
+        "archive_written": !dry_run,
+    }))
 }
 
 /// `am agents reap --stale-days N` (GH#275): soft-retire long-idle agent
@@ -49463,6 +49694,320 @@ http_headers = { Authorization = "Bearer secret" }
                     "both paths must leave exactly the fresh message unread"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn agents_set_reaper_exempt_requires_explicit_bool_and_classifies_dry_run() {
+        let base = [
+            "am",
+            "agents",
+            "set-reaper-exempt",
+            "--project",
+            "existing-project",
+            "--agent",
+            "BlueLake",
+        ];
+        for suffix in [&[][..], &["--exempt"][..], &["--exempt", "maybe"][..]] {
+            assert!(
+                Cli::try_parse_from(base.iter().copied().chain(suffix.iter().copied())).is_err(),
+                "the exemption must be an explicit true or false value"
+            );
+        }
+        for (value, expected) in [("true", true), ("false", false)] {
+            for dry_run in [false, true] {
+                let mut arguments = base.to_vec();
+                arguments.extend(["--exempt", value, "--json"]);
+                if dry_run {
+                    arguments.push("--dry-run");
+                }
+                let command = Cli::try_parse_from(arguments)
+                    .expect("explicit boolean must parse")
+                    .command
+                    .expect("command");
+                assert_eq!(command_is_read_only(&command), dry_run);
+                match command {
+                    Commands::Agents {
+                        action:
+                            AgentsCommand::SetReaperExempt {
+                                project_key,
+                                agent,
+                                exempt,
+                                dry_run: parsed_dry_run,
+                                json,
+                                ..
+                            },
+                    } => {
+                        assert_eq!(project_key, "existing-project");
+                        assert_eq!(agent, "BlueLake");
+                        assert_eq!(exempt, expected);
+                        assert_eq!(parsed_dry_run, dry_run);
+                        assert!(json);
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// GH#367: preview and apply the operator command against a real pool and
+    /// archive, including a retry after the DB committed but publication failed.
+    #[test]
+    fn agents_reaper_exemption_preserves_identity_and_repairs_archive_on_noop_retry() {
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("agent-exemption.sqlite3");
+        let db_path_string = db_path.display().to_string();
+        init_schema_sqlite_canonical(&db_path_string).expect("init canonical schema");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_string).expect("open db");
+        for (id, slug, human_key) in [
+            (1i64, "exemption-project", "/tmp/exemption-project"),
+            (2, "ambiguous-key", "/tmp/second-project"),
+            (3, "third-project", "ambiguous-key"),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, 1)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(slug.into()),
+                    Value::Text(human_key.into()),
+                ],
+            )
+            .expect("seed project");
+        }
+        conn.execute_sync(
+            "INSERT INTO agents (\
+            id, project_id, name, program, model, task_description, \
+            inception_ts, last_active_ts, attachments_policy, contact_policy, \
+            reaper_exempt, registration_token, retired_at\
+        ) VALUES (1, 1, 'PersistentAgent', 'original-program', 'original-model', \
+            'unchanged task', 1000000, 2000000, 'file', 'contacts_only', 0, \
+            'registration-token-must-not-leak', 3000000)",
+            &[],
+        )
+        .expect("seed existing retired identity");
+        conn.execute_sync(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (1, 4000000)",
+            &[],
+        )
+        .expect("seed preserved deregistration");
+        drop(conn);
+
+        let config = Config {
+            storage_root: dir.path().join("archive"),
+            ..Default::default()
+        };
+        let pool_config = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_string}"),
+            storage_root: Some(config.storage_root.clone()),
+            ..Default::default()
+        };
+        let pool = mcp_agent_mail_db::get_or_create_pool(&pool_config).expect("pool");
+        let profile_path = config
+            .storage_root
+            .join("projects/exemption-project/agents/PersistentAgent/profile.json");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        runtime.block_on(async {
+            let (initial, initial_deregistered_at) = outcome_to_result(
+                mcp_agent_mail_db::queries::get_agent_for_operator(
+                    &cx,
+                    &pool,
+                    1,
+                    "PersistentAgent",
+                )
+                .await,
+            )
+            .expect("initial identity");
+            let before = serde_json::to_value(&initial).expect("identity snapshot");
+            assert_eq!(initial_deregistered_at, Some(4_000_000));
+            assert!(!profile_path.exists());
+
+            let preview = agents_reaper_exemption_payload(
+                &cx,
+                &pool,
+                &config,
+                "EXEMPTION-PROJECT",
+                "persistentagent",
+                true,
+                true,
+            )
+            .await
+            .expect("preview");
+            assert_eq!(preview["before"]["reaper_exempt"], false);
+            assert_eq!(preview["after"]["reaper_exempt"], true);
+            assert_eq!(preview["changed"], false);
+            assert_eq!(preview["would_change"], true);
+            assert_eq!(preview["archive_written"], false);
+            assert_eq!(preview["agent_name"], "PersistentAgent");
+            assert!(
+                !profile_path.exists(),
+                "preview must not create an archive profile"
+            );
+
+            for (project_key, agent_name) in [
+                ("missing-project", "PersistentAgent"),
+                ("ambiguous-key", "PersistentAgent"),
+                ("exemption-project", "MissingAgent"),
+                ("", "PersistentAgent"),
+                ("exemption-project", ""),
+            ] {
+                assert!(
+                    agents_reaper_exemption_payload(
+                        &cx,
+                        &pool,
+                        &config,
+                        project_key,
+                        agent_name,
+                        true,
+                        false,
+                    )
+                    .await
+                    .is_err(),
+                    "missing or ambiguous identities must not be created"
+                );
+            }
+            assert_eq!(
+                outcome_to_result(mcp_agent_mail_db::queries::list_project_rows(&cx, &pool).await)
+                    .expect("project inventory")
+                    .len(),
+                3,
+            );
+            let (unchanged, _) = outcome_to_result(
+                mcp_agent_mail_db::queries::get_agent_for_operator(
+                    &cx,
+                    &pool,
+                    1,
+                    "PersistentAgent",
+                )
+                .await,
+            )
+            .expect("identity after preview/refusals");
+            assert_eq!(serde_json::to_value(unchanged).unwrap(), before);
+            assert!(!profile_path.exists());
+
+            let applied = agents_reaper_exemption_payload(
+                &cx,
+                &pool,
+                &config,
+                "/tmp/exemption-project",
+                "persistentagent",
+                true,
+                false,
+            )
+            .await
+            .expect("set exemption without registration");
+            assert_eq!(applied["changed"], true);
+            assert_eq!(applied["archive_written"], true);
+            assert!(!applied.to_string().contains("registration_token"));
+            assert!(
+                !applied
+                    .to_string()
+                    .contains("registration-token-must-not-leak")
+            );
+
+            let mut profile: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&profile_path).expect("read archive"))
+                    .expect("profile JSON");
+            assert_eq!(profile["reaper_exempt"], true);
+            assert_eq!(
+                profile["retired_at"],
+                mcp_agent_mail_db::micros_to_iso(3_000_000)
+            );
+            assert_eq!(
+                profile["deregistered_at"],
+                mcp_agent_mail_db::micros_to_iso(4_000_000)
+            );
+            assert!(profile.get("registration_token").is_none());
+
+            // An existing archive may contain extra metadata and intentionally
+            // different timestamps. This setter owns only its one exemption field.
+            profile["operator_note"] = serde_json::json!({"preserve": ["unknown", "fields"]});
+            profile["last_active_ts"] =
+                serde_json::json!(mcp_agent_mail_db::micros_to_iso(1_500_000));
+            std::fs::write(&profile_path, serde_json::to_vec(&profile).unwrap())
+                .expect("seed additional archived metadata");
+            let cleared = agents_reaper_exemption_payload(
+                &cx,
+                &pool,
+                &config,
+                "exemption-project",
+                "PersistentAgent",
+                false,
+                false,
+            )
+            .await
+            .expect("clear exemption");
+            assert_eq!(cleared["before"]["reaper_exempt"], true);
+            assert_eq!(cleared["after"]["reaper_exempt"], false);
+            assert_eq!(cleared["changed"], true);
+            profile["reaper_exempt"] = serde_json::json!(false);
+            let archived: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+            assert_eq!(archived, profile, "only the archived exemption may change");
+
+            std::fs::write(&profile_path, b"{not valid JSON").expect("plant archive failure");
+            let failure = agents_reaper_exemption_payload(
+                &cx,
+                &pool,
+                &config,
+                "exemption-project",
+                "PersistentAgent",
+                true,
+                false,
+            )
+            .await
+            .expect_err("malformed existing profile must not be overwritten");
+            assert!(failure.to_string().contains("db_committed=true"));
+            assert!(failure.to_string().contains("Retry the same command"));
+            assert_eq!(std::fs::read(&profile_path).unwrap(), b"{not valid JSON");
+
+            // Repair the obstacle and repeat exactly the requested value. The
+            // database is already correct, but the archive still needs publication.
+            std::fs::write(&profile_path, serde_json::to_vec(&profile).unwrap())
+                .expect("repair archive input");
+            let retried = agents_reaper_exemption_payload(
+                &cx,
+                &pool,
+                &config,
+                "exemption-project",
+                "PersistentAgent",
+                true,
+                false,
+            )
+            .await
+            .expect("retry must synchronize the archive on a DB no-op");
+            assert_eq!(retried["before"]["reaper_exempt"], true);
+            assert_eq!(retried["after"]["reaper_exempt"], true);
+            assert_eq!(retried["changed"], false);
+            assert_eq!(retried["would_change"], false);
+            assert_eq!(retried["archive_written"], true);
+            profile["reaper_exempt"] = serde_json::json!(true);
+            let archived: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+            assert_eq!(archived, profile);
+
+            let (final_agent, final_deregistered_at) = outcome_to_result(
+                mcp_agent_mail_db::queries::get_agent_for_operator(
+                    &cx,
+                    &pool,
+                    1,
+                    "PersistentAgent",
+                )
+                .await,
+            )
+            .expect("final identity");
+            let mut expected = before;
+            expected["reaper_exempt"] = serde_json::json!(1);
+            assert_eq!(
+                serde_json::to_value(final_agent).unwrap(),
+                expected,
+                "credential, retirement, activity and all other metadata must survive"
+            );
+            assert_eq!(final_deregistered_at, initial_deregistered_at);
         });
     }
 

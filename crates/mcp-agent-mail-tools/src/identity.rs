@@ -1461,7 +1461,8 @@ pub(crate) fn try_write_agent_profile(
 /// Serialize the durable, non-secret portion of an agent profile for the Git
 /// archive. Keeping lifecycle fields in the profile makes reconstruction
 /// preserve routing state without ever archiving the registration token.
-pub(crate) fn agent_archive_profile_json(
+#[must_use]
+pub fn agent_archive_profile_json(
     agent: &mcp_agent_mail_db::AgentRow,
     deregistered_at: Option<i64>,
 ) -> serde_json::Value {

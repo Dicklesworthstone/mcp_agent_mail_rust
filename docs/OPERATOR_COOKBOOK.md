@@ -180,6 +180,52 @@ metadata for that exact agent name.
 or omit `--name` and let the CLI generate one. If the project key is wrong, the
 agent will be registered in the wrong archive namespace.
 
+### Change an existing identity's reaper exemption
+
+Preview the metadata change before applying it:
+
+```bash
+PROJECT=/abs/path/project
+AGENT=BlueLake
+
+am agents set-reaper-exempt \
+  --project "$PROJECT" --agent "$AGENT" --exempt false --dry-run --json
+```
+
+The preview reports `before.reaper_exempt`, `after.reaper_exempt`, and
+`would_change`; `changed` and `archive_written` remain false. It reads an existing
+mailbox and does not register a project or identity. Missing or ambiguous
+project/agent names are refused.
+
+For the stateful operation, gracefully stop the mailbox owner through its usual
+supervisor, then inspect `am doctor locks --json` and `am doctor drain --json`.
+Confirm `safe_to_mutate` before applying:
+
+```bash
+am agents set-reaper-exempt \
+  --project "$PROJECT" --agent "$AGENT" --exempt false --json
+```
+
+The command holds the existing mailbox ownership locks through the database and
+archive updates, and refuses an unsupported live-owner write. It changes only
+the exemption flag and its archived profile field. Registration credentials,
+agent ID, program/model/task, pane binding, retirement/deregistration state, and
+last-active time are preserved. Credentials are never included in the receipt.
+Use `--exempt true` to explicitly protect an identity from the inactivity reaper;
+existing exemptions remain sticky until explicitly changed.
+
+A repeated request reports `changed: false`. It still checks the archive, so the
+same command can repair a missing or stale profile after an earlier partial
+failure. A missing profile is recreated from non-secret identity metadata;
+malformed, mismatched, or symlinked profiles are refused. If the database flag
+committed but archive publication failed, the command exits with an error
+containing `db_committed=true`; resolve the reported archive problem and retry
+the same command. Restart the mailbox service after the maintenance window.
+
+The reaper itself rechecks eligibility in its write transaction. An identity
+that becomes active or exempt after a sweep selects it is preserved, and the
+sweep reports it in `skipped_changed_count` rather than `reaped_count`.
+
 ## 4. Triage urgent inbox items and ack backlog [read-only]
 
 **Goal:** See what needs attention first for one operator.

@@ -7464,6 +7464,169 @@ pub async fn list_deregistered_agent_ids(
     }
 }
 
+/// Result of changing an operator-owned inactivity-reaper exemption.
+#[derive(Debug, Clone)]
+pub struct AgentReaperExemptionUpdate {
+    pub agent: AgentRow,
+    pub previous_exempt: bool,
+    pub changed: bool,
+    pub deregistered_at: Option<i64>,
+}
+
+async fn resolve_agent_for_operator(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    name: &str,
+) -> Outcome<(AgentRow, Option<i64>), DbError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Outcome::Err(DbError::invalid("agent_name", "agent name cannot be empty"));
+    }
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+             a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+             a.reaper_exempt, a.registration_token, a.retired_at, d.deregistered_at \
+             FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.project_id = ? AND a.name = ? COLLATE NOCASE ORDER BY a.id ASC LIMIT 2",
+            &[Value::BigInt(project_id), Value::Text(name.to_string())],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if rows.len() > 1 {
+        return Outcome::Err(DbError::invalid(
+            "agent_name",
+            format!("agent name {name:?} is ambiguous in project {project_id}"),
+        ));
+    }
+    let Some(row) = rows.first() else {
+        return Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")));
+    };
+    Outcome::Ok((
+        decode_agent_row_indexed(row),
+        row.get(13).and_then(value_as_i64),
+    ))
+}
+
+/// Resolve one existing identity for an operator without caching or mutating it.
+///
+/// The lifecycle timestamp comes from the same SELECT as the agent. Unlike
+/// ordinary compatibility lookups, an operator mutation must refuse legacy
+/// case-variant duplicates rather than silently choose one of them.
+pub async fn get_agent_for_operator(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+) -> Outcome<(AgentRow, Option<i64>), DbError> {
+    run_read_with_mvcc_retry(cx, "get_agent_for_operator", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        resolve_agent_for_operator(cx, &tracked(&*conn), project_id, name).await
+    })
+    .await
+}
+
+/// Change only the reaper exemption on a uniquely resolved existing identity.
+///
+/// This does not register, revive, touch or rotate credentials. Retired and
+/// deregistered identities retain their lifecycle state, and a same-value
+/// request performs no UPDATE. Archive publishers receive the tombstone from
+/// the same transaction so writing an updated profile preserves it as well.
+pub async fn set_agent_reaper_exempt(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+    exempt: bool,
+) -> Outcome<AgentReaperExemptionUpdate, DbError> {
+    let update = match run_with_mvcc_retry(cx, "set_agent_reaper_exempt", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let (mut agent, deregistered_at) = try_in_tx!(
+            cx,
+            &tracked,
+            resolve_agent_for_operator(cx, &tracked, project_id, name).await
+        );
+        let previous_exempt = agent.reaper_exempt != 0;
+        let changed = previous_exempt != exempt;
+        if !changed {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(AgentReaperExemptionUpdate {
+                agent,
+                previous_exempt,
+                changed,
+                deregistered_at,
+            });
+        }
+        let Some(agent_id) = agent.id else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "operator lookup returned agent without id for {project_id}:{name}"
+            )));
+        };
+        let affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET reaper_exempt = ? WHERE id = ?",
+                    &[Value::BigInt(i64::from(exempt)), Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        if affected != 1 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        }
+        agent.reaper_exempt = i64::from(exempt);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(AgentReaperExemptionUpdate {
+            agent,
+            previous_exempt,
+            changed,
+            deregistered_at,
+        })
+    })
+    .await
+    {
+        Outcome::Ok(update) => update,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    if update.changed {
+        let cache = crate::cache::read_cache();
+        let scope = cache_scope_for_pool(pool);
+        let agent = &update.agent;
+        cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
+        cache.put_agent_scoped(&scope, agent);
+    }
+    Outcome::Ok(update)
+}
+
 /// Set or clear an agent's retirement timestamp.
 pub async fn set_agent_retired_at(
     cx: &Cx,
@@ -22384,6 +22547,314 @@ mod tests {
                     .is_some(),
                 "a cancelled sweep must not strand the one-slot pool or its transaction"
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operator_reaper_exemption_preserves_identity_and_lifecycle() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("operator exemption runtime");
+        let (cx, pool, _dir) = setup_test_pool("operator-reaper-exemption.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/operator-reaper-exemption")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                for (id, name) in [
+                    (601_i64, "GreenStone"),
+                    (602, "BlueLake"),
+                    (603, "RedFox"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                         reaper_exempt, registration_token, retired_at) \
+                         VALUES (?, ?, ?, 'operator-test', 'preserved-model', 'preserved task', \
+                         50, 100, 'file', 'contacts_only', 0, ?, NULL)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project_id),
+                            Value::Text(name.to_string()),
+                            Value::Text(format!("preserved-token-{id}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                conn.execute_raw("UPDATE agents SET retired_at = 120 WHERE id = 602")
+                    .unwrap();
+            }
+            deregister_agent(&cx, &pool, 603, 140)
+                .await
+                .into_result()
+                .unwrap();
+
+            for (name, expected_deregistered_at) in
+                [("GREENSTONE", None), ("bluelake", None), ("redfox", Some(140))]
+            {
+                let (original, deregistered_at) =
+                    get_agent_for_operator(&cx, &pool, project_id, name)
+                        .await
+                        .into_result()
+                        .unwrap();
+                assert_eq!(deregistered_at, expected_deregistered_at);
+                let agent_id = original.id.unwrap();
+                let _ = get_agent_by_id(&cx, &pool, agent_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                let update = set_agent_reaper_exempt(&cx, &pool, project_id, name, true)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert!(!update.previous_exempt);
+                assert!(update.changed);
+                assert_eq!(update.deregistered_at, deregistered_at);
+                let mut expected = original.clone();
+                expected.reaper_exempt = 1;
+                assert_eq!(
+                    serde_json::to_value(&update.agent).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                    "changing exemption must preserve every other identity field"
+                );
+                let cached = get_agent_by_id(&cx, &pool, agent_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&cached).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+
+                let repeated = set_agent_reaper_exempt(&cx, &pool, project_id, name, true)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert!(repeated.previous_exempt);
+                assert!(!repeated.changed);
+                assert_eq!(repeated.deregistered_at, deregistered_at);
+                assert_eq!(
+                    serde_json::to_value(&repeated.agent).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+
+                let restored = set_agent_reaper_exempt(&cx, &pool, project_id, name, false)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert!(restored.previous_exempt);
+                assert!(restored.changed);
+                assert_eq!(restored.deregistered_at, deregistered_at);
+                let (fresh, fresh_deregistered_at) =
+                    get_agent_for_operator(&cx, &pool, project_id, name)
+                        .await
+                        .into_result()
+                        .unwrap();
+                assert_eq!(fresh_deregistered_at, deregistered_at);
+                assert_eq!(
+                    serde_json::to_value(&restored.agent).unwrap(),
+                    serde_json::to_value(&original).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&fresh).unwrap(),
+                    serde_json::to_value(&original).unwrap(),
+                    "tokens, timestamps, policies, task and lifecycle must survive a round trip"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn operator_agent_lookup_is_uncached_and_works_in_a_query_only_pool() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("operator read-only runtime");
+        let (cx, pool, dir) = setup_test_pool("operator-query-only.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/operator-query-only")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let original = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "test-model",
+                Some("keep this identity"),
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_id = original.id.unwrap();
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE agents SET reaper_exempt = 1, last_active_ts = 100, retired_at = 120 \
+                     WHERE id = ?",
+                    &[Value::BigInt(agent_id)],
+                )
+                .unwrap();
+                conn.execute_sync(
+                    "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (?, 140)",
+                    &[Value::BigInt(agent_id)],
+                )
+                .unwrap();
+            }
+            let read_cfg = crate::pool::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    dir.path().join("operator-query-only.db").display()
+                ),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let read_pool = crate::create_query_only_pool(&read_cfg).expect("query-only pool");
+            {
+                let conn = acquire_conn(&cx, &read_pool).await.into_result().unwrap();
+                assert_eq!(
+                    conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0)
+                        .unwrap(),
+                    1,
+                    "the operator dry-run must work with database writes disabled"
+                );
+            }
+            let cache = crate::cache::read_cache();
+            let scope = cache_scope_for_pool(&read_pool);
+            cache.put_agent_scoped(&scope, &original);
+            let (actual, deregistered_at) =
+                get_agent_for_operator(&cx, &read_pool, project_id, "bluelake")
+                    .await
+                    .into_result()
+                    .unwrap();
+            let mut expected = original.clone();
+            expected.reaper_exempt = 1;
+            expected.last_active_ts = 100;
+            expected.retired_at = Some(120);
+            assert_eq!(deregistered_at, Some(140));
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(cache.get_agent_by_id_scoped(&scope, agent_id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(original).unwrap(),
+                "operator previews must bypass and leave the read cache untouched"
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operator_reaper_exemption_refuses_ambiguous_and_missing_identities() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("operator ambiguity runtime");
+        let (cx, pool, _dir) = setup_test_pool("operator-ambiguous.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/operator-ambiguous")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let other_project_id = ensure_project(&cx, &pool, "/tmp/operator-unambiguous")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let projection = "SELECT id, project_id, name, program, model, task_description, \
+                              inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                              reaper_exempt, registration_token, retired_at FROM agents ORDER BY id";
+            let before = {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                // Legacy databases may predate the case-insensitive unique index.
+                conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                    .unwrap();
+                for (id, project, name) in [
+                    (701_i64, project_id, "GreenStone"),
+                    (702, project_id, "greenstone"),
+                    (703, other_project_id, "GreenStone"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                         reaper_exempt, registration_token, retired_at) \
+                         VALUES (?, ?, ?, 'operator-test', 'test-model', 'keep identity', \
+                         50, 100, 'file', 'contacts_only', 0, ?, NULL)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project),
+                            Value::Text(name.to_string()),
+                            Value::Text(format!("original-token-{id}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                conn.query_sync(projection, &[])
+                    .unwrap()
+                    .iter()
+                    .map(decode_agent_row_indexed)
+                    .collect::<Vec<_>>()
+            };
+            for name in ["GreenStone", "greenstone", "GREENSTONE"] {
+                assert!(matches!(
+                    get_agent_for_operator(&cx, &pool, project_id, name).await,
+                    Outcome::Err(DbError::InvalidArgument { field: "agent_name", message })
+                        if message.contains("ambiguous")
+                ));
+                for exempt in [false, true] {
+                    assert!(matches!(
+                        set_agent_reaper_exempt(&cx, &pool, project_id, name, exempt).await,
+                        Outcome::Err(DbError::InvalidArgument { field: "agent_name", message })
+                            if message.contains("ambiguous")
+                    ));
+                }
+            }
+            assert!(matches!(
+                get_agent_for_operator(&cx, &pool, project_id, "MissingAgent").await,
+                Outcome::Err(DbError::NotFound { .. })
+            ));
+            assert!(matches!(
+                set_agent_reaper_exempt(&cx, &pool, project_id, "MissingAgent", true).await,
+                Outcome::Err(DbError::NotFound { .. })
+            ));
+            let update =
+                set_agent_reaper_exempt(&cx, &pool, other_project_id, "greenstone", true)
+                    .await
+                    .into_result()
+                    .unwrap();
+            assert_eq!(update.agent.id, Some(703));
+            assert!(update.changed);
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let after = conn.query_sync(projection, &[]).unwrap();
+            assert_eq!(after.len(), before.len(), "missing lookups must not register agents");
+            for (mut expected, row) in before.into_iter().zip(&after) {
+                if expected.id == Some(703) {
+                    expected.reaper_exempt = 1;
+                }
+                assert_eq!(
+                    serde_json::to_value(decode_agent_row_indexed(row)).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "ambiguous identities must remain untouched; resolution stays project-scoped"
+                );
+            }
         });
     }
 

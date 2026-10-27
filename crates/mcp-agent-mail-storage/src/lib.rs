@@ -1688,7 +1688,16 @@ fn admit_direct_publication(
 /// can never be coupled to another agent's archive-drain latency.
 fn write_op_sync_direct_with_cancel(
     op: &WriteOp,
+    cancelled: impl FnMut() -> bool,
+) -> DirectArchiveWrite {
+    write_archive_sync_direct_with_cancel(op, cancelled, || wbq_execute_op(op, "archive-direct"))
+}
+
+/// Share direct-write admission and accounting with narrow metadata updates.
+fn write_archive_sync_direct_with_cancel(
+    op: &WriteOp,
     mut cancelled: impl FnMut() -> bool,
+    write: impl FnOnce() -> Result<()>,
 ) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     let disk_pressure = metrics.system.disk_pressure_level.load();
@@ -1715,7 +1724,7 @@ fn write_op_sync_direct_with_cancel(
     };
 
     let started = Instant::now();
-    let result = wbq_execute_op(op, "archive-direct");
+    let result = write();
     metrics.storage.archive_direct_writes_total.add(1);
     metrics
         .storage
@@ -1747,6 +1756,33 @@ pub fn write_op_sync_direct_cancellable(cx: &asupersync::Cx, op: &WriteOp) -> Di
 #[must_use]
 pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
     write_op_sync_direct_with_cancel(op, || false)
+}
+
+/// Publish an operator's reaper-exemption change before returning.
+///
+/// Existing profiles retain every other field, including extension and
+/// lifecycle metadata. A missing profile is created from the caller's
+/// non-secret canonical profile. A same-value retry still repairs a missing
+/// or stale artifact after a previously committed database update.
+#[must_use]
+pub fn write_agent_reaper_exemption_sync_direct(
+    config: &Config,
+    project_slug: &str,
+    agent_profile: &serde_json::Value,
+) -> DirectArchiveWrite {
+    let op = WriteOp::AgentProfile {
+        project_slug: project_slug.to_string(),
+        config: config.clone(),
+        agent_json: agent_profile.clone(),
+    };
+    write_archive_sync_direct_with_cancel(
+        &op,
+        || false,
+        || {
+            let archive = ensure_archive(config, project_slug)?;
+            write_agent_reaper_exemption_with_config(&archive, config, agent_profile)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -8889,6 +8925,91 @@ pub fn write_agent_profile_with_config(
     })?;
     enqueue_async_commit(repo_root, config, &format!("agent: profile {name}"), &[rel]);
 
+    Ok(())
+}
+
+/// Update only the exemption field while holding the normal profile locks.
+fn write_agent_reaper_exemption_with_config(
+    archive: &ProjectArchive,
+    config: &Config,
+    fallback: &serde_json::Value,
+) -> Result<()> {
+    let invalid = |message: &str| {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        ))
+    };
+    let name = fallback
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid("agent profile must contain a name"))?;
+    let name = validate_archive_component("agent name", name)?;
+    let exempt = fallback
+        .get("reaper_exempt")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| invalid("agent profile must contain a boolean reaper_exempt"))?;
+    if fallback.get("registration_token").is_some() {
+        return Err(invalid("registration credentials must not be archived"));
+    }
+
+    let repo_root = archive_repo_root_checked(archive)?;
+    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
+    let changed_path = with_project_lock_inner(archive, true, false, || {
+        let project_root = archive_project_root_checked(archive)?;
+        let profile_dir = project_root.join("agents").join(name);
+        // ensure_dir's fast cache is not authority for a subsequent read.
+        // Check every existing parent even when this directory was seen before.
+        if path_existing_prefix_has_symlink(&profile_dir)? {
+            return Err(StorageError::InvalidPath(
+                "agent profile directory must not be symlinked".to_string(),
+            ));
+        }
+        let profile_path = profile_dir.join("profile.json");
+        let mut profile = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+            &profile_path,
+            1024 * 1024,
+        ) {
+            Ok(bytes) => {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if value.get("registration_token").is_some() {
+                    return Err(invalid("registration credentials must not be archived"));
+                }
+                let archived_name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| invalid("archived agent profile must contain a name"))?;
+                if !archived_name.eq_ignore_ascii_case(name) {
+                    return Err(invalid("archived agent profile identity does not match"));
+                }
+                if value
+                    .get("reaper_exempt")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(exempt)
+                {
+                    return Ok(None);
+                }
+                value
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fallback.clone(),
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        let fields = profile
+            .as_object_mut()
+            .ok_or_else(|| invalid("archived agent profile must be a JSON object"))?;
+        fields.insert("reaper_exempt".to_string(), serde_json::Value::Bool(exempt));
+        ensure_dir(&profile_dir)?;
+        write_json(&profile_path, &profile, true)?;
+        rel_path_cached(&archive.canonical_repo_root, &profile_path).map(Some)
+    })?;
+    if let Some(rel) = changed_path {
+        enqueue_async_commit(
+            repo_root,
+            config,
+            &format!("agent: reaper exemption {name}"),
+            &[rel],
+        );
+    }
     Ok(())
 }
 
@@ -16397,6 +16518,183 @@ mod tests {
 
         let profile_path = archive.root.join("agents/TestAgent/profile.json");
         assert!(profile_path.exists());
+    }
+
+    #[test]
+    fn operator_reaper_exemption_preserves_other_profile_fields_and_noop_bytes() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "operator-exemption").unwrap();
+        let original = serde_json::json!({
+            "name": "BlueLake",
+            "program": "service",
+            "model": "test",
+            "task_description": "preserve archived metadata",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-02T00:00:00Z",
+            "retired_at": "2026-01-03T00:00:00Z",
+            "deregistered_at": "2026-01-04T00:00:00Z",
+            "reaper_exempt": false,
+            "extension": {"operator_note": "keep this", "values": [1, 2, 3]}
+        });
+        write_agent_profile_with_config(&archive, &config, &original).unwrap();
+        let profile_path = archive.root.join("agents/BlueLake/profile.json");
+        let mut fallback = original.clone();
+        fallback["task_description"] = serde_json::json!("different DB metadata");
+        fallback["last_active_ts"] = serde_json::json!("2026-10-27T00:00:00Z");
+        fallback["extension"] = serde_json::Value::Null;
+
+        for exempt in [true, false] {
+            fallback["reaper_exempt"] = serde_json::Value::Bool(exempt);
+            let result =
+                write_agent_reaper_exemption_sync_direct(&config, &archive.slug, &fallback);
+            assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+            let mut expected = original.clone();
+            expected["reaper_exempt"] = serde_json::Value::Bool(exempt);
+            let published = fs::read(&profile_path).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&published).unwrap(),
+                expected
+            );
+            let retry = write_agent_reaper_exemption_sync_direct(&config, &archive.slug, &fallback);
+            assert!(matches!(retry, DirectArchiveWrite::Written), "{retry:?}");
+            assert_eq!(fs::read(&profile_path).unwrap(), published);
+        }
+    }
+
+    #[test]
+    fn operator_reaper_exemption_recreates_missing_profile_with_lifecycle_state() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let profile = serde_json::json!({
+            "name": "RedStone",
+            "program": "service",
+            "model": "test",
+            "task_description": "retired service identity",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-02T00:00:00Z",
+            "retired_at": "2026-01-03T00:00:00Z",
+            "deregistered_at": "2026-01-04T00:00:00Z",
+            "reaper_exempt": false
+        });
+        let result =
+            write_agent_reaper_exemption_sync_direct(&config, "operator-missing", &profile);
+        assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+        let archive = ensure_archive(&config, "operator-missing").unwrap();
+        assert_eq!(
+            read_agent_profile(&archive, "RedStone").unwrap(),
+            Some(profile)
+        );
+    }
+
+    #[test]
+    fn operator_reaper_exemption_refuses_invalid_profiles_without_replacing_them() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let fallback = serde_json::json!({"name": "BlueLake", "reaper_exempt": false});
+        for (slug, bytes) in [
+            ("operator-malformed", "{broken"),
+            ("operator-nonobject", "[]"),
+            (
+                "operator-wrong-name",
+                "{\"name\":\"OtherAgent\",\"reaper_exempt\":true}",
+            ),
+            (
+                "operator-existing-secret-noop",
+                "{\"name\":\"BlueLake\",\"reaper_exempt\":false,\"registration_token\":\"private\"}",
+            ),
+            (
+                "operator-existing-secret-change",
+                "{\"name\":\"BlueLake\",\"reaper_exempt\":true,\"registration_token\":\"private\"}",
+            ),
+        ] {
+            let archive = ensure_archive(&config, slug).unwrap();
+            let profile_dir = archive.root.join("agents/BlueLake");
+            fs::create_dir_all(&profile_dir).unwrap();
+            let path = profile_dir.join("profile.json");
+            fs::write(&path, bytes).unwrap();
+            let result = write_agent_reaper_exemption_sync_direct(&config, slug, &fallback);
+            assert!(
+                matches!(result, DirectArchiveWrite::Failed(_)),
+                "{result:?}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+        }
+
+        let secret = serde_json::json!({
+            "name": "SecretAgent",
+            "reaper_exempt": true,
+            "registration_token": "must-never-be-archived"
+        });
+        let result = write_agent_reaper_exemption_sync_direct(&config, "operator-secret", &secret);
+        assert!(
+            matches!(result, DirectArchiveWrite::Failed(_)),
+            "{result:?}"
+        );
+        assert!(
+            !tmp.path()
+                .join("projects/operator-secret/agents/SecretAgent/profile.json")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_reaper_exemption_refuses_symlinked_profiles_and_cached_parents() {
+        use std::os::unix::fs::symlink;
+
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let fallback = serde_json::json!({"name": "BlueLake", "reaper_exempt": false});
+        let outside = tmp.path().join("outside-agent");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_profile = outside.join("profile.json");
+        let outside_bytes = b"{\"name\":\"BlueLake\",\"reaper_exempt\":true}";
+        fs::write(&outside_profile, outside_bytes).unwrap();
+
+        let archive = ensure_archive(&config, "operator-file-link").unwrap();
+        let profile_dir = archive.root.join("agents/BlueLake");
+        fs::create_dir_all(&profile_dir).unwrap();
+        symlink(&outside_profile, profile_dir.join("profile.json")).unwrap();
+        let result = write_agent_reaper_exemption_sync_direct(&config, &archive.slug, &fallback);
+        assert!(
+            matches!(result, DirectArchiveWrite::Failed(_)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&outside_profile).unwrap(), outside_bytes);
+
+        let archive = ensure_archive(&config, "operator-parent-link").unwrap();
+        write_agent_profile_with_config(&archive, &config, &fallback).unwrap();
+        let profile_dir = archive.root.join("agents/BlueLake");
+        // Warm ensure_dir's cache, then replace only the path authority.
+        fs::rename(&profile_dir, archive.root.join("retained-agent")).unwrap();
+        symlink(&outside, &profile_dir).unwrap();
+        let result = write_agent_reaper_exemption_sync_direct(&config, &archive.slug, &fallback);
+        assert!(
+            matches!(result, DirectArchiveWrite::Failed(_)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&outside_profile).unwrap(), outside_bytes);
+    }
+
+    #[test]
+    fn operator_reaper_exemption_honors_disk_critical_refusal() {
+        let _pressure =
+            DiskPressureReset::set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let profile = serde_json::json!({"name": "BlueLake", "reaper_exempt": true});
+        let result =
+            write_agent_reaper_exemption_sync_direct(&config, "operator-disk-critical", &profile);
+        assert!(
+            matches!(result, DirectArchiveWrite::SkippedDiskCritical),
+            "{result:?}"
+        );
+        assert!(!tmp.path().join("projects/operator-disk-critical").exists());
     }
 
     #[test]
