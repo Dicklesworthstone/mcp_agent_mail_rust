@@ -20209,7 +20209,9 @@ fn render_server_file_reservations(
             ..
         }
     ) {
-        rows.retain(|row| row.released_ts.is_none_or(|ts| ts <= 0) && row.expires_ts > now_us);
+        // The server selected active leases using its own clock. Preserve that
+        // authoritative set even if this client's clock considers them expired.
+        rows.retain(|row| row.released_ts.is_none_or(|ts| ts <= 0));
     }
     match action {
         FileReservationsCommand::List { .. } => {

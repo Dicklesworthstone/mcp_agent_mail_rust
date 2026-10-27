@@ -6812,6 +6812,154 @@ fn reservation_server_legacy_negotiation_fails_closed_without_retries_or_paginat
 }
 
 #[test]
+fn reservation_server_reads_preserve_active_leases_when_client_clock_is_ahead() {
+    // R3 protocol fixture: the compiled CLI and HTTP transport are real. Both
+    // server protocols say these leases are active at their authority's clock.
+    // Local wall time may affect displays, but must not remove those leases.
+    let expires = "2024-02-02T00:00:00Z";
+    assert!(
+        mcp_agent_mail_db::now_micros() > mcp_agent_mail_db::iso_to_micros(expires).unwrap(),
+        "fixture must exercise a client clock ahead of the server"
+    );
+    for legacy in [false, true] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            let agents = json!([
+                {"id": 1, "name": "RusticGlen", "project_id": 1},
+                {"id": 2, "name": "BlueLake", "project_id": 1}
+            ]);
+            let payload = if uri.starts_with("resource://project/") {
+                json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                    "created_at": "2024-01-01T00:00:00Z", "agents": agents})
+            } else {
+                let mut rows = reservation_read_legacy_rows(2);
+                rows[0]["path_pattern"] = json!("src/**");
+                rows[1]["path_pattern"] = json!("src/lib.rs");
+                rows[1]["agent"] = json!("BlueLake");
+                for row in &mut rows {
+                    row["exclusive"] = json!(true);
+                    row["expires_ts"] = json!(expires);
+                }
+                if legacy {
+                    assert!(
+                        uri == "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                            || uri
+                                == "resource://file_reservations/gh368-project?active_only=true&limit=250&offset=0&format=json"
+                    );
+                    json!(rows)
+                } else {
+                    assert_eq!(
+                        uri,
+                        "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                    );
+                    for (index, row) in rows.iter_mut().enumerate() {
+                        row["project_id"] = json!(1);
+                        row["agent_id"] = json!(index + 1);
+                    }
+                    let mut snapshot =
+                        reservation_read_snapshot(&expected_project, "gh368-project", rows);
+                    snapshot["agents"] = agents;
+                    snapshot
+                }
+            };
+            reservation_read_resource_reply(request, payload)
+        });
+        let vars = reservation_read_env(&env, peer.port, &env.database_url());
+        let uri = "resource://file_reservations/gh368-project?active_only=true&limit=2";
+        let cases = [
+            vec![
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+            vec![
+                "robot",
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+            vec![
+                "robot",
+                "navigate",
+                uri,
+                "--project",
+                &project,
+                "--json",
+                "--server",
+            ],
+            vec!["file_reservations", "active", &project, "--server"],
+            vec!["file_reservations", "list", &project, "--server"],
+            vec!["file_reservations", "soon", &project, "--server"],
+            vec![
+                "file_reservations",
+                "conflicts",
+                &project,
+                "src/lib.rs",
+                "--server",
+            ],
+        ];
+        for args in &cases {
+            let out = run_am_hermetic(&vars, Some(env.hostile_repo()), args);
+            let text = reservation_read_success(&out);
+            if args.contains(&"--json") {
+                let data: Value = serde_json::from_str(text).unwrap();
+                let navigate = args.get(1) == Some(&"navigate");
+                let rows = if navigate {
+                    &data["data"]["reservations"]
+                } else {
+                    assert_eq!(data["conflicts"].as_array().unwrap().len(), 1);
+                    assert_eq!(data["reservation_read_attestation"]["source"], "mcp_server");
+                    &data["all_active"]
+                };
+                let actual: std::collections::HashSet<_> = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["path"].as_str().unwrap(),
+                            row["agent"].as_str().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    std::collections::HashSet::from([
+                        ("src/**", "RusticGlen"),
+                        ("src/lib.rs", "BlueLake")
+                    ]),
+                    "legacy={legacy}, args={args:?}"
+                );
+            } else {
+                for expected in ["src/**", "src/lib.rs", "RusticGlen", "BlueLake"] {
+                    assert!(text.contains(expected), "missing {expected}: {text}");
+                }
+            }
+        }
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            cases.len() * if legacy { 4 } else { 3 }
+        );
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
 fn reservation_server_reads_accept_verified_empty_results_and_preserve_navigation_pages() {
     let env = TestEnv::new();
     let project = env
