@@ -41769,10 +41769,11 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 ///
 /// Selection matches the issue's contract exactly: `last_active_ts < cutoff
 /// AND retired_at IS NULL AND reaper_exempt = 0`. The mutation is the same
-/// soft retire the `retire_agent` MCP tool performs
-/// (`queries::set_agent_retired_at(.., Some(now))`), so `unretire_agent`
-/// remains a path back and re-running the sweep is a no-op for already
-/// retired rows. This deliberately skips the server-tool path: the whole
+/// soft retirement the `retire_agent` MCP tool performs, with eligibility
+/// rechecked atomically by `queries::retire_agent_if_stale`. An agent that
+/// becomes active or exempt during the sweep is preserved. `unretire_agent`
+/// remains a path back, and already retired rows are a no-op. This deliberately
+/// skips the server-tool path: the whole
 /// point is retiring agents from projects whose sessions are all dead.
 async fn handle_agents_reap(
     stale_days: u32,
@@ -41889,26 +41890,19 @@ async fn agents_reap_payload(
     }
 
     let mut reaped = 0usize;
+    let mut skipped_changed = 0usize;
     if !dry_run {
         for agent_id in &candidate_ids {
-            match mcp_agent_mail_db::queries::set_agent_retired_at(
-                cx,
-                pool,
-                *agent_id,
-                Some(now_us),
-            )
-            .await
-            {
-                // The agent was deregistered between the listing above and
-                // this write. Same outcome as the listing-time skip.
-                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
-                    field: "agent_deregistered",
-                    ..
-                }) => skipped_deregistered += 1,
-                other => {
-                    outcome_to_result(other)?;
-                    reaped += 1;
-                }
+            match outcome_to_result(
+                mcp_agent_mail_db::queries::retire_agent_if_stale(
+                    cx, pool, *agent_id, cutoff_us, now_us,
+                )
+                .await,
+            )? {
+                Some(_) => reaped += 1,
+                // Activity, exemption, retirement or deregistration changed
+                // after selection. Only count transitions this sweep made.
+                None => skipped_changed += 1,
             }
         }
     }
@@ -41922,6 +41916,7 @@ async fn agents_reap_payload(
         "candidate_count": candidates.len(),
         "reaped_count": reaped,
         "skipped_deregistered_count": skipped_deregistered,
+        "skipped_changed_count": skipped_changed,
         "candidates": candidates,
     }))
 }
@@ -41945,10 +41940,19 @@ fn render_agents_reap_payload(
         .get("skipped_deregistered_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let skipped_changed = payload
+        .get("skipped_changed_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let note_skipped = || {
         if skipped_deregistered > 0 {
             output::info(&format!(
                 "Skipped {skipped_deregistered} deregistered agent(s): their retirement state cannot change."
+            ));
+        }
+        if skipped_changed > 0 {
+            output::info(&format!(
+                "Skipped {skipped_changed} candidate(s) whose eligibility changed during the sweep."
             ));
         }
     };
@@ -49531,6 +49535,7 @@ http_headers = { Authorization = "Bearer secret" }
             assert_eq!(dry["candidate_count"], 1);
             assert_eq!(dry["reaped_count"], 0);
             assert_eq!(dry["candidates"][0]["agent_name"], "StaleAgent");
+            assert_eq!(dry["skipped_changed_count"], 0);
             assert_eq!(dry["candidates"][0]["project_slug"], "reap-proj");
 
             // Leg 2: the real run retires exactly that set.
@@ -49540,6 +49545,7 @@ http_headers = { Authorization = "Bearer secret" }
             assert_eq!(real["candidate_count"], 1);
             assert_eq!(real["reaped_count"], 1);
             assert_eq!(real["candidates"][0]["agent_name"], "StaleAgent");
+            assert_eq!(real["skipped_changed_count"], 0);
 
             // Leg 3: a re-run is a no-op.
             let rerun = agents_reap_payload(&cx, &pool, 30, None, false)

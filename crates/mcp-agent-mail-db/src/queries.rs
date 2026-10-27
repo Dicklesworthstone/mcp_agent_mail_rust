@@ -7563,6 +7563,106 @@ pub async fn set_agent_retired_at(
     Outcome::Ok(agent)
 }
 
+/// Retire an agent only if it is still eligible for the operator's stale sweep.
+///
+/// Candidate lists are observations, not mutation authority: an agent may
+/// become active, exempt, retired or deregistered before the sweep reaches it.
+/// Recheck the complete predicate in the write transaction. `Some` describes
+/// a new retirement; `None` means the current row no longer qualifies. This
+/// never refreshes activity, rotates credentials, or changes other metadata.
+pub async fn retire_agent_if_stale(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    cutoff_us: i64,
+    retired_at: i64,
+) -> Outcome<Option<AgentRow>, DbError> {
+    let changed = match run_with_mvcc_retry(cx, "retire_agent_if_stale", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        if try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        )
+        .is_some()
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(None);
+        }
+
+        let affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET retired_at = ? WHERE id = ? \
+                     AND last_active_ts < ? AND retired_at IS NULL AND reaper_exempt = 0",
+                    &[
+                        Value::BigInt(retired_at),
+                        Value::BigInt(agent_id),
+                        Value::BigInt(cutoff_us),
+                    ],
+                )
+                .await
+            )
+        );
+        // Read through the same transaction, including no-op updates, so a
+        // missing identity is an explicit error rather than a reported skip.
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        if affected == 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(None);
+        }
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(Some(agent))
+    })
+    .await
+    {
+        Outcome::Ok(changed) => changed,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    if let Some(agent) = &changed {
+        let cache = crate::cache::read_cache();
+        let scope = cache_scope_for_pool(pool);
+        cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
+        cache.put_agent_scoped(&scope, agent);
+    }
+    Outcome::Ok(changed)
+}
+
 /// Mark an agent deregistered while preserving its row, reservations, and message history.
 pub async fn deregister_agent(
     cx: &Cx,
@@ -22100,6 +22200,190 @@ mod tests {
                 .into_result()
                 .expect("retire agent after explicit reactivation");
             assert_eq!(second_retirement.retired_at, Some(333));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reaper_rechecks_candidates_after_activity_exemption_and_lifecycle_changes() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("reaper race runtime");
+        let (cx, pool, _dir) = setup_test_pool("reaper-candidate-races.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/reaper-candidate-races")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let projection = "SELECT id, project_id, name, program, model, task_description, \
+                              inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                              reaper_exempt, registration_token, retired_at FROM agents ORDER BY id";
+            let (candidates, before) = {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                for (id, name) in [
+                    (501_i64, "GreenStone"),
+                    (502, "BlueLake"),
+                    (503, "RedFox"),
+                    (504, "AmberBear"),
+                    (505, "SilverCloud"),
+                    (506, "GoldCove"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                         reaper_exempt, registration_token, retired_at) \
+                         VALUES (?, ?, ?, 'codex-cli', 'test-model', 'keep this task', \
+                         50, 100, 'file', 'contacts_only', 0, ?, NULL)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project_id),
+                            Value::Text(name.to_string()),
+                            Value::Text(format!("synthetic-token-{id}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                let candidates = conn
+                    .query_sync(
+                        "SELECT id FROM agents WHERE last_active_ts < 200 \
+                         AND retired_at IS NULL AND reaper_exempt = 0 ORDER BY id",
+                        &[],
+                    )
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get_as::<i64>(0).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(candidates, [501, 502, 503, 504, 505, 506]);
+
+                // These are real intervening database writes after discovery,
+                // not a prefiltered fixture. Every ID remains in the sweep.
+                conn.execute_raw("UPDATE agents SET last_active_ts = 201 WHERE id = 502")
+                    .unwrap();
+                conn.execute_raw("UPDATE agents SET last_active_ts = 200 WHERE id = 503")
+                    .unwrap();
+                conn.execute_raw("UPDATE agents SET reaper_exempt = 1 WHERE id = 504")
+                    .unwrap();
+                conn.execute_raw("UPDATE agents SET retired_at = 222 WHERE id = 505")
+                    .unwrap();
+                conn.execute_raw(
+                    "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (506, 222)",
+                )
+                .unwrap();
+                let before = conn
+                    .query_sync(projection, &[])
+                    .unwrap()
+                    .iter()
+                    .map(decode_agent_row_indexed)
+                    .collect::<Vec<_>>();
+                (candidates, before)
+            };
+
+            let mut retired = Vec::new();
+            for id in &candidates {
+                if let Some(agent) = retire_agent_if_stale(&cx, &pool, *id, 200, 300)
+                    .await
+                    .into_result()
+                    .unwrap()
+                {
+                    retired.push(agent.id.unwrap());
+                    assert_eq!(agent.retired_at, Some(300));
+                }
+            }
+            assert_eq!(retired, [501], "only a still-eligible candidate may retire");
+            for id in candidates {
+                assert!(
+                    retire_agent_if_stale(&cx, &pool, id, 200, 400)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_none(),
+                    "repeat sweeps must not count an existing retirement again"
+                );
+            }
+
+            let cached = get_agent_by_id(&cx, &pool, 501)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(cached.retired_at, Some(300));
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let after = conn.query_sync(projection, &[]).unwrap();
+            assert_eq!(after.len(), before.len());
+            for (mut expected, row) in before.into_iter().zip(&after) {
+                if expected.id == Some(501) {
+                    expected.retired_at = Some(300);
+                }
+                assert_eq!(
+                    serde_json::to_value(decode_agent_row_indexed(row)).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "tokens, activity, policies, identity and all skipped rows must be preserved"
+                );
+            }
+            assert_eq!(
+                conn.query_sync("SELECT deregistered_at FROM agent_deregistrations", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                222
+            );
+            drop(conn);
+            assert!(matches!(
+                retire_agent_if_stale(&cx, &pool, 999, 200, 300).await,
+                Outcome::Err(DbError::NotFound { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn cancelled_reaper_preserves_identity_and_leaves_the_pool_usable() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("cancelled reaper runtime");
+        let (cx, pool, _dir) = setup_test_pool("reaper-cancellation.db");
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reaper-cancellation")
+                .await
+                .into_result()
+                .unwrap();
+            let original = register_agent(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                "BlueLake",
+                "codex-cli",
+                "test-model",
+                Some("keep the original task"),
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_id = original.id.unwrap();
+            let cancelled = Cx::for_testing();
+            cancelled.cancel_with(asupersync::types::CancelKind::User, Some("cancel reaper"));
+            assert!(matches!(
+                retire_agent_if_stale(&cancelled, &pool, agent_id, i64::MAX, now_micros()).await,
+                Outcome::Cancelled(_)
+            ));
+            let unchanged = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&unchanged).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+            assert!(
+                retire_agent_if_stale(&cx, &pool, agent_id, i64::MAX, now_micros())
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_some(),
+                "a cancelled sweep must not strand the one-slot pool or its transaction"
+            );
         });
     }
 
