@@ -20,7 +20,8 @@ use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::mem::size_of;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -93,6 +94,13 @@ const CONTEXT_HIT_RADIUS_LINES: usize = 2;
 
 /// Hard cap on highlight terms to keep rendering predictable.
 const MAX_HIGHLIGHT_TERMS: usize = 8;
+
+/// Shared retention limits for rendered Markdown bodies and composed details.
+/// These bound cache-owned storage, not the full result set, active caller
+/// Arcs, transient rendering allocations, allocator bookkeeping, or process RSS.
+const RENDER_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const RENDER_CACHE_MAX_ENTRY_BYTES: usize = 2 * 1024 * 1024;
+const RENDER_CACHE_MAX_ENTRIES: usize = 512;
 
 /// Minimum title width required before we show a snippet in the results list.
 #[allow(dead_code)]
@@ -611,6 +619,174 @@ struct SearchExecutionSignature {
 }
 
 type DetailCacheKey = (i64, &'static str, &'static str, u64);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderedTextCacheKey {
+    Markdown(i64, &'static str),
+    Detail(DetailCacheKey),
+}
+
+impl RenderedTextCacheKey {
+    const fn theme(self) -> &'static str {
+        match self {
+            Self::Markdown(_, theme) | Self::Detail((_, _, theme, _)) => theme,
+        }
+    }
+}
+
+struct RenderedTextCacheEntry {
+    key: RenderedTextCacheKey,
+    rendered: Arc<Text<'static>>,
+    retained_bytes: usize,
+}
+
+/// One fixed-capacity FIFO owns both render layers. A bounded linear lookup
+/// avoids an additional hash index and its separately allocated buckets. Hits
+/// clone only an Arc; a rejected admission still returns the complete render.
+struct RenderedTextCache {
+    entries: VecDeque<RenderedTextCacheEntry>,
+    retained_bytes: usize,
+    theme: Option<&'static str>,
+}
+
+impl Default for RenderedTextCache {
+    fn default() -> Self {
+        let mut cache = Self {
+            entries: VecDeque::with_capacity(RENDER_CACHE_MAX_ENTRIES),
+            retained_bytes: 0,
+            theme: None,
+        };
+        cache.retained_bytes = cache.metadata_bytes();
+        cache
+    }
+}
+
+impl RenderedTextCache {
+    fn metadata_bytes(&self) -> usize {
+        size_of::<Self>() + self.entries.capacity() * size_of::<RenderedTextCacheEntry>()
+    }
+
+    fn select_theme(&mut self, theme: &'static str) {
+        if self.theme != Some(theme) {
+            self.entries.clear();
+            self.retained_bytes = self.metadata_bytes();
+            self.theme = Some(theme);
+        }
+    }
+
+    fn get(&mut self, key: RenderedTextCacheKey) -> Option<Arc<Text<'static>>> {
+        self.select_theme(key.theme());
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| Arc::clone(&entry.rendered))
+    }
+
+    fn insert(&mut self, key: RenderedTextCacheKey, text: Text<'static>) -> Arc<Text<'static>> {
+        self.select_theme(key.theme());
+        let (text, retained_bytes) = account_rendered_text(text);
+        let rendered = Arc::new(text);
+        let Some(retained_bytes) = retained_bytes else {
+            return rendered;
+        };
+
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key)
+            && let Some(previous) = self.entries.remove(index)
+        {
+            self.retained_bytes -= previous.retained_bytes;
+        }
+        while self.entries.len() >= RENDER_CACHE_MAX_ENTRIES
+            || self.retained_bytes > RENDER_CACHE_MAX_BYTES - retained_bytes
+        {
+            let Some(oldest) = self.entries.pop_front() else {
+                return rendered;
+            };
+            self.retained_bytes -= oldest.retained_bytes;
+        }
+        self.retained_bytes += retained_bytes;
+        self.entries.push_back(RenderedTextCacheEntry {
+            key,
+            rendered: Arc::clone(&rendered),
+            retained_bytes,
+        });
+        rendered
+    }
+
+    fn discard_details(&mut self) {
+        let mut released = 0;
+        self.entries.retain(|entry| {
+            if matches!(entry.key, RenderedTextCacheKey::Detail(_)) {
+                released += entry.retained_bytes;
+                false
+            } else {
+                true
+            }
+        });
+        self.retained_bytes -= released;
+    }
+}
+
+fn owned_span_string_capacity(value: &Cow<'_, str>) -> usize {
+    match value {
+        Cow::Borrowed(_) => 0,
+        Cow::Owned(value) => value.capacity(),
+    }
+}
+
+fn retained_span_bytes(
+    spans: &[Span<'static>],
+    capacity: usize,
+    available: usize,
+) -> Option<usize> {
+    let mut bytes = capacity.checked_mul(size_of::<Span<'static>>())?;
+    if bytes > available {
+        return None;
+    }
+    for span in spans {
+        bytes = bytes.checked_add(owned_span_string_capacity(&span.content))?;
+        bytes = bytes.checked_add(span.link.as_ref().map_or(0, owned_span_string_capacity))?;
+        if bytes > available {
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
+fn account_rendered_text(text: Text<'static>) -> (Text<'static>, Option<usize>) {
+    // ftui-text 0.7 owns private Vecs in Text and Line. Its consuming iterators
+    // expose Vec::IntoIter; collecting that iterator and passing the resulting
+    // owned Vec to from_lines/from_spans preserve its allocation. Measure those
+    // actual capacities rather than text lengths or private-buffer estimates.
+    // Revisit this ownership roundtrip when changing the pinned ftui version.
+    let mut lines: Vec<Line<'static>> = text.into_iter().collect();
+    let arc_bytes = size_of::<Text<'static>>() + 2 * size_of::<usize>();
+    let Some(mut bytes) = lines
+        .capacity()
+        .checked_mul(size_of::<Line<'static>>())
+        .and_then(|line_bytes| line_bytes.checked_add(arc_bytes))
+        .filter(|bytes| *bytes <= RENDER_CACHE_MAX_ENTRY_BYTES)
+    else {
+        return (Text::from_lines(lines), None);
+    };
+    let mut admitted = true;
+    for line in &mut lines {
+        let spans: Vec<Span<'static>> = std::mem::take(line).into_iter().collect();
+        let line_bytes = retained_span_bytes(
+            &spans,
+            spans.capacity(),
+            RENDER_CACHE_MAX_ENTRY_BYTES - bytes,
+        );
+        *line = Line::from_spans(spans);
+        let Some(line_bytes) = line_bytes else {
+            admitted = false;
+            break;
+        };
+        bytes += line_bytes;
+    }
+    // Oversized content is moved back intact. Only the bounded prefix needed
+    // to refuse admission was inspected; full-body display remains unchanged.
+    (Text::from_lines(lines), admitted.then_some(bytes))
+}
 
 fn explain_facet_value<'a>(
     explain: &'a mcp_agent_mail_db::search_planner::QueryExplain,
@@ -1319,10 +1495,8 @@ pub struct SearchCockpitScreen {
     last_split_area: Cell<Rect>,
     /// Small animation phase for header/status flourish.
     ui_phase: u8,
-    /// Cached markdown render for selected message bodies, keyed by message id.
-    rendered_markdown_cache: RefCell<HashMap<(i64, &'static str), Arc<Text<'static>>>>,
-    /// Cached detail panel text for selected entries, keyed by (id, kind, theme).
-    rendered_detail_cache: RefCell<HashMap<DetailCacheKey, Arc<Text<'static>>>>,
+    /// Markdown and detail renders share one entry and retained-byte budget.
+    rendered_cache: RefCell<RenderedTextCache>,
     /// Last-seen data generation snapshot for dirty-state gating.
     last_data_gen: super::DataGeneration,
     /// Per-selection collapsible JSON tree interaction state.
@@ -1416,8 +1590,7 @@ impl SearchCockpitScreen {
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_split_area: Cell::new(Rect::new(0, 0, 0, 0)),
             ui_phase: 0,
-            rendered_markdown_cache: RefCell::new(HashMap::new()),
-            rendered_detail_cache: RefCell::new(HashMap::new()),
+            rendered_cache: RefCell::new(RenderedTextCache::default()),
             last_data_gen: super::DataGeneration::stale(),
             json_tree_state: RefCell::new(crate::tui_markdown::JsonTreeViewState::default()),
             filter_presets_path,
@@ -1877,32 +2050,27 @@ impl SearchCockpitScreen {
             .as_deref()
             .filter(|raw| !raw.trim().is_empty())?;
         let theme_key = crate::tui_theme::current_theme_env_value();
-        let cache_key = (entry.id, theme_key);
-        if let Some(existing) = self.rendered_markdown_cache.borrow().get(&cache_key) {
-            return Some(Arc::clone(existing));
+        let cache_key = RenderedTextCacheKey::Markdown(entry.id, theme_key);
+        if let Some(existing) = self.rendered_cache.borrow_mut().get(cache_key) {
+            return Some(existing);
         }
         let theme = crate::tui_theme::markdown_theme();
-        let rendered = Arc::new(tui_markdown::render_body(body, &theme));
+        let rendered = tui_markdown::render_body(body, &theme);
         self.bump_preview_markdown_render_count();
-        let mut cache = self.rendered_markdown_cache.borrow_mut();
-        if cache.len() > 512 {
-            cache.clear();
-        }
-        cache.insert(cache_key, Arc::clone(&rendered));
-        Some(rendered)
+        Some(self.rendered_cache.borrow_mut().insert(cache_key, rendered))
     }
 
     /// Return cached detail text for an entry, generating lazily.
     fn cached_rendered_detail(&self, entry: &ResultEntry) -> Arc<Text<'static>> {
         let theme_key = crate::tui_theme::current_theme_env_value();
-        let cache_key = (
+        let cache_key = RenderedTextCacheKey::Detail((
             entry.id,
             entry.doc_kind.as_str(),
             theme_key,
             self.detail_cache_generation,
-        );
-        if let Some(existing) = self.rendered_detail_cache.borrow().get(&cache_key) {
-            return Arc::clone(existing);
+        ));
+        if let Some(existing) = self.rendered_cache.borrow_mut().get(cache_key) {
+            return existing;
         }
 
         let rendered_body = self.cached_rendered_markdown(entry);
@@ -1910,7 +2078,7 @@ impl SearchCockpitScreen {
             self.bump_preview_markdown_render_count();
         }
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let rendered = Arc::new(compose_detail_text(
+        let rendered = compose_detail_text(
             entry,
             &self.highlight_terms,
             self.last_diagnostics.as_ref(),
@@ -1919,14 +2087,9 @@ impl SearchCockpitScreen {
             DetailViewMode::Markdown,
             None,
             0,
-        ));
+        );
 
-        let mut cache = self.rendered_detail_cache.borrow_mut();
-        if cache.len() > 512 {
-            cache.clear();
-        }
-        cache.insert(cache_key, Arc::clone(&rendered));
-        rendered
+        self.rendered_cache.borrow_mut().insert(cache_key, rendered)
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected search result.
@@ -3042,6 +3205,9 @@ impl SearchCockpitScreen {
     fn refresh_detail_cache_generation(&mut self) {
         let signature = self.detail_cache_signature();
         if signature != self.last_detail_cache_signature {
+            // Remove the old generation instead of retaining unreachable
+            // detail renders. This also invalidates correctly at u64::MAX.
+            self.rendered_cache.get_mut().discard_details();
             self.detail_cache_generation = self.detail_cache_generation.saturating_add(1);
             self.last_detail_cache_signature = signature;
         }
@@ -3864,12 +4030,9 @@ impl MailScreen for SearchCockpitScreen {
                     self.detail_scroll.set(0);
                 }
             }
-            let rendered_body_override = if self.detail_view_mode.get() == DetailViewMode::JsonTree
-            {
-                None
-            } else {
-                selected_entry.and_then(|entry| self.cached_rendered_markdown(entry))
-            };
+            // The composed detail owns its body render. Asking for Markdown
+            // separately would parse an oversized, deliberately uncached body
+            // twice per frame, and would warm it even on a detail-cache hit.
             let rendered_detail_override =
                 if self.detail_view_mode.get() == DetailViewMode::JsonTree {
                     None
@@ -3883,7 +4046,7 @@ impl MailScreen for SearchCockpitScreen {
                 self.detail_scroll.get(),
                 &self.highlight_terms,
                 self.last_diagnostics.as_ref(),
-                rendered_body_override.as_deref(),
+                None,
                 rendered_detail_override.as_deref(),
                 matches!(self.focus, Focus::ResultList),
                 self.detail_view_mode.get(),
@@ -7683,21 +7846,515 @@ mod tests {
         }
     }
 
+    fn make_render_cache_entry(id: i64, body_bytes: usize, tail: &str) -> ResultEntry {
+        let mut body = String::new();
+        while body.len() < body_bytes {
+            body.push_str("ordinary synthetic observation preserves every original message byte\n");
+        }
+        body.push_str(tail);
+        let mut entry = make_msg_entry();
+        entry.id = id;
+        entry.full_body = Some(body);
+        entry.rendered_body = None;
+        entry
+    }
+
+    fn assert_render_cache_within_budget(screen: &SearchCockpitScreen) {
+        let cache = screen.rendered_cache.borrow();
+        assert!(cache.retained_bytes <= RENDER_CACHE_MAX_BYTES);
+        assert!(cache.entries.len() <= RENDER_CACHE_MAX_ENTRIES);
+        // This lower bound is deliberately independent of the production
+        // accounting helper. Both layers own their cloned String storage.
+        let owned_string_bytes: usize = cache
+            .entries
+            .iter()
+            .flat_map(|entry| entry.rendered.lines())
+            .flat_map(Line::spans)
+            .map(|span| {
+                let content = match &span.content {
+                    Cow::Owned(value) => value.capacity(),
+                    Cow::Borrowed(_) => 0,
+                };
+                content
+                    + match &span.link {
+                        Some(Cow::Owned(value)) => value.capacity(),
+                        Some(Cow::Borrowed(_)) | None => 0,
+                    }
+            })
+            .sum();
+        assert!(
+            cache.retained_bytes >= owned_string_bytes,
+            "the shared charge must cover all owned body and hyperlink strings"
+        );
+        assert!(owned_string_bytes <= RENDER_CACHE_MAX_BYTES);
+    }
+
+    fn assert_detail_renders_full_body_tail(
+        entry: &ResultEntry,
+        rendered: &Text<'static>,
+        tail: &str,
+    ) {
+        assert!(
+            rendered
+                .to_plain_text()
+                .ends_with(entry.full_body.as_deref().unwrap()),
+            "the detail renderer must retain the complete original body"
+        );
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 32, &mut pool);
+        let max_scroll = Cell::new(0);
+        render_detail(
+            &mut frame,
+            Rect::new(0, 0, 120, 32),
+            Some(entry),
+            usize::MAX,
+            &[],
+            None,
+            None,
+            Some(rendered),
+            true,
+            DetailViewMode::Markdown,
+            None,
+            0,
+            &max_scroll,
+        );
+        assert!(max_scroll.get() > 0, "the fixture must exercise scrolling");
+        assert!(
+            max_scroll.get() < usize::from(u16::MAX),
+            "the fixture must fit the renderer's existing scroll range"
+        );
+        assert!(
+            buffer_to_text(&frame.buffer).contains(tail),
+            "the complete body tail must remain visible after scrolling"
+        );
+    }
+
     #[test]
     fn cached_rendered_markdown_counts_only_cache_misses() {
+        let _theme =
+            ftui_extras::theme::ScopedThemeLock::new(ftui_extras::theme::ThemeId::CyberpunkAurora);
         let screen = SearchCockpitScreen::new();
         let entry = make_msg_entry();
         assert_eq!(screen.preview_markdown_render_count.get(), 0);
 
-        assert!(screen.cached_rendered_markdown(&entry).is_some());
+        let first = screen
+            .cached_rendered_markdown(&entry)
+            .expect("first body render");
         assert_eq!(screen.preview_markdown_render_count.get(), 1);
 
-        assert!(screen.cached_rendered_markdown(&entry).is_some());
+        let repeated = screen
+            .cached_rendered_markdown(&entry)
+            .expect("cached body render");
+        assert!(Arc::ptr_eq(&first, &repeated));
+        let detail = screen.cached_rendered_detail(&entry);
+        let repeated_detail = screen.cached_rendered_detail(&entry);
+        assert!(Arc::ptr_eq(&detail, &repeated_detail));
         assert_eq!(screen.preview_markdown_render_count.get(), 1);
+        assert_eq!(screen.rendered_cache.borrow().entries.len(), 2);
+        assert_render_cache_within_budget(&screen);
+    }
+
+    #[test]
+    fn render_cache_bounds_large_bodies_across_both_layers_and_rebuilds_evictions() {
+        let _theme =
+            ftui_extras::theme::ScopedThemeLock::new(ftui_extras::theme::ThemeId::CyberpunkAurora);
+        let screen = SearchCockpitScreen::new();
+        let first = make_render_cache_entry(1_000, 128 * 1024, "FINAL BODY CANARY FIRST");
+        let body = screen
+            .cached_rendered_markdown(&first)
+            .expect("render first body");
+        let detail = screen.cached_rendered_detail(&first);
+        let first_body = Arc::downgrade(&body);
+        let first_detail = Arc::downgrade(&detail);
+        assert_eq!(body.to_plain_text(), first.full_body.as_deref().unwrap());
+        assert_detail_renders_full_body_tail(&first, &detail, "FINAL BODY CANARY FIRST");
+        drop(body);
+        drop(detail);
+        let mut visited_body_bytes = first.full_body.as_ref().unwrap().len() * 2;
+        let mut visited_render_entries = 2;
+        for id in 1_001..1_032 {
+            let tail = format!("FINAL BODY CANARY {id}");
+            let entry = make_render_cache_entry(id, 128 * 1024, &tail);
+            let body = screen
+                .cached_rendered_markdown(&entry)
+                .expect("render full body");
+            let detail = screen.cached_rendered_detail(&entry);
+            assert_eq!(body.to_plain_text(), entry.full_body.as_deref().unwrap());
+            assert!(
+                detail
+                    .to_plain_text()
+                    .ends_with(entry.full_body.as_deref().unwrap())
+            );
+            visited_body_bytes += entry.full_body.as_ref().unwrap().len() * 2;
+            visited_render_entries += 2;
+            assert_render_cache_within_budget(&screen);
+            let cache = screen.rendered_cache.borrow();
+            assert!(
+                cache.entries.iter().any(|entry| {
+                    matches!(entry.key, RenderedTextCacheKey::Markdown(entry_id, _) if entry_id == id)
+                }),
+                "each individual body must fit admission; this is an aggregate-budget test"
+            );
+            assert!(cache.entries.iter().any(|entry| {
+                matches!(entry.key, RenderedTextCacheKey::Detail((entry_id, _, _, _)) if entry_id == id)
+            }));
+        }
+        assert!(visited_body_bytes > RENDER_CACHE_MAX_BYTES);
+        assert!(visited_render_entries < RENDER_CACHE_MAX_ENTRIES);
+        assert!(
+            first_body.upgrade().is_none() && first_detail.upgrade().is_none(),
+            "byte pressure must release both old render allocations before the entry limit"
+        );
+        let renders_before = screen.preview_markdown_render_count.get();
+        let rebuilt = screen.cached_rendered_detail(&first);
+        assert_eq!(
+            screen.preview_markdown_render_count.get(),
+            renders_before + 1
+        );
+        assert_detail_renders_full_body_tail(&first, &rebuilt, "FINAL BODY CANARY FIRST");
+        let repeated = screen.cached_rendered_detail(&first);
+        assert!(Arc::ptr_eq(&rebuilt, &repeated));
+        assert_eq!(
+            screen.preview_markdown_render_count.get(),
+            renders_before + 1
+        );
+        assert_render_cache_within_budget(&screen);
+    }
+
+    #[test]
+    fn render_cache_bypasses_oversized_bodies_without_truncating_detail_frames() {
+        let _theme =
+            ftui_extras::theme::ScopedThemeLock::new(ftui_extras::theme::ThemeId::CyberpunkAurora);
+        let mut screen = SearchCockpitScreen::new();
+        let small = make_msg_entry();
+        let small_body = screen
+            .cached_rendered_markdown(&small)
+            .expect("warm small body");
+        let small_detail = screen.cached_rendered_detail(&small);
+        let retained_before = screen.rendered_cache.borrow().retained_bytes;
+        let entry = make_render_cache_entry(
+            9_000,
+            RENDER_CACHE_MAX_ENTRY_BYTES + 1_024,
+            "FINAL OVERSIZED BODY CANARY",
+        );
+        let body = screen
+            .cached_rendered_markdown(&entry)
+            .expect("oversized full body");
+        assert_eq!(body.to_plain_text(), entry.full_body.as_deref().unwrap());
+        let body_witness = Arc::downgrade(&body);
+        drop(body);
+        assert!(
+            body_witness.upgrade().is_none(),
+            "oversized bodies must not be retained"
+        );
+        let detail = screen.cached_rendered_detail(&entry);
+        assert_detail_renders_full_body_tail(&entry, &detail, "FINAL OVERSIZED BODY CANARY");
+        let detail_witness = Arc::downgrade(&detail);
+        drop(detail);
+        assert!(
+            detail_witness.upgrade().is_none(),
+            "oversized details must not be retained"
+        );
+
+        // Exercise the actual screen view: a bypass must parse once per frame,
+        // even though the composed detail also requests its markdown body.
+        screen.results = vec![entry];
+        screen.rebuild_result_rows();
+        screen.dock.visible = true;
+        screen.dock.position = DockPosition::Bottom;
+        screen.dock.set_ratio(0.7);
+        screen.detail_scroll.set(usize::MAX);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        for _ in 0..2 {
+            let renders_before = screen.preview_markdown_render_count.get();
+            let mut frame = ftui::Frame::new(160, 50, &mut pool);
+            screen.view(&mut frame, Rect::new(0, 0, 160, 50), &state);
+            assert_eq!(
+                screen.preview_markdown_render_count.get(),
+                renders_before + 1
+            );
+            assert!(screen.last_detail_max_scroll.get() > 0);
+            assert!(screen.last_detail_max_scroll.get() < usize::from(u16::MAX));
+            assert!(
+                buffer_to_text(&frame.buffer).contains("FINAL OVERSIZED BODY CANARY"),
+                "oversized full-body tails must remain visible through MailScreen::view"
+            );
+            assert_render_cache_within_budget(&screen);
+            assert_eq!(
+                screen.rendered_cache.borrow().retained_bytes,
+                retained_before
+            );
+            assert_eq!(screen.rendered_cache.borrow().entries.len(), 2);
+        }
+        assert!(Arc::ptr_eq(
+            &small_body,
+            &screen
+                .cached_rendered_markdown(&small)
+                .expect("small body survived bypass")
+        ));
+        assert!(Arc::ptr_eq(
+            &small_detail,
+            &screen.cached_rendered_detail(&small)
+        ));
+    }
+
+    #[test]
+    fn render_cache_applies_entry_limit_across_both_render_layers() {
+        let _theme =
+            ftui_extras::theme::ScopedThemeLock::new(ftui_extras::theme::ThemeId::CyberpunkAurora);
+        let screen = SearchCockpitScreen::new();
+        let first = make_render_cache_entry(20_000, 0, "FIRST SMALL BODY");
+        let first_body = screen.cached_rendered_markdown(&first).expect("small body");
+        let first_detail = screen.cached_rendered_detail(&first);
+        let body_witness = Arc::downgrade(&first_body);
+        let detail_witness = Arc::downgrade(&first_detail);
+        drop(first_body);
+        drop(first_detail);
+        for offset in 1..=RENDER_CACHE_MAX_ENTRIES / 2 {
+            let entry = make_render_cache_entry(
+                20_000 + i64::try_from(offset).unwrap(),
+                0,
+                "SMALL COMPLETE BODY",
+            );
+            let _ = screen.cached_rendered_detail(&entry);
+            assert_render_cache_within_budget(&screen);
+        }
+        let cache = screen.rendered_cache.borrow();
+        assert_eq!(cache.entries.len(), RENDER_CACHE_MAX_ENTRIES);
+        assert!(cache.retained_bytes < RENDER_CACHE_MAX_BYTES / 2);
+        assert!(body_witness.upgrade().is_none());
+        assert!(detail_witness.upgrade().is_none());
+    }
+
+    #[test]
+    fn render_cache_releases_old_details_without_reparsing_the_body() {
+        let _theme =
+            ftui_extras::theme::ScopedThemeLock::new(ftui_extras::theme::ThemeId::CyberpunkAurora);
+        let mut screen = SearchCockpitScreen::new();
+        let entry = make_render_cache_entry(30_000, 16 * 1024, "FINAL GENERATION BODY CANARY");
+        let body = screen
+            .cached_rendered_markdown(&entry)
+            .expect("stable body");
+        let mut old_detail: Option<std::sync::Weak<Text<'static>>> = None;
+        for generation in 0..32 {
+            if generation == 30 {
+                screen.detail_cache_generation = u64::MAX;
+            }
+            let hint = format!("generation observation {generation}");
+            screen.last_diagnostics = Some(SearchDegradedDiagnostics {
+                degraded: true,
+                fallback_mode: None,
+                timeout_stage: None,
+                budget_tier: None,
+                budget_exhausted: None,
+                remediation_hint: Some(hint.clone()),
+            });
+            screen.refresh_detail_cache_generation();
+            if generation >= 30 {
+                assert_eq!(screen.detail_cache_generation, u64::MAX);
+            }
+            if let Some(previous) = old_detail.take() {
+                assert!(
+                    previous.upgrade().is_none(),
+                    "obsolete detail must be released immediately"
+                );
+            }
+            let detail = screen.cached_rendered_detail(&entry);
+            let visible = detail.to_plain_text();
+            assert!(visible.contains(&hint));
+            assert!(visible.ends_with(entry.full_body.as_deref().unwrap()));
+            assert_eq!(screen.preview_markdown_render_count.get(), 1);
+            assert!(Arc::ptr_eq(
+                &body,
+                &screen
+                    .cached_rendered_markdown(&entry)
+                    .expect("body reused across generation")
+            ));
+            assert_eq!(screen.rendered_cache.borrow().entries.len(), 2);
+            assert_render_cache_within_budget(&screen);
+            old_detail = Some(Arc::downgrade(&detail));
+        }
+    }
+
+    #[test]
+    fn render_cache_releases_obsolete_themes_and_keeps_full_body_content() {
+        use ftui_extras::theme::{ScopedThemeLock, ThemeId};
+
+        let _theme = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let screen = SearchCockpitScreen::new();
+        let entry = make_render_cache_entry(40_000, 16 * 1024, "FINAL THEME BODY CANARY");
+        let mut old_body: Option<std::sync::Weak<Text<'static>>> = None;
+        let mut old_detail: Option<std::sync::Weak<Text<'static>>> = None;
+        for (index, theme) in [
+            ThemeId::CyberpunkAurora,
+            ThemeId::Darcula,
+            ThemeId::LumenLight,
+            ThemeId::NordicFrost,
+            ThemeId::CyberpunkAurora,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = crate::tui_theme::set_theme_and_get_name(theme);
+            let body = screen
+                .cached_rendered_markdown(&entry)
+                .expect("body under current theme");
+            let detail = screen.cached_rendered_detail(&entry);
+            assert_eq!(body.to_plain_text(), entry.full_body.as_deref().unwrap());
+            assert!(
+                detail
+                    .to_plain_text()
+                    .ends_with(entry.full_body.as_deref().unwrap())
+            );
+            assert_eq!(
+                screen.preview_markdown_render_count.get(),
+                u64::try_from(index).unwrap() + 1
+            );
+            if let Some(previous) = old_body.take() {
+                assert!(previous.upgrade().is_none());
+            }
+            if let Some(previous) = old_detail.take() {
+                assert!(previous.upgrade().is_none());
+            }
+            assert_eq!(screen.rendered_cache.borrow().entries.len(), 2);
+            assert_render_cache_within_budget(&screen);
+            old_body = Some(Arc::downgrade(&body));
+            old_detail = Some(Arc::downgrade(&detail));
+        }
+    }
+
+    #[test]
+    fn render_cache_accounts_spare_capacity_and_owned_hyperlinks() {
+        let mut content = String::with_capacity(4_096);
+        content.push_str("owned body");
+        let mut link = String::with_capacity(8_192);
+        link.push_str("https://example.test/owned");
+        let string_capacity = content.capacity() + link.capacity();
+        let style = Style::default().bold();
+        let mut spans = Vec::with_capacity(128);
+        spans.push(Span::styled(content, style).link(link));
+        spans.push(Span::raw(" borrowed body").link("https://example.test/borrowed"));
+        let span_capacity = spans.capacity();
+        let mut lines = Vec::with_capacity(64);
+        lines.push(Line::from_spans(spans));
+        lines.push(Line::raw("FINAL ACCOUNTING TAIL"));
+        let line_capacity = lines.capacity();
+        let text = Text::from_lines(lines);
+        let expected = text.clone();
+        let mut cache = RenderedTextCache::default();
+        let rendered = cache.insert(RenderedTextCacheKey::Markdown(50_000, "fixture"), text);
+        assert_eq!(rendered.as_ref(), &expected);
+        assert!(matches!(
+            &rendered.lines()[0].spans()[0].content,
+            Cow::Owned(_)
+        ));
+        assert!(matches!(
+            &rendered.lines()[0].spans()[1].content,
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(rendered.lines()[0].spans()[0].style, Some(style));
+        assert_eq!(cache.entries.len(), 1);
+        let charged = cache.entries[0].retained_bytes;
+        assert!(
+            charged
+                >= string_capacity
+                    + span_capacity * size_of::<Span<'static>>()
+                    + line_capacity * size_of::<Line<'static>>(),
+            "unused line/span/String capacities and owned link storage must all be charged"
+        );
+        drop(cache);
+
+        // Consume the actual returned allocation after cache ownership ends;
+        // do not clone it, because cloning could discard the original slack.
+        let text = Arc::try_unwrap(rendered).expect("only caller owns the admitted render");
+        let lines: Vec<Line<'static>> = text.into_iter().collect();
+        let mut actual = size_of::<Text<'static>>()
+            + 2 * size_of::<usize>()
+            + lines.capacity() * size_of::<Line<'static>>();
+        for line in lines {
+            let spans: Vec<Span<'static>> = line.into_iter().collect();
+            actual += spans.capacity() * size_of::<Span<'static>>();
+            for span in spans {
+                if let Cow::Owned(value) = span.content {
+                    actual += value.capacity();
+                }
+                if let Some(Cow::Owned(value)) = span.link {
+                    actual += value.capacity();
+                }
+            }
+        }
+        assert!(
+            charged >= actual,
+            "recorded bytes must cover actual retained allocations"
+        );
+    }
+
+    #[test]
+    fn render_cache_oversize_accounting_preserves_unvisited_text() {
+        let mut cache = RenderedTextCache::default();
+        let warm_key = RenderedTextCacheKey::Markdown(60_000, "fixture");
+        let warm = cache.insert(warm_key, Text::raw("ordinary cached observation"));
+        let retained_before = cache.retained_bytes;
+        for component in ["lines", "spans", "content", "link"] {
+            let mut content = String::with_capacity(if component == "content" {
+                RENDER_CACHE_MAX_ENTRY_BYTES + 1
+            } else {
+                32
+            });
+            content.push_str("first visible span");
+            let mut link = String::with_capacity(if component == "link" {
+                RENDER_CACHE_MAX_ENTRY_BYTES + 1
+            } else {
+                64
+            });
+            link.push_str("https://example.test/retained");
+            let mut spans = Vec::with_capacity(if component == "spans" {
+                RENDER_CACHE_MAX_ENTRY_BYTES / size_of::<Span<'static>>() + 1
+            } else {
+                2
+            });
+            spans.push(Span::styled(content, Style::default().bold()).link(link));
+            spans.push(Span::raw(" second visible span"));
+            let mut lines = Vec::with_capacity(if component == "lines" {
+                RENDER_CACHE_MAX_ENTRY_BYTES / size_of::<Line<'static>>() + 1
+            } else {
+                3
+            });
+            lines.push(Line::from_spans(spans));
+            lines.push(Line::new());
+            lines.push(Line::from_spans([
+                Span::styled("UNVISITED FULL TAIL", Style::default().italic())
+                    .link("https://example.test/tail"),
+                Span::raw(" after accounting stops"),
+            ]));
+            let text = Text::from_lines(lines);
+            let expected = text.clone();
+            let rendered = cache.insert(RenderedTextCacheKey::Markdown(60_001, "fixture"), text);
+            assert_eq!(
+                rendered.as_ref(),
+                &expected,
+                "oversized {component} must preserve all text"
+            );
+            assert_eq!(cache.retained_bytes, retained_before);
+            assert_eq!(cache.entries.len(), 1);
+            assert!(Arc::ptr_eq(
+                &warm,
+                &cache.get(warm_key).expect("warm entry retained")
+            ));
+            let witness = Arc::downgrade(&rendered);
+            drop(rendered);
+            assert!(
+                witness.upgrade().is_none(),
+                "oversized {component} must bypass admission"
+            );
+        }
     }
 
     #[test]
     fn detail_cache_generation_invalidates_detail_render_cache() {
+        let _theme =
+            ftui_extras::theme::ScopedThemeLock::new(ftui_extras::theme::ThemeId::CyberpunkAurora);
         let mut screen = SearchCockpitScreen::new();
         let entry = make_agent_entry();
 

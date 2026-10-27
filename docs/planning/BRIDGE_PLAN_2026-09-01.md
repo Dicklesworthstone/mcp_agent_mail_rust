@@ -187,6 +187,67 @@ Each bead embeds source context, reasoning, implementation scope, realistic posi
 a negative a naive fix fails, E2E logging, and closure evidence. Implementation and tests
 stay in one logical bead, as the suite's scope-splitting prohibition requires.
 
+#### Search rendered-text retention (adjacent to `br-kp1in.44`, October 27)
+
+Source review at `789efef153c3aaa458c96980f260e0d1eef85073` found that the search
+screen independently retained rendered Markdown and composed detail text until each
+map exceeded 512 entries. Full message bodies were preserved, with no byte admission
+limit. This is a concrete cache-retention gap, not attribution of the historical
+8.8 GB daemon observation and not a measured memory or latency improvement.
+
+The commit containing this note replaces those maps with one fixed-capacity FIFO:
+8 MiB of accounted retained storage, at most 2 MiB per admitted render, and 512 entries
+across both layers. Accounting includes actual line/span vector capacities, owned text
+and hyperlink string capacities, the Text allocation and Arc counters, and queue
+metadata. The ownership-preserving vector roundtrip is checked against pinned
+`ftui-text 0.7.0`; the implementation documents that dependency. Admission inspection
+stops after the bounded prefix needed to reject an entry, moving the remaining text
+back intact. Oversized entries remain available for complete display without evicting
+ordinary cached entries in the current theme. Hits clone an Arc; eviction is bounded.
+
+Theme changes release both old render layers. Detail-context changes release the old
+detail generation while keeping reusable Markdown, including when the generation
+counter is saturated. The actual screen rendering path now requests composed detail
+once, avoiding a second Markdown parse per frame when an oversized body bypasses
+retention. JSON mode and complete message bodies remain unchanged. The budget covers
+cache ownership; full result bodies, active caller Arcs, transient widget/rendering
+allocations, allocator bookkeeping and process RSS remain outside it.
+
+Seven new regressions exercise both cache layers below the old count threshold,
+combined entry pressure, eviction and full-body reconstruction, oversized bypass,
+theme/detail churn, saturated generation invalidation, and spare vector/string/link
+capacity accounting. Weak references assert that obsolete allocations are released.
+Two actual `MailScreen::view` frames assert one Markdown render per oversized request
+and a visible final-body canary after scrolling. An existing small-hit test now checks
+Arc reuse in both layers. All fixtures are synthetic and in memory; these are authored
+regressions, not executed runtime proof.
+
+**Validation remains OPEN.** Pinned nightly formatting and the scoped formatter check
+passed, as did `git diff --check`; independent production and test source review found
+no further concrete blocker. Six strict `RCH_REQUIRE_REMOTE=1 rch exec -- ...` attempts
+for both compiler graphs, Clippy, workspace formatting, the search-screen nextest
+selection and full workspace nextest all stopped with exit 127 because `rch` is absent.
+UBS and Beads import were also unavailable. No compilation or runtime test ran. The
+six-hour paired TUI-on/off soak, incumbent comparison and heap attribution required by
+`.44` remain necessary before closing that bead.
+
+#### Sidecarless migration ownership review (`br-hb3mk`, October 27)
+
+The same source review confirms that format detection probes activity/ownership locks
+and returns `()` before the canonical/raw open and format read. Retaining the existing
+CLI mutation locks would exclude cooperating Agent Mail callers, but bare engine opens
+do not consult them. Pinned `fsqlite-vfs 0.4.11` explicitly makes an absent-namespace
+`ReadOnlyUnadmitted` lease hold no locks; `ExistingCompanion` refuses absent authority,
+while `Shared`/`ReservedExclusive` create namespace files. Its generation-transition
+guard requires existing authority and writes a prepare record. The packaged source is
+[namespace.rs at 3bb28e73168991913974c1a7b4bb0414b48765fa](https://github.com/Dicklesworthstone/frankensqlite/blob/3bb28e73168991913974c1a7b4bb0414b48765fa/crates/fsqlite-vfs/src/namespace.rs).
+
+Migration source remains unchanged and the bead remains open. A complete repair needs
+an offline reservation honored by engine admission, or an explicit change to the
+contract permitting coordination artifacts for sidecarless `--check`. A second probe
+or retained CLI-only lock does not prove the required mixed-engine exclusion. No live
+mailbox or migration family was opened during this review.
+
 #### Restored forward-tail catch-up (`br-kp1in.35`, October 27)
 
 Source review at `629d9acfe7458fd281b349a2cbe40a75f0a61cdc` found a remaining
