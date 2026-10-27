@@ -2882,22 +2882,97 @@ Check that all parameters have valid values."
     }
 
     let mut row = if let Some(agent_name) = explicit_name {
-        // Explicit name: documented upsert/idempotent-re-registration
-        // semantics (refresh program/model/task, bump last_active_ts).
-        db_outcome_to_mcp_result(
-            register_agent_db_with_retry(
-                ctx,
+        // Under session-bound identity, "absent" from the preflight cannot
+        // authorize a later upsert: another session may create the same name
+        // between the SELECT and UPDATE. Claim a genuinely fresh row first.
+        // If the unique constraint says another writer won, resolve that row
+        // and authorize it before any profile/token mutation.
+        if crate::session_identity::enabled() && existing_before.is_none() {
+            match mcp_agent_mail_db::queries::create_agent(
+                ctx.cx(),
                 &pool,
                 project_id,
                 &agent_name,
                 &program,
                 &model,
                 task_description.as_deref(),
-                &policy,
-                reaper_exempt,
+                Some(&policy),
             )
-            .await,
-        )?
+            .await
+            {
+                Outcome::Ok(created) if reaper_exempt != Some(true) => created,
+                Outcome::Ok(_) => db_outcome_to_mcp_result(
+                    register_agent_db_with_retry(
+                        ctx,
+                        &pool,
+                        project_id,
+                        &agent_name,
+                        &program,
+                        &model,
+                        task_description.as_deref(),
+                        &policy,
+                        reaper_exempt,
+                    )
+                    .await,
+                )?,
+                Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
+                    let raced = db_outcome_to_mcp_result(
+                        mcp_agent_mail_db::queries::get_agent(
+                            ctx.cx(),
+                            &pool,
+                            project_id,
+                            &agent_name,
+                        )
+                        .await,
+                    )?;
+                    crate::session_identity::authorize_actor(
+                        ctx,
+                        &raced,
+                        false,
+                        "re-register",
+                    )?;
+                    db_outcome_to_mcp_result(
+                        register_agent_db_with_retry(
+                            ctx,
+                            &pool,
+                            project_id,
+                            &agent_name,
+                            &program,
+                            &model,
+                            task_description.as_deref(),
+                            &policy,
+                            reaper_exempt,
+                        )
+                        .await,
+                    )?
+                }
+                Outcome::Err(error) => return Err(db_error_to_mcp_error(error)),
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(panic) => {
+                    return Err(McpError::internal_error(format!(
+                        "Internal panic: {}",
+                        panic.message()
+                    )));
+                }
+            }
+        } else {
+            // Explicit name: documented upsert/idempotent-re-registration
+            // semantics (refresh program/model/task, bump last_active_ts).
+            db_outcome_to_mcp_result(
+                register_agent_db_with_retry(
+                    ctx,
+                    &pool,
+                    project_id,
+                    &agent_name,
+                    &program,
+                    &model,
+                    task_description.as_deref(),
+                    &policy,
+                    reaper_exempt,
+                )
+                .await,
+            )?
+        }
     } else {
         // No name given: draw a FRESH name. A random draw that collides with
         // an already-registered agent must redraw, never merge onto that
