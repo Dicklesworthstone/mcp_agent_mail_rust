@@ -1,5 +1,330 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## October 27, 2026 assessment (source aed1b90b; published v0.3.39)
+
+**Agent Mail is a real, useful coordination product, but it is not finished or fully
+qualified at the current source.** The ordinary coordination loop works. The remaining
+critical work is sustained archive convergence, current-candidate correctness and release
+enforcement, plus concrete crypto and ATC persistence-boundary defects and a retained
+full-snapshot metadata regression requiring current-candidate confirmation. Fresh validation
+also found a CLI test-build failure: the production graph compiles, but the all-target
+graph does not.
+Finishing a large number of beads is not a substitute for those outcomes.
+
+This section supersedes the October 22 judgment. Older observations below remain evidence
+for their named source, executable and workload; they are not current failure counts.
+
+### Scope and evidence identity
+
+- Read all 1,394 lines of repository AGENTS.md, all 2,267 lines of README.md and all
+  663 lines of the suite instructions before substantive assessment. Read both vision
+  copies and the existing bridge. Three read-only investigations covered every current
+  SPEC, the architecture/port/transition plans, the full historical Python structure,
+  the release/rollout contracts, verification ledger, and relevant security/doctor audits.
+  Identical root/planning copies were compared; divergent sections were reviewed. In
+  particular root UPGRADE_LOG.md has 799 lines, versus the planning copy's 114, and contains
+  newer native Windows evidence. Historical Search V3 proposals and TUI parity inventories
+  are explicitly superseded; they do not create missing-feature claims against new code.
+- Source inspected: `aed1b90bc3b2c525ad52e63cefeeb735f2b76fa6`, main. Initially there were
+  no tracked edits, only pre-existing Beads WAL-index and RCH directories. Those were
+  preserved. This assessment changes only this plan and the Beads graph.
+- GitHub's live release API reports **v0.3.39**, published **2026-10-13 22:10:49 UTC**,
+  with six platform archives, their checksum files, a release-smoke evidence archive,
+  SHA256SUMS and its minisign signature. Local installed `am` is **0.3.38**, SHA-256
+  `171713fa43e891f8a3430fc4f0218ff966c78465f53a79eb65253370762dfe3c`.
+  Source, installed and published binaries are separate subjects.
+- Fresh published-artifact verification downloaded v0.3.39's Linux musl archive and
+  verified SHA256SUMS with the installer's pinned minisign key, then the archive digest.
+  Its `am` SHA-256 is `aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805`,
+  matching the retained swarm control. Its server binary reports 0.3.39 and has SHA-256
+  `a9fd508c0d8ab303651d694e7b3c2d032ab3596d7808d8a6d472d089e90cc8d2`.
+- Fresh isolated installed-binary HTTP/CLI probe: **34 checks passed**, including the
+  actual send/read/ack/reply/receipt/search/reservation loop, broadcast refusal, exact-key
+  replay/conflict, qualified cross-project send and reply-back, four HTTP routes and
+  robot/doctor JSON. Twenty-five resource templates were advertised. All seven accepted
+  fixture messages reached the archive; SIGTERM completed with exit 0. This is a small
+  fixture, not swarm, repair, crypto or current-source qualification.
+- The first scratch stdio probe omitted the required `notifications/initialized` and
+  correctly received -32600 on operating requests. A causal handshake check reproduced
+  that refusal and then obtained tools after the notification. Its initial failed
+  receipt is retained as a harness error, not a product regression. A subsequent scratch
+  assertion also incorrectly treated absent optional `isError` as true. The final saved
+  harness fixes those two protocol mistakes and explicitly retains the pre-initialized
+  refusal as a negative control: **46/46 checks pass on each of installed 0.3.38 and
+  signature-verified published 0.3.39**, comprising 37 HTTP/CLI/archive/shutdown and
+  nine stdio checks per binary. JSON, stderr and re-executable `bounded_probe.py` are
+  retained in the scratch root. These are fresh functional results, not a performance
+  A/B, full installer transaction, repair, all-resource behavior or swarm qualification.
+- Fresh official **age v1.2.1** execution rejects the exact `-d -p` combination used by
+  the share implementation, exit 1. This establishes the external-command defect;
+  it is not an executed test of a rebuilt current Rust binary.
+- Current source compilation/testing results are recorded in the terminal validation
+  note below. Strict source-content/clean-overlay attempts initially refused before
+  compilation because RCH treated excluded standalone WASM/fuzz Cargo manifests as
+  selected sibling dependencies. An ordinary strict-remote invocation was then used;
+  no local fallback or deletion of those manifests was permitted.
+- Evidence scratch root: `/tmp/am-reality-20261027T1933Z/`. It retains original failures,
+  runtime JSON/logs, upstream-tool diagnostics, GitHub API snapshots and remote logs.
+  No shared mailbox repair, service replacement, publication, feature-default change,
+  paid provider request, source fix or performance claim is part of this assessment.
+
+### What is working, and where that proof stops
+
+The 12-member architecture is coherent. Native entrypoints feed FastMCP and shared tools;
+FrankenSQLite holds live mailbox rows; storage writes canonical Git artifacts through
+the write-behind and reconciliation machinery. CLI, robot, TUI and authenticated HTML
+consume that state. C SQLite remains in canonical verification/recovery and the isolated
+ATC sidecar; it is not the normal mailbox driver. Asupersync is the async runtime.
+
+All sixteen TUI screens construct real implementations. All nineteen robot commands,
+the mail UI, search, doctor mutations, import, share, installer and update paths have
+substantive code. Placeholder-screen test fixtures, intentional detect-only doctor FMs
+and explicit 501s for deferred live browser parity are not fake shipped functionality.
+Portable lexical search uses the local Tantivy bridge; optional hybrid integrates
+FrankenSearch. Current manifests select registry FastMCP **0.13.0**, contrary to the
+active documentation's older 0.10 Git-pin description.
+
+The strongest tracked operational evidence remains the two October 26 release-smoke
+receipts under `docs/evidence/release_smoke/`:
+
+| Subject | Ordinary flow/storm/crash | Mixed soak | 60-agent swarm | Archive gap after 300 s idle |
+|---|---|---|---|---|
+| main `62740a64`, dynamic ELF `0180807e…`, both orders | PASS | PASS | FAIL | 813 / 853 messages |
+| published v0.3.39, static ELF `aeb222d8…`, both orders | PASS | FAIL: drain windows/verdict | FAIL | 1,900 / 1,600 messages |
+
+The receipts identify host, load, governor and exact binaries. Both arms retain every
+acknowledged message across their deliberate SIGKILL and pass independent stopped-server
+integrity checks. That does **not** establish eventual Git recovery-ledger completeness:
+the same runs miss archive convergence and encounter tool errors. These compare dynamic
+main with static musl release artifacts, so they are operational artifact comparisons,
+not isolated algorithm measurements or a competitive benchmark win.
+
+The newer October 27 `br-bx73n` rs27/sw27 comments report substantial maintenance gains:
+reservation/release p99 around 1.2–1.7 s, 34–39% more acknowledged sends, and advancing
+WBQ windows. `br-9ott5` is legitimately closed on its own named reservation probe.
+However, the full trigger was **not met**: send p99 was 6.18/4.41 s against 3.72/3.56 s
+for v0.3.39, tool errors persisted, and archive convergence passed only one order.
+Those full newer receipts were not yet among the tracked evidence files inspected;
+the comments are recorded experimental evidence, not a new independently rerun verdict.
+Do not repeat October 22's reservation-refusal rate as today's result or reopen its
+closed repair merely because a broader release remains unqualified.
+
+The sw27 attribution records increased closed-loop send waiting after lease waits shrank,
+an engine BusySnapshot after restart, throughput decay and two never-visited crash orphans.
+It is useful direction, not permission to waive the p99 gate or adopt an unqualified engine
+tip. `br-kp1in.46` owns adoption of the engine release containing the relevant upstream
+repairs; `.35` still owns archive completeness. The current reconciler already has real
+tail/history/retry lanes and generation-bound checkpoints; asking to implement those
+again would miss the remaining real-path failure.
+
+### Numbered vision checklist and complete gap coverage
+
+`WORKING` is bounded to the named executed path. `PARTIAL` means implemented with an
+observed remaining defect or incomplete acceptance. `UNPROVEN` means this assessment has
+no decisive current execution, not that code or prior evidence is absent.
+
+| # | Testable goal | Current assessment | Evidence / remaining owner |
+|---|---|---|---|
+| 1 | Discoverable 45 tools / 25 resources | WORKING for installed discovery and sampled handlers; full current conformance UNPROVEN | fresh HTTP probe; conformance modules and current gate |
+| 2 | Send/reply/read/ack and durable receipts | WORKING on fresh isolated small fixtures | final 46-check per-binary probes; broader `.1/.2` |
+| 3 | Broadcast refused | WORKING | fresh negative plus real handler refusal; never enable it |
+| 4 | DB-to-Git convergence without a helpful client | PARTIAL | tracked swarm gaps and newer orphan evidence; `br-8j6cb`, `.35` |
+| 5 | No loss/duplicates/corruption across concurrent failure | PARTIAL | retained acknowledged-ID survival; long-horizon SIGBUS/corruption incidents remain `br-0flbu`, `br-htobc`, `.33`, `.1/.2/.9/.10` |
+| 6 | Stable-authority, recoverable mailbox state | PARTIAL | real owner/promotion/generation machinery; `br-xzgcj`, `br-8asz3`, `br-cdsge`, `br-oyget`, `br-3p187`, `br-cxsgx` |
+| 7 | Bounded engine/pool resources | PARTIAL | short retained descriptor evidence; `.44/.46`, `br-eru3j`, `br-oiok2`; no extrapolated ten-day heap verdict on this host |
+| 8 | Identity/contact/topic/session isolation | WORKING for exercised cross-project path; full opt-in session matrix UNPROVEN | current token-required HTTP lifecycle; `br-sgaee`, current conformance |
+| 9 | Leases, symmetric conflicts, TTL and real Git guard | WORKING for sampled tools; whole scale/guard contract PARTIAL | fresh lease lifecycle; closed `br-9ott5` scoped probe; `.19`, `br-gh368` |
+| 10 | Product bus and advisory build slots | Implemented; not freshly exercised here | gated by WORKTREES_ENABLED/GIT_IDENTITY_ENABLED; `.1/.2` |
+| 11 | Safe bare am launch and explicit setup | Implemented; docs PARTIAL | startup preserves configs; interactive coexistence defaults to ask; `.51` |
+| 12 | Safe client credentials/config authority | PARTIAL | real setup implementation and retained Windows positives; `br-3cqr4`, `br-x2jf5`, `br-yfzgx`, `br-17tyc` |
+| 13 | Responsive sixteen-screen TUI | Implemented; current interaction/soak UNPROVEN | concrete screen constructors; `br-drvoq`, `br-bdo5g`, `br-l4fk6`; source fixes are not new native receipts |
+| 14 | Web inspection and usable private share/export | web sampled WORKING; crypto/full-copy PARTIAL | four fresh routes; **new `.48/.49/.52`**; `.52` starts from retained native evidence |
+| 15 | Fast truthful robot/doctor state | WORKING on fresh small fixture; scale PARTIAL | fresh JSON; `.18/.44`, `br-am-health-endpoint-slow-false-fail-45e0e`, `br-eru3j` |
+| 16 | Reversible, owner-safe doctor repair/undo | Implemented; current mutation qualification UNPROVEN | seven-op chokepoint and real tests; recovery owner probes required |
+| 17 | Scoped lexical and optional hybrid search | lexical sampled WORKING; optional quality UNPROVEN | local Tantivy plus model-bound semantic paths; `.7/.8` |
+| 18 | Useful real optional summaries/TOON | PARTIAL proof | heuristic/provider/encoder paths exist; stub lanes do not establish quality; `.7/.8` |
+| 19 | Quiet, bounded and private ATC learning | PARTIAL | shadow/write-off defaults; real append/resolve; **new `.50`**; `br-au76r`, `br-hwney`, `.2` |
+| 20 | Signed install/update and advertised native artifacts | Implemented; complete current delivery acceptance PARTIAL | public v0.3.39; `br-bx73n`, `br-nq2kb`, `br-54v1u`, `br-quq4r`, `br-p9zor`, `br-s1ejh`, `br-r1say`, `.45` |
+| 21 | Legacy import and deliberate Python/crates.io transition | PARTIAL / decisions tracked | real import; `br-lkhxw`, `br-dbt24`, `br-hb3mk`, `br-ajiq8`, `br-95spu` |
+| 22 | Complete current correctness and installed parity | **FAIL: current CLI test graph does not compile; production graph PASS** | four fresh E0599 errors now `.53`; retained full-copy red `.52`; `br-bx73n`, `.3/.4/.28`, `br-ah0au` |
+| 23 | Current latency/capacity/resource budgets | PARTIAL | retained release-bound failures, dated budgets; `.5/.6`, `br-qbhs0`, `br-v0ucm` |
+| 24 | Accurate active guidance | PARTIAL | **new `.51`**; newer dependency/startup/format/auth contradictions |
+| 25 | Privacy-safe public WASM replay | Implemented; current bundle qualification UNPROVEN | `br-f9avw/.10`, `br-mq9q1`; live browser mirror stays deferred |
+
+The native Windows setup evidence is real: root UPGRADE_LOG records 1,873 native core
+tests on SURFACEBOOKJE. It does not prove Windows installer interruption recovery or
+today's release. Likewise the macOS production st_dev fix is present; `br-ah0au` remains
+open for native test/Clippy proof, not proof that the old source compile bug still exists.
+The web CDN gap has narrowed to the Tailwind exemption under `.43`; the old description
+of fifteen mutable, unhashed scripts is no longer current.
+
+### New uncovered gaps and granular bridge
+
+Before this pass, JSONL had **58 open, 22 in progress, 2 blocked, 2,514 closed and
+208 tombstones**: 82 unfinished. An ordinary import restored the missing local
+materialization row; no recovery files or database were rebuilt/deleted. The graph
+already covered every major feature family, but lacked active ownership of three
+concrete boundary defects, a retained full-snapshot metadata regression, the freshly
+observed CLI test-build failure and current user-facing documentation drift.
+
+The local materialization also retained nine equal-timestamp CLOSED records despite
+committed JSONL's OPEN status. Export exposed that disagreement. Supported `br reopen`
+restored the already-authoritative committed status, with the old closure reasons
+preserved in reconciliation comments. This is no new decision against peer work or
+fresh closure validation. Existing comments were preserved; importer-renumbered comment
+IDs are metadata changes, not added or lost comment text.
+
+| New bead | Priority | Specific implementation and decisive acceptance |
+|---|---|---|
+| `br-kp1in.48` | P1 | Repair real age passphrase exchange. Official age rejects current `-d -p`; stdin-only secret piping is also not its terminal protocol. Prove actual CLI successful/wrong-secret/tampered-file paths, preserve original fixtures and output refusals, and stop arbitrary encrypt errors silently passing the real-dependency lane. |
+| `br-kp1in.49` | P1 | Make crypto/signature publication atomically no-replace under retained parent authority. Absence preflight followed by ordinary rename/write can overwrite a concurrent result or follow a raced signature symlink. Causal raced-destination/parent tests, complete concurrent winner and real crypto positives must pass. This race is source-supported, not a claimed executed exploit. |
+| `br-kp1in.50` | P1 | Enforce bounded ATC content validation at actual append/resolve/context mutations. Runtime bypasses insert_experience validation; even row.validate omits nested outcome.evidence. Real sidecar negatives must leave state/rollups unchanged after reopen. This is a missing fail-closed invariant, not evidence of a live secret leak. |
+| `br-kp1in.51` | P2 | Correct existing launch/format/dependency/search/auth guidance against source/help and locked graph. Preserve historical ambitions, current safety and functionality. This is documentation work, never feature closure. |
+| `br-kp1in.52` | P1 | Reproduce and repair full archive copy losing user_version/application_id. `br-uwvwz` records deterministic native user_version=0 versus expected 231 on earlier main cuts; the current guarded VACUUM INTO copy still lacks metadata preservation. The existing populated schema/unknown-payload test must pass without weakening its 231/4242 assertions; current execution remains separate from that retained failure. |
+| `br-kp1in.53` | P1 | Restore the CLI test build without removing its real pagination test. At robot_commands.rs:29295/29300/29301, SQL `BigInt`/`Text` expressions resolve to the test module's serde_json::Value. The current all-target check emits four E0599 errors. Preserve the real database traversal and invalid-window assertions; run them after correcting the import/qualification. |
+
+Each bead embeds source context, reasoning, implementation scope, realistic positives,
+a negative a naive fix fails, E2E logging, and closure evidence. Implementation and tests
+stay in one logical bead, as the suite's scope-splitting prohibition requires.
+
+**Would finishing all pre-existing open/in-progress beads close the gap? No.** It would
+leave `.48/.49/.50/.52/.53` and the current guidance errors uncovered; literal execution of stale
+release tasks would also keep targeting the wrong publication path. After these additions
+and refinements, the graph covers the known bounded product goals. It cannot promise no
+undiscovered defect or universal zero latency/corruption across all future workloads.
+
+Execute the bridge in this order, with independent repairs proceeding concurrently:
+
+1. **Restore the current test build** (`.53`, S). Correct the SQL/JSON value qualification,
+   retaining the original populated pagination test. Run the all-target, production,
+   Clippy and existing focused/full test gates; a compiler fix alone is not a runtime result.
+2. **Finish accepted-message archive convergence** (`.35`, `br-8j6cb`, M). Prove every
+   accepted message's canonical/content/recipient witnesses after SIGKILL and bounded
+   idle drain, without client reads/resends. Retain useful existing retry/checkpoint
+   code; diagnose the never-visited IDs rather than reimplementing it. Pass the named
+   release-smoke swarm probe; queue progress or equal aggregate counts alone is insufficient.
+3. **Qualify the actual dependency candidate** (`.46`, `br-bx73n`, M–L). Confirm which
+   published engine contains the observed BusySnapshot/hydration repairs, then compare
+   real candidate/control on the same host/invocation. Keep p99, errors, offered/admitted
+   load, completion throughput and resource slopes together. Current ordinary checks,
+   full nextest and mandatory production graph must have terminal receipts at that cut.
+4. **Repair the concrete write/copy boundaries** (`.48/.49/.50/.52`, M each). Use existing crypto,
+   snapshot and DB seams; preserve safe positives, no-clobber, header/schema authority and idempotent state. Direct entrypoint
+   and post-insert-update negatives prevent a preferred wrapper from becoming an illusory
+   invariant. No new framework, runtime, unsafe exception or default ATC promotion.
+5. **Enforce DSR acceptance before publication** (`br-kp1in.22`, `.3/.4/.45`,
+   `br-nq2kb`, `br-bx73n`, existing artifact owners, M). DSR with strict RCH is already
+   the documented policy. Wire the actual publisher to complete candidate-bound gates,
+   installed parity, exact tag/version, platform packages, signatures, container inputs
+   and ACFS installer checksum. An Actions-only static check cannot certify DSR.
+6. **Complete selected surface/quality lanes** (existing owners, S–L). Run real TUI
+   input/resize/traversal/flash/soak, owner-safe doctor undo, legacy import/reopen,
+   optional model/provider quality, and public-replay privacy/WASM gates on their actual
+   selected artifacts. Keep optional unselected features separate from lexical acceptance.
+7. **Correct the active docs** (`.51`, S). Explain explicit setup and interactive attach
+   choice; TOON-at-TTY/JSON-when-piped; FastMCP 0.13; local lexical/optional hybrid; and
+   configured versus absent HTTP authentication. Do not change behavior to fit prose.
+
+### Ambition rounds and Bead regeneration
+
+Applied the frozen Phase 3a generation instruction retained verbatim in the September 4
+workflow below. Regeneration uses `br` exclusively and revises existing owners instead of
+creating another assessment epic.
+
+1. **Make capacity and waiting distinguishable.** Faster leases can move a fixed client
+   population into the send queue. Extend existing `.5/.6` with fixed offered/admitted-load
+   controls and measured queue/service time alongside closed-loop runs. Preserve the
+   original release p99 and errors; a capacity gain cannot erase a failed latency gate.
+   This was incorporated into the existing measurement/test beads, without another bench.
+2. **Put safety at the actual durable boundary.** The crypto and ATC defects share a
+   pattern: a preflight or preferred wrapper cannot constrain a later mutation that bypasses
+   it. New tasks require atomic publication or shared validation at every actual mutation,
+   followed by independently reopened byte/state witnesses. This improves the existing
+   implementation plan without inventing a general privacy or filesystem framework.
+3. **Bind delivery to what will execute.** Keep exact source/lock/features/executable and
+   publisher consumer as one candidate. Update `.22` from an obsolete venue choice to
+   enforcement of accepted DSR policy. Keep historical Windows/retained release evidence
+   useful within scope. A clean short smoke cannot retire the long-running incidents.
+
+The regenerated graph adds `.49 -> .48` for the complete passphrase positive;
+`.2 -> .50` for effect-enabled mixed-workflow certification; and
+`br-bx73n -> .35/.45/.48/.49/.52/.53/br-nq2kb` for supported archive/crypto, strict-build
+and actual publisher acceptance. Arrows mean
+left depends on right. ATC default-off lexical acceptance is not silently forced to
+claim live learning. Historical privacy tasks are related provenance, not reopened.
+`.22` remains policy/retarget work upstream of `br-nq2kb`; requiring it to execute its
+own downstream publication gate would be a semantic cycle. Release acceptance depends
+on the actual enforcement task, so policy-only closure cannot qualify publication.
+
+### Refinement passes and terminal validation
+
+The frozen Phase 5 instruction retained verbatim below was applied to each pass:
+
+1. **Current truth and ownership:** checked all 25 goal rows against source and active
+   JSONL. Retained the closed reservation improvement, corrected stale macOS/Windows/CDN
+   descriptions, and preserved every peer status/assignee. No duplicate implementation
+   owner or replacement feature family was introduced.
+2. **Behavior and decisive dependencies:** new tasks carry real crypto/sidecar positives,
+   causal no-clobber and update-boundary negatives, nonempty test counts and sanitized
+   structured logs. Tests and code are one unit; optional absence cannot masquerade as
+   a required-path pass. `.5/.6` now distinguish load migration from service-time effects.
+3. **Graph and execution order:** added the causal edges above and historical privacy
+   provenance; retained independent authoring of tests and existing owner tasks. `br dep
+   cycles --json` reported zero active cycles after each structural batch.
+4. **Coverage and scope:** the additional security review found conflicting auth-default
+   prose, incorporated in `.51`. Current trusted-local behavior remains unchanged.
+   Full adaptive-state restart replay remains an existing `.2` acceptance question,
+   not a new feature mandated by a checked historical TODO.
+5. **Independent challenge:** found and corrected an advisory-only strict-build link,
+   added the actual publisher prerequisite, and kept `.22` from waiting on its downstream
+   gate. Made the auth discrepancy explicit in `.51`'s standalone description. The
+   retained full-copy header failure had no active owner, so `.52` now owns its existing
+   populated probe, preserving the distinction between old execution and current source.
+   The fresh compiler result supplied `.53`, with the original real tests preserved.
+   No existing test expectation, product behavior or release threshold was relaxed.
+6. **Final convergence check:** readback, dependency/duplicate review and `bv` validation
+   found no further substantive change. Independent read-only review confirmed the
+   coherent `.22 -> publisher -> final acceptance` ordering and no active blocking
+   cycles. No unexecuted runtime claim was promoted by this review.
+
+### Terminal validation and handoff
+
+| Check | Actual terminal result | Meaning |
+|---|---|---|
+| `cargo check --locked --workspace --lib --bins` | **PASS**, strict remote hz4, exit 0, 18m31s | Current default-feature production graph compiles. This does not compile its test targets or qualify a packaged release. |
+| `cargo check --locked --workspace --all-targets` | **FAIL**, strict remote hz4, Cargo exit **101**, four CLI lib-test E0599 errors | SQL bind expressions `Value::BigInt`/`Value::Text` resolve to JSON Value in the existing real pagination fixture; `.53` owns the repair. |
+| `cargo fmt --all --check` | **PASS**, exit 0 | No formatting drift at the assessed source. |
+| Full workspace nextest attempt | **CANCELED**, strict remote vmi1153651, exit **143**, **zero tests executed** | Stopped the owned cold compilation after the independent all-target failure proved the required test graph cannot pass. No selected/full runtime verdict is inferred. |
+| All-target Clippy attempt | **CANCELED BEFORE ADMISSION**, exit **130** | No Clippy execution or green result. The known test-compile blocker must be fixed before the required complete gate. |
+| Installed 0.3.38 bounded real-binary workflow | **46/46 PASS** | 37 HTTP/CLI/archive/shutdown and nine stdio checks on private fixtures. |
+| Signature-verified published 0.3.39 bounded real-binary workflow | **46/46 PASS** | The actual public musl executable, not merely a version-matching local build. |
+| Rust AST and text placeholder scans | no `todo!()` / `unimplemented!()` matches | Inventory evidence only; substantive data-flow review and actual runs establish behavior. |
+| Scoped UBS for changed Markdown/JSONL | **exit 3: nothing scanned** | Unsupported file types; not a scanner pass. No no-scan override or suppression used. |
+| Graph and change review | **zero active cycles**, no duplicate suggestion on new beads, whitespace clean | `br` mutations, `bv --robot-triage`/`--robot-suggest`, semantic JSONL comparison. |
+
+The all-target wrapper initially reported unconfirmed completion while releasing its
+source-authority lock. Exact-job recovery subsequently acknowledged **the underlying
+Cargo exit 101**. Recovery's own exit 0 is successful result retrieval, not a passing
+compiler check. The canceled nextest job was separately recovered with exit 143 and
+terminal acknowledgment. No automatic replay or local fallback was used; no owned
+runtime probe server remains running. Source/lock and critical inspected files matched
+the worker; the local product source stayed at aed1b90b throughout.
+
+The final durable graph has **2,810 records: 64 open, 22 in progress, 2 blocked,
+2,514 closed and 208 tombstones**. That is **88 unfinished**, versus the initial 82,
+because six previously uncovered defects/drift items now have explicit owners. There
+is no implementation-completion claim in that increase. Existing status, assignee and
+priority values match the initial committed JSONL; no original ID or comment text was
+lost. The nine materialization reconciliations preserve earlier closure evidence.
+
+All requested assessment phases are complete: full governing-document reading,
+vision-to-code/runtime map, coverage audit, in-place bridge, initial Beads, three ambition
+rounds, regenerated Beads, five refinement rounds and a final no-change convergence
+check, then `br`/`bv` validation. The next implementation is the small `.53` test-build
+repair, followed by the actual named gates and archive/crypto/ATC/release work above.
+The current project remains unfinished; this assessment does not implement those fixes,
+close their beads, change a gate/default, publish a release or repair the shared mailbox.
+
 ## October 22, 2026 assessment (shipped v0.3.39; origin/main 127defb6)
 
 **For a small or medium team, Agent Mail still does what the README says, and v0.3.39 is
