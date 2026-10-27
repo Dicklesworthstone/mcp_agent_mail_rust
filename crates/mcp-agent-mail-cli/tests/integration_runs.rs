@@ -5881,6 +5881,366 @@ fn reservation_read_snapshot(project: &str, slug: &str, rows: Vec<Value>) -> Val
     })
 }
 
+fn conversation_read_message(id: i64, include_body: bool) -> Value {
+    json!({
+        "id": id, "project_id": 1, "sender_id": 1,
+        "from": "RusticGlen", "from_program": "codex", "from_model": "test-model",
+        "to": ["BlueLake"], "subject": format!("Context message {id}"), "topic": "delivery",
+        "body_md": include_body.then(|| format!("Full conversation body {id}")),
+        "attachments_json": "[]", "thread_id": "TKT-42", "importance": "high",
+        "ack_required": true, "recipient_count": 2,
+        "acked_count": if id == 43 { 2 } else { 1 },
+        "created_ts": 1_704_067_200_000_000_i64 + id * 1_000_000,
+    })
+}
+
+fn conversation_read_snapshot(project: &str, thread: bool, bodies: bool) -> Value {
+    let identity = json!({"id": 1, "slug": "conversation-project", "human_key": project,
+        "created_at": 1_704_067_200_000_000_i64});
+    if thread {
+        json!({
+            "schema_version": 1, "complete": true, "project": identity,
+            "captured_ts": 1_704_067_300_000_000_i64, "thread_id": "TKT-42",
+            "subject": "Context message 41", "since_ts": null, "limit": 2,
+            "include_bodies": bodies, "message_count": 3, "omitted_older": 1,
+            "participants": ["RusticGlen", "BlueLake"],
+            "messages": [conversation_read_message(42, bodies), conversation_read_message(43, bodies)],
+        })
+    } else {
+        json!({
+            "schema_version": 1, "complete": true, "project": identity,
+            "captured_ts": 1_704_067_300_000_000_i64,
+            "message": conversation_read_message(42, true), "thread_id": "TKT-42",
+            "position": 2, "total_in_thread": 3,
+            "previous": {"id": 41, "from": "BlueLake", "subject": "Earlier reply"},
+            "next": {"id": 43, "from": "RusticGlen", "subject": "Later reply"},
+        })
+    }
+}
+
+#[test]
+fn conversation_server_reads_render_complete_context_without_local_database_admission() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "conversation-project", "human_key": expected_project,
+                "created_at": "2024-01-01T00:00:00Z", "agents": []})
+        } else {
+            assert!(
+                uri.contains("project=conversation-project&context=true"),
+                "{uri}"
+            );
+            let thread = uri.starts_with("resource://thread/TKT-42?");
+            if thread {
+                assert!(uri.contains("&limit=2&include_bodies="), "{uri}");
+            } else {
+                assert_eq!(
+                    uri,
+                    "resource://message/42?project=conversation-project&context=true&format=json"
+                );
+            }
+            conversation_read_snapshot(
+                &expected_project,
+                thread,
+                !uri.contains("include_bodies=false"),
+            )
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let unavailable = env.tmp.path().join("unusable-local.sqlite3");
+    std::fs::write(
+        &unavailable,
+        b"This local file must never be opened as a database.\n",
+    )
+    .unwrap();
+    let before = file_snapshot(&unavailable);
+    let vars = reservation_read_env(
+        &env,
+        peer.port,
+        &format!("sqlite:///{}", unavailable.display()),
+    );
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "message",
+            "42",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(result["_meta"]["project"], "conversation-project");
+    let data = &result;
+    assert_eq!(data["id"], 42);
+    assert_eq!(data["position"], 2);
+    assert_eq!(data["total_in_thread"], 3);
+    assert_eq!(data["from_program"], "codex");
+    assert_eq!(data["from_model"], "test-model");
+    assert_eq!(data["body"], "Full conversation body 42");
+    assert_eq!(data["ack_status"], "partial (1/2)");
+    assert_eq!(data["previous"], "#41 BlueLake: Earlier reply");
+    assert_eq!(data["next"], "#43 RusticGlen: Later reply");
+
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "thread",
+            "TKT-42",
+            "--limit",
+            "2",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let data = &result;
+    assert_eq!(data["message_count"], 3);
+    assert_eq!(data["omitted_older"], 1);
+    assert_eq!(data["messages"][0]["position"], 2);
+    assert_eq!(data["messages"][1]["position"], 3);
+    assert_eq!(data["messages"][0]["body"], "Full conversation body 42");
+    assert_eq!(data["messages"][1]["ack"], "done");
+
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "thread",
+            "TKT-42",
+            "--limit",
+            "2",
+            "--project",
+            &project,
+            "--format",
+            "toon",
+            "--server",
+        ],
+    );
+    let text = reservation_read_success(&out);
+    assert!(text.contains("Context message 42"));
+    assert!(!text.contains("Full conversation body"));
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 9);
+    assert_eq!(file_snapshot(&unavailable), before);
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
+}
+
+#[test]
+fn conversation_server_reads_fail_closed_on_incomplete_or_changed_context() {
+    for (thread, failure) in [
+        (false, "legacy-response"),
+        (true, "legacy-response"),
+        (false, "incomplete"),
+        (true, "incomplete"),
+        (false, "foreign-project"),
+        (true, "wrong-window"),
+        (false, "missing-neighbor"),
+        (false, "wrong-message"),
+        (true, "wrong-thread"),
+        (false, "changed-project"),
+        (true, "changed-project"),
+        (false, "wrong-uri"),
+        (true, "wrong-id"),
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let mut project_reads = 0;
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                project_reads += 1;
+                return reservation_read_resource_reply(
+                    request,
+                    json!({
+                        "id": 1, "slug": "conversation-project", "human_key": expected_project,
+                        "created_at": if failure == "changed-project" && project_reads > 1 {
+                            "2025-01-01T00:00:00Z"
+                        } else { "2024-01-01T00:00:00Z" }, "agents": [],
+                    }),
+                );
+            }
+            let mut snapshot = conversation_read_snapshot(&expected_project, thread, true);
+            match failure {
+                "legacy-response" => {
+                    snapshot = json!({"id": 42, "body_md": "partial legacy resource"})
+                }
+                "incomplete" => snapshot["complete"] = json!(false),
+                "foreign-project" => snapshot["message"]["project_id"] = json!(2),
+                "wrong-window" => {
+                    snapshot["messages"].as_array_mut().unwrap().pop();
+                }
+                "missing-neighbor" => snapshot["previous"] = Value::Null,
+                "wrong-message" => snapshot["message"]["id"] = json!(43),
+                "wrong-thread" => snapshot["thread_id"] = json!("other-thread"),
+                _ => {}
+            }
+            let mut reply = reservation_read_resource_reply(request, snapshot);
+            match failure {
+                "wrong-uri" => {
+                    reply["result"]["contents"][0]["uri"] = json!("resource://message/43")
+                }
+                "wrong-id" => reply["id"] = json!("unrelated-request"),
+                _ => {}
+            }
+            reply
+        });
+        let mut args = vec![
+            "robot",
+            if thread { "thread" } else { "message" },
+            if thread { "TKT-42" } else { "42" },
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ];
+        if thread {
+            args.extend(["--limit", "2"]);
+        }
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &args,
+        );
+        eprintln!("conversation context failure scenario: thread={thread}, {failure}");
+        reservation_read_failed_closed(&out);
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            if failure == "changed-project" { 3 } else { 2 },
+            "must reach the intended context validation boundary: {failure}"
+        );
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
+fn conversation_server_reads_use_real_resources_for_receipts_and_numeric_threads() {
+    let (env, project, slug) = reservation_read_fixture();
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    for id in 41..=43 {
+        insert_message(
+            &conn,
+            id,
+            1,
+            1,
+            &format!("Real conversation {id}"),
+            &format!("Real body {id}"),
+        );
+        conn.execute_sync(
+            "UPDATE messages SET ack_required=1, created_ts=?, thread_id=? WHERE id=?",
+            &[
+                SqlValue::BigInt(1_704_067_200_000_000 + id * 1_000_000),
+                if id == 41 {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Text("41".into())
+                },
+                SqlValue::BigInt(id),
+            ],
+        )
+        .unwrap();
+        insert_recipient(&conn, id, 1);
+        insert_recipient(&conn, id, 2);
+    }
+    conn.execute_raw(
+        "UPDATE message_recipients SET ack_ts=1704067300000000 \
+         WHERE (message_id=42 AND agent_id=2) OR message_id=43;",
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+    let port = unused_loopback_port();
+    let server = reservation_read_start_server(&env, port);
+    let unavailable = env.tmp.path().join("conversation-client-unusable.sqlite3");
+    std::fs::write(
+        &unavailable,
+        b"The client must use MCP, not this local file.\n",
+    )
+    .unwrap();
+    let before = file_snapshot(&unavailable);
+    let client_archive = env.tmp.path().join("conversation-client-archive");
+    std::fs::create_dir_all(&client_archive).unwrap();
+    let mut vars =
+        reservation_read_env(&env, port, &format!("sqlite:///{}", unavailable.display()));
+    vars.push(("STORAGE_ROOT".into(), client_archive.display().to_string()));
+
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "message",
+            "42",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(result["_meta"]["project"], slug);
+    let data = &result;
+    assert_eq!(data["thread"], "41");
+    assert_eq!(data["position"], 2);
+    assert_eq!(data["total_in_thread"], 3);
+    assert_eq!(data["body"], "Real body 42");
+    assert_eq!(data["ack_status"], "partial (1/2)");
+    assert_eq!(data["previous"], "#41 RusticGlen: Real conversation 41");
+    assert_eq!(data["next"], "#43 RusticGlen: Real conversation 43");
+    assert_eq!(data["from_program"], "test");
+
+    for prefix in [vec!["robot", "thread"], vec!["thread"]] {
+        let mut args = prefix;
+        args.extend([
+            "41",
+            "--limit",
+            "2",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ]);
+        let out = run_am_hermetic(&vars, Some(env.hostile_repo()), &args);
+        let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+        let data = &result;
+        assert_eq!(data["thread_id"], "41");
+        assert_eq!(data["subject"], "Real conversation 41");
+        assert_eq!(data["message_count"], 3);
+        assert_eq!(data["omitted_older"], 1);
+        assert_eq!(data["messages"][0]["position"], 2);
+        assert_eq!(data["messages"][0]["ack"], "partial (1/2)");
+        assert_eq!(data["messages"][0]["body"], "Real body 42");
+        assert_eq!(data["messages"][1]["position"], 3);
+        assert_eq!(data["messages"][1]["ack"], "done");
+    }
+    drop(server);
+    assert_eq!(file_snapshot(&unavailable), before);
+    assert!(snapshot_tree(&client_archive).is_empty());
+}
+
 #[test]
 fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
     for failure in [

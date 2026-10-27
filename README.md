@@ -890,9 +890,9 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
 | `am robot timeline` | Project event stream (last 24h unless `--since`) | `--since`, `--kind`, `--source` |
 | `am robot overview` | Cross-project summary | `--format`, `--counts` |
-| `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
-| `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
-| `am robot message <id>` | Single-message deep view | `--format`, `--project` |
+| `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format`, `--server` |
+| `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--limit`, `--cursor`, `--format` |
+| `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--server` |
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness; JSON entries carry absolute `granted_ts`/`expires_ts` (RFC 3339 UTC) and integer `remaining_seconds`/`granted_age_seconds` next to the humanized `remaining` | `--all`, `--conflicts`, `--expiring`, `--agent` |
 | `am robot metrics` | Tool call rates, failures, latency percentiles (server-wide) | `--format` |
@@ -911,6 +911,24 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 - **`toon`** (default at TTY): Token-efficient, compact, optimized for agent parsing
 - **`json`** (default when piped): Machine-readable envelope with `_meta`, `_alerts`, `_actions`
 - **`md`** (thread/message-focused): Human-readable narrative for deep context
+
+### Search Pages
+
+`am robot search` accepts `--limit` from 1 through 1000 (default 20) and
+`--cursor` to continue from the response's `next_cursor`:
+
+```bash
+am robot search 'migration' --project /abs/path --limit 50 --format json
+am robot search 'migration' --project /abs/path --limit 50 --cursor '<next_cursor>' --format json
+```
+
+Keep the query, project, and filters the same when resuming. Stop when
+`next_cursor` is absent. Both the existing live-server route and the local
+snapshot route carry the requested page size and cursor. Recipient-kind
+filtering (`--kind to`, `cc`, or `bcc`) resumes after the last displayed match,
+including when more matches remain inside a fetched backend page. Invalid
+limits and malformed cursors fail before opening a mailbox. Search pages
+reflect the current index; they do not freeze a changing corpus across calls.
 
 `am robot overview` summarizes the whole mailbox; the global `--project` and
 `--agent` flags do not scope this command. Message counts use one grouped query,
@@ -992,6 +1010,37 @@ inspection does. `AGENT_MAIL_GUARD_MODE=warn` turns that into a warning.
 | Tool implementations | `crates/mcp-agent-mail-tools/src/**` |
 | TUI | `crates/mcp-agent-mail-server/src/tui_*.rs` |
 | CLI/launcher | `crates/mcp-agent-mail-cli/src/**` |
+
+### Message and Thread Context Through the Server
+
+Use `--server` when the running daemon can answer but a new local database
+connection cannot be admitted:
+
+```bash
+am robot message 1234 --project /abs/path --server --format json
+am robot thread 1234 --project /abs/path --server --limit 200 --format md
+am thread TKT-123 --project /abs/path --server --since 2026-01-01T00:00:00Z
+```
+
+These commands preserve the normal message/thread output, including sender
+program/model, acknowledgement counts, message neighbours, whole-thread
+participants, and the newest `--limit` messages in chronological order with
+their full-thread positions. `--since` filters the count and displayed window;
+the subject and participants still describe the whole conversation. They pin
+the configured endpoint and bearer token, verify stored project identity, and
+never open a local mailbox or fall back to an archive. Older servers without
+complete context support are rejected explicitly. As with other MCP resources,
+BCC identities are redacted and excluded from the participant list.
+
+MCP clients can request these envelopes using
+`resource://message/<id>?project=<slug>&context=true&format=json` or
+`resource://thread/<id>?project=<slug>&context=true&limit=200&include_bodies=true&format=json`.
+Thread context accepts `since_ts` as an ISO-8601 timestamp. The versioned
+envelope includes stored project identity, a capture time and `complete=true`.
+All context fields come from one read snapshot. The server refuses conversations
+with more than 10,000 messages or receipt rows, more than 1,000 displayed
+messages, or more than 4 MiB of context; it never silently truncates those
+bounds. Resources without `context=true` keep their existing response formats.
 
 ### Complete Reservation Reads Through the Server
 

@@ -3055,6 +3055,9 @@ pub enum RobotSubcommand {
         /// Show messages after this timestamp.
         #[arg(long)]
         since: Option<String>,
+        /// Read through the configured MCP server without local database access.
+        #[arg(long)]
+        server: bool,
     },
 
     /// Full-text search with facets and relevance scores.
@@ -3070,12 +3073,21 @@ pub enum RobotSubcommand {
         /// Limit results to messages after this timestamp.
         #[arg(long)]
         since: Option<String>,
+        /// Maximum matches to return, from 1 through 1000.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Continue from next_cursor using the same query and filters.
+        #[arg(long)]
+        cursor: Option<String>,
     },
 
     /// Single message with thread position, adjacent messages, sender info.
     Message {
         /// Message ID.
         id: i64,
+        /// Read through the configured MCP server without local database access.
+        #[arg(long)]
+        server: bool,
     },
 
     /// Resolve any resource:// URI and return in robot format.
@@ -7523,6 +7535,117 @@ fn build_thread(
 
 // ── Message command implementation ──────────────────────────────────────────
 
+fn server_context_ack(
+    message: &mcp_agent_mail_db::message_context::ContextMessage,
+    pending: &str,
+) -> String {
+    if !message.ack_required {
+        "none".into()
+    } else if message.recipient_count > 0 && message.acked_count == message.recipient_count {
+        "done".into()
+    } else if message.acked_count > 0 {
+        format!(
+            "partial ({}/{})",
+            message.acked_count, message.recipient_count
+        )
+    } else {
+        pending.into()
+    }
+}
+
+fn build_thread_from_server(
+    snapshot: mcp_agent_mail_db::message_context::ThreadContextSnapshot,
+) -> ThreadData {
+    let last_ts = snapshot
+        .messages
+        .iter()
+        .map(|message| message.created_ts)
+        .max()
+        .unwrap_or(0);
+    let messages = snapshot
+        .messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let ack = server_context_ack(&message, "required");
+            ThreadMessage {
+                position: snapshot.omitted_older + index + 1,
+                from: message.from,
+                to: message.to.join(", "),
+                age: format_age(age_seconds_from_micros(
+                    snapshot.captured_ts,
+                    message.created_ts,
+                )),
+                importance: message.importance,
+                ack,
+                subject: message.subject,
+                topic: message.topic,
+                body: message.body_md,
+            }
+        })
+        .collect();
+    ThreadData {
+        thread_id: snapshot.thread_id,
+        subject: snapshot.subject,
+        message_count: snapshot.message_count,
+        omitted_older: (snapshot.omitted_older > 0).then_some(snapshot.omitted_older),
+        participants: snapshot.participants,
+        last_activity: if last_ts > 0 {
+            format_age(age_seconds_from_micros(snapshot.captured_ts, last_ts))
+        } else {
+            "unknown".into()
+        },
+        messages,
+    }
+}
+
+fn build_message_from_server(
+    snapshot: mcp_agent_mail_db::message_context::MessageContextSnapshot,
+) -> MessageContext {
+    let message = snapshot.message;
+    let ack_status = server_context_ack(&message, "pending");
+    let adjacent = |value: mcp_agent_mail_db::message_context::AdjacentMessage| {
+        format!(
+            "#{} {}: {}",
+            value.id,
+            value.from,
+            truncate_str(&value.subject, 60)
+        )
+    };
+    let attachments = parse_attachments_json(&message.attachments_json)
+        .into_iter()
+        .map(|attachment| AttachmentInfo {
+            name: attachment.name,
+            size: attachment.size_text,
+            mime_type: attachment.mime_type,
+        })
+        .collect();
+    MessageContext {
+        id: message.id,
+        from: message.from,
+        from_program: message.from_program.filter(|value| !value.is_empty()),
+        from_model: message.from_model.filter(|value| !value.is_empty()),
+        to: message.to,
+        subject: message.subject,
+        topic: message.topic,
+        // The resource validator requires a body before rendering is possible.
+        body: message.body_md.unwrap_or_default(),
+        thread: snapshot.thread_id,
+        position: snapshot.position,
+        total_in_thread: snapshot.total_in_thread,
+        importance: message.importance,
+        ack_status,
+        created: mcp_agent_mail_db::micros_to_iso(message.created_ts),
+        age: format_age(age_seconds_from_micros(
+            snapshot.captured_ts,
+            message.created_ts,
+        )),
+        previous: snapshot.previous.map(adjacent),
+        next: snapshot.next.map(adjacent),
+        attachments,
+    }
+}
+
 fn append_thread_membership_condition(
     alias: &str,
     thread_ref: &str,
@@ -7922,6 +8045,23 @@ fn search_hit_age(now_us: i64, created_ts: i64) -> String {
     })
 }
 
+fn validate_robot_search_window(limit: usize, cursor: Option<&str>) -> Result<(), CliError> {
+    if !(1..=1000).contains(&limit) {
+        return Err(CliError::InvalidArgument(
+            "search --limit must be between 1 and 1000".to_string(),
+        ));
+    }
+    if let Some(cursor) = cursor
+        && (cursor.len() > 128
+            || mcp_agent_mail_db::search_planner::SearchCursor::decode(cursor).is_none())
+    {
+        return Err(CliError::InvalidArgument(
+            "invalid search cursor; use next_cursor from the same query and filters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Robot search through the running server (br-kp1in.18); `Ok(None)` sends
 /// the caller to the private-snapshot path.
 fn search_via_server(
@@ -7930,14 +8070,20 @@ fn search_via_server(
     query: &str,
     importance: Option<&str>,
     since: Option<&str>,
+    limit: usize,
+    cursor: Option<&str>,
 ) -> Result<Option<SearchData>, CliError> {
+    validate_robot_search_window(limit, cursor)?;
     let mut arguments = serde_json::json!({
         "project_key": project_key,
         "query": query,
-        "limit": 20,
+        "limit": limit,
         "explain": true,
         "include_body_md": true,
     });
+    if let Some(cursor) = cursor {
+        arguments["cursor"] = cursor.into();
+    }
     if let Some(importance) = importance.map(str::trim).filter(|value| !value.is_empty()) {
         arguments["importance"] = importance.into();
     }
@@ -8049,7 +8195,9 @@ fn build_search(
     importance_filter: Option<&str>,
     since: Option<&str>,
     limit: usize,
+    cursor: Option<&str>,
 ) -> Result<SearchData, CliError> {
+    validate_robot_search_window(limit, cursor)?;
     let raw_query = query.trim();
     if raw_query.is_empty() {
         return Ok(SearchData {
@@ -8081,6 +8229,7 @@ fn build_search(
     let mut search_query =
         mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
     search_query.explain = true;
+    search_query.cursor = cursor.map(str::to_string);
 
     // A comma-separated list, as the server-routed search accepts.
     if let Some(list) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
@@ -8246,13 +8395,37 @@ where
         }
 
         if out.len() >= requested_limit {
+            // A recipient filter can fill the visible page before the backend
+            // page ends. Its backend cursor would skip matching rows we have
+            // not returned. Resume at the last visible match instead.
+            let visible_cursor = omitted_matching_row_in_page
+                .then(|| out.last())
+                .flatten()
+                .and_then(|row| {
+                    // Robot search uses relevance ranking. Other rankings
+                    // require their own timestamp boundary, so refuse to
+                    // invent a continuation if this helper is reused there.
+                    if paged_query.ranking
+                        != mcp_agent_mail_db::search_planner::RankingMode::Relevance
+                    {
+                        return None;
+                    }
+                    // The SQL fallback has no relevance score. Its search
+                    // service uses zero as the cursor key, with id as the tie
+                    // breaker, so preserve that same continuation contract.
+                    let score = row.score.unwrap_or(0.0);
+                    score.is_finite().then(|| {
+                        mcp_agent_mail_db::search_planner::SearchCursor { score, id: row.id }
+                            .encode()
+                    })
+                });
             return Ok(CollectedSearchRows {
                 rows: out,
                 explain,
                 assistance,
                 guidance,
                 next_cursor: if omitted_matching_row_in_page {
-                    None
+                    visible_cursor
                 } else {
                     next_cursor
                 },
@@ -16208,28 +16381,57 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 )?
             }
         }
-        RobotSubcommand::Thread { id, limit, since } => {
-            let scope = resolve_robot_project_scope(args.project.as_deref())?;
-
+        RobotSubcommand::Thread {
+            id,
+            limit,
+            since,
+            server,
+        } => {
             // For thread command, bodies included in md/json, excluded in toon
             let include_bodies = format != OutputFormat::Toon;
-            let data = build_thread(
-                scope.conn(),
-                scope.project_id,
-                &id,
-                limit,
-                since.as_deref(),
-                include_bodies,
-            )?;
+            let (project_slug, data) = if server {
+                let config = mcp_agent_mail_core::Config::from_env();
+                let project_key = robot_server_project_key(args.project.as_deref())?;
+                let cutoff = since.as_deref().map(parse_since_micros).transpose()?;
+                let (project, snapshot) = crate::message_read::read_thread(
+                    &config,
+                    &project_key,
+                    &id,
+                    limit.unwrap_or(200),
+                    cutoff,
+                    include_bodies,
+                )?;
+                (project.slug, build_thread_from_server(snapshot))
+            } else {
+                let scope = resolve_robot_project_scope(args.project.as_deref())?;
+                let data = build_thread(
+                    scope.conn(),
+                    scope.project_id,
+                    &id,
+                    limit,
+                    since.as_deref(),
+                    include_bodies,
+                )?;
+                (scope.project_slug, data)
+            };
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(scope.project_slug);
+            env._meta.project = Some(project_slug);
             format_output_md(&env, format)?
         }
-        RobotSubcommand::Message { id } => {
-            let scope = resolve_robot_project_scope(args.project.as_deref())?;
-            let data = build_message(scope.conn(), scope.project_id, id)?;
+        RobotSubcommand::Message { id, server } => {
+            let (project_slug, data) = if server {
+                let config = mcp_agent_mail_core::Config::from_env();
+                let project_key = robot_server_project_key(args.project.as_deref())?;
+                let (project, snapshot) =
+                    crate::message_read::read_message(&config, &project_key, id)?;
+                (project.slug, build_message_from_server(snapshot))
+            } else {
+                let scope = resolve_robot_project_scope(args.project.as_deref())?;
+                let data = build_message(scope.conn(), scope.project_id, id)?;
+                (scope.project_slug, data)
+            };
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(scope.project_slug);
+            env._meta.project = Some(project_slug);
             format_output_md(&env, format)?
         }
         RobotSubcommand::Search {
@@ -16237,7 +16439,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             kind,
             importance,
             since,
+            limit,
+            cursor,
         } => 'search: {
+            validate_robot_search_window(limit, cursor.as_deref())?;
             let config = mcp_agent_mail_core::Config::from_env();
             // br-kp1in.18: a running server answers from its live pool and
             // index in milliseconds; the private snapshot below costs seconds
@@ -16252,6 +16457,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     &query,
                     importance.as_deref(),
                     since.as_deref(),
+                    limit,
+                    cursor.as_deref(),
                 )?
             {
                 let mut env = RobotEnvelope::new(cmd_name, format, data);
@@ -16310,7 +16517,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 kind.as_deref(),
                 importance.as_deref(),
                 since.as_deref(),
-                20,
+                limit,
+                cursor.as_deref(),
             )?;
             let search_index = data.search_index.clone();
             let mut env = RobotEnvelope::new(cmd_name, format, data);
@@ -20525,7 +20733,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_search_rows_with_runner_suppresses_cursor_when_filter_overflows_page() {
+    fn collect_search_rows_with_runner_resumes_at_last_visible_filtered_match() {
         use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -20555,41 +20763,60 @@ mod tests {
         )
         .expect("insert recipients");
 
-        let mut query = SearchQuery::messages("needle", 1);
-        query.limit = Some(search_page_limit(2, Some("to")));
+        for scored in [true, false] {
+            for more_backend_pages in [true, false] {
+                let mut query = SearchQuery::messages("needle", 1);
+                query.limit = Some(search_page_limit(2, Some("to")));
+                let mut call_count = 0usize;
+                let rows = collect_search_rows_with_runner(&conn, query, Some("to"), 2, |query| {
+                    call_count += 1;
+                    assert!(
+                        query.cursor.is_none(),
+                        "collector should not fetch past the page that already filled the visible limit"
+                    );
+                    let mut results = vec![
+                        planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
+                        planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
+                        planner_search_result_row(30, "third", 0.7, 300, "th-3", "Gamma"),
+                        planner_search_result_row(40, "fourth", 0.6, 400, "th-4", "Delta"),
+                    ];
+                    if !scored {
+                        for row in &mut results {
+                            row.score = None;
+                        }
+                    }
+                    Ok(SearchResponse {
+                        results,
+                        next_cursor: more_backend_pages.then(|| "cursor-after-page".into()),
+                        explain: None,
+                        assistance: None,
+                        guidance: None,
+                        audit: vec![],
+                    })
+                })
+                .expect("collect kind-filtered rows");
 
-        let mut call_count = 0usize;
-        let rows = collect_search_rows_with_runner(&conn, query, Some("to"), 2, |query| {
-            call_count += 1;
-            assert!(
-                query.cursor.is_none(),
-                "collector should not fetch past the page that already filled the visible limit"
-            );
-            Ok(SearchResponse {
-                results: vec![
-                    planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
-                    planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
-                    planner_search_result_row(30, "third", 0.7, 300, "th-3", "Gamma"),
-                    planner_search_result_row(40, "fourth", 0.6, 400, "th-4", "Delta"),
-                ],
-                next_cursor: Some("cursor-after-page".into()),
-                explain: None,
-                assistance: None,
-                guidance: None,
-                audit: vec![],
-            })
-        })
-        .expect("collect kind-filtered rows");
-
-        assert_eq!(call_count, 1);
-        assert_eq!(
-            rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            vec![20, 30]
-        );
-        assert!(
-            rows.next_cursor.is_none(),
-            "cursor would skip the unreturned matching row from the current fetched page"
-        );
+                assert_eq!(call_count, 1);
+                assert_eq!(
+                    rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    vec![20, 30]
+                );
+                let cursor = mcp_agent_mail_db::search_planner::SearchCursor::decode(
+                    rows.next_cursor
+                        .as_deref()
+                        .expect("unreturned matching row has a continuation"),
+                )
+                .expect("native search cursor");
+                assert_eq!(
+                    cursor.id, 30,
+                    "the backend page boundary would skip message 40"
+                );
+                assert_eq!(
+                    cursor.score.to_bits(),
+                    if scored { 0.7_f64 } else { 0.0_f64 }.to_bits()
+                );
+            }
+        }
     }
 
     /// GH#291: proven never-written orphan pages are named on a passing
@@ -28084,6 +28311,8 @@ mod tests {
                     kind: None,
                     importance: None,
                     since: None,
+                    limit: 20,
+                    cursor: None,
                 },
             },
             &db_url,
@@ -29033,6 +29262,112 @@ mod tests {
     }
 
     #[test]
+    fn robot_search_rejects_invalid_windows_before_opening_a_mailbox() {
+        use mcp_agent_mail_db::search_planner::SearchCursor;
+        for limit in [0, 1001, usize::MAX] {
+            assert!(validate_robot_search_window(limit, None).is_err());
+        }
+        for cursor in [
+            "",
+            "not-a-cursor",
+            "s7ff0000000000000:i1",
+            "s7ff8000000000000:i1",
+        ] {
+            assert!(validate_robot_search_window(20, Some(cursor)).is_err());
+        }
+        for limit in [1, 20, 1000] {
+            let cursor = SearchCursor {
+                score: 0.25,
+                id: 42,
+            }
+            .encode();
+            assert!(validate_robot_search_window(limit, Some(&cursor)).is_ok());
+        }
+    }
+
+    #[test]
+    fn robot_search_cursor_traverses_real_results_without_skipping_filtered_matches() {
+        let (temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw("BEGIN IMMEDIATE").expect("begin corpus");
+        for id in 1_i64..=13 {
+            conn.execute_sync(
+                "INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts) VALUES (?,1,1,'pagewalk','pagewalk',?)",
+                &[Value::BigInt(id), Value::BigInt(id * 1_000_000)],
+            ).expect("insert search corpus");
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,2,?)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(if id % 3 == 0 { "cc" } else { "to" }.to_string()),
+                ],
+            )
+            .expect("insert recipient");
+        }
+        conn.execute_raw("COMMIT").expect("commit corpus");
+        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!(
+                "sqlite:///{}",
+                temp_dir
+                    .path()
+                    .join("robot_thread_message_test.sqlite3")
+                    .display()
+            ),
+            storage_root: Some(temp_dir.path().join("archive")),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..mcp_agent_mail_db::DbPoolConfig::default()
+        })
+        .expect("create real search pool");
+        for kind in [None, Some("to"), Some("cc")] {
+            let mut cursor = None;
+            let mut ids = HashSet::new();
+            let mut cursors = HashSet::new();
+            loop {
+                let page = build_search(
+                    &conn,
+                    &pool,
+                    1,
+                    "pagewalk",
+                    kind,
+                    None,
+                    None,
+                    2,
+                    cursor.as_deref(),
+                )
+                .expect("search page");
+                assert!(page.results.len() <= 2);
+                for row in page.results {
+                    assert!(
+                        ids.insert(row.id),
+                        "a continuation replayed message {}",
+                        row.id
+                    );
+                }
+                let Some(next) = page.next_cursor else { break };
+                assert!(
+                    cursors.insert(next.clone()),
+                    "search cursor did not advance"
+                );
+                assert!(cursors.len() <= 13, "search failed to terminate");
+                cursor = Some(next);
+            }
+            let expected: HashSet<_> = (1_i64..=13)
+                .filter(|id| match kind {
+                    Some("to") => id % 3 != 0,
+                    Some("cc") => id % 3 == 0,
+                    _ => true,
+                })
+                .collect();
+            assert_eq!(
+                ids, expected,
+                "every matching message must be reachable for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_build_search_invalid_importance_errors() {
         let (temp_dir, conn) = setup_robot_thread_message_test_db();
         let db_path = temp_dir.path().join("robot_thread_message_test.sqlite3");
@@ -29054,6 +29389,7 @@ mod tests {
             Some("totally-invalid"),
             None,
             20,
+            None,
         )
         .expect_err("invalid importance should error");
 
@@ -29071,10 +29407,21 @@ mod tests {
             Some("high, urgent"),
             None,
             20,
+            None,
         )
         .expect("an importance list searches");
-        let err = build_search(&conn, &pool, 1, "auth", None, Some("high,bogus"), None, 20)
-            .expect_err("one bad entry fails the list");
+        let err = build_search(
+            &conn,
+            &pool,
+            1,
+            "auth",
+            None,
+            Some("high,bogus"),
+            None,
+            20,
+            None,
+        )
+        .expect_err("one bad entry fails the list");
         assert!(matches!(err, CliError::InvalidArgument(msg) if msg.ends_with(": bogus")));
     }
 
@@ -29726,6 +30073,75 @@ mod tests {
         assert_eq!(reply.position, 2);
         assert_eq!(reply.total_in_thread, 2);
         assert_eq!(reply.previous.as_deref(), Some("#300 Alice: Root"));
+    }
+
+    #[test]
+    fn server_message_and_thread_renderers_match_native_context() {
+        use mcp_agent_mail_db::message_context::{
+            message_context_from_conn, thread_context_from_conn,
+        };
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages (id,project_id,sender_id,subject,topic,thread_id,importance,ack_required,created_ts,body_md,attachments) VALUES
+             (300,1,1,'Root','topic',NULL,'normal',0,1000,'Root body','[]'),
+             (301,1,2,'Reply','topic','300','high',1,2000,'Reply body','[{\"name\":\"notes.txt\",\"content_type\":\"text/plain\",\"size\":\"98\"}]'),
+             (302,1,1,'Last',NULL,'300','urgent',1,2000,'Last body','[]')", &[],
+        ).unwrap();
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id,agent_id,kind,read_ts,ack_ts) VALUES
+             (300,2,'to',NULL,NULL),(301,1,'to',NULL,2500),(301,3,'cc',NULL,NULL),(302,2,'to',NULL,2500)", &[],
+        ).unwrap();
+        let project = mcp_agent_mail_db::models::ProjectRow {
+            id: Some(1),
+            slug: "proj".into(),
+            human_key: "/tmp/proj".into(),
+            created_at: 0,
+        };
+        for id in [300, 301, 302] {
+            let snapshot =
+                message_context_from_conn(&conn, &project, id, mcp_agent_mail_db::now_micros())
+                    .unwrap();
+            let mut remote = serde_json::to_value(build_message_from_server(snapshot)).unwrap();
+            let mut local = serde_json::to_value(build_message(&conn, 1, id).unwrap()).unwrap();
+            // Native and server reads can straddle an age-display boundary.
+            remote["age"] = serde_json::Value::Null;
+            local["age"] = serde_json::Value::Null;
+            assert_eq!(remote, local, "message {id}");
+        }
+        for bodies in [false, true] {
+            for limit in [0, 2, 200] {
+                for since in [None, Some(1000)] {
+                    let snapshot = thread_context_from_conn(
+                        &conn,
+                        &project,
+                        "300",
+                        limit,
+                        since,
+                        bodies,
+                        mcp_agent_mail_db::now_micros(),
+                    )
+                    .unwrap();
+                    let mut remote =
+                        serde_json::to_value(build_thread_from_server(snapshot)).unwrap();
+                    let since_iso = since.map(mcp_agent_mail_db::micros_to_iso);
+                    let mut local = serde_json::to_value(
+                        build_thread(&conn, 1, "300", Some(limit), since_iso.as_deref(), bodies)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    for value in [&mut remote, &mut local] {
+                        value["last_activity"] = serde_json::Value::Null;
+                        for message in value["messages"].as_array_mut().unwrap() {
+                            message["age"] = serde_json::Value::Null;
+                        }
+                    }
+                    assert_eq!(
+                        remote, local,
+                        "bodies={bodies} limit={limit} since={since:?}"
+                    );
+                }
+            }
+        }
     }
 
     // ── is_prose_command ────────────────────────────────────────────────

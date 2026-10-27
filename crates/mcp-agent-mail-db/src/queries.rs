@@ -16375,6 +16375,62 @@ pub async fn list_file_reservations(
     .await
 }
 
+/// Complete single-message context from the server resource read pool.
+pub async fn message_context_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    id: i64,
+) -> Outcome<crate::message_context::MessageContextSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "message_context_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match crate::message_context::message_context_from_conn(&**conn, project, id, now_micros())
+        {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
+/// Complete conversation context from the server resource read pool.
+pub async fn thread_context_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    thread: &str,
+    limit: usize,
+    since: Option<i64>,
+    include_bodies: bool,
+) -> Outcome<crate::message_context::ThreadContextSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "thread_context_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match crate::message_context::thread_context_from_conn(
+            &**conn,
+            project,
+            thread,
+            limit,
+            since,
+            include_bodies,
+            now_micros(),
+        ) {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
 /// Maximum rows (and holder identities) in one complete reservation snapshot.
 pub const FILE_RESERVATION_SNAPSHOT_MAX_ROWS: usize = 10_000;
 /// Maximum raw string bytes and serialized JSON bytes for the snapshot resource.

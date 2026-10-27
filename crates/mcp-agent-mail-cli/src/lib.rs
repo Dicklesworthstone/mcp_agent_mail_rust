@@ -25,6 +25,7 @@ pub mod e2e_runner;
 pub mod flags;
 pub mod golden;
 pub mod legacy;
+mod message_read;
 pub mod output;
 mod release_signing;
 pub mod reliability_coverage;
@@ -559,6 +560,9 @@ pub enum Commands {
         /// Show messages after this timestamp.
         #[arg(long)]
         since: Option<String>,
+        /// Read through the configured MCP server without local database access.
+        #[arg(long)]
+        server: bool,
     },
     /// Check agent inbox for unread messages (for git hooks and editor integrations).
     #[command(name = "check-inbox")]
@@ -4126,12 +4130,18 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             agent,
             limit,
             since,
+            server,
         } => robot::handle_robot(robot_alias_args(
             format,
             json,
             project,
             agent,
-            robot::RobotSubcommand::Thread { id, limit, since },
+            robot::RobotSubcommand::Thread {
+                id,
+                limit,
+                since,
+                server,
+            },
         )),
         Commands::CheckInbox {
             agent,

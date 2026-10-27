@@ -25,6 +25,44 @@ use mcp_agent_mail_db::queries::{
 };
 const RESOURCE_TIMEOUT_SECONDS: u64 = 30;
 
+/// A pinned, authenticated resource authority shared by explicit server reads.
+pub(crate) struct ServerResourceSession {
+    client: asupersync::http::h1::HttpClient,
+    server_url: String,
+    bearer: Option<String>,
+}
+
+impl ServerResourceSession {
+    pub(crate) fn new(config: &Config) -> CliResult<Self> {
+        let server_url = crate::local_server_url(config);
+        let bearer = mcp_agent_mail_core::config::env_value("AGENT_MAIL_TOKEN")
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| crate::local_server_bearer_token(config))
+            .map(|token| token.trim().to_string());
+        if bearer.as_deref().is_some_and(|token| {
+            token
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        }) {
+            return Err(CliError::InvalidArgument(
+                "server bearer token contains invalid whitespace or control characters".to_string(),
+            ));
+        }
+        Ok(Self {
+            client: asupersync::http::h1::HttpClient::builder()
+                .no_redirects()
+                .no_retries()
+                .build(),
+            server_url,
+            bearer,
+        })
+    }
+
+    pub(crate) async fn read(&self, uri: &str) -> CliResult<Value> {
+        read_resource_json(&self.client, &self.server_url, self.bearer.as_deref(), uri).await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ServerReservation {
     pub id: i64,
@@ -64,34 +102,13 @@ pub(crate) fn read_server(
 
     // Pin the endpoint and credential for all three reads. In particular, never
     // retry an authentication rejection on a different endpoint or in SQLite.
-    let server_url = crate::local_server_url(config);
-    let bearer = mcp_agent_mail_core::config::env_value("AGENT_MAIL_TOKEN")
-        .filter(|token| !token.trim().is_empty())
-        .or_else(|| crate::local_server_bearer_token(config))
-        .map(|token| token.trim().to_string());
-    if bearer.as_deref().is_some_and(|token| {
-        token
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    }) {
-        return Err(CliError::InvalidArgument(
-            "server bearer token contains invalid whitespace or control characters".to_string(),
-        ));
-    }
-    // HTTP's existing blocking path rejects redirects. Pin the same policy
-    // for HTTPS: a redirect must not change the selected mailbox authority or
-    // forward its credential to a different resource on the same origin.
-    let client = asupersync::http::h1::HttpClient::builder()
-        .no_redirects()
-        .no_retries()
-        .build();
+    let session = ServerResourceSession::new(config)?;
     crate::context::run_async(async {
         let project_uri = format!(
             "resource://project/{}?format=json",
             encode_resource_component(project_key)
         );
-        let before =
-            read_resource_json(&client, &server_url, bearer.as_deref(), &project_uri).await?;
+        let before = session.read(&project_uri).await?;
         let project = validate_project(&before, project_key)?;
         let agent_roster = validate_agent_roster(&before, project.id)?;
 
@@ -99,8 +116,7 @@ pub(crate) fn read_server(
             "resource://file_reservations/{}?snapshot=true&active_only={active_only}&format=json",
             encode_resource_component(&project.slug)
         );
-        let payload =
-            read_resource_json(&client, &server_url, bearer.as_deref(), &reservation_uri).await?;
+        let payload = session.read(&reservation_uri).await?;
         let (holder_roster, reservations) = validate_snapshot(&payload, &project, active_only)?;
         if agent_roster
             .iter()
@@ -115,8 +131,7 @@ pub(crate) fn read_server(
         // unregistered path. Re-read the actual stored project descriptor,
         // including its creation epoch, so a deleted/recreated or rebound
         // project cannot lend authority to a stale reservation response.
-        let after =
-            read_resource_json(&client, &server_url, bearer.as_deref(), &project_uri).await?;
+        let after = session.read(&project_uri).await?;
         let after_project = validate_project(&after, project_key)?;
         let after_agent_roster = validate_agent_roster(&after, after_project.id)?;
         if !same_project(&project, &after_project) || agent_roster != after_agent_roster {
@@ -134,7 +149,7 @@ pub(crate) fn read_server(
     })
 }
 
-fn encode_resource_component(value: &str) -> String {
+pub(crate) fn encode_resource_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -152,7 +167,7 @@ async fn read_resource_json(
     bearer: Option<&str>,
     uri: &str,
 ) -> CliResult<Value> {
-    let id = format!("cli-reservations-read-{uri}");
+    let id = format!("cli-resource-read-{uri}");
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": &id,
@@ -178,7 +193,7 @@ fn sanitize_transport_error(error: CliError) -> CliError {
     let message = error.to_string();
     if message.starts_with("authentication failed") {
         return CliError::Other(
-            "server reservation read authentication failed; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN"
+            "server resource read authentication failed; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN"
                 .to_string(),
         );
     }
@@ -189,10 +204,10 @@ fn sanitize_transport_error(error: CliError) -> CliError {
     {
         return CliError::Other(if (300..400).contains(&status) {
             format!(
-                "server reservation read refused an HTTP redirect ({status}); configure the final trusted AGENT_MAIL_URL explicitly"
+                "server resource read refused an HTTP redirect ({status}); configure the final trusted AGENT_MAIL_URL explicitly"
             )
         } else {
-            format!("server reservation read failed with HTTP status {status}")
+            format!("server resource read failed with HTTP status {status}")
         });
     }
     if matches!(error, CliError::Io(_))
@@ -200,19 +215,19 @@ fn sanitize_transport_error(error: CliError) -> CliError {
         || message.starts_with("request to ")
     {
         return CliError::Other(
-            "server reservation resource unavailable or timed out; check AGENT_MAIL_URL/HTTP_HOST/HTTP_PORT/HTTP_PATH"
+            "server resource unavailable or timed out; check AGENT_MAIL_URL/HTTP_HOST/HTTP_PORT/HTTP_PATH"
                 .to_string(),
         );
     }
     CliError::Other(
-        "server reservation resource read failed because the endpoint configuration or HTTP/JSON response was invalid; no reservation data accepted"
+        "server resource read failed because the endpoint configuration or HTTP/JSON response was invalid; no data accepted"
             .to_string(),
     )
 }
 
 fn invalid_response(detail: &str) -> CliError {
     CliError::Other(format!(
-        "invalid server reservation response: {detail}; refusing unverified reservation data"
+        "invalid server resource response: {detail}; refusing unverified data"
     ))
 }
 
@@ -237,10 +252,9 @@ fn validate_resource_response(response: &Value, id: &str, uri: &str) -> CliResul
             .and_then(Value::as_i64);
         return Err(CliError::Other(match code {
             Some(code) => format!(
-                "server rejected reservation resource read (JSON-RPC error {code}); verify the project and server authentication"
+                "server rejected resource read (JSON-RPC error {code}); verify the project and server authentication"
             ),
-            None => "server rejected reservation resource read with a malformed JSON-RPC error"
-                .to_string(),
+            None => "server rejected resource read with a malformed JSON-RPC error".to_string(),
         }));
     }
     let result = response
@@ -304,7 +318,7 @@ fn timestamp(value: &Value, key: &str) -> CliResult<i64> {
         .ok_or_else(|| invalid_response(&format!("invalid {key} timestamp")))
 }
 
-fn validate_project(value: &Value, requested_key: &str) -> CliResult<ResolvedProject> {
+pub(crate) fn validate_project(value: &Value, requested_key: &str) -> CliResult<ResolvedProject> {
     let project = ResolvedProject {
         id: positive_id(value)?,
         slug: nonempty_text(value, "slug")?.to_string(),
@@ -339,14 +353,14 @@ pub(crate) fn verify_project_selector(project: &ResolvedProject, selector: &str)
     };
     if !matches {
         return Err(CliError::Other(
-            "server project identity does not match the requested project; refusing unverified reservation data"
+            "server project identity does not match the requested project; refusing unverified data"
                 .to_string(),
         ));
     }
     Ok(())
 }
 
-fn same_project(left: &ResolvedProject, right: &ResolvedProject) -> bool {
+pub(crate) fn same_project(left: &ResolvedProject, right: &ResolvedProject) -> bool {
     left.id == right.id
         && left.slug == right.slug
         && left.human_key == right.human_key

@@ -54,6 +54,7 @@ pub mod integrity;
 pub mod invariants;
 pub mod mail_explorer;
 pub mod mailbox_verdict;
+pub mod message_context;
 pub mod migrate;
 pub mod models;
 pub mod never_written_pages;

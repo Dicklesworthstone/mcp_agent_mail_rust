@@ -2749,7 +2749,9 @@ pub struct MessageDetails {
     pub bcc: Vec<String>,
 }
 
-/// Get full message details.
+/// Get full message details. Opt-in `context=true` returns the versioned,
+/// bounded read snapshot used by `am robot message --server`, including
+/// acknowledgement counts, sender metadata and neighbouring thread messages.
 #[resource(
     uri = "resource://message/{message_id}",
     description = "Read a single message by id within a project.\n\nWhen to use\n-----------\n- Fetch the canonical body/metadata for rendering in a client after list/search.\n- Retrieve attachments and full details for a given message id.\n\nParameters\n----------\nmessage_id : str\n    Numeric id as a string.\nproject : str\n    Project slug or human key (required for disambiguation).\n\nCommon mistakes\n---------------\n- Omitting `project` when a message id might exist in multiple projects.\n\nReturns\n-------\ndict\n    Full message payload including body and sender name.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r5\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://message/1234?project=/abs/path/backend\"}}\n```"
@@ -2771,6 +2773,17 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
     let pool = get_resource_db_pool(ctx.cx()).await?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+
+    if query
+        .get("context")
+        .is_some_and(|value| parse_bool_param(value))
+    {
+        let snapshot = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::message_context_snapshot(ctx.cx(), &pool, &project, msg_id)
+                .await,
+        )?;
+        return context_snapshot_json(&snapshot);
+    }
 
     // Get message from DB
     let msg = db_outcome_to_mcp_result(
@@ -2855,7 +2868,24 @@ pub struct ThreadDetails {
     pub messages: Vec<ThreadMessageEntry>,
 }
 
-/// Get thread messages.
+/// Context replies refuse an incomplete or unbounded wire representation.
+fn context_snapshot_json(snapshot: &impl Serialize) -> McpResult<String> {
+    let json = serde_json::to_string(snapshot).map_err(|error| {
+        McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}"))
+    })?;
+    if json.len() > mcp_agent_mail_db::message_context::MAX_CONTEXT_BYTES {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "complete message context exceeds the 4 MiB response limit; request fewer thread messages or omit bodies",
+        ));
+    }
+    Ok(json)
+}
+
+/// Get thread messages. Opt-in `context=true` returns a complete, bounded
+/// conversation snapshot with newest-window semantics, full-thread participants
+/// and receipt counts. It accepts `since_ts` and a displayed limit of 0..=1000;
+/// normal resource reads keep their existing oldest-first shape and limits.
 #[resource(
     uri = "resource://thread/{thread_id}",
     description = "List messages for a thread within a project.\n\nWhen to use\n-----------\n- Present a conversation view for a given ticket/thread key.\n- Export a thread for summarization or reporting.\n\nParameters\n----------\nthread_id : str\n    Either a string thread key or a numeric message id to seed the thread.\nproject : str\n    Project slug or human key (required).\ninclude_bodies : bool\n    Include message bodies if true (default false).\nlimit : int\n    Max number of messages to return (default 10,000).\n\nReturns\n-------\ndict\n    { project, thread_id, limit, truncated, messages: [{...}] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/TKT-123?project=/abs/path/backend&include_bodies=true\"}}\n```\n\nNumeric seed example (message id as thread seed):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/1234?project=/abs/path/backend\"}}\n```"
@@ -2890,6 +2920,40 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
+
+    if query
+        .get("context")
+        .is_some_and(|value| parse_bool_param(value))
+    {
+        let limit = query.get("limit").map_or(Ok(200), |value| {
+            value.parse::<usize>().map_err(|_| {
+                McpError::new(
+                    McpErrorCode::InvalidParams,
+                    "context limit must be an integer from 0 through 1000",
+                )
+            })
+        })?;
+        if limit > mcp_agent_mail_db::message_context::MAX_CONTEXT_MESSAGES {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "context limit must be an integer from 0 through 1000",
+            ));
+        }
+        let since = parse_resource_since_ts(&query)?;
+        let snapshot = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::thread_context_snapshot(
+                ctx.cx(),
+                &pool,
+                &project,
+                &thread_id_str,
+                limit,
+                since,
+                include_bodies,
+            )
+            .await,
+        )?;
+        return context_snapshot_json(&snapshot);
+    }
 
     // Get thread messages
     let mut rows = db_outcome_to_mcp_result(
@@ -6203,6 +6267,41 @@ mod resource_shape_tests {
                     !thread_value.to_string().contains(&hidden.name),
                     "thread resource leaked hidden recipient name"
                 );
+
+                let message_context = parse_json(
+                    &message_details(
+                        &ctx,
+                        format!(
+                            "{}?project={project_ref}&context=true",
+                            message.id.unwrap_or(0)
+                        ),
+                    )
+                    .await
+                    .expect("complete message context"),
+                );
+                assert_eq!(message_context["schema_version"], 1);
+                assert_eq!(message_context["complete"], true);
+                assert_eq!(message_context["project"]["id"], project_id);
+                assert_eq!(message_context["position"], 1);
+                assert_eq!(message_context["total_in_thread"], 1);
+                assert_eq!(message_context["message"]["recipient_count"], 2);
+                assert_eq!(message_context["message"]["acked_count"], 0);
+                assert_eq!(message_context["message"]["body_md"], "Hidden body.");
+                assert!(!message_context.to_string().contains(&hidden.name));
+
+                let thread_context = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&context=true&limit=1&include_bodies=true"),
+                    ).await.expect("complete thread context"),
+                );
+                assert_eq!(thread_context["schema_version"], 1);
+                assert_eq!(thread_context["complete"], true);
+                assert_eq!(thread_context["message_count"], 1);
+                assert_eq!(thread_context["omitted_older"], 0);
+                assert_eq!(thread_context["messages"][0]["recipient_count"], 2);
+                assert_eq!(thread_context["messages"][0]["body_md"], "Hidden body.");
+                assert!(!thread_context.to_string().contains(&hidden.name));
             });
         });
     }
@@ -7698,8 +7797,35 @@ mod resource_shape_tests {
                     with_bodies_value["messages"][0]["body_md"],
                     "Thread toggle body text"
                 );
+
+                let context = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&context=true&limit=0"),
+                    )
+                    .await
+                    .expect("count-only complete context"),
+                );
+                assert_eq!(context["message_count"], 1);
+                assert_eq!(context["omitted_older"], 1);
+                assert_eq!(context["messages"], serde_json::json!([]));
+                assert_eq!(context["participants"].as_array().map(Vec::len), Some(2));
+                for invalid_limit in ["1001", "-1", "not-a-number"] {
+                    assert!(thread_details(&ctx, format!(
+                        "{thread_id}?project={project_ref}&context=true&limit={invalid_limit}"
+                    )).await.is_err());
+                }
             });
         });
+    }
+
+    #[test]
+    fn context_snapshot_rejects_json_escape_expansion() {
+        let payload = serde_json::json!({"body": "\u{0001}".repeat(
+            mcp_agent_mail_db::message_context::MAX_CONTEXT_BYTES / 2
+        )});
+        assert!(context_snapshot_json(&payload).is_err());
+        assert!(context_snapshot_json(&serde_json::json!({"complete":true})).is_ok());
     }
 
     #[test]
