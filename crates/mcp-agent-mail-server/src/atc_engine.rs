@@ -4034,10 +4034,10 @@ pub struct AtcEngine {
     /// Recent reservation lifecycle events for expiry sweep correlation (br-bn0vb.10).
     /// Ring buffer bounded to MAX_RESERVATION_EVENT_LOG entries.
     reservation_event_log: VecDeque<ReservationEvent>,
-    /// Per-agent last-outcome index. Survives ring buffer eviction so the
+    /// Per-project, per-agent last-outcome index. Survives ring buffer eviction so the
     /// sweep can always find the most recent non-Granted outcome even after
     /// a flood of events from other agents pushes the original event out.
-    reservation_last_outcome: HashMap<String, (ReservationEventKind, i64)>,
+    reservation_last_outcome: HashMap<(String, String), (ReservationEventKind, i64)>,
 }
 
 const MAX_RESERVATION_EVENT_LOG: usize = 512;
@@ -4050,7 +4050,6 @@ const MAX_RESERVATION_EVENT_LOG: usize = 512;
 pub(crate) struct ReservationEvent {
     pub kind: ReservationEventKind,
     pub agent: String,
-    #[allow(dead_code)]
     pub project: String,
     #[allow(dead_code)]
     pub paths: Vec<String>,
@@ -4529,7 +4528,18 @@ impl AtcEngine {
     fn push_reservation_event(&mut self, event: ReservationEvent) {
         if !matches!(event.kind, ReservationEventKind::Granted) {
             self.reservation_last_outcome
-                .insert(event.agent.clone(), (event.kind, event.timestamp_micros));
+                .entry((
+                    event.project.trim().to_string(),
+                    event.agent.to_ascii_lowercase(),
+                ))
+                .and_modify(|previous| {
+                    // An out-of-order observation must not erase newer evidence
+                    // when the bounded event log later evicts both events.
+                    if event.timestamp_micros >= previous.1 {
+                        *previous = (event.kind, event.timestamp_micros);
+                    }
+                })
+                .or_insert((event.kind, event.timestamp_micros));
         }
         if self.reservation_event_log.len() >= MAX_RESERVATION_EVENT_LOG {
             self.reservation_event_log.pop_front();
@@ -4540,36 +4550,35 @@ impl AtcEngine {
     pub(crate) fn reservation_outcome_for_agent(
         &self,
         agent: &str,
+        project: &str,
         since_micros: i64,
     ) -> Option<ReservationEventKind> {
-        for event in self.reservation_event_log.iter().rev() {
-            if event.timestamp_micros < since_micros {
-                // Don't break — clock skew between agents can produce
-                // out-of-order timestamps in the ring buffer.
-                continue;
-            }
-            if event.agent.eq_ignore_ascii_case(agent) {
-                match event.kind {
-                    ReservationEventKind::Released => return Some(ReservationEventKind::Released),
-                    ReservationEventKind::ForceReleased => {
-                        return Some(ReservationEventKind::ForceReleased);
-                    }
-                    ReservationEventKind::Conflicted => {
-                        return Some(ReservationEventKind::Conflicted);
-                    }
-                    ReservationEventKind::Renewed => return Some(ReservationEventKind::Renewed),
-                    ReservationEventKind::Granted => {}
-                }
-            }
+        let project = project.trim();
+        if project.is_empty() || agent.trim().is_empty() {
+            return None;
         }
-        // Fallback: if the ring buffer evicted the event, consult the
-        // per-agent last-outcome cache (survives eviction).
-        for (cached_agent, (kind, ts)) in &self.reservation_last_outcome {
-            if cached_agent.eq_ignore_ascii_case(agent) && *ts >= since_micros {
-                return Some(*kind);
-            }
-        }
-        None
+        // Agent names are only unique within a project. Both the ring and its
+        // eviction fallback must carry that scope; an unrelated project's
+        // release is not evidence that this intervention succeeded.
+        let recent = self.reservation_event_log.iter().filter_map(|event| {
+            (event.timestamp_micros >= since_micros
+                && event.kind != ReservationEventKind::Granted
+                && event.agent.eq_ignore_ascii_case(agent)
+                && crate::atc_project_keys_match(&event.project, project))
+            .then_some((event.kind, event.timestamp_micros))
+        });
+        let retained = self.reservation_last_outcome.iter().filter_map(
+            |((cached_project, cached_agent), &(kind, timestamp))| {
+                (timestamp >= since_micros
+                    && cached_agent.eq_ignore_ascii_case(agent)
+                    && crate::atc_project_keys_match(cached_project, project))
+                .then_some((kind, timestamp))
+            },
+        );
+        recent
+            .chain(retained)
+            .max_by_key(|(_, timestamp)| *timestamp)
+            .map(|(kind, _)| kind)
     }
 
     fn note_atc_intervention(&mut self, timestamp_micros: i64) {
@@ -7469,7 +7478,7 @@ mod synthesis_tests {
             "proj-alpha",
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::Released));
     }
 
@@ -7493,7 +7502,7 @@ mod synthesis_tests {
             )],
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("RedHawk", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("RedHawk", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::Conflicted));
     }
 
@@ -7507,7 +7516,7 @@ mod synthesis_tests {
             "proj-alpha",
             1_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, None);
     }
 
@@ -7520,7 +7529,7 @@ mod synthesis_tests {
             "proj-alpha",
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::ForceReleased));
     }
 
@@ -7533,7 +7542,7 @@ mod synthesis_tests {
             "proj-alpha",
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::Renewed));
     }
 
@@ -7576,7 +7585,7 @@ mod synthesis_tests {
         );
         // Query since t=3_000_000.
         // Reverse iteration: RedHawk@1M (ts < 3M → break). Never reaches BlueLake@5M.
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 3_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 3_000_000);
         assert_eq!(
             outcome,
             Some(ReservationEventKind::Released),
@@ -7607,12 +7616,109 @@ mod synthesis_tests {
         }
         // BlueLake's event is evicted from the ring buffer, but the
         // per-agent last-outcome cache preserves it.
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 0);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 0);
         assert_eq!(
             outcome,
             Some(ReservationEventKind::ForceReleased),
             "per-agent outcome cache must survive ring buffer eviction"
         );
+    }
+
+    #[test]
+    fn reservation_outcomes_are_project_scoped_before_and_after_eviction() {
+        let mut engine = AtcEngine::new_for_testing();
+        let paths = ["src/**".to_string()];
+        engine.note_reservation_released("BlueLake", &paths, "/project/alpha", 5_000_000);
+        engine.note_reservation_force_released("BlueLake", &paths, "/project/beta", 6_000_000);
+
+        for evict in [false, true] {
+            if evict {
+                for i in 0..MAX_RESERVATION_EVENT_LOG {
+                    engine.note_reservation_granted(
+                        "FloodAgent",
+                        &paths,
+                        false,
+                        "/project/other",
+                        7_000_000 + i64::try_from(i).unwrap(),
+                    );
+                }
+                assert!(
+                    engine
+                        .reservation_event_log
+                        .iter()
+                        .all(|event| { event.kind == ReservationEventKind::Granted })
+                );
+            }
+            assert_eq!(
+                engine.reservation_outcome_for_agent("bluelake", "/project/alpha", 4_000_000),
+                Some(ReservationEventKind::Released),
+                "another project's newer outcome must not replace this project's evidence"
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "/project/beta", 4_000_000),
+                Some(ReservationEventKind::ForceReleased)
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "/project/unknown", 0),
+                None
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "", 0),
+                None
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 5_000_001),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_outcomes_do_not_merge_project_paths_with_colliding_slugs() {
+        let mut engine = AtcEngine::new_for_testing();
+        let first = "/tmp/atc-alpha/beta";
+        let second = "/tmp/atc/alpha-beta";
+        assert_eq!(
+            mcp_agent_mail_db::queries::generate_slug(first),
+            mcp_agent_mail_db::queries::generate_slug(second)
+        );
+        engine.note_reservation_released("BlueLake", &[], first, 1_000_000);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", first, 0),
+            Some(ReservationEventKind::Released)
+        );
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", second, 0),
+            None,
+            "display slug equality must not merge two full project identities"
+        );
+    }
+
+    #[test]
+    fn reservation_outcomes_keep_newest_evidence_when_events_arrive_out_of_order() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 5_000_000);
+        engine.note_reservation_renewed("bluelake", &[], "/project/alpha", 2_000_000);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released),
+            "arrival order must not overwrite a newer observation"
+        );
+        for i in 0..MAX_RESERVATION_EVENT_LOG {
+            engine.note_reservation_granted(
+                "FloodAgent",
+                &[],
+                false,
+                "/project/alpha",
+                6_000_000 + i64::try_from(i).unwrap(),
+            );
+        }
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BLUELAKE", "/project/alpha", 4_000_000),
+            Some(ReservationEventKind::Released),
+            "eviction fallback must preserve the newest scoped observation"
+        );
+        assert_eq!(engine.reservation_last_outcome.len(), 1);
     }
 
     #[test]
@@ -10845,17 +10951,18 @@ pub fn atc_note_build_slot_released(agent: &str, slot: &str, project: &str, time
     e.note_build_slot_released(agent, timestamp_micros);
 }
 
-/// Query the engine's reservation event log for the most recent outcome affecting `agent`
-/// since `since_micros`. Returns None if no relevant event found.
+/// Query the engine's reservation event log for the most recent outcome affecting
+/// `agent` in `project` since `since_micros`. Returns None without scoped evidence.
 #[must_use]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn atc_reservation_outcome_for_agent(
     agent: &str,
+    project: &str,
     since_micros: i64,
 ) -> Option<ReservationEventKind> {
     let engine_lock = ATC_ENGINE.get()?;
     let engine = engine_lock.lock().ok()?;
-    engine.reservation_outcome_for_agent(agent, since_micros)
+    engine.reservation_outcome_for_agent(agent, project, since_micros)
 }
 
 pub fn atc_note_intervention(timestamp_micros: i64) {
