@@ -712,7 +712,7 @@ fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
 /// and must use the guarded same-engine API instead. A multiply-linked inode
 /// likewise defeats pathname-based ownership checks because another alias can
 /// still be live or replaced independently.
-fn validate_private_canonical_snapshot_source(path: &Path) -> Result<(), ShareError> {
+pub(crate) fn validate_private_canonical_snapshot_source(path: &Path) -> Result<(), ShareError> {
     let metadata = std::fs::symlink_metadata(path).map_err(ShareError::Io)?;
     if !metadata.file_type().is_file() {
         return Err(ShareError::Validation {
@@ -1332,6 +1332,7 @@ pub fn create_snapshot_context_with_observer(
         project_filters,
         scrub_preset,
         purpose,
+        None,
         observer,
         &mut |_| Ok(()),
     )
@@ -1355,6 +1356,34 @@ pub fn create_snapshot_context_with_progress(
     purpose: SnapshotPurpose,
     observer: &mut SnapshotObserver<'_>,
 ) -> Result<SnapshotContext, ShareError> {
+    create_snapshot_context_with_options(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        SnapshotOptions {
+            purpose,
+            namespace_retention_root: None,
+        },
+        observer,
+    )
+}
+
+/// Prepare a live-mailbox snapshot with an explicit private metadata retention
+/// destination. The live source retains the same guarded read-only admission.
+///
+/// # Errors
+///
+/// Returns snapshot/cancellation errors and refuses retention inside the
+/// snapshot directory. The caller must preserve failed snapshot staging.
+pub fn create_snapshot_context_with_options(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    options: SnapshotOptions<'_>,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
     rebuild_sqlite_snapshot_with_progress(
         source,
         snapshot_path,
@@ -1368,7 +1397,8 @@ pub fn create_snapshot_context_with_progress(
         snapshot_path,
         project_filters,
         scrub_preset,
-        purpose,
+        options.purpose,
+        options.namespace_retention_root,
         &mut |_| {},
         observer,
     )
@@ -1384,6 +1414,19 @@ pub enum SnapshotPurpose {
     /// lossless `archive` preset keeps tokens and a restore can still send.
     /// Viewer-only search indexes and materialized tables are not built.
     PrivateArchive,
+}
+
+/// Destination policy for snapshot preparation.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotOptions<'a> {
+    pub purpose: SnapshotPurpose,
+    /// Existing caller-owned directory outside snapshot staging and published
+    /// payloads. Unique metadata-only children are retained with mode 0700 on
+    /// Unix. `None` uses the process temp root only if outside the snapshot
+    /// directory; its lifetime remains controlled by that root's owner.
+    /// Retirement uses same-filesystem rename and propagates cross-device
+    /// errors; it never substitutes copy-and-delete.
+    pub namespace_retention_root: Option<&'a Path>,
 }
 
 /// Full snapshot preparation pipeline for a private canonical SQLite source.
@@ -1439,6 +1482,7 @@ pub fn create_private_canonical_snapshot_context_with_observer(
         project_filters,
         scrub_preset,
         purpose,
+        None,
         observer,
         &mut |_| Ok(()),
     )
@@ -1459,6 +1503,34 @@ pub fn create_private_canonical_snapshot_context_with_progress(
     purpose: SnapshotPurpose,
     observer: &mut SnapshotObserver<'_>,
 ) -> Result<SnapshotContext, ShareError> {
+    create_private_canonical_snapshot_context_with_options(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        SnapshotOptions {
+            purpose,
+            namespace_retention_root: None,
+        },
+        observer,
+    )
+}
+
+/// Prepare an engine-exclusive private canonical source with an explicit
+/// metadata retention destination. Live mailboxes must use the runtime API.
+///
+/// # Errors
+///
+/// Returns snapshot/cancellation errors and unsafe-retention refusals. The
+/// caller must preserve failed snapshot staging instead of publishing it.
+pub fn create_private_canonical_snapshot_context_with_options(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    options: SnapshotOptions<'_>,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
     rebuild_sqlite_snapshot_with_progress(
         source,
         snapshot_path,
@@ -1472,7 +1544,8 @@ pub fn create_private_canonical_snapshot_context_with_progress(
         snapshot_path,
         project_filters,
         scrub_preset,
-        purpose,
+        options.purpose,
+        options.namespace_retention_root,
         &mut |_| {},
         observer,
     )
@@ -1755,6 +1828,7 @@ fn finish_snapshot_context(
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
     purpose: SnapshotPurpose,
+    namespace_retention_root: Option<&Path>,
     phase_observer: &mut dyn FnMut(SnapshotPhaseEvent),
     observer: &mut SnapshotObserver<'_>,
 ) -> Result<SnapshotContext, ShareError> {
@@ -1790,11 +1864,20 @@ fn finish_snapshot_context(
     // deleted rows and redacted payload bytes cannot remain in free pages.
     let fts_enabled = match purpose {
         SnapshotPurpose::PrivateArchive => {
-            crate::finalize::finalize_snapshot_with_progress(snapshot_path, observer)?;
+            crate::finalize::finalize_snapshot_with_retention(
+                snapshot_path,
+                namespace_retention_root,
+                observer,
+            )?;
             false
         }
         SnapshotPurpose::Publish => {
-            crate::finalize::finalize_export_with_progress(snapshot_path, observer)?.fts_enabled
+            crate::finalize::finalize_export_with_retention(
+                snapshot_path,
+                namespace_retention_root,
+                observer,
+            )?
+            .fts_enabled
         }
     };
     phase_observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize));
@@ -2737,6 +2820,16 @@ mod tests {
             assert!(!context.fts_enabled);
             assert_eq!(context.scope.remaining.messages, 3);
             assert!(!sqlite_sidecar_artifacts_exist(&snapshot).unwrap());
+            let guarded = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+                &snapshot,
+                "restorable private archive handoff test",
+            )
+            .expect("the unchanged guard must admit the completed private archive");
+            assert!(matches!(
+                &guarded,
+                mcp_agent_mail_db::pool::GuardedReadOnlyConn::Canonical(_)
+            ));
+            drop(guarded);
             let copied = private_source(&snapshot);
             assert_eq!(restore_state(&copied), original);
             let integrity = copied.query_sync("PRAGMA integrity_check", &[]).unwrap();

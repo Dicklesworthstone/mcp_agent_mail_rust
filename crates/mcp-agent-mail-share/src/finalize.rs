@@ -14,6 +14,13 @@ type Conn = DbConn;
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
 const UNKNOWN_PROJECT_SLUG_PREFIX: &str = "[unknown-project-";
 const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+const PRIVATE_SNAPSHOT_NAMESPACE_SUFFIXES: [&str; 5] = [
+    "-fsqlite-ns-gate",
+    "-fsqlite-ns-use",
+    "-wal-cert",
+    "-wal-cert-head",
+    ".fsqlite-migration-state",
+];
 
 #[cfg(test)]
 // Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
@@ -662,6 +669,11 @@ fn create_performance_indexes_with_conn(conn: &Conn) -> Result<Vec<String>, Shar
 ///
 /// This rebuilds the snapshot into a compact fresh database with the export
 /// page size, then applies the final journal mode and statistics pragmas.
+/// The caller must exclusively own the closed private snapshot; this is never
+/// an entry point for a live mailbox or a database with other owning handles.
+/// Namespace metadata is retained outside the snapshot directory under the
+/// process temp root. An unsafe/default destination or cross-device rename
+/// fails explicitly; snapshot options can supply a suitable retention root.
 pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareError> {
     finalize_snapshot_with_progress(snapshot_path, &mut |_| Ok(()))
 }
@@ -670,14 +682,53 @@ pub(crate) fn finalize_snapshot_with_progress(
     snapshot_path: &Path,
     observer: &mut SnapshotObserver<'_>,
 ) -> Result<(), ShareError> {
+    finalize_snapshot_with_retention(snapshot_path, None, observer)
+}
+
+pub(crate) fn finalize_snapshot_with_retention(
+    snapshot_path: &Path,
+    namespace_retention_root: Option<&Path>,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<(), ShareError> {
     observer(SnapshotProgress::phase(SnapshotProgressPhase::Compact))?;
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
-    let (_temp_dir, rebuilt_path, backup_path) =
+    require_private_snapshot_main_inode(&snapshot_path)?;
+    let mut namespace_present = false;
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&snapshot_path, suffix);
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => namespace_present = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShareError::Io(error)),
+        }
+    }
+    if namespace_present {
+        let original = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+            &snapshot_path,
+            "private snapshot before inode handoff",
+        )
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("cannot admit the original private snapshot before handoff: {error}"),
+        })?;
+        drop(original);
+    }
+    let (temp_dir, rebuilt_path, backup_path) =
         prepare_rebuilt_snapshot_storage(&snapshot_path, observer)?;
 
     apply_export_finalize_pragmas(&rebuilt_path)?;
     observer(SnapshotProgress::phase(SnapshotProgressPhase::Compact))?;
-    replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
+    if let Err(error) = replace_snapshot_with_rebuilt_path(
+        &rebuilt_path,
+        &snapshot_path,
+        &backup_path,
+        namespace_retention_root,
+    ) {
+        let retained = temp_dir.keep();
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "{error}; private snapshot handoff stage retained at {}",
+            retained.display()
+        ))));
+    }
     cleanup_snapshot_sidecars(&snapshot_path)?;
 
     Ok(())
@@ -692,10 +743,18 @@ pub(crate) fn finalize_export_with_progress(
     snapshot_path: &Path,
     observer: &mut SnapshotObserver<'_>,
 ) -> Result<FinalizeResult, ShareError> {
+    finalize_export_with_retention(snapshot_path, None, observer)
+}
+
+pub(crate) fn finalize_export_with_retention(
+    snapshot_path: &Path,
+    namespace_retention_root: Option<&Path>,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<FinalizeResult, ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
-    finalize_snapshot_with_progress(&snapshot_path, observer)?;
+    finalize_snapshot_with_retention(&snapshot_path, namespace_retention_root, observer)?;
     observer(SnapshotProgress::phase(SnapshotProgressPhase::Viewer))?;
-    let (_rollback_stage, rollback_source_path, rollback_backup_path) =
+    let (rollback_stage, rollback_source_path, rollback_backup_path) =
         prepare_post_finalize_rollback_snapshot(&snapshot_path)?;
 
     let result = (|| -> Result<FinalizeResult, ShareError> {
@@ -724,16 +783,18 @@ pub(crate) fn finalize_export_with_progress(
     match result {
         Ok(result) => Ok(result),
         Err(error) => {
-            replace_snapshot_with_rebuilt_path(
+            if let Err(rollback_error) = replace_snapshot_with_rebuilt_path(
                 &rollback_source_path,
                 &snapshot_path,
                 &rollback_backup_path,
-            )
-            .map_err(|rollback_error| {
-                ShareError::Io(std::io::Error::other(format!(
-                    "finalize export failed ({error}); restoring pre-FTS snapshot state also failed ({rollback_error})"
-                )))
-            })?;
+                namespace_retention_root,
+            ) {
+                let retained = rollback_stage.keep();
+                return Err(ShareError::Io(std::io::Error::other(format!(
+                    "finalize export failed ({error}); restoring pre-FTS snapshot state also failed ({rollback_error}); private rollback stage retained at {}",
+                    retained.display()
+                ))));
+            }
             cleanup_snapshot_sidecars(&snapshot_path)?;
             Err(error)
         }
@@ -748,9 +809,15 @@ fn prepare_rebuilt_snapshot_storage(
     let parent = snapshot_path
         .parent()
         .ok_or_else(|| ShareError::Io(std::io::Error::other("snapshot path has no parent")))?;
-    let temp_dir = tempfile::Builder::new()
-        .prefix("am-share-finalize-")
-        .tempdir_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("am-share-finalize-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let temp_dir = builder.tempdir_in(parent)?;
     let source_copy = temp_dir.path().join("mailbox.source.sqlite3");
     stage_snapshot_source(&snapshot_path, &source_copy)?;
     let rebuilt_path = temp_dir.path().join("mailbox.sqlite3");
@@ -824,9 +891,15 @@ fn prepare_post_finalize_rollback_snapshot(
     let parent = snapshot_path
         .parent()
         .ok_or_else(|| ShareError::Io(std::io::Error::other("snapshot path has no parent")))?;
-    let temp_dir = tempfile::Builder::new()
-        .prefix("am-share-finalize-rollback-")
-        .tempdir_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("am-share-finalize-rollback-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let temp_dir = builder.tempdir_in(parent)?;
     let rollback_source_path = temp_dir.path().join("mailbox.pre-fts.sqlite3");
     std::fs::copy(&snapshot_path, &rollback_source_path).map_err(|error| {
         ShareError::Io(std::io::Error::other(format!(
@@ -843,7 +916,7 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let (_temp_dir, rebuilt_path, backup_path) =
         prepare_rebuilt_snapshot_storage(&snapshot_path, &mut |_| Ok(()))?;
-    replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
+    replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path, None)?;
     cleanup_snapshot_sidecars(&snapshot_path)?;
     Ok(())
 }
@@ -857,13 +930,17 @@ fn apply_export_finalize_pragmas(snapshot_path: &Path) -> Result<(), ShareError>
         });
     }
 
-    let conn = open_conn(snapshot_path)?;
+    // This is the newly rebuilt private image, not the live mailbox. Keep it
+    // canonical so no inode-bound admission record follows it across rename.
+    crate::snapshot::validate_private_canonical_snapshot_source(snapshot_path)?;
+    let conn = open_canonical_conn(snapshot_path)?;
     conn.execute_raw("PRAGMA journal_mode='DELETE'")
         .map_err(sql_err)?;
     conn.execute_raw("PRAGMA analysis_limit=400")
         .map_err(sql_err)?;
     conn.execute_raw("ANALYZE").map_err(sql_err)?;
     conn.execute_raw("PRAGMA optimize").map_err(sql_err)?;
+    drop(conn);
     Ok(())
 }
 
@@ -899,16 +976,200 @@ fn cleanup_snapshot_sidecars(snapshot_path: &Path) -> Result<(), ShareError> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct SnapshotNamespaceQuarantine {
+    directory: std::path::PathBuf,
+    moved: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+fn require_private_snapshot_main_inode(snapshot_path: &Path) -> Result<(), ShareError> {
+    let metadata = std::fs::symlink_metadata(snapshot_path)?;
+    if !metadata.is_file() {
+        return Err(ShareError::Validation {
+            message: "private snapshot handoff requires a real main file".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(ShareError::Validation {
+                message: "private snapshot handoff requires an exclusively owned main inode"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl SnapshotNamespaceQuarantine {
+    fn restore(&self) -> Result<(), ShareError> {
+        for (original, retained) in self.moved.iter().rev() {
+            match std::fs::symlink_metadata(original) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(ShareError::Io(std::io::Error::other(format!(
+                        "cannot restore private snapshot namespace at occupied {}; evidence retained in {}",
+                        original.display(),
+                        self.directory.display()
+                    ))));
+                }
+                Err(error) => return Err(ShareError::Io(error)),
+            }
+            std::fs::rename(retained, original).map_err(|error| {
+                ShareError::Io(std::io::Error::other(format!(
+                    "cannot restore private snapshot namespace {}: {error}; evidence retained in {}",
+                    original.display(),
+                    self.directory.display()
+                )))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn move_snapshot_namespace_companions(
+    companions: &[std::path::PathBuf],
+    directory: std::path::PathBuf,
+) -> Result<SnapshotNamespaceQuarantine, ShareError> {
+    let mut quarantine = SnapshotNamespaceQuarantine {
+        directory,
+        moved: Vec::new(),
+    };
+    for original in companions {
+        let retained = quarantine
+            .directory
+            .join(original.file_name().ok_or_else(|| ShareError::Validation {
+                message: "private snapshot namespace companion has no filename".to_string(),
+            })?);
+        if let Err(error) = std::fs::rename(original, &retained) {
+            let detail = format!(
+                "cannot quarantine private snapshot namespace {}: {error}; evidence directory {}",
+                original.display(),
+                quarantine.directory.display()
+            );
+            quarantine.restore().map_err(|restore_error| {
+                ShareError::Io(std::io::Error::other(format!(
+                    "{detail}; namespace rollback also failed: {restore_error}"
+                )))
+            })?;
+            return Err(ShareError::Io(std::io::Error::other(detail)));
+        }
+        quarantine.moved.push((original.clone(), retained));
+    }
+    Ok(quarantine)
+}
+
+fn quarantine_private_snapshot_namespace(
+    snapshot_path: &Path,
+    namespace_retention_root: Option<&Path>,
+) -> Result<Option<SnapshotNamespaceQuarantine>, ShareError> {
+    // All scope/scrub and rebuild connections have left scope before this
+    // handoff. Only the caller-owned snapshot's witnesses are moved; neither
+    // the live source family nor the rebuilt image is admitted or modified.
+    let mut companions = Vec::new();
+    let mut namespace_members = 0;
+    for suffix in PRIVATE_SNAPSHOT_NAMESPACE_SUFFIXES {
+        let companion = mcp_agent_mail_core::disk::sqlite_sidecar_path(snapshot_path, suffix);
+        match std::fs::symlink_metadata(&companion) {
+            Ok(metadata) if metadata.is_file() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+
+                    if metadata.nlink() != 1 {
+                        return Err(ShareError::Validation {
+                            message: format!(
+                                "private snapshot namespace companion has other hard links: {}",
+                                companion.display()
+                            ),
+                        });
+                    }
+                }
+                namespace_members +=
+                    usize::from(matches!(suffix, "-fsqlite-ns-gate" | "-fsqlite-ns-use"));
+                companions.push(companion);
+            }
+            Ok(_) => {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "private snapshot namespace companion is not a real file: {}",
+                        companion.display()
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShareError::Io(error)),
+        }
+    }
+    if namespace_members == 1 {
+        return Err(ShareError::Validation {
+            message: "private snapshot namespace sidecar pair is incomplete".to_string(),
+        });
+    }
+    if companions.is_empty() {
+        return Ok(None);
+    }
+    let parent = snapshot_path.parent().ok_or_else(|| {
+        ShareError::Io(std::io::Error::other(
+            "snapshot path has no parent directory",
+        ))
+    })?;
+    let snapshot_directory = std::fs::canonicalize(parent)?;
+    let default_root = std::env::temp_dir();
+    let retention_root = std::fs::canonicalize(namespace_retention_root.unwrap_or(&default_root))?;
+    if retention_root.starts_with(&snapshot_directory) {
+        return Err(ShareError::Validation {
+            message: "private snapshot namespace retention must be outside the snapshot directory; supply an explicit retention root"
+                .to_string(),
+        });
+    }
+    // Retain only engine metadata, outside the snapshot/bundle directory.
+    // Explicit callers own this root's lifetime. The default temp root is
+    // accepted only outside the snapshot directory, never as an inner keep
+    // that disappears when the caller disposes the outer snapshot stage.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".snapshot-namespace.");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let directory = builder.tempdir_in(&retention_root)?.keep();
+    move_snapshot_namespace_companions(&companions, directory).map(Some)
+}
+
+fn restore_snapshot_namespace_after_error(
+    quarantine: Option<&SnapshotNamespaceQuarantine>,
+    detail: String,
+) -> ShareError {
+    if let Some(quarantine) = quarantine
+        && let Err(restore_error) = quarantine.restore()
+    {
+        return ShareError::Io(std::io::Error::other(format!(
+            "{detail}; namespace rollback also failed: {restore_error}"
+        )));
+    }
+    ShareError::Io(std::io::Error::other(detail))
+}
+
 fn replace_snapshot_with_rebuilt_path(
     rebuilt_path: &Path,
     snapshot_path: &Path,
     backup_path: &Path,
+    namespace_retention_root: Option<&Path>,
 ) -> Result<(), ShareError> {
-    std::fs::rename(snapshot_path, backup_path).map_err(|error| {
-        ShareError::Io(std::io::Error::other(format!(
-            "failed to stage existing snapshot for replacement: {error}"
-        )))
-    })?;
+    require_private_snapshot_main_inode(snapshot_path)?;
+    let quarantine =
+        quarantine_private_snapshot_namespace(snapshot_path, namespace_retention_root)?;
+    if let Err(error) = std::fs::rename(snapshot_path, backup_path) {
+        return Err(restore_snapshot_namespace_after_error(
+            quarantine.as_ref(),
+            format!("failed to stage existing snapshot for replacement: {error}"),
+        ));
+    }
 
     if let Err(rename_error) = std::fs::rename(rebuilt_path, snapshot_path) {
         if let Err(rollback_error) = std::fs::rename(backup_path, snapshot_path) {
@@ -916,9 +1177,10 @@ fn replace_snapshot_with_rebuilt_path(
                 "failed to replace snapshot via rename ({rename_error}); rollback failed ({rollback_error})"
             ))));
         }
-        return Err(ShareError::Io(std::io::Error::other(format!(
-            "failed to replace snapshot via rename ({rename_error})"
-        ))));
+        return Err(restore_snapshot_namespace_after_error(
+            quarantine.as_ref(),
+            format!("failed to replace snapshot via rename ({rename_error})"),
+        ));
     }
 
     Ok(())
@@ -1440,6 +1702,264 @@ mod tests {
     }
 
     #[test]
+    fn finalize_snapshot_quarantines_namespace_and_guarded_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let retention_root = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let witnesses = PRIVATE_SNAPSHOT_NAMESPACE_SUFFIXES
+            .iter()
+            .map(|suffix| mcp_agent_mail_core::disk::sqlite_sidecar_path(&db, suffix))
+            .filter(|path| path.is_file())
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_owned(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            assert!(mcp_agent_mail_core::disk::sqlite_sidecar_path(&db, suffix).is_file());
+        }
+
+        finalize_snapshot_with_retention(&db, Some(retention_root.path()), &mut |_| Ok(()))
+            .expect("handoff the closed private snapshot");
+
+        for suffix in PRIVATE_SNAPSHOT_NAMESPACE_SUFFIXES {
+            assert!(
+                std::fs::symlink_metadata(mcp_agent_mail_core::disk::sqlite_sidecar_path(
+                    &db, suffix
+                ))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+        }
+        let retained = std::fs::read_dir(retention_root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".snapshot-namespace.")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(&retained[0]).unwrap().count(),
+            witnesses.len(),
+            "quarantine must retain metadata witnesses, not old main/WAL payload"
+        );
+        for (name, bytes) in witnesses {
+            assert_eq!(std::fs::read(retained[0].join(name)).unwrap(), bytes);
+        }
+        let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+            &db,
+            "finalized private snapshot test",
+        )
+        .expect("the unchanged guard must admit the replacement inode");
+        assert!(matches!(
+            &conn,
+            mcp_agent_mail_db::pool::GuardedReadOnlyConn::Canonical(_)
+        ));
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 2);
+        let integrity = conn.query_sync("PRAGMA quick_check", &[]).unwrap();
+        assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+    }
+
+    #[test]
+    fn namespace_quarantine_survives_the_outer_snapshot_stage() {
+        let retention_root = tempfile::tempdir().unwrap();
+        let (stage_path, witness) = {
+            let stage = tempfile::tempdir().unwrap();
+            let db = create_test_db(stage.path());
+            let witness = std::fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(
+                &db,
+                "-fsqlite-ns-use",
+            ))
+            .unwrap();
+            finalize_snapshot_with_retention(&db, Some(retention_root.path()), &mut |_| Ok(()))
+                .expect("retain private namespace outside the disposable snapshot stage");
+            (stage.path().to_path_buf(), witness)
+        };
+        assert!(
+            !stage_path.exists(),
+            "the owning snapshot stage has expired"
+        );
+        let retained = std::fs::read_dir(retention_root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read(retained.join("test_finalize.sqlite3-fsqlite-ns-use")).unwrap(),
+            witness
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(retained).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_quarantine_refuses_retention_inside_the_snapshot_stage() {
+        let stage = tempfile::tempdir().unwrap();
+        let db = create_test_db(stage.path());
+        let original = std::fs::read(&db).unwrap();
+        let namespace = mcp_agent_mail_core::disk::sqlite_sidecar_path(&db, "-fsqlite-ns-use");
+        let witness = std::fs::read(&namespace).unwrap();
+
+        let error = finalize_snapshot_with_retention(&db, Some(stage.path()), &mut |_| Ok(()))
+            .expect_err("an inner keep would disappear with the outer owning stage");
+
+        assert!(
+            error
+                .to_string()
+                .contains("retention must be outside the snapshot directory")
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), original);
+        assert_eq!(std::fs::read(namespace).unwrap(), witness);
+    }
+
+    #[test]
+    fn namespace_quarantine_failure_propagates_and_restores_prior_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let companions = ["-fsqlite-ns-gate", "-fsqlite-ns-use"]
+            .map(|suffix| mcp_agent_mail_core::disk::sqlite_sidecar_path(&db, suffix));
+        let original = companions
+            .each_ref()
+            .map(|path| std::fs::read(path).unwrap());
+        let quarantine = dir.path().join("quarantine");
+        std::fs::create_dir(&quarantine).unwrap();
+        let blocker = quarantine.join(companions[1].file_name().unwrap());
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("preserved"), b"occupied destination").unwrap();
+
+        let error = move_snapshot_namespace_companions(&companions, quarantine.clone())
+            .expect_err("a real filesystem retirement failure must propagate");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot quarantine private snapshot namespace")
+        );
+        for (path, bytes) in companions.iter().zip(original) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(!quarantine.join(companions[0].file_name().unwrap()).exists());
+        assert_eq!(
+            std::fs::read(blocker.join("preserved")).unwrap(),
+            b"occupied destination"
+        );
+        let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+            &db,
+            "rolled-back namespace quarantine test",
+        )
+        .expect("the original namespace remains usable after retirement failure");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 2);
+    }
+
+    #[test]
+    fn snapshot_publish_failure_restores_original_namespace_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let original = std::fs::read(&db).unwrap();
+        let companions = PRIVATE_SNAPSHOT_NAMESPACE_SUFFIXES
+            .iter()
+            .map(|suffix| mcp_agent_mail_core::disk::sqlite_sidecar_path(&db, suffix))
+            .filter(|path| path.is_file())
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        let backup = dir.path().join("backup.sqlite3");
+        let missing = dir.path().join("missing-rebuilt.sqlite3");
+
+        let error = replace_snapshot_with_rebuilt_path(&missing, &db, &backup, None)
+            .expect_err("missing rebuilt image must fail after staging the original");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to replace snapshot via rename")
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), original);
+        assert!(!backup.exists());
+        for (path, bytes) in companions {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+            &db,
+            "rolled-back snapshot publication test",
+        )
+        .expect("rollback must restore the original admitted generation");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_handoff_refuses_a_main_inode_with_another_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let alias = dir.path().join("shared-alias.sqlite3");
+        std::fs::hard_link(&db, &alias).unwrap();
+        let original = std::fs::read(&db).unwrap();
+        let namespace = mcp_agent_mail_core::disk::sqlite_sidecar_path(&db, "-fsqlite-ns-use");
+        let witness = std::fs::read(&namespace).unwrap();
+
+        let error = finalize_snapshot_for_export(&db)
+            .expect_err("an alias defeats exclusive ownership of the private main inode");
+
+        assert!(error.to_string().contains("exclusively owned main inode"));
+        assert_eq!(std::fs::read(&db).unwrap(), original);
+        assert_eq!(std::fs::read(alias).unwrap(), original);
+        assert_eq!(std::fs::read(namespace).unwrap(), witness);
+    }
+
+    #[test]
+    fn snapshot_handoff_preserves_a_mismatched_namespace_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let namespace = mcp_agent_mail_core::disk::sqlite_sidecar_path(&db, "-fsqlite-ns-use");
+        let witness = std::fs::read(&namespace).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let replacement = create_test_db(other.path());
+        std::fs::rename(&db, dir.path().join("original.sqlite3")).unwrap();
+        std::fs::rename(replacement, &db).unwrap();
+        let replacement_bytes = std::fs::read(&db).unwrap();
+
+        let error = finalize_snapshot_for_export(&db)
+            .expect_err("a stale namespace must not be laundered into canonical authority");
+
+        assert!(error.to_string().contains("different database generation"));
+        assert_eq!(std::fs::read(&db).unwrap(), replacement_bytes);
+        assert_eq!(std::fs::read(namespace).unwrap(), witness);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".snapshot-namespace.")),
+            "namespace refusal must occur before any retirement"
+        );
+    }
+
+    #[test]
     fn full_finalize_pipeline() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
@@ -1955,7 +2475,7 @@ mod tests {
 
         std::fs::write(&snapshot, b"original snapshot").unwrap();
 
-        let err = replace_snapshot_with_rebuilt_path(&missing_rebuilt, &snapshot, &backup)
+        let err = replace_snapshot_with_rebuilt_path(&missing_rebuilt, &snapshot, &backup, None)
             .expect_err("missing rebuilt snapshot should fail replacement");
         assert!(
             err.to_string()

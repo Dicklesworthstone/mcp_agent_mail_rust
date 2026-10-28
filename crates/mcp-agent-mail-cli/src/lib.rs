@@ -16506,28 +16506,33 @@ impl CanonicalSnapshotSource {
         project_filters: &[String],
         scrub_preset: share::ScrubPreset,
         purpose: share::SnapshotPurpose,
+        namespace_retention_root: &Path,
         progress: &mut dyn FnMut(share::SnapshotProgress) -> Result<(), share::ShareError>,
     ) -> Result<share::SnapshotContext, share::ShareError> {
+        let options = share::snapshot::SnapshotOptions {
+            purpose,
+            namespace_retention_root: Some(namespace_retention_root),
+        };
         match self.kind {
             CanonicalSnapshotSourceKind::LiveSqlite => {
-                share::create_snapshot_context_with_progress(
+                share::snapshot::create_snapshot_context_with_options(
                     &self.actual_path,
                     snapshot_path,
                     project_filters,
                     scrub_preset,
-                    purpose,
+                    options,
                     progress,
                 )
             }
             CanonicalSnapshotSourceKind::LiveSnapshot
             | CanonicalSnapshotSourceKind::ArchiveSnapshot
             | CanonicalSnapshotSourceKind::StagedFamilyCopy => {
-                share::create_private_canonical_snapshot_context_with_progress(
+                share::snapshot::create_private_canonical_snapshot_context_with_options(
                     &self.actual_path,
                     snapshot_path,
                     project_filters,
                     scrub_preset,
-                    purpose,
+                    options,
                     progress,
                 )
             }
@@ -56582,6 +56587,103 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn archive_inventory_excludes_only_selected_database_coordination() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        let output = root.path().join("archive-output");
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        let database = storage.join("mailbox.sqlite3");
+        seed_mailbox_db(&database);
+        let _read_locks = acquire_cli_mailbox_read_locks_for_paths(&database, &storage).unwrap();
+        let coordination = [
+            ".mailbox.activity.lock",
+            "mailbox.sqlite3.activity.lock",
+            "mailbox.sqlite3-fsqlite-ns-gate",
+            "mailbox.sqlite3-fsqlite-ns-use",
+            "mailbox.sqlite3.fsqlite-migration-state",
+        ];
+        let original = coordination.map(|name| {
+            let path = storage.join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        let unrelated = [
+            ".mailbox.activity.lock.notes",
+            "doctor/reclaimable/mailbox.sqlite3-fsqlite-ns-use",
+            "mailbox.sqlite3-fsqlite-ns-use.notes",
+            "nested/.mailbox.activity.lock",
+            "other.sqlite3-fsqlite-ns-use",
+        ];
+        for name in unrelated {
+            let path = storage.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, name.as_bytes()).unwrap();
+        }
+        let exclusions =
+            archive_save_storage_exclusions(&storage, &database, &output, false).unwrap();
+        let mut observer = |_: &ArchiveProgressEvent| Ok(());
+        let mut progress = ArchiveSaveProgress::new(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut observer,
+        );
+        let inventory =
+            inventory_archive_storage_with_policy(&storage, &exclusions, false, &mut progress)
+                .unwrap();
+        let selected = inventory
+            .files
+            .iter()
+            .map(|file| file.relative.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(selected, unrelated.map(PathBuf::from));
+        for (path, bytes) in original {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        for name in unrelated {
+            assert_eq!(std::fs::read(storage.join(name)).unwrap(), name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn archive_save_plan_allows_missing_first_output_without_creating_it() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        std::fs::write(root_path.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(&root_path);
+        let storage = root_path.join("storage");
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::write(storage.join("message.md"), b"mailbox data").unwrap();
+        let database = storage.join("missing.sqlite3");
+        let output = archive_states_dir(false).unwrap();
+        assert!(!output.exists());
+
+        archive_save_plan(
+            &database,
+            &storage,
+            "archive",
+            ArchiveSaveOptions::default(),
+            ArchiveProgressFormat::Text,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &ArchiveDiagnostics::disabled(),
+        )
+        .expect("first-save planning must not require existing output or SQLite");
+
+        assert!(!output.exists());
+        assert!(!database.exists());
+        assert!(!storage.join(".mailbox.activity.lock").exists());
+        assert!(
+            archive_save_storage_exclusions(&storage, &database, &output, false).is_err(),
+            "executing-save exclusions must still require existing output"
+        );
+    }
+
+    #[test]
     fn archive_save_list_restore_roundtrip_smoke() {
         use std::io::Read as _;
 
@@ -57956,6 +58058,119 @@ http_headers = { Authorization = "Bearer secret" }
                 std::fs::read(storage_root.join(recovery)).unwrap(),
                 b"recovery evidence"
             );
+        }
+    }
+
+    #[test]
+    fn archive_save_retains_private_namespace_outside_payload_and_preserves_failed_stage() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().canonicalize().unwrap();
+        std::fs::write(storage.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(&storage);
+        seed_storage_root(&storage);
+        let database = storage.join("mailbox.sqlite3");
+        seed_mailbox_db(&database);
+        let original = std::fs::read(&database).unwrap();
+        let output = archive_states_dir(false).unwrap();
+        let archive = archive_save_state_internal(
+            &database,
+            &storage,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("retained-namespace".to_string()),
+            ArchiveSaveOptions {
+                exclude_recovery: true,
+                ..ArchiveSaveOptions::default()
+            },
+            &ArchiveDiagnostics::disabled(),
+        )
+        .expect("save through the real scoped snapshot and ZIP path");
+        let (metadata, metadata_error) = load_archive_metadata(&archive);
+        assert!(metadata_error.is_none(), "{metadata_error:?}");
+        let retention_root = PathBuf::from(metadata["private_retention_root"].as_str().unwrap());
+        assert!(!retention_root.starts_with(&storage));
+        assert!(!retention_root.starts_with(&output));
+        let retained = std::fs::read_dir(&retention_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".snapshot-namespace.")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        let witness = retained[0].join("mailbox.sqlite3-fsqlite-ns-use");
+        let witness_bytes = std::fs::read(&witness).unwrap();
+        assert!(!witness_bytes.is_empty());
+        for entry in std::fs::read_dir(&retained[0]).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            let name = entry.file_name();
+            assert!(
+                [
+                    "mailbox.sqlite3-fsqlite-ns-gate",
+                    "mailbox.sqlite3-fsqlite-ns-use",
+                    "mailbox.sqlite3-wal-cert",
+                    "mailbox.sqlite3-wal-cert-head",
+                    "mailbox.sqlite3.fsqlite-migration-state",
+                ]
+                .iter()
+                .any(|expected| name.as_os_str() == OsStr::new(*expected))
+            );
+        }
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+        for index in 0..zip.len() {
+            let name = zip.by_index(index).unwrap().name().to_string();
+            assert!(!name.contains(".snapshot-namespace."));
+            assert!(!name.contains("mailbox-archive-"));
+        }
+        drop(zip);
+        assert!(std::fs::read_dir(&output).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("mailbox-archive-")
+        }));
+
+        let error = archive_save_state_internal(
+            &database,
+            &storage,
+            vec!["unknown-project".to_string()],
+            "archive".to_string(),
+            None,
+            ArchiveSaveOptions::default(),
+            &ArchiveDiagnostics::disabled(),
+        )
+        .expect_err("a failed scope must retain its private snapshot stage");
+        let detail = error.to_string();
+        let failed = PathBuf::from(
+            detail
+                .rsplit_once("failed private archive snapshot retained at ")
+                .expect("scope failure must identify its retained private stage")
+                .1,
+        );
+        assert!(!failed.starts_with(&storage));
+        assert!(!failed.starts_with(&output));
+        assert!(failed.join("mailbox.sqlite3").is_file());
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&database).unwrap(), original);
+        assert_eq!(std::fs::read(witness).unwrap(), witness_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for private in [&retention_root, &retained[0], &failed] {
+                assert_eq!(
+                    std::fs::metadata(private).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
         }
     }
 
@@ -89387,7 +89602,7 @@ fn archive_storage_excluded_relative_paths(
     storage_root: &Path,
     database_path: &Path,
 ) -> std::collections::BTreeSet<PathBuf> {
-    let mut excluded = std::collections::BTreeSet::new();
+    let mut excluded = std::collections::BTreeSet::from([PathBuf::from(".mailbox.activity.lock")]);
     // Match in one coordinate system, even when DATABASE_URL is relative or
     // the storage directory was reached through a symlink alias. Canonicalize
     // the parent only: an absent primary may still have sidecars to exclude.
@@ -89415,6 +89630,19 @@ fn archive_storage_excluded_relative_paths(
         return excluded;
     };
     extend_sqlite_artifact_relative_paths(&mut excluded, relative_db);
+    // These exact companions describe the selected live database's local
+    // engine admission and coordination, not restorable mailbox payload.
+    // Other databases and similarly named recovery evidence remain selected.
+    for suffix in [
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+        ".fsqlite-migration-state",
+        ".activity.lock",
+    ] {
+        let mut companion = relative_db.as_os_str().to_os_string();
+        companion.push(suffix);
+        excluded.insert(PathBuf::from(companion));
+    }
     excluded
 }
 
@@ -90196,27 +90424,25 @@ fn archive_save_storage_exclusions(
     archive_dir: &Path,
     exclude_recovery: bool,
 ) -> CliResult<BTreeSet<PathBuf>> {
-    archive_save_storage_exclusions_with_source(
+    // Executing a save requires an existing output directory. Read-only
+    // first-save planning resolves a missing output separately below.
+    let canonical_output = std::fs::canonicalize(archive_dir)?;
+    archive_save_storage_exclusions_for_resolved_output(
         storage_root,
         database_path,
-        archive_dir,
+        &canonical_output,
         exclude_recovery,
-        None,
     )
 }
 
-fn archive_save_storage_exclusions_with_source(
+fn archive_save_storage_exclusions_for_resolved_output(
     storage_root: &Path,
     database_path: &Path,
-    archive_dir: &Path,
+    canonical_output: &Path,
     exclude_recovery: bool,
-    private_source_dir: Option<&Path>,
 ) -> CliResult<BTreeSet<PathBuf>> {
     let canonical_storage = std::fs::canonicalize(storage_root)?;
-    // A read-only inventory must also work before the first save creates its
-    // output directory. Resolve existing ancestors without creating anything.
-    let canonical_output = archive_recovery_normalize_path(archive_dir, true)?;
-    if canonical_output == canonical_storage {
+    if canonical_output == canonical_storage.as_path() {
         return Err(CliError::InvalidArgument(
             "archive output directory must differ from the mailbox storage root".to_string(),
         ));
@@ -90229,6 +90455,23 @@ fn archive_save_storage_exclusions_with_source(
         // Output is not mailbox authority; never embed previous or staged ZIPs.
         excluded.insert(relative_archive_dir.to_path_buf());
     }
+    Ok(excluded)
+}
+
+fn archive_save_storage_exclusions_with_source(
+    storage_root: &Path,
+    database_path: &Path,
+    archive_dir: &Path,
+    exclude_recovery: bool,
+    private_source_dir: Option<&Path>,
+) -> CliResult<BTreeSet<PathBuf>> {
+    let mut excluded = archive_save_storage_exclusions(
+        storage_root,
+        database_path,
+        archive_dir,
+        exclude_recovery,
+    )?;
+    let canonical_storage = std::fs::canonicalize(storage_root)?;
     if let Some(private_source_dir) = private_source_dir {
         let private_source_dir = std::fs::canonicalize(private_source_dir)?;
         if let Ok(relative) = private_source_dir.strip_prefix(&canonical_storage) {
@@ -90243,6 +90486,43 @@ fn archive_save_storage_exclusions_with_source(
         }
     }
     Ok(excluded)
+}
+
+fn archive_snapshot_retention_parent(
+    archive_dir: &Path,
+    storage_root: &Path,
+) -> CliResult<PathBuf> {
+    let mut candidate = archive_dir.parent();
+    while let Some(parent) = candidate {
+        if !parent.starts_with(storage_root) {
+            return Ok(parent.to_path_buf());
+        }
+        candidate = parent.parent();
+    }
+    Err(CliError::Other(
+        "archive save cannot retain private metadata outside the selected storage root".to_string(),
+    ))
+}
+
+fn preserve_failed_archive_snapshot(
+    stage: tempfile::TempDir,
+    retention_root: &Path,
+    error: &share::ShareError,
+) -> CliError {
+    let retained = retention_root.join("failed-snapshot");
+    if let Err(retention_error) = std::fs::rename(stage.path(), &retained) {
+        let original = stage.keep();
+        return CliError::Other(format!(
+            "{error}; cannot relocate failed private archive snapshot to {}: {retention_error}; original private stage retained at {}",
+            retained.display(),
+            original.display()
+        ));
+    }
+    let _original_name = stage.keep();
+    CliError::Other(format!(
+        "{error}; failed private archive snapshot retained at {}",
+        retained.display()
+    ))
 }
 
 fn archive_save_plan(
@@ -90266,8 +90546,15 @@ fn archive_save_plan(
         let source_db = PathBuf::from(resolve_sqlite_runtime_path(&source_db.to_string_lossy()));
         let storage_root = std::fs::canonicalize(storage_root)?;
         let archive_dir = archive_states_dir(false)?;
-        let excluded =
-            archive_save_storage_exclusions(&storage_root, &source_db, &archive_dir, false)?;
+        // Planning must work before the first save, without creating output
+        // or relaxing the executing save's existing-directory requirement.
+        let canonical_output = archive_recovery_normalize_path(&archive_dir, true)?;
+        let excluded = archive_save_storage_exclusions_for_resolved_output(
+            &storage_root,
+            &source_db,
+            &canonical_output,
+            false,
+        )?;
         progress.phase("storage_inventory")?;
         let inventory = inventory_archive_storage_with_policy(
             &storage_root,
@@ -90453,6 +90740,18 @@ fn archive_save_state_with_progress(
     let timestamp = timestamp.with_nanosecond(0).unwrap_or(timestamp);
     let base_name = compose_archive_basename(timestamp, &projects, &preset_str, label.as_deref());
     let destination = ensure_unique_archive_path(&archive_dir, &base_name)?;
+    // Neither the storage inventory nor the output ZIP directory may contain
+    // retained namespace evidence or failed private snapshot payloads.
+    let retention_parent = archive_snapshot_retention_parent(&archive_dir, storage_root)?;
+    let mut retention_builder = tempfile::Builder::new();
+    retention_builder.prefix(".archive-save-private.");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        retention_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let namespace_retention_root = retention_builder.tempdir_in(&retention_parent)?.keep();
 
     let preserve_full_schema = projects.is_empty() && matches!(preset, share::ScrubPreset::Archive);
     if preserve_full_schema {
@@ -90460,9 +90759,15 @@ fn archive_save_state_with_progress(
     }
     // Place the final image under the excluded output directory, even when
     // TMPDIR happens to be inside mailbox storage.
-    let temp_dir = tempfile::Builder::new()
-        .prefix("mailbox-archive-")
-        .tempdir_in(&archive_dir)?;
+    let mut snapshot_builder = tempfile::Builder::new();
+    snapshot_builder.prefix("mailbox-archive-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        snapshot_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let temp_dir = snapshot_builder.tempdir_in(&archive_dir)?;
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
 
     // A private save: the preset alone decides (the lossless `archive`
@@ -90492,9 +90797,22 @@ fn archive_save_state_with_progress(
             &projects,
             preset,
             share::SnapshotPurpose::PrivateArchive,
+            &namespace_retention_root,
             &mut |update| progress.snapshot(update),
         )
-    }?;
+    };
+    let context = match context {
+        Ok(context) => context,
+        Err(error) => {
+            // Retirement can restore witnesses to the stage. Retain that
+            // whole private failure outside output instead of dropping it.
+            return Err(preserve_failed_archive_snapshot(
+                temp_dir,
+                &namespace_retention_root,
+                &error,
+            ));
+        }
+    };
 
     if options.exclude_recovery {
         progress.phase("recovery_exclusion_check")?;
@@ -90562,6 +90880,7 @@ fn archive_save_state_with_progress(
 
     let metadata = serde_json::json!({
         "version": 1,
+        "private_retention_root": namespace_retention_root,
         "created_at": timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         "projects_requested": projects_requested,
         "projects_included": projects_included,
