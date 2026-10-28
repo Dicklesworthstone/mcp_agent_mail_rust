@@ -773,6 +773,22 @@ async fn privacy_query_rows(cx: &Cx, pool: &DbPool, sql: &str) -> Vec<sqlmodel_c
     }
 }
 
+fn privacy_rows_fingerprint(rows: &[sqlmodel_core::Row]) -> String {
+    // Row's Debug includes a randomly ordered name-to-index lookup cache.
+    // Preserve every ordered column name and every typed value separately,
+    // including privacy/future columns and even a column/value length mismatch.
+    let contents = rows
+        .iter()
+        .map(|row| {
+            (
+                row.column_names().collect::<Vec<_>>(),
+                row.values().collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("{contents:?}")
+}
+
 async fn privacy_snapshot(cx: &Cx, pool: &DbPool) -> String {
     let rows = privacy_query_rows(
         cx,
@@ -786,7 +802,11 @@ async fn privacy_snapshot(cx: &Cx, pool: &DbPool) -> String {
         "SELECT * FROM atc_experience_rollups ORDER BY stratum_key",
     )
     .await;
-    format!("{rows:?}\n{rollups:?}")
+    format!(
+        "{}\n{}",
+        privacy_rows_fingerprint(&rows),
+        privacy_rows_fingerprint(&rollups)
+    )
 }
 
 async fn assert_privacy_snapshot_unchanged(cx: &Cx, pool: &DbPool, before: &str) {
@@ -840,6 +860,64 @@ async fn seed_privacy_rollup(cx: &Cx, pool: &DbPool) {
     .await
     .into_result()
     .expect("seed nonempty rollup witness");
+}
+
+#[test]
+fn privacy_fingerprint_preserves_reopens_and_detects_real_cell_and_rollup_changes() {
+    for storage in [PrivacyStorage::File, PrivacyStorage::Memory] {
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+        let (cx, pool, dir) = setup_privacy_db(&rt, storage);
+        let _retained_dir = dir.map(tempfile::TempDir::keep);
+        rt.block_on(async {
+            append_atc_experience(
+                &cx,
+                &pool,
+                &make_probe_experience(2900, 2901, "GreenCastle"),
+            )
+            .await
+            .into_result()
+            .expect("append fingerprint control");
+            seed_privacy_rollup(&cx, &pool).await;
+            let before = privacy_snapshot(&cx, &pool).await;
+            for _ in 0..3 {
+                assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+            }
+
+            // This persisted field is absent from ExperienceRow: reducing the
+            // witness to that model would miss the planted one-cell mutation.
+            let sql = "UPDATE atc_experiences SET privacy_classification = 'metadata_only'";
+            let changed = if pool.sqlite_path() == ":memory:" {
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("memory writer");
+                conn.execute_sync(sql, &[])
+                    .expect("change real privacy cell")
+            } else {
+                let path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(pool.sqlite_path());
+                let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path)
+                    .expect("independent sidecar writer");
+                conn.execute_sync(sql, &[])
+                    .expect("change real privacy cell")
+            };
+            assert_eq!(changed, 1, "control must change exactly one stored row");
+            let after_cell = privacy_snapshot(&cx, &pool).await;
+            assert!(
+                before != after_cell,
+                "fingerprint missed a persisted privacy cell"
+            );
+            assert_privacy_snapshot_unchanged(&cx, &pool, &after_cell).await;
+
+            seed_privacy_rollup(&cx, &pool).await;
+            let after_rollup = privacy_snapshot(&cx, &pool).await;
+            assert!(
+                after_cell != after_rollup,
+                "fingerprint missed a real rollup update"
+            );
+            assert_privacy_snapshot_unchanged(&cx, &pool, &after_rollup).await;
+        });
+    }
 }
 
 fn privacy_outcome() -> ExperienceOutcome {
@@ -1764,14 +1842,13 @@ fn check_message_outcome_ack_dominance(storage: PrivacyStorage) {
         // Keep a nonempty rollup witness: resolving or upgrading a row must not
         // independently count a second observation or alter accumulated losses.
         seed_privacy_rollup(&cx, &pool).await;
-        let rollups_before = format!(
-            "{:?}",
-            privacy_query_rows(
+        let rollups_before = privacy_rows_fingerprint(
+            &privacy_query_rows(
                 &cx,
                 &pool,
-                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key"
+                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key",
             )
-            .await
+            .await,
         );
         let mut decision_id = 7000;
         for initial_state in [ExperienceState::Executed, ExperienceState::Open] {
@@ -1895,14 +1972,13 @@ fn check_message_outcome_ack_dominance(storage: PrivacyStorage) {
         );
         assert_privacy_snapshot_unchanged(&cx, &pool, &before_unrelated_ack).await;
         assert_stored_message_outcome(&cx, &pool, unrelated_id, &unrelated).await;
-        let rollups_after = format!(
-            "{:?}",
-            privacy_query_rows(
+        let rollups_after = privacy_rows_fingerprint(
+            &privacy_query_rows(
                 &cx,
                 &pool,
-                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key"
+                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key",
             )
-            .await
+            .await,
         );
         assert!(
             rollups_before == rollups_after,

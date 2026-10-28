@@ -1053,15 +1053,15 @@ fn e2e_opt_in_atc_rejects_content_on_real_http_observation_path() {
             let resolved = get_message_sent_row(&runtime, &cx, &pool, message_id);
             assert_eq!(resolved.state.to_string(), "resolved");
             assert_eq!(resolved.outcome.as_ref().unwrap().label, "acknowledged");
-            let rollups_before = runtime
-                .block_on(query_rollups(&cx, &pool))
-                .into_result()
-                .expect("rollups after real acknowledgement");
+            // The HTTP path persists the raw outcome; materialized rollups
+            // refresh on the operator's five-minute cadence. Exercise that
+            // real maintenance seam explicitly before checking its aggregates.
+            let rollups_before = refresh_and_read_rollups(&runtime, &cx, &pool);
             assert!(
                 rollups_before
                     .iter()
                     .any(|rollup| rollup.resolved_count >= 1 && rollup.correct_count >= 1),
-                "ordinary HTTP acknowledgement must update the real rollup"
+                "real rollup refresh must include the HTTP acknowledgement"
             );
 
             // Thread IDs enter generated observation context. This follows

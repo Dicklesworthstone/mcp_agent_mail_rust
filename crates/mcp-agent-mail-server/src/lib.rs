@@ -23599,6 +23599,21 @@ first body
         );
     }
 
+    fn atc_rows_fingerprint(rows: &[mcp_agent_mail_db::sqlmodel_core::Row]) -> String {
+        // Keep the complete ordered schema and typed cells, not Row's Debug
+        // representation of its freshly randomized column lookup HashMap.
+        let contents = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.column_names().collect::<Vec<_>>(),
+                    row.values().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("{contents:?}")
+    }
+
     fn reopened_atc_content_snapshot(primary_path: &str) -> String {
         let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary_path);
         let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
@@ -23612,7 +23627,98 @@ first body
                 &[],
             )
             .expect("read persisted ATC rollups");
-        format!("{rows:?}\n{rollups:?}")
+        format!(
+            "{}\n{}",
+            atc_rows_fingerprint(&rows),
+            atc_rows_fingerprint(&rollups)
+        )
+    }
+
+    #[test]
+    fn reopened_atc_fingerprint_is_stable_and_detects_real_privacy_and_rollup_cells() {
+        let dir = tempfile::tempdir().expect("fingerprint fixture").keep();
+        let db_path = dir.join("atc-fingerprint.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let pool = create_pool(&DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_str}"),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("private fingerprint pool");
+        let cx = Cx::for_testing();
+        let row = sample_resolution_experience(1_700_000_000_000_000, None, None);
+        block_on(mcp_agent_mail_db::queries::append_atc_experience(
+            &cx, &pool, &row,
+        ))
+        .into_result()
+        .expect("append fingerprint control");
+        block_on(mcp_agent_mail_db::queries::update_atc_experience_rollup(
+            &cx,
+            &pool,
+            "liveness:probe:0",
+            "liveness",
+            "probe",
+            0,
+            ExperienceState::Resolved,
+            true,
+            0.5,
+            0.0,
+            200_000,
+            1_700_000_000_500_000,
+        ))
+        .into_result()
+        .expect("seed nonempty fingerprint rollup");
+        let before = reopened_atc_content_snapshot(&db_path_str);
+        for _ in 0..3 {
+            assert!(
+                reopened_atc_content_snapshot(&db_path_str) == before,
+                "unchanged independent reopen changed the fingerprint"
+            );
+        }
+
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&db_path_str);
+        {
+            let writer = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+                .expect("private fingerprint writer");
+            let changed = writer
+                .execute_sync(
+                    "UPDATE atc_experiences SET privacy_classification = 'metadata_only'",
+                    &[],
+                )
+                .expect("change persisted field absent from ExperienceRow");
+            assert_eq!(changed, 1, "control must change exactly one stored row");
+        }
+        let after_cell = reopened_atc_content_snapshot(&db_path_str);
+        assert!(
+            before != after_cell,
+            "fingerprint missed a real privacy cell mutation"
+        );
+        assert!(
+            reopened_atc_content_snapshot(&db_path_str) == after_cell,
+            "mutated row must remain stable across independent reopens"
+        );
+        {
+            let writer = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+                .expect("private rollup fingerprint writer");
+            let changed = writer
+                .execute_sync(
+                    "UPDATE atc_experience_rollups SET total_count = total_count + 1",
+                    &[],
+                )
+                .expect("change a persisted rollup cell");
+            assert_eq!(changed, 1, "control must change exactly one rollup row");
+        }
+        let after_rollup = reopened_atc_content_snapshot(&db_path_str);
+        assert!(
+            after_cell != after_rollup,
+            "fingerprint missed a real rollup cell mutation"
+        );
+        assert!(
+            reopened_atc_content_snapshot(&db_path_str) == after_rollup,
+            "mutated rollup must remain stable across independent reopens"
+        );
     }
 
     fn reopened_atc_message_outcome(primary_path: &str) -> ExperienceOutcome {
@@ -24771,7 +24877,27 @@ first body
 
     #[test]
     fn dispatch_request_contact_preserves_contact_parameter_names() {
-        with_serialized_tool_dispatch_env(&[], |project_key| {
+        with_serialized_tool_dispatch_env(&[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "0")], |_| {
+            // Use the real checkout as the project; the helper still isolates
+            // every mailbox/archive write, with ephemeral-root protection on.
+            let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("workspace root")
+                .canonicalize()
+                .expect("existing project root");
+            assert!(project_root.is_dir());
+            assert!(!mcp_agent_mail_core::ephemeral::path_has_ephemeral_root(
+                &project_root
+            ));
+            let project_key = project_root
+                .to_str()
+                .expect("project root UTF-8")
+                .to_string();
+            assert!(!mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(
+                &project_key
+            ));
+            assert!(!mcp_agent_mail_core::ephemeral::ephemeral_project_roots_allowed());
             let config = mcp_agent_mail_core::Config::from_env();
             let state = build_state(config);
 
@@ -34325,9 +34451,15 @@ first body
                         assert!(final_outcome.correct);
                         let acknowledged_snapshot = reopened_atc_content_snapshot(&db_path_str);
                         if competing == "acknowledged" {
-                            assert_eq!(acknowledged_snapshot, competing_snapshot);
+                            assert!(
+                                acknowledged_snapshot == competing_snapshot,
+                                "the winning ACK must preserve every stored cell"
+                            );
                         } else {
-                            assert_ne!(acknowledged_snapshot, competing_snapshot);
+                            assert!(
+                                acknowledged_snapshot != competing_snapshot,
+                                "ACK upgrade must change the stored outcome"
+                            );
                         }
                         let resolved_count = before_metrics.experiences_resolved_total + 1;
                         let after_metrics = mcp_agent_mail_core::global_metrics().atc.snapshot();
@@ -34358,9 +34490,8 @@ first body
                             );
                         }
                         sweep_open_experiences_for_resolution(&pool, now, i64::MAX / 4);
-                        assert_eq!(
-                            reopened_atc_content_snapshot(&db_path_str),
-                            acknowledged_snapshot,
+                        assert!(
+                            reopened_atc_content_snapshot(&db_path_str) == acknowledged_snapshot,
                             "replayed feedback must preserve persisted rows and rollups"
                         );
                         assert_eq!(
@@ -34476,7 +34607,10 @@ first body
                         4,
                         "each rejected signal must report only its static category"
                     );
-                    assert_eq!(reopened_atc_content_snapshot(&db_path_str), baseline);
+                    assert!(
+                        reopened_atc_content_snapshot(&db_path_str) == baseline,
+                        "rejected feedback changed stored rows or rollups"
+                    );
                 },
             );
         }
