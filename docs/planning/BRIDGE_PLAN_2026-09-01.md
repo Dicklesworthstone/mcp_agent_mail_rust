@@ -1,5 +1,55 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## October 28 implementation follow-through (12:35 UTC)
+
+The October 27 assessment below is historical. Its actionable crypto, compiler,
+schema-rebuild and recovery-owner defects now have implementation and scoped native
+evidence. The project still fails the original large-archive recovery and snapshot
+metadata gates; these repairs do not establish release readiness.
+
+- Real official-age 1.2.1 interoperability passes through a prepared normal production
+  `am`: 18 detailed cases, 32 commands and five publication races, plus separately
+  executed missing-input and conflicting-option controls. Exact candidate SHA-256 is
+  `3f278c873b714562f395f445f06907b314daf234e5607589bf56b57e855f339b`.
+  Passphrase whitespace/TAB, identity/default-output positives and tamper/wrong-secret/
+  overwrite refusals retain byte witnesses. `.48` is closed; native Windows publication
+  evidence remains required by `.49`.
+- The original archive-save failures now pass real save/restore/scope/scrub paths in a
+  536/536 CLI library batch. Private snapshot namespace evidence stays outside published
+  payloads, and handoff failures retain their stages. `.58` remains open while dedicated
+  lower-level handoff/rollback coverage runs.
+- Legacy schema migration preserves the exact owned external cursor trigger and later
+  columns/indexes/triggers, rejects unsupported definitions before data loss, and retains
+  rollback/retry controls. Original decisive DB cases passed; `.60` is closed. This does
+  not repair `.52`'s retained `user_version` 231-to-0 engine failure.
+- Initializing-owner recovery and failed namespace promotions have real positive and
+  rollback evidence (`.61`). The original 400-message startup keeper now uses separate
+  cold child processes (`.64`), without presenting mixed live-engine checkpoints as an
+  engine-corruption proof. Real unprivileged reader/readonly controls execute through
+  retained ELF authority on Linux RCH targets (`.65`).
+- A real one-slot pool timeout exposed a separate MCP conversion defect. The mapper now
+  preserves the existing pool-exhaustion classification without widening classifiers,
+  retries or identity policy. The entire tools library passes 1,160/1,160 with zero
+  skipped; `.66` is closed. The merged storage library passes 928/928 with two unchanged
+  skips. These are named component results, not their sum presented as a workspace pass.
+- Strict all-target, production lib/bins, Clippy and formatting checks pass on final code
+  manifest `4f7c83559aabe4d8dd07d4fafecdcf4e51bfad14a5d7dbbfedd85586a9427945`.
+  Native tools/workspace snapshot `581ea000…` precedes only three explanatory UBS comments
+  and an equivalent ATC branch inversion. Static scans have zero critical findings with
+  substantial warnings retained. The full current native workspace lane is still running;
+  `.53`, `.57`, `.59` and `.62` remain open for their complete acceptance.
+- The release oracle now compares durable contents passively after workers stop, rather
+  than polling MCP and trusting equal counts. Forty oracle tests pass; an actual equal-
+  count/changed-body negative exposes the former false positive. Candidate and incumbent
+  still fail the original release workload; retained orphan 20195 misses the unchanged
+  300-second bound. `.35`, `.63`, qualified upstream-engine adoption, native-platform and
+  remaining authority/performance work stay open. No application performance win is claimed.
+
+Implementation and scoped receipts are linked from the corresponding Beads. Detailed
+logs and the requested granular TODO are retained under `/tmp/am-agency-20261027/`;
+they are host-local evidence, not portable release certification. Verification here is
+self-reverification with bounded peer source review, not independent runtime certification.
+
 ## October 27, 2026 assessment (source aed1b90b; published v0.3.39)
 
 **Agent Mail is a real, useful coordination product, but it is not finished or fully
