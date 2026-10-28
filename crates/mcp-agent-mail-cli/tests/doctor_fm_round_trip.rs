@@ -38,7 +38,7 @@ fn run_undo(
     run_undo_with_scopes(target, run_id, dry_run, strict, &[target.to_path_buf()])
 }
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -184,7 +184,7 @@ fn assert_byte_identical(
             diff.push_str(&format!(" - extra in actual: {}\n", path.display()));
         }
     }
-    panic!("{label} round-trip not byte-identical:\n{diff}");
+    panic!("{label} round-trip not byte-identical:\n{diff}"); // ubs:ignore — integration-test assertion helper is compiled only by tests/it.rs; a real byte/mode/inventory mismatch must fail
 }
 
 #[test]
@@ -295,6 +295,9 @@ fn round_trip_wrong_mcp_url_json_op_write_file() {
 }
 "#;
     fs::write(&cfg, original_body).expect("plant mcp.json");
+    let original_metadata = fs::symlink_metadata(&cfg).expect("original config metadata");
+    assert!(original_metadata.is_file());
+    assert_eq!(original_metadata.nlink(), 1);
 
     let pre_fix = snapshot_tree(td.path(), true);
     let pre_body = pre_fix
@@ -316,7 +319,9 @@ fn round_trip_wrong_mcp_url_json_op_write_file() {
         ..empty_inputs(&td)
     };
 
+    let started_us = mcp_agent_mail_core::timestamps::now_micros();
     let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    let completed_us = mcp_agent_mail_core::timestamps::now_micros();
     assert_eq!(outcome.actions_taken, 1);
 
     let post_fix_body = fs::read_to_string(&cfg).unwrap();
@@ -329,6 +334,45 @@ fn round_trip_wrong_mcp_url_json_op_write_file() {
         "post-fix body must differ from original"
     );
 
+    // Atomic exchange deliberately retains the displaced original beside the
+    // live config. Admit this one witnessed artifact, preserving the complete
+    // inventory oracle for every other path and for the artifact after undo.
+    let post_fix = snapshot_tree(td.path(), true);
+    let added: Vec<_> = post_fix
+        .iter()
+        .filter(|(path, _, _)| !pre_fix.iter().any(|(before, _, _)| before == path))
+        .collect();
+    assert_eq!(added.len(), 1, "only the displaced original may be added");
+    let retained = added[0];
+    assert_eq!(retained.0.components().count(), 1);
+    let prefix = format!(".mcp.json.{}.", std::process::id());
+    let name = retained.0.to_str().expect("retained config filename");
+    let fields: Vec<_> = name
+        .strip_prefix(&prefix)
+        .expect("retained filename identifies this config and process")
+        .split('.')
+        .collect();
+    assert_eq!(fields.len(), 3);
+    let retained_us: i64 = fields[0].parse().expect("retained timestamp");
+    assert_eq!(fields[0], retained_us.to_string());
+    assert!((started_us..=completed_us).contains(&retained_us));
+    let attempt: u16 = fields[1].parse().expect("retained collision attempt");
+    assert_eq!(fields[1], attempt.to_string());
+    assert!(attempt < 1024);
+    assert_eq!(fields[2], "replaced");
+    let retained_path = td.path().join(&retained.0);
+    let retained_metadata =
+        fs::symlink_metadata(&retained_path).expect("retained original metadata");
+    assert!(retained_metadata.is_file());
+    assert_eq!(retained_metadata.nlink(), 1);
+    assert_eq!(retained_metadata.dev(), original_metadata.dev());
+    assert_eq!(retained_metadata.ino(), original_metadata.ino());
+    assert!(retained.1 == original_body.as_bytes());
+    assert_eq!(retained.2, original_metadata.permissions().mode() & 0o777);
+    let mut expected_post_undo = pre_fix.clone();
+    expected_post_undo.push(retained.clone());
+    expected_post_undo.sort_by(|a, b| a.0.cmp(&b.0));
+
     drop(ctx);
 
     let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
@@ -339,7 +383,12 @@ fn round_trip_wrong_mcp_url_json_op_write_file() {
     );
 
     let post_undo = snapshot_tree(td.path(), true);
-    assert_byte_identical("wrong_mcp_url_json", &pre_fix, &post_undo);
+    assert_byte_identical("wrong_mcp_url_json", &expected_post_undo, &post_undo);
+    let retained_after =
+        fs::symlink_metadata(&retained_path).expect("retained original survives undo");
+    assert_eq!(retained_after.dev(), original_metadata.dev());
+    assert_eq!(retained_after.ino(), original_metadata.ino());
+    assert_eq!(retained_after.nlink(), 1);
 }
 
 #[test]

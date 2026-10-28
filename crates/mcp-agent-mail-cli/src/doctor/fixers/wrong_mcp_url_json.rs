@@ -299,6 +299,15 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx_for(td: &TempDir, run_id: &str) -> MutateContext {
+        crate::doctor::ensure_private_test_git_root(td.path());
+        let ignore = td.path().join(".gitignore");
+        if !ignore.exists() {
+            fs::write(
+                &ignore,
+                b"/config.json\n/claude.json\n/.config.json.*\n/.claude.json.*\n/config.json.bak*\n/claude.json.bak*\n/.doctor/\n",
+            )
+            .unwrap();
+        }
         let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)

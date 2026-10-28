@@ -1365,6 +1365,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn make_ctx(td: &TempDir, run_id: &str) -> MutateContext {
+        crate::doctor::ensure_private_test_git_root(td.path());
         let run_dir = td.path().join(".doctor").join("runs").join(run_id);
         fs::create_dir_all(run_dir.join("backups")).unwrap();
         let actions = OpenOptions::new()
@@ -2679,18 +2680,34 @@ mod tests {
     fn transform_file_checks_backup_worktree_for_home_config_secrets() {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
+        crate::doctor::ensure_private_test_git_root(home.path());
+        let home_ignore = home.path().join(".gitignore");
+        let home_ignore_rules = b"/config.json\n/.config.json.*\n/config.json.bak*\n";
+        fs::write(&home_ignore, home_ignore_rules).unwrap();
         config_test_git(workspace.path(), &["init", "-q"]);
         let target = home.path().join("config.json");
-        fs::write(&target, br#"{"token":"old-private-value"}"#).unwrap();
+        let original = br#"{"token":"old-private-value"}"#;
+        fs::write(&target, original).unwrap();
         let mut ctx = make_ctx(&workspace, "2026-10-23T00-00-04Z__backup_exposure");
         ctx.capabilities
             .write_scopes
             .push(home.path().to_path_buf());
+        assert!(!workspace.path().join(".gitignore").exists());
         let replacement = br#"{"token":"new-private-value"}"#;
         let result = transform_config_file(&ctx, &target, 0o600, true, |_| {
             Ok(Some(replacement.to_vec()))
         });
-        assert!(result.unwrap_err().to_string().contains("does not protect"));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("does not protect"), "{error}");
+        assert!(
+            error.contains(".doctor/") && error.contains("/backups/"),
+            "the unprotected workspace backup must cause refusal: {error}"
+        );
+        assert!(!error.contains("old-private-value"));
+        assert!(!error.contains("new-private-value"));
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert_eq!(fs::read(&home_ignore).unwrap(), home_ignore_rules);
+        assert!(!workspace.path().join(".gitignore").exists());
         assert!(
             fs::read(ctx.run_dir.join("actions.jsonl"))
                 .unwrap()
@@ -2707,5 +2724,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(fs::read(&target).unwrap(), replacement);
+        assert_eq!(fs::read(&home_ignore).unwrap(), home_ignore_rules);
+        assert_eq!(
+            fs::read(workspace.path().join(".gitignore")).unwrap(),
+            b"/.doctor/\n"
+        );
     }
 }

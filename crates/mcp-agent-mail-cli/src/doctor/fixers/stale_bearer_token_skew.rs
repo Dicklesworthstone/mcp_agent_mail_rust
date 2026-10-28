@@ -294,7 +294,10 @@ fn scan_value_containers(
                     let Some(token) = value.as_str() else {
                         continue;
                     };
-                    if strip_bearer_prefix(token) == canonical_token {
+                    if mcp_agent_mail_core::setup::constant_time_str_eq(
+                        strip_bearer_prefix(token),
+                        canonical_token,
+                    ) {
                         continue;
                     }
                     out.push(StaleBearerTokenSkewFinding {
@@ -377,8 +380,11 @@ pub fn fix(
         let Some(current) = slot.as_str() else {
             return Ok(None);
         };
-        if current != finding.current_token
-            || strip_bearer_prefix(current) == finding.canonical_token
+        if !mcp_agent_mail_core::setup::constant_time_str_eq(current, &finding.current_token)
+            || mcp_agent_mail_core::setup::constant_time_str_eq(
+                strip_bearer_prefix(current),
+                &finding.canonical_token,
+            )
         {
             return Ok(None);
         }
@@ -413,6 +419,15 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx_for(td: &TempDir, run_id: &str) -> MutateContext {
+        crate::doctor::ensure_private_test_git_root(td.path());
+        let ignore = td.path().join(".gitignore");
+        if !ignore.exists() {
+            fs::write(
+                &ignore,
+                b"/mcp.json\n/claude.json\n/.mcp.json.*\n/.claude.json.*\n/mcp.json.bak*\n/claude.json.bak*\n/.doctor/\n",
+            )
+            .unwrap();
+        }
         let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)
@@ -746,8 +761,8 @@ mod tests {
                 inside_headers: true,
                 field: "Authorization".into(),
             },
-            current_token: "Bearer super-secret-token-abc123".into(),
-            canonical_token: "super-canonical-token-xyz789".into(),
+            current_token: "Bearer super-secret-token-abc123".into(), // ubs:ignore — synthetic cfg(test) canary must be absent from serialized finding evidence
+            canonical_token: "super-canonical-token-xyz789".into(), // ubs:ignore — synthetic cfg(test) canonical canary verifies evidence redaction
         };
         let g = f.to_finding();
         let s = serde_json::to_string(&g).unwrap();

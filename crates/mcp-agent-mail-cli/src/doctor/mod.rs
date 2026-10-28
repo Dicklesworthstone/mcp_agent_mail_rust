@@ -1934,7 +1934,7 @@ fn canonical_mcp_url_for_config(config: &Config) -> String {
 /// `git` isn't on PATH (the known-bad-git FM is unreachable in that case).
 fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::DetectInputs> {
     use std::process::Command;
-    let which_git = Command::new("sh")
+    let which_git = Command::new("sh") // ubs:ignore — fixed literal command below has no interpolated input; this local doctor resolves the operator's PATH git
         .arg("-c")
         .arg("command -v git")
         .output()
@@ -1947,7 +1947,7 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
             .trim()
             .to_string(),
     );
-    let out = Command::new(&system_git_path)
+    let out = Command::new(&system_git_path) // ubs:ignore — executable is the operator's PATH git resolved by the fixed command above, not request content
         .arg("--version")
         .output()
         .ok()?;
@@ -1959,7 +1959,7 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
     let am_git_binary_env = mcp_agent_mail_core::config::infra_env_value("AM_GIT_BINARY");
     let am_git_binary_version = am_git_binary_env
         .as_deref()
-        .and_then(|path| Command::new(path).arg("--version").output().ok())
+        .and_then(|path| Command::new(path).arg("--version").output().ok()) // ubs:ignore — AM_GIT_BINARY is an explicit trusted local executable override being diagnosed
         .filter(|output| output.status.success())
         .map(|output| git_version_text_from_stdout(&String::from_utf8_lossy(&output.stdout)));
     Some(fixers::known_bad_git_no_override::DetectInputs {
@@ -4106,6 +4106,43 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+fn ensure_private_test_git_root(root: &Path) {
+    // RCH places TMPDIR inside its checkout. A fixture must own its nearest
+    // Git authority instead of contending on that enclosing repository's
+    // nonblocking mutation guard. Preserve explicitly prepared repositories.
+    if !root.join(".git").exists() {
+        let initialized = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["init", "-q"])
+            .output()
+            .expect("initialize private doctor fixture repository");
+        assert!(
+            initialized.status.success(),
+            "fixture git init failed: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+    }
+    let discovered = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .expect("discover doctor fixture Git authority");
+    assert!(
+        discovered.status.success(),
+        "fixture Git discovery failed: {}",
+        String::from_utf8_lossy(&discovered.stderr)
+    );
+    let discovered = String::from_utf8(discovered.stdout).expect("fixture Git root is UTF-8");
+    assert_eq!(
+        std::fs::canonicalize(discovered.trim()).unwrap(),
+        std::fs::canonicalize(root).unwrap(),
+        "doctor fixture must not inherit an enclosing Git authority"
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4919,7 +4956,7 @@ mod tests {
         let release_path = td.path().join("holder.release");
         let test_exe = std::env::current_exe().expect("resolve doctor test executable");
 
-        let holder = std::process::Command::new(&test_exe)
+        let holder = std::process::Command::new(&test_exe) // ubs:ignore — cfg(test) reexecutes std::env::current_exe for the real cross-process lock witness
             .arg(FIX_ONLY_LOCK_HOLDER_TEST)
             .arg("--exact")
             .arg("--nocapture")
@@ -4949,7 +4986,7 @@ mod tests {
             fixers::reservation_db_archive_parity::FM_ID,
             fixers::reservation_artifact_normalize::FM_ID,
         ] {
-            let output = std::process::Command::new(&test_exe)
+            let output = std::process::Command::new(&test_exe) // ubs:ignore — cfg(test) current_exe reexecutes this integration probe against the owned private mailbox
                 .arg(FIX_ONLY_LOCK_INVOKER_TEST)
                 .arg("--exact")
                 .arg("--nocapture")
@@ -5402,25 +5439,34 @@ mod tests {
             converging_active.contains("reconciling 8 active reservation(s)"),
             "{converging_active}"
         );
-        for (label, progress) in [
-            ("absent", None),
+        for (label, progress, expected_detail) in [
+            (
+                "absent",
+                None,
+                "active reservation(s) missing archive artifact(s)",
+            ),
             (
                 "stale pass",
                 Some(active_progress(now - 11 * minute, Some(now - 11 * minute))),
+                "active reservation(s) missing archive artifact(s)",
             ),
             (
                 "no recent repair",
                 Some(active_progress(now - minute, Some(now - 30 * minute))),
+                "missing active reservation artifact(s)",
             ),
-            ("never repaired", Some(active_progress(now - minute, None))),
+            (
+                "never repaired",
+                Some(active_progress(now - minute, None)),
+                "missing active reservation artifact(s)",
+            ),
         ] {
             let stalled =
                 reservation_parity_reconciling(&pending_active, None, progress.as_ref(), now)
                     .expect_err(label)
                     .expect("pending active repairs get a reason");
             assert!(
-                stalled.contains("active reservation(s) missing archive artifact(s)")
-                    && stalled.contains("am doctor fix --only"),
+                stalled.contains(expected_detail) && stalled.contains("am doctor fix --only"),
                 "{label}: {stalled}"
             );
         }
