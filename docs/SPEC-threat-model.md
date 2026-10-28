@@ -1,6 +1,6 @@
 # SPEC: Threat Model
 
-**Status:** living security posture document as of 2026-04-18
+**Status:** living security posture document as of 2026-04-18; authentication-default description reconciled 2026-10-27
 
 This document consolidates the security posture for MCP Agent Mail so security
 reviews do not have to reconstruct it from scattered auth notes, installer
@@ -11,6 +11,12 @@ The default deployment assumption is a single-user or tightly trusted local
 operator environment. HTTP is expected to be localhost-only or behind a trusted
 HTTPS terminator. SQLite, the Git archive, and env files rely on normal OS
 account boundaries and disk controls for confidentiality at rest.
+
+HTTP authentication is off when neither a bearer token nor JWT auth is
+configured. Configuring either enables the HTTP auth gate; the guarded
+localhost bypass is a separate explicit opt-in. This trusted-local mode does
+not provide hostile same-account isolation. Configure auth and external TLS
+before exposing the server beyond loopback; see [`SECURITY.md`](../SECURITY.md).
 
 ## Assets
 
@@ -43,7 +49,7 @@ account boundaries and disk controls for confidentiality at rest.
 | Surface | Trust boundary | Main risks |
 |---|---|---|
 | MCP transport (`stdio`, HTTP MCP) | Client-to-server command execution boundary | auth bypass, bearer-token disclosure, request replay, route confusion |
-| `/mail/*` web UI routes | Browser-facing human oversight surface authenticated via bearer or JWT | unauthorized access, XSS-style rendering bugs, token leakage via logs or browser history |
+| `/mail/*` web UI routes | Browser-facing human oversight surface sharing the configured HTTP auth boundary | unauthorized access, XSS-style rendering bugs, token leakage via logs or browser history |
 | `/web-dashboard/*` routes | Deferred browser-mirror namespace, not a supported production surface today | stale unaudited code path, accidental reactivation without security review |
 | CLI commands reading config or archive state | Local operator and agent shell boundary | token leakage via env files or shell history, over-broad local reads |
 | Git archive files and permissions | Filesystem boundary for durable mailbox artifacts | symlink/path confusion, local disclosure, tampering |
@@ -56,7 +62,7 @@ account boundaries and disk controls for confidentiality at rest.
 
 | Surface | Existing mitigation | Current coverage / gap |
 |---|---|---|
-| HTTP transport | Bearer token via `HTTP_BEARER_TOKEN`; localhost unauthenticated mode is explicit opt-in | `✓` Auth required by default; network confidentiality still depends on localhost-only deployment or external TLS |
+| HTTP transport | Configured bearer token via `HTTP_BEARER_TOKEN` or JWT; localhost bypass is explicit opt-in when auth is configured | `✓` Configured auth is enforced unless the guarded local bypass applies; with neither credential mechanism configured, auth is off for trusted-local operation. Network confidentiality still depends on localhost-only deployment or external TLS |
 | JWT auth | Shared-secret or JWKS verification with `kid` handling, startup validation, and regression tests | `✓` Present; JWT configuration mistakes remain operator-sensitive and require review when auth semantics change |
 | `/mail/*` routes | Same auth boundary as HTTP transport plus tested route-specific denial behavior | `✓` Present; browser token handling and rendered-output review remain ongoing responsibilities |
 | `/web-dashboard/*` routes | Deferred status documented; not a supported reviewed surface in current docs | Gap by design; any reactivation must update this threat model and complete `br-il53l.8` or successor review work |

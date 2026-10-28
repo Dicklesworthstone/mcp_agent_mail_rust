@@ -155,23 +155,105 @@ fn share_decrypt_rejects_identity_plus_passphrase() {
 }
 
 fn try_generate_age_identity(dir: &Path) -> Option<(PathBuf, String)> {
+    for tool in ["age", "age-keygen"] {
+        match Command::new(tool).arg("--version").output() {
+            // ubs:ignore -- fixed allowlist above: age and age-keygen only.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("failed to start {tool}: {error}"), // ubs:ignore -- test helper must fail for a present but broken tool.
+            Ok(output) => assert!(output.status.success(), "{tool} --version failed"),
+        }
+    }
     let identity_path = dir.join("identity.txt");
     let out = Command::new("age-keygen")
         .arg("-o")
         .arg(&identity_path)
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
+        .expect("start available age-keygen");
+    assert!(
+        out.status.success(),
+        "age-keygen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let combined =
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     let recipient = combined
         .lines()
-        .find(|line| line.contains("public key:"))
+        .find(|line| line.to_ascii_lowercase().contains("public key:"))
         .and_then(|line| line.split_whitespace().last())
-        .map(|s| s.to_string())?;
+        .map(str::to_string)
+        .expect("age-keygen must report its public key");
     Some((identity_path, recipient))
+}
+
+#[test]
+fn share_decrypt_passphrase_preserves_whitespace_and_rejects_wrong_secret() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    // Official age v1.2.1 ciphertext. Keep this end-to-end CLI regression
+    // independent of the Rust encryptor and of an optional age executable.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(concat!(
+            "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHNjcnlwdCBNZGJyRWUyMTI1OXhXZklGMDVnZVFRIDE4ClFO",
+            "SjZGQnZZbnp3VlU3VVR2TDMrL21ZYUJKeTJSenZoVjFua2FtcGNGMWMKLS0tIEZWNDJqTzEwVjM0c1h0",
+            "ZUFBMTlkUlRWd2ZsUi9WUys3WEpVVFdBdUR0d3MKsV8E3CJaZMgKjOXYwp4It0psXeYtkfYemRI/oVyB",
+            "kWMY8joJnxn3SyEUH5cxO836hifUup82nCMgHJlSWY9Mn4K0UN8EtPuxan7KEZ8="
+        ))
+        .expect("official age ciphertext");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let encrypted = dir.path().join("official.age");
+    std::fs::write(&encrypted, &bytes).expect("write ciphertext");
+    for (index, secret) in [
+        "am-share interoperability passphrase  \t",
+        "wrong passphrase",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let output = dir.path().join(format!("plaintext-{index}"));
+        let mut child = Command::new(am_bin())
+            .args([
+                "share",
+                "decrypt",
+                encrypted.to_str().expect("UTF8 path"),
+                "--passphrase",
+                "--output",
+                output.to_str().expect("UTF8 path"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start actual am");
+        let mut stdin = child.stdin.take().expect("passphrase pipe");
+        stdin
+            .write_all(secret.as_bytes())
+            .expect("supply secret in memory");
+        stdin.write_all(b"\r\n").expect("transport line terminator");
+        drop(stdin);
+        let result = child.wait_with_output().expect("wait for am");
+        assert!(!String::from_utf8_lossy(&result.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&result.stderr).contains(secret));
+        if index == 0 {
+            assert!(
+                result.status.success(),
+                "passphrase decryption failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                std::fs::read(&output).expect("published plaintext"),
+                b"Agent Mail age interoperability regression\0\xff\n"
+            );
+        } else {
+            assert!(!result.status.success());
+            assert!(!output.exists(), "wrong secret must not publish plaintext");
+        }
+    }
+    assert_eq!(
+        std::fs::read(encrypted).expect("unchanged ciphertext"),
+        bytes
+    );
 }
 
 #[test]
@@ -179,20 +261,19 @@ fn share_decrypt_roundtrip_identity_default_output() {
     // Requires age + age-keygen CLIs.
     let dir = tempfile::tempdir().expect("tempdir");
     let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
-        eprintln!("Skipping: age-keygen not available");
+        eprintln!("Skipping: age or age-keygen not installed");
         return;
     };
 
     let input = dir.path().join("bundle.zip");
     std::fs::write(&input, b"test bundle data").expect("write input");
 
-    let encrypted = match mcp_agent_mail_share::encrypt_with_age(&input, &[recipient]) {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("Skipping: age CLI not available");
-            return;
-        }
-    };
+    let generated = mcp_agent_mail_share::encrypt_with_age(&input, &[recipient])
+        .expect("available age must encrypt successfully");
+    let ciphertext_dir = dir.path().join("ciphertext");
+    std::fs::create_dir(&ciphertext_dir).expect("create ciphertext directory");
+    let encrypted = ciphertext_dir.join("bundle.zip.age");
+    std::fs::rename(generated, &encrypted).expect("move ciphertext, retaining original plaintext");
 
     // Omit -o to exercise default output path behavior.
     let out = run_am(&[

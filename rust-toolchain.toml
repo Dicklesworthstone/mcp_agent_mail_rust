@@ -1,5 +1,5 @@
 [toolchain]
-# The pinned compiler provides Rust 1.100, required by the fastmcp 0.7.1
+# The pinned compiler provides Rust 1.100, required by the fastmcp 0.13.0
 # registry dependency and declared in the workspace package metadata.
 channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]

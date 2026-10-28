@@ -2749,7 +2749,9 @@ pub struct MessageDetails {
     pub bcc: Vec<String>,
 }
 
-/// Get full message details. Opt-in `context=true` returns the versioned,
+/// Get full message details.
+///
+/// Opt-in `context=true` returns the versioned,
 /// bounded read snapshot used by `am robot message --server`, including
 /// acknowledgement counts, sender metadata and neighbouring thread messages.
 #[resource(
@@ -2882,7 +2884,9 @@ fn context_snapshot_json(snapshot: &impl Serialize) -> McpResult<String> {
     Ok(json)
 }
 
-/// Get thread messages. Opt-in `context=true` returns a complete, bounded
+/// Get thread messages.
+///
+/// Opt-in `context=true` returns a complete, bounded
 /// conversation snapshot with newest-window semantics, full-thread participants
 /// and receipt counts. It accepts `since_ts` and a displayed limit of 0..=1000;
 /// normal resource reads keep their existing oldest-first shape and limits.

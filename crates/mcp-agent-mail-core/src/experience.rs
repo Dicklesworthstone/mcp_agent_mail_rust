@@ -407,6 +407,84 @@ pub struct ExperienceOutcome {
     pub evidence: Option<Value>,
 }
 
+impl ExperienceOutcome {
+    /// Validate content before an outcome is appended, resolved, or amended.
+    /// Diagnostics deliberately contain no rejected payload bytes.
+    #[must_use]
+    pub fn validate(&self) -> Vec<&'static str> {
+        let mut issues = Vec::new();
+        if self.label.len() > 256 {
+            issues.push("outcome.label exceeds 256 bytes");
+        } else if contains_secret(&self.label) {
+            issues.push("outcome.label contains a suspected secret");
+        }
+        if let Some(evidence) = &self.evidence
+            && let Err(reason) = validate_experience_json(evidence)
+        {
+            issues.push("outcome.evidence is invalid");
+            issues.push(reason);
+        }
+        issues
+    }
+}
+
+/// Bound the work and memory used to validate arbitrary ATC evidence/context.
+///
+/// Scan decoded strings and object keys rather than serializing the whole
+/// value. This catches escaped credentials and rejects oversized/deep payloads
+/// before recursive serialization or context merging. Numeric metrics, flags,
+/// pseudonyms, and nested metric structures remain accepted.
+///
+/// # Errors
+/// Rejects suspected credentials, depth above 16, more than 1024 JSON nodes,
+/// or more than 16 KiB of decoded text (including object keys).
+pub fn validate_experience_json(value: &Value) -> Result<(), &'static str> {
+    const MAX_NODES: usize = 1024;
+    const MAX_DEPTH: usize = 16;
+    const MAX_TEXT_BYTES: usize = 16 * 1024;
+
+    let mut remaining_nodes = MAX_NODES;
+    let mut remaining_text = MAX_TEXT_BYTES;
+    let mut pending = vec![(value, 0)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            return Err("JSON depth exceeds 16");
+        }
+        remaining_nodes = remaining_nodes
+            .checked_sub(1)
+            .ok_or("JSON exceeds 1024 nodes")?;
+        let mut scan = |text: &str| {
+            remaining_text = remaining_text
+                .checked_sub(text.len())
+                .ok_or("JSON text exceeds 16384 bytes")?;
+            if contains_secret(text) {
+                return Err("suspected secret");
+            }
+            Ok(())
+        };
+        match value {
+            Value::String(text) => scan(text)?,
+            Value::Array(items) => {
+                if items.len() > remaining_nodes.saturating_sub(pending.len()) {
+                    return Err("JSON exceeds 1024 nodes");
+                }
+                pending.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            Value::Object(items) => {
+                if items.len() > remaining_nodes.saturating_sub(pending.len()) {
+                    return Err("JSON exceeds 1024 nodes");
+                }
+                for (key, item) in items {
+                    scan(key)?;
+                    pending.push((item, depth + 1));
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Resolution kind (unified terminal Open→ transition)
 // ──────────────────────────────────────────────────────────────────────
@@ -673,22 +751,29 @@ impl ExperienceRow {
         {
             issues.push("resolved_ts_micros must be set for resolved/censored/expired state");
         }
-        if contains_secret(&self.evidence_summary) {
-            issues.push("evidence_summary contains a suspected secret");
-        }
-        if let Some(label) = self.outcome.as_ref().map(|o| &o.label)
-            && contains_secret(label)
-        {
-            issues.push("outcome.label contains a suspected secret");
-        }
-        if let Some(ctx) = &self.context {
-            let ctx_str = ctx.to_string();
-            if contains_secret(&ctx_str) {
-                issues.push("context contains a suspected secret");
-            }
-        }
+        issues.extend(self.validate_content());
+        issues
+    }
+
+    /// Validate Category D payloads without imposing Bayesian lifecycle rules.
+    /// Event-only observations (for example deadlock advisories) legitimately
+    /// have no posterior; they still must satisfy the same content boundary.
+    #[must_use]
+    pub fn validate_content(&self) -> Vec<&'static str> {
+        let mut issues = Vec::new();
         if self.evidence_summary.len() > 256 {
             issues.push("evidence_summary exceeds 256 chars");
+        } else if contains_secret(&self.evidence_summary) {
+            issues.push("evidence_summary contains a suspected secret");
+        }
+        if let Some(outcome) = &self.outcome {
+            issues.extend(outcome.validate());
+        }
+        if let Some(ctx) = &self.context
+            && let Err(reason) = validate_experience_json(ctx)
+        {
+            issues.push("context is invalid");
+            issues.push(reason);
         }
 
         issues
@@ -754,7 +839,20 @@ pub fn contains_secret(input: &str) -> bool {
     }
 
     for prefix in SECRET_PREFIXES {
-        if input.contains(prefix) {
+        let matched = if prefix.starts_with("sk-") {
+            // API keys start a token. A bare substring also matches the end
+            // of ordinary thread names such as "task-build" or "risk-check",
+            // which the real observation builder retains as metric context.
+            input.match_indices(prefix).any(|(start, _)| {
+                input[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|before| !before.is_alphanumeric() && before != '_')
+            })
+        } else {
+            input.contains(prefix)
+        };
+        if matched {
             return true;
         }
     }
@@ -2169,6 +2267,39 @@ mod tests {
     }
 
     #[test]
+    fn api_key_detection_preserves_hyphenated_task_metadata() {
+        // The real message observation builder retains thread_id in context.
+        // The last two letters of a task name are not an API-key prefix.
+        for thread in ["task-build", "risk-check", "mask-cache", "task-ant-review"] {
+            assert!(!contains_secret(thread), "ordinary thread: {thread}");
+            assert!(
+                validate_experience_json(&serde_json::json!({
+                    "thread_id": thread,
+                    "token_count": 12,
+                }))
+                .is_ok()
+            );
+        }
+        // Keep prefix detection at the start and after ordinary separators,
+        // including the JSON-string punctuation used by earlier callers.
+        for secret in [
+            "sk-short",
+            "sk-ant-api03-synthetic",
+            "key:sk-proj-synthetic",
+            "prefix-sk-proj-synthetic",
+            "\"sk-proj-synthetic\"",
+        ] {
+            assert!(contains_secret(secret));
+            assert!(
+                validate_experience_json(&serde_json::json!({
+                    "nested": [{"credential": secret}],
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn detects_secret_substrings() {
         assert!(contains_secret("AWS_SECRET_ACCESS_KEY=wJalrXUtnFE"));
         assert!(contains_secret("export PRIVATE KEY here"));
@@ -2219,6 +2350,67 @@ mod tests {
         }));
         let issues = row.validate();
         assert!(issues.iter().any(|i| i.contains("context")));
+    }
+
+    #[test]
+    fn validate_rejects_nested_secret_in_outcome_evidence() {
+        let mut row = sample_builder().build(1, 1_000_000);
+        row.outcome = Some(ExperienceOutcome {
+            observed_ts_micros: 2_000_000,
+            label: "acknowledged".to_string(),
+            correct: true,
+            actual_loss: Some(0.0),
+            regret: None,
+            evidence: Some(serde_json::json!({
+                "delivery": [{"credential": "ghp_synthetic_atc_canary"}]
+            })),
+        });
+        assert!(
+            row.validate()
+                .iter()
+                .any(|issue| issue.contains("outcome.evidence")),
+            "nested evidence must receive the same validation as context"
+        );
+    }
+
+    #[test]
+    fn content_validation_bounds_work_and_accepts_metric_payloads() {
+        let metrics = serde_json::json!({
+            "agent": "BlueSpring", "token_count": 42, "kind": "token_bucket",
+            "observations": [{"latency_micros": 1200, "acknowledged": true}],
+        });
+        assert_eq!(validate_experience_json(&metrics), Ok(()));
+        assert_eq!(
+            validate_experience_json(&Value::Array(vec![Value::Null; 1023])),
+            Ok(())
+        );
+        assert!(validate_experience_json(&Value::Array(vec![Value::Null; 1024])).is_err());
+        assert_eq!(
+            validate_experience_json(&Value::String("x".repeat(16 * 1024))),
+            Ok(())
+        );
+        assert!(validate_experience_json(&Value::String("x".repeat(16 * 1024 + 1))).is_err());
+        let mut nested = Value::Null;
+        for _ in 0..16 {
+            nested = Value::Array(vec![nested]);
+        }
+        assert_eq!(validate_experience_json(&nested), Ok(()));
+        assert!(validate_experience_json(&Value::Array(vec![nested])).is_err());
+        let escaped: Value =
+            serde_json::from_str(r#"{"metric":["gh\u0070_synthetic_atc_canary"]}"#)
+                .expect("valid escaped JSON");
+        assert_eq!(validate_experience_json(&escaped), Err("suspected secret"));
+        assert_eq!(
+            validate_experience_json(&serde_json::json!({"ghp_synthetic_atc_canary": 1})),
+            Err("suspected secret")
+        );
+        assert!(
+            validate_experience_json(&serde_json::json!({
+                "first": "x".repeat(9000), "second": "x".repeat(9000),
+            }))
+            .is_err(),
+            "the text budget is shared across the entire value"
+        );
     }
 
     #[test]

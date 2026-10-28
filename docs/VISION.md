@@ -42,7 +42,7 @@ $ am
 
 No subcommands needed for the default flow. Subcommands exist for targeted operations (`am setup --dry-run`, `am serve-http --no-tui`, `am robot inbox`, etc.) but the bare `am` command does everything.
 
-> **Reality note (2026-10-08):** Since GH#318, bare `am` starts the HTTP server and TUI without rewriting coding-agent MCP config files on every launch. Agent discovery and MCP config mutation run only when `am setup` (`am setup run`) is invoked explicitly.
+> **Reality note (2026-10-08; updated 2026-10-27):** Since GH#318, bare `am` starts the HTTP server and TUI without rewriting coding-agent MCP config files on every launch. Agent discovery and MCP config mutation run only when `am setup` (`am setup run`) is invoked explicitly. When a healthy service already owns the configured endpoint, interactive startup defaults to an attach/takeover/quit prompt (`AM_ATTACH_MODE=ask`), with read-only attachment selected by Enter. `AM_ATTACH_MODE=attach` selects attachment without prompting; takeover remains explicit through the prompt, `--takeover`, or `AM_ATTACH_MODE=takeover`, using supervised service control. The original zero-prompt and automatic-configuration goals above are historical ambition, superseded by these operational ownership and setup decisions.
 
 ### Two Audiences, One Binary
 
@@ -107,6 +107,8 @@ This was requested multiple times and must be implemented exactly like the frank
 
 For coding agents that interact with `am` programmatically. The interface an agent would design for itself.
 
+> **Historical proposal (February 2026; superseded 2026-10-27):** The examples below retain the original ambition, not current copy-paste recipes. Current `am robot` exposes read-only `reservations`; reservation mutations use `am file_reservations` or the MCP tools `file_reservation_paths` / `release_file_reservations`. There are no `am robot reserve` / `release` commands or YAML output. Use the [current command reference](../README.md#robot-mode-am-robot) for supported names, flags, and formats.
+
 ```bash
 # Inbox (default: JSON, compact)
 am robot inbox --agent BlueLake --limit 10 --format json
@@ -132,7 +134,7 @@ am robot thread br-123 --include-bodies --format md
 # Default format: JSON. Also supports: toon, md, yaml
 ```
 
-> **Reality note (2026-10-08):** `am robot` supports `--format toon|json|md`. When `--format` is omitted, `am robot` defaults to `toon` on non-TTY stdout (for token-efficient agent consumption) and `json` on an interactive TTY.
+> **Reality note (2026-10-08; corrected 2026-10-27):** `am robot` supports `--format toon|json`; prose commands `thread` and `message` also support `md` (`markdown`). Without an explicit format, ordinary commands use TOON on an interactive TTY and JSON when piped. `thread` and `message` default to Markdown even when piped; pass `--format json` for machine-readable output. This supersedes the historical JSON-only default and YAML examples above.
 
 ---
 

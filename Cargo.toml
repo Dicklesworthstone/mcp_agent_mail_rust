@@ -78,6 +78,11 @@ mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 franken-agent-detection = "0.3.7"
 cap-fs-ext = "=4.0.3"
 cap-std = "=4.0.3"
+age = { version = "=0.12.1", default-features = false, features = ["armor"] }
+# Preserve canonical terminal passphrase bytes (including tabs). 7.5's raw
+# editor silently discards control characters such as a literal tab.
+rpassword = "=7.4.0"
+zeroize = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9.42"

@@ -102,11 +102,11 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
-| `fastmcp-rust` (`0.10.0`, immutable Git revision `1c2e5e4b`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
+| `fastmcp-rust` (`0.13.0`, crates.io; imported as `fastmcp`) | MCP protocol implementation; `Cargo.lock` selects the 0.13.0 registry family on Asupersync 0.5 |
 | `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; registry FrankenSQLite `=0.4.10` is the runtime `DbConn`. The `[patch]` Git revision `2633b38a` in `Cargo.toml` applies only to embedded Beads' separate 0.3.18 engine |
 | `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.7.0`, FrankenTUI) | TUI rendering for operations console; facade defaults disabled, platform-specific backends selected by the server |
-| `frankensearch` (`0.6.1`, git revision `616c9a7a6bdada97d81f760808996911ba3be294`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context, and its rustix 1.1.5 requirement agrees with FastMCP |
+| `frankensearch` (`0.6.1`, git revision `616c9a7a6bdada97d81f760808996911ba3be294`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Optional `hybrid` integration for semantic retrieval and reranking; portable lexical Search V3 uses the local `TantivyBridge`. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context, and its rustix 1.1.5 requirement agrees with FastMCP |
 | `beads_rust` (`=0.6.0`, default features disabled) | Issue tracking integration; separate patched FrankenSQLite 0.3.18 engine |
 | `franken-agent-detection` (`0.3.7`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |
@@ -717,7 +717,7 @@ documented (GH#290).
 - **Write-behind cache** — dual-indexed ReadCache with deferred touch batching (30s flush)
 - **Async git commit coalescer** — batches writes to avoid commit storms
 - **i64 microseconds** for all timestamps — no chrono NaiveDateTime in storage layer
-- **Search V3 via frankensearch** with lexical/semantic/hybrid routing; release binaries (dist.yml, Dockerfiles) are built with `--features portable` and therefore ship the lexical tier only — semantic/hybrid routing exists only in default-feature source builds (`install-local.sh`)
+- **Search V3** — portable lexical retrieval uses the local `TantivyBridge`; release binaries (dist.yml, Dockerfiles) use `--features portable`. Optional FrankenSearch semantic retrieval and hybrid fusion require the `hybrid` feature (enabled in default-feature source builds such as `install-local.sh`) and the runtime opt-in `AM_SEARCH_SEMANTIC_ENABLED=true`.
 - **Compatibility testing** against intentionally retained Python wire contracts,
   plus Rust-native durability and behavior fixtures. The Rust implementation is
   authoritative; legacy parity never overrides reliability, security, bounded
@@ -755,9 +755,21 @@ am --help                                 # Full operator CLI
 ```
 
 When an interactive `am` finds a healthy Agent Mail service already serving the
-configured endpoint, it attaches read-only to that service's `/mail/ws-state`
-snapshot instead of stopping or restarting it. The attachment takes no mutation
-lock and exits with `Ctrl-C`; `--takeover` remains explicit opt-in replacement.
+configured endpoint, it defaults to an attach/takeover/quit prompt
+(`AM_ATTACH_MODE=ask`). Enter chooses a read-only `/mail/ws-state` attachment;
+it takes no mutation lock, leaves the service running, and exits with `Ctrl-C`.
+Set `AM_ATTACH_MODE=attach` to select it without prompting. Choosing takeover,
+passing `--takeover`, or setting `AM_ATTACH_MODE=takeover` explicitly selects the
+supervised replacement path; a managed service is restored when the local
+session ends. If this decision runs without interactive stdin, the default is
+read-only attachment.
+
+HTTP authentication depends on configured bearer/JWT credentials. With neither
+configured, auth is off for trusted-local operation; an explicit localhost bypass
+is a separate option when auth is configured. Configure auth before network
+exposure, and retain the trusted-local identity boundary in
+[`SECURITY.md`](SECURITY.md); transport auth does not isolate hostile clients
+sharing the same OS account or bearer credential.
 
 ### Robot Mode (`am robot`)
 

@@ -296,7 +296,7 @@ fn remember_source_delivery(
 /// authority; no old cursor is silently reinterpreted as a new position.
 /// Returns shared-delivery message IDs whose recipient JSON must be refreshed
 /// before subsequent shared receipt restoration and candidate promotion.
-pub(crate) fn preserve_delivery_history(
+pub fn preserve_delivery_history(
     target: &CanonicalDbConn,
     source: &CanonicalDbConn,
     project_ids: &HashMap<i64, i64>,

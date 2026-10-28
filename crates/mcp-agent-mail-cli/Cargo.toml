@@ -75,6 +75,8 @@ fs2.workspace = true
 git2.workspace = true
 dirs.workspace = true
 getrandom = "0.4.2"
+rpassword.workspace = true
+zeroize.workspace = true
 
 # nix is Unix-only (it doesn't compile on Windows). The CLI's nix usages
 # (PID liveness, mkfifo, mode bits) live in #[cfg(unix)] code paths.

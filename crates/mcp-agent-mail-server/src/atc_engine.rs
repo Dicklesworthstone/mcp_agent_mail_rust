@@ -129,6 +129,11 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     ///
     /// `prior` must be a valid probability distribution (non-negative, sums to ~1).
     /// `loss_entries` are `(action, state, cost)` triples.
+    ///
+    /// # Panics
+    /// Panics on an empty action/state domain, duplicate prior states, or loss
+    /// entries outside the prior's state domain. These are caller invariants
+    /// for the typed decision policy, not values decoded from an MCP request.
     pub fn new(prior: &[(S, f64)], loss_entries: &[(A, S, f64)], alpha: f64) -> Self {
         let mut actions = Vec::new();
         let mut action_index = HashMap::new();
@@ -162,6 +167,7 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
                 .copied()
                 .expect("DecisionCore action index must exist");
             let state_idx = state_index.get(&state).copied().unwrap_or_else(|| {
+                // ubs:ignore rust.ownership.panic-macro -- intentional constructor invariant; loss states must belong to the supplied prior.
                 panic!("DecisionCore loss entry references unknown state: {state:?}")
             });
             loss_matrix[action_idx * state_count + state_idx] = cost;
@@ -327,15 +333,19 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     }
 
     /// Update a single loss entry while keeping the dense matrix coherent.
+    ///
+    /// # Panics
+    /// Panics if the action or state is outside this policy's fixed domain.
+    /// Callers update entries enumerated from that domain.
     pub fn set_loss_entry(&mut self, action: A, state: S, cost: f64) {
-        let action_idx =
-            self.action_index.get(&action).copied().unwrap_or_else(|| {
-                panic!("DecisionCore unknown action in set_loss_entry: {action:?}")
-            });
-        let state_idx =
-            self.state_index.get(&state).copied().unwrap_or_else(|| {
-                panic!("DecisionCore unknown state in set_loss_entry: {state:?}")
-            });
+        let action_idx = self.action_index.get(&action).copied().unwrap_or_else(|| {
+            // ubs:ignore rust.ownership.panic-macro -- intentional fixed-domain API invariant, not a request-selected action.
+            panic!("DecisionCore unknown action in set_loss_entry: {action:?}")
+        });
+        let state_idx = self.state_index.get(&state).copied().unwrap_or_else(|| {
+            // ubs:ignore rust.ownership.panic-macro -- intentional fixed-domain API invariant, not a request-selected state.
+            panic!("DecisionCore unknown state in set_loss_entry: {state:?}")
+        });
         let offset = self.loss_offset(action_idx, state_idx);
         self.loss_matrix[offset] = cost;
     }
@@ -8323,7 +8333,7 @@ mod predictive_tests {
             graph.record_participation(&format!("Agent{index}"), &format!("thread-{index}"));
         }
         let (pairs, observed) = graph.high_risk_pairs_with_work(1);
-        assert!(pairs.is_empty());
+        assert_eq!(pairs, Vec::<(String, String, usize)>::new());
         assert_eq!(observed, 0);
         assert_consistent_participation_indexes(&graph);
     }

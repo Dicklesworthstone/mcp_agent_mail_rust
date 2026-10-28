@@ -2,12 +2,16 @@
 
 > Audited 2026-04-18. Covers every field in `ExperienceRow`, `FeatureVector`,
 > `FeatureExtension`, `ExperienceOutcome`, and `NonExecutionReason`.
+> Category D mutation-boundary enforcement updated 2026-10-27.
 
 ## Principle
 
 ATC stores **metrics, not content**. The type system enforces this for the
 hot path (FeatureVector is pure quantized numerics). Freeform fields are
-validated at write time by `ExperienceRow::validate()` and `contains_secret()`.
+validated at write time by the shared `ExperienceRow::validate_content()`,
+`ExperienceOutcome::validate()` and bounded decoded-JSON validator. Public
+append, context/state transition, resolve and outcome-amend APIs enforce these
+checks before either the file-backed sidecar or in-memory backend writes.
 
 ## Privacy Categories
 
@@ -44,7 +48,7 @@ validated at write time by `ExperienceRow::validate()` and `contains_secret()`.
 | `expected_loss` | f64 | A | Numeric metric |
 | `runner_up_action` | Option\<String\> | B | Action label from constrained vocabulary |
 | `runner_up_loss` | Option\<f64\> | A | Numeric metric |
-| `evidence_summary` | String | **D** | Freeform — validated by `contains_secret()`, max 256 chars |
+| `evidence_summary` | String | **D** | Freeform — validated by `contains_secret()`, max 256 UTF-8 bytes |
 | `calibration_healthy` | bool | A | Flag |
 | `safe_mode_active` | bool | A | Flag |
 | `non_execution_reason` | Option\<enum\> | B | Structured enum with numeric fields |
@@ -117,7 +121,10 @@ All variants are **Category B (Derived)** — structured enums with numeric fiel
 
 ## Secret Detection (`contains_secret()`)
 
-Applied to Category D fields during `ExperienceRow::validate()`.
+Applied to Category D fields by the shared content validator at durable mutation
+boundaries. This is heuristic detection of recognizable credential patterns,
+not a guarantee that arbitrary content is safe or that every credential format
+is recognized.
 
 ### Patterns Detected
 
@@ -126,7 +133,7 @@ Applied to Category D fields during `ExperienceRow::validate()`.
 | `AKIA...` / `ASIA...` | AWS access key | Prefix |
 | `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_` | GitHub token | Prefix |
 | `xoxb-` / `xoxp-` / `xoxs-` / `xoxa-` | Slack token | Prefix |
-| `sk-` / `sk-ant-` | OpenAI/Anthropic key | Prefix |
+| `sk-` / `sk-ant-` | OpenAI/Anthropic key | Token prefix: start of string or after a non-alphanumeric, non-underscore separator |
 | `glpat-` | GitLab PAT | Prefix |
 | `npm_` | npm token | Prefix |
 | `pypi-AgEIcHlwaS5` | PyPI token | Prefix |
@@ -139,12 +146,32 @@ Applied to Category D fields during `ExperienceRow::validate()`.
 
 ### Validation Integration
 
-`ExperienceRow::validate()` checks Category D fields:
-- `evidence_summary`: secret scan + max 256 chars
-- `outcome.label`: secret scan
-- `context` (serialized to string): secret scan
+The shared content checks cover:
 
-Callers should reject rows where `validate()` returns a non-empty list.
+- `evidence_summary` and `outcome.label`: secret scan and max 256 UTF-8 bytes each.
+- `context` and nested `outcome.evidence`: iterative scans of decoded strings
+  and object keys, including escaped credential patterns. Each JSON payload is
+  limited to depth 16, 1,024 nodes and 16 KiB of cumulative decoded string/key
+  bytes. Numeric and boolean metrics remain accepted.
+- Context patches: validate both existing and incoming values before recursive
+  merge, then validate the result, preventing individually valid patches from
+  growing an oversized durable context.
+
+Rejected mutations report fixed field/reason categories without echoing rejected
+bytes. Invalid updates preserve the existing row and rollups. These checks do
+not redact historical rows or change retention or default ATC write/executor modes.
+
+`ExperienceRow::validate()` retains the stricter Bayesian/lifecycle requirements
+for learning inserts. Direct append also serves event-only observations such as
+deadlock advisories with no posterior, so it enforces shared content validation
+without imposing those additional learning-insert requirements.
+
+The API-key token boundary admits ordinary thread metadata such as `task-build`
+and `risk-check`; actual `sk-`/`sk-ant-` tokens at a string start or after normal
+separators remain rejected. An embedded substring immediately following an
+alphanumeric or underscore is no longer independently classified by this rule.
+Other existing secret patterns remain unchanged. Classification of Category B
+vocabulary fields is separate from these Category D content checks.
 
 ---
 

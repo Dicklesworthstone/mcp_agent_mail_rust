@@ -704,6 +704,12 @@ fn merge_context_patch(
     existing: Option<serde_json::Value>,
     patch: Option<&serde_json::Value>,
 ) -> std::result::Result<Option<serde_json::Value>, DbError> {
+    // Validate both inputs before the recursive merge, then the combined
+    // value: a series of individually bounded patches must not grow an
+    // unbounded durable payload.
+    for value in existing.as_ref().into_iter().chain(patch) {
+        validate_atc_context(value)?;
+    }
     let Some(patch) = patch else {
         return Ok(existing);
     };
@@ -724,7 +730,23 @@ fn merge_context_patch(
         None => serde_json::Map::new(),
     };
     merge_json_object(&mut merged, patch_map);
-    Ok(Some(serde_json::Value::Object(merged)))
+    let merged = serde_json::Value::Object(merged);
+    validate_atc_context(&merged)?;
+    Ok(Some(merged))
+}
+
+fn validate_atc_context(context: &serde_json::Value) -> std::result::Result<(), DbError> {
+    mcp_agent_mail_core::experience::validate_experience_json(context)
+        .map_err(|reason| DbError::invalid("context", reason))
+}
+
+fn validate_atc_outcome(outcome: &ExperienceOutcome) -> std::result::Result<(), DbError> {
+    let issues = outcome.validate();
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(DbError::invalid("outcome", issues.join("; ")))
+    }
 }
 
 pub(crate) fn decode_atc_experience_row(
@@ -18870,6 +18892,12 @@ pub async fn append_atc_experience(
     pool: &DbPool,
     row: &ExperienceRow,
 ) -> Outcome<ExperienceRow, DbError> {
+    // The server calls this API directly; validation in insert_experience
+    // alone cannot protect either durable backend.
+    let issues = row.validate_content();
+    if !issues.is_empty() {
+        return Outcome::Err(DbError::invalid("experience_row", issues.join("; ")));
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -19244,6 +19272,11 @@ pub async fn transition_atc_experience(
     non_execution_reason: Option<&NonExecutionReason>,
     context_patch: Option<&serde_json::Value>,
 ) -> Outcome<(), DbError> {
+    if let Some(context) = context_patch
+        && let Err(error) = validate_atc_context(context)
+    {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -19497,6 +19530,9 @@ pub async fn resolve_atc_experience(
     experience_id: u64,
     outcome: &ExperienceOutcome,
 ) -> Outcome<(), DbError> {
+    if let Err(error) = validate_atc_outcome(outcome) {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -19606,6 +19642,9 @@ pub async fn overwrite_resolved_atc_experience_outcome(
     experience_id: u64,
     outcome: &ExperienceOutcome,
 ) -> Outcome<(), DbError> {
+    if let Err(error) = validate_atc_outcome(outcome) {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -19725,6 +19764,11 @@ pub async fn resolve_experience(
     experience_id: u64,
     resolution: &ResolutionKind,
 ) -> Outcome<(), DbError> {
+    if let ResolutionKind::Resolved(outcome) = resolution
+        && let Err(error) = validate_atc_outcome(outcome)
+    {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -23668,6 +23712,354 @@ mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn atc_content_validation_covers_direct_append_before_persistence() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+        let (cx, file_pool, _dir) = setup_test_pool("atc_content_append.db");
+        let memory_pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("memory pool");
+
+        rt.block_on(async {
+            for pool in [&file_pool, &memory_pool] {
+                let valid = make_insert_experience_test_row(
+                    70_001,
+                    80_001,
+                    ExperienceState::Resolved,
+                    1_700_000_000_000_000,
+                );
+                let baseline = append_atc_experience(&cx, pool, &valid)
+                    .await
+                    .into_result()
+                    .expect("positive append");
+                let repeated = append_atc_experience(&cx, pool, &valid)
+                    .await
+                    .into_result()
+                    .expect("positive idempotent append");
+                assert_eq!(baseline, repeated);
+
+                // atc_engine's deadlock_cycle events deliberately have no
+                // Bayesian posterior. Append accepts this observation shape;
+                // the stricter learning insert contract remains unchanged.
+                let mut event = valid.clone();
+                event.decision_id += 1000;
+                event.effect_id += 1000;
+                event.posterior.clear();
+                event.decision_class = "deadlock_cycle".to_string();
+                event.effect_kind = EffectKind::Advisory;
+                assert!(
+                    insert_experience(&cx, pool, event.clone())
+                        .await
+                        .into_result()
+                        .is_err(),
+                    "learning insert retains its structural gate"
+                );
+                let observation = append_atc_experience(&cx, pool, &event)
+                    .await
+                    .into_result()
+                    .expect("event-only positive append");
+                assert_eq!(observation.posterior, Vec::<(String, f64)>::new());
+
+                for field in 0..6 {
+                    let mut invalid = valid.clone();
+                    invalid.decision_id += field + 1;
+                    invalid.effect_id += field + 1;
+                    match field {
+                        0 => invalid.evidence_summary = "ghp_synthetic_atc_canary".to_string(),
+                        1 => {
+                            invalid.context = Some(serde_json::json!({
+                                "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                            }));
+                        }
+                        2 => {
+                            invalid.outcome.as_mut().expect("outcome").label =
+                                "ghp_synthetic_atc_canary".to_string();
+                        }
+                        3 => {
+                            invalid.outcome.as_mut().expect("outcome").evidence =
+                                Some(serde_json::json!({
+                                    "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                                }));
+                        }
+                        4 => {
+                            invalid.context = Some(serde_json::json!({
+                                "metric": "x".repeat(16 * 1024)
+                            }));
+                        }
+                        _ => {
+                            let mut nested = serde_json::Value::Null;
+                            for _ in 0..17 {
+                                nested = serde_json::json!([nested]);
+                            }
+                            invalid.outcome.as_mut().expect("outcome").evidence = Some(nested);
+                        }
+                    }
+                    let error = append_atc_experience(&cx, pool, &invalid)
+                        .await
+                        .into_result()
+                        .expect_err("direct append must validate content");
+                    assert!(matches!(
+                        error,
+                        asupersync::OutcomeError::Err(DbError::InvalidArgument { .. })
+                    ));
+                    assert!(!format!("{error:?}").contains("synthetic_atc_canary"));
+                    let counts = if pool.sqlite_path() == ":memory:" {
+                        durability_probe_query(
+                            &cx,
+                            pool,
+                            "SELECT COUNT(*) FROM atc_experiences",
+                            &[],
+                        )
+                        .await
+                        .into_result()
+                        .expect("count memory rows")
+                    } else {
+                        let conn = open_canonical_atc_conn(pool, "reopen after invalid append")
+                            .expect("independent sidecar reopen");
+                        let counts = canonical_query_atc_rows(
+                            &conn,
+                            "SELECT COUNT(*) FROM atc_experiences",
+                            &[],
+                            "count rejected rows",
+                        )
+                        .expect("count sidecar rows");
+                        close_canonical_db_conn(conn, "reopen after invalid append");
+                        counts
+                    };
+                    assert_eq!(
+                        counts.first().and_then(row_first_i64),
+                        Some(2),
+                        "durable store must contain only the two accepted positive rows"
+                    );
+                }
+                let reopened = fetch_durable_atc_experience_by_id(
+                    &cx,
+                    pool,
+                    i64::try_from(baseline.experience_id).expect("id"),
+                )
+                .await
+                .into_result()
+                .expect("reopen")
+                .expect("positive row retained");
+                assert_eq!(reopened, baseline);
+            }
+        });
+    }
+
+    #[test]
+    fn atc_content_validation_preserves_rows_after_rejected_updates() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+        let (cx, file_pool, _dir) = setup_test_pool("atc_content_updates.db");
+        let memory_pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("memory pool");
+
+        rt.block_on(async {
+            for pool in [&file_pool, &memory_pool] {
+                let row = make_insert_experience_test_row(
+                    70_100,
+                    80_100,
+                    ExperienceState::Open,
+                    1_700_000_000_000_000,
+                );
+                let mut before = append_atc_experience(&cx, pool, &row)
+                    .await
+                    .into_result()
+                    .expect("append positive row");
+                let first = serde_json::json!({"first_metric": "x".repeat(9000)});
+                transition_atc_experience(
+                    &cx,
+                    pool,
+                    before.experience_id,
+                    ExperienceState::Open,
+                    0,
+                    None,
+                    Some(&first),
+                )
+                .await
+                .into_result()
+                .expect("bounded metric patch accepted");
+                before = fetch_durable_atc_experience_by_id(
+                    &cx,
+                    pool,
+                    i64::try_from(before.experience_id).expect("id"),
+                )
+                .await
+                .into_result()
+                .expect("reopen patched row")
+                .expect("row");
+                let second = serde_json::json!({"second_metric": "x".repeat(9000)});
+                // Each patch is individually valid, but storing both would
+                // cross the shared text budget. Verify transaction rollback.
+                assert!(
+                    transition_atc_experience(
+                        &cx,
+                        pool,
+                        before.experience_id,
+                        ExperienceState::Open,
+                        0,
+                        None,
+                        Some(&second)
+                    )
+                    .await
+                    .into_result()
+                    .is_err()
+                );
+                let after = fetch_durable_atc_experience_by_id(
+                    &cx,
+                    pool,
+                    i64::try_from(before.experience_id).expect("id"),
+                )
+                .await
+                .into_result()
+                .expect("reopen after oversized merge")
+                .expect("row");
+                assert_eq!(after, before);
+                let good = ExperienceOutcome {
+                    observed_ts_micros: 1_700_000_000_010_000,
+                    label: "acknowledged".to_string(),
+                    correct: true,
+                    actual_loss: Some(0.0),
+                    regret: Some(0.0),
+                    evidence: Some(serde_json::json!({"latency_micros": 10_000})),
+                };
+                let mut rollups_before = fetch_atc_rollups(&cx, pool)
+                    .await
+                    .into_result()
+                    .expect("initial rollups");
+                for api in 0..4 {
+                    for field in 0..2 {
+                        let mut bad = good.clone();
+                        if field == 0 {
+                            bad.label = "ghp_synthetic_atc_canary".to_string();
+                        } else {
+                            bad.evidence = Some(serde_json::json!({
+                                "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                            }));
+                        }
+                        let patch = serde_json::json!({
+                            "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                        });
+                        let result = match api {
+                            0 => {
+                                transition_atc_experience(
+                                    &cx,
+                                    pool,
+                                    before.experience_id,
+                                    ExperienceState::Open,
+                                    0,
+                                    None,
+                                    Some(&patch),
+                                )
+                                .await
+                            }
+                            1 => {
+                                resolve_atc_experience(&cx, pool, before.experience_id, &bad).await
+                            }
+                            2 => {
+                                resolve_experience(
+                                    &cx,
+                                    pool,
+                                    before.experience_id,
+                                    &ResolutionKind::Resolved(bad),
+                                )
+                                .await
+                            }
+                            _ => {
+                                overwrite_resolved_atc_experience_outcome(
+                                    &cx,
+                                    pool,
+                                    before.experience_id,
+                                    &bad,
+                                )
+                                .await
+                            }
+                        };
+                        let error = result.into_result().expect_err("invalid update must fail");
+                        assert!(matches!(
+                            error,
+                            asupersync::OutcomeError::Err(DbError::InvalidArgument { .. })
+                        ));
+                        assert!(!format!("{error:?}").contains("synthetic_atc_canary"));
+                        let after = fetch_durable_atc_experience_by_id(
+                            &cx,
+                            pool,
+                            i64::try_from(before.experience_id).expect("id"),
+                        )
+                        .await
+                        .into_result()
+                        .expect("independent reopen")
+                        .expect("row retained");
+                        assert_eq!(after, before, "rejected update changed durable row");
+                        let rollups_after = fetch_atc_rollups(&cx, pool)
+                            .await
+                            .into_result()
+                            .expect("reopen rollups after rejected update");
+                        assert_eq!(rollups_after, rollups_before);
+                    }
+                    if api == 2 {
+                        resolve_atc_experience(&cx, pool, before.experience_id, &good)
+                            .await
+                            .into_result()
+                            .expect("valid outcome resolves");
+                        before = fetch_durable_atc_experience_by_id(
+                            &cx,
+                            pool,
+                            i64::try_from(before.experience_id).expect("id"),
+                        )
+                        .await
+                        .into_result()
+                        .expect("reopen positive resolution")
+                        .expect("resolved row");
+                        assert_eq!(before.state, ExperienceState::Resolved);
+                        assert_eq!(before.outcome.as_ref(), Some(&good));
+                        update_atc_experience_rollup(
+                            &cx,
+                            pool,
+                            "liveness:probe:0",
+                            "liveness",
+                            "probe",
+                            0,
+                            ExperienceState::Resolved,
+                            true,
+                            0.0,
+                            0.0,
+                            10_000,
+                            good.observed_ts_micros,
+                        )
+                        .await
+                        .into_result()
+                        .expect("real positive rollup");
+                        rollups_before = fetch_atc_rollups(&cx, pool)
+                            .await
+                            .into_result()
+                            .expect("reopen positive rollup");
+                        assert_eq!(rollups_before.len(), 1);
+                        assert_eq!(rollups_before[0].2, 1, "resolved_count");
+                    }
+                }
+                overwrite_resolved_atc_experience_outcome(&cx, pool, before.experience_id, &good)
+                    .await
+                    .into_result()
+                    .expect("valid acknowledgement amendment");
+            }
+        });
     }
 
     #[test]

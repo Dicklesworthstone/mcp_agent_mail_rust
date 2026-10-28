@@ -6944,12 +6944,24 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 .output
                 .unwrap_or_else(|| share::default_decrypt_output(&args.encrypted_path));
             let passphrase_str = if args.passphrase {
-                ftui_runtime::ftui_eprintln!("Enter passphrase:");
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_line(&mut buf)
-                    .map_err(|e| CliError::Other(format!("failed to read passphrase: {e}")))?;
-                Some(buf.trim_end().to_string())
+                let secret = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    rpassword::prompt_password("Enter passphrase: ").map(zeroize::Zeroizing::new)
+                } else {
+                    let mut buf = zeroize::Zeroizing::new(String::new());
+                    std::io::stdin().read_line(&mut buf).map(|_| {
+                        // Only the transport line terminator is removed. Spaces
+                        // and tabs can be part of the actual passphrase.
+                        if buf.ends_with('\n') {
+                            buf.pop();
+                            if buf.ends_with('\r') {
+                                buf.pop();
+                            }
+                        }
+                        buf
+                    })
+                }
+                .map_err(|e| CliError::Other(format!("failed to read passphrase: {e}")))?;
+                Some(secret)
             } else {
                 None
             };
@@ -6957,7 +6969,7 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 &args.encrypted_path,
                 &output,
                 args.identity.as_deref(),
-                passphrase_str.as_deref(),
+                passphrase_str.as_ref().map(|secret| secret.as_str()),
             )?;
             ftui_runtime::ftui_println!("Decrypted to: {}", output.display());
             Ok(())
@@ -9453,7 +9465,9 @@ fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Environment variable carrying a `mail send` sender token (non-echoing path).
+// ubs:ignore rust.security.hardcoded-secrets -- environment key name; the credential is read from the environment.
 const AGENT_MAIL_SENDER_TOKEN_ENV: &str = "AGENT_MAIL_SENDER_TOKEN";
+// ubs:ignore rust.security.hardcoded-secrets -- boolean policy environment key, not a credential value.
 const AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN_ENV: &str =
     "AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN";
 
@@ -35230,6 +35244,7 @@ fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Valu
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    // ubs:ignore rust.security.command-executable -- explicit local AM_GIT_BINARY/PATH version probe, no request-derived executable.
     let mut child = match Command::new(path_or_name)
         .arg("--version")
         .stdin(Stdio::null())
@@ -35490,6 +35505,7 @@ fn doctor_run_version_line_once(path: &Path, timeout_secs: u64) -> Result<String
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    // ubs:ignore rust.security.command-executable -- local PATH/install candidate for the fixed am binary names; --version only.
     let mut child = Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
@@ -36641,6 +36657,7 @@ fn handle_doctor_check_with_target(
             }
 
             // Check for alias
+            // ubs:ignore rust.security.command-executable -- shell is from the fixed zsh/bash tuple; diagnostic script is constant.
             let alias_out = std::process::Command::new(shell_bin)
                 .arg(flag)
                 .arg("alias am 2>/dev/null; true")
@@ -36660,6 +36677,7 @@ fn handle_doctor_check_with_target(
             }
 
             // Check binary path
+            // ubs:ignore rust.security.command-executable -- fixed zsh/bash tuple and constant which-am diagnostic script.
             let which_out = std::process::Command::new(shell_bin)
                 .arg(flag)
                 .arg("which am 2>/dev/null || echo NOT_FOUND")
@@ -37931,6 +37949,7 @@ fn rewrite_omp_mcp_config_to_native_http(
     {
         headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
         if let Some(token) = desired_bearer_token.filter(|token| !token.trim().is_empty()) {
+            // ubs:ignore rust.security.response-header -- serde_json config map, serialized to a local file; no HTTP response.
             headers.insert(
                 "Authorization".to_string(),
                 serde_json::Value::String(format!("Bearer {token}")),
@@ -38099,6 +38118,7 @@ fn rewrite_json_mcp_entry_to_http_url(
         .cloned()
         .unwrap_or_default();
     if let Some(token) = desired_bearer_token.filter(|token| !token.trim().is_empty()) {
+        // ubs:ignore rust.security.response-header -- local MCP config JSON data, not an outgoing HTTP header.
         headers.insert(
             "Authorization".to_string(),
             serde_json::Value::String(format!("Bearer {token}")),
@@ -38110,6 +38130,7 @@ fn rewrite_json_mcp_entry_to_http_url(
         .and_then(serde_json::Value::as_str)
         .filter(|token| !token.trim().is_empty())
     {
+        // ubs:ignore rust.security.response-header -- migrates local config env data into JSON; no HTTP response.
         headers.insert(
             "Authorization".to_string(),
             serde_json::Value::String(format!("Bearer {token}")),
@@ -46171,6 +46192,7 @@ fn service_restart_launchd() -> CliResult<()> {
 
 /// Run an external command, returning an error on non-zero exit.
 fn run_cmd(program: &str, args: &[&str]) -> CliResult<()> {
+    // ubs:ignore rust.security.command-executable -- all private callers use literal launchctl/systemctl; service values are separate argv.
     let output = std::process::Command::new(program)
         .args(args)
         .output()
@@ -46273,6 +46295,7 @@ fn run_systemctl_user(args: &[&str]) -> CliResult<()> {
 /// process via `Command::env` (never `std::env::set_var`, keeping this
 /// compatible with `forbid(unsafe_code)` on edition 2024).
 fn run_cmd_with_env(program: &str, args: &[&str], env: &[(&str, String)]) -> CliResult<()> {
+    // ubs:ignore rust.security.command-executable -- production fixes systemctl; other callers are literal-sh environment tests.
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     for (key, value) in env {
@@ -46946,6 +46969,7 @@ mod tests {
                 break;
             }
             if let Some((k, v)) = line.split_once(':') {
+                // ubs:ignore rust.security.response-header -- test client parses RECEIVED headers into a HashMap; emits no response.
                 headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
             }
         }
@@ -48864,7 +48888,7 @@ http_headers = { Authorization = "Bearer secret" }
     fn doctor_bearer_check_exempts_the_configs_setup_writes_header_free() {
         let home = PathBuf::from("/home/tester");
         let params = mcp_agent_mail_core::setup::SetupParams {
-            token: "live-secret-token".to_string(),
+            token: "live-secret-token".to_string(), // ubs:ignore rust.security.hardcoded-secrets -- synthetic cfg(test) path-classification token.
             project_dir: PathBuf::from("/tmp/project"),
             home_dir_override: Some(home.clone()),
             agents: Some(vec![mcp_agent_mail_core::setup::AgentPlatform::Cursor]),
@@ -63014,7 +63038,7 @@ command = "mcp-agent-mail"
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         let desired_url = "http://127.0.0.1:8765/mcp/?label=\"quoted\"";
-        let desired_token = "quote\"slash\\line\nnext";
+        let desired_token = "quote\"slash\\line\nnext"; // ubs:ignore rust.security.hardcoded-secrets -- synthetic TOML escaping roundtrip fixture.
         std::fs::write(
             &config,
             r#"[mcp_servers.mcp_agent_mail]
@@ -85919,6 +85943,7 @@ fn write_command_output_artifact(
     command: &str,
     args: &[&str],
 ) -> bool {
+    // ubs:ignore rust.security.command-executable -- private callers use literal rch and fixed status/queue diagnostic argv.
     if let Ok(output) = std::process::Command::new(command).args(args).output() {
         let payload = serde_json::json!({
             "command": std::iter::once(command.to_string())
@@ -86221,6 +86246,7 @@ fn handle_am_run_with(
         }
     }
 
+    // ubs:ignore rust.security.command-executable -- am-run intentionally executes the local operator's required command argv.
     let mut cmd = std::process::Command::new(&args.cmd[0]);
     if args.cmd.len() > 1 {
         cmd.args(&args.cmd[1..]);
@@ -86241,7 +86267,7 @@ fn handle_am_run_with(
         } else {
             match run_child_status_guarded(&mut cmd) {
                 Ok(status) => status.exit_code(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 127,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 127, // ubs:ignore rust.security.constant-time-compare -- ErrorKind enum dispatch, not secret equality.
                 Err(_) => 1,
             }
         }
@@ -94712,7 +94738,9 @@ fn render_table_text(title: Option<&str>, headers: &[&str], rows: Vec<Vec<String
     let header = Row::new(headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
     let ftui_rows = rows.into_iter().map(Row::new).collect::<Vec<_>>();
 
+    // ubs:ignore rust.security.response-header -- ftui table construction for terminal rendering; no HTTP types.
     let mut table = Table::new(ftui_rows, widths)
+        // ubs:ignore rust.security.response-header -- ftui column-label Row, not an HTTP response header.
         .header(header)
         .column_spacing(2);
     if let Some(t) = title {

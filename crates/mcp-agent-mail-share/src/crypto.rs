@@ -1,7 +1,7 @@
 //! Cryptographic operations for bundle signing and encryption.
 //!
 //! - Ed25519 manifest signing via `ed25519-dalek`
-//! - Age encryption/decryption via CLI shelling
+//! - Age encryption/identity decryption via CLI, passphrase decryption in process
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -709,50 +709,60 @@ pub fn decrypt_with_age(
     }
     validate_crypto_output_path(output_path, "decryption output")?;
 
-    check_age_available()?;
-
     let (staging_dir, staged_output) =
         create_staged_crypto_output_path(output_path, "decryption output", ".age-decrypt.")?;
 
-    let mut cmd = age_command();
-    cmd.arg("-d");
-
-    if let Some(id_path) = identity {
-        cmd.arg("-i").arg(id_path);
-    } else if let Some(_pass) = passphrase {
-        // age reads passphrase from stdin when -p is used
-        cmd.arg("-p");
-    } else {
-        // Unreachable because we validated inputs above, but keep a defensive branch.
-        return Err(ShareError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "either identity or passphrase required for decryption",
-        )));
-    }
-
-    cmd.arg("-o").arg(&staged_output).arg(encrypted_path);
-
     if let Some(pass) = passphrase {
-        use std::io::Write;
-        cmd.stdin(std::process::Stdio::piped());
-        // To prevent deadlock during write_all if age produces unexpected output on stdout/stderr,
-        // we map them to null since we output to a file and don't log them for passphrase runs.
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let mut child = cmd.spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(pass.as_bytes())?;
-            stdin.write_all(b"\n")?;
+        // The official age CLI reads secrets from its terminal and rejects
+        // `-d -p`. Use the supported synchronous library API instead: no
+        // passphrase enters an argument, environment variable, or child pipe.
+        let rejected = || {
+            ShareError::Io(std::io::Error::other(
+                "age decryption failed (check passphrase and file integrity)",
+            ))
+        };
+        let encrypted = std::fs::File::open(encrypted_path)?;
+        let input = age::armor::ArmoredReader::new(encrypted);
+        let decryptor = age::Decryptor::new_buffered(input).map_err(|_| rejected())?;
+        let identity =
+            age::scrypt::Identity::new(age::secrecy::SecretString::from(pass.to_owned()));
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .map_err(|_| rejected())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            // Do NOT include stderr when a passphrase was involved —
-            // error output could leak passphrase-related diagnostics.
-            return Err(ShareError::Io(std::io::Error::other(
-                "age decryption failed (check passphrase and file integrity)".to_string(),
-            )));
+        let mut output = options.open(&staged_output)?;
+        // An authenticated initial chunk is insufficient. Consume and verify
+        // the entire stream before the private plaintext can be published.
+        use std::io::{Read as _, Write as _};
+        let mut buffer = zeroize::Zeroizing::new(vec![0_u8; 64 * 1024]);
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(rejected()),
+            };
+            if read == 0 {
+                break;
+            }
+            // Keep output failures (disk full, permissions, etc.) actionable;
+            // only decryption/read errors get the secret-safe crypto message.
+            output.write_all(&buffer[..read])?;
         }
+        output.sync_all()?;
     } else {
+        check_age_available()?;
+        let mut cmd = age_command();
+        cmd.arg("-d");
+        if let Some(id_path) = identity {
+            cmd.arg("-i").arg(id_path);
+        }
+        cmd.arg("-o").arg(&staged_output).arg(encrypted_path);
         let result = cmd.output()?;
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -921,7 +931,7 @@ fn age_command() -> std::process::Command {
     #[cfg(test)]
     {
         if let Some(path) = AGE_COMMAND_OVERRIDE.with(|slot| slot.borrow().clone()) {
-            return std::process::Command::new(path);
+            return std::process::Command::new(path); // ubs:ignore -- test-only fixture executable; production always runs "age".
         }
     }
     std::process::Command::new("age")
@@ -975,14 +985,20 @@ mod tests {
 
     fn try_generate_age_identity(dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
         let identity_path = dir.join("age_identity.txt");
-        let output = std::process::Command::new("age-keygen")
+        let output = match std::process::Command::new("age-keygen")
             .arg("-o")
             .arg(&identity_path)
             .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("failed to start age-keygen: {error}"),
+            Ok(output) => output,
+        };
+        assert!(
+            output.status.success(),
+            "age-keygen failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -992,7 +1008,8 @@ mod tests {
             .lines()
             .find(|line| line.to_ascii_lowercase().contains("public key:"))
             .and_then(|line| line.split_whitespace().last())
-            .map(std::string::ToString::to_string)?;
+            .map(std::string::ToString::to_string)
+            .expect("available age-keygen must report its public key");
         Some((identity_path, recipient))
     }
 
@@ -2740,6 +2757,104 @@ mod tests {
         let err = decrypt_with_age(&encrypted, &output, Some(&linked_identity), None)
             .expect_err("symlinked identity files must be rejected");
         assert!(format!("{err}").contains("must not be a symlink"));
+    }
+
+    #[test]
+    fn decrypt_passphrase_accepts_official_age_binary_and_armor() {
+        use std::io::Write as _;
+
+        // Captured with official age v1.2.1 (binary SHA-256
+        // aaec874ed903da4b02a9d503778ae05ee5005b2acc0f4a4cf10e5d0f17fd4384).
+        // This is an interoperability fixture, not a claim of a live CLI run.
+        let ciphertext = base64_decode(concat!(
+            "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHNjcnlwdCBNZGJyRWUyMTI1OXhXZklGMDVnZVFRIDE4ClFO",
+            "SjZGQnZZbnp3VlU3VVR2TDMrL21ZYUJKeTJSenZoVjFua2FtcGNGMWMKLS0tIEZWNDJqTzEwVjM0c1h0",
+            "ZUFBMTlkUlRWd2ZsUi9WUys3WEpVVFdBdUR0d3MKsV8E3CJaZMgKjOXYwp4It0psXeYtkfYemRI/oVyB",
+            "kWMY8joJnxn3SyEUH5cxO836hifUup82nCMgHJlSWY9Mn4K0UN8EtPuxan7KEZ8="
+        ))
+        .expect("official fixture base64");
+        let mut armor =
+            age::armor::ArmoredWriter::wrap_output(Vec::new(), age::armor::Format::AsciiArmor)
+                .expect("armor writer");
+        armor.write_all(&ciphertext).expect("armor ciphertext");
+        let armored = armor.finish().expect("finish armor");
+        let dir = tempfile::tempdir().expect("private test directory");
+        for (index, bytes) in [ciphertext, armored].iter().enumerate() {
+            let input = dir.path().join(format!("official-{index}.age"));
+            let output = dir.path().join(format!("plaintext-{index}"));
+            std::fs::write(&input, bytes).expect("write ciphertext fixture");
+            with_age_command_override(&dir.path().join("no-age-executable"), || {
+                decrypt_with_age(
+                    &input,
+                    &output,
+                    None,
+                    Some("am-share interoperability passphrase  \t"),
+                )
+                .expect("real age passphrase decryption without a CLI dependency");
+            });
+            assert_eq!(
+                std::fs::read(&output).expect("read plaintext"),
+                b"Agent Mail age interoperability regression\0\xff\n"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(&output)
+                        .expect("stat plaintext")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decrypt_passphrase_authenticates_the_final_chunk_before_publication() {
+        use std::io::Write as _;
+
+        let passphrase = "synthetic passphrase canary";
+        let plaintext = vec![0xA5; 128 * 1024 + 17];
+        let encryptor = age::Encryptor::with_user_passphrase(age::secrecy::SecretString::from(
+            passphrase.to_owned(),
+        ));
+        let mut ciphertext = Vec::new();
+        let mut writer = encryptor
+            .wrap_output(&mut ciphertext)
+            .expect("encrypt writer");
+        writer
+            .write_all(&plaintext)
+            .expect("encrypt multiple real chunks");
+        writer.finish().expect("final authentication tag");
+        let dir = tempfile::tempdir().expect("private test directory");
+        for case in 0..3 {
+            let mut bytes = ciphertext.clone();
+            match case {
+                0 => {}
+                1 => {
+                    bytes.pop();
+                }
+                _ => *bytes.last_mut().expect("ciphertext") ^= 1,
+            }
+            let input = dir.path().join(format!("corrupt-{case}.age"));
+            let output = dir.path().join(format!("never-published-{case}"));
+            std::fs::write(&input, &bytes).expect("write ciphertext");
+            let supplied = if case == 0 {
+                "wrong passphrase"
+            } else {
+                passphrase
+            };
+            let error = decrypt_with_age(&input, &output, None, Some(supplied))
+                .expect_err("wrong secret or corrupt final chunk must fail");
+            assert!(
+                !output.exists(),
+                "partial authenticated chunks must remain private"
+            );
+            assert!(!error.to_string().contains(supplied));
+            assert_eq!(std::fs::read(&input).expect("unchanged input"), bytes);
+        }
     }
 
     #[test]

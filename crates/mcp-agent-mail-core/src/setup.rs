@@ -5066,8 +5066,9 @@ where
         &backup_parent_authority,
         &protect_artifact,
     )?;
-    if backup.content.as_bytes() != view.before
+    if backup.content.as_bytes() != view.before // ubs:ignore -- private backup integrity check, not an authentication oracle.
         || backup.link_count != 1
+        // ubs:ignore -- compares public permission bits, not secret bytes.
         || (cfg!(unix) && backup.recorded_mode & 0o7777 != 0o600)
     {
         return Err(invalid_setup_path(
@@ -5241,7 +5242,7 @@ fn transform_config_atomic_inner(
     #[cfg(unix)]
     let permissions_need_tightening = existing_file
         .as_ref()
-        .is_some_and(|snapshot| snapshot.permissions != effective_permissions);
+        .is_some_and(|snapshot| snapshot.permissions != effective_permissions); // ubs:ignore -- compares public permission bits, not secret bytes.
     #[cfg(not(unix))]
     let permissions_need_tightening = false;
     let topology_needs_detaching = existing_file
@@ -7047,12 +7048,11 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
             }
         };
         let content = if source.provider == OmpMcpAuthorityProvider::Extension {
-            match prepare_omp_extension_mcp_content(content, &source) {
-                Ok(content) => content,
-                Err(()) => {
-                    inspection.unsupported_paths.push(source.path);
-                    continue;
-                }
+            if let Ok(content) = prepare_omp_extension_mcp_content(content, &source) {
+                content
+            } else {
+                inspection.unsupported_paths.push(source.path);
+                continue;
             }
         } else {
             content
@@ -7929,9 +7929,12 @@ fn analyze_toml_config_content(
                 .all(|section| section.authorization.is_none())
         },
         |expected| {
-            sections
-                .iter()
-                .any(|section| section.authorization.as_deref() == Some(expected))
+            sections.iter().any(|section| {
+                section
+                    .authorization
+                    .as_deref()
+                    .is_some_and(|actual| constant_time_str_eq(actual, expected))
+            })
         },
     );
     if !auth_matches {
@@ -8690,6 +8693,21 @@ mod tests {
     #[test]
     fn audited_config_transform_never_completes_or_rolls_back_a_changed_source() {
         let td = setup_real_tempdir();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(td.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            std::fs::canonicalize(td.path()).unwrap(),
+            resolve_secret_git_context_inner(&td.path().join("config.json"), false, false, true)
+                .unwrap()
+                .expect("isolated Git authority")
+                .0,
+        );
         let path = td.path().join("config.json");
         let backup = td.path().join("backups/config.json");
         std::fs::write(&path, b"original").unwrap();
@@ -8724,6 +8742,26 @@ mod tests {
     fn audited_config_transform_refuses_changed_lock_leaf() {
         for replace_lock in [false, true] {
             let td = setup_real_tempdir();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(td.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(
+                std::fs::canonicalize(td.path()).unwrap(),
+                resolve_secret_git_context_inner(
+                    &td.path().join("config.json"),
+                    false,
+                    false,
+                    true
+                )
+                .unwrap()
+                .expect("isolated Git authority")
+                .0,
+            );
             let path = td.path().join("config.json");
             let backup = td.path().join("backups/config.json");
             let lock_path = td.path().join(".config.json.doctor-lock");
@@ -9476,7 +9514,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 8765,
             path: "/mcp/".into(),
-            token: "test-token".into(),
+            token: "test-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/project"),
             skip_user_config: true,
             ..Default::default()
@@ -9509,7 +9547,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 8765,
             path: "/mcp/".into(),
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(AgentPlatform::ALL.to_vec()),
@@ -9567,7 +9605,7 @@ mod tests {
         std::fs::write(&outside, "sentinel\n").unwrap();
         symlink(&outside, tmp.path().join(".gitignore")).unwrap();
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -9611,7 +9649,7 @@ mod tests {
                 .success()
         );
         let params = SetupParams {
-            token: "must-not-enter-index".into(),
+            token: "must-not-enter-index".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -9665,7 +9703,7 @@ mod tests {
         let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
         assert!(!flock_sentinel.exists());
         let params = SetupParams {
-            token: "must-not-enter-index".into(),
+            token: "must-not-enter-index".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -9708,7 +9746,7 @@ mod tests {
         );
         let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
         let params = SetupParams {
-            token: "must-not-reach-symlink".into(),
+            token: "must-not-reach-symlink".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -9753,7 +9791,7 @@ mod tests {
         );
         let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
         let params = SetupParams {
-            token: "must-not-reach-unsafe-gitignore".into(),
+            token: "must-not-reach-unsafe-gitignore".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -9789,7 +9827,7 @@ mod tests {
                 .success()
         );
         let mut params = SetupParams {
-            token: "old-secret-token".into(),
+            token: "old-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -9911,7 +9949,7 @@ mod tests {
         let tmp = setup_real_tempdir();
         let override_path = tmp.path().join("custom-agent/mcp.json");
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             omp_user_config_path_override: Some(override_path.clone()),
@@ -9956,7 +9994,7 @@ mod tests {
         // Brackets are Git glob metacharacters and valid filenames on Windows.
         let override_path = tmp.path().join("custom[agent]/mcp[local].json");
         let mut params = SetupParams {
-            token: "first-secret".into(),
+            token: "first-secret".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             omp_user_config_path_override: Some(override_path.clone()),
@@ -9965,18 +10003,24 @@ mod tests {
             skip_hooks: true,
             ..Default::default()
         };
+        let initial = run_setup(&params);
         assert!(
-            run_setup(&params)[0]
+            initial[0]
                 .actions
                 .iter()
-                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))),
+            "initial literal-metacharacter setup: {:?}",
+            initial[0].actions
         );
         params.token = "second-secret".into();
+        let rotated = run_setup(&params);
         assert!(
-            run_setup(&params)[0]
+            rotated[0]
                 .actions
                 .iter()
-                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))),
+            "rotated literal-metacharacter setup: {:?}",
+            rotated[0].actions
         );
 
         let status = Command::new("git")
@@ -10091,7 +10135,7 @@ mod tests {
     #[test]
     fn nonempty_token_writes_authorization_header() {
         let params = SetupParams {
-            token: "real-token".into(),
+            token: "real-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/p"),
             skip_user_config: true,
             skip_hooks: true,
@@ -10116,7 +10160,7 @@ mod tests {
     fn config_paths_without_expected_bearer_token_lists_the_header_free_user_configs() {
         let home = PathBuf::from("/home/tester");
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/project"),
             home_dir_override: Some(home.clone()),
             agents: Some(vec![AgentPlatform::Cursor]),
@@ -10142,7 +10186,7 @@ mod tests {
     #[test]
     fn config_paths_without_expected_bearer_token_is_the_complement_of_expected_auth() {
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/project"),
             home_dir_override: Some(PathBuf::from("/home/tester")),
             skip_hooks: true,
@@ -10517,7 +10561,7 @@ mod tests {
             project_dir: project.clone(),
             omp_user_config_path_override: Some(PathBuf::from(path)),
             agents: Some(vec![AgentPlatform::Omp]),
-            token: "must-not-be-written".to_string(),
+            token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
             skip_hooks: true,
             ..SetupParams::default()
         };
@@ -10526,7 +10570,7 @@ mod tests {
             SetupParams {
                 project_dir: project.clone(),
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "must-not-be-written".to_string(),
+                token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             },
@@ -10534,7 +10578,7 @@ mod tests {
                 project_dir: project.clone(),
                 home_dir_override: Some(PathBuf::from("relative-home")),
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "must-not-be-written".to_string(),
+                token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             },
@@ -10549,7 +10593,7 @@ mod tests {
                     std::path::MAIN_SEPARATOR
                 ))),
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "must-not-be-written".to_string(),
+                token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             },
@@ -10584,7 +10628,7 @@ mod tests {
         let params = SetupParams {
             project_dir: project.clone(),
             agents: Some(vec![AgentPlatform::Omp]),
-            token: "ordinary-direct-setup".to_string(),
+            token: "ordinary-direct-setup".to_string(), // ubs:ignore -- synthetic test credential.
             skip_hooks: true,
             ..SetupParams::default()
         };
@@ -10852,7 +10896,7 @@ mod tests {
             project_dir: tmp.path().join("project"),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Antigravity]),
-            token: "transport-fixture-token".into(),
+            token: "transport-fixture-token".into(), // ubs:ignore -- synthetic test credential.
             ..Default::default()
         };
         let actions = AgentPlatform::Antigravity.config_actions(&params);
@@ -13112,7 +13156,7 @@ http_headers = { Authorization = "Bearer tok" }
             std::fs::create_dir_all(&project).unwrap();
             let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", profile.as_os_str());
             let params = SetupParams {
-                token: "profile-test-token".into(),
+                token: "profile-test-token".into(), // ubs:ignore -- synthetic test credential.
                 project_dir: project.clone(),
                 home_dir_override: Some(home.clone()),
                 agents: Some(vec![AgentPlatform::Claude]),
@@ -13199,7 +13243,7 @@ http_headers = { Authorization = "Bearer tok" }
             project_dir: tmp.path().join("project"),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Claude]),
-            token: "must-not-be-written".into(),
+            token: "must-not-be-written".into(), // ubs:ignore -- synthetic test credential.
             ..Default::default()
         };
         let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "../other-profile");
@@ -13273,7 +13317,7 @@ http_headers = { Authorization = "Bearer tok" }
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Claude]),
-            token: "must-not-enter-index".into(),
+            token: "must-not-enter-index".into(), // ubs:ignore -- synthetic test credential.
             skip_hooks: true,
             ..Default::default()
         };
@@ -14117,7 +14161,10 @@ http_headers = { Authorization = "Bearer tok" }
             "extensions: [./mail-extension]\ndisabledProviders: []\n",
         )
         .unwrap();
-        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
         assert!(omp_mcp_authority_paths(&params).contains(&mcp));
         let overlay = params.project_dir.join("providers.yml");
         std::fs::write(&overlay, "disabledProviders: [omp-plugins]\n").unwrap();
@@ -14158,7 +14205,7 @@ http_headers = { Authorization = "Bearer tok" }
         )
         .unwrap();
         let standard = first_setup_status_file(&params);
-        assert!(standard.drift_reasons.is_empty());
+        assert_eq!(standard.drift_reasons, Vec::<ConfigDriftReason>::new());
         assert!(omp_mcp_authority_paths(&params).contains(&manifest));
         assert!(
             !omp_mcp_authority_paths(&params).contains(&mcp),
@@ -14221,7 +14268,10 @@ http_headers = { Authorization = "Bearer tok" }
         let entrypoint = params.project_dir.join("extension.ts");
         std::fs::write(&entrypoint, "export default function () {}\n").unwrap();
         std::fs::write(&settings, "extensions: [./extension.ts]\n").unwrap();
-        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
         assert!(!omp_mcp_authority_paths(&params).contains(&entrypoint.join("mcp.json")));
 
         let unsafe_root = params.project_dir.join("../outside");
@@ -14345,7 +14395,7 @@ http_headers = { Authorization = "Bearer tok" }
         let root = params.project_dir.join("mail-extension");
         let mcp = root.join(".mcp.json");
         let absent = first_setup_status_file(&params);
-        assert!(absent.drift_reasons.is_empty());
+        assert_eq!(absent.drift_reasons, Vec::<ConfigDriftReason>::new());
         for path in [root.join("plugin.json"), mcp.clone(), root.join("mcp.json")] {
             assert!(omp_mcp_authority_paths(&params).contains(&path));
             assert!(absent.status_observations.iter().any(|observation| {
@@ -14545,7 +14595,7 @@ http_headers = { Authorization = "Bearer tok" }
             project_dir: tmp.path().join("invalid-project"),
             home_dir_override: Some(PathBuf::from("relative-home")),
             agents: Some(vec![AgentPlatform::Omp]),
-            token: "must-not-be-planned".to_string(),
+            token: "must-not-be-planned".to_string(), // ubs:ignore -- synthetic test credential.
             skip_hooks: true,
             ..SetupParams::default()
         };
@@ -14572,7 +14622,7 @@ http_headers = { Authorization = "Bearer tok" }
             let params = SetupParams {
                 project_dir: named_project,
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "named-profile-token".to_string(),
+                token: "named-profile-token".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             };
@@ -14602,7 +14652,7 @@ http_headers = { Authorization = "Bearer tok" }
             let params = SetupParams {
                 project_dir: custom_project,
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "custom-agent-token".to_string(),
+                token: "custom-agent-token".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             };

@@ -5,6 +5,8 @@
 #   am e2e run --project . share
 # Compatibility fallback:
 #   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh share
+# Required real-age lane without the database/export phases:
+#   AM_E2E_SHARE_CRYPTO_ONLY=1 am e2e run --project . share
 #
 # This suite verifies:
 # - Export creates a bundle with manifest.json, mailbox.sqlite3, viewer/
@@ -33,8 +35,17 @@ e2e_banner "Share / Export Bundle E2E Test Suite"
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 
-for cmd in sqlite3 python3; do
+REQUIRED_COMMANDS=(python3)
+if [ "${AM_E2E_SHARE_CRYPTO_ONLY:-0}" != "1" ]; then
+    REQUIRED_COMMANDS+=(sqlite3)
+fi
+for cmd in "${REQUIRED_COMMANDS[@]}"; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
+        if [ "${AM_E2E_SHARE_CRYPTO_ONLY:-0}" = "1" ]; then
+            e2e_fail "required crypto lane dependency missing: ${cmd}"
+            e2e_summary
+            exit 1
+        fi
         e2e_log "${cmd} not found; skipping suite"
         e2e_skip "${cmd} required"
         e2e_summary
@@ -54,10 +65,8 @@ e2e_fatal() {
 # ---------------------------------------------------------------------------
 
 AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
-MCP_BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 e2e_log "am binary: ${AM_BIN}"
-e2e_log "mcp-agent-mail binary: ${MCP_BIN}"
 
 # ---------------------------------------------------------------------------
 # Workspace
@@ -78,6 +87,199 @@ am_env() {
     STORAGE_ROOT="${STORAGE_ROOT}" \
     "$@"
 }
+
+e2e_case_banner "Real age passphrase and identity decryption through am"
+if am_env python3 - "${AM_BIN}" "${WORK}/crypto" "${E2E_ARTIFACT_DIR}/crypto.json" "${BASH_SOURCE[0]}" <<'PY'
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import pty
+import secrets
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+binary, root, report_path, source_path = map(lambda p: Path(p).resolve(), sys.argv[1:])
+root.mkdir(mode=0o700)
+home = root / 'home'
+home.mkdir(mode=0o700)
+env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'))
+checks, commands = [], []
+report = {'scope': 'real-age and actual-am crypto; Unix terminal evidence only',
+          'harness_sha256': hashlib.sha256(source_path.read_bytes()).hexdigest(),
+          'checks': checks, 'commands': commands}
+secret = 'am-live-' + secrets.token_hex(24) + '  \t'
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def check(name, ok):
+    checks.append({'name': name, 'passed': bool(ok)})
+    if not ok:
+        raise AssertionError(name)
+
+def run(program, args, supplied=None):
+    # ubs:ignore python.taint.command -- executes the operator-selected E2E candidate or fixed age/age-keygen tools as argv, never a shell/request payload.
+    result = subprocess.run([str(program), *map(str, args)], cwd=root, env=env,
+                            input=supplied, capture_output=True, timeout=90,
+                            start_new_session=True)
+    check('command output excludes supplied secret',
+          secret.rstrip().encode() not in result.stdout + result.stderr)
+    commands.append({'executable': str(program), 'argv': list(map(str, args)),
+                     'exit': result.returncode, 'stdout': result.stdout.decode(errors='replace'),
+                     'stderr': result.stderr.decode(errors='replace')})
+    return result
+
+def terminal(program, args, prompts):
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.chdir(root)
+            # ubs:ignore python.taint.command -- only the explicit E2E candidate or discovered literal age executable reaches this PTY child.
+            os.execvpe(str(program), [str(program), *map(str, args)], env)
+        finally:
+            os._exit(127)
+    transcript, pending = bytearray(), bytearray()
+    deadline = time.monotonic() + 90
+    reaped = False
+    try:
+        for prompt in [p.encode() for p in prompts]:
+            while prompt not in pending:
+                check('terminal prompt meets deadline', time.monotonic() < deadline)
+                if select.select([fd], [], [], 0.1)[0]:
+                    data = os.read(fd, 65536)
+                    if not data:
+                        raise AssertionError('terminal closed before secret prompt')
+                    pending.extend(data)
+                    transcript.extend(data)
+            del pending[:pending.index(prompt) + len(prompt)]
+            # The program must disable echo itself. Poll the real PTY mode;
+            # disabling it in the harness would hide a broken CLI implementation.
+            while termios.tcgetattr(fd)[3] & termios.ECHO:
+                check('terminal disables echo before deadline', time.monotonic() < deadline)
+                time.sleep(0.005)
+            os.write(fd, (secret + '\n').encode())
+        while True:
+            check('terminal completion meets deadline', time.monotonic() < deadline)
+            if select.select([fd], [], [], 0.1)[0]:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                transcript.extend(data)
+        while True:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                break
+            check('terminal child exits before deadline', time.monotonic() < deadline)
+            time.sleep(0.01)
+        reaped = True
+        check('terminal output excludes supplied secret', secret.rstrip().encode() not in transcript)
+        code = os.waitstatus_to_exitcode(status)
+        commands.append({'executable': str(program), 'argv': list(map(str, args)),
+                         'exit': code, 'transcript': transcript.decode(errors='replace')})
+        check('terminal command succeeds', code == 0)
+    finally:
+        if not reaped:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+        os.close(fd)
+
+try:
+    # Missing tools are a failed required lane, never an arbitrary-error skip.
+    age, keygen = map(shutil.which, ['age', 'age-keygen'])
+    check('required age and age-keygen are installed', age is not None and keygen is not None)
+    age, keygen = Path(age).resolve(), Path(keygen).resolve()
+    report['executables'] = {str(p): sha(p) for p in [binary, age, keygen]}
+    check('official age version succeeds', run(age, ['--version']).returncode == 0)
+    check('official keygen version succeeds', run(keygen, ['--version']).returncode == 0)
+    plain = root / 'original.bin'
+    plain.write_bytes(b'Agent Mail real crypto probe\0\xff\n' + os.urandom(100000))
+    expected = sha(plain)
+    cipher = root / 'passphrase.age'
+    terminal(age, ['-p', '-o', cipher, plain], ['Enter passphrase', 'Confirm passphrase'])
+    retained = {plain: expected, cipher: sha(cipher)}
+    report['plaintext_sha256'], report['ciphertext_sha256'] = expected, retained[cipher]
+    for flags in [['-d', '-p'], ['-d']]:
+        output = root / ('unsupported-' + str(len(flags)) + '.bin')
+        result = run(age, [*flags, '-o', output, cipher], (secret + '\n').encode())
+        check('unsupported CLI secret exchange fails ' + str(flags),
+              result.returncode != 0 and (not output.exists() or sha(output) != expected))
+    pipe_out = root / 'piped.bin'
+    result = run(binary, ['share', 'decrypt', cipher, '--passphrase', '-o', pipe_out],
+                 (secret + '\r\n').encode())
+    check('pipe preserves significant spaces and tab', result.returncode == 0 and sha(pipe_out) == expected)
+    terminal_out = root / 'terminal.bin'
+    terminal(binary, ['share', 'decrypt', cipher, '--passphrase', '-o', terminal_out], ['Enter passphrase: '])
+    check('hidden terminal preserves significant spaces and tab', sha(terminal_out) == expected)
+    retained.update({pipe_out: expected, terminal_out: expected})
+    for label, data in [('wrong', cipher.read_bytes()), ('truncated', cipher.read_bytes()[:-1]),
+                        ('corrupt', cipher.read_bytes()[:-1] + bytes([cipher.read_bytes()[-1] ^ 1]))]:
+        source, output = root / (label + '.age'), root / (label + '.bin')
+        source.write_bytes(data)
+        retained[source] = sha(source)
+        supplied = 'wrong-' + secret if label == 'wrong' else secret
+        result = run(binary, ['share', 'decrypt', source, '--passphrase', '-o', output],
+                     (supplied + '\n').encode())
+        check(label + ' secret/final chunk publishes nothing', result.returncode != 0 and not output.exists())
+    check('existing output is refused', run(binary, ['share', 'decrypt', cipher, '--passphrase', '-o', pipe_out],
+                                           (secret + '\n').encode()).returncode != 0)
+    identity = root / 'identity.txt'
+    check('real identity generation succeeds', run(keygen, ['-o', identity]).returncode == 0)
+    public = run(keygen, ['-y', identity]).stdout.decode().strip()
+    check('real public key returned', public.startswith('age1'))
+    cipher_dir = root / 'identity-cipher'
+    cipher_dir.mkdir()
+    identity_cipher = cipher_dir / 'original.bin.age'
+    check('real identity encryption succeeds', run(age, ['-r', public, '-o', identity_cipher, plain]).returncode == 0)
+    retained[identity_cipher] = sha(identity_cipher)
+    explicit = root / 'identity-explicit.bin'
+    check('identity explicit output succeeds', run(binary, ['share', 'decrypt', identity_cipher, '-i', identity, '-o', explicit]).returncode == 0 and sha(explicit) == expected)
+    default = cipher_dir / 'original.bin'
+    check('identity default output succeeds', run(binary, ['share', 'decrypt', identity_cipher, '-i', identity]).returncode == 0 and sha(default) == expected)
+    retained.update({explicit: expected, default: expected})
+    wrong_identity = root / 'wrong-identity.txt'
+    check('second real identity generated', run(keygen, ['-o', wrong_identity]).returncode == 0)
+    refused = root / 'wrong-key.bin'
+    check('wrong identity publishes nothing', run(binary, ['share', 'decrypt', identity_cipher, '-i', wrong_identity, '-o', refused]).returncode != 0 and not refused.exists())
+    check('missing input publishes nothing', run(binary, ['share', 'decrypt', root / 'missing.age', '-i', identity, '-o', refused]).returncode != 0 and not refused.exists())
+    check('conflicting secret selection publishes nothing', run(binary, ['share', 'decrypt', cipher, '-i', identity, '--passphrase', '-o', refused], (secret + '\n').encode()).returncode != 0 and not refused.exists())
+    check('all original inputs and outputs remain intact', all(sha(p) == digest for p, digest in retained.items()))
+    report['verdict'] = 'PASS'
+except Exception as error:
+    # Do not quote dependency exception strings that might contain supplied data.
+    report['verdict'], report['failure_type'] = 'FAIL', type(error).__name__
+finally:
+    report_path.write_text(json.dumps(report, indent=2) + '\n')
+print(json.dumps({'verdict': report['verdict'], 'checks': len(checks), 'report': str(report_path)}))
+sys.exit(0 if report['verdict'] == 'PASS' else 1)
+PY
+then
+    e2e_pass "real age/actual am crypto controls passed (see crypto.json)"
+else
+    e2e_fail "real age/actual am crypto lane failed (see crypto.json)"
+fi
+
+if [ "${AM_E2E_SHARE_CRYPTO_ONLY:-0}" = "1" ]; then
+    e2e_summary
+    exit
+fi
+
+MCP_BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+e2e_log "mcp-agent-mail binary: ${MCP_BIN}"
 
 extract_local_asset_paths() {
     local html_file="$1"

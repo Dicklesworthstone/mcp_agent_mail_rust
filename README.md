@@ -92,7 +92,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 19 agent-optimized CLI subcommands with `toon`/`json` output (`md` for thread and message views) for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
-| **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing need a build with the hybrid feature (`feature = "hybrid"`) and the runtime opt-in `AM_SEARCH_SEMANTIC_ENABLED=true`. Without both, every query runs lexical. |
+| **Hybrid Search** | Portable lexical Search V3 uses the local Tantivy bridge. Optional FrankenSearch integration supplies semantic and hybrid routing in builds with the `hybrid` feature and the runtime opt-in `AM_SEARCH_SEMANTIC_ENABLED=true`. Without both, every query runs lexical. |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
 | **Dual-Mode Interface** | MCP server (`mcp-agent-mail`) and operator CLI (`am`) share tools but enforce strict surface separation |
 
@@ -345,7 +345,11 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). On current `main`, Cargo fetches [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294`, recorded in `Cargo.toml` and `Cargo.lock` and aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This revision shares FastMCP's rustix 1.1.5 requirement; the enabled search features retain local Model2Vec and native reranking without FastEmbed or Tokio. A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source. The mailbox uses registry FrankenSQLite `=0.4.10` through SQLModel 0.5.0 on Asupersync 0.5.0. FastMCP 0.10.0 remains pinned to an immutable revision preserving protocol negotiation. Registry `beads_rust =0.6.0` retains its separate FrankenSQLite 0.3.18 engine, patched to an immutable Git revision, with default features disabled. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results.
+Requires Rust nightly (see `rust-toolchain.toml`). Current `main` records [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294` in `Cargo.toml` and `Cargo.lock`, aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This optional `hybrid` integration shares FastMCP's rustix 1.1.5 requirement and enables local Model2Vec and native reranking without FastEmbed or Tokio. Portable builds use the local Tantivy bridge for lexical Search V3 without enabling FrankenSearch integration.
+
+A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source.
+
+The mailbox uses registry FrankenSQLite `=0.4.10` through SQLModel 0.5.0 on Asupersync 0.5.0. `Cargo.lock` selects the FastMCP 0.13.0 family from crates.io, with `fastmcp-rust` imported as `fastmcp`. Registry `beads_rust =0.6.0` retains its separate FrankenSQLite 0.3.18 engine, patched to an immutable Git revision, with default features disabled. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results.
 
 ### Platforms
 
@@ -656,10 +660,15 @@ isolate hostile clients that share one bearer credential and can read each
 other's session ids.
 
 When an interactive `am` finds a healthy Agent Mail service already serving the
-configured endpoint, it attaches a read-only terminal view to that service's
-`/mail/ws-state` snapshot. It does not stop or restart the service, acquire a
-mutation lock, or run service-control commands. `--takeover` remains the
-explicit opt-in for a local replacement.
+configured endpoint, it defaults to an attach/takeover/quit prompt
+(`AM_ATTACH_MODE=ask`). Enter chooses a read-only view of the service's
+`/mail/ws-state` snapshot; that attachment does not stop or restart the service,
+acquire a mutation lock, or run service-control commands. Set
+`AM_ATTACH_MODE=attach` to select it without prompting. Choose takeover, pass
+`--takeover`, or set `AM_ATTACH_MODE=takeover` for an explicit local replacement
+through the supervised service-control path; a managed service is restored when
+the local session ends. If this decision runs without interactive stdin, the
+default is read-only attachment.
 
 ### Dual-Mode Interface
 
@@ -910,7 +919,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 
 - **`toon`** (default at TTY): Token-efficient, compact, optimized for agent parsing
 - **`json`** (default when piped): Machine-readable envelope with `_meta`, `_alerts`, `_actions`
-- **`md`** (thread/message-focused): Human-readable narrative for deep context
+- **`md`** (`thread` and `message` only, and their default even when piped): Human-readable narrative for deep context. Pass `--format json` to pipe them into `jq`.
 
 ### Search Pages
 
@@ -1234,7 +1243,13 @@ for the shipped replay boundary and the still-deferred live parity contract.
 | `/mail/api/projects/{project}/agents` | JSON roster for one project |
 | `/mail/archive/*` | Archive browser and time-travel routes |
 
-Auth: set `HTTP_BEARER_TOKEN` for production. For local dev, set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` to browse without headers.
+Auth: HTTP authentication is off when neither `HTTP_BEARER_TOKEN` nor JWT auth
+is configured; this supports the trusted-local deployment described in
+[`SECURITY.md`](SECURITY.md). Configure a bearer token or JWT before exposing the
+server beyond loopback. With auth configured,
+`HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` explicitly permits the guarded local
+bypass; it is not needed for no-token operation. These transport controls do not
+isolate hostile clients sharing the same OS account or bearer credential.
 
 ### Human Overseer
 
@@ -1280,7 +1295,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_HOST` | `127.0.0.1` | Bind address |
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
-| `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
+| `HTTP_BEARER_TOKEN` | (unset unless configured, including via `.env`) | HTTP bearer credential; with JWT auth also disabled, an unset token leaves HTTP authentication off for trusted-local operation |
 | `HTTP_ALLOWED_HOSTS` | (none) | Comma-separated extra `Host:` header values the HTTP listener accepts, in addition to the bind host, its loopback variant, and `localhost`. Set this (or pass repeatable `serve-http --allowed-host <HOST>`) to reach the `/mail` web UI via a hostname or reverse proxy instead of getting an HTTP 421. Empty by default (loopback-only). |
 | `DATABASE_URL` | `<STORAGE_ROOT>/storage.sqlite3` | SQLite connection URL. Unset, the database lives inside `STORAGE_ROOT`; an explicit relative path is resolved against the working directory |
 | `AM_CACHE_PROFILE` | `balanced` | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
@@ -1520,7 +1535,7 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 - **Write-behind cache** with dual-indexed ReadCache and deferred touch batching (30s flush)
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
-- **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate and run only with `AM_SEARCH_SEMANTIC_ENABLED=true`; portable/no-default builds and the default runtime keep the deterministic lexical path.
+- **Search V3**: portable lexical retrieval uses the local `TantivyBridge`; optional FrankenSearch semantic retrieval and hybrid fusion compile through the `hybrid` feature and run only with `AM_SEARCH_SEMANTIC_ENABLED=true`. Portable builds and the default runtime keep the deterministic lexical path.
 - **Compatibility testing** against intentionally retained Python wire contracts,
   plus Rust-native durability and behavior fixtures. The Rust implementation is
   authoritative; legacy parity never overrides reliability, security, bounded
@@ -2001,7 +2016,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Pinned Git dependencies.** Current `main` fetches FrankenSearch, FastMCP, and patched FrankenSQLite from immutable Git revisions. Source builds require access to those repositories as well as crates.io; use `cargo build --locked`. Earlier release tags may require sibling checkouts; `install.sh --from-source` provisions their recorded revisions.
+- **Pinned Git dependencies.** Current `main` records optional FrankenSearch and patched FrankenSQLite at immutable Git revisions; the FastMCP 0.13.0 family comes from crates.io. Source builds require access to the selected Git sources as well as crates.io; use `cargo build --locked`. Earlier release tags may require sibling checkouts; `install.sh --from-source` provisions their recorded revisions.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
