@@ -27856,10 +27856,7 @@ mod tests {
                  INSERT INTO message_recipients (message_id, agent_id, kind)
                  VALUES (1, 2, 'to');
                  INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
-                 VALUES (2, 1, 'to', 200), (3, 1, 'to', 300);
-                 INSERT OR REPLACE INTO inbox_stats
-                     (agent_id, total_count, unread_count, ack_pending_count)
-                 VALUES (2, 99, 99, 99);",
+                 VALUES (2, 1, 'to', 200), (3, 1, 'to', 300);",
             )
             .unwrap();
             // Install the real trigger before pooled transactions begin.
@@ -27876,6 +27873,29 @@ mod tests {
             .unwrap();
             rt.block_on(async {
                 let cx = Cx::current().expect("runtime context");
+                {
+                    // Pool initialization repairs aggregate statistics. Plant
+                    // the rollback witness only after that real startup pass.
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    conn.execute_raw(
+                        "INSERT OR REPLACE INTO inbox_stats
+                         (agent_id, total_count, unread_count, ack_pending_count)
+                         VALUES (2, 99, 99, 99);",
+                    ).unwrap();
+                    let rows = conn.query_sync(
+                        "SELECT total_count, unread_count, ack_pending_count FROM inbox_stats WHERE agent_id = 2",
+                        &[],
+                    ).unwrap();
+                    assert_eq!(
+                        (
+                            rows[0].get_named::<i64>("total_count").unwrap(),
+                            rows[0].get_named::<i64>("unread_count").unwrap(),
+                            rows[0].get_named::<i64>("ack_pending_count").unwrap(),
+                        ),
+                        (99, 99, 99),
+                        "{label}: rollback witness follows pool initialization"
+                    );
+                }
                 let outcome = if uncapped {
                     mark_all_messages_read_in_project(&cx, &pool, 1, 2).await.map(|_| ())
                 } else {
@@ -27947,6 +27967,9 @@ mod tests {
             let rows = conn.query_sync("SELECT read_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 2", &[]).unwrap();
             assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None, "neither failed action commits direct receipts");
             conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;").unwrap();
+            conn.execute_raw(
+                "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state",
+            ).unwrap();
             drop(conn);
             assert_eq!(
                 mark_all_messages_read_in_project(&cx, &pool, 1, 2)
@@ -31832,6 +31855,11 @@ mod tests {
                         conn.execute_raw(
                             "ALTER TABLE project_mailbox_deliveries RENAME TO saved_cleanup_deliveries",
                         ).expect("preserve delivery table under another name");
+                    }
+                    if case == "legacy" {
+                        conn.execute_raw(
+                            "ALTER TABLE inbox_delivery_cursor_state RENAME TO saved_cleanup_cursor_state",
+                        ).expect("preserve cursor authority under another name for the legacy fixture");
                     }
                     if case == "unreadable" {
                         conn.execute_raw(
@@ -38132,6 +38160,10 @@ mod tests {
             let conn = pool.acquire(&cx).await.into_result().unwrap();
             conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;")
                 .unwrap();
+            conn.execute_raw(
+                "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state",
+            )
+            .unwrap();
             drop(conn);
             let rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 10)
                 .await

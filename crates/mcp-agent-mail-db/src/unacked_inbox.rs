@@ -1036,6 +1036,12 @@ mod tests {
                 conn.execute_raw("DROP TABLE project_mailbox_deliveries")
                     .unwrap();
             }
+            if missing == "both" {
+                conn.execute_raw(
+                    "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state",
+                )
+                .unwrap();
+            }
             let result = read_from_conn(&Cx::for_testing(), &*conn, 1, 2, 100);
             if missing == "both" {
                 assert_eq!(ids(&result.into_result().unwrap()), [2, 4]);
@@ -1350,6 +1356,8 @@ mod tests {
     fn metadata_cutoff_also_filters_pre_shared_schema_direct_mail() {
         let (_directory, conn, _pool) = fixture();
         conn.execute_raw("PRAGMA foreign_keys=OFF; DROP TABLE project_mailbox_receipts; DROP TABLE project_mailbox_deliveries").unwrap();
+        conn.execute_raw("ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state")
+            .unwrap();
         for (cutoff, expected) in [(199, vec![]), (200, vec![2]), (300, vec![2, 4])] {
             let rows = read_with_options(
                 &Cx::for_testing(),

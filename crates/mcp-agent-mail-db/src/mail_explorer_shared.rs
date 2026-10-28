@@ -631,6 +631,11 @@ mod tests {
                 pool,
                 "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
             );
+            execute(
+                runtime,
+                pool,
+                "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state",
+            );
             let legacy = page(runtime, pool, &query());
             assert_eq!(ids(&legacy), [102, 101]);
             assert_eq!(legacy.total_count, 2);

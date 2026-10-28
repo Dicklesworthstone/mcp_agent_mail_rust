@@ -541,6 +541,12 @@ mod tests {
                      ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;",
                 )
                 .unwrap();
+                if !retain_shared_events {
+                    conn.execute_raw(
+                        "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state",
+                    )
+                    .unwrap();
+                }
 
                 for bodies in [false, true] {
                     let indexed = fetch_inbox_for_product_agent_scoped(
@@ -635,6 +641,12 @@ mod tests {
                     "ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries",
                 )
                 .unwrap();
+                if !retain_shared_events {
+                    conn.execute_raw(
+                        "ALTER TABLE retained_cursor_state RENAME TO inbox_delivery_cursor_state",
+                    )
+                    .unwrap();
+                }
                 let restored = fetch_inbox_for_product_agent_scoped(
                     &cx,
                     &pool,

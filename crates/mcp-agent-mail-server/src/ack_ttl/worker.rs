@@ -384,6 +384,10 @@ mod tests {
     }
 
     fn seed_tail(pool: &DbPool, cx: &Cx) -> String {
+        let generation = block_on(mcp_agent_mail_db::queries::db_generation_id(cx, pool))
+            .into_result()
+            .expect("seed tail generation")
+            .expect("tail fixture needs a durable generation");
         let conn = block_on(pool.acquire(cx)).into_result().unwrap();
         for id in [2_i64, 3] {
             conn.execute_sync(
@@ -397,13 +401,16 @@ mod tests {
             )
             .unwrap();
         }
-        conn.query_sync(
-            "SELECT generation_id FROM db_identity WHERE singleton = 0",
-            &[],
-        )
-        .unwrap()[0]
+        let persisted = conn
+            .query_sync(
+                "SELECT generation_id FROM db_identity WHERE singleton = 0",
+                &[],
+            )
+            .unwrap()[0]
             .get_named::<String>("generation_id")
-            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, generation);
+        generation
     }
 
     fn set_generation(pool: &DbPool, cx: &Cx, generation: &str) {

@@ -12,4 +12,5 @@ Options:
       --agent <AGENT>      Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
       --limit <LIMIT>      Maximum messages in thread
       --since <SINCE>      Show messages after this timestamp
+      --server             Read through the configured MCP server without local database access
   -h, --help               Print help
