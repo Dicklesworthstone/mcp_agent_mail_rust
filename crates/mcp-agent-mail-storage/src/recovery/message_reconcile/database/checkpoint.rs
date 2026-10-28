@@ -578,6 +578,8 @@ impl Store {
             cursor.backfill_ceiling = None;
             cursor.next_lane_is_history = false;
             cursor.startup_backfill_complete = false;
+            cursor.startup_tail = None;
+            cursor.startup_tail_initialized = false;
             return Err(invalid(
                 "checkpoint source/archive generation does not match",
             ));
@@ -1363,11 +1365,18 @@ mod tests {
         cursor.tail_after = Some(100_000);
         cursor.backfill_ceiling = Some(100);
         cursor.startup_backfill_complete = true;
+        cursor.startup_tail = Some(super::super::StartupTail {
+            after: 100_000,
+            ceiling: 110_000,
+        });
+        cursor.startup_tail_initialized = true;
         cursor.checkpoint_dirty = true;
         cursor.defer_transient(77, now);
         assert!(current.restore(&mut cursor).is_err());
         assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
         assert!(!cursor.startup_backfill_complete);
+        assert!(cursor.startup_tail.is_none());
+        assert!(!cursor.startup_tail_initialized);
         assert_eq!(cursor.retries.len(), 1);
         assert_eq!(cursor.retries[0].id, 77);
         assert_eq!(cursor.retries[0].ready_at, now);
@@ -1920,6 +1929,66 @@ mod tests {
                 assert_eq!(row.get_named::<i64>("read_ts").unwrap(), 2_000_000);
                 assert_eq!(row.get_named::<i64>("ack_ts").unwrap(), 2_500_000);
             }
+        });
+    }
+
+    #[test]
+    fn restarted_worker_prioritizes_new_crash_orphans_without_discarding_old_progress() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            // A slow pre-crash worker checkpointed far below the newest rows.
+            // Nearly all intervening mail reached Git through ordinary writes;
+            // the newest two accepted messages died with that process's WBQ.
+            for id in 902..939 {
+                if id != 903 {
+                    let prepared = super::super::prepare_message(cx, pool, id).unwrap();
+                    super::super::reconcile_prepared(config, &prepared).unwrap();
+                }
+            }
+            let mut previous = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            previous.source_identity = pool.sqlite_identity_key();
+            previous.tail_after = Some(905);
+            previous.backfill_ceiling = Some(904);
+            previous.next_lane_is_retry = true;
+            previous.defer_transient(901, Instant::now());
+            previous.retries.push_back(DeferredRetry {
+                id: 902,
+                attempts: 3,
+                ready_at: Instant::now() + MAX_RETRY_BACKOFF,
+            });
+            let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            store.save(&previous).unwrap();
+            drop(store);
+
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let report = super::super::reconcile_message_batch(
+                cx,
+                pool,
+                config,
+                &mut restarted,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_eq!(report.repaired, 4);
+            assert_eq!(report.deferred, 0);
+            assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+            assert!(report.payload_bytes <= super::super::MAX_BATCH_PAYLOAD_BYTES);
+            for id in [901, 903, 939, 940] {
+                assert_message_committed(cx, pool, config, id, 40);
+            }
+            // Recent coverage must not falsely certify the intervening range
+            // or restart history at its newest ID. The old cooldown survives.
+            assert!(restarted.tail_after.is_some_and(|id| id > 905 && id < 939));
+            assert!(restarted.backfill_ceiling.is_some_and(|id| id < 904));
+            let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            let saved = store.load().unwrap().unwrap();
+            assert_eq!(saved.tail_after, restarted.tail_after);
+            assert_eq!(saved.backfill_ceiling, restarted.backfill_ceiling);
+            assert_eq!(saved.retries.len(), 1);
+            assert_eq!(saved.retries[0].id, 902);
+            assert_eq!(saved.retries[0].attempts, 3);
+            assert!(saved.retries[0].wait_us > 0);
         });
     }
 

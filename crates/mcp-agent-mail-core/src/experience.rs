@@ -380,6 +380,15 @@ pub enum NonExecutionReason {
     },
 }
 
+impl NonExecutionReason {
+    /// Validate text before an execution/state update copies or persists it.
+    ///
+    /// Errors contain only fixed policy categories, never supplied text.
+    pub fn validate_content(&self) -> Result<(), &'static str> {
+        ContentValidator::default().non_execution_reason(self)
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Outcome
 // ──────────────────────────────────────────────────────────────────────
@@ -408,81 +417,13 @@ pub struct ExperienceOutcome {
 }
 
 impl ExperienceOutcome {
-    /// Validate content before an outcome is appended, resolved, or amended.
-    /// Diagnostics deliberately contain no rejected payload bytes.
-    #[must_use]
-    pub fn validate(&self) -> Vec<&'static str> {
-        let mut issues = Vec::new();
-        if self.label.len() > 256 {
-            issues.push("outcome.label exceeds 256 bytes");
-        } else if contains_secret(&self.label) {
-            issues.push("outcome.label contains a suspected secret");
-        }
-        if let Some(evidence) = &self.evidence
-            && let Err(reason) = validate_experience_json(evidence)
-        {
-            issues.push("outcome.evidence is invalid");
-            issues.push(reason);
-        }
-        issues
+    /// Validate an outcome, including every nested evidence key and value.
+    ///
+    /// This uses the same bounded policy as [`ExperienceRow::validate_content`]
+    /// and can be called before any lifecycle or rollup mutation.
+    pub fn validate_content(&self) -> Result<(), &'static str> {
+        ContentValidator::default().outcome(self)
     }
-}
-
-/// Bound the work and memory used to validate arbitrary ATC evidence/context.
-///
-/// Scan decoded strings and object keys rather than serializing the whole
-/// value. This catches escaped credentials and rejects oversized/deep payloads
-/// before recursive serialization or context merging. Numeric metrics, flags,
-/// pseudonyms, and nested metric structures remain accepted.
-///
-/// # Errors
-/// Rejects suspected credentials, depth above 16, more than 1024 JSON nodes,
-/// or more than 16 KiB of decoded text (including object keys).
-pub fn validate_experience_json(value: &Value) -> Result<(), &'static str> {
-    const MAX_NODES: usize = 1024;
-    const MAX_DEPTH: usize = 16;
-    const MAX_TEXT_BYTES: usize = 16 * 1024;
-
-    let mut remaining_nodes = MAX_NODES;
-    let mut remaining_text = MAX_TEXT_BYTES;
-    let mut pending = vec![(value, 0)];
-    while let Some((value, depth)) = pending.pop() {
-        if depth > MAX_DEPTH {
-            return Err("JSON depth exceeds 16");
-        }
-        remaining_nodes = remaining_nodes
-            .checked_sub(1)
-            .ok_or("JSON exceeds 1024 nodes")?;
-        let mut scan = |text: &str| {
-            remaining_text = remaining_text
-                .checked_sub(text.len())
-                .ok_or("JSON text exceeds 16384 bytes")?;
-            if contains_secret(text) {
-                return Err("suspected secret");
-            }
-            Ok(())
-        };
-        match value {
-            Value::String(text) => scan(text)?,
-            Value::Array(items) => {
-                if items.len() > remaining_nodes.saturating_sub(pending.len()) {
-                    return Err("JSON exceeds 1024 nodes");
-                }
-                pending.extend(items.iter().map(|item| (item, depth + 1)));
-            }
-            Value::Object(items) => {
-                if items.len() > remaining_nodes.saturating_sub(pending.len()) {
-                    return Err("JSON exceeds 1024 nodes");
-                }
-                for (key, item) in items {
-                    scan(key)?;
-                    pending.push((item, depth + 1));
-                }
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) => {}
-        }
-    }
-    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -751,32 +692,280 @@ impl ExperienceRow {
         {
             issues.push("resolved_ts_micros must be set for resolved/censored/expired state");
         }
-        issues.extend(self.validate_content());
+        if let Err(issue) = self.validate_content() {
+            issues.push(issue);
+        }
+
         issues
     }
 
-    /// Validate Category D payloads without imposing Bayesian lifecycle rules.
-    /// Event-only observations (for example deadlock advisories) legitimately
-    /// have no posterior; they still must satisfy the same content boundary.
-    #[must_use]
-    pub fn validate_content(&self) -> Vec<&'static str> {
-        let mut issues = Vec::new();
-        if self.evidence_summary.len() > 256 {
-            issues.push("evidence_summary exceeds 256 chars");
-        } else if contains_secret(&self.evidence_summary) {
-            issues.push("evidence_summary contains a suspected secret");
-        }
-        if let Some(outcome) = &self.outcome {
-            issues.extend(outcome.validate());
-        }
-        if let Some(ctx) = &self.context
-            && let Err(reason) = validate_experience_json(ctx)
-        {
-            issues.push("context is invalid");
-            issues.push(reason);
-        }
+    /// Validate bounded content independently of lifecycle invariants.
+    ///
+    /// Append and amendment boundaries must call this before cloning or
+    /// serializing untrusted payloads. Validate the merged candidate as well
+    /// as a patch, so individually valid patches cannot grow a row past the
+    /// aggregate limits. Only fixed field/category names appear in errors.
+    pub fn validate_content(&self) -> Result<(), &'static str> {
+        self.validate_content_with_optional_outcome(self.outcome.as_ref())
+    }
 
-        issues
+    /// Validate the aggregate row with a proposed outcome replacement without
+    /// cloning either payload. Use before promoting state or updating rollups.
+    pub fn validate_content_with_outcome(
+        &self,
+        outcome: &ExperienceOutcome,
+    ) -> Result<(), &'static str> {
+        self.validate_content_with_optional_outcome(Some(outcome))
+    }
+
+    fn validate_content_with_optional_outcome(
+        &self,
+        outcome: Option<&ExperienceOutcome>,
+    ) -> Result<(), &'static str> {
+        let mut validator = ContentValidator::default();
+        if self.evidence_summary.len() > 256 {
+            return Err("evidence_summary exceeds 256 chars");
+        }
+        validator.text(&self.evidence_summary, ContentField::EvidenceSummary)?;
+        if let Some(outcome) = outcome {
+            validator.outcome(outcome)?;
+        }
+        if let Some(context) = &self.context {
+            validator.json(context, 0, ContentField::Context)?;
+        }
+        // Pseudonyms and opaque identifiers remain valid; their strings must
+        // not provide another route for credentials or unbounded payloads.
+        for text in [
+            self.trace_id.as_str(),
+            self.claim_id.as_str(),
+            self.evidence_id.as_str(),
+            self.decision_class.as_str(),
+            self.subject.as_str(),
+            self.action.as_str(),
+        ] {
+            validator.text(text, ContentField::Metadata)?;
+        }
+        for text in [
+            self.project_key.as_deref(),
+            self.policy_id.as_deref(),
+            self.runner_up_action.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validator.text(text, ContentField::Metadata)?;
+        }
+        validator.require_nodes(self.posterior.len())?;
+        for (label, _) in &self.posterior {
+            validator.text(label, ContentField::Metadata)?;
+            validator.bytes(32)?;
+        }
+        if let Some(reason) = &self.non_execution_reason {
+            validator.non_execution_reason(reason)?;
+        }
+        if let Some(extension) = &self.feature_ext {
+            validator.require_nodes(extension.fields.len())?;
+            for (key, _) in &extension.fields {
+                validator.text(key, ContentField::Metadata)?;
+                validator.bytes(24)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Bounded content validation for all persistence entrypoints
+// ──────────────────────────────────────────────────────────────────────
+
+/// Maximum nesting beneath the root of an ATC context/evidence JSON value.
+pub const MAX_ATC_CONTENT_JSON_DEPTH: usize = 16;
+
+/// Maximum combined dynamic text/JSON bytes accepted in one ATC row or patch.
+///
+/// JSON escaping and punctuation count toward this budget. Fixed-width row
+/// fields do not; posterior/extension numerics receive conservative allowances.
+pub const MAX_ATC_CONTENT_BYTES: usize = 64 * 1024;
+
+/// Maximum text fields, JSON values and object keys inspected per validation.
+pub const MAX_ATC_CONTENT_NODES: usize = 4096;
+
+/// Maximum bytes in any individual metadata string, JSON key or string value.
+/// The evidence summary retains its stricter 256-byte limit.
+pub const MAX_ATC_CONTENT_STRING_BYTES: usize = 4096;
+
+/// Validate a context patch before merging it into a persisted experience.
+///
+/// Call [`ExperienceRow::validate_content`] on the merged candidate too, before
+/// changing state or rollups. Errors never contain input keys or values.
+pub fn validate_atc_context(context: &Value) -> Result<(), &'static str> {
+    ContentValidator::default().json(context, 0, ContentField::Context)
+}
+
+#[derive(Clone, Copy)]
+enum ContentField {
+    EvidenceSummary,
+    OutcomeLabel,
+    OutcomeEvidence,
+    Context,
+    NonExecutionReason,
+    Metadata,
+}
+
+impl ContentField {
+    const fn secret_error(self) -> &'static str {
+        match self {
+            Self::EvidenceSummary => "evidence_summary contains a suspected secret",
+            Self::OutcomeLabel => "outcome.label contains a suspected secret",
+            Self::OutcomeEvidence => "outcome.evidence contains a suspected secret",
+            Self::Context => "context contains a suspected secret",
+            Self::NonExecutionReason => "non_execution_reason contains a suspected secret",
+            Self::Metadata => "experience metadata contains a suspected secret",
+        }
+    }
+}
+
+/// Shared fail-fast visitor. It never serializes/clones a whole payload or
+/// builds a work list proportional to its size. Recursion is limited before descent;
+/// container lengths, string lengths and aggregate budgets are checked before
+/// loops, scanning and allocation. JSON is scanned decoded, so escaping cannot
+/// conceal a canary, and object keys receive the same checks as values.
+struct ContentValidator {
+    bytes_remaining: usize,
+    nodes_remaining: usize,
+}
+
+impl Default for ContentValidator {
+    fn default() -> Self {
+        Self {
+            bytes_remaining: MAX_ATC_CONTENT_BYTES,
+            nodes_remaining: MAX_ATC_CONTENT_NODES,
+        }
+    }
+}
+
+// Stream number encoding into the same byte budget rather than allocating a
+// representation or charging every small metric as a maximum-width number.
+// This also bounds numbers if serde_json's arbitrary_precision is ever enabled
+// by another workspace dependency: an oversized write is refused by length.
+impl std::io::Write for ContentValidator {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes(buffer.len()).map_err(std::io::Error::other)?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ContentValidator {
+    fn bytes(&mut self, amount: usize) -> Result<(), &'static str> {
+        self.bytes_remaining = self
+            .bytes_remaining
+            .checked_sub(amount)
+            .ok_or("ATC content exceeds byte limit")?;
+        Ok(())
+    }
+
+    const fn require_nodes(&self, amount: usize) -> Result<(), &'static str> {
+        if amount > self.nodes_remaining {
+            Err("ATC content exceeds validation work limit")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn node(&mut self) -> Result<(), &'static str> {
+        self.nodes_remaining = self
+            .nodes_remaining
+            .checked_sub(1)
+            .ok_or("ATC content exceeds validation work limit")?;
+        Ok(())
+    }
+
+    fn text(&mut self, text: &str, field: ContentField) -> Result<(), &'static str> {
+        self.node()?;
+        self.string(text, field)
+    }
+
+    fn string(&mut self, text: &str, field: ContentField) -> Result<(), &'static str> {
+        if text.len() > MAX_ATC_CONTENT_STRING_BYTES {
+            return Err("ATC content string exceeds byte limit");
+        }
+        self.bytes(text.len())?;
+        self.bytes(2)?;
+        // Count JSON escaping without allocating a serialized copy. Each
+        // byte is visited only after its raw size fits the remaining budget.
+        for byte in text.bytes() {
+            match byte {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => self.bytes(1)?,
+                0..=31 => self.bytes(5)?,
+                _ => {}
+            }
+        }
+        if contains_secret(text) {
+            return Err(field.secret_error());
+        }
+        Ok(())
+    }
+
+    fn json(
+        &mut self,
+        value: &Value,
+        depth: usize,
+        field: ContentField,
+    ) -> Result<(), &'static str> {
+        if depth > MAX_ATC_CONTENT_JSON_DEPTH {
+            return Err("ATC content exceeds JSON depth limit");
+        }
+        self.node()?;
+        match value {
+            Value::String(text) => self.string(text, field)?,
+            Value::Array(values) => {
+                self.require_nodes(values.len())?;
+                self.bytes(2 + values.len().saturating_sub(1))?;
+                for child in values {
+                    self.json(child, depth + 1, field)?;
+                }
+            }
+            Value::Object(values) => {
+                self.require_nodes(values.len().saturating_mul(2))?;
+                self.bytes(2 + values.len().saturating_sub(1) + values.len())?;
+                for (key, child) in values {
+                    self.text(key, field)?;
+                    self.json(child, depth + 1, field)?;
+                }
+            }
+            Value::Null | Value::Bool(true) => self.bytes(4)?,
+            Value::Bool(false) => self.bytes(5)?,
+            Value::Number(number) => serde_json::to_writer(&mut *self, number)
+                .map_err(|_| "ATC content exceeds byte limit")?,
+        }
+        Ok(())
+    }
+
+    fn outcome(&mut self, outcome: &ExperienceOutcome) -> Result<(), &'static str> {
+        self.text(&outcome.label, ContentField::OutcomeLabel)?;
+        if let Some(evidence) = &outcome.evidence {
+            self.json(evidence, 0, ContentField::OutcomeEvidence)?;
+        }
+        Ok(())
+    }
+
+    fn non_execution_reason(&mut self, reason: &NonExecutionReason) -> Result<(), &'static str> {
+        match reason {
+            NonExecutionReason::BudgetExhausted { budget_name, .. } => {
+                self.text(budget_name, ContentField::NonExecutionReason)
+            }
+            NonExecutionReason::SafetyGate { gate_name, .. } => {
+                self.text(gate_name, ContentField::NonExecutionReason)
+            }
+            NonExecutionReason::CalibrationFallback { reason } => {
+                self.text(reason, ContentField::NonExecutionReason)
+            }
+            NonExecutionReason::DeliberateInaction { .. } => Ok(()),
+        }
     }
 }
 
@@ -791,10 +980,26 @@ static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.").expect("JWT regex")
 });
 
-/// Secret-detection prefixes and substrings.
-///
-/// Each entry is `(pattern, match_mode)` where match_mode indicates
-/// whether to use prefix or substring matching.
+static AUTH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Bearer credentials remain sensitive when a diagnostic prefix touches
+    // the scheme, including `authorization_Bearer`. A word boundary would
+    // hide that case because underscore is a regex word character.
+    Regex::new(r"(?i)bearer[ \t]+\S+|\btoken[ \t]+[A-Za-z0-9._~+/=-]{16,}")
+        .expect("authorization regex")
+});
+
+static API_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Short matches require a boundary to preserve ordinary `task-rate` and
+    // `risk-budget` metrics. Long vendor-prefixed or bare alphanumeric keys
+    // must also reject when concatenated with an alphanumeric prefix.
+    Regex::new(
+        r"(?:^|[^A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]+|sk-(?:(?:proj-|ant-)[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})",
+    )
+        .expect("API key regex")
+});
+
+/// Secret token prefixes. Authorization phrases and the short `sk-` prefix
+/// use boundary-aware patterns above to preserve ordinary metric labels.
 const SECRET_PREFIXES: &[&str] = &[
     "AKIA",             // AWS access key ID
     "ASIA",             // AWS temporary access key
@@ -808,10 +1013,6 @@ const SECRET_PREFIXES: &[&str] = &[
     "xoxp-",            // Slack user token
     "xoxs-",            // Slack session token
     "xoxa-",            // Slack app token
-    "sk-",              // OpenAI / Anthropic API key
-    "sk-ant-",          // Anthropic API key
-    "Bearer ",          // Authorization bearer tokens
-    "token ",           // Generic token prefix
     "glpat-",           // GitLab personal access token
     "npm_",             // npm access token
     "pypi-AgEIcHlwaS5", // PyPI token
@@ -839,20 +1040,7 @@ pub fn contains_secret(input: &str) -> bool {
     }
 
     for prefix in SECRET_PREFIXES {
-        let matched = if prefix.starts_with("sk-") {
-            // API keys start a token. A bare substring also matches the end
-            // of ordinary thread names such as "task-build" or "risk-check",
-            // which the real observation builder retains as metric context.
-            input.match_indices(prefix).any(|(start, _)| {
-                input[..start]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|before| !before.is_alphanumeric() && before != '_')
-            })
-        } else {
-            input.contains(prefix)
-        };
-        if matched {
+        if input.contains(prefix) {
             return true;
         }
     }
@@ -869,6 +1057,10 @@ pub fn contains_secret(input: &str) -> bool {
     }
 
     if JWT_RE.is_match(input) {
+        return true;
+    }
+
+    if AUTH_RE.is_match(input) || API_KEY_RE.is_match(input) {
         return true;
     }
 
@@ -2151,7 +2343,26 @@ mod tests {
             let encoded = serde_json::to_string(&row).unwrap();
             let decoded: ExperienceRow = serde_json::from_str(&encoded).unwrap();
 
-            prop_assert!(decoded.validate().is_empty(), "decoded row should remain structurally valid after roundtrip");
+            // Keep the generator broad: random metadata can resemble a key.
+            // Such rows must reject consistently, while ordinary metadata
+            // must remain both structurally and content-valid after decoding.
+            let secret_in_metadata = [
+                Some(row.subject.as_str()),
+                Some(row.action.as_str()),
+                row.project_key.as_deref(),
+                row.policy_id.as_deref(),
+                row.runner_up_action.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(contains_secret);
+            let expected_issues = if secret_in_metadata {
+                vec!["experience metadata contains a suspected secret"]
+            } else {
+                Vec::new()
+            };
+            prop_assert_eq!(row.validate(), expected_issues.clone());
+            prop_assert_eq!(decoded.validate(), expected_issues);
             prop_assert_eq!(decoded, row);
         }
 
@@ -2273,7 +2484,7 @@ mod tests {
         for thread in ["task-build", "risk-check", "mask-cache", "task-ant-review"] {
             assert!(!contains_secret(thread), "ordinary thread: {thread}");
             assert!(
-                validate_experience_json(&serde_json::json!({
+                validate_atc_context(&serde_json::json!({
                     "thread_id": thread,
                     "token_count": 12,
                 }))
@@ -2291,7 +2502,7 @@ mod tests {
         ] {
             assert!(contains_secret(secret));
             assert!(
-                validate_experience_json(&serde_json::json!({
+                validate_atc_context(&serde_json::json!({
                     "nested": [{"credential": secret}],
                 }))
                 .is_err()
@@ -2379,35 +2590,46 @@ mod tests {
             "agent": "BlueSpring", "token_count": 42, "kind": "token_bucket",
             "observations": [{"latency_micros": 1200, "acknowledged": true}],
         });
-        assert_eq!(validate_experience_json(&metrics), Ok(()));
+        assert_eq!(validate_atc_context(&metrics), Ok(()));
         assert_eq!(
-            validate_experience_json(&Value::Array(vec![Value::Null; 1023])),
+            validate_atc_context(&Value::Array(vec![Value::Null; MAX_ATC_CONTENT_NODES - 1])),
             Ok(())
         );
-        assert!(validate_experience_json(&Value::Array(vec![Value::Null; 1024])).is_err());
+        assert!(
+            validate_atc_context(&Value::Array(vec![Value::Null; MAX_ATC_CONTENT_NODES])).is_err()
+        );
         assert_eq!(
-            validate_experience_json(&Value::String("x".repeat(16 * 1024))),
+            validate_atc_context(&Value::String("x".repeat(MAX_ATC_CONTENT_STRING_BYTES))),
             Ok(())
         );
-        assert!(validate_experience_json(&Value::String("x".repeat(16 * 1024 + 1))).is_err());
+        assert!(
+            validate_atc_context(&Value::String("x".repeat(MAX_ATC_CONTENT_STRING_BYTES + 1)))
+                .is_err()
+        );
         let mut nested = Value::Null;
-        for _ in 0..16 {
+        for _ in 0..MAX_ATC_CONTENT_JSON_DEPTH {
             nested = Value::Array(vec![nested]);
         }
-        assert_eq!(validate_experience_json(&nested), Ok(()));
-        assert!(validate_experience_json(&Value::Array(vec![nested])).is_err());
+        assert_eq!(validate_atc_context(&nested), Ok(()));
+        assert!(validate_atc_context(&Value::Array(vec![nested])).is_err());
         let escaped: Value =
             serde_json::from_str(r#"{"metric":["gh\u0070_synthetic_atc_canary"]}"#)
                 .expect("valid escaped JSON");
-        assert_eq!(validate_experience_json(&escaped), Err("suspected secret"));
         assert_eq!(
-            validate_experience_json(&serde_json::json!({"ghp_synthetic_atc_canary": 1})),
-            Err("suspected secret")
+            validate_atc_context(&escaped),
+            Err("context contains a suspected secret")
+        );
+        assert_eq!(
+            validate_atc_context(&serde_json::json!({"ghp_synthetic_atc_canary": 1})),
+            Err("context contains a suspected secret")
         );
         assert!(
-            validate_experience_json(&serde_json::json!({
-                "first": "x".repeat(9000), "second": "x".repeat(9000),
-            }))
+            validate_atc_context(&Value::Array(vec![
+                Value::String("x".repeat(
+                    MAX_ATC_CONTENT_STRING_BYTES
+                ));
+                16
+            ]))
             .is_err(),
             "the text budget is shared across the entire value"
         );
@@ -2428,6 +2650,246 @@ mod tests {
         assert!(
             !issues.iter().any(|i| i.contains("secret")),
             "clean row should have no secret issues: {issues:?}"
+        );
+    }
+
+    fn synthetic_outcome(evidence: Value) -> ExperienceOutcome {
+        ExperienceOutcome {
+            observed_ts_micros: 2_000_000,
+            label: "agent_responded_within_window".to_string(),
+            correct: true,
+            actual_loss: Some(0.25),
+            regret: Some(0.0),
+            evidence: Some(evidence),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_nested_outcome_evidence_and_keys_without_echo() {
+        const CANARY: &str = "Bearer synthetic_atc_canary_never_a_real_secret_0123456789";
+        let payloads = [
+            serde_json::json!({"observations": [{"details": [CANARY]}]}),
+            Value::Object(serde_json::Map::from_iter([(
+                CANARY.to_string(),
+                Value::Bool(true),
+            )])),
+        ];
+        for evidence in payloads {
+            let outcome = synthetic_outcome(evidence);
+            let error = outcome.validate_content().unwrap_err();
+            assert_eq!(error, "outcome.evidence contains a suspected secret");
+            assert!(!error.contains(CANARY));
+            let mut row = sample_row();
+            row.outcome = Some(outcome);
+            assert!(
+                row.validate()
+                    .contains(&"outcome.evidence contains a suspected secret")
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_json_escaping_cannot_hide_credentials() {
+        for encoded in [
+            r#"{"observation":"\u0042earer synthetic_canary_0123456789"}"#,
+            r#"{"observation":"authorization_\u0042earer synthetic_canary_0123456789"}"#,
+            r#"{"observation":"prefixXsk\u002dproj-synthetic_canary_0123456789"}"#,
+        ] {
+            let context: Value = serde_json::from_str(encoded).unwrap();
+            assert_eq!(
+                validate_atc_context(&context),
+                Err("context contains a suspected secret")
+            );
+            assert_eq!(
+                synthetic_outcome(context).validate_content(),
+                Err("outcome.evidence contains a suspected secret")
+            );
+        }
+    }
+
+    #[test]
+    fn secret_detection_preserves_prefixed_credentials_and_metric_words() {
+        assert!(contains_secret(
+            "authorization_Bearer synthetic_canary_0123456789"
+        ));
+        assert!(contains_secret(
+            "prefixXsk-proj-synthetic_canary_0123456789"
+        ));
+        assert!(contains_secret(
+            "prefixXsk-ant-api03-synthetic_canary_0123456789"
+        ));
+        assert!(contains_secret(
+            "prefixXsk-abcdefghijklmnopqrstuvxyz0123456789"
+        ));
+        assert!(!contains_secret(
+            "token usage=32 token_count task-rate risk-budget task-complete risk-low"
+        ));
+        assert!(!contains_secret(
+            "task-completion-rate-over-window-secs risk-budget-exhaustion-counter-last-hour"
+        ));
+    }
+
+    #[test]
+    fn metadata_and_execution_reason_share_content_validation() {
+        const CANARY: &str = "Bearer synthetic_atc_canary_never_a_real_secret_0123456789";
+        let reason = NonExecutionReason::CalibrationFallback {
+            reason: CANARY.to_string(),
+        };
+        assert_eq!(
+            reason.validate_content(),
+            Err("non_execution_reason contains a suspected secret")
+        );
+        let mut row = sample_row();
+        row.non_execution_reason = Some(reason);
+        assert!(row.validate_content().is_err());
+        row.non_execution_reason = None;
+        row.subject = CANARY.to_string();
+        assert_eq!(
+            row.validate_content(),
+            Err("experience metadata contains a suspected secret")
+        );
+        row.subject = "GreenCastle".to_string();
+        row.feature_ext = Some(FeatureExtension {
+            ext_version: 1,
+            fields: vec![(CANARY.to_string(), 1)],
+        });
+        assert!(row.validate_content().is_err());
+    }
+
+    #[test]
+    fn content_validator_preserves_metric_strings_and_pseudonyms() {
+        let mut row = sample_builder()
+            .project_key("/data/projects/coordination")
+            .context(serde_json::json!({
+                "token_count": 32,
+                "token_bucket": "available",
+                "note": "token usage=32",
+                "risk-budget": "task-rate",
+                "long_metrics": [
+                    "task-completion-rate-over-window-secs",
+                    "risk-budget-exhaustion-counter-last-hour"
+                ],
+                "agent": "GreenCastle",
+                "metrics": [true, null, 0.95, {"latency_ms": 18}]
+            }))
+            .build(1, 1_000_000);
+        row.outcome = Some(synthetic_outcome(serde_json::json!({
+            "observed": true,
+            "counter": "token_count",
+            "count": 32,
+        })));
+        assert!(row.validate_content().is_ok());
+        assert!(!contains_secret("task-rate risk-budget token usage=32"));
+        assert!(contains_secret("prefix_sk-proj-synthetic_canary_1234"));
+        assert!(contains_secret("bearer synthetic_canary_1234567890"));
+    }
+
+    #[test]
+    fn content_validator_bounds_individual_strings_before_scanning() {
+        let accepted = Value::String("a".repeat(MAX_ATC_CONTENT_STRING_BYTES));
+        assert!(validate_atc_context(&accepted).is_ok());
+        let rejected = Value::String("a".repeat(MAX_ATC_CONTENT_STRING_BYTES + 1));
+        assert_eq!(
+            validate_atc_context(&rejected),
+            Err("ATC content string exceeds byte limit")
+        );
+        let rejected_key = Value::Object(serde_json::Map::from_iter([(
+            "a".repeat(MAX_ATC_CONTENT_STRING_BYTES + 1),
+            Value::Null,
+        )]));
+        assert_eq!(
+            validate_atc_context(&rejected_key),
+            Err("ATC content string exceeds byte limit")
+        );
+    }
+
+    #[test]
+    fn content_validator_bounds_aggregate_json_bytes_and_escaping() {
+        // 16 strings plus their quotes, array brackets and commas total
+        // exactly 64 KiB; one additional ASCII byte must be refused.
+        let mut strings = vec![Value::String("a".repeat(4093)); 16];
+        strings[15] = Value::String("a".repeat(4092));
+        let accepted = Value::Array(strings.clone());
+        assert_eq!(accepted.to_string().len(), MAX_ATC_CONTENT_BYTES);
+        assert!(validate_atc_context(&accepted).is_ok());
+        strings[15] = Value::String("a".repeat(4093));
+        assert_eq!(
+            validate_atc_context(&Value::Array(strings)),
+            Err("ATC content exceeds byte limit")
+        );
+        // Escaped control characters must count as their stored JSON size.
+        let escaped = Value::Array(vec![Value::String("\0".repeat(4096)); 3]);
+        assert_eq!(
+            validate_atc_context(&escaped),
+            Err("ATC content exceeds byte limit")
+        );
+    }
+
+    #[test]
+    fn content_validator_bounds_json_work_including_object_keys() {
+        let accepted = Value::Array(vec![Value::Null; MAX_ATC_CONTENT_NODES - 1]);
+        assert!(validate_atc_context(&accepted).is_ok());
+        let rejected = Value::Array(vec![Value::Null; MAX_ATC_CONTENT_NODES]);
+        assert_eq!(
+            validate_atc_context(&rejected),
+            Err("ATC content exceeds validation work limit")
+        );
+        let keys = Value::Object(
+            (0..MAX_ATC_CONTENT_NODES / 2)
+                .map(|index| (format!("metric_{index}"), Value::Null))
+                .collect(),
+        );
+        assert_eq!(
+            validate_atc_context(&keys),
+            Err("ATC content exceeds validation work limit")
+        );
+    }
+
+    #[test]
+    fn numeric_metrics_use_actual_json_size() {
+        // Thousands of small counters fit both the work and byte budgets;
+        // charging a maximum-width number for each would reject this input.
+        let counters = Value::Array(vec![Value::from(1); MAX_ATC_CONTENT_NODES - 1]);
+        assert!(validate_atc_context(&counters).is_ok());
+        let metrics = serde_json::json!([u64::MAX, i64::MIN, 1.2e300, true, false, null]);
+        let mut validator = ContentValidator::default();
+        validator.json(&metrics, 0, ContentField::Context).unwrap();
+        assert_eq!(
+            MAX_ATC_CONTENT_BYTES - validator.bytes_remaining,
+            metrics.to_string().len()
+        );
+        let wide_counters = Value::Array(vec![Value::from(u64::MAX); MAX_ATC_CONTENT_NODES - 1]);
+        assert_eq!(
+            validate_atc_context(&wide_counters),
+            Err("ATC content exceeds byte limit")
+        );
+    }
+
+    #[test]
+    fn content_validator_bounds_depth_before_recursive_descent() {
+        let mut value = Value::Null;
+        for _ in 0..MAX_ATC_CONTENT_JSON_DEPTH {
+            value = Value::Array(vec![value]);
+        }
+        assert!(validate_atc_context(&value).is_ok());
+        value = Value::Array(vec![value]);
+        assert_eq!(
+            validate_atc_context(&value),
+            Err("ATC content exceeds JSON depth limit")
+        );
+    }
+
+    #[test]
+    fn replacement_outcome_shares_budget_with_existing_row_context() {
+        let context = Value::Array(vec![Value::String("a".repeat(4093)); 8]);
+        let evidence = Value::Array(vec![Value::String("b".repeat(4093)); 8]);
+        let row = sample_builder().context(context).build(1, 1_000_000);
+        let outcome = synthetic_outcome(evidence);
+        assert!(row.validate_content().is_ok());
+        assert!(outcome.validate_content().is_ok());
+        assert_eq!(
+            row.validate_content_with_outcome(&outcome),
+            Err("ATC content exceeds byte limit")
         );
     }
 }

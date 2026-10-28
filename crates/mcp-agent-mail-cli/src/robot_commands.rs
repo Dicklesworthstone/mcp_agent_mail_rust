@@ -9546,6 +9546,9 @@ fn build_reservations_at(
             expires_ts: row.get_named("expires_ts").unwrap_or(0),
             released_ts: None,
         })
+        // Keep direct-read expiry checks at the database authority, including
+        // the existing fallback for an invalid stored expiry value.
+        .filter(|row| row.expires_ts > now_us)
         .collect::<Vec<_>>();
     // Preserve holder-ID scoping on direct reads, including a malformed
     // cross-project holder reference with the same display name.
@@ -9592,8 +9595,10 @@ fn build_reservations_from_records(
     let mut expiring_soon = Vec::new();
 
     for row in records {
-        // A lease may expire while the three server reads are in flight.
-        if row.expires_ts <= now_us || reservation_is_released(row.released_ts) {
+        // Each authority has already selected its active leases. A client
+        // clock ahead of the server must not turn that snapshot into an empty
+        // success; use the local clock only for relative display values.
+        if reservation_is_released(row.released_ts) {
             continue;
         }
         let path = row.path_pattern.clone();
@@ -13588,15 +13593,14 @@ fn build_navigate_server_reservations(
     if let Some(expected) = query.get("project") {
         crate::reservation_read::verify_project_selector(&read.project, expected)?;
     }
-    let now = mcp_agent_mail_db::now_micros();
     // Native navigation pages newest-first, whereas the MCP resource pages
     // oldest-first. Require one complete read, then sort and slice locally;
     // forwarding OFFSET would silently return a different set of leases.
+    // Active membership comes from the server, never from the client clock.
     let mut records = read.reservations;
     records.sort_by_key(|row| (std::cmp::Reverse(row.created_ts), row.id));
     let reservations: Vec<_> = records
         .iter()
-        .filter(|row| !active_only || row.expires_ts > now)
         .skip(offset)
         .take(limit)
         .map(|row| {

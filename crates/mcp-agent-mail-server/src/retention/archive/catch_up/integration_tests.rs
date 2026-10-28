@@ -6,6 +6,7 @@ use super::super::schedule::{Lane, RepairSchedule};
 use super::*;
 use asupersync::Outcome;
 use fastmcp_core::block_on;
+use mcp_agent_mail_db::sqlmodel_core::Value as DbValue;
 use mcp_agent_mail_db::{DbPoolConfig, create_pool, now_micros, queries};
 use mcp_agent_mail_storage::recovery::agent_reconcile::AgentReconcileCursor;
 use mcp_agent_mail_storage::recovery::reservation_reconcile::ReservationReconcileCursor;
@@ -43,7 +44,7 @@ fn fixture() -> Fixture {
         &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
         || match block_on(queries::ensure_project(&cx, &pool, &human_key)) {
             Outcome::Ok(project) => project,
-            other => panic!("ensure_project failed: {other:?}"),
+            other => panic!("ensure_project failed: {other:?}"), // ubs:ignore — cfg(test)-only fixture must fail if real project setup fails
         },
     );
     let project_id = project.id.unwrap();
@@ -53,14 +54,14 @@ fn fixture() -> Fixture {
             &cx, &pool, project_id, name, "test", "test", None, None, None,
         )) {
             Outcome::Ok(agent) => agent,
-            other => panic!("register_agent failed: {other:?}"),
+            other => panic!("register_agent failed: {other:?}"), // ubs:ignore — cfg(test)-only fixture must fail if real agent registration fails
         };
         agents.push(agent.id.unwrap());
     }
     let conn = match block_on(pool.acquire(&cx)) {
         Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => panic!("acquire failed: {error}"),
-        _ => panic!("acquire was cancelled or panicked"),
+        Outcome::Err(error) => panic!("acquire failed: {error}"), // ubs:ignore — cfg(test)-only fixture acquisition failure must fail the test
+        _ => panic!("acquire was cancelled or panicked"), // ubs:ignore — cfg(test)-only fixture must reject cancellation/panic
     };
     // These rows model mail accepted just before a crash: inside the ordinary
     // 30-second grace, but before the restarted worker's settled-write anchor.
@@ -98,8 +99,8 @@ fn fixture() -> Fixture {
 fn assert_source_untouched(fixture: &Fixture) {
     let conn = match block_on(fixture.pool.acquire(&fixture.cx)) {
         Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => panic!("acquire failed: {error}"),
-        _ => panic!("acquire was cancelled or panicked"),
+        Outcome::Err(error) => panic!("acquire failed: {error}"), // ubs:ignore — cfg(test)-only fixture acquisition failure must fail the test
+        _ => panic!("acquire was cancelled or panicked"), // ubs:ignore — cfg(test)-only fixture must reject cancellation/panic
     };
     let rows = conn
         .query_sync("SELECT id, subject, body_md FROM messages ORDER BY id", &[])
@@ -131,6 +132,14 @@ fn assert_source_untouched(fixture: &Fixture) {
 }
 
 fn assert_committed_bundles(fixture: &Fixture, expected_messages: usize) {
+    assert_committed_bundles_in_range(fixture, 9001..=9009, expected_messages);
+}
+
+fn assert_committed_bundles_in_range(
+    fixture: &Fixture,
+    ids: std::ops::RangeInclusive<i64>,
+    expected_messages: usize,
+) {
     let mut copies = BTreeMap::<i64, usize>::new();
     for entry in walkdir::WalkDir::new(&fixture.config.storage_root).follow_links(false) {
         let entry = entry.unwrap();
@@ -154,7 +163,7 @@ fn assert_committed_bundles(fixture: &Fixture, expected_messages: usize) {
         let Some(id) = message["id"].as_i64() else {
             continue;
         };
-        assert!((9001..=9009).contains(&id));
+        assert!(ids.contains(&id));
         assert_eq!(message["subject"], json!(format!("subject-{id}")));
         assert_eq!(body, format!("body-{id}"));
         assert_eq!(message["thread_id"], json!("burst-thread"));
@@ -222,6 +231,225 @@ fn real_crash_orphans_converge_across_checkpointed_batches_without_client_reads(
     );
     assert_source_untouched(&fixture);
     assert_committed_bundles(&fixture, 9);
+}
+
+fn insert_tail_messages(fixture: &Fixture, ids: impl Iterator<Item = i64>) {
+    let conn = match block_on(fixture.pool.acquire(&fixture.cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => panic!("acquire failed: {error}"), // ubs:ignore — cfg(test)-only fixture acquisition failure must fail the test
+        _ => panic!("acquire was cancelled or panicked"), // ubs:ignore — cfg(test)-only fixture must reject cancellation/panic
+    };
+    for id in ids {
+        // Reuse only the fixture's project/agent identities. Old timestamps
+        // make these rows eligible without sleeps or changing the grace policy.
+        conn.execute_raw(&format!(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, \
+              ack_required, created_ts, attachments, archive_metadata_json) \
+             SELECT {id}, project_id, sender_id, 'burst-thread', 'subject-{id}', \
+                    'body-{id}', 'normal', 1, 1000000, '[]', '{{}}' \
+             FROM messages WHERE id = 9001"
+        ))
+        .unwrap();
+        conn.execute_raw(&format!(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+             SELECT {id}, agent_id, kind, NULL, NULL \
+             FROM message_recipients WHERE message_id = 9001"
+        ))
+        .unwrap();
+    }
+}
+
+fn source_snapshot(fixture: &Fixture) -> [Vec<Vec<DbValue>>; 2] {
+    let conn = match block_on(fixture.pool.acquire(&fixture.cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => panic!("acquire failed: {error}"), // ubs:ignore — cfg(test)-only fixture acquisition failure must fail the test
+        _ => panic!("acquire was cancelled or panicked"), // ubs:ignore — cfg(test)-only fixture must reject cancellation/panic
+    };
+    [
+        "SELECT * FROM messages ORDER BY id",
+        "SELECT * FROM message_recipients ORDER BY message_id, agent_id",
+    ]
+    .map(|sql| {
+        conn.query_sync(sql, &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.values().cloned().collect())
+            .collect()
+    })
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the restart, scheduling and committed-byte witnesses together.
+fn restored_forward_tail_reaches_orphan_after_history_ends_without_client_reads() {
+    let fixture = fixture();
+    let stop = AtomicBool::new(false);
+    let mut before_restart = ReconcileCursor::settled_before(now_micros());
+    let mut repaired = 0;
+    for _ in 0..9 {
+        let report = reconcile_message_batch(
+            &fixture.cx,
+            &fixture.pool,
+            &fixture.config,
+            &mut before_restart,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(report.deferred, 0);
+        assert_eq!(report.checkpoint_saved, Some(true));
+        repaired += report.repaired;
+        if repaired == 9 {
+            break;
+        }
+    }
+    assert_eq!(repaired, 9);
+    assert_committed_bundles(&fixture, 9);
+    drop(before_restart);
+
+    // Inspect the checkpoint actually published by the production entrypoint.
+    // The next history query will be empty, while the forward cursor is still
+    // at the last message accepted before the simulated restart.
+    let checkpoint_paths = std::fs::read_dir(
+        std::path::Path::new(fixture.pool.sqlite_path())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().path())
+    .filter(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(".am-message-reconcile-")
+                    && std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext == "json")
+            })
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(checkpoint_paths.len(), 1);
+    let checkpoint_bytes = std::fs::read(&checkpoint_paths[0]).unwrap();
+    let checkpoint: Value = serde_json::from_slice(&checkpoint_bytes).unwrap();
+    assert_eq!(checkpoint["tail_after"], json!(9009));
+    assert_eq!(checkpoint["backfill_ceiling"], json!(9000));
+
+    // Build a healthy forward backlog without touching that durable cursor.
+    // The ordinary, non-checkpointed public entrypoint supplies all archive/Git
+    // work; this fixture never fabricates archive bytes or a checkpoint schema.
+    insert_tail_messages(&fixture, (9010..=9074).filter(|id| *id != 9042));
+    let mut preparation = ReconcileCursor::default();
+    let mut prepared = 0;
+    for _ in 0..32 {
+        let report = reconcile_message_batch(
+            &fixture.cx,
+            &fixture.pool,
+            &fixture.config,
+            &mut preparation,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(report.deferred, 0);
+        assert_eq!(report.checkpoint_saved, None);
+        prepared += report.repaired;
+        if prepared == 64 {
+            break;
+        }
+    }
+    assert_eq!(prepared, 64);
+    assert_eq!(
+        std::fs::read(&checkpoint_paths[0]).unwrap(),
+        checkpoint_bytes
+    );
+    assert_committed_bundles_in_range(&fixture, 9001..=9074, 73);
+    insert_tail_messages(&fixture, std::iter::once(9042));
+    let conn = match block_on(fixture.pool.acquire(&fixture.cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => panic!("acquire failed: {error}"), // ubs:ignore — cfg(test)-only fixture acquisition failure must fail the test
+        _ => panic!("acquire was cancelled or panicked"), // ubs:ignore — cfg(test)-only fixture must reject cancellation/panic
+    };
+    conn.execute_raw(
+        "UPDATE message_recipients SET read_ts = 2000000, ack_ts = 2500000 \
+         WHERE message_id % 2 = 0",
+    )
+    .unwrap();
+    drop(conn);
+    let source_before = source_snapshot(&fixture);
+    assert_eq!(source_before[0].len(), 74);
+    assert_eq!(source_before[1].len(), 74);
+
+    let mut restarted = ReconcileCursor::settled_before(now_micros());
+    let mut reports = Vec::new();
+    let backlog = run_with(
+        || {
+            reconcile_message_batch(
+                &fixture.cx,
+                &fixture.pool,
+                &fixture.config,
+                &mut restarted,
+                &stop,
+            )
+        },
+        |report| {
+            assert!(!report.interrupted);
+            assert_eq!(report.deferred, 0);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert!(report.scanned <= 32);
+            assert!(report.repaired <= 4);
+            assert!(report.payload_bytes <= 16 * 1024 * 1024);
+            reports.push((
+                report.unchanged,
+                report.repaired,
+                report.budget_exhausted,
+                report.checkpoint_restored,
+            ));
+        },
+        || Duration::ZERO,
+    )
+    .unwrap();
+    assert!(reports[0].3, "the real durable cursor must be restored");
+    // Startup priority checks sixteen newest settled rows alongside the
+    // original sixteen forward rows; neither page contains orphan 9042.
+    assert_eq!(reports[0].0, 32);
+    assert_eq!(reports[0].1, 0);
+    assert!(
+        reports[0].2,
+        "ending history must not hide the remaining eligible forward tail"
+    );
+    assert!(reports.len() >= 3);
+    assert_eq!(reports[1].1, 0, "a second healthy page precedes the orphan");
+    assert_eq!(reports.iter().map(|report| report.1).sum::<usize>(), 1);
+    assert!(
+        !backlog,
+        "the finite healthy tail must eventually permit idle"
+    );
+    assert_eq!(source_snapshot(&fixture), source_before);
+    assert_committed_bundles_in_range(&fixture, 9001..=9074, 74);
+
+    // A subsequent ordinary rotation is healthy, not a permanent startup loop.
+    let mut idle_batches = 0;
+    assert!(
+        !run_with(
+            || {
+                reconcile_message_batch(
+                    &fixture.cx,
+                    &fixture.pool,
+                    &fixture.config,
+                    &mut restarted,
+                    &stop,
+                )
+            },
+            |report| {
+                idle_batches += 1;
+                assert_eq!(report.repaired, 0);
+                assert_eq!(report.deferred, 0);
+                assert!(!report.budget_exhausted);
+            },
+            || Duration::ZERO,
+        )
+        .unwrap()
+    );
+    assert_eq!(idle_batches, 1);
+    assert_eq!(source_snapshot(&fixture), source_before);
 }
 
 #[test]

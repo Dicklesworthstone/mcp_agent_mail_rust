@@ -176,7 +176,7 @@ fn run_am_binary(
     args: &[&str],
     stdin: Option<&[u8]>,
 ) -> Output {
-    let mut cmd = Command::new(binary);
+    let mut cmd = Command::new(binary); // ubs:ignore — integration callers select the Cargo-built am or an explicitly prepared private test candidate, never a request value
     cmd.args(args);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
@@ -197,10 +197,10 @@ fn run_am_binary(
         }
         child
             .wait_with_output()
-            .unwrap_or_else(|error| panic!("wait for {} output: {error}", binary.display()))
+            .unwrap_or_else(|error| panic!("wait for {} output: {error}", binary.display())) // ubs:ignore — test helper must fail on candidate process I/O failure
     } else {
         cmd.output()
-            .unwrap_or_else(|error| panic!("spawn {}: {error}", binary.display()))
+            .unwrap_or_else(|error| panic!("spawn {}: {error}", binary.display())) // ubs:ignore — test helper must fail if the candidate cannot be spawned
     }
 }
 
@@ -259,7 +259,7 @@ fn run_am_with_timeout(
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => panic!("timed am wait failed: {error}"),
+            Err(error) => panic!("timed am wait failed: {error}"), // ubs:ignore — integration fixture must fail on process wait errors
         }
     }
 
@@ -401,7 +401,7 @@ fn run_stdio_session(env: &[(String, String)], requests: &[Value]) -> StdioSessi
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => panic!("stdio wait failed: {error}"),
+            Err(error) => panic!("stdio wait failed: {error}"), // ubs:ignore — integration fixture must fail on process wait errors
         }
     }
 
@@ -440,7 +440,7 @@ fn json_check<'a>(value: &'a Value, id: &str) -> &'a Value {
         .expect("checks array")
         .iter()
         .find(|check| check["id"].as_str() == Some(id))
-        .unwrap_or_else(|| panic!("missing check {id}"))
+        .unwrap_or_else(|| panic!("missing check {id}")) // ubs:ignore — missing doctor check is a failed integration assertion
 }
 
 fn init_cli_schema(db_path: &Path) {
@@ -465,7 +465,7 @@ struct TreeEntry {
 
 fn file_snapshot(path: &Path) -> (u64, u64) {
     let bytes =
-        std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())); // ubs:ignore — test file witness must fail if it cannot be read
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     (bytes.len() as u64, hasher.finish())
@@ -474,7 +474,7 @@ fn file_snapshot(path: &Path) -> (u64, u64) {
 fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
     fn visit(root: &Path, current: &Path, out: &mut BTreeMap<PathBuf, TreeEntry>) {
         let mut entries: Vec<_> = std::fs::read_dir(current)
-            .unwrap_or_else(|error| panic!("read_dir {}: {error}", current.display()))
+            .unwrap_or_else(|error| panic!("read_dir {}: {error}", current.display())) // ubs:ignore — test tree witness must fail on enumeration errors
             .map(|entry| entry.expect("read dir entry"))
             .collect();
         entries.sort_by_key(|entry| entry.path());
@@ -486,7 +486,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
                 .expect("entry below snapshot root")
                 .to_path_buf();
             let metadata = std::fs::symlink_metadata(&path)
-                .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display()));
+                .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display())); // ubs:ignore — test file witness must fail on metadata errors
             let file_type = metadata.file_type();
             let mode = file_mode(&metadata);
             let modified = metadata.modified().ok();
@@ -525,7 +525,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
                         len: None,
                         content_hash: None,
                         symlink_target: Some(std::fs::read_link(&path).unwrap_or_else(|error| {
-                            panic!("read_link {}: {error}", path.display())
+                            panic!("read_link {}: {error}", path.display()) // ubs:ignore — test symlink witness must fail on read errors
                         })),
                         mode,
                         modified,
@@ -568,11 +568,11 @@ fn set_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let mut perms = std::fs::metadata(path)
-        .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display()))
+        .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display())) // ubs:ignore — private test shim must have readable metadata
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms)
-        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display())); // ubs:ignore — private test shim must be executable or the test must fail
 }
 
 #[cfg(not(unix))]
@@ -584,7 +584,7 @@ fn write_version_shim(path: &Path, binary: &str) {
         env!("CARGO_PKG_VERSION")
     );
     std::fs::write(path, contents)
-        .unwrap_or_else(|error| panic!("write shim {}: {error}", path.display()));
+        .unwrap_or_else(|error| panic!("write shim {}: {error}", path.display())); // ubs:ignore — private test shim creation failure must fail the test
     set_executable(path);
 }
 
@@ -1616,6 +1616,7 @@ fn assert_success(
     }
     write_artifact(case, args, &out);
     panic!(
+        // ubs:ignore — integration helper fails after writing diagnostics for an unsuccessful candidate command
         "expected success for {case} args={args:?}, got status={:?}\nstdout:\n{}\nstderr:\n{}",
         out.status.code(),
         String::from_utf8_lossy(&out.stdout),
@@ -1654,7 +1655,7 @@ fn robot_search_index_state<'a>(value: &'a Value, context: &str) -> &'a str {
         .or_else(|| value.get("data").and_then(|data| data.get("search_index")))
         .and_then(|search_index| search_index.get("state"))
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("missing robot search_index.state in {context}: {value}"))
+        .unwrap_or_else(|| panic!("missing robot search_index.state in {context}: {value}")) // ubs:ignore — test response assertion must reject missing state
 }
 
 fn robot_total_results(value: &Value, context: &str) -> u64 {
@@ -1662,7 +1663,7 @@ fn robot_total_results(value: &Value, context: &str) -> u64 {
         .get("total_results")
         .or_else(|| value.get("data").and_then(|data| data.get("total_results")))
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("missing robot total_results in {context}: {value}"))
+        .unwrap_or_else(|| panic!("missing robot total_results in {context}: {value}")) // ubs:ignore — test response assertion must reject missing result count
 }
 
 fn doctor_non_ok_checks(value: &Value) -> Value {
@@ -1984,6 +1985,7 @@ fn collect_installed_parity_outputs(binary: &Path, env: &TestEnv) -> Value {
         );
         let parsed: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
             panic!(
+                // ubs:ignore — parity integration helper must fail if a candidate emits invalid JSON
                 "{} parity command emitted invalid JSON for {}: {error}\nstdout:\n{}",
                 surface.id,
                 binary.display(),
@@ -5427,7 +5429,7 @@ fn file_reservations_soon_returns_expiring() {
 // GH#368: the supported server-read mode must use the real MCP resource without
 // opening a new local database connection. All state and child servers here are
 // private fixtures; these tests never discover or restart an operator's mailbox.
-const RESERVATION_READ_TEST_TOKEN: &str = "gh368-private-reservation-read-token";
+const RESERVATION_READ_TEST_TOKEN: &str = "gh368-private-reservation-read-token"; // ubs:ignore — synthetic credential used only by this private real-server regression fixture
 
 fn reservation_read_fixture() -> (TestEnv, String, String) {
     let env = TestEnv::new();
@@ -5805,7 +5807,7 @@ impl ReservationReadPeer {
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     }
-                    Err(error) => panic!("accept private peer request: {error}"),
+                    Err(error) => panic!("accept private peer request: {error}"), // ubs:ignore — private test server must fail on unexpected accept errors
                 };
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -6805,6 +6807,154 @@ fn reservation_server_legacy_negotiation_fails_closed_without_retries_or_paginat
             peer.requests.load(std::sync::atomic::Ordering::Relaxed),
             expected_reads * commands.len(),
             "{failure} must stop at its failing boundary without retries or OFFSET pages"
+        );
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
+fn reservation_server_reads_preserve_active_leases_when_client_clock_is_ahead() {
+    // R3 protocol fixture: the compiled CLI and HTTP transport are real. Both
+    // server protocols say these leases are active at their authority's clock.
+    // Local wall time may affect displays, but must not remove those leases.
+    let expires = "2024-02-02T00:00:00Z";
+    assert!(
+        mcp_agent_mail_db::now_micros() > mcp_agent_mail_db::iso_to_micros(expires).unwrap(),
+        "fixture must exercise a client clock ahead of the server"
+    );
+    for legacy in [false, true] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            let agents = json!([
+                {"id": 1, "name": "RusticGlen", "project_id": 1},
+                {"id": 2, "name": "BlueLake", "project_id": 1}
+            ]);
+            let payload = if uri.starts_with("resource://project/") {
+                json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                    "created_at": "2024-01-01T00:00:00Z", "agents": agents})
+            } else {
+                let mut rows = reservation_read_legacy_rows(2);
+                rows[0]["path_pattern"] = json!("src/**");
+                rows[1]["path_pattern"] = json!("src/lib.rs");
+                rows[1]["agent"] = json!("BlueLake");
+                for row in &mut rows {
+                    row["exclusive"] = json!(true);
+                    row["expires_ts"] = json!(expires);
+                }
+                if legacy {
+                    assert!(
+                        uri == "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                            || uri
+                                == "resource://file_reservations/gh368-project?active_only=true&limit=250&offset=0&format=json"
+                    );
+                    json!(rows)
+                } else {
+                    assert_eq!(
+                        uri,
+                        "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                    );
+                    for (index, row) in rows.iter_mut().enumerate() {
+                        row["project_id"] = json!(1);
+                        row["agent_id"] = json!(index + 1);
+                    }
+                    let mut snapshot =
+                        reservation_read_snapshot(&expected_project, "gh368-project", rows);
+                    snapshot["agents"] = agents;
+                    snapshot
+                }
+            };
+            reservation_read_resource_reply(request, payload)
+        });
+        let vars = reservation_read_env(&env, peer.port, &env.database_url());
+        let uri = "resource://file_reservations/gh368-project?active_only=true&limit=2";
+        let cases = [
+            vec![
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+            vec![
+                "robot",
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+            vec![
+                "robot",
+                "navigate",
+                uri,
+                "--project",
+                &project,
+                "--json",
+                "--server",
+            ],
+            vec!["file_reservations", "active", &project, "--server"],
+            vec!["file_reservations", "list", &project, "--server"],
+            vec!["file_reservations", "soon", &project, "--server"],
+            vec![
+                "file_reservations",
+                "conflicts",
+                &project,
+                "src/lib.rs",
+                "--server",
+            ],
+        ];
+        for args in &cases {
+            let out = run_am_hermetic(&vars, Some(env.hostile_repo()), args);
+            let text = reservation_read_success(&out);
+            if args.contains(&"--json") {
+                let data: Value = serde_json::from_str(text).unwrap();
+                let navigate = args.get(1) == Some(&"navigate");
+                let rows = if navigate {
+                    &data["data"]["reservations"]
+                } else {
+                    assert_eq!(data["conflicts"].as_array().unwrap().len(), 1);
+                    assert_eq!(data["reservation_read_attestation"]["source"], "mcp_server");
+                    &data["all_active"]
+                };
+                let actual: std::collections::HashSet<_> = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["path"].as_str().unwrap(),
+                            row["agent"].as_str().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    std::collections::HashSet::from([
+                        ("src/**", "RusticGlen"),
+                        ("src/lib.rs", "BlueLake")
+                    ]),
+                    "legacy={legacy}, args={args:?}"
+                );
+            } else {
+                for expected in ["src/**", "src/lib.rs", "RusticGlen", "BlueLake"] {
+                    assert!(text.contains(expected), "missing {expected}: {text}");
+                }
+            }
+        }
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            cases.len() * if legacy { 4 } else { 3 }
         );
         assert!(!env.db_path.exists());
         assert!(snapshot_tree(&env.storage_root).is_empty());
@@ -7949,6 +8099,7 @@ fn check_reconstruct_preview_reservations(ambiguous_source: bool, check_reseed: 
     let preview = run(&preview_env, "--dry-run");
     let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap_or_else(|error| {
         panic!(
+            // ubs:ignore — reconstruct integration helper must reject a non-JSON dry-run response
             "preview stdout must be a single JSON value ({error}):\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&preview.stdout),
             String::from_utf8_lossy(&preview.stderr)

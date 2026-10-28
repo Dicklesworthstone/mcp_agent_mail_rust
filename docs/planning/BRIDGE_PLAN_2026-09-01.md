@@ -187,6 +187,254 @@ Each bead embeds source context, reasoning, implementation scope, realistic posi
 a negative a naive fix fails, E2E logging, and closure evidence. Implementation and tests
 stay in one logical bead, as the suite's scope-splitting prohibition requires.
 
+#### Search rendered-text retention (adjacent to `br-kp1in.44`, October 27)
+
+Source review at `789efef153c3aaa458c96980f260e0d1eef85073` found that the search
+screen independently retained rendered Markdown and composed detail text until each
+map exceeded 512 entries. Full message bodies were preserved, with no byte admission
+limit. This is a concrete cache-retention gap, not attribution of the historical
+8.8 GB daemon observation and not a measured memory or latency improvement.
+
+The commit containing this note replaces those maps with one fixed-capacity FIFO:
+8 MiB of accounted retained storage, at most 2 MiB per admitted render, and 512 entries
+across both layers. Accounting includes actual line/span vector capacities, owned text
+and hyperlink string capacities, the Text allocation and Arc counters, and queue
+metadata. The ownership-preserving vector roundtrip is checked against pinned
+`ftui-text 0.7.0`; the implementation documents that dependency. Admission inspection
+stops after the bounded prefix needed to reject an entry, moving the remaining text
+back intact. Oversized entries remain available for complete display without evicting
+ordinary cached entries in the current theme. Hits clone an Arc; eviction is bounded.
+
+Theme changes release both old render layers. Detail-context changes release the old
+detail generation while keeping reusable Markdown, including when the generation
+counter is saturated. The actual screen rendering path now requests composed detail
+once, avoiding a second Markdown parse per frame when an oversized body bypasses
+retention. JSON mode and complete message bodies remain unchanged. The budget covers
+cache ownership; full result bodies, active caller Arcs, transient widget/rendering
+allocations, allocator bookkeeping and process RSS remain outside it.
+
+Seven new regressions exercise both cache layers below the old count threshold,
+combined entry pressure, eviction and full-body reconstruction, oversized bypass,
+theme/detail churn, saturated generation invalidation, and spare vector/string/link
+capacity accounting. Weak references assert that obsolete allocations are released.
+Two actual `MailScreen::view` frames assert one Markdown render per oversized request
+and a visible final-body canary after scrolling. An existing small-hit test now checks
+Arc reuse in both layers. All fixtures are synthetic and in memory; these are authored
+regressions, not executed runtime proof.
+
+**Validation remains OPEN.** Pinned nightly formatting and the scoped formatter check
+passed, as did `git diff --check`; independent production and test source review found
+no further concrete blocker. Six strict `RCH_REQUIRE_REMOTE=1 rch exec -- ...` attempts
+for both compiler graphs, Clippy, workspace formatting, the search-screen nextest
+selection and full workspace nextest all stopped with exit 127 because `rch` is absent.
+UBS and Beads import were also unavailable. No compilation or runtime test ran. The
+six-hour paired TUI-on/off soak, incumbent comparison and heap attribution required by
+`.44` remain necessary before closing that bead.
+
+#### Sidecarless migration ownership review (`br-hb3mk`, October 27)
+
+The same source review confirms that format detection probes activity/ownership locks
+and returns `()` before the canonical/raw open and format read. Retaining the existing
+CLI mutation locks would exclude cooperating Agent Mail callers, but bare engine opens
+do not consult them. Pinned `fsqlite-vfs 0.4.11` explicitly makes an absent-namespace
+`ReadOnlyUnadmitted` lease hold no locks; `ExistingCompanion` refuses absent authority,
+while `Shared`/`ReservedExclusive` create namespace files. Its generation-transition
+guard requires existing authority and writes a prepare record. The packaged source is
+[namespace.rs at 3bb28e73168991913974c1a7b4bb0414b48765fa](https://github.com/Dicklesworthstone/frankensqlite/blob/3bb28e73168991913974c1a7b4bb0414b48765fa/crates/fsqlite-vfs/src/namespace.rs).
+
+Migration source remains unchanged and the bead remains open. A complete repair needs
+an offline reservation honored by engine admission, or an explicit change to the
+contract permitting coordination artifacts for sidecarless `--check`. A second probe
+or retained CLI-only lock does not prove the required mixed-engine exclusion. No live
+mailbox or migration family was opened during this review.
+
+#### Restored forward-tail catch-up (`br-kp1in.35`, October 27)
+
+Source review at `629d9acfe7458fd281b349a2cbe40a75f0a61cdc` found a remaining
+scheduling gap alongside the existing retry/checkpoint/startup-history machinery.
+A saved descending history cursor can finish its round while the saved forward cursor
+is still far behind newer eligible mail. A full healthy forward page then reported no
+backlog, returning the worker to minute-long polling before it reached unseen orphans.
+This is a source-supported interleaving, not attribution of the historical swarm IDs.
+
+Forward selection now reads at most 17 eligible IDs and admits the original 16. The
+extra ID is only a lookahead; it authorizes no payload read or archive publication.
+When the tail watermark actually advances but that successor remains ahead, the
+existing catch-up hint stays set independently of history completion. Exactly-full
+terminal pages, initial newest-page selection, cancellation and blocked admission
+do not invent forward backlog. Cooling duplicate IDs can advance the cursor without
+another repair attempt. The 32-attempt, four-repair, 16 MiB batch bounds, retry backoff,
+normal grace, server turn limits, publication checks and checkpoint schema remain.
+
+Four new tests cover this change. The server test uses real mailbox and Git operations
+to publish a checkpoint at tail 9009/history 9000, builds a healthy higher-ID backlog
+without altering that checkpoint, adds DB-only orphan 9042, and reconstructs the cursor.
+The first two healthy forward pages must continue before the orphan is repaired, and
+the finite backlog must return to idle. It compares every message/recipient column,
+including read/ack state, and all 74 canonical/outbox/inbox copies against raw Git HEAD
+blobs. Three storage controls cover initial/exact-end pages, cooling cursor progress,
+and cancelled, saturated-retry and grace-only passes. This is an authored cursor-restart
+regression; it does not claim an executed process-crash or release-smoke result.
+
+**Validation remains OPEN.** Pinned nightly formatting and scoped `--check` passed for
+both changed Rust files, along with `git diff --check` and independent source review.
+Strict RCH attempts for both compiler graphs, Clippy, workspace formatting, storage
+reconciler tests, server catch-up tests and full workspace nextest all stopped with
+exit 127 (`rch` absent). UBS and Beads import were also unavailable. No Rust compilation
+or runtime test ran. The named release-build swarm/SIGKILL/300-second convergence
+acceptance remains unrun, and `.35` and its broader convergence owners remain open.
+
+#### Recovery promotion follow-up (`br-8asz3`, October 27)
+
+At `629d9acfe7458fd281b349a2cbe40a75f0a61cdc`, the retained-parent recovery helper
+still handled an unsupported atomic no-replace rename by checking absence again and
+using an ordinary replacing rename. A competing destination could appear after that
+second check. This remaining source defect is separate from the already implemented
+directory anchoring and hard-link-alias rejection recorded on the bead.
+
+The commit containing this note removes that fallback for primary quarantine and
+candidate activation. The anchored atomic operation now either succeeds or propagates
+its original error and context. Existing rollback, receipt and admission rules retain
+control after refusal; no replacing rename is substituted when the primitive fails.
+
+Three public `promote_recovery_candidate` tests cover seven disposable fixture cases:
+`NOSYS` and `INVAL` selectively injected at quarantine and activation, real-kernel
+regular-file and dangling-symlink collisions after the last destination inspection,
+and successful real-kernel promotion. They retain source/candidate inode witnesses,
+the exact candidate bytes after receipt preparation, and the pending intent bytes.
+Safe refusal/rollback must preserve that intent as aborted; successful promotion must
+retain the original generation in quarantine and commit a verifiable receipt. Fixtures
+are retained. Selective syscall injection is not native unsupported-platform proof.
+
+**Validation remains OPEN.** The pinned nightly formatter parsed/formatted `pool.rs`
+and its scoped `--check` passed, as did `git diff --check`. Source review found no further
+concrete blocker. Strict RCH attempts for both compiler graphs, Clippy, workspace
+formatting, focused promotion tests and full workspace nextest all stopped with exit
+127 because `rch` is absent. UBS and `br sync --import-only` likewise could not run.
+No compilation, runtime test or native-platform qualification is claimed; the bead
+remains open. No live mailbox or recovery family was modified during implementation.
+
+#### Crypto publication implementation follow-up (`br-kp1in.49`, October 27)
+
+The implementation in the commit containing this note replaces crypto output
+preflight-plus-rename/write with one retained publication boundary. Encryption,
+identity decryption, in-process passphrase decryption and signature creation retain
+the output parent and private staging handles. External age receives held input and
+output files through stdin/stdout. New outputs publish through an atomic no-replace
+hard link; a concurrently created regular file or symlink remains untouched. Private
+stages use mode 0700 with 0600 files on Unix and are retained on success and refusal.
+No temporary destructor follows an old pathname to remove artifacts after a parent
+substitution. A late namespace change or failed post-publication confirmation returns
+an explicit unconfirmed result and retains the original-directory artifacts.
+
+Authorized signature overwrite remains supported. Linux/macOS exchange and native
+Windows replacement retain the displaced object and compare its identity, streamed
+content hash, size, mode, modification time and link topology with the captured target.
+A separate candidate link survives replacement. Recovery detaches and inspects the
+current final object before restoring a retained object with no-replace semantics;
+it does not blindly overwrite a third writer. Unsupported replacement platforms fail
+closed. Windows replacement releases staged-file handles before the exclusive native
+open and reopens the retained candidate afterward; directory ancestors remain pinned.
+These platform implementations still require native execution evidence.
+
+Six new test functions exercise the public APIs across raced regular destinations,
+dangling/outside symlinks, bounded concurrent winner/loser ordering, early/late parent
+substitution with a recreated staging-path trap, changed authorized overwrite targets
+and Windows directory pinning. Existing child-failure and authenticated-stream negatives
+now assert retained private partial evidence. The ordinary overwrite positive independently
+verifies the new Ed25519 signature and retention of both candidate and displaced object.
+Unix child shims establish causal interleavings only; real-age positives remain required.
+The existing `e2e_share.sh --crypto-only` lane adds five real CLI/age publication cases,
+including two different completed ciphertexts, structured process completion receipts,
+no-follow inode/hash/link witnesses and bounded retained-artifact inventories.
+
+**Validation status: OPEN.** The pinned `nightly-2026-08-31` formatter parsed/formatted
+`crypto.rs`, and its subsequent scoped `--check` passed. `bash -n`, the crypto matrix
+and generated-wrapper Python AST checks, Cargo manifest/lock TOML dependency checks,
+and `git diff --check` passed. Seven strict `RCH_REQUIRE_REMOTE=1 rch exec -- ...`
+attempts stopped with exit 127 (`rch` absent): production and all-target compiler graphs,
+Clippy, workspace formatting, required real-age crypto tests, full workspace nextest,
+and the separate `.52` snapshot reproduction. UBS and `br sync --import-only` also
+stopped with exit 127. No Rust compilation, runtime tests, real CLI matrix or native
+Windows validation ran; no passing safety verdict or bead closure is claimed. The
+snapshot implementation is unchanged because its required current-candidate reproduction
+could not execute. Suite guidance at `/data/projects/AGENTS.md` is absent here.
+
+#### ATC persistence implementation follow-up (`br-kp1in.50`, October 27)
+
+Commit `2a31869504f045cd03e04997bf4782d7188eba30` adds the shared bounded content
+validator at direct append, outcome resolution/replacement and context/reason/state
+amendment boundaries in both storage implementations. Nested outcome evidence and
+decoded JSON keys/values are checked before serialization. Validation bounds dynamic
+content to 64 KiB, 4,096 visited fields/values, 16 JSON levels and 4,096 bytes per string
+(the existing 256-byte summary limit remains). Merged context and replacement outcomes
+are checked against the complete row inside the write transaction. Atomic execution
+capture and observed-outcome resolution prevent rejected content leaving an intermediate
+Dispatched or Open state. Valid first-insert-wins behavior and rollup APIs are retained.
+
+The server integration in the commit containing this note uses those atomic APIs and
+removes rejected input from diagnostics. Across the implementation there are 25 new
+test functions: 11 core validator tests, 12 file/memory public-entrypoint tests, a real
+server sidecar seam test and an opt-in HTTP test on disposable mailbox/storage fixtures.
+The persistence tests independently reopen the sidecar and compare all experience and
+rollup columns after rejection; positive metrics, outcomes and idempotent replays remain
+covered. The HTTP fixture also inspects the operator inventory. Default shadow/write-off
+configuration is unchanged. These are authored regressions, not executed runtime proof.
+
+**Validation status: OPEN, not closure evidence.** The pinned `nightly-2026-08-31`
+formatter (`rustfmt 1.10.0-nightly`, runtime `9085017724`) parsed/formatted all five
+changed Rust files; a subsequent direct `rustfmt --check` and `git diff --check` passed.
+Strict `RCH_REQUIRE_REMOTE=1 rch exec -- ...` attempts for the production compiler graph,
+all-target compiler graph, Clippy, workspace formatting, focused core tests, DB lifecycle
+and rollup tests, server seam test and HTTP test all stopped with exit 127 because `rch`
+is unavailable. UBS likewise stopped with exit 127 (`ubs` unavailable). No Rust compilation
+or runtime tests ran, and local formatting is not a substitute for the strict remote
+gates. Suite guidance at `/data/projects/AGENTS.md` was absent in this environment.
+Keep `.50` open until the named gates and real fixture tests pass on the exact candidate.
+No live mailbox or existing sidecar was modified during this implementation session.
+
+##### Atomic message-feedback follow-up (`br-kp1in.50`)
+
+Source review of `a03883ffff666cb4ff43c5c681c8f671c9e0139a` found a remaining
+lifecycle race: an acknowledgement could fetch an Executed/Open row, lose to a read or
+overdue resolution, then receive a successful no-op from the generic resolver. The
+server's separate resolved-row branch never ran, so its documented acknowledgement
+precedence could be lost. This is a source-confirmed interleaving, not an executed
+current-binary reproduction.
+
+The follow-up in the commit containing this note adds `resolve_atc_message_outcome`.
+Both storage implementations select, validate and decide precedence in the same write
+transaction. Acknowledgements upgrade read/overdue outcomes; duplicate acknowledgements
+preserve the first accepted timestamp/evidence; late reads and overdue observations
+cannot downgrade them. Unrelated resolved outcomes retain their existing semantics.
+The generic resolution APIs remain first-resolution-wins. The shared bounded validator
+also checks the complete replacement candidate before replay/no-op decisions.
+
+The server feedback and overdue sweep consume the committed effect receipt. Only an
+initial resolution updates the resolved/open counters; upgrades and no-ops do not count
+another lifecycle completion. Incoming feedback content is checked before shadow,
+lookup-retry, missing-row or terminal diagnostics, and failure logs retain static
+categories instead of supplied metadata or opaque errors. Tests force competing writes
+between the server fetch and mutation, exercise both database implementations directly,
+and reopen the private sidecar to compare stored outcomes, timestamps and rollups.
+
+There are six additional authored regressions: four paired file/memory database tests
+and two server tests. The server interleaving matrix uses separate mailbox directories
+for all eight cases because ATC uses a fixed sidecar basename within each directory.
+The diagnostic regression captures tracing fields for synthetic agent/project canaries
+against missing/resolved rows in live/shadow mode. These tests have not executed here.
+
+**Validation remains OPEN.** `git diff --check` passed, and the pinned nightly
+formatter parsed/formatted the three changed Rust files. Ten fresh strict
+`RCH_REQUIRE_REMOTE=1 rch exec -- ...`
+attempts stopped with exit 127 (`rch: command not found`): production and all-target
+compiler graphs, Clippy, workspace formatting, core validator tests, DB lifecycle/rollup
+tests, server feedback tests, the prior server content-boundary test, opt-in HTTP test,
+and full workspace nextest. UBS also stopped with exit 127. No compilation or runtime
+test result is claimed. Suite guidance at `/data/projects/AGENTS.md` and the `br`
+executable are absent here. This follow-up does not close `.50` or change ATC defaults. Only
+disposable fixtures are used by the regressions; no live mailbox was accessed.
+
 **Would finishing all pre-existing open/in-progress beads close the gap? No.** It would
 leave `.48/.49/.50/.52/.53` and the current guidance errors uncovered; literal execution of stale
 release tasks would also keep targeting the wrong publication path. After these additions

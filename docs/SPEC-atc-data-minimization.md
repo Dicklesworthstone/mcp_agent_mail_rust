@@ -133,7 +133,7 @@ is recognized.
 | `AKIA...` / `ASIA...` | AWS access key | Prefix |
 | `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_` | GitHub token | Prefix |
 | `xoxb-` / `xoxp-` / `xoxs-` / `xoxa-` | Slack token | Prefix |
-| `sk-` / `sk-ant-` | OpenAI/Anthropic key | Token prefix: start of string or after a non-alphanumeric, non-underscore separator |
+| `sk-` / `sk-ant-` | OpenAI/Anthropic key | Token-boundary prefix for short keys; concatenated long-key patterns are also checked |
 | `glpat-` | GitLab PAT | Prefix |
 | `npm_` | npm token | Prefix |
 | `pypi-AgEIcHlwaS5` | PyPI token | Prefix |
@@ -148,11 +148,14 @@ is recognized.
 
 The shared content checks cover:
 
-- `evidence_summary` and `outcome.label`: secret scan and max 256 UTF-8 bytes each.
+- `evidence_summary`: secret scan and max 256 UTF-8 bytes.
+- `outcome.label` and individual metadata/JSON strings: secret scan and max
+  4,096 UTF-8 bytes each.
 - `context` and nested `outcome.evidence`: iterative scans of decoded strings
   and object keys, including escaped credential patterns. Each JSON payload is
-  limited to depth 16, 1,024 nodes and 16 KiB of cumulative decoded string/key
-  bytes. Numeric and boolean metrics remain accepted.
+  limited to depth 16. One aggregate budget covers the row's dynamic fields:
+  4,096 inspected values/keys/text fields and 64 KiB including JSON escaping,
+  punctuation and numeric encodings. Numeric and boolean metrics remain accepted.
 - Context patches: validate both existing and incoming values before recursive
   merge, then validate the result, preventing individually valid patches from
   growing an oversized durable context.
@@ -166,12 +169,13 @@ for learning inserts. Direct append also serves event-only observations such as
 deadlock advisories with no posterior, so it enforces shared content validation
 without imposing those additional learning-insert requirements.
 
-The API-key token boundary admits ordinary thread metadata such as `task-build`
-and `risk-check`; actual `sk-`/`sk-ant-` tokens at a string start or after normal
-separators remain rejected. An embedded substring immediately following an
-alphanumeric or underscore is no longer independently classified by this rule.
-Other existing secret patterns remain unchanged. Classification of Category B
-vocabulary fields is separate from these Category D content checks.
+The API-key detector admits ordinary thread metadata such as `task-build`
+and `risk-check`; short `sk-`/`sk-ant-` tokens require a boundary. Long vendor
+prefixes and long bare alphanumeric keys are also recognized when concatenated
+with an alphanumeric prefix. Authorization and credential-assignment patterns
+are scanned after JSON decoding as well. Category B vocabulary classification
+describes producer intent; metadata and non-execution reason strings also receive
+the shared bounds and secret checks before persistence.
 
 ---
 

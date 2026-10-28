@@ -1718,9 +1718,43 @@ fn run_tmux_capture(args: &[&str]) -> Result<Option<String>, TmuxProbeError> {
 /// cannot fill the pipe while we wait for it, and a descendant retaining the
 /// pipe cannot leave a blocked reader thread behind after we return.
 fn run_tmux_bounded(
-    mut command: std::process::Command,
+    command: std::process::Command,
 ) -> Result<std::process::Output, TmuxProbeError> {
-    use std::io::Read;
+    let timeout = tmux_probe_timeout();
+    run_command_bounded(command, timeout, MAX_TMUX_PROBE_OUTPUT_BYTES, false).map_err(|error| {
+        let error = match error.kind() {
+            std::io::ErrorKind::TimedOut => TmuxProbeError::TimedOut { timeout },
+            std::io::ErrorKind::FileTooLarge => TmuxProbeError::OutputLimit {
+                limit: MAX_TMUX_PROBE_OUTPUT_BYTES,
+            },
+            _ => TmuxProbeError::Spawn(error),
+        };
+        tracing::warn!(code = error.code(), "{error}");
+        error
+    })
+}
+
+/// Capture a local command without leaving pipe-reader threads behind.
+///
+/// The child and both output pipes share one deadline and one aggregate byte
+/// limit. Each drain iteration reads at most one chunk per pipe, so continuous
+/// stdout cannot starve stderr or child/deadline polling. A descendant holding
+/// a pipe open produces a timeout even after the direct child exits. Stderr is
+/// discarded when `capture_stderr` is false, preserving tmux's stdout-only policy.
+///
+/// The direct child is killed and reaped on failure; unrelated descendants are
+/// never signalled. Output readers are owned locally and close on every return.
+/// A child exiting at the deadline receives at most 50 ms of drain grace.
+///
+/// # Errors
+/// Returns `TimedOut` if the child or pipe exceeds the deadline, `FileTooLarge`
+/// if aggregate output exceeds `max_output_bytes`, or the spawn/read/wait error.
+pub fn run_command_bounded(
+    mut command: std::process::Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    capture_stderr: bool,
+) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
 
     /// Grace granted to the stdout drain after the child has exited, so a
@@ -1733,23 +1767,31 @@ fn run_tmux_bounded(
         let _ = child.wait();
     }
 
-    let timeout = tmux_probe_timeout();
-    let (mut reader, writer) = tmux_stdout_pipe().map_err(TmuxProbeError::Spawn)?;
+    let (stdout_reader, stdout_writer) = bounded_output_pipe()?;
+    let stderr_pipe = if capture_stderr {
+        Some(bounded_output_pipe()?)
+    } else {
+        None
+    };
+    let (stderr_reader, stderr_writer) = match stderr_pipe {
+        Some((reader, writer)) => (Some(reader), writer),
+        None => (None, Stdio::null()),
+    };
     command
         .stdin(Stdio::null())
-        .stdout(writer)
-        .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(TmuxProbeError::Spawn)?;
+        .stdout(stdout_writer)
+        .stderr(stderr_writer);
+    let mut child = command.spawn()?;
     // Command retains explicitly supplied handles after spawning. Close our
     // writer copy so only the child and its descendants can postpone EOF.
     command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
 
     let mut deadline = Instant::now() + timeout;
     let mut poll_interval = Duration::from_millis(1);
     let mut status = None;
-    let mut stdout = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut eof = false;
+    let mut readers = [Some(stdout_reader), stderr_reader];
+    let mut output = [Vec::new(), Vec::new()];
     loop {
         if status.is_none() {
             match child.try_wait() {
@@ -1760,63 +1802,82 @@ fn run_tmux_bounded(
                 Ok(None) => {}
                 Err(error) => {
                     kill_and_reap(&mut child);
-                    return Err(TmuxProbeError::Spawn(error));
+                    return Err(error);
                 }
             }
         }
-        if let Some(status) = status.filter(|_| eof) {
+        if let Some(status) = status.filter(|_| readers.iter().all(Option::is_none)) {
+            let [stdout, stderr] = output;
             return Ok(std::process::Output {
                 status,
                 stdout,
-                stderr: Vec::new(),
+                stderr,
             });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             kill_and_reap(&mut child);
-            tracing::warn!(
-                code = TMUX_PROBE_TIMEOUT_CODE,
-                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                command = ?command,
-                "tmux child or stdout pipe exceeded its deadline; pane facts unavailable"
-            );
-            return Err(TmuxProbeError::TimedOut { timeout });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "child or output pipe exceeded its deadline",
+            ));
         }
-        if !eof {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    eof = true;
-                    continue;
-                }
-                Ok(length) => {
-                    if length > MAX_TMUX_PROBE_OUTPUT_BYTES - stdout.len() {
-                        kill_and_reap(&mut child);
-                        let error = TmuxProbeError::OutputLimit {
-                            limit: MAX_TMUX_PROBE_OUTPUT_BYTES,
-                        };
-                        tracing::warn!(code = error.code(), command = ?command, "{error}");
-                        return Err(error);
-                    }
-                    stdout.extend_from_slice(&buffer[..length]);
-                    poll_interval = Duration::from_millis(1);
-                    // Poll both child and deadline even under continuous output.
-                    continue;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    kill_and_reap(&mut child);
-                    return Err(TmuxProbeError::Spawn(error));
-                }
+        let made_progress = match drain_command_output(&mut readers, &mut output, max_output_bytes)
+        {
+            Ok(progress) => progress,
+            Err(error) => {
+                kill_and_reap(&mut child);
+                return Err(error);
             }
+        };
+        if made_progress {
+            poll_interval = Duration::from_millis(1);
+            continue;
         }
         std::thread::sleep(poll_interval.min(remaining));
         poll_interval = (poll_interval * 2).min(MAX_POLL_INTERVAL);
     }
 }
 
+/// Read one nonblocking chunk from each pipe before polling the child again.
+fn drain_command_output(
+    readers: &mut [Option<impl std::io::Read>; 2],
+    output: &mut [Vec<u8>; 2],
+    max_output_bytes: usize,
+) -> std::io::Result<bool> {
+    let mut made_progress = false;
+    let mut total_bytes = output.iter().map(Vec::len).sum::<usize>();
+    let mut buffer = [0_u8; 8192];
+    for (reader_slot, bytes) in readers.iter_mut().zip(output) {
+        let Some(reader) = reader_slot else {
+            continue;
+        };
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                *reader_slot = None;
+                made_progress = true;
+            }
+            Ok(length) => {
+                if length > max_output_bytes - total_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::FileTooLarge,
+                        "command output exceeded its aggregate byte limit",
+                    ));
+                }
+                total_bytes += length;
+                bytes.extend_from_slice(&buffer[..length]);
+                made_progress = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => made_progress = true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(made_progress)
+}
+
 #[cfg(unix)]
-fn tmux_stdout_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdio)> {
+fn bounded_output_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdio)> {
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
     let (reader, writer) = std::io::pipe()?;
@@ -1826,7 +1887,7 @@ fn tmux_stdout_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdi
 }
 
 #[cfg(windows)]
-fn tmux_stdout_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdio)> {
+fn bounded_output_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdio)> {
     use std::os::windows::io::OwnedHandle;
 
     struct Reader(socketpair::SocketpairStream);
@@ -1856,10 +1917,10 @@ fn tmux_stdout_pipe() -> std::io::Result<(impl std::io::Read, std::process::Stdi
 }
 
 #[cfg(not(any(unix, windows)))]
-fn tmux_stdout_pipe() -> std::io::Result<(std::io::Empty, std::process::Stdio)> {
+fn bounded_output_pipe() -> std::io::Result<(std::io::Empty, std::process::Stdio)> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "nonblocking tmux pipes are unavailable on this platform",
+        "nonblocking command pipes are unavailable on this platform",
     ))
 }
 
@@ -3815,8 +3876,11 @@ esac
                     ),
                 ]);
                 let started = Instant::now();
+                // This budget also covers shell startup and PID publication.
+                // Keep the outer three-second drain deadline below unchanged;
+                // direct-child tests separately exercise a 200 ms budget.
                 let result = crate::config::with_process_env_overrides_for_test(
-                    &[(TMUX_PROBE_TIMEOUT_ENV, "200")],
+                    &[(TMUX_PROBE_TIMEOUT_ENV, "1000")],
                     || run_tmux_bounded(command),
                 );
                 let elapsed = started.elapsed();

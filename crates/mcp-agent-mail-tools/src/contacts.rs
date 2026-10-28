@@ -91,6 +91,30 @@ pub struct RespondContactResponse {
 /// Valid contact policy values.
 pub const VALID_CONTACT_POLICIES: &[&str] = &["open", "auto", "contacts_only", "block_all"];
 
+/// Contact links are authorization state. Retired identities must not create,
+/// approve, block, or refresh that state until they are explicitly unretired.
+fn require_active_contact_participant(
+    agent: &mcp_agent_mail_db::AgentRow,
+    role: &'static str,
+) -> McpResult<()> {
+    if let Some(retired_at) = agent.retired_at {
+        return Err(legacy_tool_error(
+            "AGENT_RETIRED",
+            format!(
+                "{role} agent {} is retired; unretire the identity before changing contact authorization",
+                agent.name
+            ),
+            false,
+            serde_json::json!({
+                "agent": agent.name,
+                "role": role,
+                "retired_at": micros_to_iso(retired_at),
+            }),
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize a contact policy string.
 ///
 /// Trims whitespace and lowercases without changing semantic intent.
@@ -423,6 +447,8 @@ pub(crate) async fn request_contact_with_intro(
         &target_project_row.human_key,
     )
     .await?;
+    require_active_contact_participant(&from_row, "requester")?;
+    require_active_contact_participant(&to_row, "target")?;
     let from_agent_name = from_row.name.clone();
     let target_agent_name = to_row.name.clone();
 
@@ -708,6 +734,12 @@ pub async fn respond_contact(
         &source_project_row.human_key,
     )
     .await?;
+    // Validate both identities before the contact-link mutation. In particular,
+    // a retired requester must not be approved/blocked and a retired recipient
+    // must not mutate authorization merely because an old session still has a
+    // valid binding.
+    require_active_contact_participant(&to_row, "recipient")?;
+    require_active_contact_participant(&from_row, "requester")?;
     // Mirror request_contact: clamp caller-supplied TTL to [60s, 1 year] so the DB's
     // expires_ts = now + ttl*1_000_000 cannot be driven past a reasonable horizon.
     let ttl = match ttl_seconds {

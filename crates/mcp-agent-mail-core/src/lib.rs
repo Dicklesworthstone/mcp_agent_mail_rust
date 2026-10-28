@@ -204,7 +204,7 @@ pub use pane_identity::{
     is_agent_pane_command, list_identities, list_identities_with_paths, read_identity_record,
     resolve_identity, resolve_identity_current_pane, resolve_identity_with_binding,
     resolve_identity_with_binding_on_server, resolve_identity_with_optional_pane,
-    resolve_identity_with_optional_pane_on_server, resolve_identity_with_path,
+    resolve_identity_with_optional_pane_on_server, resolve_identity_with_path, run_command_bounded,
     tmux_env_socket_path_validated, validate_tmux_socket_path, write_identity,
     write_identity_current_pane, write_identity_on_server, write_identity_with_optional_pane,
     write_identity_with_optional_pane_on_server,

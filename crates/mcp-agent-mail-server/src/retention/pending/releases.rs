@@ -324,6 +324,27 @@ async fn apply_release(
         .id
         .filter(|id| *id > 0)
         .ok_or_else(|| "release agent has no positive identity".to_string())?;
+    // A broad degraded-mode "release all" is only authority for the session
+    // that queued it. If the agent became active again before replay, treating
+    // that old intent as current can release leases the revived session renewed
+    // in place (their created_ts remains older than the intent cutoff). Narrow
+    // path/id intents remain exact client requests and keep their original
+    // cutoff semantics.
+    let agent_revived_after_intent = agent.last_active_ts > intent.created_ts;
+    if intent.paths.is_none() && intent.file_reservation_ids.is_none() && agent_revived_after_intent
+    {
+        tracing::info!(
+            agent = %agent.name,
+            intent_created_ts = intent.created_ts,
+            agent_last_active_ts = agent.last_active_ts,
+            "abandoning stale broad release intent after agent revival"
+        );
+        return Ok(AppliedPage {
+            released: Vec::new(),
+            generation: None,
+            complete: true,
+        });
+    }
     // An explicit empty filter is complete without scanning any lease rows.
     if paths.as_ref().is_some_and(Vec::is_empty)
         || intent

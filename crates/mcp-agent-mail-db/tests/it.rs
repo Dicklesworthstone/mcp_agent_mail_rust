@@ -7,6 +7,11 @@
 //! test in its own process. Declare new test files below;
 //! `every_test_file_is_linked` fails for any `tests/*.rs` left out.
 
+// Clippy's Send proof traverses the nested FrankenSQLite acquire/initialization
+// futures used by real sidecar tests. Keep the proof enabled with the same
+// compiler recursion budget as the tools integration target.
+#![recursion_limit = "256"]
+
 /// Shared helpers (tests/common/mod.rs); use them as `crate::common`.
 mod common;
 

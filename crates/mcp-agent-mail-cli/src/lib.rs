@@ -6944,24 +6944,8 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 .output
                 .unwrap_or_else(|| share::default_decrypt_output(&args.encrypted_path));
             let passphrase_str = if args.passphrase {
-                let secret = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    rpassword::prompt_password("Enter passphrase: ").map(zeroize::Zeroizing::new)
-                } else {
-                    let mut buf = zeroize::Zeroizing::new(String::new());
-                    std::io::stdin().read_line(&mut buf).map(|_| {
-                        // Only the transport line terminator is removed. Spaces
-                        // and tabs can be part of the actual passphrase.
-                        if buf.ends_with('\n') {
-                            buf.pop();
-                            if buf.ends_with('\r') {
-                                buf.pop();
-                            }
-                        }
-                        buf
-                    })
-                }
-                .map_err(|e| CliError::Other(format!("failed to read passphrase: {e}")))?;
-                Some(secret)
+                ftui_runtime::ftui_eprintln!("Enter passphrase:");
+                Some(read_share_passphrase()?)
             } else {
                 None
             };
@@ -6998,6 +6982,48 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
         }
         ShareCommand::Deploy { action } => handle_deploy(action),
     }
+}
+
+fn read_share_passphrase() -> CliResult<zeroize::Zeroizing<String>> {
+    use std::io::IsTerminal;
+
+    // Never fall back to an echoing terminal read if the no-echo reader fails.
+    // A non-terminal stdin remains available for secret pipes without putting
+    // the passphrase in argv, the environment, or a plaintext secret file.
+    let passphrase = if std::io::stdin().is_terminal() {
+        rpassword::read_password().map(zeroize::Zeroizing::new)
+    } else {
+        read_share_passphrase_line(&mut std::io::stdin().lock())
+    }
+    .map_err(|_| CliError::Other("failed to read passphrase".to_string()))?;
+
+    if passphrase.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "passphrase must not be empty".to_string(),
+        ));
+    }
+    Ok(passphrase)
+}
+
+fn read_share_passphrase_line(
+    reader: &mut impl std::io::BufRead,
+) -> std::io::Result<zeroize::Zeroizing<String>> {
+    let mut passphrase = zeroize::Zeroizing::new(String::new());
+    if reader.read_line(&mut passphrase)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "passphrase input ended before a value was read",
+        ));
+    }
+    // Only the line terminator is framing. Spaces, tabs, and other trailing
+    // whitespace are part of the secret and must survive unchanged.
+    if passphrase.ends_with('\n') {
+        passphrase.pop();
+        if passphrase.ends_with('\r') {
+            passphrase.pop();
+        }
+    }
+    Ok(passphrase)
 }
 
 fn handle_deploy(action: DeployCommand) -> CliResult<()> {
@@ -20183,7 +20209,9 @@ fn render_server_file_reservations(
             ..
         }
     ) {
-        rows.retain(|row| row.released_ts.is_none_or(|ts| ts <= 0) && row.expires_ts > now_us);
+        // The server selected active leases using its own clock. Preserve that
+        // authoritative set even if this client's clock considers them expired.
+        rows.retain(|row| row.released_ts.is_none_or(|ts| ts <= 0));
     }
     match action {
         FileReservationsCommand::List { .. } => {
@@ -35240,93 +35268,35 @@ fn mcp_config_url_matches_any_expected(actual_url: &str, expected_urls: &[String
 /// forever on a malicious or deadlocked git binary — the bug we're
 /// actively trying to detect should not itself become a DoS vector.
 fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Value {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::process::Command;
+    use std::time::Duration;
 
     // ubs:ignore rust.security.command-executable -- explicit local AM_GIT_BINARY/PATH version probe, no request-derived executable.
-    let mut child = match Command::new(path_or_name)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
+    let mut command = Command::new(path_or_name);
+    command.arg("--version");
+    let out = match mcp_agent_mail_core::run_command_bounded(
+        command,
+        Duration::from_secs(5),
+        1024 * 1024,
+        true,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+            let oversized = error.kind() == std::io::ErrorKind::FileTooLarge;
+            let detail = if timed_out {
+                format!("git --version timed out after 5s: {path_or_name}")
+            } else {
+                format!("git --version probe failed for {path_or_name}: {error}")
+            };
             return serde_json::json!({
                 "check": format!("git_binary_{source}"),
-                "status": if source == "env" { "fail" } else { "warn" },
-                "detail": format!("cannot spawn {path_or_name}: {e}"),
+                "status": if source == "env" || timed_out || oversized { "fail" } else { "warn" },
+                "detail": detail,
                 "source": source,
                 "path": path_or_name,
             });
         }
-    };
-
-    // Concurrent drain so the pipe can never back-pressure the child.
-    let stdout_h = child.stdout.take().map(|mut o| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = o.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_h = child.stderr.take().map(|mut e| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = e.read_to_end(&mut buf);
-            buf
-        })
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // We intentionally drop the reader thread handles without joining them.
-                    // If `kill()` failed and the child is still running (e.g. a grandchild
-                    // inherited the pipe), `join()` would hang forever.
-                    return serde_json::json!({
-                        "check": format!("git_binary_{source}"),
-                        "status": "fail",
-                        "detail": format!("git --version timed out after 5s: {path_or_name}"),
-                        "source": source,
-                        "path": path_or_name,
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) => {
-                // Best-effort reap. try_wait failure (EINTR, ECHILD)
-                // leaves the child unreaped otherwise, same shape as
-                // the git_cmd::wait_with_timeout fix (bfc2d913).
-                let _ = child.kill();
-                let _ = child.wait();
-                // We intentionally drop the reader thread handles without joining them.
-                // If `kill()` failed and the child is still running (e.g. a grandchild
-                // inherited the pipe), `join()` would hang forever.
-                return serde_json::json!({
-                    "check": format!("git_binary_{source}"),
-                    "status": "warn",
-                    "detail": format!("git --version wait failed: {e}"),
-                    "source": source,
-                    "path": path_or_name,
-                });
-            }
-        }
-    };
-    let stdout_bytes = stdout_h.and_then(|h| h.join().ok()).unwrap_or_default();
-    let stderr_bytes = stderr_h.and_then(|h| h.join().ok()).unwrap_or_default();
-
-    let out = std::process::Output {
-        status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
     };
     if !out.status.success() {
         return serde_json::json!({
@@ -35501,67 +35471,32 @@ fn doctor_run_version_line_with_timeout(path: &Path, timeout_secs: u64) -> Resul
 }
 
 fn doctor_run_version_line_once(path: &Path, timeout_secs: u64) -> Result<String, String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::process::Command;
+    use std::time::Duration;
 
     // ubs:ignore rust.security.command-executable -- local PATH/install candidate for the fixed am binary names; --version only.
-    let mut child = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("cannot spawn {} --version: {error}", path.display()))?;
-
-    let stdout_h = child.stdout.take().map(|mut stdout| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_h = child.stderr.take().map(|mut stderr| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            buf
-        })
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{} --version timed out after {timeout_secs}s",
-                        path.display()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{} --version wait failed: {error}", path.display()));
-            }
+    let mut command = Command::new(path);
+    command.arg("--version");
+    let output = mcp_agent_mail_core::run_command_bounded(
+        command,
+        Duration::from_secs(timeout_secs),
+        1024 * 1024,
+        true,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            format!(
+                "{} --version timed out after {timeout_secs}s",
+                path.display()
+            )
+        } else {
+            format!("{} --version probe failed: {error}", path.display())
         }
-    };
-
-    let stdout = stdout_h
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let stderr = stderr_h
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
+    })?;
     let combined = format!(
         "{}\n{}",
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr)
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     let line = combined
         .lines()
@@ -35569,13 +35504,13 @@ fn doctor_run_version_line_once(path: &Path, timeout_secs: u64) -> Result<String
         .map(str::trim)
         .unwrap_or("unknown")
         .to_string();
-    if status.success() {
+    if output.status.success() {
         Ok(line)
     } else {
         Err(format!(
             "{} --version exited {}: {line}",
             path.display(),
-            status.code().unwrap_or(-1)
+            output.status.code().unwrap_or(-1)
         ))
     }
 }
@@ -53452,6 +53387,40 @@ http_headers = { Authorization = "Bearer secret" }
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn share_passphrase_pipe_preserves_significant_whitespace() {
+        for input in [
+            "  pass phrase \t\n",
+            "  pass phrase \t\r\n",
+            "  pass phrase \t",
+        ] {
+            let passphrase = read_share_passphrase_line(&mut input.as_bytes()).unwrap();
+            assert_eq!(passphrase.as_str(), "  pass phrase \t");
+        }
+
+        let passphrase = read_share_passphrase_line(&mut "雪\rword\n".as_bytes()).unwrap();
+        assert_eq!(passphrase.as_str(), "雪\rword");
+    }
+
+    #[test]
+    fn share_passphrase_pipe_reads_one_line() {
+        let mut input = &b"first\nsecond\n"[..];
+        assert_eq!(
+            read_share_passphrase_line(&mut input).unwrap().as_str(),
+            "first"
+        );
+        assert_eq!(
+            read_share_passphrase_line(&mut input).unwrap().as_str(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn share_passphrase_pipe_rejects_missing_input() {
+        let error = read_share_passphrase_line(&mut &b""[..]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -72515,7 +72484,7 @@ startup_timeout_sec = 42
     #[test]
     fn doctor_version_probe_times_out_twice_and_reports_retry() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let script = write_probe_script(temp.path(), "sleep 30\necho 'am 9.9.9'");
+        let script = write_probe_script(temp.path(), "exec sleep 30");
         let error = doctor_run_version_line_with_timeout(&script, 1)
             .expect_err("hung probe must fail after retry");
         assert!(error.contains("timed out after 1s"), "{error}");
@@ -72530,13 +72499,278 @@ startup_timeout_sec = 42
         let script = write_probe_script(
             temp.path(),
             &format!(
-                "if [ ! -e '{m}' ]; then touch '{m}'; sleep 30; fi\necho 'am 0.0.1'",
-                m = marker.display()
+                "if [ ! -e {m} ]; then touch {m}; exec sleep 30; fi\necho 'am 0.0.1'",
+                m = shell_quote(&marker.to_string_lossy())
             ),
         );
         let line = doctor_run_version_line_with_timeout(&script, 1)
             .expect("retry must recover once the cold start is over");
         assert_eq!(line, "am 0.0.1");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn doctor_probe_child_pids() -> std::io::Result<BTreeSet<i32>> {
+        let mut children = BTreeSet::new();
+        for task in std::fs::read_dir("/proc/self/task")? {
+            let path = task?.path().join("children");
+            let contents = match std::fs::read_to_string(path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for pid in contents.split_whitespace() {
+                children.insert(pid.parse().map_err(std::io::Error::other)?);
+            }
+        }
+        Ok(children)
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DoctorProbeDescendants {
+        previous_subreaper: bool,
+        children_before: BTreeSet<i32>,
+        pid_files: Vec<PathBuf>,
+        marker: String,
+        script_path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DoctorProbeDescendants {
+        fn drop(&mut self) {
+            let recorded = self
+                .pid_files
+                .iter()
+                .filter_map(|path| {
+                    std::fs::read_to_string(path)
+                        .ok()?
+                        .trim()
+                        .parse::<i32>()
+                        .ok()
+                })
+                .collect::<BTreeSet<_>>();
+            // Other tests may share this process under plain cargo test. Only
+            // our PID witnesses or unique fixture marker grant cleanup authority.
+            // The marker/argv also covers a shell dying before PID publication.
+            // An unreaped direct/adopted child cannot have its PID reused.
+            if let Ok(children) = doctor_probe_child_pids() {
+                for &pid in children.difference(&self.children_before) {
+                    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+                    let command = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                    let marker = format!("AM_DOCTOR_PROBE_OWNER={}", self.marker);
+                    let owned = recorded.contains(&pid)
+                        || environ
+                            .split(|byte| *byte == 0)
+                            .any(|entry| entry == marker.as_bytes())
+                        || command
+                            .split(|byte| *byte == 0)
+                            .any(|entry| entry == self.script_path.as_os_str().as_encoded_bytes());
+                    if !owned {
+                        continue;
+                    }
+                    let pid = nix::unistd::Pid::from_raw(pid);
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                    let _ = nix::sys::wait::waitpid(pid, None);
+                }
+            }
+            let _ = nix::sys::prctl::set_child_subreaper(self.previous_subreaper);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_version_callers_bound_descendant_pipes_without_reader_leaks() {
+        use nix::sys::prctl::{get_child_subreaper, set_child_subreaper};
+        struct OtherChild(std::process::Child);
+        impl Drop for OtherChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let mut descendants = DoctorProbeDescendants {
+            previous_subreaper: get_child_subreaper().expect("read subreaper"),
+            children_before: doctor_probe_child_pids().expect("owned children before fixture"),
+            pid_files: Vec::new(),
+            marker: temp.path().to_string_lossy().into_owned(),
+            script_path: temp.path().join("fake-am"),
+        };
+        set_child_subreaper(true).expect("own fixture descendants");
+        // Spawn after the baseline: blindly cleaning up every new child would
+        // kill this unrelated control, just as it could another concurrent test.
+        let mut unrelated = OtherChild(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("unrelated child control"),
+        );
+        let threads = || {
+            std::fs::read_dir("/proc/self/task")
+                .expect("live threads")
+                .map(|entry| entry.expect("thread").file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let fds = || {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("live descriptors")
+                .count()
+        };
+        let threads_before = threads();
+        let fds_before = fds();
+        let mut pid_files = Vec::new();
+        for git in [true, false] {
+            for stream in ["stdout", "stderr"] {
+                for iteration in 0..2 {
+                    let pid_file = temp.path().join(format!("{git}-{stream}-{iteration}.pid"));
+                    let redirect = if stream == "stdout" {
+                        "2>/dev/null"
+                    } else {
+                        ">/dev/null"
+                    };
+                    let version = if git {
+                        "git version 2.43.0"
+                    } else {
+                        "am 0.0.1"
+                    };
+                    let script = write_probe_script(
+                        temp.path(),
+                        &format!(
+                            "export AM_DOCTOR_PROBE_OWNER={}\nsleep 30 {redirect} &\nprintf '%s\\n' \"$!\" > {}\nprintf '%s\\n' '{version}'",
+                            shell_quote(&descendants.marker),
+                            shell_quote(&pid_file.to_string_lossy()),
+                        ),
+                    );
+                    pid_files.push(pid_file.clone());
+                    descendants.pid_files.push(pid_file.clone());
+                    let started = std::time::Instant::now();
+                    let rejected = if git {
+                        let result = git_binary_doctor_entry(script.to_str().expect("path"), "env");
+                        result["status"] == "fail"
+                            && result["detail"]
+                                .as_str()
+                                .is_some_and(|s| s.contains("timed out after 5s"))
+                    } else {
+                        doctor_run_version_line_once(&script, 1)
+                            .is_err_and(|error| error.contains("timed out after 1s"))
+                    };
+                    let elapsed = started.elapsed();
+                    let pid = std::fs::read_to_string(&pid_file)
+                        .expect("real child published descendant PID")
+                        .trim()
+                        .parse::<i32>()
+                        .expect("descendant PID");
+                    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .expect("descendant must still exist");
+                    assert_ne!(
+                        state
+                            .rsplit_once(") ")
+                            .expect("process stat")
+                            .1
+                            .chars()
+                            .next(),
+                        Some('Z'),
+                        "descendant must still hold the selected pipe"
+                    );
+                    assert!(
+                        rejected,
+                        "{git}/{stream}/{iteration}: held pipe must refuse"
+                    );
+                    assert!(
+                        elapsed < std::time::Duration::from_secs(if git { 7 } else { 3 }),
+                        "{git}/{stream}/{iteration}: actual caller exceeded its bounded drain: {elapsed:?}"
+                    );
+                    assert_eq!(threads(), threads_before, "no detached reader threads");
+                    assert_eq!(fds(), fds_before, "no retained pipe descriptors");
+                }
+            }
+        }
+        let previous_subreaper = descendants.previous_subreaper;
+        drop(descendants);
+        assert!(
+            unrelated
+                .0
+                .try_wait()
+                .expect("unrelated child state")
+                .is_none(),
+            "descendant cleanup must preserve unrelated children"
+        );
+        assert_eq!(
+            get_child_subreaper().expect("restored subreaper"),
+            previous_subreaper
+        );
+        for path in pid_files {
+            let pid = std::fs::read_to_string(path).expect("PID witness");
+            assert!(
+                !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+                "owned descendant reaped"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_version_callers_preserve_output_exit_and_size_contracts() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let script = write_probe_script(temp.path(), "printf 'am 0.0.1\\n'");
+        assert_eq!(
+            doctor_run_version_line_once(&script, 1).unwrap(),
+            "am 0.0.1"
+        );
+        let script = write_probe_script(temp.path(), "printf 'am 0.0.2\\n' >&2");
+        assert_eq!(
+            doctor_run_version_line_once(&script, 1).unwrap(),
+            "am 0.0.2"
+        );
+        let script = write_probe_script(temp.path(), "printf 'fixture rejected\\n' >&2; exit 7");
+        let error = doctor_run_version_line_once(&script, 1).expect_err("nonzero must fail");
+        assert!(error.contains("exited 7: fixture rejected"), "{error}");
+        let result = git_binary_doctor_entry(script.to_str().unwrap(), "env");
+        assert_eq!(result["status"], "warn");
+        assert!(result["detail"].as_str().unwrap().contains("exit 7"));
+        let script = write_probe_script(temp.path(), "printf 'git version 2.43.0\\n'");
+        let result = git_binary_doctor_entry(script.to_str().unwrap(), "env");
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["version"], "2.43.0");
+        let script = write_probe_script(temp.path(), "head -c 1048577 /dev/zero");
+        assert!(
+            doctor_run_version_line_once(&script, 2)
+                .unwrap_err()
+                .contains("aggregate byte limit")
+        );
+        let result = git_binary_doctor_entry(script.to_str().unwrap(), "env");
+        assert_eq!(result["status"], "fail");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("aggregate byte limit")
+        );
+        // Each pipe fits independently; their combined size decides admission.
+        let script = write_probe_script(
+            temp.path(),
+            "head -c 524288 /dev/zero; head -c 524288 /dev/zero >&2",
+        );
+        let line = doctor_run_version_line_once(&script, 2).expect("exact aggregate limit");
+        assert_eq!(line.len(), 524_288);
+        assert!(line.bytes().all(|byte| byte == 0));
+        let script = write_probe_script(
+            temp.path(),
+            "head -c 524289 /dev/zero; head -c 524288 /dev/zero >&2",
+        );
+        let error = doctor_run_version_line_once(&script, 2).expect_err("combined overflow");
+        assert!(error.contains("aggregate byte limit"), "{error}");
+        let result = git_binary_doctor_entry(script.to_str().unwrap(), "env");
+        assert_eq!(result["status"], "fail");
+        let script = write_probe_script(
+            temp.path(),
+            "head -c 131072 /dev/zero & head -c 131072 /dev/zero >&2 & wait",
+        );
+        let line = doctor_run_version_line_once(&script, 2).expect("simultaneous pipe pressure");
+        assert_eq!(line.len(), 131_072);
+        assert!(line.bytes().all(|byte| byte == 0));
     }
 
     #[test]
