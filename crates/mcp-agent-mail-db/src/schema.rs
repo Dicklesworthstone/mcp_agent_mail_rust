@@ -4025,16 +4025,21 @@ async fn query_text_pairs<C: Connection>(
     second: &str,
 ) -> Outcome<Vec<(String, String)>, SqlError> {
     match conn.query(cx, sql, &[]).await {
-        Outcome::Ok(rows) => Outcome::Ok(
-            rows.iter()
-                .filter_map(|row| {
-                    Some((
-                        row.get_named::<String>(first).ok()?,
-                        row.get_named::<String>(second).ok()?,
+        Outcome::Ok(rows) => {
+            let pairs = rows
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.get_named::<String>(first)?,
+                        row.get_named::<String>(second)?,
                     ))
                 })
-                .collect(),
-        ),
+                .collect::<Result<Vec<_>, SqlError>>();
+            match pairs {
+                Ok(pairs) => Outcome::Ok(pairs),
+                Err(error) => Outcome::Err(error),
+            }
+        }
         Outcome::Err(err) => Outcome::Err(err),
         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => Outcome::Panicked(payload),
@@ -4078,11 +4083,76 @@ async fn execute_project_event_scope_migration<C: Connection>(
     execute_statements(cx, conn, &statements).await
 }
 
+async fn v15_owned_cursor_delete_trigger<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<Option<String>, SqlError> {
+    let rows = match conn
+        .query(
+            cx,
+            "SELECT type, name, tbl_name, sql FROM sqlite_master \
+             WHERE LOWER(name) = 'trg_inbox_delivery_cursor_delete'",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if rows.is_empty() {
+        return Outcome::Ok(None);
+    }
+    let authored = schema_migrations()
+        .into_iter()
+        .find(|migration| migration.id == "v34_trg_inbox_delivery_cursor_delete");
+    let Some(authored) = authored else {
+        return Outcome::Err(SqlError::Custom(
+            "v15 rebuild cannot verify its authored cursor-delete trigger".to_string(),
+        ));
+    };
+    // SQLite and the pinned runtime store this creation prefix without
+    // IF NOT EXISTS. Compare the rest byte-for-byte: whitespace folding or
+    // lowercasing string literals would accept a changed visibility policy.
+    let stored_authored = authored
+        .up
+        .strip_prefix("CREATE TRIGGER IF NOT EXISTS ")
+        .map(|body| format!("CREATE TRIGGER {body}"));
+    let sql = rows[0].get_named::<String>("sql");
+    let verified = rows.len() == 1
+        && rows[0]
+            .get_named::<String>("type")
+            .is_ok_and(|kind| kind == "trigger")
+        && rows[0]
+            .get_named::<String>("name")
+            .is_ok_and(|name| name == "trg_inbox_delivery_cursor_delete")
+        && rows[0]
+            .get_named::<String>("tbl_name")
+            .is_ok_and(|table| table == "inbox_delivery_events")
+        && sql.as_ref().is_ok_and(|sql| {
+            sql == &authored.up
+                || stored_authored
+                    .as_ref()
+                    .is_some_and(|expected| sql == expected)
+        });
+    if !verified {
+        return Outcome::Err(SqlError::Custom(
+            "v15 rebuild refuses unsupported definition of trg_inbox_delivery_cursor_delete; preserve or migrate this schema before retrying"
+                .to_string(),
+        ));
+    }
+    match sql {
+        Ok(sql) => Outcome::Ok(Some(sql)),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
 async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     cx: &Cx,
     conn: &C,
 ) -> Outcome<(), SqlError> {
-    const DROP_TRIGGERS: [&str; 12] = [
+    const DROP_TRIGGERS: [&str; 11] = [
         "DROP TRIGGER IF EXISTS fts_messages_ai",
         "DROP TRIGGER IF EXISTS fts_messages_ad",
         "DROP TRIGGER IF EXISTS fts_messages_au",
@@ -4098,7 +4168,6 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         // have run on a historical database).
         "DROP TRIGGER IF EXISTS trg_inbox_delivery_events_recipient_insert",
         "DROP TRIGGER IF EXISTS trg_messages_default_recipients_json",
-        "DROP TABLE IF EXISTS messages_v15_rebuild",
     ];
     const V15_INDEXES: [&str; 8] = [
         "CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts)",
@@ -4111,12 +4180,6 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "CREATE INDEX IF NOT EXISTS idx_messages_ack_required_id ON messages(ack_required, id)",
     ];
 
-    let drops = DROP_TRIGGERS.map(String::from);
-    match execute_statements(cx, conn, &drops).await {
-        Outcome::Ok(()) => {}
-        other => return other,
-    }
-
     // On a legacy (Python-shaped) mailbox the base pass defers this migration
     // to the canonical pass, after later migrations have already added
     // columns, indexes and triggers to `messages` and recorded them as
@@ -4125,25 +4188,80 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     // the lexical-clock triggers), leaving a mailbox the startup schema gate
     // refuses. Carry every later column that has an authored definition, and
     // every index and trigger still on the table, across the rebuild.
-    let later_columns: Vec<(String, String)> =
-        match query_text_pairs(cx, conn, "PRAGMA table_info(messages)", "name", "name").await {
-            Outcome::Ok(columns) => columns
-                .into_iter()
-                .map(|(name, _)| name)
-                .filter(|name| {
-                    !V15_MESSAGES_COLUMNS
-                        .iter()
-                        .any(|known| known.eq_ignore_ascii_case(name))
-                })
-                .filter_map(|name| {
-                    authored_messages_column_definition(&name).map(|definition| (name, definition))
-                })
-                .collect(),
-            Outcome::Err(err) => return Outcome::Err(err),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    let columns = match conn.query(cx, "PRAGMA table_xinfo(messages)", &[]).await {
+        Outcome::Ok(columns) => columns,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut later_columns = Vec::new();
+    for column in columns {
+        let name = match column.get_named::<String>("name") {
+            Ok(name) => name,
+            Err(error) => return Outcome::Err(error),
         };
-    let dependents = match query_text_pairs(
+        // SQLite's seventh table_xinfo value is `hidden`. The runtime
+        // adapter currently labels it `_c6`; decode its required position
+        // strictly on both engines rather than defaulting missing metadata.
+        let hidden = match column.get_as::<i64>(6) {
+            Ok(hidden) => hidden,
+            Err(error) => return Outcome::Err(error),
+        };
+        if hidden != 0 {
+            return Outcome::Err(SqlError::Custom(format!(
+                "v15 rebuild refuses unsupported generated or hidden messages column {name}; preserve or migrate this schema before retrying"
+            )));
+        }
+        if V15_MESSAGES_COLUMNS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        let Some(definition) = authored_messages_column_definition(&name) else {
+            return Outcome::Err(SqlError::Custom(format!(
+                "v15 rebuild refuses unsupported messages column {name}; preserve or migrate this schema before retrying"
+            )));
+        };
+        later_columns.push((name, definition));
+    }
+    let external_cursor_delete = match v15_owned_cursor_delete_trigger(cx, conn).await {
+        Outcome::Ok(sql) => sql,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match conn
+        .query(
+            cx,
+            "SELECT name FROM sqlite_master WHERE LOWER(name) = 'messages_v15_rebuild'",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) if rows.is_empty() => {}
+        Outcome::Ok(_) => {
+            return Outcome::Err(SqlError::Custom(
+                "v15 rebuild refuses an occupied messages_v15_rebuild slot; preserve this schema before retrying"
+                    .to_string(),
+            ));
+        }
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    let mut drops = DROP_TRIGGERS.map(String::from).to_vec();
+    if external_cursor_delete.is_some() {
+        // This trigger lives on another table and references messages. Remove
+        // only its verified authored definition during the DROP/RENAME gap.
+        drops.push("DROP TRIGGER trg_inbox_delivery_cursor_delete".to_string());
+    }
+    match execute_statements(cx, conn, &drops).await {
+        Outcome::Ok(()) => {}
+        other => return other,
+    }
+    let mut dependents = match query_text_pairs(
         cx,
         conn,
         "SELECT name, sql FROM sqlite_master \
@@ -4159,6 +4277,9 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    if let Some(sql) = external_cursor_delete {
+        dependents.push(("trg_inbox_delivery_cursor_delete".to_string(), sql));
+    }
 
     let carried = later_columns
         .iter()
@@ -6225,6 +6346,378 @@ mod tests {
             .collect();
         let lost: Vec<&String> = before.difference(&after).collect();
         assert!(lost.is_empty(), "the v15 rebuild dropped {lost:?}");
+    }
+
+    async fn seed_v15_owned_trigger_fixture<C: Connection>(cx: &Cx, conn: &C) {
+        let pragmas = PRAGMA_DB_INIT_SQL
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        execute_statements(cx, conn, &pragmas)
+            .await
+            .into_result()
+            .expect("apply the actual runtime/canonical-follow-up startup policy");
+        let foreign_keys = conn
+            .query(cx, "PRAGMA foreign_keys", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(foreign_keys.len(), 1);
+        assert_eq!(foreign_keys[0].get_as::<i64>(0).unwrap(), 0);
+        conn.execute(
+            cx,
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, \
+                sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, \
+                body_md TEXT NOT NULL, importance TEXT NOT NULL DEFAULT 'normal', \
+                ack_required INTEGER NOT NULL DEFAULT 0, created_ts INTEGER NOT NULL, \
+                attachments TEXT NOT NULL DEFAULT '[]')",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("create legacy messages without recipients_json");
+        migrate_to_latest_base(cx, conn)
+            .await
+            .into_result()
+            .expect("install real base migrations including v34 cursor authority");
+        let statements = [
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'v15','/v15',0)",
+            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts,contact_policy) \
+             VALUES(1,1,'Sender','test','test',0,0,'auto'),\
+                   (2,1,'Viewer','test','test',0,0,'auto'),\
+                   (3,1,'Blocked','test','test',0,0,'block_all')",
+            "INSERT INTO messages(id,project_id,sender_id,thread_id,subject,body_md,importance,ack_required,created_ts,attachments,topic,archive_metadata_json) \
+             VALUES(1,1,1,'direct','direct subject','direct body','high',1,100,'[]','Release','{}'),\
+                   (2,1,1,'shared','shared subject','shared body','normal',0,200,'[]','Release','{\"reply_to\":1}')",
+            "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(1,2,'to')",
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES(2,1,'to',200)",
+            "INSERT INTO inbox_delivery_events(project_id,agent_id,message_id,kind,delivered_ts) VALUES(1,NULL,2,'project',200)",
+            "CREATE TABLE v15_custom_audit(message_id INTEGER, body TEXT)",
+            "CREATE INDEX v15_custom_subject ON messages(subject)",
+            "CREATE TRIGGER v15_custom_message_update AFTER UPDATE ON messages BEGIN \
+             INSERT INTO v15_custom_audit(message_id,body) VALUES(NEW.id,NEW.body_md); END",
+        ]
+        .map(String::from);
+        execute_statements(cx, conn, &statements)
+            .await
+            .into_result()
+            .expect("seed rows, later-column data, custom index and trigger");
+    }
+
+    fn v15_fixture_rows<C: crate::pool::SyncQuery>(conn: &C, sql: &str) -> Vec<Vec<Value>> {
+        conn.query_sync(sql, &[])
+            .unwrap_or_else(|error| panic!("snapshot query {sql}: {error}"))
+            .iter()
+            .map(|row| row.values().cloned().collect())
+            .collect()
+    }
+
+    fn v15_fixture_snapshot<C: crate::pool::SyncQuery>(conn: &C) -> Vec<(String, Vec<Vec<Value>>)> {
+        let mut snapshot = vec![(
+            "sqlite_master".to_string(),
+            v15_fixture_rows(
+                conn,
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+            ),
+        )];
+        for row in conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                &[],
+            )
+            .expect("enumerate every persisted fixture table")
+        {
+            let table = row.get_named::<String>("name").unwrap();
+            let quoted = table.replace('"', "\"\"");
+            let mut rows = v15_fixture_rows(conn, &format!("SELECT * FROM \"{quoted}\""));
+            rows.sort_by_cached_key(|row| format!("{row:?}"));
+            snapshot.push((table, rows));
+        }
+        snapshot
+    }
+
+    async fn assert_v15_owned_trigger_rollback_and_retry<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        seed_v15_owned_trigger_fixture(cx, conn).await;
+        assert!(
+            conn.query_sync("PRAGMA table_xinfo(messages)", &[])
+                .unwrap()
+                .iter()
+                .all(|row| row.get_named::<String>("name").unwrap() != "recipients_json")
+        );
+        let migration = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v15_add_recipients_json_to_messages")
+            .unwrap();
+        conn.execute(
+            cx,
+            &format!(
+                "CREATE TRIGGER reject_v15_ledger BEFORE INSERT ON {MIGRATIONS_TABLE_NAME} \
+                 WHEN NEW.id = 'v15_add_recipients_json_to_messages' BEGIN \
+                 SELECT RAISE(ABORT, 'v15 ledger failure'); END"
+            ),
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let before_failure = v15_fixture_snapshot(conn);
+        let error = run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect_err("ledger failure must follow the real table and trigger rebuild");
+        assert!(error.to_string().contains("v15 ledger failure"), "{error}");
+        assert_eq!(
+            v15_fixture_snapshot(conn),
+            before_failure,
+            "complete schema and data roll back"
+        );
+        conn.execute(cx, "DROP TRIGGER reject_v15_ledger", &[])
+            .await
+            .into_result()
+            .unwrap();
+
+        const MESSAGE_DATA: &str = "SELECT id,project_id,sender_id,thread_id,subject,body_md,importance,ack_required,created_ts,attachments,topic,archive_metadata_json FROM messages ORDER BY id";
+        const OBJECTS: &str = "SELECT type,name,tbl_name,sql FROM sqlite_master \
+             WHERE type IN ('index','trigger') AND sql IS NOT NULL \
+             AND name NOT IN ('trg_inbox_stats_insert','trg_inbox_stats_mark_read','trg_inbox_stats_ack') \
+             ORDER BY type,name";
+        let messages = v15_fixture_rows(conn, MESSAGE_DATA);
+        let objects = v15_fixture_rows(conn, OBJECTS);
+        let children: Vec<_> = v15_fixture_snapshot(conn)
+            .into_iter()
+            .filter(|(table, _)| {
+                table != "sqlite_master" && table != "messages" && table != MIGRATIONS_TABLE_NAME
+            })
+            .collect();
+        run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect("the original pending v15 migration must genuinely retry");
+        assert_eq!(v15_fixture_rows(conn, MESSAGE_DATA), messages);
+        assert_eq!(
+            v15_fixture_rows(conn, OBJECTS),
+            objects,
+            "every other index/trigger retains its exact SQL"
+        );
+        let after_children: Vec<_> = v15_fixture_snapshot(conn)
+            .into_iter()
+            .filter(|(table, _)| {
+                table != "sqlite_master" && table != "messages" && table != MIGRATIONS_TABLE_NAME
+            })
+            .collect();
+        assert_eq!(
+            after_children, children,
+            "all other persisted rows survive the rebuild"
+        );
+        let migrated = conn
+            .query_sync(
+                "SELECT recipients_json FROM messages WHERE topic='release' ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            migrated.len(),
+            2,
+            "the authored NOCASE topic definition survives"
+        );
+        assert!(
+            migrated
+                .iter()
+                .all(|row| row.get_named::<String>("recipients_json").unwrap() == "{}")
+        );
+        assert_v15_restored_trigger_effects(cx, conn).await;
+    }
+
+    async fn assert_v15_restored_trigger_effects<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        let shared_seq = conn
+            .query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE message_id=2 AND agent_id IS NULL",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("seq")
+            .unwrap();
+        conn.execute(
+            cx,
+            "DELETE FROM inbox_delivery_events WHERE message_id=2",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("exercise the restored external cursor-delete trigger");
+        let loss = conn
+            .query_sync(
+                "SELECT pruned_through_seq FROM inbox_delivery_cursor_state \
+                 WHERE project_id=1 AND scope='agent' AND scope_id=2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            loss[0].get_named::<i64>("pruned_through_seq").unwrap(),
+            shared_seq
+        );
+        assert!(
+            conn.query_sync(
+                "SELECT scope_id FROM inbox_delivery_cursor_state \
+                 WHERE project_id=1 AND scope='agent' AND scope_id=3",
+                &[],
+            )
+            .unwrap()
+            .is_empty(),
+            "the authored trigger must keep blocked viewers excluded"
+        );
+        conn.execute(
+            cx,
+            "UPDATE messages SET body_md='updated after rebuild' WHERE id=1",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let audit = conn
+            .query_sync("SELECT message_id,body FROM v15_custom_audit", &[])
+            .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].get_named::<i64>("message_id").unwrap(), 1);
+        assert_eq!(
+            audit[0].get_named::<String>("body").unwrap(),
+            "updated after rebuild"
+        );
+    }
+
+    #[test]
+    fn v15_owned_external_cursor_trigger_survives_canonical_and_runtime_rollback_retry() {
+        let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            assert_v15_owned_trigger_rollback_and_retry(&cx, &canonical).await;
+        });
+        let runtime = DbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            assert_v15_owned_trigger_rollback_and_retry(&cx, &runtime).await;
+        });
+    }
+
+    #[test]
+    fn v15_foreign_key_enforced_rebuild_refuses_and_preserves_complete_state() {
+        let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            seed_v15_owned_trigger_fixture(&cx, &canonical).await;
+            canonical
+                .execute(&cx, "PRAGMA foreign_keys = ON", &[])
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                canonical.query_sync("PRAGMA foreign_keys", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            let before = v15_fixture_snapshot(&canonical);
+            let migration = schema_migrations()
+                .into_iter()
+                .find(|migration| migration.id == "v15_add_recipients_json_to_messages")
+                .unwrap();
+            let error = run_single_migration_with_lock_retry(&cx, &canonical, &migration)
+                .await
+                .into_result()
+                .expect_err("an FK-enforced rebuild must retain its real refusal");
+            assert!(
+                error.to_string().contains("FOREIGN KEY constraint failed"),
+                "{error}"
+            );
+            assert_eq!(v15_fixture_snapshot(&canonical), before);
+            assert_eq!(
+                canonical.query_sync("PRAGMA foreign_keys", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1,
+                "migration must never disable enforcement to bypass a refusal"
+            );
+        });
+    }
+
+    async fn assert_v15_unsupported_schema_is_retained<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+        mutations: &[String],
+        expected: &str,
+    ) {
+        seed_v15_owned_trigger_fixture(cx, conn).await;
+        execute_statements(cx, conn, mutations)
+            .await
+            .into_result()
+            .unwrap();
+        let before = v15_fixture_snapshot(conn);
+        let migration = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v15_add_recipients_json_to_messages")
+            .unwrap();
+        let error = run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect_err("unknown authority must refuse before destructive DDL");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(
+            v15_fixture_snapshot(conn),
+            before,
+            "unknown schema and every populated row remain authoritative"
+        );
+    }
+
+    #[test]
+    fn v15_refuses_unknown_columns_trigger_definitions_and_occupied_rebuild_slots() {
+        let authored = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v34_trg_inbox_delivery_cursor_delete")
+            .unwrap()
+            .up;
+        for (mutations, expected) in [
+            (
+                vec![
+                    "ALTER TABLE messages ADD COLUMN custom_payload TEXT".to_string(),
+                    "UPDATE messages SET custom_payload='retained custom data'".to_string(),
+                ],
+                "unsupported messages column custom_payload",
+            ),
+            (
+                vec!["ALTER TABLE messages ADD COLUMN custom_projection TEXT GENERATED ALWAYS AS (subject || body_md) VIRTUAL".to_string()],
+                "unsupported generated or hidden messages column custom_projection",
+            ),
+            (
+                vec![
+                    "DROP TRIGGER trg_inbox_delivery_cursor_delete".to_string(),
+                    authored.replace("'block_all'", "'BLOCK_ALL'"),
+                ],
+                "unsupported definition of trg_inbox_delivery_cursor_delete",
+            ),
+            (
+                vec![
+                    "CREATE TABLE messages_v15_rebuild(payload BLOB)".to_string(),
+                    "INSERT INTO messages_v15_rebuild VALUES(X'00FF01')".to_string(),
+                ],
+                "occupied messages_v15_rebuild slot",
+            ),
+        ] {
+            let mutations = mutations.as_slice();
+            let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+            block_on(|cx| async move {
+                assert_v15_unsupported_schema_is_retained(&cx, &canonical, mutations, expected).await;
+            });
+            let runtime = DbConn::open_memory().unwrap();
+            block_on(|cx| async move {
+                assert_v15_unsupported_schema_is_retained(&cx, &runtime, mutations, expected).await;
+            });
+        }
     }
 
     #[test]

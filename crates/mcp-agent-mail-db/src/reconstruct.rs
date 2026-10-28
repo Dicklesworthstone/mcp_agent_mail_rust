@@ -7468,6 +7468,10 @@ mod tests {
             .position(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
             .unwrap();
         let migration = legacy.remove(index);
+        // This fixture predates the v33 event representation. Installing v34
+        // first creates a mixed-epoch schema that the ownership guard refuses
+        // before the intended ledger-write rollback control can be reached.
+        legacy.retain(|migration| !migration.id.starts_with("v34_"));
         apply_snapshot_migrations(&conn, legacy, "legacy fixture").unwrap();
         conn.execute_raw(
             "PRAGMA foreign_keys = OFF; \
@@ -7528,6 +7532,74 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    #[test]
+    fn snapshot_project_event_migration_preserves_mixed_epoch_authority_on_refusal() {
+        let conn = DbConn::open_memory().expect("canonical reconstruction database");
+        let mut mixed = schema::schema_migrations_base();
+        let index = mixed
+            .iter()
+            .position(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
+            .unwrap();
+        let migration = mixed.remove(index);
+        // Deliberately install later cursor authority without its historical
+        // predecessor. This is a refusal control, not the pre-v33 retry fixture.
+        apply_snapshot_migrations(&conn, mixed, "mixed-epoch fixture").unwrap();
+        for sql in [
+            "PRAGMA foreign_keys = OFF",
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'shared','/shared',1)",
+            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+             VALUES(1,1,'BlueLake','test','test',1,1)",
+            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             VALUES(1,1,1,'shared','retained body',10)",
+            "INSERT INTO inbox_delivery_events(seq,project_id,agent_id,message_id,kind,delivered_ts) \
+             VALUES(42,1,0,1,'project',10)",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+        let snapshot = || {
+            [
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name".to_string(),
+                "SELECT * FROM messages ORDER BY id".to_string(),
+                "SELECT * FROM inbox_delivery_events ORDER BY seq".to_string(),
+                "SELECT * FROM inbox_delivery_cursor_state ORDER BY project_id,scope,scope_id"
+                    .to_string(),
+                format!(
+                    "SELECT * FROM {} ORDER BY id",
+                    schema::MIGRATIONS_TABLE_NAME
+                ),
+            ]
+            .map(|sql| {
+                conn.query_sync(&sql, &[])
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().cloned().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = snapshot();
+        let error = apply_snapshot_migrations(&conn, vec![migration], "mixed-epoch upgrade")
+            .expect_err("later cursor authority must not be accepted as historical v33 ownership");
+        assert!(
+            error.to_string().contains("refuses unsupported trigger"),
+            "{error}"
+        );
+        assert!(
+            [
+                "trg_inbox_delivery_cursor_insert",
+                "trg_inbox_delivery_cursor_delete",
+                "trg_messages_cascade_inbox_delivery_events",
+            ]
+            .iter()
+            .any(|name| error.to_string().contains(name)),
+            "{error}"
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "mixed schema, ledger and cursor data remain intact"
         );
     }
 
