@@ -7523,7 +7523,9 @@ fn resolve_reservation_experience(
     since_micros: i64,
     now_micros: i64,
 ) -> Option<ExperienceOutcome> {
-    let event_kind = atc::atc_reservation_outcome_for_agent(&experience.subject, since_micros)?;
+    let project = experience.project_key.as_deref()?;
+    let event_kind =
+        atc::atc_reservation_outcome_for_agent(&experience.subject, project, since_micros)?;
     let (label, correct, actual_loss) = match event_kind {
         atc::ReservationEventKind::Released => ("clean_release", true, 0.0),
         atc::ReservationEventKind::ForceReleased => ("force_released", true, 0.1),
@@ -7540,6 +7542,7 @@ fn resolve_reservation_experience(
         evidence: Some(serde_json::json!({
             "resolution_signal": "reservation_event_log",
             "agent": experience.subject,
+            "project_key": project,
             "event_kind": label,
         })),
     })
@@ -7833,16 +7836,20 @@ fn sweep_open_experiences_with_before_message_mutation(
 
         let resolution_anchor_micros = atc_resolution_anchor_micros(experience);
         let age_micros = now_micros.saturating_sub(resolution_anchor_micros);
-        let reservation_outcome = if is_reservation_related_experience(experience) {
+        let reservation_related = is_reservation_related_experience(experience);
+        let reservation_outcome = if reservation_related {
             resolve_reservation_experience(experience, resolution_anchor_micros, now_micros)
         } else {
             None
         };
         let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
-        let activity_outcome = if reservation_outcome.is_none() {
-            atc_resolution_outcome_from_activity(experience, agent_active_since)
-        } else {
+        // General activity is indexed by agent name, which is only unique
+        // within a project. It cannot establish a reservation outcome: an
+        // unrelated same-name agent may have made the observed tool call.
+        let activity_outcome = if reservation_related {
             None
+        } else {
+            atc_resolution_outcome_from_activity(experience, agent_active_since)
         };
         if let Some(outcome) = reservation_outcome.as_ref().or(activity_outcome.as_ref())
             && !atc_resolution_content_is_valid(experience, outcome, "resolution_sweep")
@@ -15390,7 +15397,25 @@ fn append_message_flow_events(
 #[derive(Debug, Clone, Default)]
 struct DomainEventContext {
     project: Option<String>,
+    // The UI uses slugs, but inference must retain an available full path:
+    // distinct project paths can slugify to the same display label.
+    atc_project: Option<String>,
     agent: Option<String>,
+}
+
+fn resolve_atc_reservation_project(project_key: &str) -> Option<String> {
+    // Successful reservation tools already resolved this project through the
+    // mailbox pool. Reuse that authority without bootstrapping a database or
+    // creating a project from observation post-processing. A slug and its full
+    // path must enter the same exact-keyed conflict graph.
+    let pool = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())?;
+    atc_ledger_block_on(|cx| async move {
+        let ctx = McpContext::new(cx, 0);
+        mcp_agent_mail_tools::tool_util::resolve_existing_project(&ctx, &pool, project_key).await
+    })
+    .ok()
+    .map(|project| project.human_key)
+    .filter(|key| !key.trim().is_empty())
 }
 
 fn resolve_domain_event_context(
@@ -15398,6 +15423,11 @@ fn resolve_domain_event_context(
     project_hint: Option<&str>,
     agent_hint: Option<&str>,
 ) -> DomainEventContext {
+    let atc_project = extract_arg_str(
+        call_args,
+        &["project_key", "project", "human_key", "project_slug"],
+    )
+    .or_else(|| project_hint.map(str::to_string));
     let project = project_hint
         .map(|value| normalize_project_value(value.to_string()))
         .or_else(|| {
@@ -15421,7 +15451,11 @@ fn resolve_domain_event_context(
             ],
         )
     });
-    DomainEventContext { project, agent }
+    DomainEventContext {
+        project,
+        atc_project,
+        agent,
+    }
 }
 
 fn derive_message_domain_events(
@@ -15524,6 +15558,51 @@ fn derive_reservation_granted_domain_events(
     payload: &serde_json::Value,
     ctx: &DomainEventContext,
 ) -> Vec<tui_events::MailEvent> {
+    let events = derive_reservation_grant_event(call_args, payload, ctx);
+    // A fully denied request has no grants, but its blocking edges are the
+    // essential input to deadlock detection. Observe conflicts independently
+    // of the grant event so empty/partial grants cannot hide a wait cycle.
+    // Keep the observed conflict after grant processing: historical grants in
+    // an idempotent replay do not supersede its current conflict snapshot.
+    if let (Some(project), Some(agent), Some(conflicts)) = (
+        ctx.atc_project.as_deref(),
+        ctx.agent.as_deref(),
+        payload
+            .get("conflicts")
+            .and_then(serde_json::Value::as_array),
+    ) {
+        let observations: Vec<atc::AtcConflictObservation> = conflicts
+            .iter()
+            .filter_map(|conflict| {
+                let requested = conflict.get("path")?.as_str()?;
+                let holders = conflict.get("holders")?.as_array()?;
+                Some(holders.iter().filter_map(move |holder| {
+                    Some(atc::AtcConflictObservation {
+                        holder: holder.get("agent")?.as_str()?.to_string(),
+                        requested_path: requested.to_string(),
+                        holder_path_pattern: holder.get("path_pattern")?.as_str()?.to_string(),
+                    })
+                }))
+            })
+            .flatten()
+            .collect();
+        if !observations.is_empty() {
+            atc::atc_note_reservation_conflicts(
+                agent,
+                project,
+                &observations,
+                mcp_agent_mail_db::now_micros(),
+            );
+        }
+    }
+    events
+}
+
+fn derive_reservation_grant_event(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
     let Some(granted) = payload.get("granted").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
@@ -15556,44 +15635,14 @@ fn derive_reservation_granted_domain_events(
     };
     let agent_value = ctx.agent.clone().unwrap_or_else(|| "unknown".to_string());
     // Wire reservation grants into ATC conflict graph (br-0qt6e.2.9)
-    atc::atc_note_reservation_granted(
-        &agent_value,
-        &paths,
-        exclusive,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
-
-    // Wire any conflicts into ATC conflict graph (br-0qt6e.2.9)
-    if let Some(conflicts_arr) = payload
-        .get("conflicts")
-        .and_then(serde_json::Value::as_array)
-    {
-        if !conflicts_arr.is_empty() {
-            let observations: Vec<atc::AtcConflictObservation> = conflicts_arr
-                .iter()
-                .filter_map(|c| {
-                    let requested = c.get("path")?.as_str()?;
-                    let holders = c.get("holders")?.as_array()?;
-                    Some(holders.iter().filter_map(move |h| {
-                        Some(atc::AtcConflictObservation {
-                            holder: h.get("agent")?.as_str()?.to_string(),
-                            requested_path: requested.to_string(),
-                            holder_path_pattern: h.get("path_pattern")?.as_str()?.to_string(),
-                        })
-                    }))
-                })
-                .flatten()
-                .collect();
-            if !observations.is_empty() {
-                atc::atc_note_reservation_conflicts(
-                    &agent_value,
-                    project_value,
-                    &observations,
-                    mcp_agent_mail_db::now_micros(),
-                );
-            }
-        }
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_granted(
+            &agent_value,
+            &paths,
+            exclusive,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
     }
 
     vec![tui_events::MailEvent::reservation_granted(
@@ -15628,12 +15677,14 @@ fn derive_release_domain_events(
         paths.push("<all-active>".to_string());
     }
     // Wire reservation releases into ATC conflict graph (br-0qt6e.2.9)
-    atc::atc_note_reservation_released(
-        &agent_value,
-        &paths,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_released(
+            &agent_value,
+            &paths,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
+    }
 
     vec![tui_events::MailEvent::reservation_released(
         agent_value,
@@ -15678,12 +15729,14 @@ fn derive_renew_domain_events(
     if paths.is_empty() {
         paths.push("<renewed>".to_string());
     }
-    atc::atc_note_reservation_renewed(
-        &agent_value,
-        &paths,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_renewed(
+            &agent_value,
+            &paths,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
+    }
 
     vec![tui_events::MailEvent::reservation_granted(
         agent_value,
@@ -15726,12 +15779,14 @@ fn derive_force_release_domain_events(
         .or_else(|| ctx.agent.clone())
         .unwrap_or_else(|| "unknown".to_string());
     // Wire force-release into ATC conflict graph (br-bn0vb.7)
-    atc::atc_note_reservation_force_released(
-        &agent_value,
-        &paths,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_force_released(
+            &agent_value,
+            &paths,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
+    }
 
     vec![tui_events::MailEvent::reservation_released(
         agent_value,
@@ -15852,7 +15907,31 @@ fn derive_domain_events_from_tool_payload(
     project_hint: Option<&str>,
     agent_hint: Option<&str>,
 ) -> Vec<tui_events::MailEvent> {
-    let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    let mut ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    if matches!(
+        tool_name,
+        "file_reservation_paths"
+            | "release_file_reservations"
+            | "renew_file_reservations"
+            | "force_release_file_reservation"
+            | "macro_start_session"
+            | "macro_file_reservation_cycle"
+    ) && atc::atc_enabled()
+        && mcp_agent_mail_core::Config::get().atc_write_mode.is_live()
+    {
+        ctx.atc_project = ctx
+            .atc_project
+            .as_deref()
+            .and_then(resolve_atc_reservation_project);
+        if ctx.atc_project.is_none() {
+            // A missing authority must not turn a display slug into trusted
+            // project identity. UI events still render; only ATC inference is
+            // skipped. Off mode and shadow tracing retain their existing paths.
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("reservation_project_resolution");
+        }
+    }
     match tool_name {
         "send_message" | "reply_message" => derive_message_domain_events(payload, &ctx),
         "fetch_inbox" => derive_fetch_inbox_domain_events(payload, &ctx, None),
@@ -35167,6 +35246,236 @@ first body
             }
             other => panic!("expected ReservationGranted event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn atc_denied_reservations_reach_deadlock_detection_and_scoped_resolution() {
+        const CHILD: &str = "AM_TEST_ATC_RESERVATION_FEEDBACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // ATC write mode is a process-lifetime choice. Keep the real tool,
+            // engine and sidecar fixture isolated from other tests and mailboxes.
+            let dir = tempfile::tempdir().expect("private reservation feedback fixture");
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "tests::atc_denied_reservations_reach_deadlock_detection_and_scoped_resolution",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "DATABASE_URL",
+                    format!("sqlite:///{}", dir.path().join("mail.sqlite3").display()),
+                )
+                .env("STORAGE_ROOT", dir.path().join("archive"))
+                .env("AM_ATC_ENABLED", "true")
+                .env("AM_ATC_WRITE_MODE", "live")
+                .env("AM_ATC_EXECUTOR_MODE", "shadow")
+                .env("ATC_LEARNING_DISABLED", "0")
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .current_dir(dir.path())
+                .output()
+                .expect("run isolated ATC reservation feedback test");
+            assert!(
+                output.status.success(),
+                "ATC reservation feedback failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let config = mcp_agent_mail_core::Config::get();
+        atc::init_global_atc(&config);
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("real mailbox pool");
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = std::env::current_dir()
+            .expect("fixture directory")
+            .join("project-alpha")
+            .to_string_lossy()
+            .into_owned();
+        let project = block_on(mcp_agent_mail_db::queries::ensure_project(
+            &cx,
+            &pool,
+            &project_key,
+        ))
+        .into_result()
+        .expect("project");
+        let project_id = project.id.expect("project ID");
+        for (name, path) in [("BlueLake", "src/a.rs"), ("RedFox", "src/b.rs")] {
+            block_on(mcp_agent_mail_db::queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                name,
+                "codex-cli",
+                "test",
+                None,
+                None,
+                None,
+            ))
+            .into_result()
+            .expect("registered owner");
+            let granted = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                &ctx,
+                project_key.clone(),
+                name.to_string(),
+                vec![path.to_string()],
+                Some(3600),
+                Some(true),
+                Some("ATC conflict regression".to_string()),
+                None,
+            ))
+            .expect("seed real held lease");
+            let granted: serde_json::Value = serde_json::from_str(&granted).expect("grant JSON");
+            assert_eq!(granted["granted"].as_array().expect("grants").len(), 1);
+            atc::atc_register_agent_with_project(name, "codex-cli", Some(&project_key));
+        }
+
+        // Tools accept either spelling. Both denials must enter one graph.
+        for (name, path, identifier) in [
+            ("BlueLake", "src/b.rs", &project_key),
+            ("RedFox", "src/a.rs", &project.slug),
+        ] {
+            let response = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                &ctx,
+                identifier.clone(),
+                name.to_string(),
+                vec![path.to_string()],
+                Some(3600),
+                Some(true),
+                None,
+                None,
+            ))
+            .expect("real reservation denial response");
+            let payload: serde_json::Value = serde_json::from_str(&response).expect("tool JSON");
+            assert_eq!(payload["granted"], serde_json::json!([]));
+            assert_eq!(payload["conflicts"].as_array().expect("conflicts").len(), 1);
+            let call_args = serde_json::json!({
+                "project_key": identifier,
+                "agent_name": name,
+                "paths": [path],
+            });
+            let events = derive_domain_events_from_tool_result(
+                "file_reservation_paths",
+                Some(&call_args),
+                &serde_json::json!({ "content": [{ "type": "text", "text": response }] }),
+                Some(&project.slug),
+                Some(name),
+            );
+            assert!(events.is_empty(), "denial must not fabricate a grant event");
+        }
+        let report = atc::atc_tick_report(mcp_agent_mail_db::now_micros()).expect("ATC tick");
+        assert_eq!(report.summary.deadlock_cycles, 1);
+        assert!(
+            report.effects.iter().any(|effect| {
+                effect.semantics.family == "deadlock_remediation"
+                    && effect.project_key.as_deref() == Some(project_key.as_str())
+            }),
+            "fully denied real requests must produce a correctly scoped deadlock advisory"
+        );
+
+        // Same-name experiences in another project must not inherit this
+        // project's release. Reopen the durable sidecar after the actual sweep.
+        let anchor = mcp_agent_mail_db::now_micros();
+        let other_project = format!("{project_key}-other");
+        for (id, scope) in [(1_u64, &project_key), (2_u64, &other_project)] {
+            let mut row = ExperienceBuilder::new(
+                9_000 + id,
+                9_000 + id,
+                format!("scope-trace-{id}"),
+                format!("scope-claim-{id}"),
+                format!("scope-evidence-{id}"),
+                ExperienceSubsystem::Conflict,
+                "reservation_release",
+                "BlueLake",
+                EffectKind::Release,
+                "release_reservations",
+                vec![("Blocked".to_string(), 1.0)],
+                0.0,
+                "reservation feedback scope",
+                true,
+                false,
+            )
+            .project_key(scope)
+            .build(0, anchor);
+            row.state = ExperienceState::Executed;
+            row.dispatched_ts_micros = Some(anchor);
+            row.executed_ts_micros = Some(anchor);
+            block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                &cx, &pool, &row,
+            ))
+            .into_result()
+            .expect("persist scoped experience");
+        }
+        let release = block_on(
+            mcp_agent_mail_tools::reservations::release_file_reservations(
+                &ctx,
+                project.slug.clone(),
+                "BlueLake".to_string(),
+                None,
+                None,
+            ),
+        )
+        .expect("release actual held lease");
+        let release_args = serde_json::json!({
+            "project_key": project.slug,
+            "agent_name": "BlueLake",
+        });
+        let events = derive_domain_events_from_tool_result(
+            "release_file_reservations",
+            Some(&release_args),
+            &serde_json::json!({ "content": [{ "type": "text", "text": release }] }),
+            Some(&project.slug),
+            Some("BlueLake"),
+        );
+        assert_eq!(events.len(), 1);
+        // The real dispatch path also observes general tool activity after
+        // domain events. That unscoped timestamp must not resolve the other
+        // project's same-name reservation experience through the fallback.
+        let activity_at = mcp_agent_mail_db::now_micros().max(anchor + 1);
+        atc::atc_observe_activity_with_project("BlueLake", Some(&project.slug), activity_at);
+        assert_eq!(atc::atc_agent_last_activity("BlueLake"), Some(activity_at));
+        assert_eq!(
+            atc::atc_tick_report(activity_at)
+                .expect("tick after slug-based release")
+                .summary
+                .deadlock_cycles,
+            0,
+            "release by slug must clear conflicts observed through the full path"
+        );
+        sweep_open_experiences_for_resolution(&pool, activity_at, 600_000_000);
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(pool.sqlite_path());
+        let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+            .expect("independent sidecar reopen");
+        let rows = verify
+            .query_sync(
+                "SELECT project_key, state, outcome_json FROM atc_experiences ORDER BY effect_id",
+                &[],
+            )
+            .expect("read durable outcomes");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get_named::<String>("project_key").unwrap(),
+            project_key
+        );
+        assert_eq!(rows[0].get_named::<String>("state").unwrap(), "resolved");
+        let outcome: serde_json::Value =
+            serde_json::from_str(&rows[0].get_named::<String>("outcome_json").unwrap())
+                .expect("resolved outcome");
+        assert_eq!(outcome["label"], "clean_release");
+        assert_eq!(
+            rows[1].get_named::<String>("project_key").unwrap(),
+            other_project
+        );
+        assert_eq!(rows[1].get_named::<String>("state").unwrap(), "open");
+        assert!(
+            rows[1]
+                .get_named::<Option<String>>("outcome_json")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
