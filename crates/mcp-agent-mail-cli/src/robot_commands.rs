@@ -12468,7 +12468,7 @@ struct RobotAgentReservationStats {
     active_count: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RobotAgentContactStats {
     respected_count: u64,
     violation_count: u64,
@@ -12689,6 +12689,12 @@ fn fetch_robot_agent_reservation_stats(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROBOT_CONTACT_STATS_AFTER_LINKS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn fetch_robot_agent_contact_stats(
     conn: &DbConn,
     project_id: i64,
@@ -12699,82 +12705,102 @@ fn fetch_robot_agent_contact_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
-    let approved_link_exists_sql = "\
-        SELECT 1 FROM agent_links link \
-        WHERE link.status = 'approved' \
-          AND (link.expires_ts IS NULL OR link.expires_ts <= 0 OR link.expires_ts > ?) \
-          AND ( \
-            (link.a_agent_id = m.sender_id AND link.b_agent_id = mr.agent_id) \
-            OR (link.b_agent_id = m.sender_id AND link.a_agent_id = mr.agent_id) \
-          )";
+    // Reuse the nested read guard so links, policy and deliveries describe one
+    // observation even on the direct live-DB path. Releasing the savepoint
+    // never commits or rolls back a transaction owned by the caller.
+    let Ok(snapshot) = RobotInboxReadSnapshot::begin(conn) else {
+        return HashMap::new();
+    };
+    // The health view can cover a month of mail. Correlated EXISTS probes in
+    // each recipient's CASE expressions repeated the link scan for every
+    // delivery (the CLI counterpart of br-bdo5g). Read the relevant approved
+    // links once, then classify grouped deliveries in Rust. Unlike the TUI's
+    // legacy importer view, this surface intentionally accepts only approved
+    // links, not the obsolete accepted status.
+    let links_sql = format!(
+        "SELECT a_agent_id, b_agent_id FROM agent_links \
+         WHERE status = 'approved' \
+           AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
+           AND (a_agent_id IN ({agent_ids_sql}) OR b_agent_id IN ({agent_ids_sql}))"
+    );
+    let Ok(links) = conn.query_sync(&links_sql, &[Value::BigInt(now)]) else {
+        return HashMap::new();
+    };
+    // A contact link allows both directions; normalize the pair rather than
+    // retaining a second entry for its reverse direction.
+    let Some(approved_links): Option<HashSet<(i64, i64)>> = links
+        .into_iter()
+        .map(|row| {
+            let a = row.get_named::<i64>("a_agent_id").ok()?;
+            let b = row.get_named::<i64>("b_agent_id").ok()?;
+            Some((a.min(b), a.max(b)))
+        })
+        .collect()
+    else {
+        // An undecodable authority row is unavailable evidence, not proof
+        // that a recipient's contact policy was violated.
+        return HashMap::new();
+    };
+    #[cfg(test)]
+    if let Some(after_links) = ROBOT_CONTACT_STATS_AFTER_LINKS.with(|hook| hook.borrow_mut().take())
+    {
+        after_links();
+    }
     let sql = format!(
         "SELECT \
             mr.agent_id AS agent_id, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
-                    WHEN m.sender_id = mr.agent_id THEN 1 \
-                    WHEN recipient.contact_policy = 'contacts_only' \
-                     AND EXISTS ({approved_link_exists_sql}) \
-                    THEN 1 \
-                    ELSE 0 END) AS respected_count, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy = 'contacts_only' \
-                     AND m.sender_id != mr.agent_id \
-                     AND NOT EXISTS ({approved_link_exists_sql}) \
-                    THEN 1 \
-                    WHEN recipient.contact_policy = 'block_all' \
-                     AND m.sender_id != mr.agent_id \
-                    THEN 1 \
-                    ELSE 0 END) AS violation_count \
+            m.sender_id AS sender_id, \
+            recipient.contact_policy AS contact_policy, \
+            COUNT(*) AS row_count \
          FROM message_recipients mr \
          JOIN messages m ON m.id = mr.message_id \
          JOIN agents recipient ON recipient.id = mr.agent_id \
          WHERE recipient.project_id = ? \
            AND mr.agent_id IN ({agent_ids_sql}) \
            AND m.created_ts >= ? \
-         GROUP BY mr.agent_id"
+         GROUP BY mr.agent_id, m.sender_id, recipient.contact_policy"
     );
-    conn.query_sync(
-        &sql,
-        &[
-            Value::BigInt(now),
-            Value::BigInt(now),
-            Value::BigInt(project_id),
-            Value::BigInt(window_start),
-        ],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| {
-                let agent_id = row
-                    .get_named::<i64>("agent_id")
-                    .ok()
-                    .or_else(|| row.get_as::<i64>(0).ok())
-                    .unwrap_or(0);
-                let respected_count = row
-                    .get_named::<i64>("respected_count")
-                    .ok()
-                    .or_else(|| row.get_as::<i64>(1).ok())
-                    .unwrap_or(0)
-                    .max(0) as u64;
-                let violation_count = row
-                    .get_named::<i64>("violation_count")
-                    .ok()
-                    .or_else(|| row.get_as::<i64>(2).ok())
-                    .unwrap_or(0)
-                    .max(0) as u64;
-                (
-                    agent_id,
-                    RobotAgentContactStats {
-                        respected_count,
-                        violation_count,
-                    },
-                )
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    let stats = conn
+        .query_sync(
+            &sql,
+            &[Value::BigInt(project_id), Value::BigInt(window_start)],
+        )
+        .ok()
+        .map(|rows| {
+            let mut stats: HashMap<i64, RobotAgentContactStats> = HashMap::new();
+            for row in rows {
+                let Ok(agent_id) = row.get_named::<i64>("agent_id") else {
+                    continue;
+                };
+                let sender_id = row.get_named::<i64>("sender_id").ok();
+                let policy = row.get_named::<String>("contact_policy").ok();
+                let row_count = row.get_named::<i64>("row_count").unwrap_or(0).max(0) as u64;
+                let self_send = sender_id == Some(agent_id);
+                let foreign_sender = sender_id.is_some_and(|sender| sender != agent_id);
+                let linked = sender_id.is_some_and(|sender| {
+                    approved_links.contains(&(sender.min(agent_id), sender.max(agent_id)))
+                });
+                let entry = stats.entry(agent_id).or_default();
+                if matches!(policy.as_deref(), Some("open" | "auto"))
+                    || self_send
+                    || (policy.as_deref() == Some("contacts_only") && linked)
+                {
+                    entry.respected_count = entry.respected_count.saturating_add(row_count);
+                }
+                if foreign_sender
+                    && (policy.as_deref() == Some("block_all")
+                        || (policy.as_deref() == Some("contacts_only") && !linked))
+                {
+                    entry.violation_count = entry.violation_count.saturating_add(row_count);
+                }
+            }
+            stats
+        })
+        .unwrap_or_default();
+    if snapshot.finish().is_err() {
+        return HashMap::new();
+    }
+    stats
 }
 
 fn fetch_robot_agent_decision_counts(
@@ -18392,6 +18418,303 @@ mod tests {
         let approved = approved_stats.get(&2).expect("approved contact stats");
         assert_eq!(approved.respected_count, 1);
         assert_eq!(approved.violation_count, 0);
+    }
+
+    /// Preserve the previous single-statement query as an independent oracle
+    /// for the grouped implementation, including its three-valued comparisons.
+    fn legacy_robot_contact_stats(
+        conn: &DbConn,
+        project_id: i64,
+        agent_ids_sql: &str,
+        window_start: i64,
+        now: i64,
+    ) -> HashMap<i64, RobotAgentContactStats> {
+        use sqlmodel_core::Value as DbValue;
+
+        let approved_link_exists_sql = "\
+            SELECT 1 FROM agent_links link \
+            WHERE link.status = 'approved' \
+              AND (link.expires_ts IS NULL OR link.expires_ts <= 0 OR link.expires_ts > ?) \
+              AND ( \
+                (link.a_agent_id = m.sender_id AND link.b_agent_id = mr.agent_id) \
+                OR (link.b_agent_id = m.sender_id AND link.a_agent_id = mr.agent_id) \
+              )";
+        let sql = format!(
+            "SELECT \
+                mr.agent_id AS agent_id, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
+                        WHEN m.sender_id = mr.agent_id THEN 1 \
+                        WHEN recipient.contact_policy = 'contacts_only' \
+                         AND EXISTS ({approved_link_exists_sql}) \
+                        THEN 1 \
+                        ELSE 0 END) AS respected_count, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy = 'contacts_only' \
+                         AND m.sender_id != mr.agent_id \
+                         AND NOT EXISTS ({approved_link_exists_sql}) \
+                        THEN 1 \
+                        WHEN recipient.contact_policy = 'block_all' \
+                         AND m.sender_id != mr.agent_id \
+                        THEN 1 \
+                        ELSE 0 END) AS violation_count \
+             FROM message_recipients mr \
+             JOIN messages m ON m.id = mr.message_id \
+             JOIN agents recipient ON recipient.id = mr.agent_id \
+             WHERE recipient.project_id = ? \
+               AND mr.agent_id IN ({agent_ids_sql}) \
+               AND m.created_ts >= ? \
+             GROUP BY mr.agent_id"
+        );
+        conn.query_sync(
+            &sql,
+            &[
+                DbValue::BigInt(now),
+                DbValue::BigInt(now),
+                DbValue::BigInt(project_id),
+                DbValue::BigInt(window_start),
+            ],
+        )
+        .expect("legacy correlated contact query")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get_named::<i64>("agent_id").expect("recipient id"),
+                RobotAgentContactStats {
+                    respected_count: row
+                        .get_named::<i64>("respected_count")
+                        .expect("respected count")
+                        .max(0) as u64,
+                    violation_count: row
+                        .get_named::<i64>("violation_count")
+                        .expect("violation count")
+                        .max(0) as u64,
+                },
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn robot_contact_stats_grouped_matches_legacy_across_policies_and_projects() {
+        use sqlmodel_core::Value as DbValue;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_robot_test_db_with_real_schema(&dir.path().join("contact-health.sqlite3"));
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                (1, 'selected', '/selected', 0), (2, 'other', '/other', 0); \
+             INSERT INTO agents \
+                (id, project_id, name, program, model, inception_ts, last_active_ts, contact_policy) \
+             VALUES \
+                (1, 1, 'Auto', '', '', 0, 0, 'auto'), \
+                (2, 1, 'Open', '', '', 0, 0, 'open'), \
+                (3, 1, 'Guarded', '', '', 0, 0, 'contacts_only'), \
+                (4, 1, 'Blocked', '', '', 0, 0, 'block_all'), \
+                (5, 1, 'Expiring', '', '', 0, 0, 'contacts_only'), \
+                (6, 1, 'Approved', '', '', 0, 0, 'contacts_only'), \
+                (7, 1, 'UnknownPolicy', '', '', 0, 0, 'future-policy'), \
+                (8, 1, 'NoMessages', '', '', 0, 0, 'contacts_only'), \
+                (10, 2, 'CrossSender', '', '', 0, 0, 'auto'), \
+                (11, 2, 'ReverseSender', '', '', 0, 0, 'auto'), \
+                (12, 2, 'LegacySender', '', '', 0, 0, 'auto'), \
+                (13, 1, 'PendingSender', '', '', 0, 0, 'auto'), \
+                (20, 2, 'ForeignRecipient', '', '', 0, 0, 'contacts_only'); \
+             INSERT INTO agent_links \
+                (a_project_id, a_agent_id, b_project_id, b_agent_id, status, created_ts, updated_ts, expires_ts) \
+             VALUES \
+                (2, 10, 1, 3, 'approved', 0, 0, NULL), \
+                (1, 3, 2, 11, 'approved', 0, 0, 2000), \
+                (2, 12, 1, 3, 'accepted', 0, 0, NULL), \
+                (2, 10, 1, 5, 'approved', 0, 0, 999), \
+                (1, 5, 2, 11, 'approved', 0, 0, 1000), \
+                (2, 12, 1, 5, 'approved', 0, 0, -1), \
+                (1, 13, 1, 5, 'pending', 0, 0, NULL), \
+                (2, 10, 1, 6, 'rejected', 0, 0, NULL), \
+                (2, 11, 1, 6, 'approved', 0, 0, 0), \
+                (2, 12, 1, 6, 'approved', 0, 0, 1001), \
+                (2, 10, 2, 20, 'approved', 0, 0, 0); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+                (1, 2, 10, '', '', 500), (2, 2, 11, '', '', 500), \
+                (3, 2, 12, '', '', 500), (4, 1, 13, '', '', 500), \
+                (5, 1, 3, '', '', 500), (6, 1, 4, '', '', 500), \
+                (7, 1, 7, '', '', 500), (8, 2, 10, '', '', 99), \
+                (9, 1, 13, '', '', 100); \
+             INSERT INTO message_recipients (message_id, agent_id) VALUES \
+                (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 20), \
+                (2, 3), (2, 5), (2, 6), (3, 3), (3, 5), (3, 6), \
+                (4, 3), (4, 5), (5, 3), (6, 4), (7, 7), (8, 3), (9, 3);",
+        )
+        .expect("seed policies, link boundaries, and cross-project mail");
+
+        // Multiple deliveries in the same group must keep their full weight.
+        // BCC and CC are deliveries too, as in the original query.
+        conn.execute_raw("BEGIN").expect("begin bulk fixture");
+        for id in 100..228 {
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES (?, 2, 10, '', '', 500)",
+                &[DbValue::BigInt(id)],
+            )
+            .expect("insert repeated delivery");
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, 3, ?)",
+                &[
+                    DbValue::BigInt(id),
+                    DbValue::Text(if id % 2 == 0 { "cc" } else { "bcc" }.to_string()),
+                ],
+            )
+            .expect("insert repeated recipient");
+        }
+        conn.execute_raw("COMMIT").expect("commit bulk fixture");
+
+        let ids = "1,2,3,4,5,6,7,8,20";
+        let actual = fetch_robot_agent_contact_stats(&conn, 1, ids, 100, 1_000);
+        let legacy = legacy_robot_contact_stats(&conn, 1, ids, 100, 1_000);
+        let expected: HashMap<_, _> = [
+            (1, 1, 0),   // auto
+            (2, 1, 0),   // open
+            (3, 131, 3), // approved in both directions, self-send, grouped CC/BCC
+            (4, 1, 1),   // block_all still permits self-send
+            (5, 1, 3),   // negative expiry permits; past/exact expiry and pending refuse
+            (6, 2, 1),   // zero/future expiry permits; rejected refuses
+            (7, 1, 0),   // unknown policy keeps self-send without inventing violations
+        ]
+        .into_iter()
+        .map(|(id, respected_count, violation_count)| {
+            (
+                id,
+                RobotAgentContactStats {
+                    respected_count,
+                    violation_count,
+                },
+            )
+        })
+        .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, legacy);
+        assert!(fetch_robot_agent_contact_stats(&conn, 1, "", 100, 1_000).is_empty());
+        assert!(fetch_robot_agent_contact_stats(&conn, 1, ids, 501, 1_000).is_empty());
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 2, ids, 100, 1_000),
+            HashMap::from([(
+                20,
+                RobotAgentContactStats {
+                    respected_count: 1,
+                    violation_count: 0,
+                },
+            )]),
+            "the selected project filters recipients, not cross-project senders"
+        );
+    }
+
+    #[test]
+    fn robot_contact_stats_grouped_keeps_a_consistent_snapshot_and_caller_transaction() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("contact-snapshot.sqlite3");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
+        conn.execute_raw(
+            "PRAGMA journal_mode = WAL; \
+             INSERT INTO agents \
+                (id, project_id, name, program, model, inception_ts, last_active_ts, contact_policy) \
+             VALUES (1, 1, 'Sender', '', '', 0, 0, 'open'), \
+                    (2, 1, 'Recipient', '', '', 0, 0, 'block_all'); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (1, 1, 1, '', '', 100); \
+             INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 2); \
+             INSERT INTO agent_links \
+                (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, created_ts, updated_ts) \
+             VALUES (1, 1, 1, 1, 2, 'approved', 0, 0); \
+             PRAGMA query_only = ON;",
+        )
+        .expect("seed direct WAL reader");
+        let writer = std::rc::Rc::new(
+            DbConn::open_file(db_path.to_str().expect("db path")).expect("peer writer"),
+        );
+        let peer = std::rc::Rc::clone(&writer);
+        let wrote = std::rc::Rc::new(std::cell::Cell::new(false));
+        let wrote_in_hook = std::rc::Rc::clone(&wrote);
+        ROBOT_CONTACT_STATS_AFTER_LINKS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Both coherent states classify the delivery as a violation.
+                // Old links plus the NEW contacts_only policy would invent a
+                // respected delivery that never existed in any committed state.
+                peer.execute_raw(
+                    "BEGIN IMMEDIATE; \
+                         UPDATE agent_links SET status = 'rejected' WHERE id = 1; \
+                         UPDATE agents SET contact_policy = 'contacts_only' WHERE id = 2; \
+                         COMMIT;",
+                )
+                .expect("peer changes link and policy between the two reads");
+                wrote_in_hook.set(true);
+            }));
+        });
+        let violation = HashMap::from([(
+            2,
+            RobotAgentContactStats {
+                respected_count: 0,
+                violation_count: 1,
+            },
+        )]);
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation,
+            "links and recipient policy must share the held read snapshot"
+        );
+        assert!(wrote.get(), "peer commit must actually execute");
+        assert_eq!(
+            conn.query_sync("SELECT contact_policy FROM agents WHERE id = 2", &[])
+                .unwrap()[0]
+                .get_named::<String>("contact_policy")
+                .unwrap(),
+            "contacts_only",
+            "the reader must release its snapshot after returning"
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation
+        );
+
+        conn.execute_raw(
+            "PRAGMA query_only = OFF; BEGIN; \
+             UPDATE agents SET contact_policy = 'open' WHERE id = 2;",
+        )
+        .expect("caller-owned transaction");
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            HashMap::from([(
+                2,
+                RobotAgentContactStats {
+                    respected_count: 1,
+                    violation_count: 0,
+                },
+            )])
+        );
+        conn.execute_raw("ROLLBACK")
+            .expect("successful health read must not commit its caller's transaction");
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation
+        );
+
+        conn.execute_raw(
+            "BEGIN; UPDATE agent_links \
+             SET a_agent_id = 'malformed-id', status = 'approved' WHERE id = 1;",
+        )
+        .expect("plant undecodable link authority in caller transaction");
+        assert!(fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000).is_empty());
+        conn.execute_raw("ROLLBACK")
+            .expect("failed health read must not end its caller's transaction");
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation
+        );
     }
 
     fn with_navigate_resource_env<F, T>(database_url: &str, storage_root: &str, f: F) -> T
