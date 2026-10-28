@@ -523,29 +523,68 @@ fn select_ids(
         cursor.next_lane_is_startup = cursor.startup_tail.is_some();
     }
     let tail_started_after = cursor.tail_after;
-    let mut tail = if let Some(after) = tail_started_after {
-        conn.query_sync(
-            "SELECT id FROM messages WHERE id > ? AND created_ts <= ? ORDER BY id ASC LIMIT ?",
-            &[after.into(), cutoff.into(), (IDS_PER_LANE + 1).into()],
-        )
+    let (mut tail, tail_next_id) = if let Some(after) = tail_started_after {
+        // Creation timestamps precede insertion and are not ordered by ID:
+        // an older send can commit after a younger one. Filtering SQL by age
+        // would let the watermark jump over the younger row, losing it from
+        // this lane even after its grace expires. Read one bounded ID page
+        // and stop at the first unsettled row instead. History and due retries
+        // still make independent progress beyond that scheduling barrier.
+        let rows = conn
+            .query_sync(
+                "SELECT id, created_ts FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?",
+                &[after.into(), (IDS_PER_LANE + 1).into()],
+            )
+            .map_err(source_error)?;
+        let mut tail = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.get_named::<i64>("created_ts").map_err(source_error)? > cutoff {
+                break;
+            }
+            tail.push(row.get_named::<i64>("id").map_err(source_error)?);
+        }
+        let next = if i64::try_from(tail.len()).is_ok_and(|len| len > IDS_PER_LANE) {
+            tail.pop()
+        } else {
+            None
+        };
+        (tail, next)
     } else {
-        conn.query_sync(
-            "SELECT id FROM messages WHERE created_ts <= ? ORDER BY id DESC LIMIT ?",
-            &[cutoff.into(), IDS_PER_LANE.into()],
-        )
-    }
-    .map_err(source_error)?
-    .into_iter()
-    .map(|row| row.get_named::<i64>("id").map_err(source_error))
-    .collect::<Result<Vec<_>, _>>()?;
-    tail.sort_unstable();
-    let tail_next_id = if tail_started_after.is_some()
-        && i64::try_from(tail.len()).is_ok_and(|len| len > IDS_PER_LANE)
-    {
-        tail.pop()
-    } else {
-        None
+        // The initial newest-page shortcut must retain the same barrier. If
+        // its eligible page lies entirely above an unsettled lower ID, seed
+        // the forward hint immediately before that row, not above it. This
+        // records no archive proof and does not put young mail in the retry
+        // lane (which deliberately bypasses the write-behind grace). Bound
+        // both reads to the already observed maximum: an older request that
+        // commits after the barrier read must remain future forward work, not
+        // let this newest page jump over an intervening younger commit.
+        let first_unsettled = conn
+            .query_sync(
+                "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts > ? ORDER BY id ASC LIMIT 1",
+                &[max_id.into(), cutoff.into()],
+            )
+            .map_err(source_error)?
+            .first()
+            .map(|row| row.get_named::<i64>("id").map_err(source_error))
+            .transpose()?;
+        let mut tail = conn
+            .query_sync(
+                "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
+                &[max_id.into(), cutoff.into(), IDS_PER_LANE.into()],
+            )
+            .map_err(source_error)?
+            .into_iter()
+            .map(|row| row.get_named::<i64>("id").map_err(source_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(barrier) = first_unsettled {
+            tail.retain(|id| *id < barrier);
+            if tail.is_empty() {
+                cursor.tail_after = Some(barrier.saturating_sub(1));
+            }
+        }
+        (tail, None)
     };
+    tail.sort_unstable();
     let history = conn
         .query_sync(
             "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
@@ -1146,6 +1185,24 @@ fn reconcile_message_batch_inner(
     cursor: &mut ReconcileCursor,
     stop: &AtomicBool,
 ) -> Result<ReconcileReport, String> {
+    reconcile_message_batch_at(
+        cx,
+        pool,
+        config,
+        cursor,
+        stop,
+        mcp_agent_mail_db::now_micros(),
+    )
+}
+
+fn reconcile_message_batch_at(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReconcileCursor,
+    stop: &AtomicBool,
+    now_us: i64,
+) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
@@ -1157,7 +1214,7 @@ fn reconcile_message_batch_inner(
         );
     }
     let cutoff = normal_archive_cutoff(
-        mcp_agent_mail_db::now_micros(),
+        now_us,
         cursor.settled_before_us,
         crate::archive_lag_snapshot().oldest_unmaterialized_us,
     );
@@ -3129,6 +3186,172 @@ mod tests {
                 retained_message_ids(cx, pool),
                 (901..933).collect::<Vec<_>>()
             );
+        });
+    }
+
+    #[test]
+    fn forward_tail_keeps_younger_lower_id_until_grace_expires() {
+        retention_fixture(40, |cx, pool, config| {
+            // A newer request obtained the lower ID while an older request
+            // was still waiting to insert. History has already passed both;
+            // this forward cursor must not lose the still-in-flight row.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET created_ts = 2000000 WHERE id = 938")
+                .unwrap();
+            drop(conn);
+            archive_fixture_range(cx, pool, config, 901..938);
+            archive_fixture_range(cx, pool, config, 939..941);
+            let before = admission_tests::database_evidence(cx, pool);
+            let orphan = prepare_message(cx, pool, 938).unwrap();
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &orphan.message,
+                &orphan.sender,
+                &orphan.recipients,
+            )
+            .unwrap()
+            .0;
+            let stop = AtomicBool::new(false);
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(936),
+                backfill_ceiling: Some(920),
+                startup_backfill_complete: true,
+                ..ReconcileCursor::default()
+            };
+            let shielded = reconcile_message_batch_at(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &stop,
+                NORMAL_ARCHIVE_GRACE_US + 1_500_000,
+            )
+            .unwrap();
+            assert_eq!(shielded.repaired, 0);
+            assert_eq!(shielded.deferred, 0);
+            assert_eq!(shielded.retry_len, 0, "young mail is not failed mail");
+            assert!(!shielded.budget_exhausted, "grace must not busy-poll");
+            assert_eq!(cursor.tail_after, Some(937));
+            assert_eq!(cursor.backfill_ceiling, Some(904));
+            assert!(!paths.canonical.exists());
+
+            // Advance only the observed time: source rows, grace duration,
+            // retry debt and history position remain untouched. The very next
+            // forward pass now repairs the orphan through real DB/Git paths.
+            let repaired = reconcile_message_batch_at(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &stop,
+                NORMAL_ARCHIVE_GRACE_US + 2_000_000,
+            )
+            .unwrap();
+            assert_eq!(repaired.repaired, 1);
+            assert_eq!(repaired.files_created, 4);
+            assert_eq!(repaired.deferred, 0);
+            assert_eq!(cursor.tail_after, Some(940));
+            assert!(repaired.scanned <= MAX_IDS_PER_PASS);
+            assert!(repaired.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+            assert!(
+                verify_retention_archive(&archive, &orphan, &mut 0)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(admission_tests::database_evidence(cx, pool), before);
+        });
+    }
+
+    #[test]
+    fn newest_page_retains_young_lower_id_without_blocking_history_repairs() {
+        retention_fixture(20, |cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET created_ts = 2000000 WHERE id = 901")
+                .unwrap();
+            drop(conn);
+            let before = admission_tests::database_evidence(cx, pool);
+            let stop = AtomicBool::new(false);
+            let mut cursor = ReconcileCursor::default();
+            let waiting_time = NORMAL_ARCHIVE_GRACE_US + 1_500_000;
+            let first =
+                reconcile_message_batch_at(cx, pool, config, &mut cursor, &stop, waiting_time)
+                    .unwrap();
+            assert_eq!(first.repaired, MAX_REPAIRS_PER_BATCH);
+            assert_eq!(first.deferred, 0);
+            assert_eq!(cursor.tail_after, Some(900));
+            assert_eq!(cursor.backfill_ceiling, Some(916));
+
+            let second =
+                reconcile_message_batch_at(cx, pool, config, &mut cursor, &stop, waiting_time)
+                    .unwrap();
+            assert_eq!(second.repaired, MAX_REPAIRS_PER_BATCH);
+            assert_eq!(cursor.tail_after, Some(900));
+            assert_eq!(cursor.backfill_ceiling, Some(912));
+            assert_eq!(second.retry_len, 0);
+            let orphan = prepare_message(cx, pool, 901).unwrap();
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &orphan.message,
+                &orphan.sender,
+                &orphan.recipients,
+            )
+            .unwrap()
+            .0;
+            assert!(!paths.canonical.exists());
+
+            let resumed = reconcile_message_batch_at(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &stop,
+                NORMAL_ARCHIVE_GRACE_US + 2_000_000,
+            )
+            .unwrap();
+            assert_eq!(resumed.deferred, 0);
+            assert!(resumed.repaired > 0 && resumed.repaired <= MAX_REPAIRS_PER_BATCH);
+            assert!(cursor.tail_after.is_some_and(|id| id >= 901));
+            assert!(
+                verify_retention_archive(&archive, &orphan, &mut 0)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(admission_tests::database_evidence(cx, pool), before);
+        });
+    }
+
+    #[test]
+    fn young_lookahead_does_not_report_eligible_forward_backlog() {
+        retention_fixture(18, |cx, pool, _config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET created_ts = 2000000 WHERE id = 917")
+                .unwrap();
+            drop(conn);
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                backfill_ceiling: Some(900),
+                ..ReconcileCursor::default()
+            };
+            let selected = select_ids(cx, pool, &mut cursor, 1_500_000).unwrap();
+            assert_eq!(selected.tail_next_id, None);
+            assert_eq!(
+                selected.ids,
+                (901..917)
+                    .map(|id| (id, ScanLane::Tail))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(cursor.tail_after, Some(900), "selection consumes no rows");
+            for (id, lane) in selected.ids {
+                cursor.advance_scan(id, lane);
+            }
+            let waiting = select_ids(cx, pool, &mut cursor, 1_500_000).unwrap();
+            assert!(waiting.ids.iter().all(|(_, lane)| *lane != ScanLane::Tail));
+            assert_eq!(waiting.tail_next_id, None);
+            assert_eq!(cursor.tail_after, Some(916));
         });
     }
 

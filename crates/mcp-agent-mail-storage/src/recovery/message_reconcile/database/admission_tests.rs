@@ -89,7 +89,7 @@ fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
     });
 }
 
-fn database_evidence(cx: &Cx, pool: &DbPool) -> Value {
+pub(super) fn database_evidence(cx: &Cx, pool: &DbPool) -> Value {
     let conn = outcome(block_on(pool.acquire(cx))).unwrap();
     let messages = conn.query_sync(
         "SELECT id, project_id, sender_id, subject, body_md, thread_id, topic, importance, ack_required, \
