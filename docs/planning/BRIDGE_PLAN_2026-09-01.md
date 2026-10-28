@@ -1,5 +1,60 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## October 28 integration follow-through (19:18 UTC)
+
+The fixes through `d37756f8` were pushed, then eight incoming commits were
+preserved through `972d6f08`. Integration repair `549f9aba` restores the inbox
+test build and actual server startup. Fifteen assessed Beads have closed against
+their individual criteria; the remaining release and persistence gates stay open.
+
+- `.67`: three old full-row hydration calls now pass the required argument;
+  equivalent strict lint repairs preserve the existing fixtures and assertions.
+  The original compiler/lint failures remain recorded. Fifteen real inbox and
+  priority tests pass. This is build/fixture maintenance, with no performance credit.
+- `.68`: registering ordinary and query-specific project templates terminated
+  actual HTTP startup at FastMCP final admission. One admitted handler now reads
+  the original URI and preserves exact/ancestor resolution and encoded delimiters.
+  Prepared current development binary `34c6e21c…` starts HTTP and stdio, advertises
+  45 tools/25 templates and exits cleanly. Actual encoded-path, missing-project,
+  no-write and invalid-option controls pass; an authenticated retirement probe
+  passes nine checks including missing-token refusal and no reactivation.
+- The unchanged 46-check live flow produces **45 pass, one fail**. Completed
+  passive snapshots show seven DB/seven archive messages, but the cross-project
+  reply's archive lacks `reply_to` although SQLite records its parent. The terminal
+  deadline observation's `TimeoutError` does not erase that earlier mismatch or
+  establish a database outage. `.69` tracks this distinct observed defect; its
+  routed-envelope fix and real archive/DB/replay assertions are implemented, with
+  native acceptance blocked by repeated remote failures. Original `.35` remains open with its original
+  large-archive orphan and unchanged 300-second gate.
+- All-target, separate production, strict Clippy and formatting checks pass for
+  the `75194424…` integration source. Its completed five-file UBS scan retains
+  zero critical, 7,591 warning and 3,071 informational findings. After the reply
+  fix and incoming recovery change, all-target and production checks also pass;
+  final formatting and the three-file UBS scan pass with zero critical findings
+  and 1,432 warnings. Final-source strict Clippy and native results remain
+  unconfirmed after repeated SSH/source-authority failures. Do not carry the
+  earlier Clippy or full-workspace claim forward to the changed source.
+- The current prepared development executable came from a parent build that
+  exited 137. It supplies scoped real runtime evidence, not a completed-parent,
+  normal-production or release qualification. The earlier native matrix was
+  interrupted with its 63 observed failures retained. Subsequent obsolete
+  compilation stopped 143 before tests; its remote completion was read directly,
+  while RCH acknowledgment still failed. Complete current native acceptance for
+  `.53`, `.57` and `.62` remains open; no partial sum is a workspace pass.
+- `.52` remains a real snapshot failure: the canonical-engine branch preserves
+  header values 231/4242; the runtime branch writes them into WAL but publishes a
+  copy with 0/0. No fixture normalization, mixed-snapshot header read or unqualified
+  engine adoption was used. `.46`'s qualified engine, `.49`'s native Windows,
+  `.63`'s original 240-second retention cases and authority/platform work remain.
+
+The incoming committed-ancestor recovery patch now has compiler evidence and
+standard formatting, but its new native regressions remain unverified. Preserve
+its fail-closed Git authority checks. RCH failures are retained without local
+fallback, lock clearing, drain overrides or peer-process interruption. Detailed
+current actions and exact manifests/logs remain in
+`/tmp/am-agency-20261027/remaining-verification-todo-0642.md` and Beads. This is
+self-verification; no independent runtime or application-performance claim is made.
+
 ## October 28 implementation follow-through (12:35 UTC)
 
 The October 27 assessment below is historical. Its actionable crypto, compiler,
