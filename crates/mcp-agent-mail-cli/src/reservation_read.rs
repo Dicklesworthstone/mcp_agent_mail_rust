@@ -27,6 +27,8 @@ use mcp_agent_mail_db::queries::{
 // can prove completeness, but a full page cannot distinguish 250 from 251 rows.
 const LEGACY_RESOURCE_PAGE_MAX: usize = 250;
 const RESOURCE_TIMEOUT_SECONDS: u64 = 30;
+const MAILBOX_PROBE_TIMEOUT_SECONDS: u64 = 2;
+const MAILBOX_CONFIG_RESOURCE: &str = "resource://config/environment";
 
 /// A pinned, authenticated resource authority shared by explicit server reads.
 pub(crate) struct ServerResourceSession {
@@ -64,6 +66,166 @@ impl ServerResourceSession {
     pub(crate) async fn read(&self, uri: &str) -> CliResult<Value> {
         read_resource_json(&self.client, &self.server_url, self.bearer.as_deref(), uri).await
     }
+
+    /// Select the daemon only when its authenticated configuration names the
+    /// same SQLite/archive pair. This probe reads configuration, not health or
+    /// database state, so ordinary CLI reads do not open a second mailbox or
+    /// pay for an archive inventory. Only an unavailable endpoint, an older
+    /// server without archive identity, or a different mailbox permits local
+    /// fallback; authentication and malformed responses remain errors.
+    pub(crate) async fn for_local_mailbox(config: &Config) -> CliResult<Option<Self>> {
+        let session = Self::new(config)?;
+        // Equal path strings on different machines do not establish mailbox
+        // identity. Remote authority is selected explicitly with --server.
+        if !is_local_mailbox_endpoint(&session.server_url)? {
+            return Ok(None);
+        }
+        let id = format!("cli-resource-read-{MAILBOX_CONFIG_RESOURCE}");
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": &id,
+            "method": "resources/read",
+            "params": { "uri": MAILBOX_CONFIG_RESOURCE },
+        });
+        let response = match crate::post_jsonrpc_request_with_client(
+            &session.server_url,
+            session.bearer.as_deref(),
+            &request,
+            MAILBOX_PROBE_TIMEOUT_SECONDS,
+            &session.client,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) if crate::server_tool_error_is_unavailable(&error) => return Ok(None),
+            Err(error) => return Err(sanitize_transport_error(error)),
+        };
+        let payload = validate_resource_response(&response, &id, MAILBOX_CONFIG_RESOURCE)?;
+        if !mailbox_config_matches(&payload, config)? {
+            return Ok(None);
+        }
+        Ok(Some(session))
+    }
+
+    pub(crate) async fn verify_local_mailbox(&self, config: &Config) -> CliResult<()> {
+        if !mailbox_config_matches(&self.read(MAILBOX_CONFIG_RESOURCE).await?, config)? {
+            return Err(invalid_response(
+                "mailbox identity changed during server read",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A tool read on the same pinned endpoint and credential as the resource
+    /// identity checks. Never follow a redirect or reinterpret a rejection as
+    /// permission to read a local mailbox.
+    pub(crate) async fn call_tool(&self, tool: &str, arguments: Value) -> CliResult<Value> {
+        let id = format!("cli-read-{tool}");
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": &id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        });
+        let response = crate::post_jsonrpc_request_with_client(
+            &self.server_url,
+            self.bearer.as_deref(),
+            &request,
+            RESOURCE_TIMEOUT_SECONDS,
+            &self.client,
+        )
+        .await
+        .map_err(sanitize_transport_error)?;
+        if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || response.get("id").and_then(Value::as_str) != Some(id.as_str())
+            || response.get("error").is_some()
+        {
+            return Err(invalid_response(
+                "tool read was rejected or its request identity mismatched",
+            ));
+        }
+        let result = response
+            .get("result")
+            .filter(|result| result.is_object())
+            .ok_or_else(|| invalid_response("missing tool result object"))?;
+        if result
+            .get("isError")
+            .is_some_and(|value| value != &Value::Bool(false))
+        {
+            return Err(invalid_response("server rejected the tool read"));
+        }
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .filter(|items| items.len() == 1)
+            .ok_or_else(|| invalid_response("expected exactly one tool text content item"))?;
+        if content[0].get("type").and_then(Value::as_str) != Some("text") {
+            return Err(invalid_response("tool read did not return text content"));
+        }
+        let text = content[0]
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| text.len() <= FILE_RESERVATION_SNAPSHOT_MAX_BYTES)
+            .ok_or_else(|| invalid_response("tool text is missing or exceeds the read limit"))?;
+        let payload: Value = serde_json::from_str(text)
+            .map_err(|_| invalid_response("tool text is not valid JSON"))?;
+        for key in ["structuredContent", "structured_content"] {
+            if result
+                .get(key)
+                .is_some_and(|structured| structured != &payload)
+            {
+                return Err(invalid_response(
+                    "tool text and structured content disagree",
+                ));
+            }
+        }
+        Ok(payload)
+    }
+}
+
+fn is_local_mailbox_endpoint(endpoint: &str) -> CliResult<bool> {
+    let parsed = asupersync::http::h1::ParsedUrl::parse(endpoint)
+        .map_err(|_| invalid_response("invalid MCP endpoint URL"))?;
+    let host = parsed.host.trim_start_matches('[').trim_end_matches(']');
+    Ok(host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()))
+}
+
+fn mailbox_config_matches(value: &Value, config: &Config) -> CliResult<bool> {
+    let database_url = nonempty_text(value, "database_url")?;
+    // Older servers do not expose the archive root. They cannot authorize an
+    // automatic switch from the selected local mailbox to this endpoint.
+    if value.get("storage_root").is_none() {
+        return Ok(false);
+    }
+    let storage_root = nonempty_text(value, "storage_root")?;
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url)
+        || mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
+    {
+        return Ok(false);
+    }
+    // A relative path belongs to the daemon's working directory, which is not
+    // established by this resource. Do not resolve it against the CLI's CWD.
+    if !Path::new(storage_root).is_absolute()
+        || mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
+            .is_none_or(|path| !path.is_absolute())
+    {
+        return Ok(false);
+    }
+    let database_identity = |url: &str| {
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(url)
+            .map(|resolved| resolved.canonical_path)
+    };
+    let expected_database = database_identity(&config.database_url)
+        .map_err(|_| invalid_response("selected mailbox database URL is invalid"))?;
+    let actual_database = database_identity(database_url)
+        .map_err(|_| invalid_response("server mailbox database URL is invalid"))?;
+    let path_identity =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    Ok(expected_database == actual_database
+        && path_identity(&config.storage_root) == path_identity(Path::new(storage_root)))
 }
 
 #[derive(Debug, Clone)]
@@ -588,8 +750,258 @@ fn validate_snapshot(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) enum TestReply {
+        Resource(Value),
+        Tool(Value),
+        Raw(u16, Value),
+    }
+
+    /// Exercise the real HTTP and JSON-RPC client without requiring a local
+    /// mailbox. Scripted peer data challenges routing and trust decisions;
+    /// the complete conversation resource has separate real DB coverage.
+    pub(crate) fn with_test_server<R>(
+        replies: impl FnOnce(&Config) -> Vec<TestReply>,
+        run: impl FnOnce(&Config) -> R,
+    ) -> (R, Vec<Value>) {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &directory.path().join("never-opened.sqlite3"),
+            ),
+            storage_root: directory.path().join("never-opened-archive"),
+            http_host: "127.0.0.1".into(),
+            http_port: port,
+            http_path: "/mcp/".into(),
+            http_bearer_token: Some("read-test-token".into()),
+            ..Config::default()
+        };
+        let replies = replies(&config);
+        let endpoint = format!("http://127.0.0.1:{port}/mcp/");
+        let outcome = std::thread::scope(|scope| {
+            let peer = scope.spawn(move || {
+                let mut requests = Vec::new();
+                for reply in replies {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let (mut stream, _) = loop {
+                        match listener.accept() {
+                            Ok(connection) => break connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "missing scripted request");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("accept failed: {error}"),
+                        }
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let mut reader = std::io::BufReader::new(&mut stream);
+                    let mut length = None;
+                    let mut authenticated = false;
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                length = Some(value.trim().parse::<usize>().unwrap());
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                authenticated = value.trim() == "Bearer read-test-token";
+                            }
+                        }
+                    }
+                    assert!(authenticated, "the pinned credential must be sent");
+                    let mut bytes = vec![0; length.unwrap()];
+                    reader.read_exact(&mut bytes).unwrap();
+                    let request: Value = serde_json::from_slice(&bytes).unwrap();
+                    let (status, body) = match reply {
+                        TestReply::Resource(payload) => {
+                            assert_eq!(request["method"], "resources/read");
+                            (200, serde_json::json!({
+                                "jsonrpc":"2.0", "id":request["id"],
+                                "result":{"contents":[{"uri":request["params"]["uri"],
+                                    "mimeType":"application/json", "text":payload.to_string()}]}
+                            }))
+                        }
+                        TestReply::Tool(payload) => {
+                            assert_eq!(request["method"], "tools/call");
+                            (200, serde_json::json!({
+                                "jsonrpc":"2.0", "id":request["id"],
+                                "result":{"isError":false,"content":[{"type":"text","text":payload.to_string()}]}
+                            }))
+                        }
+                        TestReply::Raw(status, mut payload) => {
+                            if let Some(object) = payload.as_object_mut() {
+                                object.entry("id").or_insert_with(|| request["id"].clone());
+                            }
+                            (status, payload)
+                        }
+                    };
+                    let body = body.to_string();
+                    write!(stream,
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                    ).unwrap();
+                    requests.push(request);
+                }
+                requests
+            });
+            let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("AGENT_MAIL_URL", &endpoint),
+                    ("AGENT_MAIL_TOKEN", "read-test-token"),
+                ],
+                || run(&config),
+            );
+            (result, peer.join().unwrap())
+        });
+        assert!(
+            !config.storage_root.exists(),
+            "routing must not initialize an archive"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "routing must not initialize a DB, sidecar or lock"
+        );
+        outcome
+    }
+
+    pub(crate) fn mailbox_payload(config: &Config) -> Value {
+        serde_json::json!({"database_url": config.database_url, "storage_root": config.storage_root})
+    }
+
+    #[test]
+    fn automatic_mailbox_identity_never_equates_paths_on_different_hosts() {
+        for endpoint in [
+            "http://localhost:8765/mcp/",
+            "http://127.0.0.1:8765/mcp/",
+            "https://[::1]/mcp/",
+        ] {
+            assert!(is_local_mailbox_endpoint(endpoint).unwrap(), "{endpoint}");
+        }
+        for endpoint in [
+            "https://mail.example/mcp/",
+            "http://192.0.2.1/mcp/",
+            "http://localhost.example/mcp/",
+        ] {
+            assert!(!is_local_mailbox_endpoint(endpoint).unwrap(), "{endpoint}");
+        }
+        assert!(is_local_mailbox_endpoint("http://localhost@evil.example/mcp/").is_err());
+    }
+
+    #[test]
+    fn tool_reads_refuse_malformed_or_contradictory_success_envelopes() {
+        for result in [
+            serde_json::json!({"isError":"false","content":[{"type":"text","text":"{}"}]}),
+            serde_json::json!({"isError":true,"content":[{"type":"text","text":"{}"}]}),
+            serde_json::json!({"content":[{"type":"image","text":"{}"}]}),
+            serde_json::json!({"content":[{"type":"text","text":"{}"}],"structuredContent":{"different":true}}),
+            serde_json::json!({"content":[]}),
+        ] {
+            let (result, _) = with_test_server(
+                |config| {
+                    vec![
+                        TestReply::Resource(mailbox_payload(config)),
+                        TestReply::Raw(200, serde_json::json!({"jsonrpc":"2.0","result":result})),
+                    ]
+                },
+                |config| {
+                    crate::context::run_async(async {
+                        let session = ServerResourceSession::for_local_mailbox(config)
+                            .await?
+                            .unwrap();
+                        session
+                            .call_tool("search_messages", serde_json::json!({}))
+                            .await
+                    })
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn automatic_mailbox_selection_requires_both_file_authorities() {
+        let (result, requests) = with_test_server(
+            |config| vec![TestReply::Resource(mailbox_payload(config))],
+            |config| {
+                crate::context::run_async(ServerResourceSession::for_local_mailbox(config))
+                    .map(|session| session.is_some())
+            },
+        );
+        assert!(result.unwrap());
+        assert_eq!(requests[0]["params"]["uri"], MAILBOX_CONFIG_RESOURCE);
+
+        for variant in ["database", "archive", "legacy", "relative", "memory"] {
+            let (result, _) = with_test_server(
+                |config| {
+                    let mut payload = mailbox_payload(config);
+                    match variant {
+                        "database" => {
+                            payload["database_url"] = "sqlite:////unrelated/mail.db".into()
+                        }
+                        "archive" => payload["storage_root"] = "/unrelated/archive".into(),
+                        "legacy" => {
+                            payload.as_object_mut().unwrap().remove("storage_root");
+                        }
+                        "relative" => payload["database_url"] = "sqlite:///relative.db".into(),
+                        "memory" => payload["database_url"] = "sqlite:///:memory:".into(),
+                        _ => unreachable!(),
+                    }
+                    vec![TestReply::Resource(payload)]
+                },
+                |config| {
+                    crate::context::run_async(ServerResourceSession::for_local_mailbox(config))
+                        .map(|session| session.is_none())
+                },
+            );
+            assert!(result.unwrap(), "{variant} must not select the daemon");
+        }
+    }
+
+    #[test]
+    fn automatic_mailbox_selection_does_not_fall_back_after_rejection_or_bad_identity() {
+        for status in [200, 401, 403, 307] {
+            let (result, _) = with_test_server(
+                |_| {
+                    vec![TestReply::Raw(
+                        status,
+                        serde_json::json!({
+                            "jsonrpc":"2.0", "error":{"code":-32001,"message":"private-token"}
+                        }),
+                    )]
+                },
+                |config| {
+                    crate::context::run_async(ServerResourceSession::for_local_mailbox(config))
+                        .map(|session| session.is_some())
+                },
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("private-token"));
+        }
+        let (result, _) = with_test_server(
+            |config| {
+                let mut payload = mailbox_payload(config);
+                payload["storage_root"] = Value::Null;
+                vec![TestReply::Resource(payload)]
+            },
+            |config| {
+                crate::context::run_async(ServerResourceSession::for_local_mailbox(config))
+                    .map(|session| session.is_some())
+            },
+        );
+        assert!(result.is_err());
+    }
 
     fn project() -> Value {
         serde_json::json!({

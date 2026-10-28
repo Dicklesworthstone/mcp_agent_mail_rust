@@ -1,4 +1,4 @@
-//! Explicit, authenticated reads of complete conversation context.
+//! Authenticated reads of complete conversation context.
 //!
 //! No local mailbox is opened here. A single server read snapshot supplies
 //! receipts, sender metadata and thread positions; identity is checked before
@@ -172,7 +172,7 @@ fn validate_message(
     Ok(snapshot)
 }
 
-async fn project_before(
+pub(crate) async fn project_before(
     session: &ServerResourceSession,
     key: &str,
 ) -> CliResult<(String, ResolvedProject)> {
@@ -183,13 +183,26 @@ async fn project_before(
     }
     let uri = format!(
         "resource://project/{}?format=json",
-        encode_resource_component(key.trim())
+        encode_resource_component(&project_request_key(key))
     );
     let project = validate_project(&session.read(&uri).await?, key)?;
     Ok((uri, project))
 }
 
-async fn project_after(
+fn project_request_key(key: &str) -> String {
+    let key = key.trim();
+    if std::path::Path::new(key).is_absolute() {
+        // Match the local resolver's existing-directory aliases without Git
+        // identity discovery, which can write worktree metadata on a read.
+        mcp_agent_mail_core::resolve_project_path(key)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        key.to_string()
+    }
+}
+
+pub(crate) async fn project_after(
     session: &ServerResourceSession,
     uri: &str,
     key: &str,
@@ -216,30 +229,76 @@ pub(crate) fn read_thread(
         ));
     }
     let session = ServerResourceSession::new(config)?;
+    crate::context::run_async(read_thread_session(
+        &session,
+        project_key,
+        thread,
+        limit,
+        since,
+        include_bodies,
+    ))
+}
+
+pub(crate) fn try_read_thread(
+    config: &Config,
+    project_key: &str,
+    thread: &str,
+    limit: usize,
+    since: Option<i64>,
+    include_bodies: bool,
+) -> CliResult<Option<(ResolvedProject, ThreadContextSnapshot)>> {
+    if thread.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "thread id must not be empty".into(),
+        ));
+    }
+    // Preserve larger offline requests without weakening the server's bounded
+    // conversation snapshot contract.
+    if limit > MAX_CONTEXT_MESSAGES {
+        return Ok(None);
+    }
     crate::context::run_async(async {
-        let (project_uri, project) = project_before(&session, project_key).await?;
-        let mut uri = format!(
-            "resource://thread/{}?project={}&context=true&limit={limit}&include_bodies={include_bodies}&format=json",
-            encode_resource_component(thread),
-            encode_resource_component(&project.slug),
-        );
-        if let Some(cutoff) = since {
-            uri.push_str("&since_ts=");
-            uri.push_str(&encode_resource_component(
-                &mcp_agent_mail_db::micros_to_iso(cutoff),
-            ));
-        }
-        let snapshot = validate_thread(
-            session.read(&uri).await?,
-            &project,
-            thread,
-            limit,
-            since,
-            include_bodies,
-        )?;
-        project_after(&session, &project_uri, project_key, &project).await?;
-        Ok((project, snapshot))
+        let Some(session) = ServerResourceSession::for_local_mailbox(config).await? else {
+            return Ok(None);
+        };
+        let result =
+            read_thread_session(&session, project_key, thread, limit, since, include_bodies)
+                .await?;
+        session.verify_local_mailbox(config).await?;
+        Ok(Some(result))
     })
+}
+
+async fn read_thread_session(
+    session: &ServerResourceSession,
+    project_key: &str,
+    thread: &str,
+    limit: usize,
+    since: Option<i64>,
+    include_bodies: bool,
+) -> CliResult<(ResolvedProject, ThreadContextSnapshot)> {
+    let (project_uri, project) = project_before(session, project_key).await?;
+    let mut uri = format!(
+        "resource://thread/{}?project={}&context=true&limit={limit}&include_bodies={include_bodies}&format=json",
+        encode_resource_component(thread),
+        encode_resource_component(&project.slug),
+    );
+    if let Some(cutoff) = since {
+        uri.push_str("&since_ts=");
+        uri.push_str(&encode_resource_component(
+            &mcp_agent_mail_db::micros_to_iso(cutoff),
+        ));
+    }
+    let snapshot = validate_thread(
+        session.read(&uri).await?,
+        &project,
+        thread,
+        limit,
+        since,
+        include_bodies,
+    )?;
+    project_after(session, &project_uri, project_key, &project).await?;
+    Ok((project, snapshot))
 }
 
 pub(crate) fn read_message(
@@ -253,16 +312,42 @@ pub(crate) fn read_message(
         ));
     }
     let session = ServerResourceSession::new(config)?;
+    crate::context::run_async(read_message_session(&session, project_key, id))
+}
+
+pub(crate) fn try_read_message(
+    config: &Config,
+    project_key: &str,
+    id: i64,
+) -> CliResult<Option<(ResolvedProject, MessageContextSnapshot)>> {
+    if id <= 0 {
+        return Err(CliError::InvalidArgument(
+            "message id must be positive".into(),
+        ));
+    }
     crate::context::run_async(async {
-        let (project_uri, project) = project_before(&session, project_key).await?;
-        let uri = format!(
-            "resource://message/{id}?project={}&context=true&format=json",
-            encode_resource_component(&project.slug)
-        );
-        let snapshot = validate_message(session.read(&uri).await?, &project, id)?;
-        project_after(&session, &project_uri, project_key, &project).await?;
-        Ok((project, snapshot))
+        let Some(session) = ServerResourceSession::for_local_mailbox(config).await? else {
+            return Ok(None);
+        };
+        let result = read_message_session(&session, project_key, id).await?;
+        session.verify_local_mailbox(config).await?;
+        Ok(Some(result))
     })
+}
+
+async fn read_message_session(
+    session: &ServerResourceSession,
+    project_key: &str,
+    id: i64,
+) -> CliResult<(ResolvedProject, MessageContextSnapshot)> {
+    let (project_uri, project) = project_before(session, project_key).await?;
+    let uri = format!(
+        "resource://message/{id}?project={}&context=true&format=json",
+        encode_resource_component(&project.slug)
+    );
+    let snapshot = validate_message(session.read(&uri).await?, &project, id)?;
+    project_after(session, &project_uri, project_key, &project).await?;
+    Ok((project, snapshot))
 }
 
 #[cfg(test)]
@@ -302,6 +387,123 @@ mod tests {
             "position":3,"total_in_thread":4,
             "previous":{"id":2,"from":"RedRiver","subject":"older"},
             "next":{"id":4,"from":"BlueLake","subject":"newer"}})
+    }
+
+    fn project_resource() -> Value {
+        json!({"id":7,"slug":"demo","human_key":"/work/demo",
+            "created_at":mcp_agent_mail_db::micros_to_iso(100),"agents":[]})
+    }
+
+    #[test]
+    fn absolute_project_aliases_use_read_only_canonicalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        let dot_alias = directory.path().join(".");
+        assert_eq!(
+            project_request_key(&dot_alias.to_string_lossy()),
+            canonical.to_string_lossy()
+        );
+        #[cfg(unix)]
+        {
+            let alias_parent = tempfile::tempdir().unwrap();
+            let alias = alias_parent.path().join("project-link");
+            std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+            assert_eq!(
+                project_request_key(&alias.to_string_lossy()),
+                canonical.to_string_lossy()
+            );
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(project_request_key("demo"), "demo");
+    }
+
+    #[test]
+    fn automatic_conversation_reads_use_the_verified_daemon_without_local_files() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(project_resource()),
+                    TestReply::Resource(thread()),
+                    TestReply::Resource(project_resource()),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            |config| try_read_thread(config, "/work/demo", "TKT-1", 2, None, true),
+        );
+        let (project, result) = result.unwrap().expect("matching daemon selected");
+        assert_eq!(project.slug, "demo");
+        assert_eq!(result.message_count, 4);
+        assert_eq!(result.messages[0].id, 3);
+        assert!(
+            requests[2]["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("context=true")
+        );
+        assert_eq!(requests.len(), 5);
+
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(project_resource()),
+                    TestReply::Resource(single()),
+                    TestReply::Resource(project_resource()),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            |config| try_read_message(config, "demo", 3),
+        );
+        let (_, result) = result.unwrap().expect("matching daemon selected");
+        assert_eq!(result.position, 3);
+        assert_eq!(result.previous.unwrap().id, 2);
+        assert_eq!(result.next.unwrap().id, 4);
+        assert_eq!(requests.len(), 5);
+    }
+
+    #[test]
+    fn automatic_conversation_reads_refuse_a_mailbox_swap_after_the_snapshot() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+
+        let (result, _) = with_test_server(
+            |config| {
+                let mut swapped = mailbox_payload(config);
+                swapped["storage_root"] = json!("/another/archive");
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(project_resource()),
+                    TestReply::Resource(single()),
+                    TestReply::Resource(project_resource()),
+                    TestReply::Resource(swapped),
+                ]
+            },
+            |config| try_read_message(config, "demo", 3),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mailbox identity changed")
+        );
+    }
+
+    #[test]
+    fn automatic_conversation_reads_preserve_offline_and_explicit_server_semantics() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+
+        let (automatic, _) = with_test_server(
+            |_| vec![TestReply::Raw(503, json!({"error":"unavailable"}))],
+            |config| try_read_message(config, "demo", 3),
+        );
+        assert!(automatic.unwrap().is_none());
+        let (explicit, _) = with_test_server(
+            |_| vec![TestReply::Raw(503, json!({"error":"unavailable"}))],
+            |config| read_message(config, "demo", 3),
+        );
+        assert!(explicit.is_err(), "explicit --server never falls back");
     }
 
     #[test]

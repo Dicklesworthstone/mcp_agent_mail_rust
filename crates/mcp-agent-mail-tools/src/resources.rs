@@ -754,6 +754,7 @@ fn ts_f64_to_rfc3339(t: f64) -> Option<String> {
 pub struct EnvironmentSnapshot {
     pub environment: String,
     pub database_url: String,
+    pub storage_root: String,
     pub http: HttpSnapshot,
 }
 
@@ -785,6 +786,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
     let snapshot = EnvironmentSnapshot {
         environment: config.app_environment.to_string(),
         database_url: redact_database_url(&config.database_url),
+        storage_root: config.storage_root.to_string_lossy().into_owned(),
         http: HttpSnapshot {
             host: config.http_host.clone(),
             port: config.http_port,

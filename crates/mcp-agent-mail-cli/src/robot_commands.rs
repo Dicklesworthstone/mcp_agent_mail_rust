@@ -3055,7 +3055,7 @@ pub enum RobotSubcommand {
         /// Show messages after this timestamp.
         #[arg(long)]
         since: Option<String>,
-        /// Read through the configured MCP server without local database access.
+        /// Require the configured MCP server, even when its mailbox differs from local configuration.
         #[arg(long)]
         server: bool,
     },
@@ -3085,7 +3085,7 @@ pub enum RobotSubcommand {
     Message {
         /// Message ID.
         id: i64,
-        /// Read through the configured MCP server without local database access.
+        /// Require the configured MCP server, even when its mailbox differs from local configuration.
         #[arg(long)]
         server: bool,
     },
@@ -6252,6 +6252,13 @@ fn robot_server_project_key(project_flag: Option<&str>) -> Result<String, CliErr
     Ok(cwd.to_string_lossy().into_owned())
 }
 
+fn automatic_robot_project_key(project_flag: Option<&str>) -> Option<String> {
+    // Implicit CWD scope searches registered ancestors in the local resolver.
+    // A raw CWD request to the daemon is not equivalent, so preserve that path
+    // until the server exposes an authoritative ancestor-selection resource.
+    resolved_project_flag_or_env(project_flag)
+}
+
 fn build_robot_inbox_server_request(
     project_flag: Option<&str>,
     agent_flag: Option<&str>,
@@ -8072,7 +8079,7 @@ fn search_via_server(
     since: Option<&str>,
     limit: usize,
     cursor: Option<&str>,
-) -> Result<Option<SearchData>, CliError> {
+) -> Result<Option<(crate::context::ResolvedProject, SearchData)>, CliError> {
     validate_robot_search_window(limit, cursor)?;
     let mut arguments = serde_json::json!({
         "project_key": project_key,
@@ -8092,47 +8099,42 @@ fn search_via_server(
         arguments["since"] =
             mcp_agent_mail_core::timestamps::micros_to_iso(parse_since_micros(since)?).into();
     }
-    // Same endpoints and credentials as robot inbox's server route.
-    let bearer = crate::local_server_bearer_token(config);
-    for server_url in robot_inbox_server_urls(config) {
-        let call = crate::context::run_async(async {
-            Ok(crate::try_call_server_tool(
-                &server_url,
-                bearer.as_deref(),
-                "search_messages",
-                arguments.clone(),
-            )
-            .await)
+    crate::context::run_async(async {
+        let Some(session) =
+            crate::reservation_read::ServerResourceSession::for_local_mailbox(config).await?
+        else {
+            return Ok(None);
+        };
+        let (project_uri, project) =
+            crate::message_read::project_before(&session, project_key).await?;
+        // Resolve a path/slug once, then bind the tool call to the verified
+        // stored project. No worktree identity discovery or local DB admission.
+        arguments["project_key"] = project.human_key.clone().into();
+        let payload = session.call_tool("search_messages", arguments).await?;
+        let response = serde_json::from_value(payload).map_err(|_| {
+            CliError::Other("invalid server search response; refusing unverified results".into())
         })?;
-        match call {
-            crate::ServerToolCall::Success(result) => {
-                let Ok(payload) =
-                    crate::coerce_tool_result_json_or_error("search_messages", result)
-                else {
-                    return Ok(None);
-                };
-                let Ok(response) = serde_json::from_value(payload) else {
-                    return Ok(None);
-                };
-                return Ok(search_data_from_server_response(
-                    query,
-                    response,
-                    mcp_agent_mail_db::now_micros(),
-                ));
-            }
-            crate::ServerToolCall::Unavailable(_) => {}
-            // An unknown project or a bad filter: the direct path reports it.
-            crate::ServerToolCall::Rejected(_) => return Ok(None),
-        }
-    }
-    Ok(None)
+        let data = search_data_from_server_response(
+            query,
+            response,
+            mcp_agent_mail_db::now_micros(),
+        )
+        .ok_or_else(|| {
+            CliError::Other(
+                "server search response omitted relevance scores; refusing incomplete results"
+                    .into(),
+            )
+        })?;
+        crate::message_read::project_after(&session, &project_uri, project_key, &project).await?;
+        session.verify_local_mailbox(config).await?;
+        Ok(Some((project, data)))
+    })
 }
 
 /// Robot search data from the running server's `search_messages` response,
 /// requested with `explain` and bodies (br-kp1in.18). `None` when a hit
-/// carries no relevance score (a server that predates explain scores): the
-/// caller then takes the private-snapshot path rather than report invented
-/// relevance.
+/// carries no relevance score: callers must refuse incomplete results instead
+/// of reporting invented relevance.
 fn search_data_from_server_response(
     query: &str,
     response: mcp_agent_mail_tools::search::SearchResponse,
@@ -16419,18 +16421,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         } => {
             // For thread command, bodies included in md/json, excluded in toon
             let include_bodies = format != OutputFormat::Toon;
-            let (project_slug, data) = if server {
-                let config = mcp_agent_mail_core::Config::from_env();
-                let project_key = robot_server_project_key(args.project.as_deref())?;
-                let cutoff = since.as_deref().map(parse_since_micros).transpose()?;
-                let (project, snapshot) = crate::message_read::read_thread(
+            let config = mcp_agent_mail_core::Config::from_env();
+            let project_key = robot_server_project_key(args.project.as_deref())?;
+            let cutoff = since.as_deref().map(parse_since_micros).transpose()?;
+            let server_read = if server {
+                Some(crate::message_read::read_thread(
                     &config,
                     &project_key,
                     &id,
                     limit.unwrap_or(200),
                     cutoff,
                     include_bodies,
-                )?;
+                )?)
+            } else if let Some(project_key) = automatic_robot_project_key(args.project.as_deref()) {
+                crate::message_read::try_read_thread(
+                    &config,
+                    &project_key,
+                    &id,
+                    limit.unwrap_or(200),
+                    cutoff,
+                    include_bodies,
+                )?
+            } else {
+                None
+            };
+            let (project_slug, data) = if let Some((project, snapshot)) = server_read {
                 (project.slug, build_thread_from_server(snapshot))
             } else {
                 let scope = resolve_robot_project_scope(args.project.as_deref())?;
@@ -16449,11 +16464,20 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output_md(&env, format)?
         }
         RobotSubcommand::Message { id, server } => {
-            let (project_slug, data) = if server {
-                let config = mcp_agent_mail_core::Config::from_env();
-                let project_key = robot_server_project_key(args.project.as_deref())?;
-                let (project, snapshot) =
-                    crate::message_read::read_message(&config, &project_key, id)?;
+            let config = mcp_agent_mail_core::Config::from_env();
+            let project_key = robot_server_project_key(args.project.as_deref())?;
+            let server_read = if server {
+                Some(crate::message_read::read_message(
+                    &config,
+                    &project_key,
+                    id,
+                )?)
+            } else if let Some(project_key) = automatic_robot_project_key(args.project.as_deref()) {
+                crate::message_read::try_read_message(&config, &project_key, id)?
+            } else {
+                None
+            };
+            let (project_slug, data) = if let Some((project, snapshot)) = server_read {
                 (project.slug, build_message_from_server(snapshot))
             } else {
                 let scope = resolve_robot_project_scope(args.project.as_deref())?;
@@ -16477,11 +16501,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // br-kp1in.18: a running server answers from its live pool and
             // index in milliseconds; the private snapshot below costs seconds
             // per call on a large mailbox. The server's search has no
-            // recipient-kind filter, and only an explicit project is routed.
+            // recipient-kind filter, and implicit CWD retains the local
+            // ancestor-selection contract.
             if kind.is_none()
                 && !query.trim().is_empty()
-                && let Some(project_key) = resolved_project_flag_or_env(args.project.as_deref())
-                && let Some(data) = search_via_server(
+                && let Some(project_key) = automatic_robot_project_key(args.project.as_deref())
+                && let Some((project, data)) = search_via_server(
                     &config,
                     &project_key,
                     &query,
@@ -16492,8 +16517,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 )?
             {
                 let mut env = RobotEnvelope::new(cmd_name, format, data);
-                env._meta.project =
-                    Some(mcp_agent_mail_core::resolve_project_identity(&project_key).slug);
+                env._meta.project = Some(project.slug);
                 break 'search format_output(&env, format)?;
             }
             let read_db = crate::open_db_sync_async_canonical_read_best_effort_with_database_url(
@@ -23371,6 +23395,81 @@ mod tests {
     }
 
     #[test]
+    fn robot_search_uses_verified_server_project_and_never_opens_local_files() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Tool(serde_json::json!({"result":[{
+                        "id":7,"subject":"Deploy","importance":"high","ack_required":0,
+                        "created_ts":"2026-10-28T00:00:00Z","thread_id":"release","from":"BlueLake",
+                        "to":[],"cc":[],"body_md":"Ready to deploy","score":1.5
+                    }]})),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            |config| {
+                search_via_server(
+                    config,
+                    "registered-project",
+                    "deploy",
+                    Some("high"),
+                    None,
+                    20,
+                    None,
+                )
+            },
+        );
+        let (project, data) = result.unwrap().expect("selected matching daemon");
+        assert_eq!(project.slug, "registered-project");
+        assert_eq!(data.served_by, Some("server"));
+        assert_eq!(data.results[0].id, 7);
+        assert_eq!(requests[2]["params"]["name"], "search_messages");
+        assert_eq!(
+            requests[2]["params"]["arguments"]["project_key"],
+            "/work/demo"
+        );
+        assert_eq!(requests[2]["params"]["arguments"]["importance"], "high");
+        assert_eq!(requests.len(), 5);
+    }
+
+    #[test]
+    fn implicit_conversation_scope_keeps_registered_ancestor_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_memory().unwrap();
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)").unwrap();
+        conn.query_sync(
+            "INSERT INTO projects (id,slug,human_key,created_at) VALUES (7,'ancestor',?,100)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                root.to_string_lossy().into_owned(),
+            )],
+        )
+        .unwrap();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AGENT_MAIL_PROJECT", "")],
+            || {
+                assert!(automatic_robot_project_key(None).is_none());
+                assert_eq!(
+                    find_project_for_path_or_ancestors(&conn, &nested).unwrap(),
+                    (7, "ancestor".into())
+                );
+                assert_eq!(
+                    automatic_robot_project_key(Some("ancestor")).as_deref(),
+                    Some("ancestor")
+                );
+            },
+        );
+    }
+
+    #[test]
     fn robot_search_maps_a_server_response_and_refuses_unscored_hits() {
         // br-kp1in.18.
         let now_us = mcp_agent_mail_core::timestamps::iso_to_micros("2026-02-16T10:00:00Z")
@@ -23415,8 +23514,7 @@ mod tests {
             .collect();
         assert!(importance.contains(&("high", 1)) && importance.contains(&("normal", 1)));
 
-        // A server that predates explain scores: take the snapshot path
-        // rather than report relevance nobody computed.
+        // An unscored response cannot report relevance nobody computed.
         assert!(
             search_data_from_server_response("deploy", response(serde_json::Value::Null), now_us)
                 .is_none()
