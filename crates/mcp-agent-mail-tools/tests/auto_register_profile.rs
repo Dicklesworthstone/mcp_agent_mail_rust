@@ -860,7 +860,7 @@ async fn agent_names(ctx: &McpContext, project: &str) -> Vec<String> {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn qualified_recipient_is_delivered_into_its_project_over_an_approved_link() {
-    run_with_storage(|cx, _storage_root| async move {
+    run_with_storage(|cx, storage_root| async move {
         let ctx = McpContext::new(cx.clone(), 1);
         let frontend = format!("/tmp/xq-frontend-{}", unique_suffix());
         let backend = format!("/tmp/xq-backend-{}", unique_suffix());
@@ -1108,6 +1108,49 @@ fn qualified_recipient_is_delivered_into_its_project_over_an_approved_link() {
                 .any(|m| m["id"] == reply["id"] && m["from"] == "GreenCastle"),
             "the reply lands in BlueLake's frontend inbox: {blue_inbox:?}"
         );
+        mcp_agent_mail_storage::wbq_flush();
+        let archived_before_replay = archive_delivery_files(&storage_root);
+        let canonical_message = |slug: &str, id: i64| {
+            let root = Path::new(&storage_root)
+                .join("projects")
+                .join(slug)
+                .join("messages");
+            let suffix = format!("__{id}.md");
+            let paths: Vec<_> = archived_before_replay
+                .keys()
+                .filter(|path| {
+                    path.starts_with(&root)
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
+                })
+                .collect();
+            assert_eq!(paths.len(), 1, "one canonical message {id}: {paths:?}");
+            mcp_agent_mail_storage::read_message_file(paths[0])
+                .expect("read canonical cross-project message")
+        };
+        let reply_id = reply["id"].as_i64().expect("reply id");
+        let (archived_reply, archived_body) = canonical_message(
+            frontend_row["slug"].as_str().expect("frontend slug"),
+            reply_id,
+        );
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+        let conn = pool.acquire(&cx).await.into_result().expect("DB checkout");
+        let rows = conn
+            .query_sync(
+                "SELECT archive_metadata_json FROM messages WHERE id = ?",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(reply_id)],
+            )
+            .expect("durable cross-project reply metadata");
+        let metadata: String = rows[0].get_named("archive_metadata_json").unwrap();
+        let metadata: Value = serde_json::from_str(&metadata).expect("durable reply JSON");
+        assert_eq!(metadata["reply_to"], api_change);
+        assert_eq!(archived_reply["reply_to"], metadata["reply_to"]);
+        assert_eq!(archived_body, "Bumped.");
+        let (archived_send, _) = canonical_message(&backend_slug, api_change);
+        assert!(archived_send.get("reply_to").is_none());
+        drop(conn);
+
         // A retried reply replays instead of sending twice.
         let counts = delivery_counts(&cx).await;
         let replayed: Value = serde_json::from_str(
@@ -1135,6 +1178,11 @@ fn qualified_recipient_is_delivered_into_its_project_over_an_approved_link() {
         assert_eq!(replayed["id"], reply["id"]);
         assert_eq!(replayed["idempotent_replay"], true);
         assert_eq!(delivery_counts(&cx).await, counts);
+        mcp_agent_mail_storage::wbq_flush();
+        assert_eq!(
+            archive_delivery_files(&storage_root),
+            archived_before_replay
+        );
 
         // No placeholder in either project.
         assert_eq!(

@@ -3954,7 +3954,7 @@ effective_free_bytes={free}"
 
             // The shared-mailbox address is part of the envelope but gets no
             // per-agent inbox copy (it is not an agent).
-            let msg_json = serde_json::json!({
+            let mut msg_json = serde_json::json!({
                 "id": message_id,
                 "from": &sender.name,
                 "to": &envelope_to,
@@ -3970,6 +3970,9 @@ effective_free_bytes={free}"
                 "ack_required": message.ack_required != 0,
                 "attachments": &all_attachment_meta,
             });
+            if let Some(parent) = reply_to {
+                msg_json["reply_to"] = serde_json::json!(parent);
+            }
             try_write_message_archive(
                 config,
                 &delivery.slug,
