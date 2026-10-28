@@ -53,38 +53,84 @@ pub(super) struct CommittedIdentityProof {
     history_scanned: bool,
 }
 
+/// `Tree::get_path` reports NotFound both for a missing name and when an
+/// ancestor exists but is not a directory. Only the former proves absence.
+/// Walk verified tree entries explicitly, without following symlinks or
+/// gitlinks, and propagate object-read failures instead of discarding them.
+/// Keep at most one additional native tree; a returned entry owns its data.
+fn committed_path_entry(
+    repo: &Repository,
+    tree: Option<&Tree<'_>>,
+    relative: &str,
+    budget: &CanonicalScanBudget<'_>,
+) -> crate::Result<Option<git2::TreeEntry<'static>>> {
+    budget.checkpoint("git path")?;
+    let mut components = relative.split('/').peekable();
+    if Path::new(relative).is_absolute()
+        || relative.contains(['\\', '\0'])
+        || components.clone().any(|name| matches!(name, "" | "." | ".."))
+    {
+        return Err(invalid("committed canonical path is not a relative Git path"));
+    }
+    let Some(root) = tree else {
+        return Ok(None);
+    };
+    let mut parent: Option<Tree<'_>> = None;
+    while let Some(name) = components.next() {
+        budget.checkpoint("git path component")?;
+        let next = {
+            let current = parent.as_ref().unwrap_or(root);
+            let Some(entry) = current.get_name(name) else {
+                return Ok(None);
+            };
+            if components.peek().is_none() {
+                return Ok(Some(entry.to_owned()));
+            }
+            if entry.kind() != Some(ObjectType::Tree) || entry.filemode() != 0o040000 {
+                return Err(invalid(format!(
+                    "committed canonical ancestor {name} is not a directory; preserved"
+                )));
+            }
+            entry.id()
+        };
+        // An entry pointing at an unavailable object is not a missing name.
+        // Do not downgrade this failure to the successful absence result.
+        drop(parent.take());
+        parent = Some(repo.find_tree(next)?);
+    }
+    Err(invalid("committed canonical path has no terminal entry"))
+}
+
 fn canonical_is_committed(
+    repo: &Repository,
     tree: Option<&Tree<'_>>,
     canonical: &str,
     expected: Oid,
+    budget: &CanonicalScanBudget<'_>,
 ) -> crate::Result<bool> {
-    let Some(tree) = tree else {
-        return Ok(false);
-    };
-    match tree.get_path(Path::new(canonical)) {
-        Ok(entry)
+    match committed_path_entry(repo, tree, canonical, budget)? {
+        Some(entry)
             if entry.kind() == Some(ObjectType::Blob)
                 && matches!(entry.filemode(), 0o100644 | 0o100755)
                 && entry.id() == expected =>
         {
             Ok(true)
         }
-        Ok(_) => Err(invalid(format!(
+        Some(_) => Err(invalid(format!(
             "committed archive artifact {canonical} conflicts with authoritative message; preserved"
         ))),
-        Err(error) if error.code() == ErrorCode::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
+        None => Ok(false),
     }
 }
 
-fn namespace_tree(tree: Option<&Tree<'_>>, relative: &str) -> crate::Result<Option<Oid>> {
-    let Some(tree) = tree else {
+fn namespace_tree(
+    repo: &Repository,
+    tree: Option<&Tree<'_>>,
+    relative: &str,
+    budget: &CanonicalScanBudget<'_>,
+) -> crate::Result<Option<Oid>> {
+    let Some(entry) = committed_path_entry(repo, tree, relative, budget)? else {
         return Ok(None);
-    };
-    let entry = match tree.get_path(Path::new(relative)) {
-        Ok(entry) => entry,
-        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
     };
     if entry.kind() != Some(ObjectType::Tree) || entry.filemode() != 0o040000 {
         return Err(invalid(
@@ -115,8 +161,9 @@ pub(super) fn prepare_committed(
             "committed canonical target is outside its project namespace",
         ));
     }
-    let canonical_committed = canonical_is_committed(tree.as_ref(), canonical, expected)?;
-    let namespace_tree = namespace_tree(tree.as_ref(), &relative)?;
+    let canonical_committed =
+        canonical_is_committed(repo, tree.as_ref(), canonical, expected, budget)?;
+    let namespace_tree = namespace_tree(repo, tree.as_ref(), &relative, budget)?;
     let proof = CommittedIdentityProof {
         namespace: relative.clone(),
         namespace_tree,
@@ -193,7 +240,7 @@ pub(super) fn revalidate_prepared(
     let root = crate::archive_project_root_checked(archive)?.join("messages");
     let relative = crate::rel_path_cached(&archive.canonical_repo_root, &root)?;
     if relative != proof.namespace
-        || namespace_tree(tree.as_ref(), &relative)? != proof.namespace_tree
+        || namespace_tree(repo, tree.as_ref(), &relative, budget)? != proof.namespace_tree
         || (message_files_missing && !proof.history_scanned)
     {
         return Err(crate::StorageError::LockContention {
@@ -358,6 +405,274 @@ mod tests {
             std::fs::write(path, bytes).unwrap();
         }
         files
+    }
+
+    fn tree_with_entry(repo: &Repository, path: &str, mode: i32) -> (Oid, Oid) {
+        let target = if mode == 0o160000 {
+            let empty = repo.treebuilder(None).unwrap().write().unwrap();
+            let tree = repo.find_tree(empty).unwrap();
+            let signature = git2::Signature::now("recovery", "recovery@example.invalid").unwrap();
+            repo.commit(
+                None,
+                &signature,
+                &signature,
+                "gitlink witness",
+                &tree,
+                &[],
+            )
+            .unwrap()
+        } else {
+            repo.blob(b"retained committed ancestor evidence").unwrap()
+        };
+        let mut oid = target;
+        let mut entry_mode = mode;
+        for name in path.rsplit('/') {
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder.insert(name, oid, entry_mode).unwrap();
+            oid = builder.write().unwrap();
+            entry_mode = 0o040000;
+        }
+        (oid, target)
+    }
+
+    fn commit_ancestor(repo: &Repository, path: &str, mode: i32) -> (Oid, Oid) {
+        let (root, target) = tree_with_entry(repo, path, mode);
+        let tree = repo.find_tree(root).unwrap();
+        let parent = repo.head().ok().map(|head| head.peel_to_commit().unwrap());
+        let parents: Vec<_> = parent.iter().collect();
+        let signature = git2::Signature::now("recovery", "recovery@example.invalid").unwrap();
+        let head = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "ancestor witness",
+                &tree,
+                &parents,
+            )
+            .unwrap();
+        (head, target)
+    }
+
+    #[test]
+    fn committed_path_lookup_distinguishes_absence_from_nondirectory_ancestors() {
+        for mode in [0o100644, 0o100755, 0o120000, 0o160000] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let repo = Repository::init(dir.path()).unwrap();
+            let (root, target) = tree_with_entry(&repo, "projects/project", mode);
+            let tree = repo.find_tree(root).unwrap();
+            let budget = CanonicalScanBudget::default();
+            let path = "projects/project/messages/2026/01/message.md";
+            // This native error is exactly why a blanket NotFound => absent
+            // conversion is insufficient, even with a fully readable ODB.
+            assert_eq!(
+                tree.get_path(Path::new(path)).err().map(|error| error.code()),
+                Some(ErrorCode::NotFound)
+            );
+            let error = committed_path_entry(&repo, Some(&tree), path, &budget)
+                .err()
+                .expect("an existing non-directory ancestor is conflicting evidence");
+            assert!(
+                error
+                    .to_string()
+                    .contains("ancestor project is not a directory")
+            );
+            assert!(canonical_is_committed(&repo, Some(&tree), path, target, &budget).is_err());
+            assert!(
+                namespace_tree(&repo, Some(&tree), "projects/project/messages", &budget).is_err()
+            );
+            for absent in ["missing/child", "projects/missing/child"] {
+                assert!(
+                    committed_path_entry(&repo, Some(&tree), absent, &budget)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let retained = committed_path_entry(&repo, Some(&tree), "projects/project", &budget)
+                .unwrap()
+                .unwrap();
+            assert_eq!((retained.id(), retained.filemode()), (target, mode));
+        }
+    }
+
+    #[test]
+    fn committed_path_lookup_rejects_invalid_paths_even_without_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let budget = CanonicalScanBudget::default();
+        for path in [
+            "",
+            ".",
+            "..",
+            "/projects",
+            "missing//child",
+            "missing/../child",
+            "missing/./child",
+            "missing/",
+            "missing\\child",
+            "missing/\0child",
+        ] {
+            assert!(
+                committed_path_entry(&repo, None, path, &budget).is_err(),
+                "{path:?}"
+            );
+        }
+        assert!(
+            committed_path_entry(&repo, None, "projects/project/messages", &budget)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unavailable_intermediate_tree_is_not_absence_and_restoration_reenables_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let (root, target) = tree_with_entry(&repo, "projects/project", 0o100644);
+        let tree = repo.find_tree(root).unwrap();
+        let subtree = tree.get_name("projects").unwrap().id().to_string();
+        let object = repo
+            .path()
+            .join("objects")
+            .join(&subtree[..2])
+            .join(&subtree[2..]);
+        let retained = dir.path().join("retained-subtree-object");
+        let before = std::fs::read(&object).unwrap();
+        drop(tree);
+        drop(repo);
+        // Preserve the actual loose object, rather than substituting a mock
+        // lookup failure. Reopen to exclude the previous repository's cache.
+        std::fs::rename(&object, &retained).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        let tree = repo.find_tree(root).unwrap();
+        let budget = CanonicalScanBudget::default();
+        assert!(committed_path_entry(&repo, Some(&tree), "projects/project", &budget).is_err());
+        assert!(!object.exists());
+        assert_eq!(std::fs::read(&retained).unwrap(), before);
+        drop(tree);
+        drop(repo);
+        std::fs::rename(&retained, &object).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        let tree = repo.find_tree(root).unwrap();
+        assert_eq!(
+            committed_path_entry(&repo, Some(&tree), "projects/project", &budget)
+                .unwrap()
+                .unwrap()
+                .id(),
+            target
+        );
+    }
+
+    #[test]
+    fn missing_expected_leaf_blob_still_allows_authoritative_repair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let path = "messages/message.md";
+        let (root, target) = tree_with_entry(&repo, path, 0o100644);
+        let hex = target.to_string();
+        let object = repo.path().join("objects").join(&hex[..2]).join(&hex[2..]);
+        let retained = dir.path().join("retained-target-blob");
+        let before = std::fs::read(&object).unwrap();
+        drop(repo);
+        std::fs::rename(&object, &retained).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        let tree = repo.find_tree(root).unwrap();
+        assert!(repo.find_blob(target).is_err());
+        // The existing contract permits recreating this exact leaf from the
+        // authoritative bundle. Do not require that leaf object to be present
+        // merely to distinguish missing parents from absent path components.
+        assert!(
+            canonical_is_committed(
+                &repo,
+                Some(&tree),
+                path,
+                target,
+                &CanonicalScanBudget::default(),
+            )
+            .unwrap()
+        );
+        assert!(!object.exists());
+        assert_eq!(std::fs::read(retained).unwrap(), before);
+    }
+
+    #[test]
+    fn committed_ancestor_conflicts_refuse_repairs_without_changing_any_bundle_copy() {
+        for mode in [0o100644, 0o100755, 0o120000, 0o160000] {
+            for interrupted in [false, true] {
+                let (_dir, config, archive, message, recipients) = fixture();
+                crate::flush_async_commits();
+                let repo = Repository::open(&archive.repo_root).unwrap();
+                let ancestor =
+                    crate::rel_path_cached(&archive.canonical_repo_root, &archive.root).unwrap();
+                let (before, target) = commit_ancestor(&repo, &ancestor, mode);
+                let index_before = std::fs::read(repo.path().join("index")).ok();
+                let files = if interrupted {
+                    materialize_bundle(&archive, &message, &recipients)
+                } else {
+                    Vec::new()
+                };
+                let paths =
+                    crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                        .unwrap()
+                        .0;
+                let error =
+                    reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
+                        .unwrap_err();
+                assert!(
+                    error.to_string().contains("committed canonical ancestor"),
+                    "{error}"
+                );
+                assert_eq!(repo.head().unwrap().target(), Some(before));
+                assert_eq!(std::fs::read(repo.path().join("index")).ok(), index_before);
+                let head = repo.head().unwrap().peel_to_tree().unwrap();
+                let witness = head.get_path(Path::new(&ancestor)).unwrap();
+                assert_eq!((witness.id(), witness.filemode()), (target, mode));
+                if interrupted {
+                    for (path, bytes) in files {
+                        assert_eq!(std::fs::read(path).unwrap(), bytes);
+                    }
+                } else {
+                    assert!(!paths.canonical.exists());
+                    assert!(!paths.outbox.exists());
+                    assert!(paths.inbox.iter().all(|path| !path.exists()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_namespace_proof_cannot_survive_a_new_committed_ancestor_conflict() {
+        let (_dir, _config, archive, message, recipients) = fixture();
+        crate::flush_async_commits();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let full =
+            crate::render_message_bundle_content(&message, entry(&message, &recipients).body_md)
+                .unwrap();
+        let expected = Oid::hash_object(ObjectType::Blob, full.as_bytes()).unwrap();
+        let mut budget = CanonicalScanBudget::default();
+        let proof = prepare_committed(&repo, &archive, 42, &canonical, expected, true, &mut budget)
+            .unwrap();
+        assert!(
+            proof.namespace_tree.is_none(),
+            "fixture begins without committed messages"
+        );
+        let ancestor =
+            crate::rel_path_cached(&archive.canonical_repo_root, &archive.root).unwrap();
+        let (before, _) = commit_ancestor(&repo, &ancestor, 0o100644);
+        let error = revalidate_prepared(&repo, &archive, &proof, true, &mut budget).unwrap_err();
+        assert!(
+            error.to_string().contains("committed canonical ancestor"),
+            "{error}"
+        );
+        assert_eq!(repo.head().unwrap().target(), Some(before));
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        assert!(paths.inbox.iter().all(|path| !path.exists()));
     }
 
     #[test]
