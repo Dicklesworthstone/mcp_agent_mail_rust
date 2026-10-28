@@ -174,17 +174,17 @@ use mcp_agent_mail_tools::{
     MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
     MailboxResource, MailboxWithCommitsResource, MarkAllRead, MarkMessageRead,
     MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
-    ProjectDetailsQueryResource, ProjectDetailsResource, ProjectsListQueryResource,
-    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
-    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    RetireAgent, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
-    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
-    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
-    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
-    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
-    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
-    ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource,
-    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
+    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
+    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
+    RequestContact, ResolvePaneIdentity, RespondContact, RetireAgent, SearchMessages,
+    SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct,
+    ThreadDetailsResource, ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource,
+    ToolingDiagnosticsResource, ToolingDirectoryQueryResource, ToolingDirectoryResource,
+    ToolingLocksQueryResource, ToolingLocksResource, ToolingMetricsCoreQueryResource,
+    ToolingMetricsCoreResource, ToolingMetricsQueryResource, ToolingMetricsResource,
+    ToolingRecentResource, ToolingSchemasQueryResource, ToolingSchemasResource,
+    UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource, ViewsAckRequiredResource,
+    ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -1009,7 +1009,6 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         .resource(ProjectsListResource)
         .resource(ProjectsListQueryResource)
         .resource(ProjectDetailsResource)
-        .resource(ProjectDetailsQueryResource)
         .resource(AgentsListResource)
         .resource(ProductDetailsResource)
         .resource(IdentityProjectResource)
@@ -37029,6 +37028,17 @@ first body
         assert_eq!(
             state.server_info.name, COMPAT_SERVER_NAME,
             "COMPAT LOCK: build_server() must produce the locked server name"
+        );
+        assert_eq!(state.router.tools_count(), 45);
+        let templates = state.router.resource_templates();
+        assert_eq!(templates.len(), 25);
+        assert_eq!(
+            templates
+                .iter()
+                .filter(|template| template.uri_template.starts_with("resource://project/"))
+                .map(|template| template.uri_template.as_str())
+                .collect::<Vec<_>>(),
+            ["resource://project/{slug}"]
         );
     }
 

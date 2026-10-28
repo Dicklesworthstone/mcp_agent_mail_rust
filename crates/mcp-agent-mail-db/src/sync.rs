@@ -2281,7 +2281,7 @@ mod tests {
         let metadata =
             priority_inbox_snapshot_from_conn(&conn, project, viewer, priority_options()).unwrap();
         assert_eq!(metadata.rows.len(), 1);
-        assert!(metadata.rows[0].message.body_md.is_empty());
+        assert_eq!(metadata.rows[0].message.body_md, "");
         struct NoBodyRead<'a> {
             conn: &'a DbConn,
         }

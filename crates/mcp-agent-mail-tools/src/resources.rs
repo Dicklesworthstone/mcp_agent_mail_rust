@@ -2724,21 +2724,134 @@ pub struct ProjectPathResolution {
     pub requested_path: String,
 }
 
+const PROJECT_DETAILS_RESOURCE_URI: &str = "resource://project/{slug}";
+const PROJECT_DETAILS_RESOURCE_DESCRIPTION: &str = "Fetch a project and its agents by project slug or human key.\n\nWhen to use\n-----------\n- Populate an \"LDAP-like\" directory for agents in tooling UIs.\n- Determine available agent identities and their metadata before addressing mail.\n\nParameters\n----------\nslug : str\n    Project slug (or human key; both resolve to the same target).\n\nReturns\n-------\ndict\n    Project descriptor including { agents: [...] } with agent profiles.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r3\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://project/backend-abc123\"}}\n```";
+
+/// One project route for both ordinary reads and query-aware resolution.
+///
+/// Read the original URI so encoded delimiters remain path data until the
+/// query is separated. Registering a second query template overlaps this route.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectDetailsResource;
+
+impl fastmcp_server::ResourceHandler for ProjectDetailsResource {
+    fn definition(&self) -> fastmcp_protocol::Resource {
+        fastmcp_protocol::Resource {
+            uri: PROJECT_DETAILS_RESOURCE_URI.to_string(),
+            name: "project_details".to_string(),
+            description: Some(PROJECT_DETAILS_RESOURCE_DESCRIPTION.to_string()),
+            mime_type: Some("text/plain".to_string()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
+        let definition = self.definition();
+        Some(fastmcp_protocol::ResourceTemplate {
+            uri_template: definition.uri,
+            name: definition.name,
+            description: definition.description,
+            mime_type: definition.mime_type,
+            icon: definition.icon,
+            version: definition.version,
+            tags: definition.tags,
+        })
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+        Err(McpError::invalid_params(
+            "project resource requires a concrete URI",
+        ))
+    }
+
+    fn read_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> fastmcp_server::BoxFuture<
+        'a,
+        fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+    > {
+        Box::pin(async move {
+            match project_resource_contents(ctx, uri).await {
+                Ok(contents) => fastmcp_core::Outcome::Ok(contents),
+                Err(error) => fastmcp_core::Outcome::Err(error),
+            }
+        })
+    }
+
+    fn read_final_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> fastmcp_server::BoxFuture<
+        'a,
+        fastmcp_core::McpOutcome<
+            fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+        >,
+    > {
+        Box::pin(async move {
+            match project_resource_contents(ctx, uri)
+                .await
+                .and_then(fastmcp_server::promote_legacy_resource_contents)
+            {
+                Ok(contents) => fastmcp_core::Outcome::Ok(contents),
+                Err(error) => fastmcp_core::Outcome::Err(error),
+            }
+        })
+    }
+
+    fn read_final_outcome_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> fastmcp_server::BoxFuture<
+        'a,
+        fastmcp_core::McpOutcome<
+            fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>,
+        >,
+    > {
+        Box::pin(async move {
+            match project_resource_contents(ctx, uri)
+                .await
+                .and_then(fastmcp_server::promote_legacy_resource_contents)
+                .map(fastmcp_server::FinalMethodOutcome::Complete)
+            {
+                Ok(contents) => fastmcp_core::Outcome::Ok(contents),
+                Err(error) => fastmcp_core::Outcome::Err(error),
+            }
+        })
+    }
+}
+
+async fn project_resource_contents(
+    ctx: &McpContext,
+    uri: &str,
+) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+    let target = uri
+        .strip_prefix("resource://project/")
+        .ok_or_else(|| McpError::invalid_params("invalid project resource URI"))?;
+    let text = project_details(ctx, target.to_string()).await?;
+    Ok(vec![fastmcp_protocol::ResourceContent {
+        uri: uri.to_string(),
+        mime_type: Some("text/plain".to_string()),
+        text: Some(text),
+        blob: None,
+    }])
+}
+
 /// Get project details.
-#[resource(
-    uri = "resource://project/{slug}",
-    description = "Fetch a project and its agents by project slug or human key.\n\nWhen to use\n-----------\n- Populate an \"LDAP-like\" directory for agents in tooling UIs.\n- Determine available agent identities and their metadata before addressing mail.\n\nParameters\n----------\nslug : str\n    Project slug (or human key; both resolve to the same target).\n\nReturns\n-------\ndict\n    Project descriptor including { agents: [...] } with agent profiles.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r3\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://project/backend-abc123\"}}\n```"
-)]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug, query) = split_param_and_query(&slug);
     project_details_impl(ctx, slug, query).await
 }
 
 /// Resolve a project with query options while preserving the decoded path.
-#[resource(
-    uri = "resource://project/{slug}?{query}",
-    description = "Fetch a project and its agents by slug or human key. With resolve=ancestors, select the nearest registered ancestor of an absolute path from the live database without registering a project. Agent profiles are active-only by default; include_retired=true also includes canonical retired identities for reading their direct mail history, without reactivating them. include_retired accepts only true or false; permanently deregistered identities remain excluded."
-)]
 pub async fn project_details_query(
     ctx: &McpContext,
     slug: String,
@@ -6667,11 +6780,13 @@ mod resource_shape_tests {
                     let before = inbox_read_only_witness(&cx, &pool, agent_id).await;
                     assert_eq!(before["direct"].as_array().unwrap().len(), 2);
                     assert_eq!(before["shared"].as_array().unwrap().len(), 1);
-                    let encoded_project = project
-                        .human_key
-                        .bytes()
-                        .map(|byte| format!("%{byte:02X}"))
-                        .collect::<String>();
+                    let mut encoded_project = String::new();
+                    for byte in project.human_key.bytes() {
+                        use std::fmt::Write as _;
+
+                        write!(&mut encoded_project, "%{byte:02X}")
+                            .expect("write escaped project byte");
+                    }
                     let state = fastmcp_core::SessionState::new();
                     let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
                     crate::session_identity::bind(&ctx, project_id, agent_id, &agent.name);
@@ -6901,7 +7016,6 @@ mod resource_shape_tests {
                     crate::session_identity::bind(&ctx, project_id, agent_id, &agent.name);
                     let mut router = agent_mail_resource_router();
                     router.add_resource(ProjectDetailsResource);
-                    router.add_resource(ProjectDetailsQueryResource);
                     for (query, included) in [
                         ("", false),
                         ("?include_retired=false&format=json", false),
@@ -7328,13 +7442,17 @@ mod resource_shape_tests {
                 let ctx = McpContext::new(cx.clone(), 1);
                 let capability = parse_json(&config_environment(&ctx).expect("config capability"));
                 assert_eq!(capability["project_path_resolution"], "nearest_ancestor_v1");
-                let mut router = fastmcp_server::Router::new();
-                router.add_resource(ProjectDetailsResource);
-                router.add_resource(ProjectDetailsQueryResource);
-                let encoded = key
-                    .bytes()
-                    .map(|byte| format!("%{byte:02X}"))
-                    .collect::<String>();
+                let router = fastmcp_server::Server::new("project-resource-routing", "test")
+                    .resource(ProjectDetailsResource)
+                    .try_build()
+                    .expect("one project route must pass final template admission")
+                    .into_router();
+                let mut encoded = String::new();
+                for byte in key.bytes() {
+                    use std::fmt::Write as _;
+
+                    write!(&mut encoded, "%{byte:02X}").expect("write escaped project byte");
+                }
                 for mode in ["exact", "ancestors"] {
                     let uri = format!("resource://project/{encoded}?resolve={mode}&format=json");
                     let response = router

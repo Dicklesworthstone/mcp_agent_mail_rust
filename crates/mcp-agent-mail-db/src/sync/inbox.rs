@@ -736,7 +736,7 @@ pub fn fetch_shared(
     fetch_shared_with_policy(conn, project_id, agent_id, since_ts, limit, options, false)
 }
 
-pub(crate) fn fetch_shared_with_policy(
+pub fn fetch_shared_with_policy(
     conn: &impl SyncQuery,
     project_id: i64,
     agent_id: i64,
@@ -1762,7 +1762,7 @@ mod scaling_tests {
                 let start = Instant::now();
                 let rows = with_snapshot(conn, || {
                     let window = receipt_window(conn, 1, 2, None, limit, filters)?;
-                    hydrate(conn, 1, window, filters.body_policy)
+                    hydrate(conn, 1, window, filters.body_policy, false)
                 })
                 .unwrap();
                 (rows, start.elapsed().as_micros())
@@ -1898,7 +1898,7 @@ mod scaling_tests {
                 let start = Instant::now();
                 let rows = with_snapshot(conn, || {
                     let window = receipt_window(conn, 1, 2, None, 20, filters)?;
-                    hydrate(conn, 1, window, filters.body_policy)
+                    hydrate(conn, 1, window, filters.body_policy, false)
                 })
                 .unwrap();
                 (rows, start.elapsed().as_micros())
@@ -1907,7 +1907,7 @@ mod scaling_tests {
                 let start = Instant::now();
                 let rows = with_snapshot(conn, || {
                     let window = original_receipt_window(conn, filters)?;
-                    hydrate(conn, 1, window, filters.body_policy)
+                    hydrate(conn, 1, window, filters.body_policy, false)
                 })
                 .unwrap();
                 (rows, start.elapsed().as_micros())

@@ -20802,7 +20802,7 @@ mod tests {
 
     #[test]
     fn robot_inbox_snapshot_preserves_filter_precedence() {
-        let rows = vec![
+        let rows = [
             inbox_snapshot_test_row(1, "urgent", 120, true, false),
             inbox_snapshot_test_row(2, "normal", 60, true, true),
             inbox_snapshot_test_row(3, "normal", 5, true, false),
