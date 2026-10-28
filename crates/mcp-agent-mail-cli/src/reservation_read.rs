@@ -37,6 +37,7 @@ pub(crate) struct ServerResourceSession {
     server_url: String,
     bearer: Option<String>,
     ancestor_resolution: bool,
+    inbox_priority_snapshot: bool,
 }
 
 impl ServerResourceSession {
@@ -63,6 +64,7 @@ impl ServerResourceSession {
             server_url,
             bearer,
             ancestor_resolution: false,
+            inbox_priority_snapshot: false,
         })
     }
 
@@ -108,6 +110,7 @@ impl ServerResourceSession {
             return Ok(None);
         }
         session.ancestor_resolution = supports_ancestor_resolution(&payload)?;
+        session.inbox_priority_snapshot = supports_inbox_priority_snapshot(&payload)?;
         Ok(Some(session))
     }
 
@@ -115,10 +118,15 @@ impl ServerResourceSession {
         self.ancestor_resolution
     }
 
+    pub(crate) const fn supports_inbox_priority_snapshot(&self) -> bool {
+        self.inbox_priority_snapshot
+    }
+
     pub(crate) async fn verify_local_mailbox(&self, config: &Config) -> CliResult<()> {
         let payload = self.read(MAILBOX_CONFIG_RESOURCE).await?;
         if !mailbox_config_matches(&payload, config)?
             || (self.ancestor_resolution && !supports_ancestor_resolution(&payload)?)
+            || (self.inbox_priority_snapshot && !supports_inbox_priority_snapshot(&payload)?)
         {
             return Err(invalid_response(
                 "mailbox identity changed during server read",
@@ -200,6 +208,16 @@ fn supports_ancestor_resolution(value: &Value) -> CliResult<bool> {
         Some(Value::String(capability)) => Ok(capability == "nearest_ancestor_v1"),
         Some(_) => Err(invalid_response(
             "invalid project path resolution capability",
+        )),
+    }
+}
+
+fn supports_inbox_priority_snapshot(value: &Value) -> CliResult<bool> {
+    match value.get("inbox_priority_snapshot") {
+        None => Ok(false),
+        Some(Value::String(capability)) => Ok(capability == "priority_v1"),
+        Some(_) => Err(invalid_response(
+            "invalid inbox priority snapshot capability",
         )),
     }
 }

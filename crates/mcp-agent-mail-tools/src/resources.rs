@@ -860,6 +860,8 @@ pub struct EnvironmentSnapshot {
     pub storage_root: String,
     #[serde(default)]
     pub project_path_resolution: String,
+    #[serde(default)]
+    pub inbox_priority_snapshot: String,
     pub http: HttpSnapshot,
 }
 
@@ -893,6 +895,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
         database_url: redact_database_url(&config.database_url),
         storage_root: config.storage_root.to_string_lossy().into_owned(),
         project_path_resolution: "nearest_ancestor_v1".to_string(),
+        inbox_priority_snapshot: "priority_v1".to_string(),
         http: HttpSnapshot {
             host: config.http_host.clone(),
             port: config.http_port,
@@ -2734,7 +2737,7 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
 /// Resolve a project with query options while preserving the decoded path.
 #[resource(
     uri = "resource://project/{slug}?{query}",
-    description = "Fetch a project and its agents by slug or human key. With resolve=ancestors, select the nearest registered ancestor of an absolute path from the live database without registering a project."
+    description = "Fetch a project and its agents by slug or human key. With resolve=ancestors, select the nearest registered ancestor of an absolute path from the live database without registering a project. Agent profiles are active-only by default; include_retired=true also includes canonical retired identities for reading their direct mail history, without reactivating them. include_retired accepts only true or false; permanently deregistered identities remain excluded."
 )]
 pub async fn project_details_query(
     ctx: &McpContext,
@@ -2751,6 +2754,16 @@ async fn project_details_impl(
     slug: String,
     query: HashMap<String, String>,
 ) -> McpResult<String> {
+    let include_retired = match query.get("include_retired").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "include_retired must be true or false",
+            ));
+        }
+    };
     let ancestor_paths = match query.get("resolve").map(String::as_str) {
         None | Some("exact") => None,
         Some("ancestors") => Some(resource_project_ancestor_paths(&slug)?),
@@ -2779,8 +2792,9 @@ async fn project_details_impl(
 
     let project_id = project.id.unwrap_or(0);
 
-    // This resource advertises available recipients, so use the same canonical
-    // lifecycle snapshot as the agent directory and omit retired identities.
+    // Preserve canonical identity and deregistration rules in both modes.
+    // Default discovery advertises active recipients; history readers can
+    // explicitly request retired identities without changing their lifecycle.
     let agents = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_agent_roster(ctx.cx(), &pool, project_id).await,
     )?;
@@ -2793,7 +2807,7 @@ async fn project_details_impl(
         resolution,
         agents: agents
             .into_iter()
-            .filter(|agent| agent.retired_at.is_none())
+            .filter(|agent| include_retired || agent.retired_at.is_none())
             .map(|a| ProjectAgentEntry {
                 id: a.id.unwrap_or(0),
                 name: a.name,
@@ -3234,14 +3248,213 @@ pub struct InboxResourceResponse {
     pub project: String,
 }
 
+fn priority_inbox_bool(query: &HashMap<String, String>, key: &str) -> McpResult<bool> {
+    match query.get(key).map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!("priority inbox {key} must be true or false"),
+        )),
+    }
+}
+
+fn priority_inbox_options(
+    query: &HashMap<String, String>,
+) -> McpResult<mcp_agent_mail_db::sync::InboxPriorityOptions> {
+    use mcp_agent_mail_db::sync::{InboxPriorityOptions, MAX_PRIORITY_INBOX_ROWS};
+
+    for key in query.keys() {
+        if !matches!(
+            key.as_str(),
+            "context"
+                | "project"
+                | "urgent"
+                | "ack_overdue"
+                | "unread"
+                | "all"
+                | "limit"
+                | "include_bodies"
+                | "format"
+        ) {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("unsupported priority inbox parameter: {key}"),
+            ));
+        }
+    }
+    if query.get("format").is_some_and(|format| format != "json") {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "priority inbox format must be json",
+        ));
+    }
+    let limit = query
+        .get("limit")
+        .map_or(Some(RESOURCE_LIMIT_DEFAULT), |value| {
+            value.parse::<usize>().ok()
+        });
+    let limit = limit
+        .filter(|limit| (1..=MAX_PRIORITY_INBOX_ROWS).contains(limit))
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                "priority inbox limit must be between 1 and 1000",
+            )
+        })?;
+    Ok(InboxPriorityOptions {
+        urgent: priority_inbox_bool(query, "urgent")?,
+        ack_overdue: priority_inbox_bool(query, "ack_overdue")?,
+        unread: priority_inbox_bool(query, "unread")?,
+        all: priority_inbox_bool(query, "all")?,
+        limit,
+        include_bodies: priority_inbox_bool(query, "include_bodies")?,
+    })
+}
+
+/// The priority response deliberately contains only the identity witness and
+/// selected inbox rows. Registration tokens, other recipients and attachments
+/// are not part of this read contract.
+fn priority_inbox_snapshot_json(
+    snapshot: mcp_agent_mail_db::sync::InboxPrioritySnapshot,
+    options: mcp_agent_mail_db::sync::InboxPriorityOptions,
+) -> McpResult<String> {
+    let mut messages = Vec::with_capacity(snapshot.rows.len());
+    for row in snapshot.rows {
+        let message = row.message;
+        if message.id.is_none_or(|id| id <= 0)
+            || message.project_id != snapshot.project.id.unwrap_or(0)
+            || message.sender_id <= 0
+            || row.sender_name.trim().is_empty()
+            || !matches!(
+                message.importance.as_str(),
+                "low" | "normal" | "high" | "urgent"
+            )
+            || !matches!(message.ack_required, 0 | 1)
+            || !matches!(row.kind.as_str(), "to" | "cc" | "bcc" | "project")
+        {
+            return Err(McpError::internal_error(
+                "priority inbox contains invalid message identity or delivery metadata",
+            ));
+        }
+        let mut value = serde_json::json!({
+            "id": message.id,
+            "project_id": message.project_id,
+            "sender_id": message.sender_id,
+            "from": row.sender_name,
+            "subject": message.subject,
+            "thread_id": message.thread_id,
+            "topic": message.topic,
+            "importance": message.importance,
+            "ack_required": message.ack_required != 0,
+            "created_ts": micros_to_iso(message.created_ts),
+            "read_ts": row.read_ts.map(micros_to_iso),
+            "ack_ts": row.ack_ts.map(micros_to_iso),
+            "kind": row.kind,
+            "via": crate::messaging::inbox_via(&row.kind),
+        });
+        if options.include_bodies {
+            value["body_md"] = Value::String(message.body_md);
+        }
+        messages.push(value);
+    }
+    let value = serde_json::json!({
+        "schema_version": 1,
+        // Complete requested priority top-N, not a claim that the mailbox
+        // contains no further messages.
+        "complete": true,
+        "project": {
+            "id": snapshot.project.id,
+            "slug": snapshot.project.slug,
+            "human_key": snapshot.project.human_key,
+            "created_at": micros_to_iso(snapshot.project.created_at),
+        },
+        "agent": {
+            "id": snapshot.agent.id,
+            "project_id": snapshot.agent.project_id,
+            "name": snapshot.agent.name,
+            "inception_ts": micros_to_iso(snapshot.agent.inception_ts),
+        },
+        "captured_ts": micros_to_iso(snapshot.captured_ts),
+        "ack_overdue_before": micros_to_iso(snapshot.ack_overdue_before),
+        "urgent": options.urgent,
+        "ack_overdue": options.ack_overdue,
+        "unread": options.unread,
+        "all": options.all,
+        "limit": options.limit,
+        "include_bodies": options.include_bodies,
+        "count": messages.len(),
+        "messages": messages,
+    });
+    let json = serde_json::to_string(&value).map_err(|error| {
+        McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}"))
+    })?;
+    if json.len() > mcp_agent_mail_db::sync::MAX_PRIORITY_INBOX_BYTES {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "priority inbox snapshot exceeds the 4 MiB JSON limit; reduce limit or omit bodies",
+        ));
+    }
+    Ok(json)
+}
+
+async fn priority_inbox_resource(
+    ctx: &McpContext,
+    agent_name: &str,
+    query: &HashMap<String, String>,
+) -> McpResult<String> {
+    let options = priority_inbox_options(query)?;
+    let project_key = query
+        .get("project")
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                "project query parameter is required",
+            )
+        })?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
+    let project = resolve_existing_resource_project(ctx, &pool, project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_resource_agent(ctx, &pool, project_id, agent_name).await?;
+    let conn = acquire_resource_conn(ctx.cx(), &pool).await?;
+    let snapshot = mcp_agent_mail_db::sync::priority_inbox_snapshot_from_conn(
+        &*conn,
+        project_id,
+        agent.id.unwrap_or(0),
+        options,
+    )
+    .map_err(db_error_to_mcp_error)?;
+    drop(conn);
+    if snapshot.project.id != project.id
+        || snapshot.project.slug != project.slug
+        || snapshot.project.human_key != project.human_key
+        || snapshot.project.created_at != project.created_at
+        || snapshot.agent.id != agent.id
+        || snapshot.agent.project_id != agent.project_id
+        || snapshot.agent.name != agent.name
+        || snapshot.agent.inception_ts != agent.inception_ts
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Project or agent identity changed during priority inbox resolution",
+        ));
+    }
+    crate::session_identity::authorize_actor(ctx, &snapshot.agent, false, "read mail")?;
+    priority_inbox_snapshot_json(snapshot, options)
+}
+
 /// Get inbox messages for an agent.
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://inbox/{agent}",
-    description = "Read an agent's inbox for a project.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nsince_ts : Optional[str]\n    ISO-8601 timestamp string; only messages newer than this are returned.\nurgent_only : bool\n    If true, limits to importance in {high, urgent}.\ninclude_bodies : bool\n    Include message bodies in results (default false).\nlimit : int\n    Maximum number of messages to return (default 20).\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [...] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&limit=10&urgent_only=true\"}}\n```\nIncremental fetch example (using since_ts):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&since_ts=2025-10-23T15:00:00Z\"}}\n```"
+    description = "Read an agent's inbox for a project.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nsince_ts : Optional[str]\n    ISO-8601 timestamp string; only messages newer than this are returned.\nurgent_only : bool\n    If true, limits to importance in {high, urgent}.\ninclude_bodies : bool\n    Include message bodies in results (default false).\nlimit : int\n    Maximum number of messages to return (default 20).\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [...] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&limit=10&urgent_only=true\"}}\n```\nIncremental fetch example (using since_ts):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&since_ts=2025-10-23T15:00:00Z\"}}\n```\n\nPriority snapshot (context=true)\n--------------------------------\nWhen config/environment advertises inbox_priority_snapshot=priority_v1, context=true returns schema_version=1 and a complete requested priority top-N from one read-only database snapshot. It includes project and agent identity epochs, captured_ts, the 30-minute ack_overdue_before cutoff, and exact nullable read_ts and ack_ts receipt states. It does not mark messages read, acknowledge them, update activity, or clear notification signals.\nFilter flags accept only true or false, with precedence urgent, ack_overdue, all, unread; when none applies, include unread or unacknowledged ack-required messages. Rows prioritize unread urgent/high, overdue acknowledgements, unread ack-required, other unread, other unacknowledged ack-required, then other read messages; each bucket is newest-first by created_ts and id.\nUse limit=1..1000 (default 20), include_bodies=true to include body_md, and format=json. since_ts and urgent_only are not supported in context mode. Registration tokens, other recipients, and attachments are excluded."
 )]
 pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
+    if priority_inbox_bool(&query, "context")? {
+        return priority_inbox_resource(ctx, &agent_name, &query).await;
+    }
 
     let project_key = query.get("project").cloned().unwrap_or_default();
     let include_bodies = query
@@ -5877,6 +6090,63 @@ mod resource_shape_tests {
         assert!(error.to_string().contains("4 MiB JSON limit"));
     }
 
+    #[test]
+    fn priority_inbox_snapshot_limits_serialized_escape_expansion() {
+        use mcp_agent_mail_db::sync::{
+            InboxPriorityOptions, InboxPrioritySnapshot, MAX_PRIORITY_INBOX_BYTES,
+        };
+
+        // The database byte budget counts source text; control bytes expand
+        // to six bytes each when the response is encoded as JSON.
+        let body_md = "\0".repeat(MAX_PRIORITY_INBOX_BYTES / 6 + 1);
+        assert!(body_md.len() < MAX_PRIORITY_INBOX_BYTES);
+        let snapshot = InboxPrioritySnapshot {
+            project: ProjectRow {
+                id: Some(7),
+                slug: "priority-snapshot".to_string(),
+                human_key: "/priority-snapshot".to_string(),
+                created_at: 1_000_000,
+            },
+            agent: mcp_agent_mail_db::AgentRow {
+                id: Some(11),
+                project_id: 7,
+                name: "BlueLake".to_string(),
+                inception_ts: 2_000_000,
+                ..Default::default()
+            },
+            captured_ts: 2_000_000_000,
+            ack_overdue_before: 200_000_000,
+            rows: vec![queries::InboxRow {
+                message: MessageRow {
+                    id: Some(13),
+                    project_id: 7,
+                    sender_id: 12,
+                    subject: "Escaped body".to_string(),
+                    body_md,
+                    importance: "normal".to_string(),
+                    created_ts: 3_000_000,
+                    ..Default::default()
+                },
+                kind: "to".to_string(),
+                sender_name: "RedPeak".to_string(),
+                read_ts: None,
+                ack_ts: None,
+            }],
+        };
+        let options = InboxPriorityOptions {
+            urgent: false,
+            ack_overdue: false,
+            unread: false,
+            all: false,
+            limit: 1,
+            include_bodies: true,
+        };
+        let error = priority_inbox_snapshot_json(snapshot, options)
+            .expect_err("JSON escaping must not bypass the response byte budget");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(error.to_string().contains("4 MiB JSON limit"));
+    }
+
     fn unique_suffix() -> u64 {
         let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6218,6 +6488,488 @@ mod resource_shape_tests {
         router.add_resource(ViewsAcksStaleResource);
         router.add_resource(ViewsAckOverdueResource);
         router
+    }
+
+    async fn inbox_read_only_witness(cx: &Cx, pool: &DbPool, agent_id: i64) -> Value {
+        let conn = acquire_resource_conn(cx, pool)
+            .await
+            .expect("witness reader");
+        let params = [mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)];
+        let mut receipts = Vec::new();
+        for table in ["message_recipients", "project_mailbox_receipts"] {
+            let rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT message_id, read_ts, ack_ts FROM {table} WHERE agent_id = ? ORDER BY message_id"
+                    ),
+                    &params,
+                )
+                .expect("receipt witness");
+            receipts.push(
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<i64>("message_id").unwrap(),
+                            row.get_named::<Option<i64>>("read_ts").unwrap(),
+                            row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let agents = conn
+            .query_sync(
+                "SELECT last_active_ts, retired_at FROM agents WHERE id = ?",
+                &params,
+            )
+            .expect("agent activity witness");
+        assert_eq!(agents.len(), 1);
+        serde_json::json!({
+            "direct": receipts[0],
+            "shared": receipts[1],
+            "last_active_ts": agents[0].get_named::<i64>("last_active_ts").unwrap(),
+            "retired_at": agents[0].get_named::<Option<i64>>("retired_at").unwrap(),
+        })
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn priority_inbox_router_preserves_receipts_activity_and_notifications() {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let signals = tempfile::tempdir().expect("private notification signals");
+        with_serialized_resources_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("DATABASE_POOL_TIMEOUT", "1"),
+                ("NOTIFICATIONS_ENABLED", "true"),
+                (
+                    "NOTIFICATIONS_SIGNALS_DIR",
+                    signals.path().to_str().expect("UTF-8 signals path"),
+                ),
+            ],
+            || {
+                run_async(|cx| async move {
+                    let pool = seed_pool();
+                    let project = ensure_project(&cx, &pool, "/priority inbox resource").await;
+                    let project_id = project.id.expect("project id");
+                    let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let sender = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                    let agent_id = agent.id.expect("agent id");
+                    let sender_id = sender.id.expect("sender id");
+                    let now = mcp_agent_mail_db::now_micros();
+                    let inception_ts = now - 180 * 60 * 1_000_000;
+                    let fixtures = [
+                        (
+                            "Old urgent",
+                            "urgent private body",
+                            "urgent",
+                            true,
+                            false,
+                            120,
+                        ),
+                        (
+                            "Shared overdue",
+                            "shared private body",
+                            "normal",
+                            true,
+                            true,
+                            60,
+                        ),
+                        (
+                            "New ordinary",
+                            "ordinary private body",
+                            "normal",
+                            false,
+                            false,
+                            1,
+                        ),
+                    ];
+                    let mut ids = Vec::new();
+                    let mut timestamps = Vec::new();
+                    for (subject, body, importance, ack_required, shared, age_minutes) in fixtures {
+                        let recipients = if shared {
+                            vec![]
+                        } else {
+                            vec![(agent_id, "to")]
+                        };
+                        let message = match queries::create_message_with_recipients_topic(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender_id,
+                            subject,
+                            body,
+                            Some("priority-resource"),
+                            Some("priority-topic"),
+                            None,
+                            importance,
+                            ack_required,
+                            "[]",
+                            &recipients,
+                            shared.then_some("to"),
+                        )
+                        .await
+                        {
+                            Outcome::Ok(message) => message,
+                            other => panic!("priority message fixture failed: {other:?}"),
+                        };
+                        ids.push(message.id.expect("message id"));
+                        timestamps.push(now - age_minutes * 60 * 1_000_000);
+                    }
+                    let writer = acquire_resource_conn(&cx, &pool)
+                        .await
+                        .expect("fixture writer");
+                    for (&id, &created_ts) in ids.iter().zip(&timestamps) {
+                        writer.execute_sync(
+                            "UPDATE messages SET created_ts = ?, recipients_json = ?, attachments = ? WHERE id = ?",
+                            &[
+                                SqlValue::BigInt(created_ts),
+                                SqlValue::Text(r#"{"bcc":["private-recipient-sentinel"]}"#.to_string()),
+                                SqlValue::Text(r#"[{"name":"private-attachment-sentinel"}]"#.to_string()),
+                                SqlValue::BigInt(id),
+                            ],
+                        ).expect("age messages and seed excluded metadata");
+                    }
+                    let shared_read_ts = now - 59 * 60 * 1_000_000;
+                    writer.execute_sync(
+                        "INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, ?, NULL)",
+                        &[
+                            SqlValue::BigInt(ids[1]),
+                            SqlValue::BigInt(agent_id),
+                            SqlValue::BigInt(shared_read_ts),
+                        ],
+                    ).expect("seed existing shared receipt");
+                    writer.execute_sync(
+                        "UPDATE agents SET inception_ts = ?, last_active_ts = ?, registration_token = ? WHERE id = ?",
+                        &[
+                            SqlValue::BigInt(inception_ts),
+                            SqlValue::BigInt(now - 90 * 60 * 1_000_000),
+                            SqlValue::Text("private-registration-token-sentinel".to_string()),
+                            SqlValue::BigInt(agent_id),
+                        ],
+                    ).expect("seed pre-delivery inception, stale activity, and private token");
+                    drop(writer);
+
+                    let signal_path = Config::from_env()
+                        .notifications_signals_dir
+                        .join("projects")
+                        .join(&project.slug)
+                        .join("agents")
+                        .join("BlueLake.signal");
+                    std::fs::create_dir_all(signal_path.parent().unwrap())
+                        .expect("signal directory");
+                    let signal_bytes =
+                        b"{\"project\":\"priority\",\"agent\":\"BlueLake\",\"pending\":3}\n";
+                    std::fs::write(&signal_path, signal_bytes).expect("notification witness");
+                    let before = inbox_read_only_witness(&cx, &pool, agent_id).await;
+                    assert_eq!(before["direct"].as_array().unwrap().len(), 2);
+                    assert_eq!(before["shared"].as_array().unwrap().len(), 1);
+                    let encoded_project = project
+                        .human_key
+                        .bytes()
+                        .map(|byte| format!("%{byte:02X}"))
+                        .collect::<String>();
+                    let state = fastmcp_core::SessionState::new();
+                    let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                    crate::session_identity::bind(&ctx, project_id, agent_id, &agent.name);
+                    let router = agent_mail_resource_router();
+                    for include_bodies in [false, true] {
+                        let response = router.handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://inbox/bluelake?project={encoded_project}&context=true&urgent=false&ack_overdue=false&unread=true&all=true&limit=3&include_bodies={include_bodies}&format=json"),
+                                meta: None,
+                            },
+                            state.clone(), None, None,
+                        ).await.expect("one-slot priority resource");
+                        let response = serde_json::to_value(response).unwrap();
+                        let text = response["contents"][0]["text"].as_str().unwrap();
+                        let value = parse_json(text);
+                        assert_eq!(value["schema_version"], 1);
+                        assert_eq!(value["complete"], true);
+                        assert_eq!(value["project"]["id"], project_id);
+                        assert_eq!(value["project"]["slug"], project.slug);
+                        assert_eq!(value["project"]["human_key"], project.human_key);
+                        assert_eq!(
+                            value["project"]["created_at"],
+                            micros_to_iso(project.created_at)
+                        );
+                        assert_eq!(value["agent"]["id"], agent_id);
+                        assert_eq!(value["agent"]["project_id"], project_id);
+                        assert_eq!(value["agent"]["name"], "BlueLake");
+                        assert_eq!(value["agent"]["inception_ts"], micros_to_iso(inception_ts));
+                        let captured =
+                            iso_to_micros(value["captured_ts"].as_str().unwrap()).unwrap();
+                        let cutoff =
+                            iso_to_micros(value["ack_overdue_before"].as_str().unwrap()).unwrap();
+                        assert!(captured >= now);
+                        assert_eq!(captured - cutoff, 30 * 60 * 1_000_000);
+                        for flag in ["urgent", "ack_overdue"] {
+                            assert_eq!(value[flag], false);
+                        }
+                        for flag in ["unread", "all"] {
+                            assert_eq!(value[flag], true);
+                        }
+                        assert_eq!(value["limit"], 3);
+                        assert_eq!(value["include_bodies"], include_bodies);
+                        assert_eq!(value["count"], 3);
+                        let rows = value["messages"].as_array().unwrap();
+                        assert_eq!(rows.len(), 3);
+                        for (index, row) in rows.iter().enumerate() {
+                            assert_eq!(row["id"], ids[index], "priority must precede recency");
+                            assert_eq!(row["project_id"], project_id);
+                            assert_eq!(row["sender_id"], sender_id);
+                            assert_eq!(row["from"], "RedPeak");
+                            assert_eq!(row["created_ts"], micros_to_iso(timestamps[index]));
+                            assert_eq!(row["thread_id"], "priority-resource");
+                            assert_eq!(row["topic"], "priority-topic");
+                            assert_eq!(row.get("ack_ts"), Some(&Value::Null));
+                            if index == 1 {
+                                assert_eq!(row["kind"], "project");
+                                assert_eq!(row["via"], "project");
+                                assert_eq!(row["read_ts"], micros_to_iso(shared_read_ts));
+                            } else {
+                                assert_eq!(row["kind"], "to");
+                                assert_eq!(row.get("via"), Some(&Value::Null));
+                                assert_eq!(row.get("read_ts"), Some(&Value::Null));
+                            }
+                            if include_bodies {
+                                assert_eq!(row["body_md"], fixtures[index].1);
+                            } else {
+                                assert!(row.get("body_md").is_none());
+                                assert!(!text.contains(fixtures[index].1));
+                            }
+                            for field in [
+                                "to",
+                                "cc",
+                                "bcc",
+                                "recipients",
+                                "recipients_json",
+                                "attachments",
+                            ] {
+                                assert!(row.get(field).is_none(), "excluded field {field}");
+                            }
+                        }
+                        for private in [
+                            "registration_token",
+                            "private-registration-token-sentinel",
+                            "private-recipient-sentinel",
+                            "private-attachment-sentinel",
+                        ] {
+                            assert!(!text.contains(private));
+                        }
+                        assert_eq!(inbox_read_only_witness(&cx, &pool, agent_id).await, before);
+                        assert_eq!(
+                            std::fs::read(&signal_path).unwrap(),
+                            signal_bytes.as_slice()
+                        );
+                    }
+                    let error = router.handle_resources_read(
+                        &ctx,
+                        &fastmcp_protocol::ReadResourceParams {
+                            uri: format!("resource://inbox/redpeak?project={encoded_project}&context=true&include_bodies=true&format=json"),
+                            meta: None,
+                        },
+                        state, None, None,
+                    ).await.expect_err("context mode must not bypass the bound identity");
+                    assert_eq!(
+                        crate::tool_error_code(&error),
+                        Some("SESSION_IDENTITY_MISMATCH")
+                    );
+                    assert!(!error.to_string().contains("private body"));
+                    assert_eq!(inbox_read_only_witness(&cx, &pool, agent_id).await, before);
+                    assert_eq!(
+                        std::fs::read(&signal_path).unwrap(),
+                        signal_bytes.as_slice()
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn priority_inbox_router_rejects_invalid_context_queries_before_legacy_dispatch() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let router = agent_mail_resource_router();
+                let state = fastmcp_core::SessionState::new();
+                let ctx = McpContext::with_state(cx, 1, state.clone());
+                for query in [
+                    "context=true&limit=0",
+                    "context=true&limit=1001",
+                    "context=true&limit=invalid",
+                    "context=true&urgent=1",
+                    "context=true&ack_overdue=yes",
+                    "context=true&unread=TRUE",
+                    "context=true&all=1",
+                    "context=true&include_bodies=invalid",
+                    "context=invalid",
+                    "context=true&since_ts=2026-10-28T00:00:00Z",
+                    "context=true&urgent_only=true",
+                    "context=true&format=toon",
+                ] {
+                    let error = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!(
+                                    "resource://inbox/BlueLake?project=unregistered&{query}"
+                                ),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect_err("invalid context request cannot become a legacy read");
+                    assert_eq!(error.code, McpErrorCode::InvalidParams, "{query}: {error}");
+                    assert!(
+                        !error.to_string().contains("Project not found"),
+                        "{query}: options must fail before mailbox resolution"
+                    );
+                }
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retired_inbox_history_requires_explicit_roster_opt_in_without_reactivation() {
+        with_serialized_resources_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("DATABASE_POOL_TIMEOUT", "1"),
+            ],
+            || {
+                run_async(|cx| async move {
+                    let pool = seed_pool();
+                    let project = ensure_project(&cx, &pool, "/retired-priority-history").await;
+                    let project_id = project.id.unwrap();
+                    let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let sender = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                    let agent_id = agent.id.unwrap();
+                    let direct = create_message(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap(),
+                        agent_id,
+                        "Retired direct history",
+                        "Retired private body",
+                        "retired-history",
+                        false,
+                    )
+                    .await;
+                    let shared = match queries::create_message_with_recipients_topic(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap(),
+                        "Active shared delivery",
+                        "Active shared body",
+                        Some("retired-history"),
+                        None,
+                        None,
+                        "normal",
+                        false,
+                        "[]",
+                        &[],
+                        Some("to"),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(message) => message,
+                        other => panic!("shared history fixture failed: {other:?}"),
+                    };
+                    let retired_at = mcp_agent_mail_db::now_micros();
+                    match queries::set_agent_retired_at(&cx, &pool, agent_id, Some(retired_at))
+                        .await
+                    {
+                        Outcome::Ok(retired) => assert_eq!(retired.retired_at, Some(retired_at)),
+                        other => panic!("retirement fixture failed: {other:?}"),
+                    }
+                    let before = inbox_read_only_witness(&cx, &pool, agent_id).await;
+                    assert_eq!(before["retired_at"], retired_at);
+                    let state = fastmcp_core::SessionState::new();
+                    let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                    crate::session_identity::bind(&ctx, project_id, agent_id, &agent.name);
+                    let mut router = agent_mail_resource_router();
+                    router.add_resource(ProjectDetailsResource);
+                    router.add_resource(ProjectDetailsQueryResource);
+                    for (query, included) in [
+                        ("", false),
+                        ("?include_retired=false&format=json", false),
+                        ("?include_retired=true&format=json", true),
+                    ] {
+                        let response = router
+                            .handle_resources_read(
+                                &ctx,
+                                &fastmcp_protocol::ReadResourceParams {
+                                    uri: format!("resource://project/{}{query}", project.slug),
+                                    meta: None,
+                                },
+                                state.clone(),
+                                None,
+                                None,
+                            )
+                            .await
+                            .expect("project descriptor");
+                        let response = serde_json::to_value(response).unwrap();
+                        let value = parse_json(response["contents"][0]["text"].as_str().unwrap());
+                        let rows = value["agents"].as_array().unwrap();
+                        let retired = rows.iter().find(|row| row["name"] == "BlueLake");
+                        assert_eq!(retired.is_some(), included);
+                        if let Some(retired) = retired {
+                            assert_eq!(retired["id"], agent_id);
+                            assert_eq!(retired["project_id"], project_id);
+                            assert_eq!(retired["inception_ts"], micros_to_iso(agent.inception_ts));
+                            assert!(retired.get("registration_token").is_none());
+                        }
+                        assert!(rows.iter().any(|row| row["name"] == "RedPeak"));
+                    }
+                    let error = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!(
+                                    "resource://project/{}?include_retired=1&format=json",
+                                    project.slug
+                                ),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect_err("history opt-in requires an explicit boolean");
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    let response = router.handle_resources_read(
+                        &ctx,
+                        &fastmcp_protocol::ReadResourceParams {
+                            uri: format!("resource://inbox/bluelake?project={}&context=true&all=true&include_bodies=true&format=json", project.slug),
+                            meta: None,
+                        },
+                        state, None, None,
+                    ).await.expect("retired direct history remains readable");
+                    let response = serde_json::to_value(response).unwrap();
+                    let value = parse_json(response["contents"][0]["text"].as_str().unwrap());
+                    assert_eq!(value["agent"]["name"], "BlueLake");
+                    assert_eq!(value["count"], 1);
+                    assert_eq!(value["messages"][0]["id"], direct.id.unwrap());
+                    assert_ne!(value["messages"][0]["id"], shared.id.unwrap());
+                    assert_eq!(value["messages"][0]["body_md"], "Retired private body");
+                    assert_eq!(value["messages"][0]["kind"], "to");
+                    assert_eq!(inbox_read_only_witness(&cx, &pool, agent_id).await, before);
+                });
+            },
+        );
     }
 
     const AGENT_MAIL_RESOURCE_PATHS: [&str; 8] = [
@@ -7037,11 +7789,13 @@ mod resource_shape_tests {
 
                 let config_value = parse_json(&config_environment(&ctx).expect("config env"));
                 assert!(config_value.is_object());
+                assert_eq!(config_value["inbox_priority_snapshot"], "priority_v1");
                 let config_query_value = parse_json(
                     &config_environment_query(&ctx, "format=json".to_string())
                         .expect("config env query"),
                 );
                 assert!(config_query_value.is_object());
+                assert_eq!(config_query_value["inbox_priority_snapshot"], "priority_v1");
 
                 let identity_value =
                     parse_json(&identity_project(&ctx, project_ref.clone()).expect("identity"));

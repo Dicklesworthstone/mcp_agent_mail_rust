@@ -6296,199 +6296,284 @@ fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> 
     )
 }
 
-/// `fetch_inbox` caps `limit` at this many rows.
-const ROBOT_INBOX_SERVER_WINDOW: usize = 1000;
+const ROBOT_INBOX_SNAPSHOT_LIMIT_MAX: usize = 1000;
 
-/// The `fetch_inbox` calls whose union holds every row the robot view could
-/// show. The server returns the newest rows of each call, so a view ordered
-/// by priority asks for the whole window of each candidate class and trims to
-/// `--limit` only after sorting; otherwise an old urgent message would fall
-/// behind the newest `--limit` rows and never be ranked.
-fn robot_inbox_server_windows(request: &RobotInboxServerRequest) -> Vec<serde_json::Value> {
-    let window = |urgent_only: bool, unread_only: bool, ack_overdue_only: bool, limit: usize| {
-        serde_json::json!({
-            "project_key": request.project_key,
-            "agent_name": request.agent_name,
-            "urgent_only": urgent_only,
-            "limit": i32::try_from(limit.max(1)).unwrap_or(i32::MAX),
-            "include_bodies": request.include_bodies,
-            "unread_only": unread_only,
-            "ack_overdue_only": ack_overdue_only,
-            // `am inbox` is a listing, not a consumption: without this the
-            // fetch_inbox tool auto-marks every returned row read, and the
-            // client-side bucket filter then hides those same rows from the very
-            // response that consumed them — messages nobody ever saw become
-            // permanently invisible to the default unread-only view (GH#229).
-            // Read-state changes are left to explicit `am mail read` / ack, the
-            // same non-consuming-peek contract check-inbox adopted in GH#207.
-            "mark_read": false,
-        })
-    };
-    if request.urgent {
-        // Every row is unread high/urgent, which the server already returns
-        // newest first: the same order the priority sort gives them.
-        return vec![window(true, true, false, request.limit)];
-    }
-    if request.ack_overdue {
-        return vec![window(false, false, true, ROBOT_INBOX_SERVER_WINDOW)];
-    }
-    let mut windows = vec![
-        window(false, true, false, ROBOT_INBOX_SERVER_WINDOW),
-        window(false, false, true, ROBOT_INBOX_SERVER_WINDOW),
-    ];
-    if request.all || !request.unread {
-        // Read rows rank after every unread or overdue one, newest first, so
-        // the newest `--limit` rows hold every read row the view can reach.
-        windows.push(window(false, false, false, request.limit));
-    }
-    windows
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboxSnapshotAgent {
+    id: i64,
+    project_id: i64,
+    name: String,
+    inception_ts: i64,
 }
 
-/// Merges the window payloads into one row list, keeping each message once.
-fn merge_server_inbox_windows(
-    payloads: &[serde_json::Value],
-) -> Result<serde_json::Value, CliError> {
-    let mut seen = HashSet::new();
-    let mut rows = Vec::new();
-    for payload in payloads {
-        let window_rows = server_inbox_rows(payload)
-            .ok_or_else(|| CliError::Other("unexpected fetch_inbox response shape".to_string()))?;
-        for row in window_rows {
-            let id = row.get("id").and_then(serde_json::Value::as_i64);
-            if id.is_none_or(|id| seen.insert(id)) {
-                rows.push(row.clone());
+fn invalid_inbox_snapshot(detail: &str) -> CliError {
+    CliError::Other(format!(
+        "invalid server inbox snapshot: {detail}; refusing unverified inbox data"
+    ))
+}
+
+fn inbox_snapshot_text<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str, CliError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_inbox_snapshot(&format!("missing or invalid {key}")))
+}
+
+fn inbox_snapshot_optional_text<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a str>, CliError> {
+    match value.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(invalid_inbox_snapshot(&format!("invalid {key}"))),
+    }
+}
+
+fn inbox_snapshot_timestamp(value: &serde_json::Value, key: &str) -> Result<i64, CliError> {
+    mcp_agent_mail_db::iso_to_micros(inbox_snapshot_text(value, key)?)
+        .ok_or_else(|| invalid_inbox_snapshot(&format!("invalid {key} timestamp")))
+}
+
+fn inbox_snapshot_optional_timestamp(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<Option<i64>, CliError> {
+    // Missing receipts cannot be treated as unread/unacknowledged.
+    if value.get(key) == Some(&serde_json::Value::Null) {
+        return Ok(None);
+    }
+    inbox_snapshot_timestamp(value, key).map(Some)
+}
+
+fn inbox_snapshot_positive_id(value: &serde_json::Value, key: &str) -> Result<i64, CliError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| invalid_inbox_snapshot(&format!("missing or invalid {key}")))
+}
+
+fn inbox_snapshot_agent(
+    value: &serde_json::Value,
+    project_id: i64,
+) -> Result<InboxSnapshotAgent, CliError> {
+    let name = inbox_snapshot_text(value, "name")?;
+    if name.trim().is_empty()
+        || value.get("project_id").and_then(serde_json::Value::as_i64) != Some(project_id)
+    {
+        return Err(invalid_inbox_snapshot("invalid agent name or project"));
+    }
+    Ok(InboxSnapshotAgent {
+        id: inbox_snapshot_positive_id(value, "id")?,
+        project_id,
+        name: name.to_string(),
+        inception_ts: inbox_snapshot_timestamp(value, "inception_ts")?,
+    })
+}
+
+fn resolve_server_inbox_agent(
+    descriptor: &serde_json::Value,
+    project_id: i64,
+    requested_name: &str,
+) -> Result<InboxSnapshotAgent, CliError> {
+    let agents = descriptor
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_inbox_snapshot("missing project agent roster"))?;
+    let mut selected = None;
+    for value in agents {
+        let agent = inbox_snapshot_agent(value, project_id)?;
+        if agent.name.eq_ignore_ascii_case(requested_name.trim()) {
+            if selected.is_some() {
+                return Err(invalid_inbox_snapshot("ambiguous requested agent"));
             }
+            selected = Some(agent);
         }
     }
-    Ok(serde_json::Value::Array(rows))
-}
-
-fn server_inbox_rows(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    if let Some(rows) = payload.as_array() {
-        return Some(rows);
-    }
-    if let Some(rows) = payload
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-    {
-        return Some(rows);
-    }
-    payload.get("result").and_then(serde_json::Value::as_array)
-}
-
-fn server_inbox_iso_micros(row: &serde_json::Value, key: &str) -> Option<i64> {
-    row.get(key)
-        .and_then(serde_json::Value::as_str)
-        .and_then(mcp_agent_mail_db::iso_to_micros)
+    selected
+        .ok_or_else(|| invalid_inbox_snapshot("requested agent is absent from the project roster"))
 }
 
 fn server_inbox_row_to_entry(
     row: &serde_json::Value,
+    project_id: i64,
     now_us: i64,
     ack_threshold: i64,
     include_bodies: bool,
-) -> ServerInboxEntry {
-    let id = row
-        .get("id")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let importance = row
-        .get("importance")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("normal")
-        .to_string();
-    let read_ts = server_inbox_iso_micros(row, "read_ts");
-    let ack_ts = server_inbox_iso_micros(row, "ack_ts");
-    let created_ts = server_inbox_iso_micros(row, "created_ts").unwrap_or(0);
+) -> Result<ServerInboxEntry, CliError> {
+    let id = inbox_snapshot_positive_id(row, "id")?;
+    inbox_snapshot_positive_id(row, "sender_id")?;
+    let from = inbox_snapshot_text(row, "from")?;
+    if from.trim().is_empty()
+        || row.get("project_id").and_then(serde_json::Value::as_i64) != Some(project_id)
+    {
+        return Err(invalid_inbox_snapshot("invalid sender or message project"));
+    }
+    let importance = inbox_snapshot_text(row, "importance")?;
+    if !matches!(importance, "low" | "normal" | "high" | "urgent") {
+        return Err(invalid_inbox_snapshot("invalid importance"));
+    }
+    let read_ts = inbox_snapshot_optional_timestamp(row, "read_ts")?;
+    let ack_ts = inbox_snapshot_optional_timestamp(row, "ack_ts")?;
+    let created_ts = inbox_snapshot_timestamp(row, "created_ts")?;
     let ack_required = row
         .get("ack_required")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .ok_or_else(|| invalid_inbox_snapshot("invalid acknowledgement requirement"))?;
+    let kind = inbox_snapshot_text(row, "kind")?;
+    let via = inbox_snapshot_optional_text(row, "via")?;
+    if !matches!(kind, "to" | "cc" | "bcc" | "project")
+        || (kind == "project" && via != Some("project"))
+        || (kind != "project" && via.is_some())
+    {
+        return Err(invalid_inbox_snapshot(
+            "invalid delivery kind or project mailbox marker",
+        ));
+    }
+    let body_md = if include_bodies {
+        Some(inbox_snapshot_text(row, "body_md")?.to_string())
+    } else {
+        if row.get("body_md").is_some() {
+            return Err(invalid_inbox_snapshot(
+                "body returned for a metadata-only inbox",
+            ));
+        }
+        None
+    };
     let priority = inbox_priority(
-        &importance,
+        importance,
         ack_required,
         read_ts,
         ack_ts,
         created_ts,
         ack_threshold,
     );
-    let thread_id = row
-        .get("thread_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let thread_id = inbox_snapshot_optional_text(row, "thread_id")?.unwrap_or_default();
     let age_seconds = age_seconds_from_micros(now_us, created_ts);
-    ServerInboxEntry {
+    Ok(ServerInboxEntry {
         entry: InboxEntry {
             id,
             priority: priority.label.to_string(),
-            from: row
-                .get("from")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            subject: row
-                .get("subject")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            topic: row
-                .get("topic")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+            from: from.to_string(),
+            subject: inbox_snapshot_text(row, "subject")?.to_string(),
+            topic: inbox_snapshot_optional_text(row, "topic")?.map(str::to_string),
             thread: canonical_thread_ref(id, thread_id),
             age: format_age(age_seconds),
             ack_status: priority.ack_status.to_string(),
-            importance,
-            via: row
-                .get("via")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            body_md: if include_bodies {
-                row.get("body_md")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            } else {
-                None
-            },
+            importance: importance.to_string(),
+            via: via.map(str::to_string),
+            body_md,
         },
         bucket: priority.bucket,
         ack_overdue: priority.ack_overdue,
         created_ts,
-    }
+    })
 }
 
-fn build_inbox_from_server_payload(
+fn validate_inbox_priority_snapshot(
     payload: &serde_json::Value,
     request: &RobotInboxServerRequest,
+    project: &crate::context::ResolvedProject,
+    agent: &InboxSnapshotAgent,
 ) -> Result<InboxResult, CliError> {
-    let rows = server_inbox_rows(payload)
-        .ok_or_else(|| CliError::Other("unexpected fetch_inbox response shape".to_string()))?;
-    let now_us = mcp_agent_mail_db::now_micros();
-    let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
-    let mut projected = rows
-        .iter()
-        .map(|row| server_inbox_row_to_entry(row, now_us, ack_threshold, request.include_bodies))
-        .filter(|row| {
-            if request.urgent {
-                row.bucket == 1
-            } else if request.ack_overdue {
-                row.ack_overdue
-            } else if request.all {
-                true
-            } else if request.unread {
-                row.bucket <= 4
-            } else {
-                row.bucket <= 5
-            }
-        })
-        .collect::<Vec<_>>();
-    projected.sort_by(|left, right| {
-        left.bucket
-            .cmp(&right.bucket)
-            .then_with(|| right.created_ts.cmp(&left.created_ts))
-            .then_with(|| right.entry.id.cmp(&left.entry.id))
-    });
-    projected.truncate(request.limit);
+    if payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || payload.get("complete").and_then(serde_json::Value::as_bool) != Some(true)
+        || payload.get("limit").and_then(serde_json::Value::as_u64)
+            != u64::try_from(request.limit).ok()
+    {
+        return Err(invalid_inbox_snapshot(
+            "unsupported, incomplete or differently bounded snapshot",
+        ));
+    }
+    for (key, expected) in [
+        ("urgent", request.urgent),
+        ("ack_overdue", request.ack_overdue),
+        ("unread", request.unread),
+        ("all", request.all),
+        ("include_bodies", request.include_bodies),
+    ] {
+        if payload.get(key).and_then(serde_json::Value::as_bool) != Some(expected) {
+            return Err(invalid_inbox_snapshot(
+                "snapshot filters do not match the request",
+            ));
+        }
+    }
+    let snapshot_project = crate::reservation_read::validate_project(
+        payload
+            .get("project")
+            .ok_or_else(|| invalid_inbox_snapshot("missing project identity"))?,
+        &project.slug,
+    )?;
+    let snapshot_agent = inbox_snapshot_agent(
+        payload
+            .get("agent")
+            .ok_or_else(|| invalid_inbox_snapshot("missing agent identity"))?,
+        project.id,
+    )?;
+    if !crate::reservation_read::same_project(project, &snapshot_project)
+        || &snapshot_agent != agent
+    {
+        return Err(invalid_inbox_snapshot(
+            "snapshot project or agent identity mismatch",
+        ));
+    }
+    let now_us = inbox_snapshot_timestamp(payload, "captured_ts")?;
+    let ack_threshold = inbox_snapshot_timestamp(payload, "ack_overdue_before")?;
+    if ack_threshold != micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US) {
+        return Err(invalid_inbox_snapshot("inconsistent acknowledgement clock"));
+    }
+    let rows = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_inbox_snapshot("missing message rows"))?;
+    if rows.len() > request.limit
+        || rows.len() > ROBOT_INBOX_SNAPSHOT_LIMIT_MAX
+        || payload.get("count").and_then(serde_json::Value::as_u64)
+            != u64::try_from(rows.len()).ok()
+    {
+        return Err(invalid_inbox_snapshot(
+            "snapshot count or row bound mismatch",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(rows.len());
+    let mut previous = None;
+    let mut projected = Vec::with_capacity(rows.len());
+    for value in rows {
+        let row = server_inbox_row_to_entry(
+            value,
+            project.id,
+            now_us,
+            ack_threshold,
+            request.include_bodies,
+        )?;
+        let matches = if request.urgent {
+            row.bucket == 1
+        } else if request.ack_overdue {
+            row.ack_overdue
+        } else if request.all {
+            true
+        } else if request.unread {
+            row.bucket <= 4
+        } else {
+            row.bucket <= 5
+        };
+        let key = (
+            row.bucket,
+            std::cmp::Reverse(row.created_ts),
+            std::cmp::Reverse(row.entry.id),
+        );
+        if !matches || !seen.insert(row.entry.id) || previous.is_some_and(|prior| prior > key) {
+            return Err(invalid_inbox_snapshot(
+                "duplicate, out-of-order or out-of-scope message",
+            ));
+        }
+        previous = Some(key);
+        projected.push(row);
+    }
 
     let mut overdue_ids = Vec::new();
     let entries = projected
@@ -6547,65 +6632,69 @@ fn build_inbox_from_server_payload(
 fn try_build_inbox_via_server(
     request: &RobotInboxServerRequest,
     config: &mcp_agent_mail_core::Config,
-) -> Result<Option<InboxResult>, CliError> {
-    let urls = robot_inbox_server_urls(config);
-    if urls.is_empty() {
+    selection: &crate::message_read::ProjectSelection,
+) -> Result<Option<(InboxResult, String, String)>, CliError> {
+    // Preserve the existing zero/unbounded local requests and special Git
+    // project identities before accepting any daemon as the read authority.
+    if request.limit == 0
+        || request.limit > ROBOT_INBOX_SNAPSHOT_LIMIT_MAX
+        || !selection.permits_automatic_read(config)
+    {
         return Ok(None);
     }
-    let bearer = crate::local_server_bearer_token(config);
-    let mut last_unavailable: Option<(String, String)> = None;
-
-    'urls: for server_url in urls {
-        let mut payloads = Vec::new();
-        for arguments in robot_inbox_server_windows(request) {
-            let call = crate::context::run_async(async {
-                Ok(crate::try_call_server_tool(
-                    &server_url,
-                    bearer.as_deref(),
-                    "fetch_inbox",
-                    arguments,
-                )
-                .await)
-            })?;
-            match call {
-                crate::ServerToolCall::Success(result) => {
-                    payloads.push(crate::coerce_tool_result_json_or_error(
-                        "fetch_inbox",
-                        result,
-                    )?);
-                }
-                crate::ServerToolCall::Unavailable(message) => {
-                    last_unavailable = Some((server_url, message));
-                    continue 'urls;
-                }
-                crate::ServerToolCall::Rejected(message) => {
-                    if crate::mail_server_rejection_allows_local_fallback(&message) {
-                        tracing::debug!(
-                            message = %message,
-                            "robot inbox fell back to local scope after server scope mismatch"
-                        );
-                        return Ok(None);
-                    }
-                    return Err(CliError::Other(format!(
-                        "fetch_inbox via server failed: {message}"
-                    )));
-                }
-            }
+    crate::context::run_async(async {
+        let Some(session) =
+            crate::reservation_read::ServerResourceSession::for_local_mailbox(config).await?
+        else {
+            return Ok(None);
+        };
+        if !selection.supported_by(&session) || !session.supports_inbox_priority_snapshot() {
+            return Ok(None);
         }
-        let payload = merge_server_inbox_windows(&payloads)?;
-        return build_inbox_from_server_payload(&payload, request).map(Some);
-    }
-
-    if let Some((server_url, message)) = last_unavailable {
-        crate::reject_local_fallback_if_mailbox_owned(
-            "robot inbox",
-            &server_url,
-            &message,
-            &config.database_url,
-            config.storage_root.as_path(),
+        // Retired agents retain direct-mail history. The ordinary directory
+        // lists available recipients, so explicitly include historical
+        // identities in both witnesses after negotiating this capability.
+        let project_uri = format!(
+            "{}&include_retired=true",
+            crate::message_read::project_resource_uri(selection)?
+        );
+        let (project, descriptor) =
+            crate::message_read::read_project_descriptor(&session, &project_uri, selection).await?;
+        let agent = resolve_server_inbox_agent(&descriptor, project.id, &request.agent_name)?;
+        let uri = format!(
+            "resource://inbox/{}?project={}&context=true&urgent={}&ack_overdue={}&unread={}&all={}&limit={}&include_bodies={}&format=json",
+            crate::reservation_read::encode_resource_component(&agent.name),
+            crate::reservation_read::encode_resource_component(&project.slug),
+            request.urgent,
+            request.ack_overdue,
+            request.unread,
+            request.all,
+            request.limit,
+            request.include_bodies,
+        );
+        let canonical_request = RobotInboxServerRequest {
+            project_key: project.slug.clone(),
+            agent_name: agent.name.clone(),
+            ..request.clone()
+        };
+        let result = validate_inbox_priority_snapshot(
+            &session.read(&uri).await?,
+            &canonical_request,
+            &project,
+            &agent,
         )?;
-    }
-    Ok(None)
+        let (after_project, after) =
+            crate::message_read::read_project_descriptor(&session, &project_uri, selection).await?;
+        if !crate::reservation_read::same_project(&project, &after_project)
+            || resolve_server_inbox_agent(&after, after_project.id, &request.agent_name)? != agent
+        {
+            return Err(invalid_inbox_snapshot(
+                "project or agent identity changed during inbox read",
+            ));
+        }
+        session.verify_local_mailbox(config).await?;
+        Ok(Some((result, project.slug, agent.name)))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16387,15 +16476,19 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 limit,
                 include_bodies,
             )? {
-                match try_build_inbox_via_server(&request, &config)? {
-                    Some(result) => {
+                match try_build_inbox_via_server(
+                    &request,
+                    &config,
+                    &automatic_robot_project_selection(args.project.as_deref())?,
+                )? {
+                    Some((result, project_slug, agent_name)) => {
                         phase.mark("server_fetch");
                         render_inbox_result(
                             cmd_name,
                             format,
                             result,
-                            request.project_key,
-                            request.agent_name,
+                            project_slug,
+                            agent_name,
                             phase,
                         )?
                     }
@@ -20526,18 +20619,24 @@ mod tests {
         // GH#282: fetch_inbox flags shared-mailbox mail with via="project";
         // the robot inbox must not drop it on the way to its own entries.
         let project_row = serde_json::json!({
-            "id": 7, "importance": "normal", "ack_required": false,
+            "id": 7, "project_id":1, "sender_id":2, "importance": "normal", "ack_required": false,
             "from": "GreenCastle", "subject": "Schema freeze", "thread_id": null,
+            "read_ts":null, "ack_ts":null,
             "created_ts": "2026-10-08T12:00:00Z", "kind": "project", "via": "project"
         });
         let direct_row = serde_json::json!({
-            "id": 8, "importance": "normal", "ack_required": false,
+            "id": 8, "project_id":1, "sender_id":2, "importance": "normal", "ack_required": false,
             "from": "GreenCastle", "subject": "Direct", "thread_id": null,
+            "read_ts":null, "ack_ts":null,
             "created_ts": "2026-10-08T12:00:00Z", "kind": "to"
         });
         let now_us = 1_791_500_000_000_000;
-        let shared = server_inbox_row_to_entry(&project_row, now_us, 0, false).entry;
-        let direct = server_inbox_row_to_entry(&direct_row, now_us, 0, false).entry;
+        let shared = server_inbox_row_to_entry(&project_row, 1, now_us, 0, false)
+            .unwrap()
+            .entry;
+        let direct = server_inbox_row_to_entry(&direct_row, 1, now_us, 0, false)
+            .unwrap()
+            .entry;
         assert_eq!(shared.via.as_deref(), Some("project"));
         assert_eq!(direct.via, None);
         let json = serde_json::to_value(&shared).unwrap();
@@ -20634,21 +20733,16 @@ mod tests {
         assert_eq!(v["_actions"][0], "am mail ack 1");
     }
 
-    fn window_flags(window: &serde_json::Value) -> (bool, bool, bool, i64) {
-        (
-            window["urgent_only"].as_bool().expect("urgent_only"),
-            window["unread_only"].as_bool().expect("unread_only"),
-            window["ack_overdue_only"]
-                .as_bool()
-                .expect("ack_overdue_only"),
-            window["limit"].as_i64().expect("limit"),
-        )
+    fn inbox_snapshot_test_project() -> Value {
+        serde_json::json!({"id":7,"slug":"demo","human_key":"/work/demo",
+        "created_at":"2026-01-01T00:00:00Z", "agents":[{
+            "id":12,"project_id":7,"name":"BlueLake","inception_ts":"2026-01-01T00:00:00Z"
+        }]})
     }
 
-    #[test]
-    fn robot_inbox_server_windows_preserve_robot_filter_precedence() {
-        let default_request = RobotInboxServerRequest {
-            project_key: "/tmp/demo".into(),
+    fn inbox_snapshot_test_request() -> RobotInboxServerRequest {
+        RobotInboxServerRequest {
+            project_key: "demo".into(),
             agent_name: "BlueLake".into(),
             urgent: false,
             ack_overdue: false,
@@ -20656,217 +20750,505 @@ mod tests {
             all: false,
             limit: 20,
             include_bodies: false,
-        };
-        let window = i64::try_from(ROBOT_INBOX_SERVER_WINDOW).expect("window fits");
-        let default_windows = robot_inbox_server_windows(&default_request);
-        // Unread plus overdue acknowledgements, each whole, so the priority
-        // sort runs over every candidate before `--limit` trims.
-        assert_eq!(
-            default_windows.iter().map(window_flags).collect::<Vec<_>>(),
-            vec![(false, true, false, window), (false, false, true, window)]
-        );
-        // Listing must never consume unread state (GH#229).
-        assert!(
-            default_windows
-                .iter()
-                .all(|args| args["mark_read"] == false)
-        );
+        }
+    }
 
-        let urgent_request = RobotInboxServerRequest {
-            urgent: true,
-            ack_overdue: true,
-            unread: false,
-            ..default_request.clone()
-        };
-        assert_eq!(
-            robot_inbox_server_windows(&urgent_request)
-                .iter()
-                .map(window_flags)
-                .collect::<Vec<_>>(),
-            vec![(true, true, false, 20)]
-        );
+    fn inbox_snapshot_test_clock() -> i64 {
+        mcp_agent_mail_db::iso_to_micros("2026-01-02T12:00:00Z").unwrap()
+    }
 
-        let overdue_request = RobotInboxServerRequest {
-            urgent: false,
-            ack_overdue: true,
-            unread: false,
-            ..default_request.clone()
-        };
-        assert_eq!(
-            robot_inbox_server_windows(&overdue_request)
-                .iter()
-                .map(window_flags)
-                .collect::<Vec<_>>(),
-            vec![(false, false, true, window)]
-        );
+    fn inbox_snapshot_test_row(
+        id: i64,
+        importance: &str,
+        age_minutes: i64,
+        ack_required: bool,
+        read: bool,
+    ) -> Value {
+        let now = inbox_snapshot_test_clock();
+        serde_json::json!({"id":id,"project_id":7,"sender_id":13,"from":"GreenCastle",
+            "subject":format!("message {id}"),"thread_id":"coordination","topic":null,
+            "importance":importance,"ack_required":ack_required,
+            "created_ts":mcp_agent_mail_db::micros_to_iso(now - age_minutes * 60_000_000),
+            "read_ts":read.then(|| mcp_agent_mail_db::micros_to_iso(now - 30_000_000)),
+            "ack_ts":null,"kind":"to","via":null})
+    }
 
-        let all_request = RobotInboxServerRequest {
-            unread: false,
-            all: true,
-            limit: 0,
-            ..default_request
-        };
-        let all_windows = robot_inbox_server_windows(&all_request);
-        assert_eq!(
-            all_windows.iter().map(window_flags).collect::<Vec<_>>(),
+    fn inbox_snapshot_test_payload(request: &RobotInboxServerRequest, rows: Vec<Value>) -> Value {
+        let project = inbox_snapshot_test_project();
+        let now = inbox_snapshot_test_clock();
+        serde_json::json!({"schema_version":1,"complete":true,"project":project,
+            "agent":project["agents"][0], "captured_ts":mcp_agent_mail_db::micros_to_iso(now),
+            "ack_overdue_before":mcp_agent_mail_db::micros_to_iso(micros_ago(now, ACK_OVERDUE_THRESHOLD_US)),
+            "urgent":request.urgent,"ack_overdue":request.ack_overdue,"unread":request.unread,
+            "all":request.all,"limit":request.limit,"include_bodies":request.include_bodies,
+            "count":rows.len(),"messages":rows})
+    }
+
+    fn validate_inbox_test_snapshot(
+        payload: &Value,
+        request: &RobotInboxServerRequest,
+    ) -> Result<InboxResult, CliError> {
+        let descriptor = inbox_snapshot_test_project();
+        let project = crate::reservation_read::validate_project(&descriptor, "demo").unwrap();
+        let agent = resolve_server_inbox_agent(&descriptor, project.id, "BlueLake").unwrap();
+        validate_inbox_priority_snapshot(payload, request, &project, &agent)
+    }
+
+    fn inbox_snapshot_test_mailbox(config: &mcp_agent_mail_core::Config) -> Value {
+        let mut payload = crate::reservation_read::tests::ancestor_mailbox_payload(config);
+        payload["inbox_priority_snapshot"] = "priority_v1".into();
+        payload
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_preserves_filter_precedence() {
+        let rows = vec![
+            inbox_snapshot_test_row(1, "urgent", 120, true, false),
+            inbox_snapshot_test_row(2, "normal", 60, true, true),
+            inbox_snapshot_test_row(3, "normal", 5, true, false),
+            inbox_snapshot_test_row(4, "normal", 1, false, false),
+            inbox_snapshot_test_row(5, "normal", 5, true, true),
+            inbox_snapshot_test_row(6, "normal", 1, false, true),
+        ];
+        for (urgent, overdue, unread, all, expected) in [
+            (false, false, true, false, vec![1, 2, 3, 4]),
+            (true, true, false, true, vec![1]),
+            (false, true, true, true, vec![1, 2]),
+            (false, false, false, false, vec![1, 2, 3, 4, 5]),
+            (false, false, true, true, vec![1, 2, 3, 4, 5, 6]),
+        ] {
+            let request = RobotInboxServerRequest {
+                urgent,
+                ack_overdue: overdue,
+                unread,
+                all,
+                ..inbox_snapshot_test_request()
+            };
+            let selected = rows
+                .iter()
+                .filter(|row| expected.contains(&row["id"].as_i64().unwrap()))
+                .cloned()
+                .collect();
+            let payload = inbox_snapshot_test_payload(&request, selected);
+            let result = validate_inbox_test_snapshot(&payload, &request).unwrap();
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(result.entries[0].priority, "urgent");
+            assert_eq!(result.entries[0].ack_status, "overdue");
+        }
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_uses_pinned_authority_and_captured_clock_from_nested_scope() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let requested = mcp_agent_mail_core::resolve_project_path(&nested.to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        let selection = crate::message_read::ProjectSelection::Ancestors(requested.clone());
+        let mut request = inbox_snapshot_test_request();
+        request.agent_name = "bluelake".into();
+        let mut project = inbox_snapshot_test_project();
+        project["human_key"] =
+            mcp_agent_mail_core::resolve_project_path(&directory.path().to_string_lossy())
+                .to_string_lossy()
+                .into_owned()
+                .into();
+        let mut urgent = inbox_snapshot_test_row(1, "urgent", 120, true, false);
+        urgent["kind"] = "project".into();
+        urgent["via"] = "project".into();
+        let mut payload = inbox_snapshot_test_payload(
+            &request,
             vec![
-                (false, true, false, window),
-                (false, false, true, window),
-                // The server refuses limit 0; the view trims to 0 afterwards.
-                (false, false, false, 1),
-            ]
+                urgent,
+                inbox_snapshot_test_row(2, "normal", 5, true, false),
+                inbox_snapshot_test_row(3, "normal", 1, false, false),
+            ],
         );
-        assert!(all_windows.iter().all(|args| args["mark_read"] == false));
+        payload["project"] = project.clone();
+        project["resolution"] =
+            serde_json::json!({"kind":"nearest_ancestor","requested_path":requested});
+        let (result, calls) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(payload),
+                    TestReply::Resource(project),
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                ]
+            },
+            |config| try_build_inbox_via_server(&request, config, &selection),
+        );
+        let (result, slug, agent) = result.unwrap().unwrap();
+        assert_eq!((slug.as_str(), agent.as_str()), ("demo", "BlueLake"));
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(result.entries[0].via.as_deref(), Some("project"));
+        assert_eq!(
+            result.entries[1].ack_status, "required",
+            "use captured clock, not CLI wall clock"
+        );
+        assert_eq!(result.entries[1].age, "5m ago");
+        assert!(result.actions[0].contains("--project demo --agent BlueLake"));
+        assert_eq!(calls.len(), 5);
+        assert!(calls.iter().all(|call| call["method"] == "resources/read"));
+        assert_eq!(
+            calls[1]["params"]["uri"],
+            format!(
+                "{}&include_retired=true",
+                crate::message_read::project_resource_uri(&selection).unwrap()
+            )
+        );
+        assert_eq!(
+            calls[2]["params"]["uri"],
+            "resource://inbox/BlueLake?project=demo&context=true&urgent=false&ack_overdue=false&unread=true&all=false&limit=20&include_bodies=false&format=json"
+        );
     }
 
     #[test]
-    fn robot_inbox_server_ranks_an_old_urgent_message_past_newer_unread_mail() {
-        let now = mcp_agent_mail_db::now_micros();
-        let row = |id: i64, importance: &str, age_minutes: i64| {
-            serde_json::json!({
-                "id": id,
-                "subject": format!("message {id}"),
-                "from": "GreenCastle",
-                "importance": importance,
-                "ack_required": false,
-                "created_ts": mcp_agent_mail_db::micros_to_iso(now - age_minutes * 60_000_000),
-                "thread_id": "t",
-                "kind": "to"
-            })
-        };
-        // The unread window holds three newer normal messages and the old
-        // urgent one; the overdue window repeats one of them.
-        let unread_window = serde_json::json!([
-            row(4, "normal", 1),
-            row(3, "normal", 2),
-            row(2, "normal", 3),
-            row(1, "urgent", 120),
-        ]);
-        let overdue_window = serde_json::json!({ "messages": [row(3, "normal", 2)] });
-        let merged =
-            merge_server_inbox_windows(&[unread_window, overdue_window]).expect("merge windows");
-        assert_eq!(merged.as_array().map(Vec::len), Some(4));
-
-        let request = RobotInboxServerRequest {
-            project_key: "/tmp/demo".into(),
-            agent_name: "BlueLake".into(),
-            urgent: false,
-            ack_overdue: false,
-            unread: true,
-            all: false,
-            limit: 2,
-            include_bodies: false,
-        };
-        let result = build_inbox_from_server_payload(&merged, &request).expect("server inbox");
-        let ids = result
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1, 4]);
-
-        let error = merge_server_inbox_windows(&[serde_json::json!({ "unexpected": true })])
-            .expect_err("a window without rows is not an empty inbox");
+    fn robot_inbox_command_reads_the_priority_snapshot_without_opening_a_local_mailbox() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request = inbox_snapshot_test_request();
+        let project = inbox_snapshot_test_project();
+        let snapshot = inbox_snapshot_test_payload(
+            &request,
+            vec![
+                inbox_snapshot_test_row(1, "urgent", 120, true, false),
+                inbox_snapshot_test_row(2, "normal", 5, true, false),
+            ],
+        );
+        let ((result, output), calls) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(snapshot),
+                    TestReply::Resource(project),
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                ]
+            },
+            |_| {
+                let capture = ftui_runtime::StdioCapture::install().unwrap();
+                let result = handle_robot(RobotArgs {
+                    format: Some(OutputFormat::Json),
+                    json: true,
+                    project: Some("demo".into()),
+                    agent: Some("bluelake".into()),
+                    command: RobotSubcommand::Inbox {
+                        urgent: false,
+                        ack_overdue: false,
+                        unread: false,
+                        all: false,
+                        limit: None,
+                        include_bodies: false,
+                    },
+                });
+                (result, capture.drain_to_string())
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let value: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(value["_meta"]["project"], "demo");
+        assert_eq!(value["_meta"]["agent"], "BlueLake");
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["inbox"][0]["id"], 1);
+        assert_eq!(value["inbox"][0]["ack_status"], "overdue");
+        assert_eq!(value["inbox"][1]["age"], "5m ago");
+        assert!(value["inbox"][0].get("body_md").is_none());
+        assert_eq!(calls.len(), 5);
+        assert!(calls.iter().all(|call| call["method"] == "resources/read"));
+        assert_eq!(
+            calls[1]["params"]["uri"],
+            "resource://project/demo?format=json&include_retired=true"
+        );
+        assert_eq!(calls[1]["params"]["uri"], calls[3]["params"]["uri"]);
         assert!(
-            error
-                .to_string()
-                .contains("unexpected fetch_inbox response shape")
+            calls[2]["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("unread=true")
         );
     }
 
     #[test]
-    fn robot_inbox_server_payload_uses_read_and_ack_timestamps_for_priority() {
-        let now = mcp_agent_mail_db::now_micros();
-        let old = mcp_agent_mail_db::micros_to_iso(now - ACK_OVERDUE_THRESHOLD_US - 60_000_000);
-        let recent = mcp_agent_mail_db::micros_to_iso(now - 60_000_000);
-        let read = mcp_agent_mail_db::micros_to_iso(now - 30_000_000);
-        let payload = serde_json::json!([
-            {
-                "id": 2,
-                "subject": "Normal unread",
-                "from": "GreenCastle",
-                "importance": "normal",
-                "ack_required": false,
-                "created_ts": recent.clone(),
-                "thread_id": "normal-thread",
-                "kind": "to"
-            },
-            {
-                "id": 3,
-                "subject": "Ack overdue",
-                "from": "RedStone",
-                "importance": "normal",
-                "ack_required": true,
-                "created_ts": old.clone(),
-                "read_ts": read.clone(),
-                "thread_id": "ack-thread",
-                "kind": "to"
-            },
-            {
-                "id": 1,
-                "subject": "Urgent unread",
-                "from": "BlueLake",
-                "importance": "urgent",
-                "ack_required": true,
-                "created_ts": old.clone(),
-                "thread_id": "urgent-thread",
-                "kind": "to"
-            },
-            {
-                "id": 4,
-                "subject": "Read and acked",
-                "from": "SilverPeak",
-                "importance": "normal",
-                "ack_required": true,
-                "created_ts": old,
-                "read_ts": read.clone(),
-                "ack_ts": read,
-                "thread_id": "done-thread",
-                "kind": "to"
+    fn robot_inbox_snapshot_refuses_incomplete_or_unverifiable_rows() {
+        let request = inbox_snapshot_test_request();
+        let valid = inbox_snapshot_test_payload(
+            &request,
+            vec![
+                inbox_snapshot_test_row(1, "urgent", 120, true, false),
+                inbox_snapshot_test_row(2, "normal", 5, true, false),
+                inbox_snapshot_test_row(3, "normal", 1, false, false),
+            ],
+        );
+        assert!(validate_inbox_test_snapshot(&valid, &request).is_ok());
+        for fault in [
+            "schema",
+            "incomplete",
+            "count",
+            "limit",
+            "filter",
+            "clock",
+            "project",
+            "agent",
+            "agent_epoch",
+            "id",
+            "sender",
+            "row_project",
+            "created",
+            "missing_read",
+            "ack",
+            "body",
+            "importance",
+            "kind",
+            "via",
+            "order",
+            "duplicate",
+            "out_of_scope",
+        ] {
+            let mut payload = valid.clone();
+            match fault {
+                "schema" => payload["schema_version"] = 2.into(),
+                "incomplete" => payload["complete"] = false.into(),
+                "count" => payload["count"] = 4.into(),
+                "limit" => payload["limit"] = 19.into(),
+                "filter" => payload["unread"] = false.into(),
+                "clock" => payload["ack_overdue_before"] = payload["captured_ts"].clone(),
+                "project" => payload["project"]["created_at"] = "2026-01-01T01:00:00Z".into(),
+                "agent" => payload["agent"]["id"] = 99.into(),
+                "agent_epoch" => payload["agent"]["inception_ts"] = "2026-01-01T01:00:00Z".into(),
+                "id" => payload["messages"][0]["id"] = 0.into(),
+                "sender" => payload["messages"][0]["sender_id"] = 0.into(),
+                "row_project" => payload["messages"][0]["project_id"] = 99.into(),
+                "created" => payload["messages"][0]["created_ts"] = Value::Null,
+                "missing_read" => {
+                    payload["messages"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("read_ts");
+                }
+                "ack" => payload["messages"][0]["ack_ts"] = "not-a-timestamp".into(),
+                "body" => payload["messages"][0]["body_md"] = Value::Null,
+                "importance" => payload["messages"][0]["importance"] = "unknown".into(),
+                "kind" => payload["messages"][0]["kind"] = "outbox".into(),
+                "via" => payload["messages"][0]["via"] = "project".into(),
+                "order" => payload["messages"].as_array_mut().unwrap().swap(0, 2),
+                "duplicate" => payload["messages"][1] = payload["messages"][0].clone(),
+                "out_of_scope" => {
+                    payload["messages"][2]["read_ts"] = payload["captured_ts"].clone()
+                }
+                _ => unreachable!(),
             }
-        ]);
-        let request = RobotInboxServerRequest {
-            project_key: "/tmp/demo".into(),
-            agent_name: "BlueLake".into(),
-            urgent: false,
-            ack_overdue: false,
-            unread: true,
-            all: false,
-            limit: 10,
-            include_bodies: false,
-        };
-
-        let result = build_inbox_from_server_payload(&payload, &request).expect("server inbox");
-        let ids = result
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1, 3, 2]);
-        assert_eq!(result.entries[0].priority, "urgent");
-        // Urgent unread mail keeps its rank but still reports the overdue ack.
-        assert_eq!(result.entries[0].ack_status, "overdue");
-        assert_eq!(result.entries[1].priority, "ack-overdue");
-        assert_eq!(result.entries[1].ack_status, "overdue");
-        assert_eq!(result.alerts.len(), 1);
-        assert!(result.alerts[0].1.contains("#1, #3"));
-
-        // `--ack-overdue` lists every overdue acknowledgement, the urgent one
-        // included, matching the count `robot status` reports; the acked
-        // message stays out.
-        let overdue_request = RobotInboxServerRequest {
-            ack_overdue: true,
-            unread: false,
+            assert!(
+                validate_inbox_test_snapshot(&payload, &request).is_err(),
+                "accepted {fault}"
+            );
+        }
+        let with_bodies = RobotInboxServerRequest {
+            include_bodies: true,
             ..request
         };
-        let overdue =
-            build_inbox_from_server_payload(&payload, &overdue_request).expect("overdue inbox");
-        let overdue_ids = overdue
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        assert_eq!(overdue_ids, vec![1, 3]);
+        let mut payload = valid;
+        payload["include_bodies"] = true.into();
+        assert!(validate_inbox_test_snapshot(&payload, &with_bodies).is_err());
+        for row in payload["messages"].as_array_mut().unwrap() {
+            row["body_md"] = "retained body".into();
+        }
+        assert_eq!(
+            validate_inbox_test_snapshot(&payload, &with_bodies)
+                .unwrap()
+                .entries[0]
+                .body_md
+                .as_deref(),
+            Some("retained body")
+        );
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_negotiates_before_data_and_refuses_changed_authority() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+        let request = inbox_snapshot_test_request();
+        let selection = crate::message_read::ProjectSelection::Exact("demo".into());
+        for fault in [
+            "legacy",
+            "future",
+            "unavailable",
+            "auth",
+            "capability_type",
+            "ambiguous_agent",
+            "rpc",
+            "incomplete",
+            "agent_changed",
+            "project_changed",
+            "capability_changed",
+            "mailbox_changed",
+        ] {
+            let (result, calls) = with_test_server(
+                |config| {
+                    if fault == "auth" || fault == "unavailable" {
+                        return vec![TestReply::Raw(
+                            if fault == "auth" { 401 } else { 503 },
+                            serde_json::json!({"jsonrpc":"2.0","error":{"code":-32001,"message":"private-token"}}),
+                        )];
+                    }
+                    let mut capability = inbox_snapshot_test_mailbox(config);
+                    match fault {
+                        "legacy" => {
+                            capability
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("inbox_priority_snapshot");
+                        }
+                        "future" => capability["inbox_priority_snapshot"] = "priority_v2".into(),
+                        "capability_type" => capability["inbox_priority_snapshot"] = true.into(),
+                        _ => (),
+                    }
+                    let mut replies = vec![TestReply::Resource(capability)];
+                    if matches!(fault, "legacy" | "future" | "capability_type") {
+                        return replies;
+                    }
+                    let mut project = inbox_snapshot_test_project();
+                    if fault == "ambiguous_agent" {
+                        let mut duplicate = project["agents"][0].clone();
+                        duplicate["id"] = 13.into();
+                        duplicate["name"] = "bluelake".into();
+                        project["agents"].as_array_mut().unwrap().push(duplicate);
+                    }
+                    replies.push(TestReply::Resource(project.clone()));
+                    if fault == "ambiguous_agent" {
+                        return replies;
+                    }
+                    if fault == "rpc" {
+                        replies.push(TestReply::Raw(200, serde_json::json!({"jsonrpc":"2.0","error":{"code":-32002,"message":"scope mismatch"}})));
+                        return replies;
+                    }
+                    let mut payload = inbox_snapshot_test_payload(
+                        &request,
+                        vec![inbox_snapshot_test_row(1, "urgent", 120, true, false)],
+                    );
+                    if fault == "incomplete" {
+                        payload["complete"] = false.into();
+                    }
+                    replies.push(TestReply::Resource(payload));
+                    if fault == "incomplete" {
+                        return replies;
+                    }
+                    match fault {
+                        "agent_changed" => {
+                            project["agents"][0]["inception_ts"] = "2026-01-01T01:00:00Z".into()
+                        }
+                        "project_changed" => project["created_at"] = "2026-01-01T01:00:00Z".into(),
+                        _ => (),
+                    }
+                    replies.push(TestReply::Resource(project));
+                    if matches!(fault, "agent_changed" | "project_changed") {
+                        return replies;
+                    }
+                    let mut after = inbox_snapshot_test_mailbox(config);
+                    if fault == "capability_changed" {
+                        after
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("inbox_priority_snapshot");
+                    }
+                    if fault == "mailbox_changed" {
+                        after["storage_root"] = "/another/archive".into();
+                    }
+                    replies.push(TestReply::Resource(after));
+                    replies
+                },
+                |config| try_build_inbox_via_server(&request, config, &selection),
+            );
+            if matches!(fault, "legacy" | "future" | "unavailable") {
+                assert!(result.unwrap().is_none(), "{fault}");
+                assert_eq!(calls.len(), 1);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(!error.contains("private-token"), "{fault}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_keeps_unsupported_limits_and_git_paths_local() {
+        use crate::message_read::ProjectSelection;
+        use mcp_agent_mail_core::{Config, ProjectIdentityMode};
+        let path = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AGENT_MAIL_TOKEN", "invalid bearer token")],
+            || {
+                for limit in [0, ROBOT_INBOX_SNAPSHOT_LIMIT_MAX + 1] {
+                    let request = RobotInboxServerRequest {
+                        limit,
+                        ..inbox_snapshot_test_request()
+                    };
+                    assert!(
+                        try_build_inbox_via_server(
+                            &request,
+                            &Config::default(),
+                            &ProjectSelection::Exact("demo".into())
+                        )
+                        .unwrap()
+                        .is_none()
+                    );
+                }
+                for mode in [
+                    ProjectIdentityMode::GitRemote,
+                    ProjectIdentityMode::GitCommonDir,
+                    ProjectIdentityMode::GitToplevel,
+                ] {
+                    let config = Config {
+                        worktrees_enabled: true,
+                        project_identity_mode: mode,
+                        ..Config::default()
+                    };
+                    for selection in [
+                        ProjectSelection::Ancestors(path.clone()),
+                        ProjectSelection::Exact(path.clone()),
+                    ] {
+                        assert!(
+                            try_build_inbox_via_server(
+                                &inbox_snapshot_test_request(),
+                                &config,
+                                &selection
+                            )
+                            .unwrap()
+                            .is_none()
+                        );
+                    }
+                    assert!(
+                        try_build_inbox_via_server(
+                            &inbox_snapshot_test_request(),
+                            &config,
+                            &ProjectSelection::Exact("demo".into())
+                        )
+                        .is_err(),
+                        "stored slug remains eligible and attempts its authenticated session"
+                    );
+                }
+            },
+        );
     }
 
     #[test]
