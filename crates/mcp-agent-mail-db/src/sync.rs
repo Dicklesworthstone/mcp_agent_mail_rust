@@ -404,6 +404,401 @@ pub struct InboxFetchOptions<'a> {
     pub body_policy: InboxBodyPolicy,
 }
 
+/// Maximum final row count for a coherent priority inbox read.
+pub const MAX_PRIORITY_INBOX_ROWS: usize = 1000;
+/// Maximum source string bytes in a priority snapshot's selected payload.
+/// Wire callers must also enforce this limit after JSON serialization.
+pub const MAX_PRIORITY_INBOX_BYTES: usize = 4 * 1024 * 1024;
+const PRIORITY_INBOX_ACK_OVERDUE_US: i64 = 30 * 60 * 1_000_000;
+
+/// Robot inbox filters, in precedence order: urgent, overdue, all, unread.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct InboxPriorityOptions {
+    pub urgent: bool,
+    pub ack_overdue: bool,
+    pub unread: bool,
+    pub all: bool,
+    pub limit: usize,
+    pub include_bodies: bool,
+}
+
+/// One identity, priority cutoff and message window from one read snapshot.
+#[derive(Debug)]
+pub struct InboxPrioritySnapshot {
+    pub project: crate::models::ProjectRow,
+    /// Registration tokens are deliberately not loaded by this read surface.
+    pub agent: crate::models::AgentRow,
+    pub captured_ts: i64,
+    pub ack_overdue_before: i64,
+    pub rows: Vec<InboxRow>,
+}
+
+fn priority_inbox_sql_error(error: impl std::fmt::Display) -> DbError {
+    DbError::Sqlite(error.to_string())
+}
+
+fn priority_inbox_bound_error() -> DbError {
+    DbError::invalid(
+        "inbox",
+        "priority inbox snapshot exceeds its 4 MiB byte limit",
+    )
+}
+
+fn priority_inbox_preflight(
+    conn: &impl crate::pool::SyncQuery,
+    sql: &str,
+    params: &[Value],
+    bytes: &mut i64,
+) -> Result<usize, DbError> {
+    let rows = conn
+        .query_sync(sql, params)
+        .map_err(priority_inbox_sql_error)?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::Internal("missing priority inbox bounds".into()))?;
+    let count = row
+        .get_named::<i64>("n")
+        .map_err(priority_inbox_sql_error)?;
+    let size = row
+        .get_named::<i64>("bytes")
+        .map_err(priority_inbox_sql_error)?;
+    *bytes = bytes
+        .checked_add(size)
+        .ok_or_else(priority_inbox_bound_error)?;
+    if count < 0 || size < 0 || *bytes > i64::try_from(MAX_PRIORITY_INBOX_BYTES).unwrap_or(i64::MAX)
+    {
+        return Err(priority_inbox_bound_error());
+    }
+    usize::try_from(count).map_err(|_| priority_inbox_bound_error())
+}
+
+fn priority_inbox_identity(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    bytes: &mut i64,
+) -> Result<(crate::models::ProjectRow, crate::models::AgentRow), DbError> {
+    let project_params = [Value::BigInt(project_id)];
+    if priority_inbox_preflight(
+        conn,
+        "SELECT COUNT(*) AS n, COALESCE(SUM(COALESCE(length(CAST(slug AS BLOB)),0) + COALESCE(length(CAST(human_key AS BLOB)),0)),0) AS bytes FROM projects WHERE id = ?",
+        &project_params,
+        bytes,
+    )? != 1
+    {
+        return Err(DbError::not_found("Project", project_id.to_string()));
+    }
+    let projects = conn
+        .query_sync(
+            "SELECT id, slug, human_key, created_at FROM projects WHERE id = ?",
+            &project_params,
+        )
+        .map_err(priority_inbox_sql_error)?;
+    let row = projects
+        .first()
+        .ok_or_else(|| DbError::not_found("Project", project_id.to_string()))?;
+    let project = crate::models::ProjectRow {
+        id: Some(row.get_named("id").map_err(priority_inbox_sql_error)?),
+        slug: row.get_named("slug").map_err(priority_inbox_sql_error)?,
+        human_key: row
+            .get_named("human_key")
+            .map_err(priority_inbox_sql_error)?,
+        created_at: row
+            .get_named("created_at")
+            .map_err(priority_inbox_sql_error)?,
+    };
+    let agent_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
+    if priority_inbox_preflight(
+        conn,
+        "SELECT COUNT(*) AS n, COALESCE(SUM(COALESCE(length(CAST(name AS BLOB)),0) + COALESCE(length(CAST(program AS BLOB)),0) + COALESCE(length(CAST(model AS BLOB)),0) + COALESCE(length(CAST(task_description AS BLOB)),0) + COALESCE(length(CAST(attachments_policy AS BLOB)),0) + COALESCE(length(CAST(contact_policy AS BLOB)),0)),0) AS bytes FROM agents WHERE id = ? AND project_id = ?",
+        &agent_params,
+        bytes,
+    )? != 1
+    {
+        return Err(DbError::not_found(
+            "Agent",
+            format!("{project_id}:{agent_id}"),
+        ));
+    }
+    let agents = conn.query_sync(
+        "SELECT id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, retired_at FROM agents WHERE id = ? AND project_id = ?",
+        &agent_params).map_err(priority_inbox_sql_error)?;
+    let row = agents
+        .first()
+        .ok_or_else(|| DbError::not_found("Agent", agent_id.to_string()))?;
+    let agent = crate::models::AgentRow {
+        id: Some(row.get_named("id").map_err(priority_inbox_sql_error)?),
+        project_id: row
+            .get_named("project_id")
+            .map_err(priority_inbox_sql_error)?,
+        name: row.get_named("name").map_err(priority_inbox_sql_error)?,
+        program: row.get_named("program").map_err(priority_inbox_sql_error)?,
+        model: row.get_named("model").map_err(priority_inbox_sql_error)?,
+        task_description: row
+            .get_named("task_description")
+            .map_err(priority_inbox_sql_error)?,
+        inception_ts: row
+            .get_named("inception_ts")
+            .map_err(priority_inbox_sql_error)?,
+        last_active_ts: row
+            .get_named("last_active_ts")
+            .map_err(priority_inbox_sql_error)?,
+        attachments_policy: row
+            .get_named("attachments_policy")
+            .map_err(priority_inbox_sql_error)?,
+        contact_policy: row
+            .get_named("contact_policy")
+            .map_err(priority_inbox_sql_error)?,
+        reaper_exempt: row
+            .get_named("reaper_exempt")
+            .map_err(priority_inbox_sql_error)?,
+        registration_token: None,
+        retired_at: row
+            .get_named("retired_at")
+            .map_err(priority_inbox_sql_error)?,
+    };
+    if project.id != Some(project_id)
+        || agent.id != Some(agent_id)
+        || agent.project_id != project_id
+    {
+        return Err(DbError::Internal(
+            "priority inbox identity changed inside its snapshot".into(),
+        ));
+    }
+    Ok((project, agent))
+}
+
+fn priority_inbox_bucket(row: &InboxRow, ack_overdue_before: i64) -> u8 {
+    if matches!(row.message.importance.as_str(), "urgent" | "high") && row.read_ts.is_none() {
+        1
+    } else if priority_inbox_ack_overdue(row, ack_overdue_before) {
+        2
+    } else if row.message.ack_required == 1 && row.ack_ts.is_none() && row.read_ts.is_none() {
+        3
+    } else if row.read_ts.is_none() {
+        4
+    } else if row.message.ack_required == 1 && row.ack_ts.is_none() {
+        5
+    } else {
+        6
+    }
+}
+
+fn priority_inbox_ack_overdue(row: &InboxRow, ack_overdue_before: i64) -> bool {
+    row.message.ack_required == 1
+        && row.ack_ts.is_none()
+        && row.message.created_ts < ack_overdue_before
+}
+
+fn priority_inbox_windows(
+    options: InboxPriorityOptions,
+    ack_overdue_before: i64,
+) -> Vec<InboxFetchOptions<'static>> {
+    let base = InboxFetchOptions {
+        urgent_only: false,
+        unread_only: false,
+        ack_required_only: false,
+        ack_overdue_before: None,
+        topic: None,
+        body_policy: InboxBodyPolicy::MetadataOnly,
+    };
+    let urgent = InboxFetchOptions {
+        urgent_only: true,
+        unread_only: true,
+        ..base
+    };
+    let overdue = InboxFetchOptions {
+        ack_overdue_before: Some(ack_overdue_before),
+        ..base
+    };
+    if options.urgent {
+        return vec![urgent];
+    }
+    if options.ack_overdue {
+        return vec![
+            InboxFetchOptions {
+                ack_overdue_before: Some(ack_overdue_before),
+                ..urgent
+            },
+            overdue,
+        ];
+    }
+    let mut windows = vec![
+        urgent,
+        overdue,
+        InboxFetchOptions {
+            ack_required_only: true,
+            unread_only: true,
+            ..base
+        },
+        InboxFetchOptions {
+            unread_only: true,
+            ..base
+        },
+    ];
+    if options.all || !options.unread {
+        windows.push(InboxFetchOptions {
+            ack_required_only: true,
+            ..base
+        });
+    }
+    if options.all {
+        windows.push(base);
+    }
+    windows
+}
+
+fn priority_inbox_hydrate(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    candidates: Vec<InboxRow>,
+    include_bodies: bool,
+    bytes: &mut i64,
+) -> Result<Vec<InboxRow>, DbError> {
+    let body = if include_bodies { "m.body_md" } else { "''" };
+    for chunk in candidates.chunks(256) {
+        let mut params = vec![Value::Text(UNKNOWN_SENDER_DISPLAY.to_string())];
+        for row in chunk {
+            params.push(Value::BigInt(row.message.id.ok_or_else(|| {
+                DbError::Internal("priority candidate has no ID".into())
+            })?));
+            *bytes = bytes
+                .checked_add(
+                    i64::try_from(row.kind.len()).map_err(|_| priority_inbox_bound_error())?,
+                )
+                .ok_or_else(priority_inbox_bound_error)?;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let count = priority_inbox_preflight(
+            conn,
+            &format!(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(COALESCE(length(CAST(m.subject AS BLOB)),0) + COALESCE(length(CAST(m.thread_id AS BLOB)),0) + COALESCE(length(CAST(m.topic AS BLOB)),0) + COALESCE(length(CAST(m.importance AS BLOB)),0) + COALESCE(length(CAST(m.recipients_json AS BLOB)),0) + COALESCE(length(CAST(m.attachments AS BLOB)),0) + COALESCE(length(CAST({body} AS BLOB)),0) + length(CAST(COALESCE(a.name, ?) AS BLOB))),0) AS bytes FROM messages m LEFT JOIN agents a ON a.id = m.sender_id WHERE m.id IN ({placeholders})"
+            ),
+            &params,
+            bytes,
+        )?;
+        if count != chunk.len() {
+            return Err(DbError::Internal(
+                "priority inbox selection changed inside its snapshot".into(),
+            ));
+        }
+    }
+    inbox::hydrate_priority_rows(
+        conn,
+        project_id,
+        candidates,
+        if include_bodies {
+            InboxBodyPolicy::Full
+        } else {
+            InboxBodyPolicy::MetadataOnly
+        },
+    )
+}
+
+/// Read an actionable inbox without receipt, activity or notification writes.
+///
+/// Every candidate window, identity lookup and final hydration shares one
+/// snapshot and one acknowledgment cutoff. Each bucket contributes at most
+/// the requested limit; older urgent or pending-ack mail cannot be displaced
+/// by a history of newer ordinary messages. Only final rows load display
+/// metadata or bodies, after their aggregate byte preflight.
+pub fn priority_inbox_snapshot_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    options: InboxPriorityOptions,
+) -> Result<InboxPrioritySnapshot, DbError> {
+    if options.limit == 0 || options.limit > MAX_PRIORITY_INBOX_ROWS {
+        return Err(DbError::invalid(
+            "limit",
+            "priority inbox limit must be between 1 and 1000",
+        ));
+    }
+    if project_id <= 0 || agent_id <= 0 {
+        return Err(DbError::invalid(
+            "identity",
+            "priority inbox requires persisted project and agent IDs",
+        ));
+    }
+    with_read_snapshot(conn, || {
+        let mut bytes = 0;
+        let (project, agent) = priority_inbox_identity(conn, project_id, agent_id, &mut bytes)?;
+        let captured_ts = crate::now_micros();
+        let ack_overdue_before = captured_ts.saturating_sub(PRIORITY_INBOX_ACK_OVERDUE_US);
+        let mut selected = std::collections::BTreeMap::new();
+        for filters in priority_inbox_windows(options, ack_overdue_before) {
+            let direct = inbox::fetch_direct_with_policy(
+                conn,
+                project_id,
+                agent_id,
+                None,
+                options.limit,
+                filters,
+                true,
+            )?;
+            let shared = crate::project_mailbox::fetch_project_mailbox_rows_with_policy(
+                conn,
+                project_id,
+                agent_id,
+                None,
+                options.limit,
+                filters,
+                true,
+            )?;
+            for row in crate::project_mailbox::merge_inbox_rows(direct, shared, options.limit) {
+                let id = row.message.id.filter(|id| *id > 0).ok_or_else(|| {
+                    DbError::Internal("priority inbox candidate has no persisted ID".into())
+                })?;
+                if row.message.project_id != project_id {
+                    return Err(DbError::Internal(
+                        "priority inbox candidate belongs to another project".into(),
+                    ));
+                }
+                selected.entry(id).or_insert(row);
+            }
+        }
+        let rank = |row: &InboxRow| {
+            (
+                priority_inbox_bucket(row, ack_overdue_before),
+                std::cmp::Reverse(row.message.created_ts),
+                std::cmp::Reverse(row.message.id),
+            )
+        };
+        let mut rows = selected
+            .into_values()
+            .filter(|row| {
+                let bucket = priority_inbox_bucket(row, ack_overdue_before);
+                if options.urgent {
+                    bucket == 1
+                } else if options.ack_overdue {
+                    priority_inbox_ack_overdue(row, ack_overdue_before)
+                } else if options.all {
+                    true
+                } else if options.unread {
+                    bucket <= 4
+                } else {
+                    bucket <= 5
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(rank);
+        rows.truncate(options.limit);
+        let mut rows =
+            priority_inbox_hydrate(conn, project_id, rows, options.include_bodies, &mut bytes)?;
+        rows.sort_unstable_by_key(rank);
+        Ok(InboxPrioritySnapshot {
+            project,
+            agent,
+            captured_ts,
+            ack_overdue_before,
+            rows,
+        })
+    })
+}
+
 /// Fetch inbox rows with the complete filter set used by the MCP tool.
 pub fn fetch_inbox_filtered_rows_from_conn(
     conn: &DbConn,
@@ -1498,6 +1893,610 @@ mod tests {
             .next()
             .and_then(|r| r.get_named::<i64>("id").ok())
             .expect("get message id")
+    }
+
+    fn priority_options() -> InboxPriorityOptions {
+        InboxPriorityOptions {
+            urgent: false,
+            ack_overdue: false,
+            unread: true,
+            all: false,
+            limit: 20,
+            include_bodies: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn priority_message(
+        conn: &DbConn,
+        project: i64,
+        sender: i64,
+        viewer: i64,
+        created: i64,
+        importance: &str,
+        ack_required: bool,
+        shared: bool,
+        state: (Option<i64>, Option<i64>),
+    ) -> i64 {
+        let id = insert_message(conn, project, sender, "priority");
+        conn.execute_sync(
+            "UPDATE messages SET created_ts = ?, importance = ?, ack_required = ? WHERE id = ?",
+            &[
+                Value::BigInt(created),
+                Value::Text(importance.to_string()),
+                Value::BigInt(i64::from(ack_required)),
+                Value::BigInt(id),
+            ],
+        )
+        .unwrap();
+        let read = state.0.map_or(Value::Null, Value::BigInt);
+        let ack = state.1.map_or(Value::Null, Value::BigInt);
+        if shared {
+            conn.execute_sync(
+                "INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) VALUES (?, ?, 'to', ?)",
+                &[Value::BigInt(id), Value::BigInt(project), Value::BigInt(created)],
+            ).unwrap();
+            if state.0.is_some() || state.1.is_some() {
+                conn.execute_sync("INSERT INTO project_mailbox_receipts(message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, ?, ?)",
+                    &[Value::BigInt(id), Value::BigInt(viewer), read, ack]).unwrap();
+            }
+        } else {
+            conn.execute_sync("INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, 'to', ?, ?)",
+                &[Value::BigInt(id), Value::BigInt(viewer), read, ack]).unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn priority_snapshot_surfaces_old_direct_and_shared_mail_past_a_thousand_newer_rows() {
+        let conn = test_conn();
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let viewer = insert_agent(&conn, project, "Viewer");
+        let now = crate::now_micros();
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        let direct_urgent = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now - 4 * PRIORITY_INBOX_ACK_OVERDUE_US,
+            "urgent",
+            false,
+            false,
+            (None, None),
+        );
+        let shared_urgent = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now - 4 * PRIORITY_INBOX_ACK_OVERDUE_US,
+            "high",
+            true,
+            true,
+            (None, None),
+        );
+        let overdue = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now - 2 * PRIORITY_INBOX_ACK_OVERDUE_US,
+            "normal",
+            true,
+            false,
+            (Some(77), None),
+        );
+        let pending = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now - 60_000_000,
+            "normal",
+            true,
+            true,
+            (None, None),
+        );
+        for index in 0..1100 {
+            priority_message(
+                &conn,
+                project,
+                sender,
+                viewer,
+                now - 1_000_000 + index,
+                "normal",
+                false,
+                index % 2 == 0,
+                (None, None),
+            );
+        }
+        // A direct delivery wins over the same message's project receipt.
+        conn.execute_sync("INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) VALUES (?, ?, 'to', ?)",
+            &[Value::BigInt(overdue), Value::BigInt(project), Value::BigInt(now)]).unwrap();
+        conn.execute_sync("INSERT INTO project_mailbox_receipts(message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, 88, 99)",
+            &[Value::BigInt(overdue), Value::BigInt(viewer)]).unwrap();
+        conn.execute_raw("COMMIT; PRAGMA query_only=ON").unwrap();
+        let snapshot = priority_inbox_snapshot_from_conn(
+            &conn,
+            project,
+            viewer,
+            InboxPriorityOptions {
+                limit: 4,
+                include_bodies: true,
+                ..priority_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            vec![shared_urgent, direct_urgent, overdue, pending]
+        );
+        assert_eq!(
+            snapshot.rows[0].kind,
+            crate::project_mailbox::PROJECT_MAILBOX_KIND
+        );
+        assert_eq!(snapshot.rows[2].kind, "to");
+        assert_eq!(snapshot.rows[2].read_ts, Some(77));
+        assert_eq!(snapshot.rows[2].ack_ts, None);
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .all(|row| row.message.body_md == "test body")
+        );
+        assert_eq!(
+            snapshot.ack_overdue_before,
+            snapshot.captured_ts - PRIORITY_INBOX_ACK_OVERDUE_US
+        );
+        assert_eq!(snapshot.project.id, Some(project));
+        assert_eq!(snapshot.agent.id, Some(viewer));
+        assert_eq!(snapshot.agent.last_active_ts, 1_000_000);
+        assert!(snapshot.agent.registration_token.is_none());
+        let direct = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ? AND agent_id = ?",
+            &[Value::BigInt(overdue), Value::BigInt(viewer)]).unwrap();
+        assert_eq!(
+            direct[0].get_named::<Option<i64>>("read_ts").unwrap(),
+            Some(77)
+        );
+        assert_eq!(direct[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+        let shared = conn.query_sync("SELECT read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id = ? AND agent_id = ?",
+            &[Value::BigInt(overdue), Value::BigInt(viewer)]).unwrap();
+        assert_eq!(
+            shared[0].get_named::<Option<i64>>("read_ts").unwrap(),
+            Some(88)
+        );
+        assert_eq!(
+            shared[0].get_named::<Option<i64>>("ack_ts").unwrap(),
+            Some(99)
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            1,
+            "listing must not create shared read receipts"
+        );
+    }
+
+    #[test]
+    fn priority_snapshot_preserves_filter_precedence_and_all_six_buckets() {
+        let conn = test_conn();
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let viewer = insert_agent(&conn, project, "Viewer");
+        let now = crate::now_micros();
+        let old = now - 2 * PRIORITY_INBOX_ACK_OVERDUE_US;
+        let urgent = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            old,
+            "urgent",
+            false,
+            false,
+            (None, None),
+        );
+        let urgent_overdue = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            old,
+            "high",
+            true,
+            true,
+            (None, None),
+        );
+        let overdue = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            old,
+            "normal",
+            true,
+            true,
+            (Some(1), None),
+        );
+        let pending = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now - 60_000_000,
+            "normal",
+            true,
+            false,
+            (None, None),
+        );
+        let unread = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now,
+            "normal",
+            false,
+            true,
+            (None, None),
+        );
+        let read_pending = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now,
+            "normal",
+            true,
+            true,
+            (Some(2), None),
+        );
+        let read = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            now,
+            "urgent",
+            true,
+            false,
+            (Some(3), Some(4)),
+        );
+        let cases = [
+            (
+                priority_options(),
+                vec![urgent_overdue, urgent, overdue, pending, unread],
+            ),
+            (
+                InboxPriorityOptions {
+                    urgent: true,
+                    ack_overdue: true,
+                    all: true,
+                    ..priority_options()
+                },
+                vec![urgent_overdue, urgent],
+            ),
+            (
+                InboxPriorityOptions {
+                    ack_overdue: true,
+                    all: true,
+                    ..priority_options()
+                },
+                vec![urgent_overdue, overdue],
+            ),
+            (
+                InboxPriorityOptions {
+                    unread: false,
+                    ..priority_options()
+                },
+                vec![
+                    urgent_overdue,
+                    urgent,
+                    overdue,
+                    pending,
+                    unread,
+                    read_pending,
+                ],
+            ),
+            (
+                InboxPriorityOptions {
+                    all: true,
+                    ..priority_options()
+                },
+                vec![
+                    urgent_overdue,
+                    urgent,
+                    overdue,
+                    pending,
+                    unread,
+                    read_pending,
+                    read,
+                ],
+            ),
+            (
+                InboxPriorityOptions {
+                    all: true,
+                    limit: 2,
+                    ..priority_options()
+                },
+                vec![urgent_overdue, urgent],
+            ),
+        ];
+        for (options, expected) in cases {
+            let snapshot =
+                priority_inbox_snapshot_from_conn(&conn, project, viewer, options).unwrap();
+            assert_eq!(
+                snapshot
+                    .rows
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                snapshot
+                    .rows
+                    .iter()
+                    .all(|row| row.message.body_md.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn priority_snapshot_bounds_final_payload_before_hydration_and_rejects_bad_scope() {
+        let conn = test_conn();
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let viewer = insert_agent(&conn, project, "Viewer");
+        let id = priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            crate::now_micros(),
+            "normal",
+            false,
+            false,
+            (None, None),
+        );
+        conn.execute_raw(&format!(
+            "UPDATE messages SET body_md=zeroblob({}) WHERE id={id}",
+            MAX_PRIORITY_INBOX_BYTES + 1
+        ))
+        .unwrap();
+        let metadata =
+            priority_inbox_snapshot_from_conn(&conn, project, viewer, priority_options()).unwrap();
+        assert_eq!(metadata.rows.len(), 1);
+        assert!(metadata.rows[0].message.body_md.is_empty());
+        struct NoBodyRead<'a> {
+            conn: &'a DbConn,
+        }
+        impl crate::pool::SyncQuery for NoBodyRead<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                assert!(
+                    !sql.contains("subject, body_md,"),
+                    "body must not materialize before byte refusal"
+                );
+                self.conn.query_sync(sql, params)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.conn.execute_raw(sql)
+            }
+        }
+        let error = priority_inbox_snapshot_from_conn(
+            &NoBodyRead { conn: &conn },
+            project,
+            viewer,
+            InboxPriorityOptions {
+                include_bodies: true,
+                ..priority_options()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("4 MiB"));
+        conn.execute_raw(&format!(
+            "UPDATE messages SET body_md='small', subject=zeroblob({}) WHERE id={id}",
+            MAX_PRIORITY_INBOX_BYTES + 1
+        ))
+        .unwrap();
+        assert!(
+            priority_inbox_snapshot_from_conn(&conn, project, viewer, priority_options())
+                .unwrap_err()
+                .to_string()
+                .contains("4 MiB")
+        );
+        for limit in [0, MAX_PRIORITY_INBOX_ROWS + 1, usize::MAX] {
+            assert!(
+                priority_inbox_snapshot_from_conn(
+                    &conn,
+                    project,
+                    viewer,
+                    InboxPriorityOptions {
+                        limit,
+                        ..priority_options()
+                    }
+                )
+                .is_err()
+            );
+        }
+        for (project_id, agent_id) in [
+            (0, viewer),
+            (project, 0),
+            (project + 1, viewer),
+            (project, viewer + 100),
+        ] {
+            assert!(
+                priority_inbox_snapshot_from_conn(&conn, project_id, agent_id, priority_options())
+                    .is_err()
+            );
+        }
+        conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn priority_snapshot_releases_failed_reads_without_committing_the_caller() {
+        let conn = test_conn();
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let viewer = insert_agent(&conn, project, "Viewer");
+        priority_message(
+            &conn,
+            project,
+            sender,
+            viewer,
+            crate::now_micros(),
+            "urgent",
+            false,
+            false,
+            (None, None),
+        );
+        struct Failed<'a> {
+            conn: &'a DbConn,
+            panic: bool,
+            fired: std::cell::Cell<bool>,
+        }
+        impl crate::pool::SyncQuery for Failed<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                if sql.contains("FROM message_recipients WHERE agent_id")
+                    && !self.fired.replace(true)
+                {
+                    assert!(!self.panic, "injected priority read panic");
+                    return self
+                        .conn
+                        .query_sync("SELECT * FROM missing_priority_source", &[]);
+                }
+                self.conn.query_sync(sql, params)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.conn.execute_raw(sql)
+            }
+        }
+        for panic in [false, true] {
+            conn.execute_raw("BEGIN IMMEDIATE; UPDATE projects SET slug='caller-pending'")
+                .unwrap();
+            let failed = Failed {
+                conn: &conn,
+                panic,
+                fired: std::cell::Cell::new(false),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                priority_inbox_snapshot_from_conn(&failed, project, viewer, priority_options())
+            }));
+            assert!(failed.fired.get());
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT slug FROM projects WHERE id = ?",
+                    &[Value::BigInt(project)]
+                )
+                .unwrap()[0]
+                    .get_named::<String>("slug")
+                    .unwrap(),
+                "caller-pending"
+            );
+            conn.execute_raw("ROLLBACK").unwrap();
+            let recovered =
+                priority_inbox_snapshot_from_conn(&conn, project, viewer, priority_options())
+                    .unwrap();
+            assert_eq!(recovered.project.slug, "test");
+            assert_eq!(recovered.rows.len(), 1);
+            conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        }
+    }
+
+    #[test]
+    fn priority_snapshot_keeps_identity_receipts_and_arrivals_on_one_peer_commit_boundary() {
+        event_snapshot_fixture(|reader, writer, project, viewer| {
+            struct Race<'a> {
+                reader: &'a DbConn,
+                writer: &'a DbConn,
+                project: i64,
+                viewer: i64,
+                fired: std::cell::Cell<bool>,
+            }
+            impl crate::pool::SyncQuery for Race<'_> {
+                fn query_sync(
+                    &self,
+                    sql: &str,
+                    params: &[Value],
+                ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                    let rows = self.reader.query_sync(sql, params)?;
+                    if sql.contains("FROM message_recipients WHERE agent_id")
+                        && !self.fired.replace(true)
+                    {
+                        self.writer.execute_raw("BEGIN IMMEDIATE")?;
+                        self.writer.execute_raw("UPDATE projects SET slug='peer-project'; UPDATE messages SET subject='peer changed'; UPDATE message_recipients SET read_ts=88")?;
+                        self.writer.execute_sync(
+                            "UPDATE agents SET name='PeerViewer' WHERE id=?",
+                            &[Value::BigInt(self.viewer)],
+                        )?;
+                        let id = insert_message(self.writer, self.project, 1, "peer arrival");
+                        self.writer.execute_sync("INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')", &[Value::BigInt(id), Value::BigInt(self.viewer)])?;
+                        self.writer.execute_raw("COMMIT")?;
+                    }
+                    Ok(rows)
+                }
+                fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                    self.reader.execute_raw(sql)
+                }
+            }
+            let race = Race {
+                reader,
+                writer,
+                project,
+                viewer,
+                fired: std::cell::Cell::new(false),
+            };
+            let options = InboxPriorityOptions {
+                all: true,
+                ..priority_options()
+            };
+            let snapshot =
+                priority_inbox_snapshot_from_conn(&race, project, viewer, options).unwrap();
+            assert!(race.fired.get());
+            assert_eq!(snapshot.project.slug, "test");
+            assert_eq!(snapshot.agent.name, "Viewer");
+            assert_eq!(snapshot.rows.len(), 2);
+            assert!(
+                snapshot
+                    .rows
+                    .iter()
+                    .all(|row| row.message.subject == "test subject" && row.read_ts.is_none())
+            );
+            let fresh =
+                priority_inbox_snapshot_from_conn(reader, project, viewer, options).unwrap();
+            assert_eq!(fresh.project.slug, "peer-project");
+            assert_eq!(fresh.agent.name, "PeerViewer");
+            assert_eq!(fresh.rows.len(), 3);
+            assert!(fresh.rows.iter().any(|row| row.read_ts == Some(88)));
+            reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        });
     }
 
     #[test]

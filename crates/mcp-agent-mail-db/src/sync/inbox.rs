@@ -105,6 +105,18 @@ pub(super) fn fetch_direct(
     limit: usize,
     options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
+    fetch_direct_with_policy(conn, project_id, agent_id, since_ts, limit, options, false)
+}
+
+pub(super) fn fetch_direct_with_policy(
+    conn: &impl SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+    candidates_only: bool,
+) -> Result<Vec<InboxRow>, DbError> {
     i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
     if limit == 0 {
         return Ok(Vec::new());
@@ -119,7 +131,13 @@ pub(super) fn fetch_direct(
         Some(newest) => newest,
         None => receipt_window(conn, project_id, agent_id, since_ts, limit, options)?,
     };
-    hydrate(conn, project_id, newest, options.body_policy)
+    hydrate(
+        conn,
+        project_id,
+        newest,
+        options.body_policy,
+        candidates_only,
+    )
 }
 
 /// Direct inboxes that span more than one receipt page (`PAGE_SIZE`) may try
@@ -515,6 +533,7 @@ fn hydrate(
     project_id: i64,
     newest: BTreeMap<(i64, i64), Receipt>,
     body_policy: InboxBodyPolicy,
+    candidates_only: bool,
 ) -> Result<Vec<InboxRow>, DbError> {
     let expected = newest.len();
     let ids: Vec<i64> = newest.keys().rev().map(|(_, id)| *id).collect();
@@ -526,10 +545,17 @@ fn hydrate(
         InboxBodyPolicy::Full => "body_md",
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
     };
-    let columns = format!(
-        "id, project_id, sender_id, thread_id, topic, subject, {body}, \
-        importance, ack_required, created_ts, recipients_json, attachments"
-    );
+    let columns = if candidates_only {
+        "id, project_id, sender_id, NULL AS thread_id, NULL AS topic, '' AS subject, \
+         '' AS body_md, importance, ack_required, created_ts, '[]' AS recipients_json, \
+         '[]' AS attachments"
+            .to_string()
+    } else {
+        format!(
+            "id, project_id, sender_id, thread_id, topic, subject, {body}, \
+             importance, ack_required, created_ts, recipients_json, attachments"
+        )
+    };
     let mut out = Vec::with_capacity(expected);
     for chunk in ids.chunks(PAGE_SIZE) {
         let (sql, params) = lookup_query("messages", &columns, chunk);
@@ -571,6 +597,10 @@ fn hydrate(
             "selected inbox message disappeared inside its read snapshot".into(),
         ));
     }
+    if candidates_only {
+        out.sort_unstable_by_key(|row| std::cmp::Reverse((row.message.created_ts, row.message.id)));
+        return Ok(out);
+    }
     let mut senders: Vec<i64> = out.iter().map(|row| row.message.sender_id).collect();
     senders.sort_unstable();
     senders.dedup();
@@ -591,6 +621,31 @@ fn hydrate(
     }
     out.sort_unstable_by_key(|row| std::cmp::Reverse((row.message.created_ts, row.message.id)));
     Ok(out)
+}
+
+/// Materialize only the final priority window after its byte preflight.
+pub(super) fn hydrate_priority_rows(
+    conn: &impl SyncQuery,
+    project_id: i64,
+    candidates: Vec<InboxRow>,
+    body_policy: InboxBodyPolicy,
+) -> Result<Vec<InboxRow>, DbError> {
+    let mut newest = NewestWindow::new();
+    for row in candidates {
+        let id = row
+            .message
+            .id
+            .ok_or_else(|| DbError::Internal("priority candidate has no ID".into()))?;
+        newest.insert(
+            (row.message.created_ts, id),
+            Receipt {
+                kind: row.kind,
+                read_ts: row.read_ts,
+                ack_ts: row.ack_ts,
+            },
+        );
+    }
+    hydrate(conn, project_id, newest, body_policy, false)
 }
 
 const SHARED_PAGE_SIZE: usize = 128;
@@ -677,6 +732,18 @@ pub fn fetch_shared(
     since_ts: Option<i64>,
     limit: usize,
     options: InboxFetchOptions<'_>,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_shared_with_policy(conn, project_id, agent_id, since_ts, limit, options, false)
+}
+
+pub(crate) fn fetch_shared_with_policy(
+    conn: &impl SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+    candidates_only: bool,
 ) -> Result<Vec<InboxRow>, DbError> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -851,7 +918,13 @@ pub fn fetch_shared(
         ceiling = last_ts;
         skip_at_ceiling = trailing_count;
     }
-    hydrate(conn, project_id, newest, options.body_policy)
+    hydrate(
+        conn,
+        project_id,
+        newest,
+        options.body_policy,
+        candidates_only,
+    )
 }
 
 #[cfg(test)]

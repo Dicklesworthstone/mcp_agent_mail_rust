@@ -422,6 +422,20 @@ pub fn fetch_project_mailbox_rows_from_conn(
     limit: usize,
     options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
+    fetch_project_mailbox_rows_with_policy(
+        conn, project_id, agent_id, since_ts, limit, options, false,
+    )
+}
+
+pub(crate) fn fetch_project_mailbox_rows_with_policy(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+    candidates_only: bool,
+) -> Result<Vec<InboxRow>, DbError> {
     crate::sync::inbox::with_snapshot(conn, || {
         i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
         if !has_project_deliveries(conn, project_id)? {
@@ -433,7 +447,13 @@ pub fn fetch_project_mailbox_rows_from_conn(
         ) {
             allow_absent_shared_schema(conn, &error.to_string())?;
         }
-        crate::sync::inbox::fetch_shared(conn, project_id, agent_id, since_ts, limit, options)
+        if candidates_only {
+            crate::sync::inbox::fetch_shared_with_policy(
+                conn, project_id, agent_id, since_ts, limit, options, true,
+            )
+        } else {
+            crate::sync::inbox::fetch_shared(conn, project_id, agent_id, since_ts, limit, options)
+        }
     })
 }
 
