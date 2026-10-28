@@ -282,6 +282,36 @@ fn source_snapshot(fixture: &Fixture) -> [Vec<Vec<DbValue>>; 2] {
 #[test]
 #[allow(clippy::too_many_lines)] // Keep the restart, scheduling and committed-byte witnesses together.
 fn restored_forward_tail_reaches_orphan_after_history_ends_without_client_reads() {
+    // Preserve the reconciler's real reason if this fixture defers work.
+    // RUST_LOG alone has no effect in a libtest process without a subscriber.
+    #[derive(Default)]
+    struct RepairWarnings(std::sync::atomic::AtomicU64);
+    impl tracing::Subscriber for RepairWarnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "maintenance" && *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(self.0.fetch_add(1, Ordering::Relaxed) + 1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    eprintln!("{}={value:?}", field.name());
+                },
+            );
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let _warnings = tracing::subscriber::set_default(RepairWarnings::default());
     let fixture = fixture();
     let stop = AtomicBool::new(false);
     let mut before_restart = ReconcileCursor::settled_before(now_micros());

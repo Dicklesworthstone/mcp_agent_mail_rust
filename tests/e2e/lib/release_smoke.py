@@ -50,6 +50,7 @@ NO_VERDICT, which also fails. The control arm is recorded, never gating.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -59,6 +60,7 @@ import resource
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -200,6 +202,266 @@ def tool_result(resp: dict) -> tuple[bool, object]:
     return bool(res.get("isError")), payload
 
 
+def archive_routing(value: object) -> dict[str, list[str]]:
+    """Normalize only complete arrays of recipient names, never object keys."""
+    if not isinstance(value, dict):
+        raise ValueError("routing is not an object")
+    roles = {}
+    for role in ("to", "cc", "bcc"):
+        names = value[role]
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("routing is not arrays of names")
+        roles[role] = sorted(names)
+    if not any(roles.values()):
+        raise ValueError("routing has no recipients")
+    return roles
+
+
+def archive_db_parity(storage: Path, database: Path,
+                      deadline: float | None = None) -> tuple[bool, dict]:
+    """Independently compare canonical message bytes/metadata with one DB snapshot.
+
+    No server request is made: polling health during the quiet interval can
+    exercise the very read-driven recovery that this qualification excludes.
+    Counts alone cannot detect a replaced id, body or recipient (br-kp1in.35).
+    Returned diagnostics contain ids and fixed field names, never message content.
+    SQLite progress and ordinary-file reads check the elapsed deadline. These
+    cooperative checks cannot interrupt a blocked OS filesystem operation or
+    prove safety against an adversarial directory replacement race.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + RELEASE_CONVERGE_SECS
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("archive observation deadline")
+
+    detail: dict = {"db_messages": 0, "archive_messages": 0, "invalid_files": 0,
+                    "missing_ids": [], "extra_ids": [], "duplicate_ids": [],
+                    "mismatches": [], "unverifiable_reply_ids": []}
+    expected = {}
+    absent_reply = set()
+    try:
+        check_deadline()
+        conn = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True,
+                               timeout=min(1, max(0, deadline - time.monotonic())))
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            conn.execute("BEGIN")
+            messages = conn.execute(
+                "SELECT m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, m.importance, "
+                "m.ack_required, m.created_ts, m.attachments, m.recipients_json, "
+                "m.archive_metadata_json, p.slug, p.human_key, a.name AS sender_name "
+                "FROM messages m JOIN projects p ON p.id=m.project_id "
+                "LEFT JOIN agents a ON a.id=m.sender_id").fetchall()
+            projects_by_message = {row["id"]: row["project_id"] for row in messages}
+            recipients = {}
+            recipient_ids = {}
+            recipient_names = {}
+            for row in conn.execute(
+                    "SELECT r.message_id, r.agent_id, r.kind, a.name, a.project_id "
+                    "FROM message_recipients r LEFT JOIN agents a ON a.id=r.agent_id"):
+                check_deadline()
+                message_id, agent_id, name = row["message_id"], row["agent_id"], row["name"]
+                if (message_id not in projects_by_message or type(agent_id) is not int or agent_id <= 0
+                        or not isinstance(name, str) or not name or row["kind"] not in ("to", "cc", "bcc")
+                        or row["project_id"] != projects_by_message[message_id]):
+                    raise ValueError("invalid or orphaned delivery identity")
+                ids = recipient_ids.setdefault(message_id, set())
+                names = recipient_names.setdefault(message_id, set())
+                if agent_id in ids or name.lower() in names:
+                    raise ValueError("duplicate delivery identity")
+                ids.add(agent_id)
+                names.add(name.lower())
+                roles = recipients.setdefault(row["message_id"], {"to": [], "cc": [], "bcc": []})
+                roles[row["kind"]].append(name)
+            # Shared-mailbox routing is one explicit delivery, never a fan-out
+            # into per-agent rows and never BCC. Observe it in this same snapshot.
+            project_deliveries = set()
+            for row in conn.execute(
+                    "SELECT d.message_id, d.project_id, d.kind, p.slug "
+                    "FROM project_mailbox_deliveries d LEFT JOIN projects p ON p.id=d.project_id"):
+                check_deadline()
+                message_id = row["message_id"]
+                if (message_id not in projects_by_message or message_id in project_deliveries
+                        or row["project_id"] != projects_by_message[message_id]
+                        or not isinstance(row["slug"], str) or not row["slug"]
+                        or row["kind"] not in ("to", "cc")):
+                    raise ValueError("invalid or orphaned project delivery")
+                project_deliveries.add(message_id)
+                roles = recipients.setdefault(message_id, {"to": [], "cc": [], "bcc": []})
+                roles[row["kind"]].append("project:" + row["slug"])
+            # An inner project join must not silently hide orphaned DB rows.
+            if len(messages) != conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]:
+                raise ValueError("orphaned message project")
+        finally:
+            conn.close()
+        detail["db_messages"] = len(messages)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        for row in messages:
+            check_deadline()
+            if (type(row["id"]) is not int or row["id"] <= 0
+                    or not isinstance(row["sender_name"], str) or not row["sender_name"]
+                    or type(row["ack_required"]) is not int or row["ack_required"] not in (0, 1)
+                    or type(row["created_ts"]) is not int):
+                raise ValueError("invalid message identity or scalar metadata")
+            durable = archive_routing(recipients.get(row["id"], {}))
+            cached = json.loads(row["recipients_json"])
+            # Only the exact legacy {} default allows fallback. Populated cache
+            # entries must agree with every durable recipient and its role.
+            roles = durable if isinstance(cached, dict) and not cached else archive_routing(cached)
+            if roles != durable:
+                raise ValueError("cached routing conflicts with delivery rows")
+            attachments = json.loads(row["attachments"])
+            if not isinstance(attachments, list):
+                raise ValueError("attachments are not an array")
+            envelope = {"id": row["id"], "from": row["sender_name"],
+                        "project": row["human_key"], "project_slug": row["slug"],
+                        "subject": row["subject"], "body_md": row["body_md"],
+                        "thread_id": row["thread_id"], "topic": row["topic"],
+                        "importance": row["importance"], "ack_required": bool(row["ack_required"]),
+                        "created": epoch + timedelta(microseconds=row["created_ts"]),
+                        "attachments": attachments}
+            for role in ("to", "cc", "bcc"):
+                envelope[role] = roles[role]
+            # The production durable reply record accepts {} or {reply_to:id}.
+            # NULL is legacy unknown authority, not evidence of a fresh send.
+            raw_metadata = row["archive_metadata_json"]
+            if raw_metadata is None:
+                detail["unverifiable_reply_ids"].append(row["id"])
+            else:
+                metadata = json.loads(raw_metadata)
+                if not isinstance(metadata, dict) or set(metadata) - {"reply_to"}:
+                    raise ValueError("unsupported archive metadata")
+                if "reply_to" in metadata:
+                    parent = metadata["reply_to"]
+                    if (type(parent) is not int or parent <= 0 or parent == row["id"]
+                            or not isinstance(row["thread_id"], str) or not row["thread_id"]):
+                        raise ValueError("invalid durable reply parent")
+                    envelope["reply_to"] = parent
+                else:
+                    absent_reply.add(row["id"])
+            expected[row["id"]] = envelope
+    except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, OverflowError, AttributeError) as error:
+        detail["db_error"] = type(error).__name__
+        if time.monotonic() >= deadline:
+            detail["deadline_exceeded"] = True
+        return False, detail
+
+    seen = set()
+    projects = storage / "projects"
+    try:
+        check_deadline()
+        if storage.is_symlink() or projects.is_symlink():
+            raise ValueError("archive root symlink")
+
+        def walk_error(error: OSError) -> None:
+            raise error  # os.walk otherwise silently omits unreadable subtrees
+
+        for project in projects.iterdir() if projects.exists() else ():
+            check_deadline()
+            messages_root = project / "messages"
+            if project.is_symlink() or messages_root.is_symlink():
+                detail["invalid_files"] += 1
+                continue
+            if not messages_root.is_dir():
+                continue
+            for directory, directories, files in os.walk(messages_root, followlinks=False,
+                                                        onerror=walk_error):
+                check_deadline()
+                parent = Path(directory)
+                for name in directories[:]:
+                    if parent.joinpath(name).is_symlink():
+                        detail["invalid_files"] += 1
+                        directories.remove(name)
+                    elif parent == messages_root and name == "threads":
+                        directories.remove(name)  # derived thread views are not canonical messages
+                for name in files:
+                    check_deadline()
+                    if not name.endswith(".md"):
+                        continue
+                    detail["archive_messages"] += 1
+                    path = parent / name
+                    try:
+                        if path.is_symlink():
+                            raise ValueError("canonical symlink")
+                        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                        try:
+                            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                                raise ValueError("canonical entry is not a regular file")
+                            chunks = []
+                            while True:
+                                check_deadline()
+                                chunk = os.read(descriptor, 64 * 1024)
+                                if not chunk:
+                                    break
+                                chunks.append(chunk)
+                            raw = b"".join(chunks)
+                        finally:
+                            os.close(descriptor)
+                        check_deadline()
+                        if not raw.startswith(b"---json\n"):
+                            raise ValueError("missing envelope")
+                        front, separator, body = raw[8:].partition(b"\n---\n\n")
+                        if not separator:
+                            raise ValueError("missing body boundary")
+                        actual = json.loads(front)
+                        message_id = actual["id"]
+                        suffix = re.search(r"__(\d+)\.md$", name)
+                        if type(message_id) is not int or message_id <= 0 or not suffix:
+                            raise ValueError("invalid canonical id")
+                        if int(suffix.group(1)) != message_id:
+                            raise ValueError("filename/envelope id mismatch")
+                        if message_id in seen:
+                            detail["duplicate_ids"].append(message_id)
+                        seen.add(message_id)
+                        actual["body_md"] = body.decode("utf-8")  # preserve all significant whitespace
+                        actual["created"] = datetime.fromisoformat(actual["created"].replace("Z", "+00:00"))
+                        actual.update(archive_routing(actual))
+                        if (type(actual.get("ack_required")) is not bool
+                                or not isinstance(actual.get("attachments"), list)):
+                            raise ValueError("invalid archived scalar or attachment metadata")
+                        if "reply_to" in actual:
+                            parent_id = actual["reply_to"]
+                            if (type(parent_id) is not int or parent_id <= 0 or parent_id == message_id
+                                    or not isinstance(actual.get("thread_id"), str)
+                                    or not actual["thread_id"]):
+                                raise ValueError("invalid archived reply parent")
+                        wanted = expected.get(message_id)
+                        if wanted is not None:
+                            fields = [key for key, value in wanted.items() if actual.get(key) != value]
+                            # Python considers True == 1, including inside an
+                            # attachment object; JSON preserves that type distinction.
+                            if ("attachments" not in fields
+                                    and json.dumps(actual["attachments"], sort_keys=True)
+                                    != json.dumps(wanted["attachments"], sort_keys=True)):
+                                fields.append("attachments")
+                            if project.name != wanted["project_slug"]:
+                                fields.append("canonical_project")
+                            if message_id in absent_reply and "reply_to" in actual:
+                                fields.append("reply_to")
+                            if fields:
+                                detail["mismatches"].append({"id": message_id, "fields": fields})
+                    except TimeoutError:
+                        raise
+                    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                        detail["invalid_files"] += 1
+        check_deadline()
+    except (OSError, ValueError) as error:
+        detail["archive_error"] = type(error).__name__
+        if time.monotonic() >= deadline:
+            detail["deadline_exceeded"] = True
+        return False, detail
+    detail["missing_ids"] = sorted(expected.keys() - seen)
+    detail["extra_ids"] = sorted(seen - expected.keys())
+    ok = (detail["db_messages"] == detail["archive_messages"]
+          and not any(detail[key] for key in
+                      ("invalid_files", "missing_ids", "extra_ids", "duplicate_ids", "mismatches",
+                       "unverifiable_reply_ids")))
+    return ok, detail
+
+
 class Session:
     """One agent's own MCP session against a server URL (swarm agents do not
     share one, as real agents do not)."""
@@ -265,13 +527,13 @@ class Arm:
             _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             resource.setrlimit(resource.RLIMIT_NOFILE, (min(1024, hard), hard))
 
-        log_file = self.server_log.open("ab")
-        self.proc = subprocess.Popen(
-            [str(self.binary), "serve-http", "--host", "127.0.0.1", "--port",
-             str(self.port), "--no-auth", "--no-tui"],
-            cwd=self.root, env=self.env(), stdout=log_file, stderr=log_file,
-            preexec_fn=soft_limit_1024,
-        )
+        with self.server_log.open("ab") as log_file:
+            self.proc = subprocess.Popen(
+                [str(self.binary), "serve-http", "--host", "127.0.0.1", "--port",
+                 str(self.port), "--no-auth", "--no-tui"],
+                cwd=self.root, env=self.env(), stdout=log_file, stderr=log_file,
+                preexec_fn=soft_limit_1024,
+            )
         deadline = time.time() + 120
         while time.time() < deadline:
             try:
@@ -359,26 +621,29 @@ class Arm:
             raise RuntimeError(f"health_check failed: {payload}")
         return payload
 
-    def archive_db_counts(self) -> tuple[int | None, int | None, str]:
-        """(archive, db, detail); counts are None when health cannot report them."""
-        try:
-            detail = self.health()["semantic_readiness"]["detail"]
-        except Exception as ex:  # a sick server must not erase the verdict
-            return None, None, f"{type(ex).__name__}: {ex}"[:400]
-        counts = [int(n) for n in re.findall(r"messages=(\d+)", detail)]
-        if len(counts) != 2:
-            return None, None, detail[:400]
-        return counts[0], counts[1], detail[:400]
-
-    def wait_converged(self, bound_s: int, poll_s: int) -> tuple[bool, str]:
-        deadline = time.time() + bound_s
+    def wait_converged(self, bound_s: int, poll_s: int,
+                       client_threads: list[threading.Thread] | None = None) -> tuple[bool, str]:
+        started = time.monotonic()
+        deadline = started + bound_s
         while True:
-            archive, db, detail = self.archive_db_counts()
-            if archive is not None and archive == db:
-                return True, f"archive={archive} db={db}"
-            if time.time() >= deadline:
-                return False, f"archive={archive} db={db} last={detail}"
-            time.sleep(poll_s)
+            active = sum(thread.is_alive() for thread in client_threads or [])
+            if active:
+                ok, detail = False, {"active_client_threads": active,
+                                     "convergence_unobserved": True}
+            else:
+                ok, detail = archive_db_parity(self.root / "storage", self.db_path, deadline)
+            now = time.monotonic()
+            detail.update(elapsed_s=round(now - started, 3), bound_s=bound_s,
+                          no_mcp_requests=not active, within_bound=now <= deadline)
+            with (self.root / "out" / "archive_convergence.jsonl").open("a") as trace:
+                trace.write(json.dumps({"ok": ok and now <= deadline, **detail}) + "\n")
+            if active:
+                return False, json.dumps(detail, sort_keys=True)
+            if ok and now <= deadline:
+                return True, json.dumps(detail, sort_keys=True)
+            if now >= deadline:
+                return False, json.dumps(detail, sort_keys=True)
+            time.sleep(min(poll_s, deadline - now))
 
     def offline_integrity_check(self) -> tuple[bool, object]:
         """Full PRAGMA integrity_check by C SQLite on the stopped server's file."""
@@ -892,6 +1157,8 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
     clock = {"kill_t": None, "restarted_t": None}
 
     def timed(sess: Session, tool: str, args: dict) -> tuple[bool, object] | None:
+        if stop.is_set():
+            return None  # do not launch another read after the load stops
         t0 = time.time()
         try:
             e, p = sess.call(tool, args, timeout=60)
@@ -919,6 +1186,7 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
                 time.sleep(0.2)
                 continue
             r = timed(sess, "send_message", {
+                # ubs:ignore -- seeded peer scheduling, never secret/key/token generation.
                 "project_key": proj, "sender_name": me, "to": rnd.sample(others, k=min(2, len(others))),
                 "subject": f"swarm {me} {rnd.randrange(1 << 30)}",
                 "body_md": "swarm body " * rnd.randint(1, 40),
@@ -981,8 +1249,15 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
         except Exception:  # a server too sick to answer health is judged by its windows
             unobserved += 1
     stop.set()
+    clients_deadline = time.monotonic() + 120
     for t in threads:
-        t.join(timeout=120)
+        t.join(timeout=max(0, clients_deadline - time.monotonic()))
+    active_clients = sum(t.is_alive() for t in threads)
+    check(c, "all swarm clients stop before the quiet interval", active_clients == 0,
+          {"active_client_threads": active_clients})
+    if active_clients:
+        extra.update(active_client_threads=active_clients, quiet_interval_observed=False)
+        return extra  # no quiet or archive-convergence claim from a live client
     load_secs = time.time() - started
     # Every call, so a latency tail can be placed in time (restart, backup, checkpoint).
     with (arm.root / "out" / "swarm_calls.jsonl").open("w") as f:
@@ -1008,7 +1283,7 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
     check(c, f"storage.sqlite3 descriptors bounded (<= {FD_BOUND})", fds_max <= FD_BOUND,
           f"max={fds_max}")
     check(c, "no dispatch zombies", zombies_max == 0, f"max={zombies_max}")
-    ok, detail = arm.wait_converged(CONVERGE_SECS, 10)
+    ok, detail = arm.wait_converged(CONVERGE_SECS, 10, client_threads=threads)
     check(c, f"archive converges to DB after the swarm without client reads "
              f"(<= {CONVERGE_SECS}s)", ok, detail)
     log_text = arm.server_log.read_text(errors="replace")[log_offset:]
@@ -1061,14 +1336,14 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
         target = elf_target(f.read(1 << 16))
     result: dict = {"arm": name, "binary": str(binary), "binary_sha256": sha256(binary),
                     "binary_target": target,
-                    "loadavg_start": open("/proc/loadavg").read().split()[:3], "phases": {}}
+                    "loadavg_start": Path("/proc/loadavg").read_text().split()[:3], "phases": {}}
     try:
         version = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
                                  timeout=60, env=arm.env())
         result["binary_version"] = (version.stdout or version.stderr).strip()[:200]
         arm.start()
         result["server_exe_sha256"] = sha256(Path(f"/proc/{arm.pid()}/exe"))
-        soft, hard = open(f"/proc/{arm.pid()}/limits").read().split("Max open files")[1].split()[:2]
+        soft, hard = Path(f"/proc/{arm.pid()}/limits").read_text().split("Max open files")[1].split()[:2]
         result["server_nofile_soft_hard"] = [soft, hard]
         result["server_threads_start"] = arm.threads()
         state: dict = {}
@@ -1102,7 +1377,7 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
             if "WAL-FEC" in line)
     except OSError:
         pass
-    result["loadavg_end"] = open("/proc/loadavg").read().split()[:3]
+    result["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
     verdicts = [p.get("verdict") for p in result["phases"].values()]
     result["verdict"] = ("PASS" if len(verdicts) == len(PHASES)
                          and all(v == "PASS" for v in verdicts)
@@ -1118,6 +1393,8 @@ def main() -> int:
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     receipt = {"schema_version": 3,
+               "harness_sha256": sha256(Path(__file__)),
+               "convergence_source": "independent read-only SQLite and canonical archive; no MCP polling",
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "host": socket.gethostname(), "cpu_governors": cpu_governors(),
                "soak_secs": SOAK_SECS,
@@ -1125,12 +1402,12 @@ def main() -> int:
                "fetch_inbox_p99_budget_s": FETCH_INBOX_P99_BUDGET_S,
                "swarm_agents": SWARM_AGENTS, "swarm_secs": SWARM_SECS,
                "swarm_tool_p99_budget_s": SWARM_TOOL_P99_BUDGET_S,
-               "loadavg_start": open("/proc/loadavg").read().split()[:3], "arms": []}
+               "loadavg_start": Path("/proc/loadavg").read_text().split()[:3], "arms": []}
     receipt["arms"].append(run_arm("candidate", args.bin.resolve(), args.out))
     if args.control_bin:
         receipt["arms"].append(run_arm("control", args.control_bin.resolve(), args.out))
     receipt["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    receipt["loadavg_end"] = open("/proc/loadavg").read().split()[:3]
+    receipt["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
     receipt["candidate_verdict"] = receipt["arms"][0]["verdict"]
     (args.out / "release_smoke_receipt.json").write_text(json.dumps(receipt, indent=2))
     log(f"receipt: {args.out / 'release_smoke_receipt.json'}")
