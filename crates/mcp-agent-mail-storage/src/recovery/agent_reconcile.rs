@@ -193,6 +193,27 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, Failure> 
 }
 
 fn read_source_connection(conn: &DbConn, id: i64) -> Result<AgentSource, Failure> {
+    // Initial observation and both-locks-held revalidation share this narrow
+    // boundary. The caller retires a transiently failed reader; publication
+    // itself remains outside the catch and owned by the worker supervisor.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        tests::source_read_panic(conn, id, false);
+        let result = read_source_connection_inner(conn, id);
+        #[cfg(test)]
+        tests::source_read_panic(conn, id, true);
+        result
+    }))
+    .unwrap_or_else(|_| {
+        // A panic payload may contain private profile data. Retain the ID as
+        // retry debt, never the payload or an incomplete source projection.
+        Err(Failure::source_unavailable(
+            "agent archive source read panicked",
+        ))
+    })
+}
+
+fn read_source_connection_inner(conn: &DbConn, id: i64) -> Result<AgentSource, Failure> {
     // One statement observes identity, lifecycle ledger and project together.
     // Do not select registration_token, even temporarily. The raw text bound
     // precedes materialization; serialization has its own bound below.
@@ -803,6 +824,28 @@ mod tests {
     std::thread_local! {
         static CHECKOUT_PENDING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
             const { std::cell::RefCell::new(None) };
+        static SOURCE_READ_PANIC: std::cell::Cell<Option<(i64, bool, usize)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    // Inject an unwind only at a real source-read boundary. The query and
+    // archive/Git paths remain real; query_only is a connection-local witness
+    // that the failed one-slot reader was retired rather than returned idle.
+    pub(super) fn source_read_panic(conn: &DbConn, id: i64, after_projection: bool) {
+        let fail = SOURCE_READ_PANIC.with(|slot| {
+            let Some((target, after, remaining)) = slot.get() else {
+                return false;
+            };
+            if (id, after_projection) != (target, after) {
+                return false;
+            }
+            slot.set((remaining > 1).then_some((target, after, remaining - 1)));
+            remaining == 1
+        });
+        if fail {
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            panic!("private-agent-source-panic-payload");
+        }
     }
 
     // Observe a real exhausted-pool wait, rather than guessing that a newly
@@ -928,6 +971,121 @@ mod tests {
             .unwrap();
         assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
         value
+    }
+
+    #[test]
+    fn source_panics_preserve_retry_debt_and_allow_other_profiles_to_converge() {
+        if isolate_admission_test() {
+            return;
+        }
+        for after_projection in [false, true] {
+            // Read 1 discovers the source; read 2 revalidates it under the
+            // publication locks. Both must retain the same retry obligation.
+            for read_number in 1..=2 {
+                with_mailbox(|cx, pool, config, _| {
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+                        VALUES(102, 101, 'GreenStone', 'test', 'test', 'unaffected', 1000000, 2000000)").unwrap();
+                    drop(conn);
+                    SOURCE_READ_PANIC.with(|slot| {
+                        slot.set(Some((101, after_projection, read_number)));
+                    });
+                    let mut cursor = AgentReconcileCursor::default();
+                    let stop = AtomicBool::new(false);
+                    let report =
+                        reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                    assert_eq!(
+                        (
+                            report.scanned,
+                            report.repaired,
+                            report.deferred_transient,
+                            report.retry_len
+                        ),
+                        (2, 1, 1, 1),
+                        "{report:?}"
+                    );
+                    assert!(!report.interrupted);
+                    assert!(
+                        !profile_path(config).exists(),
+                        "failed source cannot publish"
+                    );
+                    let other = config
+                        .storage_root
+                        .join("projects/project/agents/GreenStone/profile.json");
+                    let bytes = fs::read(&other).unwrap();
+                    let repo = Repository::open(&config.storage_root).unwrap();
+                    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                    let entry = tree
+                        .get_path(Path::new("projects/project/agents/GreenStone/profile.json"))
+                        .unwrap();
+                    assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    assert_eq!(
+                        conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                            .get_as::<i64>(0)
+                            .unwrap(),
+                        0,
+                        "panicked reader must not be reused"
+                    );
+                    conn.execute_raw("UPDATE agents SET retired_at = 123456789 WHERE id = 101")
+                        .unwrap();
+                    drop(conn);
+                    let recovered =
+                        reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                    assert_eq!(
+                        (recovered.repaired, recovered.retry_len, recovered.deferred),
+                        (1, 0, 0)
+                    );
+                    assert_eq!(
+                        assert_profile_committed(config)["retired_at"],
+                        timestamp(123_456_789).unwrap(),
+                        "retry must read the new lifecycle, not the failed projection"
+                    );
+                    assert_eq!(reconcile(cx, pool, config).repaired, 0);
+                    assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn source_panic_error_is_redacted_and_metadata_conflicts_keep_the_reader() {
+        with_mailbox(|cx, pool, _, _| {
+            SOURCE_READ_PANIC.with(|slot| slot.set(Some((101, true, 1))));
+            let failure = read_source(cx, pool, 101).unwrap_err();
+            assert!(failure.transient);
+            assert!(failure.detail.contains("panicked"));
+            assert!(
+                !failure
+                    .detail
+                    .contains("private-agent-source-panic-payload")
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                0
+            );
+            conn.execute_raw("UPDATE projects SET human_key = 'relative-project' WHERE id = 101")
+                .unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let failure = read_source(cx, pool, 101).unwrap_err();
+            assert!(
+                !failure.transient,
+                "conflicting metadata is not an engine panic"
+            );
+            assert!(failure.detail.contains("must be absolute"));
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        });
     }
 
     #[test]

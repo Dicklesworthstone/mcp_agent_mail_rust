@@ -323,6 +323,30 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<ReleaseSource>,
 }
 
 fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<ReleaseSource>, ReleaseFailure> {
+    // Include the two pre-publication rechecks, not archive writes or Git.
+    // Their existing transient-error paths retire the uncertain connection
+    // after releasing publication locks and retain this ID for a fresh read.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        tests::source_read_panic(conn, id, false);
+        let result = read_source_connection_inner(conn, id);
+        #[cfg(test)]
+        tests::source_read_panic(conn, id, true);
+        result
+    }))
+    .unwrap_or_else(|_| {
+        // The payload may contain private paths or reasons. It cannot become
+        // an error detail, source projection, or permission to publish.
+        Err(ReleaseFailure::source_unavailable(
+            "reservation archive source read panicked",
+        ))
+    })
+}
+
+fn read_source_connection_inner(
+    conn: &DbConn,
+    id: i64,
+) -> Result<Option<ReleaseSource>, ReleaseFailure> {
     // Identity, effective release and generation belong to one SQL snapshot.
     // Bound raw strings before materializing them; never seed a generation.
     let rows = conn.query_sync(
@@ -849,6 +873,27 @@ mod tests {
     std::thread_local! {
         static CHECKOUT_PENDING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
             const { std::cell::RefCell::new(None) };
+        static SOURCE_READ_PANIC: std::cell::Cell<Option<(i64, bool, usize)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    // An owned, one-shot unwind at a real read boundary; no source result or
+    // publication result is substituted. query_only witnesses reader disposal.
+    pub(super) fn source_read_panic(conn: &DbConn, id: i64, after_projection: bool) {
+        let fail = SOURCE_READ_PANIC.with(|slot| {
+            let Some((target, after, remaining)) = slot.get() else {
+                return false;
+            };
+            if (id, after_projection) != (target, after) {
+                return false;
+            }
+            slot.set((remaining > 1).then_some((target, after, remaining - 1)));
+            remaining == 1
+        });
+        if fail {
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            panic!("private-reservation-source-panic-payload");
+        }
     }
 
     // Observe an actual pending pool checkout without injecting an error or
@@ -1074,6 +1119,144 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&value).unwrap();
         fs::write(&path, &bytes).unwrap();
         (path, bytes)
+    }
+
+    #[test]
+    fn source_panics_preserve_release_retry_and_allow_other_releases_to_converge() {
+        if isolated_admission_test() {
+            return;
+        }
+        for after_projection in [false, true] {
+            // Discovery, locked source revalidation, and the final recheck
+            // before publication are each isolated from archive mutations.
+            for read_number in 1..=3 {
+                fixture(|cx, pool, config| {
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                        VALUES(402, 71, 81, 'other/*.rs', 1, 'unaffected', 1000000, 9000000, 6000000)").unwrap();
+                    drop(conn);
+                    let source = read_source(cx, pool, 401).unwrap().unwrap();
+                    let (path, before) = seed_artifact(config, &source, "aabb", false);
+                    SOURCE_READ_PANIC.with(|slot| {
+                        slot.set(Some((401, after_projection, read_number)));
+                    });
+                    let mut cursor = ReservationReconcileCursor::default();
+                    let stop = AtomicBool::new(false);
+                    let report =
+                        reconcile_reservation_releases(cx, pool, config, &mut cursor, &stop)
+                            .unwrap();
+                    assert_eq!(
+                        (
+                            report.scanned,
+                            report.repaired,
+                            report.deferred_transient,
+                            report.retry_len
+                        ),
+                        (2, 1, 1, 1),
+                        "{report:?}"
+                    );
+                    assert!(!report.interrupted);
+                    assert_eq!(
+                        fs::read(&path).unwrap(),
+                        before,
+                        "failed source cannot publish"
+                    );
+                    let relative = "projects/project/file_reservations/id-402-gaabb.json";
+                    let bytes = fs::read(config.storage_root.join(relative)).unwrap();
+                    let repo = Repository::open(&config.storage_root).unwrap();
+                    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                    let entry = tree.get_path(Path::new(relative)).unwrap();
+                    assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    assert_eq!(
+                        conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                            .get_as::<i64>(0)
+                            .unwrap(),
+                        0
+                    );
+                    conn.execute_raw("UPDATE file_reservations SET reason = 'fresh source after panic' WHERE id = 401").unwrap();
+                    drop(conn);
+                    let recovered =
+                        reconcile_reservation_releases(cx, pool, config, &mut cursor, &stop)
+                            .unwrap();
+                    assert_eq!(
+                        (recovered.repaired, recovered.retry_len, recovered.deferred),
+                        (1, 0, 0)
+                    );
+                    let bytes = fs::read(&path).unwrap();
+                    let repaired: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(repaired["released_ts"], source.artifact["released_ts"]);
+                    assert_eq!(repaired["reason"], "fresh source after panic");
+                    assert_eq!(repaired["operator_note"], "preserve this note");
+                    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                    let relative = crate::rel_path_cached(&config.storage_root, &path).unwrap();
+                    let entry = tree.get_path(Path::new(&relative)).unwrap();
+                    assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    let rows = conn
+                        .query_sync(
+                            "SELECT released_ts FROM file_reservations WHERE id = 401",
+                            &[],
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        rows[0].get_as::<Option<i64>>(0).unwrap(),
+                        None,
+                        "repair cannot rewrite mailbox state"
+                    );
+                    drop(conn);
+                    assert_eq!(
+                        reconcile_reservation_releases(cx, pool, config, &mut cursor, &stop)
+                            .unwrap()
+                            .repaired,
+                        0
+                    );
+                    assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn source_panic_error_is_redacted_and_release_conflicts_keep_the_reader() {
+        fixture(|cx, pool, _| {
+            SOURCE_READ_PANIC.with(|slot| slot.set(Some((401, true, 1))));
+            let failure = read_source(cx, pool, 401).unwrap_err();
+            assert!(failure.transient);
+            assert!(failure.detail.contains("panicked"));
+            assert!(
+                !failure
+                    .detail
+                    .contains("private-reservation-source-panic-payload")
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                0
+            );
+            conn.execute_raw(
+                "UPDATE db_identity SET generation_id = 'not-a-generation' WHERE singleton = 0",
+            )
+            .unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let failure = read_source(cx, pool, 401).unwrap_err();
+            assert!(
+                !failure.transient,
+                "conflicting release authority is not an engine panic"
+            );
+            assert!(failure.detail.contains("generation is invalid"));
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        });
     }
 
     #[test]
