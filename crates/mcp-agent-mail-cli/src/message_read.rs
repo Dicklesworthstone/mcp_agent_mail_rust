@@ -206,10 +206,16 @@ pub(crate) async fn project_before(
     session: &ServerResourceSession,
     selection: &ProjectSelection,
 ) -> CliResult<(String, ResolvedProject)> {
+    let uri = project_resource_uri(selection)?;
+    let (project, _) = read_project_descriptor(session, &uri, selection).await?;
+    Ok((uri, project))
+}
+
+pub(crate) fn project_resource_uri(selection: &ProjectSelection) -> CliResult<String> {
     let key = selection.key();
     if key.trim().is_empty() {
         return Err(CliError::InvalidArgument(
-            "server message reads require a project path or slug".into(),
+            "server reads require a project path or slug".into(),
         ));
     }
     let request_key = project_request_key(key);
@@ -224,12 +230,22 @@ pub(crate) async fn project_before(
             "resolve=ancestors&format=json"
         }
     };
-    let uri = format!(
+    Ok(format!(
         "resource://project/{}?{query}",
         encode_resource_component(&request_key)
-    );
-    let project = validate_project_selection(&session.read(&uri).await?, selection)?;
-    Ok((uri, project))
+    ))
+}
+
+/// Retain the verified descriptor for readers that also validate its agent
+/// roster. One RPC supplies both project and roster authority.
+pub(crate) async fn read_project_descriptor(
+    session: &ServerResourceSession,
+    uri: &str,
+    selection: &ProjectSelection,
+) -> CliResult<(ResolvedProject, Value)> {
+    let payload = session.read(uri).await?;
+    let project = validate_project_selection(&payload, selection)?;
+    Ok((project, payload))
 }
 
 fn project_request_key(key: &str) -> String {
@@ -251,7 +267,7 @@ pub(crate) async fn project_after(
     selection: &ProjectSelection,
     project: &ResolvedProject,
 ) -> CliResult<()> {
-    let after = validate_project_selection(&session.read(uri).await?, selection)?;
+    let (after, _) = read_project_descriptor(session, uri, selection).await?;
     if !same_project(project, &after) {
         return Err(invalid("project identity changed during message read"));
     }
@@ -521,6 +537,13 @@ mod tests {
                             try_read_thread(&config, &selection, "TKT-1", 20, None, false)
                                 .unwrap()
                                 .is_none()
+                        );
+                        assert!(
+                            crate::reservation_read::try_read_local_mailbox(
+                                &config, &selection, true
+                            )
+                            .unwrap()
+                            .is_none()
                         );
                     }
                     assert!(

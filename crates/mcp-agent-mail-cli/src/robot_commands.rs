@@ -14007,6 +14007,17 @@ pub(crate) fn server_reservation_read_attestation() -> ReservationReadAttestatio
     }
 }
 
+/// Automatic reads also verify that the daemon owns this CLI's mailbox pair.
+pub(crate) fn local_server_reservation_read_attestation() -> ReservationReadAttestation {
+    ReservationReadAttestation {
+        database_matches_server: Some(true),
+        storage_root_matches_server: Some(true),
+        detail: "Reservations read through the matching local MCP server; database, archive and stored project identity verified before and after the read"
+            .to_string(),
+        ..server_reservation_read_attestation()
+    }
+}
+
 fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRobotSnapshot> {
     let ws_state_url = endpoint.url.clone();
     let payload = fetch_ws_state_payload(endpoint)?;
@@ -16617,49 +16628,66 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         } => {
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
             let config = mcp_agent_mail_core::Config::from_env();
-            let (data, actions, project_slug, read_attestation) = if server {
+            let server_read = if server {
                 let project_key = robot_server_project_key(args.project.as_deref())?;
-                let mut read = crate::reservation_read::read_server(&config, &project_key, true)?;
-                let agent = resolve_server_reservation_agent(&read, agent_flag)?;
-                let my_reservation_ids: HashSet<i64> = read
-                    .reservations
-                    .iter()
-                    .filter(|row| agent.as_deref() == Some(row.agent.as_str()))
-                    .map(|row| row.id)
-                    .collect();
-                read.reservations
-                    .sort_by_key(|row| (row.expires_ts, row.id));
-                let (data, actions) = build_reservations_from_records(
-                    &read.reservations,
-                    mcp_agent_mail_db::now_micros(),
-                    &read.project.slug,
-                    agent,
-                    &my_reservation_ids,
-                    all,
-                    conflicts,
-                    expiring,
-                )?;
-                (
-                    data,
-                    actions,
-                    read.project.slug,
-                    server_reservation_read_attestation(),
-                )
+                Some(crate::reservation_read::read_server(
+                    &config,
+                    &project_key,
+                    true,
+                )?)
             } else {
-                let read_attestation = reservation_read_attestation(&config);
-                let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)
-                    .map_err(crate::reservation_server_read_error)?;
-                let (data, actions) = build_reservations_with_snapshot_cache(
-                    scope.conn(),
-                    scope.project_id,
-                    &scope.project_slug,
-                    scope.agent.clone(),
-                    all,
-                    conflicts,
-                    expiring,
-                )?;
-                (data, actions, scope.project_slug, read_attestation)
+                crate::reservation_read::try_read_local_mailbox(
+                    &config,
+                    &automatic_robot_project_selection(args.project.as_deref())?,
+                    true,
+                )?
             };
+            let (data, actions, project_slug, read_attestation) =
+                if let Some(mut read) = server_read {
+                    let agent = resolve_server_reservation_agent(&read, agent_flag)?;
+                    let my_reservation_ids: HashSet<i64> = read
+                        .reservations
+                        .iter()
+                        .filter(|row| agent.as_deref() == Some(row.agent.as_str()))
+                        .map(|row| row.id)
+                        .collect();
+                    read.reservations
+                        .sort_by_key(|row| (row.expires_ts, row.id));
+                    let (data, actions) = build_reservations_from_records(
+                        &read.reservations,
+                        mcp_agent_mail_db::now_micros(),
+                        &read.project.slug,
+                        agent,
+                        &my_reservation_ids,
+                        all,
+                        conflicts,
+                        expiring,
+                    )?;
+                    (
+                        data,
+                        actions,
+                        read.project.slug,
+                        if server {
+                            server_reservation_read_attestation()
+                        } else {
+                            local_server_reservation_read_attestation()
+                        },
+                    )
+                } else {
+                    let read_attestation = reservation_read_attestation(&config);
+                    let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)
+                        .map_err(crate::reservation_server_read_error)?;
+                    let (data, actions) = build_reservations_with_snapshot_cache(
+                        scope.conn(),
+                        scope.project_id,
+                        &scope.project_slug,
+                        scope.agent.clone(),
+                        all,
+                        conflicts,
+                        expiring,
+                    )?;
+                    (data, actions, scope.project_slug, read_attestation)
+                };
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
@@ -28846,6 +28874,69 @@ mod tests {
             live_count, 0,
             "robot search should not mutate the live sqlite index"
         );
+    }
+
+    #[test]
+    fn robot_reservations_use_the_verified_daemon_and_preserve_explicit_server_output() {
+        use crate::reservation_read::tests::{
+            TestReply, mailbox_payload, reservation_read_fixture, with_test_server,
+        };
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for explicit_server in [false, true] {
+            let (project, snapshot) = reservation_read_fixture();
+            let ((result, output), requests) = with_test_server(
+                |config| {
+                    let mut replies = Vec::new();
+                    if !explicit_server {
+                        replies.push(TestReply::Resource(mailbox_payload(config)));
+                    }
+                    replies.extend([
+                        TestReply::Resource(project.clone()),
+                        TestReply::Resource(snapshot),
+                        TestReply::Resource(project),
+                    ]);
+                    if !explicit_server {
+                        replies.push(TestReply::Resource(mailbox_payload(config)));
+                    }
+                    replies
+                },
+                |_| {
+                    let capture = ftui_runtime::StdioCapture::install().unwrap();
+                    let result = handle_robot(RobotArgs {
+                        format: Some(OutputFormat::Json),
+                        json: true,
+                        project: Some("test-project".into()),
+                        agent: Some("BlueLake".into()),
+                        command: RobotSubcommand::Reservations {
+                            agent: None,
+                            all: true,
+                            conflicts: false,
+                            expiring: Some(10),
+                            server: explicit_server,
+                        },
+                    });
+                    (result, capture.drain_to_string())
+                },
+            );
+            assert!(result.is_ok(), "{result:?}");
+            let value: Value = serde_json::from_str(output.trim()).unwrap();
+            assert_eq!(value["_meta"]["project"], "test-project");
+            assert_eq!(value["all_active"][0]["path"], "src/**");
+            assert_eq!(value["my_reservations"][0]["agent"], "BlueLake");
+            let attestation = &value["reservation_read_attestation"];
+            assert_eq!(attestation["state"], "current");
+            assert_eq!(attestation["source"], "mcp_server");
+            if explicit_server {
+                assert!(attestation["database_matches_server"].is_null());
+                assert!(attestation["storage_root_matches_server"].is_null());
+            } else {
+                assert_eq!(attestation["database_matches_server"], true);
+                assert_eq!(attestation["storage_root_matches_server"], true);
+            }
+            assert_eq!(requests.len(), if explicit_server { 3 } else { 5 });
+        }
     }
 
     #[test]

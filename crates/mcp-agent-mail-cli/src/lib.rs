@@ -20111,30 +20111,44 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
             project,
             active_only,
             all,
-            server: true,
-        } => Some((project.as_str(), *active_only || !all)),
+            server,
+        } => Some((project.as_str(), *active_only || !all, *server)),
         FileReservationsCommand::Active {
-            project,
-            server: true,
-            ..
+            project, server, ..
         }
         | FileReservationsCommand::Soon {
-            project,
-            server: true,
-            ..
+            project, server, ..
         }
         | FileReservationsCommand::Conflicts {
-            project,
-            server: true,
-            ..
-        } => Some((project.as_str(), true)),
+            project, server, ..
+        } => Some((project.as_str(), true, *server)),
         _ => None,
     };
-    if let Some((project, active_only)) = server_read {
-        let read = reservation_read::read_server(&Config::from_env(), project, active_only)?;
-        render_server_file_reservations(&action, read.reservations)?;
-        emit_cli_reservation_read_attestation(&robot::server_reservation_read_attestation());
-        return Ok(());
+    if let Some((project, active_only, explicit_server)) = server_read {
+        let config = Config::from_env();
+        let read = if explicit_server {
+            Some(reservation_read::read_server(
+                &config,
+                project,
+                active_only,
+            )?)
+        } else {
+            reservation_read::try_read_local_mailbox(
+                &config,
+                &message_read::ProjectSelection::Exact(project.to_string()),
+                active_only,
+            )?
+        };
+        if let Some(read) = read {
+            render_server_file_reservations(&action, read.reservations)?;
+            let attestation = if explicit_server {
+                robot::server_reservation_read_attestation()
+            } else {
+                robot::local_server_reservation_read_attestation()
+            };
+            emit_cli_reservation_read_attestation(&attestation);
+            return Ok(());
+        }
     }
     if matches!(
         &action,
@@ -71801,6 +71815,86 @@ startup_timeout_sec = 42
                 assert!(!server);
             }
             other => panic!("expected Conflicts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_file_reservation_reads_use_the_verified_daemon_without_local_files() {
+        use crate::reservation_read::tests::{
+            TestReply, mailbox_payload, reservation_read_fixture, with_test_server,
+        };
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for operation in ["list", "all", "active", "soon", "conflicts"] {
+            let (project, mut snapshot) = reservation_read_fixture();
+            let active_only = operation != "all";
+            snapshot["active_only"] = active_only.into();
+            let ((result, output), requests) = with_test_server(
+                |config| {
+                    vec![
+                        TestReply::Resource(mailbox_payload(config)),
+                        TestReply::Resource(project.clone()),
+                        TestReply::Resource(snapshot),
+                        TestReply::Resource(project),
+                        TestReply::Resource(mailbox_payload(config)),
+                    ]
+                },
+                |_| {
+                    let project = "test-project".to_string();
+                    let action = match operation {
+                        "list" | "all" => FileReservationsCommand::List {
+                            project,
+                            active_only: false,
+                            all: !active_only,
+                            server: false,
+                        },
+                        "active" => FileReservationsCommand::Active {
+                            project,
+                            limit: Some(1),
+                            server: false,
+                        },
+                        "soon" => FileReservationsCommand::Soon {
+                            project,
+                            minutes: Some(i64::MAX),
+                            server: false,
+                        },
+                        "conflicts" => FileReservationsCommand::Conflicts {
+                            project,
+                            paths: vec!["src/lib.rs".into()],
+                            server: false,
+                        },
+                        _ => unreachable!(),
+                    };
+                    let capture = ftui_runtime::StdioCapture::install().unwrap();
+                    let result = handle_file_reservations(action);
+                    (result, capture.drain_to_string())
+                },
+            );
+            assert!(result.is_ok(), "{operation}: {result:?}");
+            assert!(
+                output.contains("BlueLake") && output.contains("src/**"),
+                "{operation}: {output}"
+            );
+            assert!(
+                output.contains("state=current source=mcp_server"),
+                "{output}"
+            );
+            assert!(
+                output.contains("database_matches_server=Some(true)"),
+                "{output}"
+            );
+            assert!(
+                output.contains("storage_root_matches_server=Some(true)"),
+                "{output}"
+            );
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests[2]["params"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("active_only={active_only}"))
+            );
         }
     }
 

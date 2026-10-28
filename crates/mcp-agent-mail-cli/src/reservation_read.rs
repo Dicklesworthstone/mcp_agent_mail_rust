@@ -1,10 +1,10 @@
-//! Explicit, authenticated reservation reads through the running MCP server.
+//! Authenticated reservation reads through the running MCP server.
 //!
 //! A fresh CLI database connection can be refused while the server's admitted
-//! pool remains healthy (GH#368). The caller explicitly selects this authority;
-//! this module never opens a database, repairs a mailbox, or guesses from an
-//! archive. Project identity and the complete response are checked before any
-//! reservation output is made available to the caller.
+//! pool remains healthy (GH#368). Automatic reads verify the configured local
+//! mailbox; explicit server reads select their own authority. This module never
+//! opens a database, repairs a mailbox, or guesses from an archive. Project
+//! identity and the complete response are checked before returning reservations.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +16,7 @@ use mcp_agent_mail_core::Config;
 use serde_json::Value;
 
 use crate::context::ResolvedProject;
+use crate::message_read::{ProjectSelection, project_resource_uri, read_project_descriptor};
 use crate::{CliError, CliResult};
 
 // The opt-in snapshot resource proves completeness in one database read scope.
@@ -288,69 +289,106 @@ pub(crate) fn read_server(
     // Pin the endpoint and credential for every read. In particular, never
     // retry an authentication rejection on a different endpoint or in SQLite.
     let session = ServerResourceSession::new(config)?;
-    crate::context::run_async(async {
-        let project_uri = format!(
-            "resource://project/{}?format=json",
-            encode_resource_component(project_key)
-        );
-        let before = session.read(&project_uri).await?;
-        let project = validate_project(&before, project_key)?;
-        let agent_roster = validate_agent_roster(&before, project.id)?;
+    let selection = ProjectSelection::Exact(project_key.to_string());
+    // An explicit remote authority may use different filesystem aliases.
+    // Preserve its original exact selector instead of canonicalizing locally.
+    let project_uri = format!(
+        "resource://project/{}?format=json",
+        encode_resource_component(project_key)
+    );
+    crate::context::run_async(read_reservations_session(
+        &session,
+        &selection,
+        &project_uri,
+        active_only,
+    ))
+}
 
-        let reservation_uri = format!(
-            "resource://file_reservations/{}?snapshot=true&active_only={active_only}&format=json",
+/// Prefer a matching local daemon without opening a second mailbox. Only
+/// unsupported scope or unavailable/unmatched authority allows local fallback.
+pub(crate) fn try_read_local_mailbox(
+    config: &Config,
+    selection: &ProjectSelection,
+    active_only: bool,
+) -> CliResult<Option<ServerReservationRead>> {
+    if !selection.permits_automatic_read(config) {
+        return Ok(None);
+    }
+    let project_uri = project_resource_uri(selection)?;
+    crate::context::run_async(async {
+        let Some(session) = ServerResourceSession::for_local_mailbox(config).await? else {
+            return Ok(None);
+        };
+        if !selection.supported_by(&session) {
+            return Ok(None);
+        }
+        let result =
+            read_reservations_session(&session, selection, &project_uri, active_only).await?;
+        session.verify_local_mailbox(config).await?;
+        Ok(Some(result))
+    })
+}
+
+async fn read_reservations_session(
+    session: &ServerResourceSession,
+    selection: &ProjectSelection,
+    project_uri: &str,
+    active_only: bool,
+) -> CliResult<ServerReservationRead> {
+    let (project, before) = read_project_descriptor(session, project_uri, selection).await?;
+    let agent_roster = validate_agent_roster(&before, project.id)?;
+
+    let reservation_uri = format!(
+        "resource://file_reservations/{}?snapshot=true&active_only={active_only}&format=json",
+        encode_resource_component(&project.slug)
+    );
+    let payload = session.read(&reservation_uri).await?;
+    let (holder_roster, reservations) = if payload.is_array() {
+        // v0.3.39 ignores the unknown snapshot parameter and returns its
+        // ordinary default page (20 rows). That page is only a protocol
+        // signal, never evidence of a complete listing. Validate it before
+        // negotiating, then discard it and request the explicit page bound
+        // from the same authenticated authority. Do not negotiate after an
+        // HTTP/RPC error, invalid envelope, or malformed snapshot object.
+        validate_legacy_reservation_page(&payload, active_only)?;
+        let legacy_uri = format!(
+            "resource://file_reservations/{}?active_only={active_only}&limit={LEGACY_RESOURCE_PAGE_MAX}&offset=0&format=json",
             encode_resource_component(&project.slug)
         );
-        let payload = session.read(&reservation_uri).await?;
-        let (holder_roster, reservations) = if payload.is_array() {
-            // v0.3.39 ignores the unknown snapshot parameter and returns its
-            // ordinary default page (20 rows). That page is only a protocol
-            // signal, never evidence of a complete listing. Validate it before
-            // negotiating, then discard it and request the explicit page bound
-            // from the same authenticated authority. Do not negotiate after an
-            // HTTP/RPC error, invalid envelope, or malformed snapshot object.
-            validate_legacy_reservation_page(&payload, active_only)?;
-            let legacy_uri = format!(
-                "resource://file_reservations/{}?active_only={active_only}&limit={LEGACY_RESOURCE_PAGE_MAX}&offset=0&format=json",
-                encode_resource_component(&project.slug)
-            );
-            let legacy_payload = session.read(&legacy_uri).await?;
-            let reservations = validate_complete_legacy_reservations(&legacy_payload, active_only)?;
-            // Legacy pages identify holders by name, not ID. Preserve those
-            // names in the rows, while explicit --agent resolution continues
-            // to use the independently verified available-agent directory.
-            (agent_roster.clone(), reservations)
-        } else {
-            validate_snapshot(&payload, &project, active_only)?
-        };
-        if agent_roster
-            .iter()
-            .any(|agent| holder_roster.binary_search(agent).is_err())
-        {
-            return Err(invalid_response(
-                "snapshot omits a registered project identity",
-            ));
-        }
+        let legacy_payload = session.read(&legacy_uri).await?;
+        let reservations = validate_complete_legacy_reservations(&legacy_payload, active_only)?;
+        // Legacy pages identify holders by name, not ID. Preserve those
+        // names in the rows, while explicit --agent resolution continues
+        // to use the independently verified available-agent directory.
+        (agent_roster.clone(), reservations)
+    } else {
+        validate_snapshot(&payload, &project, active_only)?
+    };
+    if agent_roster
+        .iter()
+        .any(|agent| holder_roster.binary_search(agent).is_err())
+    {
+        return Err(invalid_response(
+            "snapshot omits a registered project identity",
+        ));
+    }
 
-        // The identity resource computes a filesystem identity even for an
-        // unregistered path. Re-read the actual stored project descriptor,
-        // including its creation epoch, so a deleted/recreated or rebound
-        // project cannot lend authority to a stale reservation response.
-        let after = session.read(&project_uri).await?;
-        let after_project = validate_project(&after, project_key)?;
-        let after_agent_roster = validate_agent_roster(&after, after_project.id)?;
-        if !same_project(&project, &after_project) || agent_roster != after_agent_roster {
-            return Err(CliError::Other(
-                "server project identity or agent roster changed during reservation read; refusing unverified reservation data"
-                    .to_string(),
-            ));
-        }
+    // Revalidate the stored project (and ancestor witness, when selected),
+    // creation epoch, and roster so recreation or a newly nearer project
+    // cannot lend authority to a stale reservation response.
+    let (after_project, after) = read_project_descriptor(session, project_uri, selection).await?;
+    let after_agent_roster = validate_agent_roster(&after, after_project.id)?;
+    if !same_project(&project, &after_project) || agent_roster != after_agent_roster {
+        return Err(CliError::Other(
+            "server project identity or agent roster changed during reservation read; refusing unverified reservation data"
+                .to_string(),
+        ));
+    }
 
-        Ok(ServerReservationRead {
-            project,
-            agent_names: holder_roster.into_iter().map(|(_, name)| name).collect(),
-            reservations,
-        })
+    Ok(ServerReservationRead {
+        project,
+        agent_names: holder_roster.into_iter().map(|(_, name)| name).collect(),
+        reservations,
     })
 }
 
@@ -879,6 +917,9 @@ pub(crate) mod tests {
                 &[
                     ("AGENT_MAIL_URL", &endpoint),
                     ("AGENT_MAIL_TOKEN", "read-test-token"),
+                    ("DATABASE_URL", &config.database_url),
+                    ("STORAGE_ROOT", config.storage_root.to_str().unwrap()),
+                    ("WORKTREES_ENABLED", "false"),
                 ],
                 || run(&config),
             );
@@ -1061,6 +1102,208 @@ pub(crate) mod tests {
             "captured_ts": "2026-10-26T01:15:00Z", "active_only": active_only,
             "count": rows.len(), "reservations": rows,
         })
+    }
+
+    pub(crate) fn reservation_read_fixture() -> (Value, Value) {
+        let mut project = project();
+        project["agents"] = serde_json::json!([
+            {"id":12,"project_id":7,"name":"BlueLake"}
+        ]);
+        let mut snapshot = snapshot(vec![reservation(1)], true);
+        snapshot["project"] = project.clone();
+        (project, snapshot)
+    }
+
+    #[test]
+    fn automatic_reservation_reads_keep_complete_snapshots_and_registered_agents() {
+        let (mut project, mut snapshot) = reservation_read_fixture();
+        let idle_agent = serde_json::json!({"id":13,"project_id":7,"name":"IdleAgent"});
+        project["agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(idle_agent.clone());
+        snapshot["agents"].as_array_mut().unwrap().push(idle_agent);
+        snapshot["reservations"] =
+            serde_json::json!((1..=300).map(reservation).collect::<Vec<_>>());
+        snapshot["count"] = 300.into();
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(snapshot),
+                    TestReply::Resource(project),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            |config| {
+                try_read_local_mailbox(
+                    config,
+                    &ProjectSelection::Exact("test-project".into()),
+                    true,
+                )
+            },
+        );
+        let read = result.unwrap().expect("matching daemon selected");
+        assert_eq!(read.reservations.len(), 300);
+        assert_eq!(read.agent_names, vec!["BlueLake", "IdleAgent"]);
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[2]["params"]["uri"],
+            "resource://file_reservations/test-project?snapshot=true&active_only=true&format=json"
+        );
+    }
+
+    #[test]
+    fn automatic_reservations_resolve_nested_scope_only_with_the_ancestor_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let root = mcp_agent_mail_core::resolve_project_path(&directory.path().to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        let requested = mcp_agent_mail_core::resolve_project_path(&nested.to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        let selection = ProjectSelection::Ancestors(requested.clone());
+        let (mut project, mut snapshot) = reservation_read_fixture();
+        project["human_key"] = root.clone().into();
+        snapshot["project"] = project.clone();
+        project["resolution"] =
+            serde_json::json!({"kind":"nearest_ancestor","requested_path":requested});
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(snapshot),
+                    TestReply::Resource(project),
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                ]
+            },
+            |config| try_read_local_mailbox(config, &selection, true),
+        );
+        assert_eq!(result.unwrap().unwrap().project.human_key, root);
+        assert_eq!(
+            requests[1]["params"]["uri"],
+            project_resource_uri(&selection).unwrap()
+        );
+        assert_eq!(requests[1]["params"]["uri"], requests[3]["params"]["uri"]);
+        let (result, requests) = with_test_server(
+            |config| vec![TestReply::Resource(mailbox_payload(config))],
+            |config| try_read_local_mailbox(config, &selection, true),
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "older daemon keeps existing local scope resolution"
+        );
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn automatic_reservations_refuse_changed_authority_or_incomplete_data() {
+        for variant in [
+            "roster",
+            "project",
+            "mailbox",
+            "incomplete",
+            "missing_project",
+        ] {
+            let (project, mut snapshot) = reservation_read_fixture();
+            let (result, _) =
+                with_test_server(
+                    |config| {
+                        let mut replies = vec![TestReply::Resource(mailbox_payload(config))];
+                        if variant == "missing_project" {
+                            replies.push(TestReply::Raw(200, serde_json::json!({
+                            "jsonrpc":"2.0", "error":{"code":-32002,"message":"not registered"}
+                        })));
+                            return replies;
+                        }
+                        replies.push(TestReply::Resource(project.clone()));
+                        if variant == "incomplete" {
+                            snapshot["complete"] = false.into();
+                        }
+                        replies.push(TestReply::Resource(snapshot));
+                        if variant == "incomplete" {
+                            return replies;
+                        }
+                        let mut after = project;
+                        match variant {
+                            "roster" => after["agents"][0]["name"] = "RecreatedAgent".into(),
+                            "project" => after["created_at"] = "2026-10-27T00:00:00Z".into(),
+                            _ => (),
+                        }
+                        replies.push(TestReply::Resource(after));
+                        if variant == "mailbox" {
+                            let mut changed = mailbox_payload(config);
+                            changed["storage_root"] = "/another/archive".into();
+                            replies.push(TestReply::Resource(changed));
+                        }
+                        replies
+                    },
+                    |config| {
+                        try_read_local_mailbox(
+                            config,
+                            &ProjectSelection::Exact("test-project".into()),
+                            true,
+                        )
+                    },
+                );
+            assert!(
+                result.is_err(),
+                "{variant} must never fall back or report empty success"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_reservations_preserve_the_legacy_completeness_bound() {
+        for count in [20, LEGACY_RESOURCE_PAGE_MAX] {
+            let (project, _) = reservation_read_fixture();
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut replies = vec![
+                        TestReply::Resource(mailbox_payload(config)),
+                        TestReply::Resource(project.clone()),
+                        TestReply::Resource(serde_json::json!([reservation(1)])),
+                        TestReply::Resource(serde_json::json!(
+                            (1..=i64::try_from(count).unwrap())
+                                .map(reservation)
+                                .collect::<Vec<_>>()
+                        )),
+                    ];
+                    if count < LEGACY_RESOURCE_PAGE_MAX {
+                        replies.extend([
+                            TestReply::Resource(project),
+                            TestReply::Resource(mailbox_payload(config)),
+                        ]);
+                    }
+                    replies
+                },
+                |config| {
+                    try_read_local_mailbox(
+                        config,
+                        &ProjectSelection::Exact("test-project".into()),
+                        true,
+                    )
+                },
+            );
+            assert!(
+                requests[3]["params"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .contains("limit=250&offset=0")
+            );
+            if count < LEGACY_RESOURCE_PAGE_MAX {
+                assert_eq!(result.unwrap().unwrap().reservations.len(), count);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "a full legacy page cannot prove a complete listing"
+                );
+            }
+        }
     }
 
     fn response(uri: &str, value: &Value) -> Value {
