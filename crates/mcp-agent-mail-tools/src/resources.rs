@@ -706,6 +706,12 @@ async fn resolve_existing_resource_project(
     let Some(row) = rows.first() else {
         return Err(resource_project_not_found_error());
     };
+    decode_resource_project_row(row)
+}
+
+fn decode_resource_project_row(
+    row: &mcp_agent_mail_db::sqlmodel::Row,
+) -> McpResult<mcp_agent_mail_db::ProjectRow> {
     let slug = row
         .get_named::<String>("slug")
         .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
@@ -722,6 +728,88 @@ async fn resolve_existing_resource_project(
         human_key,
         created_at,
     })
+}
+
+/// Resolve a working directory without the Git identity discovery used when
+/// registering projects. Resource reads must not create worktree markers.
+fn resource_project_ancestor_paths(project_key: &str) -> McpResult<Vec<String>> {
+    if project_key.len() > 32_768
+        || project_key.contains('\0')
+        || !Path::new(project_key).is_absolute()
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "ancestor project resolution requires an absolute path of at most 32768 bytes",
+        ));
+    }
+    let path = mcp_agent_mail_core::resolve_project_path(project_key);
+    // Canonicalization can fail for missing paths. Do not let an unresolved
+    // `..` make an unrelated directory look like an ancestor, and do not
+    // normalize it lexically across a potentially symlinked component.
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "ancestor project resolution cannot resolve parent traversal in this path",
+        ));
+    }
+    let ancestors = path
+        .ancestors()
+        .take(257)
+        .map(|ancestor| ancestor.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if ancestors.len() > 256 {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "ancestor project resolution supports at most 256 path components",
+        ));
+    }
+    Ok(ancestors)
+}
+
+async fn resolve_nearest_resource_project(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    ancestor_paths: &[String],
+) -> McpResult<mcp_agent_mail_db::ProjectRow> {
+    // One fresh query observes all candidate ancestors together. A cached
+    // project lookup, slug match, or capped project list cannot establish which
+    // registered human key is currently nearest to the working directory.
+    let placeholders = vec!["?"; ancestor_paths.len()].join(", ");
+    let sql = format!(
+        "SELECT id, slug, human_key, created_at FROM projects \
+         WHERE human_key IN ({placeholders}) \
+         ORDER BY length(human_key) DESC, id LIMIT 2"
+    );
+    let params = ancestor_paths
+        .iter()
+        .cloned()
+        .map(mcp_agent_mail_db::sqlmodel::Value::Text)
+        .collect::<Vec<_>>();
+    let conn = acquire_resource_conn(ctx.cx(), pool).await?;
+    let rows = conn.query_sync(&sql, &params).map_err(|err| {
+        let message = err.to_string();
+        if is_missing_projects_table_error(&message) {
+            resource_project_not_found_error()
+        } else {
+            resource_sync_db_error_to_mcp_error(message)
+        }
+    })?;
+    let Some(row) = rows.first() else {
+        return Err(resource_project_not_found_error());
+    };
+    let project = decode_resource_project_row(row)?;
+    if let Some(other) = rows.get(1)
+        && decode_resource_project_row(other)?.human_key == project.human_key
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Nearest project human key is ambiguous",
+        ));
+    }
+    Ok(project)
 }
 
 // Float -> int casts saturate, but we treat out-of-range values as invalid timestamps.
@@ -755,6 +843,8 @@ pub struct EnvironmentSnapshot {
     pub environment: String,
     pub database_url: String,
     pub storage_root: String,
+    #[serde(default)]
+    pub project_path_resolution: String,
     pub http: HttpSnapshot,
 }
 
@@ -787,6 +877,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
         environment: config.app_environment.to_string(),
         database_url: redact_database_url(&config.database_url),
         storage_root: config.storage_root.to_string_lossy().into_owned(),
+        project_path_resolution: "nearest_ancestor_v1".to_string(),
         http: HttpSnapshot {
             host: config.http_host.clone(),
             port: config.http_port,
@@ -2604,6 +2695,15 @@ pub struct ProjectDetailResponse {
     pub human_key: String,
     pub created_at: Option<String>,
     pub agents: Vec<ProjectAgentEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ProjectPathResolution>,
+}
+
+/// Evidence that a project was selected for an implicit working directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectPathResolution {
+    pub kind: String,
+    pub requested_path: String,
 }
 
 /// Get project details.
@@ -2612,10 +2712,55 @@ pub struct ProjectDetailResponse {
     description = "Fetch a project and its agents by project slug or human key.\n\nWhen to use\n-----------\n- Populate an \"LDAP-like\" directory for agents in tooling UIs.\n- Determine available agent identities and their metadata before addressing mail.\n\nParameters\n----------\nslug : str\n    Project slug (or human key; both resolve to the same target).\n\nReturns\n-------\ndict\n    Project descriptor including { agents: [...] } with agent profiles.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r3\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://project/backend-abc123\"}}\n```"
 )]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
-    let (slug, _query) = split_param_and_query(&slug);
+    let (slug, query) = split_param_and_query(&slug);
+    project_details_impl(ctx, slug, query).await
+}
+
+/// Resolve a project with query options while preserving the decoded path.
+#[resource(
+    uri = "resource://project/{slug}?{query}",
+    description = "Fetch a project and its agents by slug or human key. With resolve=ancestors, select the nearest registered ancestor of an absolute path from the live database without registering a project."
+)]
+pub async fn project_details_query(
+    ctx: &McpContext,
+    slug: String,
+    query: String,
+) -> McpResult<String> {
+    // The router splits URI components before percent-decoding them. Parsing
+    // the decoded slug again would truncate literal '?' and decode '%' twice.
+    project_details_impl(ctx, slug, parse_query(&query)).await
+}
+
+async fn project_details_impl(
+    ctx: &McpContext,
+    slug: String,
+    query: HashMap<String, String>,
+) -> McpResult<String> {
+    let ancestor_paths = match query.get("resolve").map(String::as_str) {
+        None | Some("exact") => None,
+        Some("ancestors") => Some(resource_project_ancestor_paths(&slug)?),
+        Some(_) => {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "resolve must be exact or ancestors",
+            ));
+        }
+    };
     let pool = get_resource_db_pool(ctx.cx()).await?;
 
-    let project = resolve_existing_resource_project(ctx, &pool, &slug).await?;
+    let (project, resolution) = if let Some(paths) = ancestor_paths {
+        let project = resolve_nearest_resource_project(ctx, &pool, &paths).await?;
+        let resolution = ProjectPathResolution {
+            kind: "nearest_ancestor".to_string(),
+            requested_path: paths[0].clone(),
+        };
+        (project, Some(resolution))
+    } else {
+        (
+            resolve_existing_resource_project(ctx, &pool, &slug).await?,
+            None,
+        )
+    };
 
     let project_id = project.id.unwrap_or(0);
 
@@ -2630,6 +2775,7 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
         slug: project.slug,
         human_key: project.human_key,
         created_at: Some(micros_to_iso(project.created_at)),
+        resolution,
         agents: agents
             .into_iter()
             .filter(|agent| agent.retired_at.is_none())
@@ -6047,6 +6193,258 @@ mod resource_shape_tests {
     /// guard) drops at the end of this statement.
     fn seed_pool() -> mcp_agent_mail_db::DbPool {
         get_db_pool().expect("db pool").clone()
+    }
+
+    async fn insert_resource_project(cx: &Cx, pool: &DbPool, id: i64, slug: &str, human_key: &str) {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let conn = acquire_resource_conn(cx, pool)
+            .await
+            .expect("seed connection");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(id),
+                SqlValue::Text(slug.to_string()),
+                SqlValue::Text(human_key.to_string()),
+                SqlValue::BigInt(1_700_000_000_000_000),
+            ],
+        )
+        .expect("insert project without resolving identity or writing Git markers");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ancestor_project_resolution_uses_live_nearest_human_keys_without_writes() {
+        with_serialized_resources_env(&[("WORKTREES_ENABLED", "true")], || {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let dir = tempfile::tempdir().expect("project directory");
+                let repo = git2::Repository::init(dir.path()).expect("initialize test repository");
+                let git_config = std::fs::read(repo.path().join("config")).expect("Git config");
+                let root = mcp_agent_mail_core::resolve_project_path(
+                    dir.path().to_str().expect("UTF-8 test path"),
+                );
+                let nested = root.join("nested-extra");
+                let requested = nested.join("src");
+                std::fs::create_dir_all(&requested).expect("working directory");
+                let root_key = root.to_string_lossy().into_owned();
+                let nested_key = nested.to_string_lossy().into_owned();
+                let requested_key = requested.to_string_lossy().into_owned();
+                insert_resource_project(&cx, &pool, 101, "parent", &root_key).await;
+                insert_resource_project(
+                    &cx,
+                    &pool,
+                    102,
+                    "prefix-sibling",
+                    &root.join("nested").to_string_lossy(),
+                )
+                .await;
+                insert_resource_project(
+                    &cx,
+                    &pool,
+                    103,
+                    &requested_key,
+                    &root.join("elsewhere").to_string_lossy(),
+                )
+                .await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let query = "resolve=ancestors&format=json".to_string();
+                let parent = parse_json(
+                    &project_details_query(&ctx, requested_key.clone(), query.clone())
+                        .await
+                        .expect("parent project"),
+                );
+                assert_eq!(parent["id"], 101);
+                assert_eq!(parent["resolution"]["requested_path"], requested_key);
+                assert_eq!(parent["resolution"]["kind"], "nearest_ancestor");
+
+                insert_resource_project(&cx, &pool, 104, "nested", &nested_key).await;
+                let nearest = parse_json(
+                    &project_details_query(&ctx, requested_key.clone(), query.clone())
+                        .await
+                        .expect("new nearest project"),
+                );
+                assert_eq!(
+                    nearest["id"], 104,
+                    "a prior result must not hide a new ancestor"
+                );
+
+                let writer = acquire_resource_conn(&cx, &pool).await.expect("writer");
+                writer
+                    .execute_sync(
+                        "UPDATE projects SET human_key = ? WHERE id = ?",
+                        &[
+                            mcp_agent_mail_db::sqlmodel::Value::Text(
+                                root.join("moved").to_string_lossy().into_owned(),
+                            ),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(104),
+                        ],
+                    )
+                    .expect("move registered project");
+                drop(writer);
+                let refreshed = parse_json(
+                    &project_details_query(&ctx, requested_key, query)
+                        .await
+                        .expect("fresh ancestor after move"),
+                );
+                assert_eq!(refreshed["id"], 101);
+
+                let read_pool = get_resource_db_pool(&cx).await.expect("resource pool");
+                let reader = acquire_resource_conn(&cx, &read_pool)
+                    .await
+                    .expect("resource reader");
+                assert!(
+                    reader
+                        .execute_sync("UPDATE projects SET slug = slug WHERE id = 101", &[])
+                        .is_err(),
+                    "project resolution must use the query-only lane"
+                );
+                let rows = reader
+                    .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                    .expect("project count");
+                assert_eq!(
+                    rows[0].get_named::<i64>("n").expect("count"),
+                    4,
+                    "implicit resolution must not register the working directory"
+                );
+                assert!(!root.join(".agent-mail-project-id").exists());
+                assert!(!repo.path().join("agent-mail").join("project-id").exists());
+                assert_eq!(
+                    std::fs::read(repo.path().join("config")).expect("unchanged Git config"),
+                    git_config
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn ancestor_project_resolution_rejects_missing_and_ambiguous_matches() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let dir = tempfile::tempdir().expect("project directory");
+                let root = mcp_agent_mail_core::resolve_project_path(
+                    dir.path().to_str().expect("UTF-8 path"),
+                );
+                let root_key = root.to_string_lossy().into_owned();
+                let request = root.join("child").to_string_lossy().into_owned();
+                let ctx = McpContext::new(cx.clone(), 1);
+                let query = "resolve=ancestors".to_string();
+                let missing = project_details_query(&ctx, request.clone(), query.clone())
+                    .await
+                    .expect_err("no match");
+                assert_eq!(missing.code, McpErrorCode::InvalidParams);
+                assert!(missing.to_string().contains("Project not found"));
+                insert_resource_project(&cx, &pool, 201, "first", &root_key).await;
+                insert_resource_project(&cx, &pool, 202, "legacy-duplicate", &root_key).await;
+                let ambiguous = project_details_query(&ctx, request, query)
+                    .await
+                    .expect_err("duplicate nearest human key");
+                assert_eq!(ambiguous.code, McpErrorCode::InvalidParams);
+                assert!(ambiguous.to_string().contains("ambiguous"));
+                let exact = parse_json(
+                    &project_details(&ctx, "first?format=json".to_string())
+                        .await
+                        .expect("exact slug remains usable"),
+                );
+                assert_eq!(exact["id"], 201);
+                assert!(
+                    exact.get("resolution").is_none(),
+                    "exact response shape is unchanged"
+                );
+            });
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn project_query_router_preserves_encoded_path_delimiters() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let dir = tempfile::tempdir().expect("project directory");
+                let root = dir.path().join("project ? %2F # + café");
+                std::fs::create_dir_all(&root).expect("special-character project path");
+                let root =
+                    mcp_agent_mail_core::resolve_project_path(root.to_str().expect("UTF-8 path"));
+                let key = root.to_string_lossy().into_owned();
+                insert_resource_project(&cx, &pool, 301, "special-path", &key).await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let capability = parse_json(&config_environment(&ctx).expect("config capability"));
+                assert_eq!(capability["project_path_resolution"], "nearest_ancestor_v1");
+                let mut router = fastmcp_server::Router::new();
+                router.add_resource(ProjectDetailsResource);
+                router.add_resource(ProjectDetailsQueryResource);
+                let encoded = key
+                    .bytes()
+                    .map(|byte| format!("%{byte:02X}"))
+                    .collect::<String>();
+                for mode in ["exact", "ancestors"] {
+                    let uri = format!("resource://project/{encoded}?resolve={mode}&format=json");
+                    let response = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: uri.clone(),
+                                meta: None,
+                            },
+                            fastmcp_core::SessionState::new(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("query-aware resource routing");
+                    let payload = serde_json::to_value(response).expect("resource response");
+                    assert_eq!(payload["contents"][0]["uri"], uri);
+                    let project = parse_json(
+                        payload["contents"][0]["text"]
+                            .as_str()
+                            .expect("JSON resource text"),
+                    );
+                    assert_eq!(project["id"], 301);
+                    assert_eq!(project["human_key"], key);
+                    if mode == "ancestors" {
+                        assert_eq!(project["resolution"]["requested_path"], key);
+                    } else {
+                        assert!(project.get("resolution").is_none());
+                    }
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn ancestor_project_resolution_rejects_invalid_requests_before_opening_database() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let ctx = McpContext::new(cx, 1);
+                let dir = tempfile::tempdir().expect("project directory");
+                let absolute = dir.path().to_string_lossy().into_owned();
+                let oversized = format!("{absolute}/{}", "a".repeat(32_768));
+                let deep = format!("{absolute}/{}", "a/".repeat(257));
+                let parent_traversal = format!("{absolute}/missing/../child");
+                for (path, query) in [
+                    (absolute.clone(), "resolve=unsupported"),
+                    ("relative/project".to_string(), "resolve=ancestors"),
+                    (oversized, "resolve=ancestors"),
+                    (deep, "resolve=ancestors"),
+                    (parent_traversal, "resolve=ancestors"),
+                    (format!("{absolute}/bad\0path"), "resolve=ancestors"),
+                ] {
+                    let err = project_details_query(&ctx, path, query.to_string())
+                        .await
+                        .expect_err("invalid request");
+                    assert_eq!(err.code, McpErrorCode::InvalidParams);
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("ancestor project resolution")
+                            || message.contains("resolve must"),
+                        "must fail path validation before database open: {err}"
+                    );
+                }
+            });
+        });
     }
 
     struct PopulatedMailboxFixture {

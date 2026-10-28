@@ -3390,8 +3390,7 @@ fn resolved_project_flag_or_env(flag: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| {
-            std::env::var("AGENT_MAIL_PROJECT")
-                .ok()
+            mcp_agent_mail_core::config::process_env_value("AGENT_MAIL_PROJECT")
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
@@ -6252,11 +6251,17 @@ fn robot_server_project_key(project_flag: Option<&str>) -> Result<String, CliErr
     Ok(cwd.to_string_lossy().into_owned())
 }
 
-fn automatic_robot_project_key(project_flag: Option<&str>) -> Option<String> {
-    // Implicit CWD scope searches registered ancestors in the local resolver.
-    // A raw CWD request to the daemon is not equivalent, so preserve that path
-    // until the server exposes an authoritative ancestor-selection resource.
-    resolved_project_flag_or_env(project_flag)
+fn automatic_robot_project_selection(
+    project_flag: Option<&str>,
+) -> Result<crate::message_read::ProjectSelection, CliError> {
+    if let Some(key) = resolved_project_flag_or_env(project_flag) {
+        return Ok(crate::message_read::ProjectSelection::Exact(key));
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliError::Other(format!("cannot get CWD: {error}")))?;
+    Ok(crate::message_read::ProjectSelection::Ancestors(
+        cwd.to_string_lossy().into_owned(),
+    ))
 }
 
 fn build_robot_inbox_server_request(
@@ -8073,7 +8078,7 @@ fn validate_robot_search_window(limit: usize, cursor: Option<&str>) -> Result<()
 /// the caller to the private-snapshot path.
 fn search_via_server(
     config: &mcp_agent_mail_core::Config,
-    project_key: &str,
+    selection: &crate::message_read::ProjectSelection,
     query: &str,
     importance: Option<&str>,
     since: Option<&str>,
@@ -8081,8 +8086,11 @@ fn search_via_server(
     cursor: Option<&str>,
 ) -> Result<Option<(crate::context::ResolvedProject, SearchData)>, CliError> {
     validate_robot_search_window(limit, cursor)?;
+    if !selection.permits_automatic_read(config) {
+        return Ok(None);
+    }
     let mut arguments = serde_json::json!({
-        "project_key": project_key,
+        "project_key": selection.key(),
         "query": query,
         "limit": limit,
         "explain": true,
@@ -8105,8 +8113,11 @@ fn search_via_server(
         else {
             return Ok(None);
         };
+        if !selection.supported_by(&session) {
+            return Ok(None);
+        }
         let (project_uri, project) =
-            crate::message_read::project_before(&session, project_key).await?;
+            crate::message_read::project_before(&session, selection).await?;
         // Resolve a path/slug once, then bind the tool call to the verified
         // stored project. No worktree identity discovery or local DB admission.
         arguments["project_key"] = project.human_key.clone().into();
@@ -8114,18 +8125,15 @@ fn search_via_server(
         let response = serde_json::from_value(payload).map_err(|_| {
             CliError::Other("invalid server search response; refusing unverified results".into())
         })?;
-        let data = search_data_from_server_response(
-            query,
-            response,
-            mcp_agent_mail_db::now_micros(),
-        )
-        .ok_or_else(|| {
-            CliError::Other(
+        let data =
+            search_data_from_server_response(query, response, mcp_agent_mail_db::now_micros())
+                .ok_or_else(|| {
+                    CliError::Other(
                 "server search response omitted relevance scores; refusing incomplete results"
                     .into(),
             )
-        })?;
-        crate::message_read::project_after(&session, &project_uri, project_key, &project).await?;
+                })?;
+        crate::message_read::project_after(&session, &project_uri, selection, &project).await?;
         session.verify_local_mailbox(config).await?;
         Ok(Some((project, data)))
     })
@@ -16433,17 +16441,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     cutoff,
                     include_bodies,
                 )?)
-            } else if let Some(project_key) = automatic_robot_project_key(args.project.as_deref()) {
+            } else {
+                let selection = automatic_robot_project_selection(args.project.as_deref())?;
                 crate::message_read::try_read_thread(
                     &config,
-                    &project_key,
+                    &selection,
                     &id,
                     limit.unwrap_or(200),
                     cutoff,
                     include_bodies,
                 )?
-            } else {
-                None
             };
             let (project_slug, data) = if let Some((project, snapshot)) = server_read {
                 (project.slug, build_thread_from_server(snapshot))
@@ -16472,10 +16479,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     &project_key,
                     id,
                 )?)
-            } else if let Some(project_key) = automatic_robot_project_key(args.project.as_deref()) {
-                crate::message_read::try_read_message(&config, &project_key, id)?
             } else {
-                None
+                let selection = automatic_robot_project_selection(args.project.as_deref())?;
+                crate::message_read::try_read_message(&config, &selection, id)?
             };
             let (project_slug, data) = if let Some((project, snapshot)) = server_read {
                 (project.slug, build_message_from_server(snapshot))
@@ -16501,14 +16507,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // br-kp1in.18: a running server answers from its live pool and
             // index in milliseconds; the private snapshot below costs seconds
             // per call on a large mailbox. The server's search has no
-            // recipient-kind filter, and implicit CWD retains the local
-            // ancestor-selection contract.
+            // recipient-kind filter. Implicit CWD uses negotiated nearest
+            // ancestor selection, preserving the local project-scope contract.
             if kind.is_none()
                 && !query.trim().is_empty()
-                && let Some(project_key) = automatic_robot_project_key(args.project.as_deref())
                 && let Some((project, data)) = search_via_server(
                     &config,
-                    &project_key,
+                    &automatic_robot_project_selection(args.project.as_deref())?,
                     &query,
                     importance.as_deref(),
                     since.as_deref(),
@@ -23395,6 +23400,43 @@ mod tests {
     }
 
     #[test]
+    fn robot_search_git_identity_paths_keep_the_local_resolver() {
+        use crate::message_read::ProjectSelection;
+        use mcp_agent_mail_core::ProjectIdentityMode;
+
+        let path = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AGENT_MAIL_TOKEN", "invalid bearer token")],
+            || {
+                for mode in [
+                    ProjectIdentityMode::GitRemote,
+                    ProjectIdentityMode::GitCommonDir,
+                    ProjectIdentityMode::GitToplevel,
+                ] {
+                    let config = mcp_agent_mail_core::Config {
+                        worktrees_enabled: true,
+                        project_identity_mode: mode,
+                        ..mcp_agent_mail_core::Config::default()
+                    };
+                    for selection in [
+                        ProjectSelection::Ancestors(path.clone()),
+                        ProjectSelection::Exact(path.clone()),
+                    ] {
+                        assert!(
+                            search_via_server(&config, &selection, "deploy", None, None, 20, None)
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
     fn robot_search_uses_verified_server_project_and_never_opens_local_files() {
         use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
         let project = serde_json::json!({"id":7,"slug":"registered-project",
@@ -23416,7 +23458,7 @@ mod tests {
             |config| {
                 search_via_server(
                     config,
-                    "registered-project",
+                    &crate::message_read::ProjectSelection::Exact("registered-project".into()),
                     "deploy",
                     Some("high"),
                     None,
@@ -23439,6 +23481,50 @@ mod tests {
     }
 
     #[test]
+    fn robot_search_from_nested_directory_uses_negotiated_ancestor_scope() {
+        use crate::reservation_read::tests::{
+            TestReply, ancestor_mailbox_payload, with_test_server,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let human_key =
+            mcp_agent_mail_core::resolve_project_path(&directory.path().to_string_lossy())
+                .to_string_lossy()
+                .into_owned();
+        let requested = mcp_agent_mail_core::resolve_project_path(&nested.to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":human_key,"created_at":"2026-10-28T00:00:00Z","agents":[],
+            "resolution":{"kind":"nearest_ancestor","requested_path":requested}});
+        let selection = crate::message_read::ProjectSelection::Ancestors(requested.clone());
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Tool(serde_json::json!({"result":[]})),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                ]
+            },
+            |config| search_via_server(config, &selection, "deploy", None, None, 20, None),
+        );
+        let (project, data) = result.unwrap().expect("ancestor search used the daemon");
+        assert_eq!(project.human_key, human_key);
+        assert_eq!(data.served_by, Some("server"));
+        assert_eq!(requests[2]["params"]["arguments"]["project_key"], human_key);
+        assert_eq!(
+            requests[1]["params"]["uri"],
+            format!(
+                "resource://project/{}?resolve=ancestors&format=json",
+                crate::reservation_read::encode_resource_component(&requested)
+            )
+        );
+    }
+
+    #[test]
     fn implicit_conversation_scope_keeps_registered_ancestor_resolution() {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join("src").join("nested");
@@ -23456,14 +23542,17 @@ mod tests {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AGENT_MAIL_PROJECT", "")],
             || {
-                assert!(automatic_robot_project_key(None).is_none());
+                assert!(matches!(
+                    automatic_robot_project_selection(None).unwrap(),
+                    crate::message_read::ProjectSelection::Ancestors(_)
+                ));
                 assert_eq!(
                     find_project_for_path_or_ancestors(&conn, &nested).unwrap(),
                     (7, "ancestor".into())
                 );
-                assert_eq!(
-                    automatic_robot_project_key(Some("ancestor")).as_deref(),
-                    Some("ancestor")
+                assert!(
+                    matches!(automatic_robot_project_selection(Some("ancestor")).unwrap(),
+                    crate::message_read::ProjectSelection::Exact(key) if key == "ancestor")
                 );
             },
         );

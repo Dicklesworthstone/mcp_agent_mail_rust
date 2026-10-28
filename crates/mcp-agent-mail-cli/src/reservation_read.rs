@@ -35,6 +35,7 @@ pub(crate) struct ServerResourceSession {
     client: asupersync::http::h1::HttpClient,
     server_url: String,
     bearer: Option<String>,
+    ancestor_resolution: bool,
 }
 
 impl ServerResourceSession {
@@ -60,6 +61,7 @@ impl ServerResourceSession {
                 .build(),
             server_url,
             bearer,
+            ancestor_resolution: false,
         })
     }
 
@@ -74,7 +76,7 @@ impl ServerResourceSession {
     /// server without archive identity, or a different mailbox permits local
     /// fallback; authentication and malformed responses remain errors.
     pub(crate) async fn for_local_mailbox(config: &Config) -> CliResult<Option<Self>> {
-        let session = Self::new(config)?;
+        let mut session = Self::new(config)?;
         // Equal path strings on different machines do not establish mailbox
         // identity. Remote authority is selected explicitly with --server.
         if !is_local_mailbox_endpoint(&session.server_url)? {
@@ -104,11 +106,19 @@ impl ServerResourceSession {
         if !mailbox_config_matches(&payload, config)? {
             return Ok(None);
         }
+        session.ancestor_resolution = supports_ancestor_resolution(&payload)?;
         Ok(Some(session))
     }
 
+    pub(crate) const fn supports_ancestor_resolution(&self) -> bool {
+        self.ancestor_resolution
+    }
+
     pub(crate) async fn verify_local_mailbox(&self, config: &Config) -> CliResult<()> {
-        if !mailbox_config_matches(&self.read(MAILBOX_CONFIG_RESOURCE).await?, config)? {
+        let payload = self.read(MAILBOX_CONFIG_RESOURCE).await?;
+        if !mailbox_config_matches(&payload, config)?
+            || (self.ancestor_resolution && !supports_ancestor_resolution(&payload)?)
+        {
             return Err(invalid_response(
                 "mailbox identity changed during server read",
             ));
@@ -180,6 +190,16 @@ impl ServerResourceSession {
             }
         }
         Ok(payload)
+    }
+}
+
+fn supports_ancestor_resolution(value: &Value) -> CliResult<bool> {
+    match value.get("project_path_resolution") {
+        None => Ok(false),
+        Some(Value::String(capability)) => Ok(capability == "nearest_ancestor_v1"),
+        Some(_) => Err(invalid_response(
+            "invalid project path resolution capability",
+        )),
     }
 }
 
@@ -878,6 +898,12 @@ pub(crate) mod tests {
 
     pub(crate) fn mailbox_payload(config: &Config) -> Value {
         serde_json::json!({"database_url": config.database_url, "storage_root": config.storage_root})
+    }
+
+    pub(crate) fn ancestor_mailbox_payload(config: &Config) -> Value {
+        let mut payload = mailbox_payload(config);
+        payload["project_path_resolution"] = "nearest_ancestor_v1".into();
+        payload
     }
 
     #[test]

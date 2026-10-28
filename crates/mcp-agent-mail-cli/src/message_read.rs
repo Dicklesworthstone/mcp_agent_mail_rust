@@ -21,6 +21,36 @@ use crate::reservation_read::{
 };
 use crate::{CliError, CliResult};
 
+/// Explicit selectors stay exact. Only implicit working-directory scope can
+/// select a registered ancestor, after the daemon advertises that contract.
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectSelection {
+    Exact(String),
+    Ancestors(String),
+}
+
+impl ProjectSelection {
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            Self::Exact(key) | Self::Ancestors(key) => key,
+        }
+    }
+
+    pub(crate) const fn supported_by(&self, session: &ServerResourceSession) -> bool {
+        matches!(self, Self::Exact(_)) || session.supports_ancestor_resolution()
+    }
+
+    pub(crate) fn permits_automatic_read(&self, config: &Config) -> bool {
+        // Git identity modes can unite sibling worktrees/checkouts under a
+        // project whose stored path is not a physical ancestor of this one.
+        // Keep that existing local resolver until the daemon offers the same
+        // identity contract; explicit stored slugs need no path discovery.
+        !config.worktrees_enabled
+            || config.project_identity_mode == mcp_agent_mail_core::ProjectIdentityMode::Dir
+            || matches!(self, Self::Exact(key) if !std::path::Path::new(key.trim()).is_absolute())
+    }
+}
+
 fn invalid(detail: &str) -> CliError {
     CliError::Other(format!(
         "invalid server message context: {detail}; refusing unverified conversation data"
@@ -174,18 +204,31 @@ fn validate_message(
 
 pub(crate) async fn project_before(
     session: &ServerResourceSession,
-    key: &str,
+    selection: &ProjectSelection,
 ) -> CliResult<(String, ResolvedProject)> {
+    let key = selection.key();
     if key.trim().is_empty() {
         return Err(CliError::InvalidArgument(
             "server message reads require a project path or slug".into(),
         ));
     }
+    let request_key = project_request_key(key);
+    let query = match selection {
+        ProjectSelection::Exact(_) => "format=json",
+        ProjectSelection::Ancestors(_) => {
+            if !std::path::Path::new(&request_key).is_absolute() {
+                return Err(CliError::InvalidArgument(
+                    "ancestor project selection requires an absolute path".into(),
+                ));
+            }
+            "resolve=ancestors&format=json"
+        }
+    };
     let uri = format!(
-        "resource://project/{}?format=json",
-        encode_resource_component(&project_request_key(key))
+        "resource://project/{}?{query}",
+        encode_resource_component(&request_key)
     );
-    let project = validate_project(&session.read(&uri).await?, key)?;
+    let project = validate_project_selection(&session.read(&uri).await?, selection)?;
     Ok((uri, project))
 }
 
@@ -205,14 +248,55 @@ fn project_request_key(key: &str) -> String {
 pub(crate) async fn project_after(
     session: &ServerResourceSession,
     uri: &str,
-    key: &str,
+    selection: &ProjectSelection,
     project: &ResolvedProject,
 ) -> CliResult<()> {
-    let after = validate_project(&session.read(uri).await?, key)?;
+    let after = validate_project_selection(&session.read(uri).await?, selection)?;
     if !same_project(project, &after) {
         return Err(invalid("project identity changed during message read"));
     }
     Ok(())
+}
+
+fn validate_project_selection(
+    value: &Value,
+    selection: &ProjectSelection,
+) -> CliResult<ResolvedProject> {
+    let ProjectSelection::Ancestors(path) = selection else {
+        if value
+            .get("resolution")
+            .is_some_and(|resolution| !resolution.is_null())
+        {
+            return Err(invalid(
+                "ancestor selection returned for an exact project request",
+            ));
+        }
+        return validate_project(value, selection.key());
+    };
+    let requested = project_request_key(path);
+    let witness = value
+        .get("resolution")
+        .ok_or_else(|| invalid("missing ancestor project resolution witness"))?;
+    if witness.get("kind").and_then(Value::as_str) != Some("nearest_ancestor")
+        || witness.get("requested_path").and_then(Value::as_str) != Some(requested.as_str())
+    {
+        return Err(invalid(
+            "ancestor project resolution witness does not match the request",
+        ));
+    }
+    let human_key = value
+        .get("human_key")
+        .and_then(Value::as_str)
+        .filter(|key| std::path::Path::new(key).is_absolute())
+        .ok_or_else(|| invalid("ancestor project has no absolute human key"))?;
+    let project = validate_project(value, human_key)?;
+    let selected_path = project_request_key(human_key);
+    if !std::path::Path::new(&requested).starts_with(&selected_path) {
+        return Err(invalid(
+            "selected project is not an ancestor of the requested path",
+        ));
+    }
+    Ok(project)
 }
 
 pub(crate) fn read_thread(
@@ -229,9 +313,10 @@ pub(crate) fn read_thread(
         ));
     }
     let session = ServerResourceSession::new(config)?;
+    let selection = ProjectSelection::Exact(project_key.to_string());
     crate::context::run_async(read_thread_session(
         &session,
-        project_key,
+        &selection,
         thread,
         limit,
         since,
@@ -241,7 +326,7 @@ pub(crate) fn read_thread(
 
 pub(crate) fn try_read_thread(
     config: &Config,
-    project_key: &str,
+    selection: &ProjectSelection,
     thread: &str,
     limit: usize,
     since: Option<i64>,
@@ -254,16 +339,18 @@ pub(crate) fn try_read_thread(
     }
     // Preserve larger offline requests without weakening the server's bounded
     // conversation snapshot contract.
-    if limit > MAX_CONTEXT_MESSAGES {
+    if limit > MAX_CONTEXT_MESSAGES || !selection.permits_automatic_read(config) {
         return Ok(None);
     }
     crate::context::run_async(async {
         let Some(session) = ServerResourceSession::for_local_mailbox(config).await? else {
             return Ok(None);
         };
+        if !selection.supported_by(&session) {
+            return Ok(None);
+        }
         let result =
-            read_thread_session(&session, project_key, thread, limit, since, include_bodies)
-                .await?;
+            read_thread_session(&session, selection, thread, limit, since, include_bodies).await?;
         session.verify_local_mailbox(config).await?;
         Ok(Some(result))
     })
@@ -271,13 +358,13 @@ pub(crate) fn try_read_thread(
 
 async fn read_thread_session(
     session: &ServerResourceSession,
-    project_key: &str,
+    selection: &ProjectSelection,
     thread: &str,
     limit: usize,
     since: Option<i64>,
     include_bodies: bool,
 ) -> CliResult<(ResolvedProject, ThreadContextSnapshot)> {
-    let (project_uri, project) = project_before(session, project_key).await?;
+    let (project_uri, project) = project_before(session, selection).await?;
     let mut uri = format!(
         "resource://thread/{}?project={}&context=true&limit={limit}&include_bodies={include_bodies}&format=json",
         encode_resource_component(thread),
@@ -297,7 +384,7 @@ async fn read_thread_session(
         since,
         include_bodies,
     )?;
-    project_after(session, &project_uri, project_key, &project).await?;
+    project_after(session, &project_uri, selection, &project).await?;
     Ok((project, snapshot))
 }
 
@@ -312,12 +399,13 @@ pub(crate) fn read_message(
         ));
     }
     let session = ServerResourceSession::new(config)?;
-    crate::context::run_async(read_message_session(&session, project_key, id))
+    let selection = ProjectSelection::Exact(project_key.to_string());
+    crate::context::run_async(read_message_session(&session, &selection, id))
 }
 
 pub(crate) fn try_read_message(
     config: &Config,
-    project_key: &str,
+    selection: &ProjectSelection,
     id: i64,
 ) -> CliResult<Option<(ResolvedProject, MessageContextSnapshot)>> {
     if id <= 0 {
@@ -325,11 +413,17 @@ pub(crate) fn try_read_message(
             "message id must be positive".into(),
         ));
     }
+    if !selection.permits_automatic_read(config) {
+        return Ok(None);
+    }
     crate::context::run_async(async {
         let Some(session) = ServerResourceSession::for_local_mailbox(config).await? else {
             return Ok(None);
         };
-        let result = read_message_session(&session, project_key, id).await?;
+        if !selection.supported_by(&session) {
+            return Ok(None);
+        }
+        let result = read_message_session(&session, selection, id).await?;
         session.verify_local_mailbox(config).await?;
         Ok(Some(result))
     })
@@ -337,16 +431,16 @@ pub(crate) fn try_read_message(
 
 async fn read_message_session(
     session: &ServerResourceSession,
-    project_key: &str,
+    selection: &ProjectSelection,
     id: i64,
 ) -> CliResult<(ResolvedProject, MessageContextSnapshot)> {
-    let (project_uri, project) = project_before(session, project_key).await?;
+    let (project_uri, project) = project_before(session, selection).await?;
     let uri = format!(
         "resource://message/{id}?project={}&context=true&format=json",
         encode_resource_component(&project.slug)
     );
     let snapshot = validate_message(session.read(&uri).await?, &project, id)?;
-    project_after(session, &project_uri, project_key, &project).await?;
+    project_after(session, &project_uri, selection, &project).await?;
     Ok((project, snapshot))
 }
 
@@ -395,6 +489,68 @@ mod tests {
     }
 
     #[test]
+    fn automatic_git_identity_path_reads_keep_the_local_resolver() {
+        use mcp_agent_mail_core::ProjectIdentityMode;
+
+        let path = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AGENT_MAIL_TOKEN", "invalid bearer token")],
+            || {
+                for mode in [
+                    ProjectIdentityMode::GitRemote,
+                    ProjectIdentityMode::GitCommonDir,
+                    ProjectIdentityMode::GitToplevel,
+                ] {
+                    let mut config = Config {
+                        worktrees_enabled: true,
+                        project_identity_mode: mode,
+                        ..Config::default()
+                    };
+                    for selection in [
+                        ProjectSelection::Ancestors(path.clone()),
+                        ProjectSelection::Exact(path.clone()),
+                    ] {
+                        assert!(!selection.permits_automatic_read(&config));
+                        // A session would reject this token, so successful
+                        // fallback proves no daemon authority was selected.
+                        assert!(try_read_message(&config, &selection, 3).unwrap().is_none());
+                        assert!(
+                            try_read_thread(&config, &selection, "TKT-1", 20, None, false)
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                    assert!(
+                        ProjectSelection::Exact("stored-slug".into())
+                            .permits_automatic_read(&config)
+                    );
+                    // Explicit --server still attempts its exact server read.
+                    assert!(
+                        read_message(&config, &path, 3)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("bearer token")
+                    );
+                    config.worktrees_enabled = false;
+                    assert!(
+                        ProjectSelection::Ancestors(path.clone()).permits_automatic_read(&config)
+                    );
+                }
+                let config = Config {
+                    worktrees_enabled: true,
+                    project_identity_mode: ProjectIdentityMode::Dir,
+                    ..Config::default()
+                };
+                assert!(ProjectSelection::Ancestors(path.clone()).permits_automatic_read(&config));
+                assert!(ProjectSelection::Exact(path).permits_automatic_read(&config));
+            },
+        );
+    }
+
+    #[test]
     fn absolute_project_aliases_use_read_only_canonicalization() {
         let directory = tempfile::tempdir().unwrap();
         let canonical = directory.path().canonicalize().unwrap();
@@ -431,7 +587,16 @@ mod tests {
                     TestReply::Resource(mailbox_payload(config)),
                 ]
             },
-            |config| try_read_thread(config, "/work/demo", "TKT-1", 2, None, true),
+            |config| {
+                try_read_thread(
+                    config,
+                    &ProjectSelection::Exact("/work/demo".into()),
+                    "TKT-1",
+                    2,
+                    None,
+                    true,
+                )
+            },
         );
         let (project, result) = result.unwrap().expect("matching daemon selected");
         assert_eq!(project.slug, "demo");
@@ -455,7 +620,7 @@ mod tests {
                     TestReply::Resource(mailbox_payload(config)),
                 ]
             },
-            |config| try_read_message(config, "demo", 3),
+            |config| try_read_message(config, &ProjectSelection::Exact("demo".into()), 3),
         );
         let (_, result) = result.unwrap().expect("matching daemon selected");
         assert_eq!(result.position, 3);
@@ -480,7 +645,7 @@ mod tests {
                     TestReply::Resource(swapped),
                 ]
             },
-            |config| try_read_message(config, "demo", 3),
+            |config| try_read_message(config, &ProjectSelection::Exact("demo".into()), 3),
         );
         assert!(
             result
@@ -496,7 +661,7 @@ mod tests {
 
         let (automatic, _) = with_test_server(
             |_| vec![TestReply::Raw(503, json!({"error":"unavailable"}))],
-            |config| try_read_message(config, "demo", 3),
+            |config| try_read_message(config, &ProjectSelection::Exact("demo".into()), 3),
         );
         assert!(automatic.unwrap().is_none());
         let (explicit, _) = with_test_server(
@@ -504,6 +669,176 @@ mod tests {
             |config| read_message(config, "demo", 3),
         );
         assert!(explicit.is_err(), "explicit --server never falls back");
+    }
+
+    #[test]
+    fn implicit_nested_directory_reads_use_the_negotiated_daemon_ancestor() {
+        use crate::reservation_read::tests::{
+            TestReply, ancestor_mailbox_payload, with_test_server,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let human_key = project_request_key(&directory.path().to_string_lossy());
+        let requested_path = project_request_key(&nested.to_string_lossy());
+        let selection = ProjectSelection::Ancestors(requested_path.clone());
+        let mut descriptor = project_resource();
+        descriptor["human_key"] = json!(human_key);
+        descriptor["resolution"] =
+            json!({"kind":"nearest_ancestor","requested_path":requested_path});
+        let mut thread_snapshot = thread();
+        thread_snapshot["project"]["human_key"] = json!(human_key);
+
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(descriptor.clone()),
+                    TestReply::Resource(thread_snapshot),
+                    TestReply::Resource(descriptor.clone()),
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                ]
+            },
+            |config| try_read_thread(config, &selection, "TKT-1", 2, None, true),
+        );
+        let (project, snapshot) = result
+            .unwrap()
+            .expect("daemon selected registered ancestor");
+        assert_eq!(project.human_key, human_key);
+        assert_eq!(snapshot.message_count, 4);
+        assert_eq!(
+            requests[1]["params"]["uri"],
+            format!(
+                "resource://project/{}?resolve=ancestors&format=json",
+                encode_resource_component(&requested_path)
+            )
+        );
+        assert_eq!(requests[1]["params"]["uri"], requests[3]["params"]["uri"]);
+
+        let mut message_snapshot = single();
+        message_snapshot["project"]["human_key"] = json!(human_key);
+        let (result, _) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(descriptor.clone()),
+                    TestReply::Resource(message_snapshot),
+                    TestReply::Resource(descriptor.clone()),
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                ]
+            },
+            |config| try_read_message(config, &selection, 3),
+        );
+        let (project, snapshot) = result
+            .unwrap()
+            .expect("daemon selected registered ancestor");
+        assert_eq!(project.human_key, human_key);
+        assert_eq!(snapshot.message.id, 3);
+        assert_eq!(snapshot.position, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_directory_falls_back_only_before_ancestor_authority_is_accepted() {
+        use crate::reservation_read::tests::{
+            TestReply, ancestor_mailbox_payload, mailbox_payload, with_test_server,
+        };
+        let selection = ProjectSelection::Ancestors("/work/demo/src".into());
+        for capability in [None, Some("future_unsupported_version")] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut payload = mailbox_payload(config);
+                    if let Some(capability) = capability {
+                        payload["project_path_resolution"] = capability.into();
+                    }
+                    vec![TestReply::Resource(payload)]
+                },
+                |config| try_read_message(config, &selection, 3),
+            );
+            assert!(result.unwrap().is_none());
+            assert_eq!(
+                requests.len(),
+                1,
+                "unsupported mode must not issue an exact project read"
+            );
+        }
+        let (result, _) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(project_resource()),
+                ]
+            },
+            |config| try_read_message(config, &selection, 3),
+        );
+        assert!(result.unwrap_err().to_string().contains("missing ancestor"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_witness_must_bind_request_and_component_wise_parent_path() {
+        let selection = ProjectSelection::Ancestors("/work/demo/src/nested".into());
+        let requested = project_request_key(selection.key());
+        let mut valid = project_resource();
+        valid["resolution"] = json!({"kind":"nearest_ancestor","requested_path":requested});
+        assert!(validate_project_selection(&valid, &selection).is_ok());
+        for (field, value) in [
+            ("kind", json!("exact")),
+            ("requested_path", json!("/work/another/src")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["resolution"][field] = value;
+            assert!(validate_project_selection(&invalid, &selection).is_err());
+        }
+        for path in [
+            "/work/demo/s",
+            "/work/demo/src-other",
+            "/work/unrelated",
+            "relative",
+        ] {
+            let mut invalid = valid.clone();
+            invalid["human_key"] = path.into();
+            assert!(
+                validate_project_selection(&invalid, &selection).is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            validate_project_selection(&valid, &ProjectSelection::Exact("demo".into())).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_selection_refuses_a_different_nearest_project_after_the_read() {
+        use crate::reservation_read::tests::{
+            TestReply, ancestor_mailbox_payload, with_test_server,
+        };
+        let selection = ProjectSelection::Ancestors("/work/demo/src/nested".into());
+        let mut before = project_resource();
+        before["resolution"] = json!({"kind":"nearest_ancestor","requested_path":project_request_key(selection.key())});
+        let mut after = before.clone();
+        after["id"] = json!(8);
+        after["slug"] = json!("nested-project");
+        after["human_key"] = json!("/work/demo/src");
+        let (result, _) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(before),
+                    TestReply::Resource(single()),
+                    TestReply::Resource(after),
+                ]
+            },
+            |config| try_read_message(config, &selection, 3),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("project identity changed")
+        );
     }
 
     #[test]
