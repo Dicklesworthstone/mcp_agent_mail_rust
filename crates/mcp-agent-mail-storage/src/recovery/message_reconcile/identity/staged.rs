@@ -57,6 +57,48 @@ fn reject_ancestor_entries(
     Ok(())
 }
 
+/// Keep only the current immutable date shard. Reopening a large month tree
+/// for every indexed entry repeatedly decodes all of its siblings. The index
+/// remains freshly observed and every entry still receives its normal checks.
+fn committed_entry<'repo>(
+    repo: &'repo Repository,
+    head: &Tree<'_>,
+    path: &str,
+    shard: &mut Option<(Oid, String, Tree<'repo>)>,
+) -> Result<git2::TreeEntry<'static>, git2::Error> {
+    // Retain the original platform/path validation for unusual spellings.
+    // Canonical date components have already been checked by the caller.
+    let Some((parent, name)) = path.rsplit_once('/') else {
+        return head.get_path(Path::new(path));
+    };
+    if path.contains(['\\', '\0']) {
+        return head.get_path(Path::new(path));
+    }
+    if !shard
+        .as_ref()
+        .is_some_and(|(tree_id, known_parent, _)| *tree_id == head.id() && known_parent == parent)
+    {
+        // Release the previous shard before opening another one. Keep at
+        // most one native tree even when the scan spans many dates.
+        *shard = None;
+        // This is an optional lookup acceleration, not another authority.
+        // Missing, malformed or unavailable parents use the original full
+        // lookup and retain its exact error/refusal behavior below.
+        *shard = head
+            .get_path(Path::new(parent))
+            .ok()
+            .filter(|entry| entry.kind() == Some(ObjectType::Tree) && entry.filemode() == 0o040000)
+            .and_then(|entry| repo.find_tree(entry.id()).ok())
+            .map(|tree| (head.id(), parent.to_owned(), tree));
+    }
+    if let Some((_, _, tree)) = shard.as_ref()
+        && let Some(entry) = tree.get_name(name)
+    {
+        return Ok(entry.to_owned());
+    }
+    head.get_path(Path::new(path))
+}
+
 pub(super) fn preflight(
     repo: &Repository,
     archive: &ProjectArchive,
@@ -125,6 +167,7 @@ pub(super) fn preflight(
     let Some(start) = index.find_prefix(prefix.as_str())? else {
         return budget.checkpoint("staged canonical result");
     };
+    let mut committed_shard = None;
     for position in start..index.len() {
         budget.checkpoint("staged canonical entry")?;
         let entry = index
@@ -164,7 +207,7 @@ pub(super) fn preflight(
             continue;
         }
         if let Some(head) = head {
-            match head.get_path(Path::new(path)) {
+            match committed_entry(repo, head, path, &mut committed_shard) {
                 Ok(committed)
                     if committed.kind() == Some(ObjectType::Blob)
                         && matches!(committed.filemode(), 0o100644 | 0o100755)
@@ -225,6 +268,81 @@ mod tests {
         index.add_path(Path::new(&relative)).unwrap();
         index.write().unwrap();
         index.get_path(Path::new(&relative), 0).unwrap().id
+    }
+
+    #[test]
+    fn date_shard_lookup_matches_full_head_across_parents_and_tree_changes() {
+        let (_dir, _config, archive, _message, _recipients) = fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let first = archive.root.join("messages/2025/01/first.md");
+        let second = archive.root.join("messages/2025/02/second.md");
+        let obstruction = archive.root.join("messages/2025/03");
+        let original = stage(&repo, &archive, &first, b"first committed bytes");
+        stage(&repo, &archive, &second, b"second committed bytes");
+        stage(&repo, &archive, &obstruction, b"not a directory");
+        let mut index = repo.index().unwrap();
+        let first_relative = crate::rel_path_cached(&archive.canonical_repo_root, &first).unwrap();
+        let mut executable = index.get_path(Path::new(&first_relative), 0).unwrap();
+        executable.mode = 0o100755;
+        index.add(&executable).unwrap();
+        index.write().unwrap();
+        let head = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let mut shard = None;
+        let namespace = first_relative.strip_suffix("/2025/01/first.md").unwrap();
+        // These are immutable Git paths, including a deliberately obstructed
+        // parent that a filesystem canonicalizer must reject before lookup.
+        for relative in [
+            first_relative.clone(),
+            format!("{namespace}/2025/02/second.md"),
+            first_relative.clone(),
+            format!("{namespace}/2025/01/missing.md"),
+            format!("{namespace}/2025/04/missing.md"),
+            format!("{namespace}/2025/03/child.md"),
+        ] {
+            match (
+                head.get_path(Path::new(&relative)),
+                committed_entry(&repo, &head, &relative, &mut shard),
+            ) {
+                (Ok(expected), Ok(observed)) => {
+                    assert_eq!(observed.id(), expected.id());
+                    assert_eq!(observed.filemode(), expected.filemode());
+                    assert_eq!(observed.kind(), expected.kind());
+                }
+                (Err(expected), Err(observed)) => {
+                    assert_eq!(observed.code(), expected.code());
+                    assert_eq!(observed.class(), expected.class());
+                    assert_eq!(observed.message(), expected.message());
+                }
+                (expected, observed) => panic!(
+                    "different lookup outcomes: native ok={}, shard ok={}",
+                    expected.is_ok(),
+                    observed.is_ok()
+                ),
+            }
+        }
+        assert_eq!(
+            committed_entry(&repo, &head, &first_relative, &mut shard)
+                .unwrap()
+                .id(),
+            original
+        );
+        let replacement = stage(&repo, &archive, &first, b"new tree, same canonical path");
+        let mut index = repo.index().unwrap();
+        let changed = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        assert_ne!(changed.id(), head.id());
+        assert_ne!(replacement, original);
+        assert_eq!(
+            committed_entry(&repo, &changed, &first_relative, &mut shard)
+                .unwrap()
+                .id(),
+            replacement
+        );
+        assert_eq!(
+            committed_entry(&repo, &head, &first_relative, &mut shard)
+                .unwrap()
+                .id(),
+            original
+        );
     }
 
     #[test]

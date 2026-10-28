@@ -797,6 +797,12 @@ fn read_only_verification_keeps_staged_conflicting_identity_visible() {
             "{error:?}"
         );
         assert!(!error.transient);
+        let error = reconcile_prepared_inner(config, &prepared, None, false).unwrap_err();
+        assert!(
+            error.detail.contains("staged canonical payload conflicts"),
+            "{error:?}"
+        );
+        assert!(!error.transient);
         assert_eq!(fs::read(repo.path().join("index")).unwrap(), before_index);
         assert_eq!(repo.head().unwrap().target(), before_head);
         assert_eq!(fs::read(&paths.canonical).unwrap(), original);
@@ -888,6 +894,126 @@ fn read_only_verification_retries_when_head_changes_even_with_identical_tree() {
         assert_ne!(before.head_id, after.head_id);
         assert_eq!(before.tree_id, after.tree_id);
         assert!(verify_prepared_without_mutation(config, &prepared, None).unwrap());
+    });
+}
+
+#[test]
+fn optimistic_epoch_drift_frees_saturated_retry_capacity_for_a_crash_orphan() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor {
+            source_identity: pool.sqlite_identity_key(),
+            retries: std::iter::once(DeferredRetry {
+                id: 901,
+                attempts: 1,
+                ready_at: Instant::now(),
+            })
+            .chain(
+                (10_000..10_000 + i64::try_from(MAX_RETRY_IDS - 1).unwrap()).map(|id| {
+                    DeferredRetry {
+                        id,
+                        attempts: 1,
+                        ready_at: Instant::now() + MAX_RETRY_BACKOFF,
+                    }
+                }),
+            )
+            .collect(),
+            ..Default::default()
+        };
+        let retained = cursor
+            .retries
+            .iter()
+            .skip(1)
+            .map(|retry| (retry.id, retry.attempts, retry.ready_at))
+            .collect::<Vec<_>>();
+        let root = config.storage_root.clone();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        super::super::SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    drop(crate::ArchiveMutationGuard::begin_at(&root));
+                }
+            }));
+        });
+        let result =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+        super::super::SCAN_HOOK.with(|slot| drop(slot.borrow_mut().take()));
+        let report = result.unwrap();
+        assert!(fired.load(Ordering::Acquire));
+        assert_eq!(
+            (report.unchanged, report.repaired, report.deferred),
+            (1, 1, 0)
+        );
+        assert_eq!(report.retry_len, MAX_RETRY_IDS - 1);
+        assert!(report.scanned <= MAX_IDS_PER_PASS);
+        assert!(report.repaired <= MAX_REPAIRS_PER_BATCH);
+        assert!(report.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+        assert_eq!(
+            cursor
+                .retries
+                .iter()
+                .map(|retry| (retry.id, retry.attempts, retry.ready_at))
+                .collect::<Vec<_>>(),
+            retained
+        );
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn optimistic_head_drift_still_requires_publication_admission() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let root = config.storage_root.clone();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        super::super::SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    // The competing Git writer need not own our process-local
+                    // fence. Change HEAD while preserving every message byte.
+                    let repo = git2::Repository::open(&root).unwrap();
+                    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+                    let tree = parent.tree().unwrap();
+                    let signature = git2::Signature::now("test", "test@example.invalid").unwrap();
+                    repo.commit(
+                        Some("HEAD"),
+                        &signature,
+                        &signature,
+                        "advance HEAD while publication is fenced",
+                        &tree,
+                        &[&parent],
+                    )
+                    .unwrap();
+                }
+            }));
+        });
+        let stop = AtomicBool::new(false);
+        let result = while_publication_fence_is_held(|| {
+            reconcile_prepared_inner(
+                config,
+                &prepared,
+                Some(RepairControl { cx, stop: &stop }),
+                false,
+            )
+        });
+        super::super::SCAN_HOOK.with(|slot| drop(slot.borrow_mut().take()));
+        assert!(fired.load(Ordering::Acquire));
+        let error = result.unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert!(!error.optimistic_observation_changed, "{error:?}");
+        assert!(error.detail.contains("publication fence busy"), "{error:?}");
+        assert_recovered(cx, pool, config, 901, false);
     });
 }
 

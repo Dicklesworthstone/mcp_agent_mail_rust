@@ -72,6 +72,7 @@ enum ScanLane {
 struct ReconcileFailure {
     detail: String,
     transient: bool,
+    optimistic_observation_changed: bool,
 }
 
 impl ReconcileFailure {
@@ -81,6 +82,19 @@ impl ReconcileFailure {
         Self {
             detail: source_error(error),
             transient: true,
+            optimistic_observation_changed: false,
+        }
+    }
+
+    fn optimistic_observation_changed() -> Self {
+        Self {
+            detail: crate::StorageError::LockContention {
+                message: "archive changed during read-only message verification; retry required"
+                    .into(),
+            }
+            .to_string(),
+            transient: true,
+            optimistic_observation_changed: true,
         }
     }
 }
@@ -90,6 +104,7 @@ impl From<String> for ReconcileFailure {
         Self {
             detail,
             transient: false,
+            optimistic_observation_changed: false,
         }
     }
 }
@@ -114,6 +129,7 @@ impl From<crate::StorageError> for ReconcileFailure {
         Self {
             detail: error.to_string(),
             transient,
+            optimistic_observation_changed: false,
         }
     }
 }
@@ -742,8 +758,17 @@ fn reconcile_prepared_inner(
     control: Option<RepairControl<'_>>,
     require_guarded_proof: bool,
 ) -> Result<ReconcileResult, ReconcileFailure> {
-    if !require_guarded_proof && verify_prepared_without_mutation(config, prepared, control)? {
-        return Ok(ReconcileResult::default());
+    if !require_guarded_proof {
+        match verify_prepared_without_mutation(config, prepared, control) {
+            Ok(true) => return Ok(ReconcileResult::default()),
+            Ok(false) => {}
+            // An optimistic observation invalidated by another writer proves
+            // neither completion nor a conflict. Recheck through the existing
+            // guarded path instead of pinning healthy retry debt indefinitely.
+            // All other failures retain their classification and refusal.
+            Err(error) if error.optimistic_observation_changed => {}
+            Err(error) => return Err(error),
+        }
     }
     // Admit before ensure_archive: even creating a missing archive must not
     // wait behind an unrelated publisher while retaining the DB source lease.
@@ -899,12 +924,10 @@ fn verify_prepared_without_mutation(
     let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)? else {
         return Ok(false);
     };
-    let changed = || crate::StorageError::LockContention {
-        message: "archive changed during read-only message verification; retry required".into(),
-    };
+    let changed = ReconcileFailure::optimistic_observation_changed;
     let committed = CommittedMessages::open(&archive)?;
     if before.generation.head != committed.head_id {
-        return Err(changed().into());
+        return Err(changed());
     }
     if !matches!(
         verify_retention_archive_at(&archive, prepared, &mut 0, &committed, control),
@@ -918,7 +941,7 @@ fn verify_prepared_without_mutation(
     // gate as publication, bracketed by the pinned HEAD checks because its
     // own preflight opens HEAD independently.
     if !committed.same_head(&archive)? {
-        return Err(changed().into());
+        return Err(changed());
     }
     let paths = crate::message_paths_for_bundle(
         &archive,
@@ -951,7 +974,7 @@ fn verify_prepared_without_mutation(
     if !committed.same_head(&archive)?
         || crate::archive_epoch_read_stamp(&archive.repo_root)?.as_ref() != Some(&before)
     {
-        return Err(changed().into());
+        return Err(changed());
     }
     Ok(true)
 }
