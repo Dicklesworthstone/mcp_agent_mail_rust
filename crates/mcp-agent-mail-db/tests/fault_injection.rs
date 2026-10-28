@@ -1170,7 +1170,19 @@ fn run_permission_test_unprivileged(test_name: &str) -> bool {
         std::env::var_os("AM_PERMISSION_TEST_CHILD").is_none(),
         "permission child must actually drop root privileges"
     );
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let executable = std::env::current_exe().unwrap();
+    // A Linux worker can keep target ancestors root-private. Execute the
+    // retained ELF without granting the unprivileged child directory access;
+    // File::open keeps the descriptor close-on-exec, so it does not leak into
+    // the permission assertion itself.
+    #[cfg(target_os = "linux")]
+    let executable_file = std::fs::File::open(&executable).unwrap();
+    #[cfg(target_os = "linux")]
+    let executable = {
+        use std::os::fd::AsRawFd as _;
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", executable_file.as_raw_fd()))
+    };
+    let output = std::process::Command::new(executable)
         .args([
             "--exact",
             &mcp_agent_mail_test_helpers::libtest_path!(test_name),
@@ -1185,6 +1197,8 @@ fn run_permission_test_unprivileged(test_name: &str) -> bool {
         .current_dir("/tmp")
         .output()
         .expect("run permission assertion without privileged DAC bypass");
+    #[cfg(target_os = "linux")]
+    drop(executable_file);
     assert!(
         output.status.success(),
         "unprivileged {test_name} failed: {}\n{}",

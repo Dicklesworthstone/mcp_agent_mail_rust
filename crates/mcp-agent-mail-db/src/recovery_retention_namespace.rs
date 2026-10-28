@@ -1535,6 +1535,7 @@ mapping.close()
     #[cfg(target_os = "linux")]
     #[test]
     fn deletion_works_for_an_unprivileged_owner_with_protected_foreign_processes() {
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
 
         const CHILD: &str = "MCP_AGENT_MAIL_RECLAIM_UNPRIVILEGED_CHILD";
@@ -1546,7 +1547,13 @@ mapping.close()
                 "::deletion_works_for_an_unprivileged_owner_with_protected_foreign_processes"
             );
             let test_name = full_name.split_once("::").unwrap().1;
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            // The worker target may have root-private ancestors. Retain this
+            // exact executable before dropping privileges; Linux resolves
+            // the descriptor before closing it on exec. No directory modes
+            // or child privileges change to accommodate the fixture.
+            let executable = File::open(std::env::current_exe().unwrap()).unwrap();
+            let executable_path = format!("/proc/self/fd/{}", executable.as_raw_fd());
+            let output = std::process::Command::new(executable_path) // ubs:ignore — cfg(test), exact retained current ELF descriptor; no external executable selection
                 .args(["--exact", test_name, "--nocapture"])
                 .env(CHILD, "1")
                 .env("TMPDIR", "/tmp")
@@ -1554,12 +1561,14 @@ mapping.close()
                 .gid(65_534)
                 .output()
                 .unwrap();
+            drop(executable);
             assert!(
                 output.status.success(),
                 "unprivileged deletion failed: stdout={} stderr={}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
             return;
         }
         let _scan_guard = reader_scan_test_guard();
