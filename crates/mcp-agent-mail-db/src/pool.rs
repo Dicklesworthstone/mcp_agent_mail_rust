@@ -3209,7 +3209,7 @@ pub struct DbPool {
     /// (mcp_agent_mail#176). File-backed pools resolve by normalized SQLite
     /// identity; `:memory:` pools resolve by their underlying pool `Arc`. See
     /// [`shared_message_id_allocator`].
-    message_id_allocator: Arc<crate::id_floor::MessageIdAllocator>,
+    message_id_state: Arc<PoolMessageIdState>,
     /// Canonical mailbox path this wrapper stands in for when `sqlite_path`
     /// is a private read-only materialization (a CLI snapshot of the live
     /// mailbox). Search V3 keys its process-global bridge state and the
@@ -3259,9 +3259,40 @@ enum DbPoolOpenMode {
 /// that pool's message-id allocator, and its process-unique cache generation.
 struct MessageIdAllocatorEntry {
     pool: Weak<Pool<DbConn>>,
-    allocator: Arc<crate::id_floor::MessageIdAllocator>,
+    state: Arc<PoolMessageIdState>,
     cache_generation: u64,
     storage_root_identity: PathBuf,
+}
+
+struct PoolMessageIdState {
+    allocator: Mutex<Arc<crate::id_floor::MessageIdAllocator>>,
+    opened_connection: AtomicBool,
+}
+
+/// A capability held by the exact pool that claimed its first init gate.
+/// It travels explicitly through reconstruction, including across awaits.
+/// Only a durable promotion may exchange its old allocator for a fresh one;
+/// every other pre-promotion pool remains terminally retired.
+struct InitializingPoolOwner {
+    pool: Arc<Pool<DbConn>>,
+    state: Arc<PoolMessageIdState>,
+    /// Immutable registry generation, copied from `DbPool::engine_generation`.
+    cache_generation: u64,
+    sqlite_identity: PathBuf,
+    storage_root_identity: PathBuf,
+    gate: Arc<SqliteInitGate>,
+    adopted: AtomicBool,
+    completed: bool,
+}
+
+impl Drop for InitializingPoolOwner {
+    fn drop(&mut self) {
+        if self.adopted.load(Ordering::Acquire) && !self.completed {
+            // Cancellation, an error, an unwind, or a dropped future may not
+            // leave an exempted pool available after incomplete initialization.
+            self.pool.close();
+        }
+    }
 }
 
 struct FileMessageIdAllocatorEntry {
@@ -3292,7 +3323,7 @@ fn shared_message_id_allocator(
     pool: &Arc<Pool<DbConn>>,
     sqlite_identity: Option<&Path>,
     storage_root_identity: &Path,
-) -> DbResult<(Arc<crate::id_floor::MessageIdAllocator>, u64)> {
+) -> DbResult<(Arc<PoolMessageIdState>, u64)> {
     let per_pool_registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut per_pool_entries = per_pool_registry
         .lock()
@@ -3309,7 +3340,7 @@ fn shared_message_id_allocator(
                 storage_root_identity,
             ));
         }
-        return Ok((entry.allocator.clone(), entry.cache_generation));
+        return Ok((entry.state.clone(), entry.cache_generation));
     }
     let allocator = match sqlite_identity {
         None => Arc::new(crate::id_floor::MessageIdAllocator::new()),
@@ -3357,18 +3388,22 @@ fn shared_message_id_allocator(
             }
         }
     };
+    let state = Arc::new(PoolMessageIdState {
+        allocator: Mutex::new(allocator),
+        opened_connection: AtomicBool::new(false),
+    });
     let generation = NEXT_POOL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
     per_pool_entries.insert(
         key,
         MessageIdAllocatorEntry {
             pool: Arc::downgrade(pool),
-            allocator: allocator.clone(),
+            state: state.clone(),
             cache_generation: generation,
             storage_root_identity: storage_root_identity.to_path_buf(),
         },
     );
     drop(per_pool_entries);
-    Ok((allocator, generation))
+    Ok((state, generation))
 }
 
 fn message_id_storage_root_conflict(
@@ -3391,6 +3426,7 @@ fn message_id_storage_root_conflict(
     }
 }
 
+#[cfg(test)]
 fn invalidate_file_message_id_allocator(normalized_identity: &Path) -> bool {
     let registry = FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
     let entry = registry
@@ -3610,7 +3646,7 @@ impl DbPool {
             checked_journal_size_limit(journal_size_limit)?,
         );
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
-        let (message_id_allocator, cache_generation) = shared_message_id_allocator(
+        let (message_id_state, cache_generation) = shared_message_id_allocator(
             &pool,
             authority.sqlite_identity.as_deref(),
             &authority.storage_root,
@@ -3633,7 +3669,7 @@ impl DbPool {
             skip_startup_init,
             open_mode: DbPoolOpenMode::Recovering,
             stats_sampler,
-            message_id_allocator,
+            message_id_state,
             search_identity_path: None,
             proactive_backup: Arc::new(Mutex::new(None)),
         })
@@ -3671,7 +3707,7 @@ impl DbPool {
         let journal_size_limit_state =
             shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
         let init_sql = Self::connection_init_sql(config, query_only, configured_journal_size_limit);
-        let (message_id_allocator, cache_generation) = shared_message_id_allocator(
+        let (message_id_state, cache_generation) = shared_message_id_allocator(
             &pool,
             authority.sqlite_identity.as_deref(),
             &authority.storage_root,
@@ -3698,7 +3734,7 @@ impl DbPool {
                 DbPoolOpenMode::Recovering
             },
             stats_sampler,
-            message_id_allocator,
+            message_id_state,
             search_identity_path: None,
             proactive_backup: Arc::new(Mutex::new(None)),
         })
@@ -3981,7 +4017,7 @@ impl DbPool {
         let storage_root_identity = self.storage_root.clone();
         let storage_root_alias = self.storage_root_alias.clone();
         let storage_root_authority = Arc::clone(&self.storage_root_authority);
-        self.message_id_allocator
+        self.message_id_allocator()
             .archive_seed_with(cx, || async move {
                 if let Err(error) = verify_frozen_storage_root_with_descriptor(
                     &storage_root_identity,
@@ -4146,6 +4182,9 @@ impl DbPool {
         let skip_startup_init = self.skip_startup_init;
         let open_mode = self.open_mode;
         let cx2 = cx.clone();
+        let initializing_pool = Arc::clone(&self.pool);
+        let message_id_state = Arc::clone(&self.message_id_state);
+        let engine_generation = self.engine_generation;
 
         let out = self
             .pool
@@ -4163,7 +4202,10 @@ impl DbPool {
                 let storage_root_authority = Arc::clone(&storage_root_authority);
                 let init_sql = init_sql.clone();
                 let cx2 = cx2.clone();
+                let initializing_pool = Arc::clone(&initializing_pool);
+                let message_id_state = Arc::clone(&message_id_state);
                 async move {
+                    let mut initializing_owner = None;
                     if let Err(error) = validate_frozen_sqlite_open_authority_with_descriptor(
                         &sqlite_path,
                         sqlite_identity.as_deref(),
@@ -4214,6 +4256,20 @@ impl DbPool {
                                     gate: &init_gate,
                                     success: false,
                                 };
+                                if let Some(identity) = &sqlite_identity
+                                    && !message_id_state.opened_connection.load(Ordering::Acquire)
+                                {
+                                    initializing_owner = Some(InitializingPoolOwner {
+                                        pool: initializing_pool,
+                                        state: Arc::clone(&message_id_state),
+                                        cache_generation: engine_generation,
+                                        sqlite_identity: identity.clone(),
+                                        storage_root_identity: storage_root.clone(),
+                                        gate: Arc::clone(&init_gate),
+                                        adopted: AtomicBool::new(false),
+                                        completed: false,
+                                    });
+                                }
                                 let init_out = initialize_sqlite_file_once_with_authorities(
                                     &cx2,
                                     &sqlite_path,
@@ -4221,6 +4277,7 @@ impl DbPool {
                                     &storage_root_alias,
                                     sqlite_authority.as_deref(),
                                     Some(&storage_root_authority),
+                                    initializing_owner.as_ref(),
                                 )
                                 .await;
                                 match init_out {
@@ -4280,6 +4337,7 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     };
+                    message_id_state.opened_connection.store(true, Ordering::Release);
 
                     if sqlite_path == ":memory:" && !skip_startup_init {
                         match initialize_in_memory_connection(&cx2, &conn, run_migrations).await {
@@ -4386,6 +4444,9 @@ impl DbPool {
                         return Outcome::Err(pin_err);
                     }
 
+                    if let Some(owner) = &mut initializing_owner {
+                        owner.completed = true;
+                    }
                     Outcome::Ok(conn)
                 }
             })
@@ -4763,11 +4824,16 @@ impl DbPool {
     /// This guarantees consecutive message creations cannot receive the same
     /// id when durable `AUTOINCREMENT` state fails to advance. Each fresh
     /// `:memory:` pool remains isolated by underlying pool `Arc`. Resolution
-    /// happens once at construction (see [`shared_message_id_allocator`]); this
-    /// accessor is a cheap clone with no locking on the message hot path.
+    /// happens at construction (see [`shared_message_id_allocator`]). A brief
+    /// lock also permits the exact unopened initializer to adopt a fresh
+    /// allocator after its own durable recovery promotion.
     #[must_use]
     pub fn message_id_allocator(&self) -> Arc<crate::id_floor::MessageIdAllocator> {
-        self.message_id_allocator.clone()
+        self.message_id_state
+            .allocator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Run `integrity::quick_check` on `conn` and, on `IntegrityCorruption`,
@@ -5920,6 +5986,14 @@ const LIVE_QUERY_ONLY_POOL_CACHE_CAPACITY: usize = 4;
 /// sized pools may point at the same file, and any surviving file descriptor
 /// could keep serving pre-recovery numeric ids.
 fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
+    retire_cached_runtime_state_after_recovery_with_owner(identity, trigger, None);
+}
+
+fn retire_cached_runtime_state_after_recovery_with_owner(
+    identity: &Path,
+    trigger: &str,
+    initializing_owner: Option<&InitializingPoolOwner>,
+) {
     let mut retired_pools = {
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
@@ -5960,12 +6034,30 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
         pools
     };
 
-    let message_id_allocator_invalidated = invalidate_file_message_id_allocator(identity);
-    let retired_generations = {
+    let (message_id_allocator_invalidated, retired_generations) = {
         let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
         let guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        // Match constructor lock order. Retirement and the one permitted
+        // allocator exchange are atomic with respect to pool registration.
+        let logical_registry =
+            FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut logical = logical_registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let previous = logical.remove(identity);
+        let previous_allocator = previous
+            .as_ref()
+            .and_then(|entry| entry.allocator.upgrade());
+        if let Some(allocator) = &previous_allocator {
+            allocator.retire();
+        }
         for entry in guard.values() {
-            if entry.allocator.is_retired()
+            if entry
+                .state
+                .allocator
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_retired()
                 && let Some(pool) = entry.pool.upgrade()
                 && !retired_pools
                     .iter()
@@ -5981,8 +6073,44 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
                 guard.get(&key).map(|entry| entry.cache_generation)
             })
             .collect::<Vec<_>>();
+        if let Some(owner) = initializing_owner
+            && owner.sqlite_identity == identity
+            && !owner.pool.is_closed()
+            && !owner.state.opened_connection.load(Ordering::Acquire)
+            && let Some(entry) = guard.get(&(Arc::as_ptr(&owner.pool) as usize))
+            && entry.cache_generation == owner.cache_generation
+            && entry.storage_root_identity == owner.storage_root_identity
+            && Arc::ptr_eq(&entry.state, &owner.state)
+        {
+            let mut allocator = owner
+                .state
+                .allocator
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if previous_allocator
+                .as_ref()
+                .is_some_and(|previous| Arc::ptr_eq(previous, &allocator))
+                && owner
+                    .adopted
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let replacement = Arc::new(crate::id_floor::MessageIdAllocator::new());
+                logical.insert(
+                    identity.to_path_buf(),
+                    FileMessageIdAllocatorEntry {
+                        allocator: Arc::downgrade(&replacement),
+                        storage_root_identity: owner.storage_root_identity.clone(),
+                    },
+                );
+                *allocator = replacement;
+                drop(allocator);
+                retired_pools.retain(|pool| !Arc::ptr_eq(pool, &owner.pool));
+            }
+        }
+        drop(logical);
         drop(guard);
-        generations
+        (previous.is_some(), generations)
     };
 
     for pool in &retired_pools {
@@ -5998,7 +6126,12 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
             .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
         let mut guard = gates.write();
         let before = guard.len();
-        guard.retain(|key, _| key.sqlite_identity.as_deref() != Some(identity));
+        guard.retain(|key, gate| {
+            key.sqlite_identity.as_deref() != Some(identity)
+                || initializing_owner.is_some_and(|owner| {
+                    owner.adopted.load(Ordering::Acquire) && Arc::ptr_eq(gate, &owner.gate)
+                })
+        });
         before.saturating_sub(guard.len())
     };
 
@@ -8457,6 +8590,15 @@ fn reconcile_archive_state_before_init(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<bool, SqlError> {
+    reconcile_archive_state_before_init_with_owner(primary_path, storage_root, None)
+}
+
+#[allow(clippy::result_large_err)]
+fn reconcile_archive_state_before_init_with_owner(
+    primary_path: &Path,
+    storage_root: &Path,
+    initializing_owner: Option<&InitializingPoolOwner>,
+) -> Result<bool, SqlError> {
     if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, primary_path) {
         return Ok(false);
     }
@@ -8478,7 +8620,12 @@ fn reconcile_archive_state_before_init(
     refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
 
     if !primary_path.exists() {
-        let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
+        let stats = reconstruct_sqlite_file_with_archive_salvage_with_policy(
+            primary_path,
+            storage_root,
+            RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
+            initializing_owner,
+        )?;
         clear_pending_archive_drift(primary_path);
         tracing::warn!(
             path = %primary_path.display(),
@@ -8657,7 +8804,12 @@ fn reconcile_archive_state_before_init(
             )));
         }
     }
-    let stats = match reconstruct_archive_drift_of_healthy_primary(primary_path, storage_root) {
+    let stats = match reconstruct_sqlite_file_with_archive_salvage_with_policy(
+        primary_path,
+        storage_root,
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly,
+        initializing_owner,
+    ) {
         Ok(stats) => stats,
         Err(error) => {
             return archive_drift_reconstruction_failed_on_healthy_primary(
@@ -10273,6 +10425,7 @@ async fn initialize_sqlite_file_once(
         storage_root,
         None,
         None,
+        None,
     )
     .await
 }
@@ -10285,6 +10438,7 @@ async fn initialize_sqlite_file_once_with_authorities(
     storage_root: &Path,
     sqlite_authority: Option<&FrozenDirectoryAuthority>,
     storage_root_authority: Option<&FrozenDirectoryAuthority>,
+    initializing_owner: Option<&InitializingPoolOwner>,
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
     if sqlite_path != ":memory:" {
@@ -10335,7 +10489,9 @@ async fn initialize_sqlite_file_once_with_authorities(
         {
             return Outcome::Err(error);
         }
-        if let Err(err) = reconcile_archive_state_before_init(path, storage_root) {
+        if let Err(err) =
+            reconcile_archive_state_before_init_with_owner(path, storage_root, initializing_owner)
+        {
             return Outcome::Err(err);
         }
         if let Some(authority) = sqlite_authority
@@ -18216,7 +18372,10 @@ fn rollback_recovery_candidate_promotion(
             ))
         })?;
     }
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
         restore_quarantined_sidecar(primary_path, suffix, "corrupt", timestamp)?;
     }
     sync_recovery_parent(primary_path)
@@ -18383,6 +18542,32 @@ fn promote_recovery_candidate_with_finalizer_and_timeout<F>(
     timestamp: &str,
     drain_timeout: std::time::Duration,
     finalize_receipt: F,
+) -> Result<(), ReconstructionCandidateFailure>
+where
+    F: Fn(
+        &crate::forensics::PreparedRecoveryReceipt,
+    ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
+{
+    promote_recovery_candidate_for_initializing_owner(
+        primary_path,
+        candidate_path,
+        storage_root,
+        timestamp,
+        drain_timeout,
+        finalize_receipt,
+        None,
+    )
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
+fn promote_recovery_candidate_for_initializing_owner<F>(
+    primary_path: &Path,
+    candidate_path: &Path,
+    storage_root: &Path,
+    timestamp: &str,
+    drain_timeout: std::time::Duration,
+    finalize_receipt: F,
+    initializing_owner: Option<&InitializingPoolOwner>,
 ) -> Result<(), ReconstructionCandidateFailure>
 where
     F: Fn(
@@ -18732,7 +18917,11 @@ where
         });
     }
 
-    retire_cached_runtime_state_after_recovery(primary_path, "durable recovery promotion");
+    retire_cached_runtime_state_after_recovery_with_owner(
+        primary_path,
+        "durable recovery promotion",
+        initializing_owner,
+    );
     if let Err(error) = crate::reconstruct::recreate_atc_sidecar_schema(primary_path) {
         return Err(ReconstructionCandidateFailure {
             error: SqlError::Custom(format!(
@@ -18758,13 +18947,15 @@ fn reconstruct_archive_into_candidate(
     storage_root: &Path,
     live_salvage_db_path: Option<&Path>,
     timestamp: &str,
+    initializing_owner: Option<&InitializingPoolOwner>,
 ) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure> {
-    reconstruct_archive_into_candidate_with_finalizer(
+    reconstruct_archive_into_candidate_for_initializing_owner(
         primary_path,
         storage_root,
         live_salvage_db_path,
         timestamp,
         crate::forensics::finalize_recovery_receipt,
+        initializing_owner,
     )
 }
 
@@ -18794,6 +18985,7 @@ fn preserve_failed_reconstruction_candidate(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
 fn reconstruct_archive_into_candidate_with_finalizer<F>(
     primary_path: &Path,
@@ -18801,6 +18993,30 @@ fn reconstruct_archive_into_candidate_with_finalizer<F>(
     live_salvage_db_path: Option<&Path>,
     timestamp: &str,
     finalize_receipt: F,
+) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure>
+where
+    F: Fn(
+        &crate::forensics::PreparedRecoveryReceipt,
+    ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
+{
+    reconstruct_archive_into_candidate_for_initializing_owner(
+        primary_path,
+        storage_root,
+        live_salvage_db_path,
+        timestamp,
+        finalize_receipt,
+        None,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn reconstruct_archive_into_candidate_for_initializing_owner<F>(
+    primary_path: &Path,
+    storage_root: &Path,
+    live_salvage_db_path: Option<&Path>,
+    timestamp: &str,
+    finalize_receipt: F,
+    initializing_owner: Option<&InitializingPoolOwner>,
 ) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure>
 where
     F: Fn(
@@ -18821,12 +19037,14 @@ where
 
     match reconstruct_result {
         Ok(stats) => match sqlite_recovery_candidate_passes_full_integrity_check(&candidate_path) {
-            Ok(true) => match promote_recovery_candidate_with_finalizer(
+            Ok(true) => match promote_recovery_candidate_for_initializing_owner(
                 primary_path,
                 &candidate_path,
                 storage_root,
                 timestamp,
+                crate::write_barrier::writer_drain_timeout(),
                 finalize_receipt,
+                initializing_owner,
             ) {
                 Ok(()) => Ok(stats),
                 Err(failure) => {
@@ -18970,6 +19188,20 @@ fn restore_quarantined_primary_with_sidecar_label_at(
     timestamp: &str,
     restore_timestamp: &str,
 ) -> Result<(), SqlError> {
+    for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
+        if path_is_occupied(&quarantined_sidecar_path(
+            primary_path,
+            suffix,
+            sidecar_label,
+            timestamp,
+        )) && path_is_occupied(&sqlite_sidecar_path(primary_path, suffix))
+        {
+            return Err(SqlError::Custom(format!(
+                "cannot restore {} while its FrankenSQLite namespace destination {suffix} is occupied; preserving both generations",
+                primary_path.display()
+            )));
+        }
+    }
     if path_is_occupied(primary_path) {
         quarantine_reconstructed_candidate(
             primary_path,
@@ -18994,7 +19226,13 @@ fn restore_quarantined_primary_with_sidecar_label_at(
         })?;
     }
 
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+    // Restore the same complete family that promotion quarantined. Leaving
+    // namespace records behind would strand an otherwise-live old owner after
+    // a pre-commit activation/receipt failure.
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
         restore_quarantined_sidecar(primary_path, suffix, sidecar_label, timestamp)?;
     }
     if path_is_occupied(primary_path) {
@@ -19066,6 +19304,12 @@ fn quarantine_reconstructed_candidate(
     if !path_is_occupied(primary_path) {
         return Ok(None);
     }
+    if sqlite_family_carries_franken_namespace(primary_path) {
+        return Err(SqlError::Custom(format!(
+            "refusing to quarantine occupied replacement {} with FrankenSQLite namespace authority during rollback; preserving both generations",
+            primary_path.display()
+        )));
+    }
 
     let quarantined = sqlite_path_with_file_name_suffix(
         primary_path,
@@ -19134,6 +19378,12 @@ fn restore_quarantined_sidecar(
     live_os.push(suffix);
     let live_path = PathBuf::from(live_os);
     if path_is_occupied(&live_path) {
+        if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.contains(&suffix) {
+            return Err(SqlError::Custom(format!(
+                "newly appeared FrankenSQLite namespace destination {} may have a live owner; preserving it and the quarantined original",
+                live_path.display()
+            )));
+        }
         let live_metadata = std::fs::symlink_metadata(&live_path).map_err(|error| {
             SqlError::Custom(format!(
                 "failed to inspect newly appeared sidecar {} before restoring the original: {error}",
@@ -19212,6 +19462,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     storage_root: &Path,
     capture_forensics: bool,
     salvage_existing: bool,
+    initializing_owner: Option<&InitializingPoolOwner>,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     // #219: block new in-process writers and give in-flight ones a bounded
     // window to drain before touching the live file. Reentrant: the
@@ -19256,8 +19507,14 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
             )));
         }
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-        return reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp)
-            .map_err(|failure| failure.error);
+        return reconstruct_archive_into_candidate(
+            primary_path,
+            storage_root,
+            None,
+            &timestamp,
+            initializing_owner,
+        )
+        .map_err(|failure| failure.error);
     }
 
     if let Err(err) = wal_checkpoint_truncate_path(primary_path) {
@@ -19278,8 +19535,14 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     // canonical probe; probing the live inode here would reintroduce the
     // process-wide fcntl lock-erasure hazard this recovery path is avoiding.
     let live_salvage_db_path = salvage_existing.then_some(primary_path);
-    reconstruct_archive_into_candidate(primary_path, storage_root, live_salvage_db_path, &timestamp)
-        .map_err(|failure| failure.error)
+    reconstruct_archive_into_candidate(
+        primary_path,
+        storage_root,
+        live_salvage_db_path,
+        &timestamp,
+        initializing_owner,
+    )
+    .map_err(|failure| failure.error)
 }
 
 /// Coalescing window for back-to-back archive-salvage reconstructions.
@@ -19472,9 +19735,16 @@ fn reconstruct_sqlite_file_with_archive_salvage_uncached(
     primary_path: &Path,
     storage_root: &Path,
     outcome_policy: RecoveryAdmissionOutcomePolicy,
+    initializing_owner: Option<&InitializingPoolOwner>,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     let operation = || {
-        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true, true)
+        reconstruct_sqlite_file_with_archive_salvage_inner(
+            primary_path,
+            storage_root,
+            true,
+            true,
+            initializing_owner,
+        )
     };
     // A reconstruct of a MISSING or unhealthy primary is a recovery: its
     // outcome feeds the durable breaker so repeated failures back off. A
@@ -19521,6 +19791,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
         primary_path,
         storage_root,
         RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
+        None,
     )
 }
 
@@ -19532,6 +19803,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
 /// candidate that fails its integrity check) is reported to the caller and
 /// never recorded as a recovery failure, because the live database stays
 /// authoritative and keeps serving (br-plksu, br-bgwj1).
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
 fn reconstruct_archive_drift_of_healthy_primary(
     primary_path: &Path,
@@ -19541,6 +19813,7 @@ fn reconstruct_archive_drift_of_healthy_primary(
         primary_path,
         storage_root,
         RecoveryAdmissionOutcomePolicy::GuardMutationOnly,
+        None,
     )
 }
 
@@ -19549,6 +19822,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_with_policy(
     primary_path: &Path,
     storage_root: &Path,
     outcome_policy: RecoveryAdmissionOutcomePolicy,
+    initializing_owner: Option<&InitializingPoolOwner>,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     validate_sqlite_target_path(primary_path, "archive salvage reconstruction target")?;
     validate_archive_salvage_storage_root(primary_path, storage_root)?;
@@ -19569,6 +19843,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_with_policy(
                     primary_path,
                     storage_root,
                     outcome_policy,
+                    initializing_owner,
                 );
             }
             Err(error) => {
@@ -19581,6 +19856,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_with_policy(
                     primary_path,
                     storage_root,
                     outcome_policy,
+                    initializing_owner,
                 );
             }
         }
@@ -19601,6 +19877,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_with_policy(
         primary_path,
         storage_root,
         outcome_policy,
+        initializing_owner,
     )
 }
 
@@ -20019,6 +20296,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         storage_root,
         false,
         true,
+        None,
     ) {
         Ok(stats) => {
             if had_primary && stats.projects == 0 && stats.agents == 0 && stats.messages == 0 {
@@ -29881,6 +30159,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pool_acquire_uses_explicit_storage_root_for_archive_reconcile() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -29922,11 +30201,62 @@ mod tests {
                     ..Default::default()
                 };
                 let pool = DbPool::new(&config).unwrap();
+                let competing = DbPool::new(&config).expect("competing unopened pool");
+                let old_allocator = pool.message_id_allocator();
+                assert!(Arc::ptr_eq(
+                    &old_allocator,
+                    &competing.message_id_allocator()
+                ));
+                assert!(
+                    !db_path.exists(),
+                    "first acquire must perform recovery itself"
+                );
                 let rt = RuntimeBuilder::current_thread().build().unwrap();
                 let cx = Cx::for_testing();
                 rt.block_on(async {
-                    let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+                    let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+                    let rows = conn
+                        .query_sync("SELECT id, subject, body_md FROM messages", &[])
+                        .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
+                    assert_eq!(rows[0].get_named::<String>("subject").unwrap(), "First");
+                    assert!(
+                        rows[0]
+                            .get_named::<String>("body_md")
+                            .unwrap()
+                            .contains("first body")
+                    );
+                    drop(conn);
+                    let generation = crate::queries::db_generation_id(&cx, &pool)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .expect("published generation");
+                    assert_ne!(generation, "");
+                    assert!(
+                        !pool.is_closed(),
+                        "the actual initializer survives its promotion"
+                    );
+                    assert!(
+                        competing.is_closed(),
+                        "an unopened competitor gets no exemption"
+                    );
+                    assert!(matches!(competing.acquire(&cx).await, Outcome::Err(_)));
+                    assert!(old_allocator.is_retired());
+                    assert!(!Arc::ptr_eq(&old_allocator, &pool.message_id_allocator()));
+                    assert_eq!(
+                        pool.message_id_allocator()
+                            .archive_seed(&cx, &configured_storage_root)
+                            .await
+                            .into_result()
+                            .unwrap(),
+                        1
+                    );
                 });
+                crate::forensics::verify_recovery_receipt_state(&configured_storage_root, &db_path)
+                    .expect("real archive reconstruction has a consistent durable receipt");
+                assert!(!wrong_storage_root.join("projects").exists());
 
                 let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
                 let rows = conn
@@ -29940,6 +30270,195 @@ mod tests {
                 assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 1);
             },
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn initializing_recovery_owner_is_exact_and_abandoned_adoption_closes() {
+        for case in [
+            "completed",
+            "dropped_future",
+            "activation_failure",
+            "opened_owner",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("handoff.sqlite3");
+            let candidate = dir.path().join("candidate.sqlite3");
+            let storage = dir.path().join("archive");
+            std::fs::create_dir_all(&storage).unwrap();
+            let config = DbPoolConfig {
+                database_url: sqlite_url_from_path(&primary),
+                storage_root: Some(storage.clone()),
+                min_connections: 0,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let cx = Cx::for_testing();
+            let old = DbPool::new(&config).unwrap();
+            runtime.block_on(async {
+                let conn = old.acquire(&cx).await.into_result().unwrap();
+                conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL); INSERT INTO marker VALUES('old-live');").unwrap();
+            });
+            let unopened = DbPool::new(&config).unwrap();
+            let competing = DbPool::new(&config).unwrap();
+            let selected = if case == "opened_owner" {
+                &old
+            } else {
+                &unopened
+            };
+            let previous = selected.message_id_allocator();
+            let gate = Arc::new(SqliteInitGate::new());
+            assert!(matches!(
+                gate.claim_or_wait(Duration::ZERO),
+                SqliteInitGateClaim::Initialize
+            ));
+            let mut owner = InitializingPoolOwner {
+                pool: Arc::clone(&selected.pool),
+                state: Arc::clone(&selected.message_id_state),
+                cache_generation: selected.engine_generation,
+                sqlite_identity: selected.sqlite_identity.clone().unwrap(),
+                storage_root_identity: selected.storage_root.clone(),
+                gate: Arc::clone(&gate),
+                adopted: AtomicBool::new(false),
+                completed: false,
+            };
+            write_marker_db(&candidate, "new-published");
+            let before = std::fs::read(&primary).unwrap();
+            #[cfg(unix)]
+            let namespace_before = {
+                use std::os::unix::fs::MetadataExt;
+                FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.map(|suffix| {
+                    let metadata =
+                        std::fs::metadata(sqlite_sidecar_path(&primary, suffix)).unwrap();
+                    (suffix, metadata.dev(), metadata.ino(), metadata.len())
+                })
+            };
+            let finalize: fn(
+                &crate::forensics::PreparedRecoveryReceipt,
+            )
+                -> Result<(), crate::forensics::RecoveryReceiptFinalizeError> =
+                if case == "activation_failure" {
+                    crate::forensics::finalize_recovery_receipt_with_injected_pre_rename_failure
+                } else {
+                    crate::forensics::finalize_recovery_receipt
+                };
+            let result = promote_recovery_candidate_for_initializing_owner(
+                &primary,
+                &candidate,
+                &storage,
+                "20261028_000000_000",
+                crate::write_barrier::writer_drain_timeout(),
+                finalize,
+                Some(&owner),
+            );
+            if case == "activation_failure" {
+                let failure = result.expect_err("real receipt publication failure must propagate");
+                assert!(!failure.finalized_receipt_committed);
+                assert!(!owner.adopted.load(Ordering::Acquire));
+                assert!(!previous.is_retired());
+                assert!(!old.is_closed());
+                assert!(!unopened.is_closed());
+                assert!(!competing.is_closed());
+                assert_eq!(std::fs::read(&primary).unwrap(), before);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    for (suffix, device, inode, length) in namespace_before {
+                        let metadata =
+                            std::fs::metadata(sqlite_sidecar_path(&primary, suffix)).unwrap();
+                        assert_eq!(
+                            (metadata.dev(), metadata.ino(), metadata.len()),
+                            (device, inode, length)
+                        );
+                    }
+                }
+                // The retained live owner can still have committed frames in
+                // WAL. An immutable main-file diagnostic deliberately ignores
+                // them; use the actual runtime connection for this assertion.
+                runtime.block_on(async {
+                    let conn = old.acquire(&cx).await.into_result().unwrap();
+                    let rows = conn.query_sync("SELECT value FROM marker", &[]).unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].get_named::<String>("value").unwrap(), "old-live");
+                });
+                assert_eq!(
+                    sqlite_marker_value(&candidate).as_deref(),
+                    Some("new-published")
+                );
+                drop(owner);
+                assert!(
+                    !unopened.is_closed(),
+                    "failed promotion grants no exemption to clean up"
+                );
+                continue;
+            }
+            result.expect("real candidate promotion");
+            assert_eq!(
+                sqlite_marker_value(&primary).as_deref(),
+                Some("new-published")
+            );
+            crate::forensics::verify_recovery_receipt_state(&storage, &primary).unwrap();
+            assert!(old.is_closed(), "older live owners always retire");
+            assert!(competing.is_closed(), "other unopened owners also retire");
+            assert!(previous.is_retired());
+            if case == "opened_owner" {
+                assert!(!owner.adopted.load(Ordering::Acquire));
+                assert!(unopened.is_closed());
+                continue;
+            }
+            assert!(owner.adopted.load(Ordering::Acquire));
+            assert!(!unopened.is_closed());
+            assert!(!Arc::ptr_eq(&previous, &unopened.message_id_allocator()));
+            assert!(!unopened.message_id_allocator().is_retired());
+            if case == "dropped_future" {
+                // Poll a real owning future to its suspension point, then
+                // cancel it by dropping it. Neither completion guard may leak.
+                let future_gate = Arc::clone(&gate);
+                let mut future = Box::pin(async move {
+                    let _owner = owner;
+                    let _completion = SqliteInitGateCompletion {
+                        gate: &future_gate,
+                        success: false,
+                    };
+                    std::future::pending::<()>().await;
+                });
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(future.as_mut(), &mut context).is_pending());
+                drop(future);
+                assert!(
+                    unopened.is_closed(),
+                    "cancelled initialization retires its adopted pool"
+                );
+                assert!(matches!(
+                    gate.claim_or_wait(Duration::ZERO),
+                    SqliteInitGateClaim::Initialize
+                ));
+                assert_eq!(
+                    sqlite_marker_value(&primary).as_deref(),
+                    Some("new-published")
+                );
+                crate::forensics::verify_recovery_receipt_state(&storage, &primary).unwrap();
+            } else {
+                owner.completed = true;
+                drop(owner);
+                assert!(
+                    !unopened.is_closed(),
+                    "successful initialization retains its new generation"
+                );
+            }
+            assert!(matches!(
+                runtime.block_on(old.acquire(&cx)),
+                Outcome::Err(_)
+            ));
+            assert!(matches!(
+                runtime.block_on(competing.acquire(&cx)),
+                Outcome::Err(_)
+            ));
+        }
     }
 
     /// Verify corruption detection recognizes known error messages.
@@ -31570,6 +32089,17 @@ mod tests {
         std::fs::write(&wal, b"wal").expect("write wal");
         std::fs::write(&shm, b"shm").expect("write shm");
 
+        let remaining = [
+            "-wal-cert",
+            "-wal-cert-head",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+        ];
+        for suffix in remaining {
+            std::fs::write(sqlite_sidecar_path(&primary, suffix), suffix.as_bytes()).unwrap();
+            quarantine_sidecar(&primary, suffix, "20260218_120000_000").unwrap();
+        }
+
         std::fs::rename(&primary, &quarantined).expect("quarantine primary");
         quarantine_sidecar(&primary, "-journal", "20260218_120000_000")
             .expect("quarantine journal");
@@ -31583,6 +32113,48 @@ mod tests {
         assert_eq!(std::fs::read(&journal).unwrap(), b"journal");
         assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
         assert_eq!(std::fs::read(&shm).unwrap(), b"shm");
+        for suffix in remaining {
+            assert_eq!(
+                std::fs::read(sqlite_sidecar_path(&primary, suffix)).unwrap(),
+                suffix.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_preserves_newly_occupied_namespace_authority() {
+        for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("mail.sqlite3");
+            let live = sqlite_sidecar_path(&primary, suffix);
+            let retained =
+                quarantined_sidecar_path(&primary, suffix, "corrupt", "20261028_000000_000");
+            std::fs::write(&live, b"possibly-live-owner").unwrap();
+            std::fs::write(&retained, b"original-owner").unwrap();
+            let error =
+                restore_quarantined_sidecar(&primary, suffix, "corrupt", "20261028_000000_000")
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("may have a live owner"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&live).unwrap(), b"possibly-live-owner");
+            assert_eq!(std::fs::read(&retained).unwrap(), b"original-owner");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+
+            std::fs::write(&primary, b"replacement-generation").unwrap();
+            let error = quarantine_reconstructed_candidate(
+                &primary,
+                "20261028_000000_000",
+                "rollback-check",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("namespace authority"), "{error}");
+            assert_eq!(std::fs::read(&primary).unwrap(), b"replacement-generation");
+            assert_eq!(std::fs::read(&live).unwrap(), b"possibly-live-owner");
+            assert_eq!(std::fs::read(&retained).unwrap(), b"original-owner");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+        }
     }
 
     #[test]
