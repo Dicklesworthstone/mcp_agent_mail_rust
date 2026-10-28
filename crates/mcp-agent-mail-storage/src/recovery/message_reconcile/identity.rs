@@ -68,9 +68,13 @@ fn committed_path_entry(
     let mut components = relative.split('/').peekable();
     if Path::new(relative).is_absolute()
         || relative.contains(['\\', '\0'])
-        || components.clone().any(|name| matches!(name, "" | "." | ".."))
+        || components
+            .clone()
+            .any(|name| matches!(name, "" | "." | ".."))
     {
-        return Err(invalid("committed canonical path is not a relative Git path"));
+        return Err(invalid(
+            "committed canonical path is not a relative Git path",
+        ));
     }
     let Some(root) = tree else {
         return Ok(None);
@@ -412,15 +416,8 @@ mod tests {
             let empty = repo.treebuilder(None).unwrap().write().unwrap();
             let tree = repo.find_tree(empty).unwrap();
             let signature = git2::Signature::now("recovery", "recovery@example.invalid").unwrap();
-            repo.commit(
-                None,
-                &signature,
-                &signature,
-                "gitlink witness",
-                &tree,
-                &[],
-            )
-            .unwrap()
+            repo.commit(None, &signature, &signature, "gitlink witness", &tree, &[])
+                .unwrap()
         } else {
             repo.blob(b"retained committed ancestor evidence").unwrap()
         };
@@ -466,7 +463,9 @@ mod tests {
             // This native error is exactly why a blanket NotFound => absent
             // conversion is insufficient, even with a fully readable ODB.
             assert_eq!(
-                tree.get_path(Path::new(path)).err().map(|error| error.code()),
+                tree.get_path(Path::new(path))
+                    .err()
+                    .map(|error| error.code()),
                 Some(ErrorCode::NotFound)
             );
             let error = committed_path_entry(&repo, Some(&tree), path, &budget)
@@ -661,8 +660,7 @@ mod tests {
             proof.namespace_tree.is_none(),
             "fixture begins without committed messages"
         );
-        let ancestor =
-            crate::rel_path_cached(&archive.canonical_repo_root, &archive.root).unwrap();
+        let ancestor = crate::rel_path_cached(&archive.canonical_repo_root, &archive.root).unwrap();
         let (before, _) = commit_ancestor(&repo, &ancestor, 0o100644);
         let error = revalidate_prepared(&repo, &archive, &proof, true, &mut budget).unwrap_err();
         assert!(
