@@ -7147,22 +7147,29 @@ mod tests {
         for enabled in [true, false] {
             let tmp = tempfile::tempdir().expect("ack identity outage fixture");
             let root = tmp.path().canonicalize().expect("canonical fixture root");
-            let blocked_parent = root.join("database-parent-is-a-file");
-            std::fs::write(&blocked_parent, b"blocked database parent").expect("block database");
             let unavailable_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
-                &blocked_parent.join("mailbox.sqlite3"),
+                &root.join("occupied-mailbox.sqlite3"),
             );
             let archive = root.join("archive");
             mcp_agent_mail_core::config::with_process_env_overrides_for_test(
                 &[
                     ("DATABASE_URL", &unavailable_url),
                     ("STORAGE_ROOT", archive.to_str().unwrap()),
+                    ("DATABASE_POOL_SIZE", "1"),
+                    ("DATABASE_MAX_OVERFLOW", "0"),
+                    ("DATABASE_POOL_TIMEOUT", "1"),
                     (
                         "MESSAGING_SESSION_IDENTITY",
                         if enabled { "true" } else { "false" },
                     ),
                 ],
                 || {
+                    let outage_config = DbPoolConfig::from_env();
+                    let storage_root = outage_config.resolved_storage_root();
+                    assert_eq!(storage_root, archive);
+                    // Freeze the private archive authority before the configured
+                    // pool is cached; later directory creation changes its key.
+                    std::fs::create_dir_all(&storage_root).expect("private outage archive root");
                     let pool = DbPool::new(&DbPoolConfig {
                         database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
                             &root.join("live.sqlite3"),
@@ -7186,6 +7193,55 @@ mod tests {
                             &[(alice.id.unwrap(), "cc"), (bob.id.unwrap(), "to")],
                         )
                         .await;
+                        // A valid mailbox remains authoritative; the only
+                        // unavailable resource is its sole checked-out slot.
+                        assert_eq!(outage_config.min_connections, 1);
+                        assert_eq!(outage_config.max_connections, 1);
+                        assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                        let outage_pool = get_db_pool().expect("healthy configured mailbox");
+                        assert_ne!(outage_pool.sqlite_path(), pool.sqlite_path());
+                        let outage_engine = outage_pool.engine_identity_key();
+                        assert_eq!(
+                            mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+                                .expect("configured outage pool must already be cached")
+                                .engine_identity_key(),
+                            outage_engine
+                        );
+                        let occupied = outage_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("occupy the only configured slot");
+                        let source_rows = occupied
+                            .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                            .expect("configured mailbox has a real migrated schema");
+                        assert_eq!(source_rows[0].get_named::<i64>("n").unwrap(), 0);
+                        let probe_key = format!("{}-capacity-preflight", outage_pool.sqlite_path());
+                        let error = match queries::get_project_by_human_key_exact(
+                            &cx,
+                            &outage_pool,
+                            &probe_key,
+                        )
+                        .await
+                        {
+                            Outcome::Err(error) => error,
+                            Outcome::Ok(_) => {
+                                panic!("empty configured mailbox cannot cache the probe project")
+                            }
+                            Outcome::Cancelled(_) => panic!("outage probe was cancelled"),
+                            Outcome::Panicked(_) => panic!("outage probe panicked"),
+                        };
+                        assert_eq!(
+                            error.classification().class,
+                            mcp_agent_mail_db::DbErrorClass::PoolExhaustion
+                        );
+                        assert!(db_error_supports_ack_intent(&error));
+                        assert_eq!(
+                            mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+                                .expect("occupied outage pool must remain cached")
+                                .engine_identity_key(),
+                            outage_engine
+                        );
                         let bound = McpContext::with_state(
                             cx.clone(),
                             1,
@@ -7220,10 +7276,9 @@ mod tests {
                                         mcp_error_supports_ack_intent(&error),
                                         "preserve database error: {error}"
                                     );
-                                    assert!(
-                                        mcp_error_cause(&error)
-                                            .contains(blocked_parent.to_str().unwrap())
-                                    );
+                                    assert!(mcp_agent_mail_db::is_pool_exhausted_error(
+                                        &mcp_error_cause(&error)
+                                    ));
                                     assert_eq!(
                                         crate::degraded_intents::read_queued_ack_intents(&config)
                                             .unwrap(),
@@ -7308,6 +7363,16 @@ mod tests {
                         .into_result()
                         .expect("replayed recipient state");
                         assert!(state[0].ack_ts.is_some());
+                        drop(occupied);
+                        let recovered = outage_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("releasing the checkout restores the configured mailbox");
+                        let recovered_rows = recovered
+                            .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                            .expect("recovered source remains readable");
+                        assert_eq!(recovered_rows[0].get_named::<i64>("n").unwrap(), 0);
                     });
                 },
             );
@@ -7443,11 +7508,9 @@ mod tests {
         let _lock = MESSAGING_THREAD_ID_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = tempfile::tempdir().expect("unavailable database fixture");
+        let tmp = tempfile::tempdir().expect("occupied database fixture");
         let fixture_root = tmp.path().canonicalize().expect("canonical fixture root");
-        let blocked_parent = fixture_root.join("database-parent-is-a-file");
-        std::fs::write(&blocked_parent, b"unavailable database parent").expect("blocked parent");
-        let unavailable_database = blocked_parent.join("mailbox.sqlite3");
+        let unavailable_database = fixture_root.join("occupied-mailbox.sqlite3");
         let unavailable_url =
             mcp_agent_mail_core::disk::sqlite_url_from_path(&unavailable_database);
         let archive = fixture_root.join("archive");
@@ -7456,8 +7519,17 @@ mod tests {
             &[
                 ("DATABASE_URL", &unavailable_url),
                 ("STORAGE_ROOT", archive.to_str().expect("archive path")),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("DATABASE_POOL_TIMEOUT", "1"),
             ],
             || {
+                let outage_config = DbPoolConfig::from_env();
+                let storage_root = outage_config.resolved_storage_root();
+                assert_eq!(storage_root, archive);
+                // Establish the complete private directory authority before
+                // bootstrap so re-entry tests checkout exhaustion on this pool.
+                std::fs::create_dir_all(&storage_root).expect("private outage archive root");
                 let cfg = DbPoolConfig {
                     database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&live_database),
                     ..DbPoolConfig::default()
@@ -7515,23 +7587,65 @@ mod tests {
                     };
 
                     let ctx = McpContext::new(cx.clone(), 1);
-                    // Pool construction is lazy: the filesystem obstruction
-                    // must surface on the first connection acquire, which the
-                    // public tool performs while resolving its project.
-                    let unavailable_pool = get_db_pool().expect("construct lazy unavailable pool");
-                    assert_eq!(Path::new(unavailable_pool.sqlite_path()), unavailable_database);
-                    let unavailable_error = match unavailable_pool.acquire(&cx).await {
-                        Outcome::Err(error) => error.to_string(),
-                        Outcome::Ok(_) => panic!("a file cannot serve as the database parent directory"),
+                    assert_eq!(outage_config.min_connections, 1);
+                    assert_eq!(outage_config.max_connections, 1);
+                    assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                    let unavailable_pool = get_db_pool().expect("healthy configured mailbox");
+                    assert_eq!(
+                        Path::new(unavailable_pool.sqlite_path()),
+                        unavailable_database
+                    );
+                    assert_ne!(unavailable_pool.sqlite_path(), pool.sqlite_path());
+                    let outage_engine = unavailable_pool.engine_identity_key();
+                    assert_eq!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+                            .expect("configured outage pool must already be cached")
+                            .engine_identity_key(),
+                        outage_engine
+                    );
+                    let occupied = unavailable_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("occupy the only configured slot");
+                    let source_rows = occupied
+                        .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                        .expect("configured mailbox has a real migrated schema");
+                    assert_eq!(source_rows[0].get_named::<i64>("n").unwrap(), 0);
+                    let probe_key =
+                        format!("{}-capacity-preflight", unavailable_pool.sqlite_path());
+                    let unavailable_error = match queries::get_project_by_human_key_exact(
+                        &cx,
+                        &unavailable_pool,
+                        &probe_key,
+                    )
+                    .await
+                    {
+                        Outcome::Err(error) => error,
+                        Outcome::Ok(_) => {
+                            panic!("empty configured mailbox cannot cache the probe project")
+                        }
                         Outcome::Cancelled(_) => panic!("outage probe was cancelled"),
                         Outcome::Panicked(_) => panic!("outage probe panicked"),
                     };
-                    assert!(unavailable_error.contains(blocked_parent.to_str().unwrap()),
-                        "connection failure must name the obstructed database path: {unavailable_error}");
-                    assert!(!unavailable_database.exists());
-                    drop(unavailable_pool);
+                    assert_eq!(
+                        unavailable_error.classification().class,
+                        mcp_agent_mail_db::DbErrorClass::PoolExhaustion
+                    );
+                    assert!(db_error_supports_ack_intent(&unavailable_error));
+                    assert_eq!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+                            .expect("occupied outage pool must remain cached")
+                            .engine_identity_key(),
+                        outage_engine
+                    );
+                    assert!(
+                        std::fs::symlink_metadata(&unavailable_database)
+                            .unwrap()
+                            .is_file()
+                    );
                     // These are actual tool calls with a genuinely unavailable
-                    // configured DB path. Recovery below uses the independently
+                    // configured pool. Replay below uses the independently
                     // seeded live mailbox, without an unkeyed fallback or stub.
                     for (agent, message_id) in [
                         (&recipient.name, second_id),
@@ -7560,14 +7674,21 @@ mod tests {
                         .expect("queued requests");
                     assert_eq!(queued.len(), 3);
                     for intent in &queued {
-                        assert_eq!(intent.failure.stage, "resolve_project");
-                        assert!(intent.failure.error_detail.contains(blocked_parent.to_str().unwrap()),
-                            "queued failure must be caused by the same filesystem obstruction: {}",
-                            intent.failure.error_detail);
+                        assert_eq!(
+                            intent.failure.stage, "resolve_project",
+                            "queued failure detail: {}",
+                            intent.failure.error_detail
+                        );
+                        assert!(
+                            mcp_agent_mail_db::is_pool_exhausted_error(
+                                &intent.failure.error_detail
+                            ),
+                            "queued failure must be caused by actual pool exhaustion"
+                        );
                         assert_eq!(
                             intent.idempotency,
                             Some(ack_retry_claim(&intent.agent_name, intent.message_id, KEY)),
-                            "connection-open failure must preserve the normalized original retry claim"
+                            "pool-acquire failure must preserve the normalized original retry claim"
                         );
                     }
                     replay_queued_ack_intents(&ctx, &pool, &config).await;
@@ -7647,14 +7768,24 @@ mod tests {
                     assert!(!serde_json::to_string(&markers).unwrap().contains(KEY));
                     replay_queued_ack_intents(&ctx, &pool, &config).await;
                     assert_eq!(std::fs::read_to_string(log).unwrap(), before_repeat);
+                    drop(occupied);
+                    let recovered = unavailable_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("releasing the checkout restores the configured mailbox");
+                    let recovered_rows = recovered
+                        .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                        .expect("recovered source remains readable");
+                    assert_eq!(recovered_rows[0].get_named::<i64>("n").unwrap(), 0);
                 });
             },
         );
-        assert_eq!(
-            std::fs::read(blocked_parent).unwrap(),
-            b"unavailable database parent"
+        assert!(
+            std::fs::symlink_metadata(&unavailable_database)
+                .unwrap()
+                .is_file()
         );
-        assert!(!unavailable_database.exists());
     }
 
     #[test]

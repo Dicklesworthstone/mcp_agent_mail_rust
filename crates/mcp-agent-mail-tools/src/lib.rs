@@ -771,18 +771,37 @@ pub mod tool_util {
                     }),
                 ),
             ),
-            DbError::Sqlite(message) | DbError::Schema(message) => legacy_tool_error(
-                "DATABASE_ERROR",
-                "A database error occurred. This may be a transient issue - try again.",
-                true,
-                db_error_data(
-                    classification,
-                    &failure_envelope,
-                    json!({
-                        "error_detail": message,
-                    }),
-                ),
-            ),
+            DbError::Sqlite(message) | DbError::Schema(message) => {
+                // Query helpers preserve the driver text in Sqlite/Schema
+                // errors. Keep its already-known pool classification in the
+                // wire code; do not change the classifier or retry policy.
+                // Earlier corruption/FD/lock cases retain their precedence.
+                let (error_type, display) = if classification.class
+                    == mcp_agent_mail_db::DbErrorClass::PoolExhaustion
+                {
+                    (
+                        "DATABASE_POOL_EXHAUSTED",
+                        "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
+                    )
+                } else {
+                    (
+                        "DATABASE_ERROR",
+                        "A database error occurred. This may be a transient issue - try again.",
+                    )
+                };
+                legacy_tool_error(
+                    error_type,
+                    display,
+                    true,
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                        }),
+                    ),
+                )
+            }
             DbError::Serialization(message) => {
                 // Python-parity hint selection based on error content
                 let hint = if message.contains("got an unexpected keyword argument") {
@@ -1340,6 +1359,7 @@ pub mod tool_util {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let index = cache
             .iter()
+            // ubs:ignore — cache generation metadata (path, Git OID and epoch), not an authentication secret.
             .position(|entry| entry.signature == *signature)?;
         let entry = cache.remove(index)?;
         let inventory = entry.inventory.clone();
@@ -1355,6 +1375,7 @@ pub mod tool_util {
         let mut cache = READ_ARCHIVE_INVENTORY_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // ubs:ignore — canonical filesystem paths select cache entries; no secret is compared.
         cache.retain(|entry| entry.signature.storage_root != signature.storage_root);
         cache.push_back(ReadArchiveInventoryCacheEntry {
             signature,
@@ -1382,6 +1403,7 @@ pub mod tool_util {
         // the full scan; a concurrent writer otherwise gets the conservative
         // uncached behavior on this and subsequent reads.
         let inventory = scan_read_archive_inventory(storage_root);
+        // ubs:ignore — archive generation metadata detects concurrent changes; it is not a cryptographic signature.
         if clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before) {
             cache_read_archive_inventory(signature_before, &inventory);
         }
@@ -2665,6 +2687,32 @@ body
             assert_eq!(data["error"]["type"], "DATABASE_POOL_EXHAUSTED");
             assert_eq!(data["error"]["data"]["pool_size"], 10);
             assert_eq!(data["error"]["data"]["max_overflow"], 5);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_keeps_classified_query_pool_exhaustion() {
+            for error in [
+                DbError::Sqlite("QueuePool limit reached".into()),
+                DbError::Schema("QueuePool limit reached".into()),
+            ] {
+                let classification = error.classification();
+                assert_eq!(
+                    classification.class,
+                    mcp_agent_mail_db::DbErrorClass::PoolExhaustion
+                );
+                let data = db_error_to_mcp_error(error)
+                    .data
+                    .expect("classified pool envelope");
+                assert_eq!(data["error"]["type"], "DATABASE_POOL_EXHAUSTED");
+                assert_eq!(
+                    data["error"]["data"]["db_error_classification"]["class"],
+                    "pool_exhaustion"
+                );
+                assert_eq!(
+                    data["error"]["data"]["error_detail"],
+                    "QueuePool limit reached"
+                );
+            }
         }
 
         #[test]

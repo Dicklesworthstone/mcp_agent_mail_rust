@@ -7740,22 +7740,29 @@ mod tests {
     fn release_outage_cannot_queue_unresolved_session_actors() {
         for enabled in [true, false] {
             let tmp = tempfile::tempdir().expect("release identity outage fixture");
-            let blocked_parent = tmp.path().join("database-parent-is-a-file");
-            std::fs::write(&blocked_parent, b"blocked database parent").expect("block database");
             let unavailable_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
-                &blocked_parent.join("mailbox.sqlite3"),
+                &tmp.path().join("occupied-mailbox.sqlite3"),
             );
             crate::test_support::with_isolated_mailbox(
                 &RESERVATION_TEST_LOCK,
                 "release-identity-outage",
                 &[
                     ("DATABASE_URL", &unavailable_url),
+                    ("DATABASE_POOL_SIZE", "1"),
+                    ("DATABASE_MAX_OVERFLOW", "0"),
+                    ("DATABASE_POOL_TIMEOUT", "1"),
                     (
                         "MESSAGING_SESSION_IDENTITY",
                         if enabled { "true" } else { "false" },
                     ),
                 ],
                 |mailbox| {
+                    let outage_config = mcp_agent_mail_db::DbPoolConfig::from_env();
+                    let storage_root = outage_config.resolved_storage_root();
+                    assert_eq!(storage_root, mailbox.storage_root);
+                    // The helper already creates this root. Require its exact
+                    // private authority before constructing either mailbox pool.
+                    std::fs::create_dir_all(&storage_root).expect("private outage archive root");
                     let pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
                         database_url: mailbox.database_url.clone(),
                         ..mcp_agent_mail_db::DbPoolConfig::default()
@@ -7788,6 +7795,57 @@ mod tests {
                         )
                         .await;
                         let ids = [alice_lease.id.unwrap(), bob_lease.id.unwrap()];
+                        assert_eq!(outage_config.min_connections, 1);
+                        assert_eq!(outage_config.max_connections, 1);
+                        assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                        let outage_pool = get_db_pool().expect("healthy configured mailbox");
+                        assert_ne!(outage_pool.sqlite_path(), pool.sqlite_path());
+                        let outage_engine = outage_pool.engine_identity_key();
+                        assert_eq!(
+                            mcp_agent_mail_db::get_cached_pool(
+                                &mcp_agent_mail_db::DbPoolConfig::from_env(),
+                            )
+                            .expect("configured outage pool must already be cached")
+                            .engine_identity_key(),
+                            outage_engine
+                        );
+                        let occupied = outage_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("occupy the only configured slot");
+                        let source_rows = occupied
+                            .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                            .expect("configured mailbox has a real migrated schema");
+                        assert_eq!(source_rows[0].get_named::<i64>("n").unwrap(), 0);
+                        let probe_key = format!("{}-capacity-preflight", outage_pool.sqlite_path());
+                        let error = match queries::get_project_by_human_key_exact(
+                            &cx,
+                            &outage_pool,
+                            &probe_key,
+                        )
+                        .await
+                        {
+                            Outcome::Err(error) => error,
+                            Outcome::Ok(_) => {
+                                panic!("empty configured mailbox cannot cache the probe project")
+                            }
+                            Outcome::Cancelled(_) => panic!("outage probe was cancelled"),
+                            Outcome::Panicked(_) => panic!("outage probe panicked"),
+                        };
+                        assert_eq!(
+                            error.classification().class,
+                            mcp_agent_mail_db::DbErrorClass::PoolExhaustion
+                        );
+                        assert!(db_error_supports_release_intent(&error));
+                        assert_eq!(
+                            mcp_agent_mail_db::get_cached_pool(
+                                &mcp_agent_mail_db::DbPoolConfig::from_env(),
+                            )
+                            .expect("occupied outage pool must remain cached")
+                            .engine_identity_key(),
+                            outage_engine
+                        );
                         let bound = McpContext::with_state(
                             cx.clone(),
                             1,
@@ -7798,6 +7856,10 @@ mod tests {
                             project_id,
                             alice.id.unwrap(),
                             &alice.name,
+                        );
+                        assert_eq!(
+                            crate::session_identity::session_bindings(&bound).is_empty(),
+                            !enabled
                         );
                         let config = Config::get();
                         for (agent, lease) in [(&alice, &alice_lease), (&bob, &bob_lease)] {
@@ -7821,6 +7883,14 @@ mod tests {
                                     assert!(
                                         mcp_error_supports_release_intent(&error),
                                         "original DB error: {error}"
+                                    );
+                                    assert_eq!(
+                                        crate::tool_error_code(&error),
+                                        Some("DATABASE_POOL_EXHAUSTED"),
+                                        "the occupied configured pool must remain the cause: {error}; detail={:?}",
+                                        error.data.as_ref().and_then(
+                                            |data| data.pointer("/error/data/error_detail")
+                                        )
                                     );
                                     assert_eq!(
                                         read_queued_release_intents(&config).unwrap(),
@@ -7896,6 +7966,16 @@ mod tests {
                                 .into_result()
                                 .expect("replayed Bob lease");
                         assert!(leases[0].released_ts.is_some());
+                        drop(occupied);
+                        let recovered = outage_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("releasing the checkout restores the configured mailbox");
+                        let recovered_rows = recovered
+                            .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                            .expect("recovered source remains readable");
+                        assert_eq!(recovered_rows[0].get_named::<i64>("n").unwrap(), 0);
                     });
                 },
             );
