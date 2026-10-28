@@ -615,6 +615,8 @@ fn tool_filter_allows(config: &Config, tool_name: &str) -> bool {
     tool_cluster(tool_name).is_none_or(|cluster| config.should_expose_tool(tool_name, cluster))
 }
 
+/// Every caller reads mail as this agent. Apply the same session identity
+/// restriction here so alternate mailbox views cannot bypass inbox admission.
 async fn resolve_resource_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -653,8 +655,21 @@ async fn resolve_resource_agent(
         ));
     };
 
-    match mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), pool, agent_id).await {
-        Outcome::Ok(agent) => Ok(agent),
+    // Release the name lookup before acquiring the fresh row, including for
+    // one-slot pools. Cached identity may predate a rename or reused row ID.
+    drop(conn);
+    match mcp_agent_mail_db::queries::get_agent_by_id_fresh(ctx.cx(), pool, agent_id).await {
+        Outcome::Ok(agent) => {
+            if agent.project_id != project_id || !agent.name.eq_ignore_ascii_case(&agent_name_norm)
+            {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    "Agent identity changed during resource resolution",
+                ));
+            }
+            crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
+            Ok(agent)
+        }
         Outcome::Err(err) => Err(db_error_to_mcp_error(err)),
         Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
         Outcome::Panicked(p) => Err(McpError::internal_error(format!(
@@ -3252,9 +3267,6 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_resource_agent(ctx, &pool, project_id, &agent_name).await?;
-    // GH#279 (opt-in): a session holding another identity here reads only
-    // its own inbox, as through `fetch_inbox`.
-    crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
     let agent_name = agent.name;
 
@@ -6193,6 +6205,197 @@ mod resource_shape_tests {
     /// guard) drops at the end of this statement.
     fn seed_pool() -> mcp_agent_mail_db::DbPool {
         get_db_pool().expect("db pool").clone()
+    }
+
+    fn agent_mail_resource_router() -> fastmcp_server::Router {
+        let mut router = fastmcp_server::Router::new();
+        router.add_resource(InboxResource);
+        router.add_resource(MailboxResource);
+        router.add_resource(MailboxWithCommitsResource);
+        router.add_resource(OutboxResource);
+        router.add_resource(ViewsUrgentUnreadResource);
+        router.add_resource(ViewsAckRequiredResource);
+        router.add_resource(ViewsAcksStaleResource);
+        router.add_resource(ViewsAckOverdueResource);
+        router
+    }
+
+    const AGENT_MAIL_RESOURCE_PATHS: [&str; 8] = [
+        "inbox",
+        "mailbox",
+        "mailbox-with-commits",
+        "outbox",
+        "views/urgent-unread",
+        "views/ack-required",
+        "views/acks-stale",
+        "views/ack-overdue",
+    ];
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_agent_mail_resource_enforces_session_identity_on_one_slot_pool() {
+        for enabled in [false, true] {
+            with_serialized_resources_env(
+                &[
+                    (
+                        "MESSAGING_SESSION_IDENTITY",
+                        if enabled { "true" } else { "false" },
+                    ),
+                    ("DATABASE_POOL_SIZE", "1"),
+                    ("DATABASE_MAX_OVERFLOW", "0"),
+                    ("DATABASE_POOL_TIMEOUT", "1"),
+                ],
+                || {
+                    run_async(|cx| async move {
+                        let pool = seed_pool();
+                        let project =
+                            ensure_project(&cx, &pool, "/resource-session-identity").await;
+                        let project_id = project.id.expect("project id");
+                        let own = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                        let other = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                        for (sender, recipient) in [(&own, &other), (&other, &own)] {
+                            create_message(
+                                &cx,
+                                &pool,
+                                project_id,
+                                sender.id.expect("sender id"),
+                                recipient.id.expect("recipient id"),
+                                "Private identity witness",
+                                "Private mail body",
+                                "identity-views",
+                                true,
+                            )
+                            .await;
+                        }
+                        let writer = acquire_resource_conn(&cx, &pool).await.expect("writer");
+                        writer.execute_sync(
+                            "UPDATE messages SET created_ts = created_ts - 120000000 WHERE project_id = ?",
+                            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)],
+                        ).expect("age ack-required messages");
+                        drop(writer);
+
+                        let state = fastmcp_core::SessionState::new();
+                        let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                        crate::session_identity::bind(&ctx, project_id, own.id.unwrap(), &own.name);
+                        let unbound = fastmcp_core::SessionState::new();
+                        let unbound_ctx = McpContext::with_state(cx, 2, unbound.clone());
+                        let router = agent_mail_resource_router();
+                        for path in AGENT_MAIL_RESOURCE_PATHS {
+                            for (agent, restricted) in [("bluelake", false), ("redpeak", enabled)] {
+                                let result = router.handle_resources_read(
+                                    &ctx,
+                                    &fastmcp_protocol::ReadResourceParams {
+                                        uri: format!("resource://{path}/{agent}?project={}&ttl_seconds=1&ttl_minutes=1&include_bodies=true", project.slug),
+                                        meta: None,
+                                    },
+                                    state.clone(), None, None,
+                                ).await;
+                                if restricted {
+                                    let error =
+                                        result.expect_err("borrowed identity must be refused");
+                                    assert_eq!(
+                                        crate::tool_error_code(&error),
+                                        Some("SESSION_IDENTITY_MISMATCH"),
+                                        "{path}: {error}"
+                                    );
+                                    assert!(!error.to_string().contains("Private mail body"));
+                                } else {
+                                    let payload = serde_json::to_value(
+                                        result.expect("authorized resource read"),
+                                    )
+                                    .unwrap();
+                                    let value = parse_json(
+                                        payload["contents"][0]["text"].as_str().unwrap(),
+                                    );
+                                    assert!(
+                                        value["count"].as_u64().is_some_and(|count| count > 0),
+                                        "{path}: authorized data must remain available: {value}"
+                                    );
+                                }
+                            }
+                            let result = router.handle_resources_read(
+                                &unbound_ctx,
+                                &fastmcp_protocol::ReadResourceParams {
+                                    uri: format!("resource://{path}/RedPeak?project={}&ttl_seconds=1&ttl_minutes=1", project.slug),
+                                    meta: None,
+                                },
+                                unbound.clone(), None, None,
+                            ).await.expect("unbound trusted-local behavior stays available");
+                            let payload = serde_json::to_value(result).unwrap();
+                            let value =
+                                parse_json(payload["contents"][0]["text"].as_str().unwrap());
+                            assert!(
+                                value["count"].as_u64().is_some_and(|count| count > 0),
+                                "{path}: {value}"
+                            );
+                        }
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_mail_resources_cannot_authorize_a_renamed_row_from_the_read_cache() {
+        with_serialized_resources_env(&[("MESSAGING_SESSION_IDENTITY", "true")], || {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let project = ensure_project(&cx, &pool, "/resource-renamed-identity").await;
+                let project_id = project.id.unwrap();
+                let own = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let own_id = own.id.unwrap();
+                let read_pool = get_resource_db_pool(&cx).await.unwrap();
+                let cached = queries::get_agent_by_id(&cx, &read_pool, own_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(cached.name, "BlueLake");
+                let state = fastmcp_core::SessionState::new();
+                let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                crate::session_identity::bind(&ctx, project_id, own_id, &own.name);
+                let writer = acquire_resource_conn(&cx, &pool).await.unwrap();
+                writer
+                    .execute_sync(
+                        "UPDATE agents SET name = ? WHERE id = ?",
+                        &[
+                            mcp_agent_mail_db::sqlmodel::Value::Text("RedPeak".to_string()),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(own_id),
+                        ],
+                    )
+                    .expect("rename without invalidating the stale cache");
+                drop(writer);
+                let cached = queries::get_agent_by_id(&cx, &read_pool, own_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(
+                    cached.name, "BlueLake",
+                    "the negative must exercise a genuinely stale cache entry"
+                );
+                let router = agent_mail_resource_router();
+                for path in AGENT_MAIL_RESOURCE_PATHS {
+                    let error = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://{path}/RedPeak?project={}", project.slug),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect_err("old cached identity cannot authorize the renamed agent");
+                    assert_eq!(
+                        crate::tool_error_code(&error),
+                        Some("SESSION_IDENTITY_MISMATCH"),
+                        "{path}: {error}"
+                    );
+                }
+            });
+        });
     }
 
     async fn insert_resource_project(cx: &Cx, pool: &DbPool, id: i64, slug: &str, human_key: &str) {
