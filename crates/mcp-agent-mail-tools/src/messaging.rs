@@ -6826,7 +6826,16 @@ mod tests {
         });
     }
 
-    fn assert_cancelled_coordination_requests_finish_while_admission_closed(request_local: bool) {
+    #[derive(Clone, Copy, Debug)]
+    enum AdmissionRequestEnd {
+        AmbientCancellation,
+        RequestCancellation,
+        RequestDeadline,
+    }
+
+    fn assert_cancelled_coordination_requests_finish_while_admission_closed(
+        ending: AdmissionRequestEnd,
+    ) {
         // The recovery barrier is process-wide. Keep this actual-tool test
         // separate from unrelated pool users instead of resetting global state.
         const CHILD: &str = "AM_TEST_COORDINATION_ADMISSION_CANCEL_CHILD";
@@ -6932,10 +6941,10 @@ mod tests {
             let start = Arc::new(Barrier::new(11));
             let (done_tx, done_rx) = mpsc::channel();
             let mut requests = Vec::new();
-            let mut request_cancellations = Vec::new();
+            let mut request_contexts = Vec::new();
             for operation in 0..10 {
                 let ctx = McpContext::new(request_cx.clone(), operation + 1);
-                request_cancellations.push(ctx.request_cancellation());
+                request_contexts.push(ctx.clone());
                 let start = Arc::clone(&start);
                 let done_tx = done_tx.clone();
                 requests.push(std::thread::spawn(move || {
@@ -7057,16 +7066,30 @@ mod tests {
             start.wait();
             let before_cancel = done_rx.recv_timeout(Duration::from_millis(100));
             let cancelled_at = Instant::now();
+            let request_local = !matches!(ending, AdmissionRequestEnd::AmbientCancellation);
             let mut all_tokens_cancelled = true;
-            if request_local {
-                // These are the real FastMCP request tokens. Cancelling them
-                // must not cancel the ambient context shared with siblings.
-                for cancellation in request_cancellations {
-                    all_tokens_cancelled &= cancellation.cancel();
+            match ending {
+                AdmissionRequestEnd::AmbientCancellation => {
+                    // The blocking HTTP dispatcher uses this runtime signal.
+                    request_cx.set_cancel_requested(true);
                 }
-            } else {
-                // The blocking HTTP dispatcher uses this runtime signal.
-                request_cx.set_cancel_requested(true);
+                AdmissionRequestEnd::RequestCancellation => {
+                    // These are the real FastMCP request tokens. Cancelling them
+                    // must not cancel the ambient context shared with siblings.
+                    for ctx in &request_contexts {
+                        all_tokens_cancelled &= ctx.request_cancellation().cancel();
+                    }
+                }
+                AdmissionRequestEnd::RequestDeadline => {
+                    // Expire each clone-shared request ceiling only after the
+                    // actual tools are waiting. The ambient context stays live;
+                    // no wall-clock scheduling or substituted liveness is used.
+                    for ctx in &request_contexts {
+                        drop(ctx.clone().with_budget_ceiling(
+                            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                        ));
+                    }
+                }
             }
             let mut completed = Vec::new();
             while completed.len() < 10 {
@@ -7079,7 +7102,7 @@ mod tests {
             let retained_owner = current_thread_holds_promotion_barrier();
             let counted = active_writer_count();
             eprintln!(
-                "[GH#353 write admission] request_local={request_local} completed={}/10 cancellation_wait_us={} promotion_held={retained_owner} active_writers={counted}",
+                "[GH#353 write admission] request_local={request_local} ending={ending:?} completed={}/10 cancellation_wait_us={} promotion_held={retained_owner} active_writers={counted}",
                 completed.len(),
                 completion_latency.as_micros(),
             );
@@ -7103,6 +7126,14 @@ mod tests {
                 !request_local,
                 "request-local cancellation must not alter the ambient context"
             );
+            for ctx in &request_contexts {
+                assert!(ctx.ensure_live().is_err());
+                assert_eq!(
+                    ctx.deadline_expired(),
+                    matches!(ending, AdmissionRequestEnd::RequestDeadline),
+                    "request cancellation and deadline expiry remain distinguishable"
+                );
+            }
             assert_eq!(
                 mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
                     .expect("warm pool remains available")
@@ -7181,12 +7212,23 @@ mod tests {
 
     #[test]
     fn cancelled_coordination_requests_finish_while_recovery_keeps_admission_closed() {
-        assert_cancelled_coordination_requests_finish_while_admission_closed(false);
+        assert_cancelled_coordination_requests_finish_while_admission_closed(
+            AdmissionRequestEnd::AmbientCancellation,
+        );
     }
 
     #[test]
     fn request_local_cancellation_finishes_while_recovery_keeps_admission_closed() {
-        assert_cancelled_coordination_requests_finish_while_admission_closed(true);
+        assert_cancelled_coordination_requests_finish_while_admission_closed(
+            AdmissionRequestEnd::RequestCancellation,
+        );
+    }
+
+    #[test]
+    fn request_deadline_finishes_while_recovery_keeps_admission_closed() {
+        assert_cancelled_coordination_requests_finish_while_admission_closed(
+            AdmissionRequestEnd::RequestDeadline,
+        );
     }
 
     #[test]

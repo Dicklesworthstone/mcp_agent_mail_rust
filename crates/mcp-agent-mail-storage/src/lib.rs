@@ -1686,7 +1686,17 @@ fn admit_direct_publication(
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
-fn write_op_sync_direct_with_cancel(
+///
+/// `cancelled` is checked while waiting for the publication fence. Prepared
+/// reservation writes also check it while waiting for the project lock and
+/// immediately before publishing staged artifacts. Supply the request's full
+/// liveness check when its transport cancellation is independent of its
+/// asupersync context. Cancellation returns [`DirectArchiveWrite::Failed`]
+/// with [`StorageError::Io`] of kind [`std::io::ErrorKind::Interrupted`]. A
+/// caller that already committed a database mutation must retain that receipt
+/// and arrange archive reconciliation after any failed publication.
+#[must_use]
+pub fn write_op_sync_direct_with_cancel(
     op: &WriteOp,
     mut cancelled: impl FnMut() -> bool,
 ) -> DirectArchiveWrite {
@@ -1707,14 +1717,20 @@ fn write_op_sync_direct_with_cancel(
         // directories under the blocking fence, so it keeps the bounded
         // window of the path below.
         let started = Instant::now();
+        let mut cancellation_observed = false;
+        let mut observe_cancellation = || {
+            let stopped = cancelled();
+            cancellation_observed |= stopped;
+            stopped
+        };
         let mut admission = ReservationAdmission::Direct {
             deadline: started + DIRECT_FENCE_ADMISSION_BUDGET,
-            cancelled: &mut cancelled,
+            cancelled: &mut observe_cancellation,
         };
         let result = ensure_archive(config, project_slug).and_then(|archive| {
             write_file_reservation_records_admitted(&archive, config, reservations, &mut admission)
         });
-        return finish_direct_write(op, started, result);
+        return finish_direct_write(op, started, result, cancellation_observed);
     }
     write_archive_sync_direct_with_cancel(op, cancelled, || wbq_execute_op(op, "archive-direct"))
 }
@@ -1760,11 +1776,16 @@ fn write_archive_sync_direct_with_cancel(
         };
 
     let started = Instant::now();
-    finish_direct_write(op, started, write())
+    finish_direct_write(op, started, write(), false)
 }
 
 /// Record a direct write's metrics and archive outcome.
-fn finish_direct_write(op: &WriteOp, started: Instant, result: Result<()>) -> DirectArchiveWrite {
+fn finish_direct_write(
+    op: &WriteOp,
+    started: Instant,
+    result: Result<()>,
+    cancellation_observed: bool,
+) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     metrics.storage.archive_direct_writes_total.add(1);
     metrics
@@ -1778,7 +1799,19 @@ fn finish_direct_write(op: &WriteOp, started: Instant, result: Result<()>) -> Di
             &result,
             Err(StorageError::LockContention { .. } | StorageError::LockTimeout(_))
         );
+    // A request abandoning admission is not evidence that its archive failed.
+    // Keep the failed-request counters, but do not let cancelled callers trip
+    // the archive breaker or trigger recovery of a healthy repository. An
+    // actual filesystem interruption still counts unless admission observed
+    // the request's cancellation itself.
+    let cancelled_reservation = cancellation_observed
+        && matches!(op, WriteOp::FileReservation { .. })
+        && matches!(
+            &result,
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+        );
     if !contended_reservation
+        && !cancelled_reservation
         && !matches!(
             &result,
             Err(StorageError::ReservationPublicationConflict { .. })
@@ -9290,6 +9323,21 @@ enum ReservationAdmission<'a> {
     },
 }
 
+impl ReservationAdmission<'_> {
+    fn check_cancelled(&mut self) -> Result<()> {
+        if let Self::Direct { cancelled, .. } = self
+            && cancelled()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "reservation publication cancelled",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 /// Pause before a direct reservation writer that found the project's archive
 /// lock busy checks it again. It holds no fence meanwhile.
 const DIRECT_RESERVATION_LOCK_BUSY_PAUSE: Duration = Duration::from_millis(2);
@@ -9306,6 +9354,11 @@ fn publish_reservation_writes(
     let root = archive_project_root_checked(archive)?;
     let process_lock = archive_process_lock(archive)?;
     loop {
+        // A prepared request can wait here without ever reaching fence
+        // admission. Observe cancellation even while the project stays busy,
+        // so an abandoned caller does not occupy a dispatch thread for the
+        // full five-second publication budget.
+        admission.check_cancelled()?;
         // A direct writer waits out a busy project without the fence. This
         // only peeks: the lock is released at once and taken again below, in
         // the fence-then-project order. Admitting just to find the project
@@ -9350,6 +9403,10 @@ fn publish_reservation_writes(
         match process.and_then(|process| lock.acquire().map(|()| process)) {
             Ok(_process) => {
                 validate_reservation_publications(checks)?;
+                // Cancellation during lock acquisition or validation must
+                // leave the private stages unpublished. Their owner cleans
+                // them up as the locks and mutation window unwind.
+                admission.check_cancelled()?;
                 let result = staged.publish();
                 lock.release()?;
                 return result;
@@ -17966,6 +18023,131 @@ mod tests {
         assert!(staged_temp_files(&reservation_dir).is_empty());
     }
 
+    #[test]
+    fn direct_reservation_cancellation_ends_the_project_lock_wait() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "cancelled-project-wait").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let process_lock = archive_process_lock(&archive).unwrap();
+        let owner = process_lock.lock().unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = Arc::clone(&cancelled);
+        let op = WriteOp::FileReservation {
+            project_slug: "cancelled-project-wait".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 9,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            })],
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let outcome =
+                write_op_sync_direct_with_cancel(&op, || cancellation.load(Ordering::Acquire));
+            done_tx.send(outcome).unwrap();
+            op
+        });
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut staged = staged_temp_files(&reservation_dir);
+        while staged.len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            staged = staged_temp_files(&reservation_dir);
+        }
+        cancelled.store(true, Ordering::Release);
+        let started = Instant::now();
+        let outcome = done_rx.recv_timeout(Duration::from_secs(2));
+        let cancellation_latency = started.elapsed();
+        let owner_preserved = matches!(
+            process_lock.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let unpublished = !reservation_dir.join("id-9.json").exists();
+        // Join the writer even when the baseline waits out the observation
+        // deadline instead of noticing cancellation behind the real owner.
+        drop(owner);
+        let op = writer.join().unwrap();
+        assert_eq!(staged.len(), 2, "the request must reach staged publication");
+        assert!(
+            matches!(&outcome, Ok(DirectArchiveWrite::Failed(StorageError::Io(error)))
+                if error.kind() == std::io::ErrorKind::Interrupted),
+            "cancelled request did not leave the held project lock: {outcome:?}; elapsed={cancellation_latency:?}"
+        );
+        assert!(
+            owner_preserved,
+            "cancellation must not release another owner"
+        );
+        assert!(unpublished, "cancelled stages must not become reservations");
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+        let key = format!("{}::cancelled-project-wait", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .all(|entry| entry.archive_key != key),
+            "request cancellation must not classify a healthy archive as failed"
+        );
+        assert!(
+            matches!(write_op_sync_direct(&op), DirectArchiveWrite::Written),
+            "a fresh request must publish once the real owner releases the lock"
+        );
+        let published: serde_json::Value =
+            serde_json::from_slice(&fs::read(reservation_dir.join("id-9.json")).unwrap()).unwrap();
+        assert_eq!(published["agent"], "GreenCastle");
+    }
+
+    #[test]
+    fn direct_reservation_cancellation_after_admission_preserves_existing_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "cancelled-before-rename").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let artifact = reservation_dir.join("id-10.json");
+        let before = b"{\"id\":10,\"agent\":\"GreenCastle\"}";
+        fs::write(&artifact, before).unwrap();
+        let staged = StagedArchiveWrites::stage(vec![(
+            artifact.clone(),
+            b"{\"id\":10,\"agent\":\"BlueLake\"}".to_vec(),
+        )])
+        .unwrap();
+        let mut saw_owned_locks = false;
+        let process_lock = archive_process_lock(&archive).unwrap();
+        let mut cancelled = || {
+            // Cancel only after the real publication fence and project mutex
+            // are both held, without relying on a count of internal callbacks.
+            let owned = ARCHIVE_MUTATION_DEPTH.with(|depth| depth.get() > 0)
+                && matches!(
+                    process_lock.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+            saw_owned_locks |= owned;
+            owned
+        };
+        let result = publish_reservation_writes(
+            &archive,
+            staged,
+            &[],
+            &mut ReservationAdmission::Direct {
+                deadline: Instant::now() + DIRECT_FENCE_ADMISSION_BUDGET,
+                cancelled: &mut cancelled,
+            },
+        );
+        assert!(
+            matches!(&result, Err(StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::Interrupted),
+            "{result:?}"
+        );
+        assert!(saw_owned_locks);
+        assert_eq!(fs::read(&artifact).unwrap(), before);
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+        assert!(process_lock.try_lock().is_ok());
+        assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
     /// br-9bwnb: a staged temp file is no archive state. The overload
     /// `commit_all` adds the whole worktree; it must never publish a temp file
     /// another writer staged outside the fence, while the artifact beside it
@@ -25843,6 +26025,72 @@ mod tests {
             .find(|row| row.archive_key == key)
             .expect("failed direct write must feed the per-archive circuit breaker");
         assert!(row.consecutive_failures >= 1);
+    }
+
+    #[test]
+    fn non_reservation_interrupted_io_still_feeds_the_archive_breaker() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-interrupted-io");
+        let result = write_archive_sync_direct_with_cancel(
+            &op,
+            || false,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "archive filesystem operation interrupted",
+                )
+                .into())
+            },
+        );
+
+        assert!(
+            matches!(&result, DirectArchiveWrite::Failed(StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::Interrupted),
+            "{result:?}"
+        );
+        let key = format!("{}::direct-interrupted-io", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .any(|entry| entry.archive_key == key && entry.consecutive_failures == 1),
+            "an interrupted filesystem operation is not request cancellation"
+        );
+    }
+
+    #[test]
+    fn reservation_interrupted_io_without_cancellation_feeds_the_archive_breaker() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = WriteOp::FileReservation {
+            project_slug: "reservation-interrupted-io".to_string(),
+            config: test_config(tmp.path()),
+            reservations: Vec::new(),
+        };
+        let result = write_archive_sync_direct_with_cancel(
+            &op,
+            || false,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "reservation filesystem operation interrupted",
+                )
+                .into())
+            },
+        );
+
+        assert!(
+            matches!(&result, DirectArchiveWrite::Failed(StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::Interrupted),
+            "{result:?}"
+        );
+        let key = format!("{}::reservation-interrupted-io", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .any(|entry| entry.archive_key == key && entry.consecutive_failures == 1),
+            "a reservation filesystem failure is not request cancellation"
+        );
     }
 
     #[test]

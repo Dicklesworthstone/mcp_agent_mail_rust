@@ -318,7 +318,7 @@ impl ReservationArchivePublicationError {
 fn dispatch_reservation_archive_write_inner(
     op: mcp_agent_mail_storage::WriteOp,
     context: &str,
-    cx: Option<&asupersync::Cx>,
+    ctx: Option<&McpContext>,
 ) -> Result<(), ReservationArchivePublicationError> {
     // GH#178: the reservation JSON artifact (`id-<id>.json`) must be durable on
     // return because the pre-commit guard reads it directly; a stale artifact
@@ -337,9 +337,13 @@ fn dispatch_reservation_archive_write_inner(
     // durability guarantee the guard depends on is strictly stronger: the
     // artifact is proven on disk on return (or a hard error is surfaced), rather
     // than merely warned about on a 30s flush timeout.
-    let outcome = cx.map_or_else(
+    let outcome = ctx.map_or_else(
         || mcp_agent_mail_storage::write_op_sync_direct(&op),
-        |cx| mcp_agent_mail_storage::write_op_sync_direct_cancellable(cx, &op),
+        |ctx| {
+            mcp_agent_mail_storage::write_op_sync_direct_with_cancel(&op, || {
+                ensure_request_live(ctx).is_err()
+            })
+        },
     );
     match outcome {
         mcp_agent_mail_storage::DirectArchiveWrite::Written => Ok(()),
@@ -380,19 +384,12 @@ fn dispatch_reservation_archive_write_inner(
     }
 }
 
-fn dispatch_reservation_archive_write(
-    op: mcp_agent_mail_storage::WriteOp,
-    context: &str,
-) -> Result<(), ReservationArchivePublicationError> {
-    dispatch_reservation_archive_write_inner(op, context, None)
-}
-
 fn dispatch_reservation_archive_write_cancellable(
     ctx: &McpContext,
     op: mcp_agent_mail_storage::WriteOp,
     context: &str,
 ) -> Result<(), ReservationArchivePublicationError> {
-    dispatch_reservation_archive_write_inner(op, context, Some(ctx.cx()))
+    dispatch_reservation_archive_write_inner(op, context, Some(ctx))
 }
 
 /// Is every record in this archive op a TERMINAL release artifact (`released_ts`
@@ -403,7 +400,7 @@ fn dispatch_reservation_archive_write_cancellable(
 /// (ids are never reused, even after row deletion), so no later mutation can
 /// make a queued release stale. Any op carrying
 /// an ACTIVE record (grant/renew/reconcile heals) is NOT safe to queue after a
-/// failed direct write — see `dispatch_reservation_archive_write`.
+/// failed direct write — see `dispatch_reservation_archive_write_inner`.
 fn reservation_op_is_terminal_release(op: &mcp_agent_mail_storage::WriteOp) -> bool {
     match op {
         mcp_agent_mail_storage::WriteOp::FileReservation { reservations, .. } => {
@@ -753,6 +750,7 @@ fn reservation_rows_needing_archive_heal(
 /// archive-write converges to a consistent archive (no wrong holder) on the next
 /// `file_reservation_paths` call, with no operator action.
 fn reconcile_active_reservation_archive(
+    ctx: &McpContext,
     project: &mcp_agent_mail_db::ProjectRow,
     active_rows: &[mcp_agent_mail_db::FileReservationRow],
     agent_names: &HashMap<i64, String>,
@@ -784,7 +782,8 @@ fn reconcile_active_reservation_archive(
         config: config.clone(),
         reservations: heal,
     };
-    if dispatch_reservation_archive_write(
+    if dispatch_reservation_archive_write_cancellable(
+        ctx,
         op,
         &format!(
             "reservation archive reconcile-on-read project={}",
@@ -875,6 +874,7 @@ fn released_rows_needing_archive_heal(
 /// always safe to (re)write — reservation ids are never reused, so no later
 /// mutation can supersede a release.
 fn reconcile_released_reservation_archive(
+    ctx: &McpContext,
     project: &mcp_agent_mail_db::ProjectRow,
     released_rows: &[mcp_agent_mail_db::FileReservationRow],
     agent_names: &HashMap<i64, String>,
@@ -906,7 +906,8 @@ fn reconcile_released_reservation_archive(
         config: config.clone(),
         reservations: heal,
     };
-    if dispatch_reservation_archive_write(
+    if dispatch_reservation_archive_write_cancellable(
+        ctx,
         op,
         &format!(
             "reservation archive released-row reconcile-on-read project={}",
@@ -2153,6 +2154,7 @@ pub async fn file_reservation_paths(
             .collect();
         let db_generation = fetch_db_generation(ctx, &pool).await;
         reconcile_active_reservation_archive(
+            ctx,
             &project,
             &active,
             &agent_names,
@@ -2168,6 +2170,7 @@ pub async fn file_reservation_paths(
             .await
         {
             reconcile_released_reservation_archive(
+                ctx,
                 &project,
                 &released_rows,
                 &agent_names,
@@ -2895,6 +2898,7 @@ pub async fn release_file_reservations(
             .filter_map(|row| row.id.map(|id| (id, row.name)))
             .collect();
         reconcile_active_reservation_archive(
+            ctx,
             &project,
             &active_rows,
             &agent_names,
@@ -2910,6 +2914,7 @@ pub async fn release_file_reservations(
             .await
         {
             reconcile_released_reservation_archive(
+                ctx,
                 &project,
                 &released_unexpired,
                 &agent_names,
