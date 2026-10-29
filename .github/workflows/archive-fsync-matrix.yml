@@ -1,11 +1,21 @@
 name: Archive Fsync Matrix
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/archive-fsync-matrix.yml"
+      - "scripts/ci/checkpoint_path_probe.py"
+      - "crates/mcp-agent-mail-storage/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
   pull_request:
     branches: [main]
     paths:
       - ".github/workflows/archive-fsync-matrix.yml"
       - "scripts/bench_archive_fsync_matrix.sh"
+      - "scripts/ci/checkpoint_path_probe.py"
       - "crates/mcp-agent-mail-storage/**"
       - "benches/BUDGETS.md"
       - "docs/OPERATOR_RUNBOOK.md"
@@ -15,13 +25,128 @@ on:
 
 concurrency:
   group: archive-fsync-matrix-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Keep an in-flight native baseline when the next storage fix is pushed.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
   contents: read
 
 jobs:
+  # GH369: these jobs do not depend on the broad Linux CI job. A format/lint
+  # failure elsewhere must not suppress the native Windows filesystem evidence.
+  checkpoint-path-diagnostic:
+    name: Checkpoint Path Diagnostic (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install repository-pinned native compiler
+        run: |
+          set -euo pipefail
+          toolchain=$(python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+      - name: Diagnose real canonical-path metadata and production prefix validation
+        run: |
+          python scripts/ci/checkpoint_path_probe.py --repo "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/checkpoint-path-probe"
+      - name: Preserve native metadata diagnostics, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checkpoint-path-diagnostic-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/checkpoint-path-probe/
+          if-no-files-found: error
+          retention-days: 14
+
+  checkpoint-lifecycle:
+    name: Checkpoint Lifecycle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_DEV_OPT_LEVEL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_TEST_OPT_LEVEL: '0'
+      CARGO_TERM_COLOR: never
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install repository-pinned native compiler
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/checkpoint-evidence"
+          toolchain=$(python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          rustc -vV | tee "$RUNNER_TEMP/checkpoint-evidence/compiler.log"
+          git config --global core.longpaths true
+      - uses: Swatinem/rust-cache@v2
+      - name: Check production storage feature graph
+        run: |
+          set -euo pipefail
+          cargo check --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/check-production.log"
+      - name: Test real canonical and adversarial prefix validation
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib path_prefix_tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/path-prefix.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/path-prefix.log"
+      - name: Test real message checkpoint lifecycle and recovery
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::message_reconcile::database::checkpoint::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/message-checkpoint.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/message-checkpoint.log"
+      - name: Test adjacent agent checkpoint lifecycle
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::agent_reconcile::retry::checkpoint::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/agent-checkpoint.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/agent-checkpoint.log"
+      - name: Test adjacent active reservation checkpoint lifecycle
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::active_reservations::retry::checkpoint::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/active-checkpoint.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/active-checkpoint.log"
+      - name: Test adjacent terminal reservation checkpoint lifecycle
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::reservation_reconcile::retry::checkpoint::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/reservation-checkpoint.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/reservation-checkpoint.log"
+      - name: Verify qualification left the sources unchanged
+        if: always()
+        run: git diff --exit-code
+      - name: Preserve every completed and failed lifecycle gate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checkpoint-lifecycle-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/checkpoint-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
   linux-fsync:
+    if: github.event_name != 'push'
     name: Archive Fsync (${{ matrix.fs }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -64,6 +189,7 @@ jobs:
           if-no-files-found: error
 
   macos-apfs:
+    if: github.event_name != 'push'
     name: Archive Fsync (apfs)
     runs-on: macos-latest
     timeout-minutes: 35

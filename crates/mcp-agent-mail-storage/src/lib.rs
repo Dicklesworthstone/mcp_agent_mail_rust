@@ -15471,9 +15471,21 @@ fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
         std::env::current_dir()?
     };
 
-    for component in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                // A canonical Windows drive prefix (\\?\C:) alone names a
+                // volume, not its root directory. symlink_metadata on that
+                // intermediate path fails with ERROR_INVALID_FUNCTION. Query
+                // the complete root, then every real descendant as before.
+                // Bare and drive-relative prefixes retain their usual checks.
+                if matches!(components.peek(), Some(Component::RootDir)) {
+                    current.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+                    components.next();
+                }
+            }
             Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => continue,
             Component::ParentDir => current.push(".."),
@@ -15489,6 +15501,106 @@ fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod path_prefix_tests {
+    use super::path_existing_prefix_has_symlink;
+    use std::fs;
+
+    #[test]
+    fn canonical_paths_validate_existing_and_missing_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        #[cfg(windows)]
+        assert!(matches!(
+            root.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        let existing = root.join("checkpoint.json");
+        fs::write(&existing, b"checkpoint").unwrap();
+        for path in [
+            root,
+            existing,
+            temp.path().join("missing-checkpoint.json"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join("missing-parent/checkpoint.json"),
+        ] {
+            assert!(
+                !path_existing_prefix_has_symlink(&path).unwrap(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn canonical_prefix_does_not_hide_symlinked_ancestors_or_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let evidence = real.join("evidence");
+        fs::write(&evidence, b"unchanged").unwrap();
+        let parent = root.join("linked-parent");
+        let leaf = root.join("linked-leaf");
+        let dangling = root.join("dangling-leaf");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &parent).unwrap();
+            std::os::unix::fs::symlink(&evidence, &leaf).unwrap();
+            std::os::unix::fs::symlink(root.join("missing-target"), &dangling).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(&real, &parent).unwrap();
+            std::os::windows::fs::symlink_file(&evidence, &leaf).unwrap();
+            std::os::windows::fs::symlink_file(root.join("missing-target"), &dangling).unwrap();
+        }
+        for link in [&parent, &leaf, &dangling] {
+            assert!(
+                fs::symlink_metadata(link).unwrap().file_type().is_symlink(),
+                "the native symlink fixture must exist: {}",
+                link.display()
+            );
+        }
+        // PathBuf::push normalizes .. on Windows verbatim paths. Preserve the
+        // actual linked-parent/.. spelling so the walker must inspect the
+        // linked ancestor before it processes the parent component.
+        let mut through_parent = parent.as_os_str().to_os_string();
+        through_parent.push(std::path::MAIN_SEPARATOR_STR);
+        through_parent.push("..");
+        through_parent.push(std::path::MAIN_SEPARATOR_STR);
+        through_parent.push("real");
+        through_parent.push(std::path::MAIN_SEPARATOR_STR);
+        through_parent.push("evidence");
+        for path in [
+            parent.join("evidence"),
+            parent.join("missing/checkpoint.json"),
+            through_parent.into(),
+            leaf,
+            dangling,
+        ] {
+            assert!(
+                path_existing_prefix_has_symlink(&path).unwrap(),
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(fs::read(evidence).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn invalid_metadata_is_not_treated_as_an_absent_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let error = path_existing_prefix_has_symlink(&root.join("invalid\0name"))
+            .expect_err("metadata errors must fail closed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 }
 
 /// ISO 8601 timestamp for the current time.
