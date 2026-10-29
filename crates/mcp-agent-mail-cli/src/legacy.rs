@@ -2257,9 +2257,10 @@ fn parse_database_value(
 
     let path = if value.contains("://") {
         let db_path = sqlite_file_path_from_database_url(value).ok_or_else(|| {
-            CliError::InvalidArgument(format!(
-                "unsupported DATABASE_URL scheme for import: {value}"
-            ))
+            CliError::InvalidArgument(
+                "unsupported DATABASE_URL scheme for import (expected a SQLite file URL)"
+                    .to_string(),
+            )
         })?;
         resolve_legacy_database_url_path(&db_path, search_root)
     } else {
@@ -4024,6 +4025,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, tmp.path().join("legacy.db"));
+    }
+
+    #[test]
+    fn parse_database_value_rejects_unsupported_urls_without_echoing_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let password = "synthetic-legacy-url-password";
+        let query_token = "synthetic-legacy-url-query-token";
+        for scheme in ["postgres", "https", "unsupported"] {
+            let value = format!(
+                "{scheme}://fixture-user:{password}@invalid.example/mail?token={query_token}"
+            );
+            let error = parse_database_value(&value, root.path(), ResolvedSource::ProjectEnv)
+                .expect_err("unsupported authorities must still be rejected");
+            assert!(matches!(error, CliError::InvalidArgument(_)));
+            for diagnostic in [error.to_string(), format!("{error:?}")] {
+                assert!(diagnostic.contains("unsupported DATABASE_URL scheme"));
+                assert!(diagnostic.contains("SQLite file URL"));
+                for sensitive in [password, query_token, value.as_str()] {
+                    assert!(
+                        !diagnostic.contains(sensitive),
+                        "rejected authority must not be included in diagnostics"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
