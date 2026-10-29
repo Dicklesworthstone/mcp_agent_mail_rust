@@ -9024,7 +9024,32 @@ fn ensure_primary_not_multiply_linked(primary_path: &Path, context: &str) -> Res
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    match mcp_agent_mail_core::disk::open_regular_file_no_follow(primary_path) {
+        Ok(file) => {
+            let links =
+                mcp_agent_mail_core::disk::windows_file_link_count(&file).map_err(|error| {
+                    SqlError::Custom(format!(
+                        "{context}: failed to inspect recovery primary {}: {error}",
+                        primary_path.display()
+                    ))
+                })?;
+            if links != 1 {
+                return Err(SqlError::Custom(format!(
+                    "{context}: live database {} has {links} hard links and aliases the live database across multiple pathnames; recovery requires an exclusively owned file generation",
+                    primary_path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "{context}: failed to inspect recovery primary {}: {error}",
+                primary_path.display()
+            )));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = context;
     Ok(())
 }
@@ -27455,48 +27480,77 @@ mod tests {
             .expect("rejection before receipt admission must not degrade readiness");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn recovery_admission_and_promotion_reject_hard_linked_primary_aliases() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = tempfile::tempdir().unwrap();
-        let primary_a = dir.path().join("storage-a.sqlite3");
-        let primary_b = dir.path().join("storage-b.sqlite3");
-        let candidate = dir.path().join("storage-a.sqlite3.candidate");
+        let dir = tempfile::Builder::new()
+            .prefix("recovery-primary-alias-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        eprintln!("retained recovery alias fixture: {}", dir.display());
+        let primary_a = dir.join("storage-a.sqlite3");
+        let primary_b = dir.join("storage-b.sqlite3");
+        let candidate = dir.join("storage-a.sqlite3.candidate");
         write_marker_db(&primary_a, "shared-live-generation");
         write_marker_db(&candidate, "fresh-candidate-generation");
+        let primary_before = std::fs::read(&primary_a).unwrap();
+        let candidate_before = std::fs::read(&candidate).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o400))
             .expect("plant read-only candidate mode");
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&candidate).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&candidate, permissions)
+                .expect("plant read-only candidate attribute");
+        }
         std::fs::hard_link(&primary_a, &primary_b).expect("hard-link primary_b to primary_a");
+        let primary_identity_before = primary_identity(&primary_a);
+        let candidate_identity_before = primary_identity(&candidate);
+        assert_eq!(primary_identity(&primary_b), primary_identity_before);
 
         recovery_admission().reset();
-        let op_called = std::cell::Cell::new(false);
-        let admission_err = with_recovery_admission(&primary_a, "test recovery", || {
-            op_called.set(true);
-            Ok(())
-        })
-        .expect_err("admission must reject a multiply-linked primary database");
-        assert!(
-            admission_err.to_string().contains("has 2 hard links"),
-            "unexpected admission error: {admission_err}"
-        );
-        assert!(
-            !op_called.get(),
-            "operation body must not run for an aliased primary"
-        );
-        assert!(
-            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&primary_a))
-                .is_err(),
-            "rejecting an aliased primary must not create breaker authority"
-        );
+        for primary in [&primary_a, &primary_b] {
+            let op_called = std::cell::Cell::new(false);
+            let admission_err = with_recovery_admission(primary, "test recovery", || {
+                op_called.set(true);
+                Ok(())
+            })
+            .expect_err("admission must reject a multiply-linked primary database");
+            assert!(
+                admission_err.to_string().contains("has 2 hard links"),
+                "unexpected admission error: {admission_err}"
+            );
+            assert!(
+                !op_called.get(),
+                "operation body must not run for either aliased primary"
+            );
+            let absent =
+                std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(primary))
+                    .expect_err("rejecting an aliased primary must not create breaker authority");
+            assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
+        }
 
-        let promo_err = promote_recovery_candidate(&primary_a, &candidate, dir.path())
-            .expect_err("promotion must reject a multiply-linked primary database");
-        assert!(
-            promo_err.to_string().contains("has 2 hard links"),
-            "unexpected promotion error: {promo_err}"
-        );
+        for primary in [&primary_a, &primary_b] {
+            let promo_err = promote_recovery_candidate(primary, &candidate, &dir)
+                .expect_err("promotion must reject a multiply-linked primary database");
+            assert!(
+                promo_err.to_string().contains("has 2 hard links"),
+                "unexpected promotion error: {promo_err}"
+            );
+            assert_eq!(primary_identity(primary), primary_identity_before);
+            crate::forensics::verify_recovery_receipt_state(&dir, primary)
+                .expect("aliased primary rejection must not create a recovery receipt");
+        }
+        assert_eq!(primary_identity(&candidate), candidate_identity_before);
+        assert_eq!(std::fs::read(&primary_a).unwrap(), primary_before);
+        assert_eq!(std::fs::read(&primary_b).unwrap(), primary_before);
+        assert_eq!(std::fs::read(&candidate).unwrap(), candidate_before);
         assert_eq!(
             sqlite_marker_value(&primary_a).as_deref(),
             Some("shared-live-generation")
@@ -27509,6 +27563,7 @@ mod tests {
             sqlite_marker_value(&candidate).as_deref(),
             Some("fresh-candidate-generation")
         );
+        #[cfg(unix)]
         assert_eq!(
             std::fs::symlink_metadata(&candidate)
                 .expect("candidate metadata")
@@ -27518,8 +27573,14 @@ mod tests {
             0o400,
             "rejection must happen before candidate permission normalization"
         );
-        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary_a)
-            .expect("aliased primary rejection must not create a recovery receipt");
+        #[cfg(windows)]
+        assert!(
+            std::fs::symlink_metadata(&candidate)
+                .expect("candidate metadata")
+                .permissions()
+                .readonly(),
+            "rejection must happen before candidate attribute normalization"
+        );
     }
 
     #[cfg(unix)]
