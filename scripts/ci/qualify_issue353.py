@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-BASE = "23fe3dce55d00486cd034549627efd164fa31332"
+BASE = "e795a9511f6ad01eaf81c0b8f2f99646dfe83e66"
 TOOLCHAIN = "nightly-2026-08-31"
 PATCH_DIR = Path("docs/evidence/gh353")
 PATCHES = {
