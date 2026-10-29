@@ -10,11 +10,13 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     'release_smoke',
@@ -170,11 +172,39 @@ class ArchiveParityTests(unittest.TestCase):
             conn.close()
         self.path = self.root / 'storage/projects/proof/messages/2023/11/witness__1.md'
         self.path.parent.mkdir(parents=True)
+        self.git('init', '--initial-branch=main')
         self.write_message(self.envelope, self.body)
         (self.root / 'original-message-retained.md').write_bytes(self.path.read_bytes())
 
-    def write_message(self, envelope, body):
-        self.path.write_bytes(('---json\n' + json.dumps(envelope) + '\n---\n\n' + body).encode())
+    def git(self, *arguments):
+        return subprocess.run(
+            ['git', '-c', 'user.name=Archive Witness', '-c', 'user.email=witness@example.invalid',
+             '-c', 'commit.gpgsign=false', '-C', str(self.root / 'storage'), *arguments],
+            check=True, capture_output=True, timeout=10,
+        ).stdout
+
+    def commit_archive(self):
+        self.git('add', '--', 'projects')
+        self.git('commit', '--allow-empty', '-m', 'Synthetic archive witness')
+
+    def mailbox_copy(self, name, folder='inbox'):
+        return self.root / 'storage/projects/proof/agents' / name / folder / '2023/11' / self.path.name
+
+    def write_message(self, envelope, body, commit=True):
+        full = ('---json\n' + json.dumps(envelope) + '\n---\n\n' + body).encode()
+        inbox = ('---json\n' + json.dumps({**envelope, 'bcc': []}) + '\n---\n\n' + body).encode()
+        self.path.write_bytes(full)
+        outbox = self.mailbox_copy(envelope['from'], 'outbox')
+        outbox.parent.mkdir(parents=True, exist_ok=True)
+        outbox.write_bytes(full)
+        for name in set(envelope['to']) | set(envelope['cc']) | set(envelope['bcc']):
+            if name.startswith('project:'):
+                continue
+            path = self.mailbox_copy(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(inbox)
+        if commit:
+            self.commit_archive()
 
     def parity(self):
         return smoke.archive_db_parity(self.root / 'storage', self.arm.db_path)
@@ -197,6 +227,136 @@ class ArchiveParityTests(unittest.TestCase):
         trace = json.loads((self.root / 'out/archive_convergence.jsonl').read_text().splitlines()[0])
         self.assertTrue(trace['no_mcp_requests'])
         self.assertTrue(trace['within_bound'])
+        self.assertEqual(trace['committed_copies'], 5)
+        self.assertEqual(trace['git_objects_verified'], 2)
+
+    def test_missing_inbox_cannot_pass_complete_canonical_counts(self):
+        inbox = self.mailbox_copy('RedLake')
+        retained = self.root / 'missing-inbox-retained.md'
+        inbox.rename(retained)
+        before = self.git('rev-parse', 'HEAD')
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertEqual(detail['missing_ids'], [])
+        self.assertEqual(detail['missing_copies'], [{'id': 1, 'copy': 'inbox'}])
+        self.assertEqual(self.git('rev-parse', 'HEAD'), before)
+        self.assertFalse(inbox.exists(), 'observing must not repair the missing inbox')
+        retained.rename(inbox)
+        self.assertTrue(self.parity()[0])
+
+    def test_missing_sender_outbox_is_not_archive_convergence(self):
+        self.mailbox_copy('BlueSpring', 'outbox').rename(self.root / 'missing-outbox-retained.md')
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['missing_copies'], [{'id': 1, 'copy': 'outbox'}])
+
+    def test_complete_working_bundle_must_also_be_committed(self):
+        body = 'changed live and working bytes, not yet in Git'
+        self.update_db('UPDATE messages SET body_md=?', (body,))
+        self.write_message(self.envelope, body, commit=False)
+        before = self.git('rev-parse', 'HEAD')
+        index_before = (self.root / 'storage/.git/index').read_bytes()
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertEqual(detail['mismatches'], [])
+        self.assertEqual(len(detail['uncommitted_copies']), 5)
+        self.assertEqual(detail['committed_copies'], 0)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), before)
+        self.assertEqual((self.root / 'storage/.git/index').read_bytes(), index_before)
+        self.commit_archive()
+        self.assertTrue(self.parity()[0])
+
+    def test_semantically_correct_uncommitted_inbox_is_not_durable(self):
+        inbox = self.mailbox_copy('RedLake')
+        raw = ('---json\n' + json.dumps({**self.envelope, 'bcc': []}, indent=2)
+               + '\n---\n\n' + self.body).encode()
+        inbox.write_bytes(raw)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [])
+        self.assertEqual(detail['uncommitted_copies'], [{'id': 1, 'copy': 'inbox'}])
+        self.commit_archive()
+        self.assertTrue(self.parity()[0])
+
+    def test_committed_bcc_leak_in_recipient_copy_is_rejected(self):
+        self.mailbox_copy('RedLake').write_bytes(self.path.read_bytes())
+        self.commit_archive()
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [{'id': 1, 'copy': 'inbox'}])
+        self.assertNotIn('WhiteOak', json.dumps(detail))
+
+    def test_missing_real_git_blob_cannot_be_supplied_by_working_copies(self):
+        relative = self.path.relative_to(self.root / 'storage').as_posix()
+        oid = self.git('rev-parse', 'HEAD:' + relative).strip().decode('ascii')
+        object_path = self.root / 'storage/.git/objects' / oid[:2] / oid[2:]
+        retained = self.root / 'missing-object-retained'
+        object_path.rename(retained)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertTrue(detail['bundle_mismatches'])
+        retained.rename(object_path)
+        self.assertTrue(self.parity()[0])
+
+    def test_one_pinned_tree_does_not_mix_copies_from_later_commits(self):
+        snapshot = smoke.ArchiveCommitSnapshot(self.root / 'storage', time.monotonic() + 5)
+        original = self.path.read_bytes()
+        try:
+            self.assertTrue(snapshot.verify(self.path, original))
+            self.write_message(self.envelope, 'later tree contents')
+            self.assertTrue(snapshot.verify(self.path, original))
+            self.assertFalse(snapshot.verify(self.path, self.path.read_bytes()))
+            self.assertNotEqual(self.git('rev-parse', 'HEAD').strip().decode(), snapshot.head)
+        finally:
+            snapshot.close()
+        self.assertIsNotNone(snapshot.reader.poll(), 'owned Git reader must be reaped')
+
+    def test_multiple_messages_share_one_reader_without_reusing_their_verdicts(self):
+        self.update_db('''INSERT INTO messages
+            SELECT 2,project_id,sender_id,subject,body_md,thread_id,topic,importance,
+                   ack_required,created_ts,attachments,recipients_json,archive_metadata_json
+            FROM messages WHERE id=1''')
+        self.update_db('INSERT INTO message_recipients SELECT 2,agent_id,kind '
+                       'FROM message_recipients WHERE message_id=1')
+        self.path = self.path.with_name('second__2.md')
+        self.write_message({**self.envelope, 'id': 2}, self.body)
+        with patch.object(smoke.subprocess, 'Popen', wraps=subprocess.Popen) as spawned:
+            ok, detail = self.parity()
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail['committed_copies'], 10)
+        self.assertEqual(detail['git_objects_verified'], 4)
+        readers = [call for call in spawned.call_args_list
+                   if call.args[0][-2:] == ['cat-file', '--batch']]
+        self.assertEqual(len(readers), 1, 'one Git reader must serve every message and copy')
+        self.mailbox_copy('RedLake').write_bytes((self.root / 'original-message-retained.md').read_bytes())
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [{'id': 2, 'copy': 'inbox'}])
+
+    def test_mailbox_symlink_is_refused_without_reading_its_target(self):
+        inbox = self.mailbox_copy('RedLake')
+        retained = self.root / 'symlink-inbox-retained.md'
+        inbox.rename(retained)
+        inbox.symlink_to(retained)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [{'id': 1, 'copy': 'inbox'}])
+        self.assertTrue(inbox.is_symlink())
+
+    def test_bcc_only_inbox_has_empty_visible_routing_without_losing_delivery(self):
+        envelope = {**self.envelope, 'to': [], 'cc': [], 'bcc': ['WhiteOak']}
+        self.update_db('ALTER TABLE message_recipients RENAME TO retained_message_recipients')
+        self.update_db('CREATE TABLE message_recipients AS SELECT * FROM retained_message_recipients '
+                       'WHERE agent_id=4')
+        self.update_db('UPDATE messages SET recipients_json=?',
+                       (json.dumps({role: envelope[role] for role in ('to', 'cc', 'bcc')}),))
+        self.write_message(envelope, self.body)
+        ok, detail = self.parity()
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail['committed_copies'], 3)
 
     def test_same_count_modified_body_is_rejected_without_echoing_content(self):
         self.write_message(self.envelope, 'different synthetic body')

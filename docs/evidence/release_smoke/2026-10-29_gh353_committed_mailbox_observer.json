@@ -1,0 +1,169 @@
+{
+  "schema": "gh353-committed-mailbox-observer-v1",
+  "issue": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/353",
+  "bead": "br-kp1in.35",
+  "scope": "Passive convergence-observer correction validated with real SQLite databases and Git repositories. This receipt is not an Agent Mail request-latency, recovery-throughput, or full release-swarm result.",
+  "sources": {
+    "baseline": {
+      "commit": "9ff9dc122d2abd141fdfa80a53548dc3455fa559",
+      "tests/e2e/lib/release_smoke.py": "0ddfd43f92354402ed0f6637682281d6ddeb8ffc35eeb0cd689824be6e8de921"
+    },
+    "completed_ab_candidate_sha256": {
+      "tests/e2e/lib/release_smoke.py": "f6fb32d54bc4de238362702e0dd3663fa984652bbff731efc60261969b26d47f",
+      "scripts/tests/test_release_smoke_swarm.py": "a561bcceb82b133e7f9f48a5a7a3a7123855aac8e7352e9c50ba4441a1abc86a"
+    },
+    "final_candidate_sha256": {
+      "tests/e2e/lib/release_smoke.py": "5f61d7b043b5f768fa0dd7d0aceffdd02f7ebdebce1dbb2c5c338f04d42401f7",
+      "scripts/tests/test_release_smoke_swarm.py": "a561bcceb82b133e7f9f48a5a7a3a7123855aac8e7352e9c50ba4441a1abc86a"
+    },
+    "ab_to_final_delta": "Verified against the retained A/B candidate bytes: only the convergence_source receipt string changes to name read-only SQLite plus committed canonical/inbox/outbox Git content; no MCP polling. Observer logic and test source are identical."
+  },
+  "observer_contract": {
+    "checks": [
+      "Retains the previous database/canonical identity, content, routing, reply, duplicate, and deadline checks.",
+      "Requires canonical and sender-outbox bytes plus every direct-recipient inbox, with BCC redacted in inboxes.",
+      "Requires matching regular-file paths and readable immutable blobs in one pinned Git HEAD; an advancing HEAD prevents a success verdict.",
+      "Uses one tree inventory and one streaming Git reader per observation, reusing verified immutable blob identities without reusing message verdicts.",
+      "Makes no MCP requests or archive repairs and does not refresh the Git index."
+    ],
+    "limits": [
+      "Attachment metadata is compared; attachment-file bytes are not independently inspected.",
+      "Cooperative deadlines cannot interrupt a blocked operating-system filesystem call or prove safety against adversarial directory replacement."
+    ]
+  },
+  "unchanged_release_contract": {
+    "convergence_seconds": 300,
+    "minimum_soak_seconds": 300,
+    "minimum_swarm_agents": 60,
+    "minimum_swarm_seconds": 480,
+    "send_reserve_release_p99_budget_seconds": 5.0,
+    "fetch_inbox_p99_budget_seconds": 2.0,
+    "request_counters_and_latency_accounting": "unchanged",
+    "release_swarm_executed_for_this_receipt": false
+  },
+  "final_source_tests": {
+    "command": "python3 -m unittest discover -s scripts/tests -p test_release_smoke_swarm.py",
+    "passed": 50,
+    "failed": 0,
+    "exit_code": 0,
+    "unittest_elapsed_seconds": 15.539,
+    "source_hashes_equal_before_and_after": true,
+    "environment": "Escalated execution allowed the existing fixture constructor to allocate a local loopback socket; no fixture or assertion was weakened.",
+    "retained_run": "oracle-exact-20261028T235950Z"
+  },
+  "completed_same_invocation_ab": {
+    "method": "Load the baseline oracle directly from the baseline commit. Run baseline and candidate against the same real SQLite/Git fixture for each scenario. Both canonical counts are 1/1 in every scenario.",
+    "result": "PASS: complete committed evidence remains accepted; four incomplete or unsafe archive states accepted by baseline are rejected by candidate.",
+    "cases": [
+      {
+        "scenario": "complete_committed_bundle",
+        "baseline_accepts": true,
+        "candidate_accepts": true,
+        "candidate_committed_copies": 5
+      },
+      {
+        "scenario": "missing_recipient_inbox",
+        "baseline_accepts": true,
+        "candidate_accepts": false,
+        "candidate_missing_copies": 1
+      },
+      {
+        "scenario": "complete_working_bundle_with_uncommitted_content",
+        "baseline_accepts": true,
+        "candidate_accepts": false,
+        "candidate_uncommitted_copies": 5
+      },
+      {
+        "scenario": "committed_inbox_leaks_bcc",
+        "baseline_accepts": true,
+        "candidate_accepts": false,
+        "candidate_bundle_mismatches": 1
+      },
+      {
+        "scenario": "missing_git_blob_with_working_copies_intact",
+        "baseline_accepts": true,
+        "candidate_accepts": false,
+        "candidate_bundle_mismatches": 2
+      }
+    ]
+  },
+  "later_ab_attempt_retained": {
+    "source_version": "final_candidate_sha256",
+    "result": "INCOMPLETE: no second complete five-case result",
+    "failure": "A real fixture's git add -- projects command exceeded its unchanged 10-second setup timeout after the final-source 50-test suite passed.",
+    "retained_run": "oracle-exact-20261028T235950Z",
+    "timeout_or_assertion_changed": false
+  },
+  "static_analysis": {
+    "scanner": {
+      "name": "Ultimate Bug Scanner",
+      "version": "5.5.24",
+      "commit": "c442573630f69e2988430a2d70f0a470bf70a8ea",
+      "ast_grep_version": "0.45.3",
+      "ast_grep_archive_sha256_verified": "f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8"
+    },
+    "python_default_gate": {
+      "files": [
+        "scripts/tests/test_release_smoke_swarm.py",
+        "tests/e2e/lib/release_smoke.py"
+      ],
+      "source_version": "final_candidate_sha256",
+      "source_hashes_equal_before_and_after": true,
+      "exit_code": 2,
+      "status": "partial",
+      "module_error": "ANALYZER_ERROR",
+      "diagnostic": "detector sql_injection: SQLFlowLimit: SQL list mutation aliasing is unsupported; analysis is incomplete",
+      "critical_reported": 0,
+      "warnings_reported": 8,
+      "info_reported": 198,
+      "categories_skipped": [],
+      "partial_result_override": false,
+      "warning_review": "Six JSON-parsing reports concern fixture/helper parsing; errors already fail fixtures or propagate to the caller's refusal path. Two Popen lifetime reports include the existing server process and the new Git reader; the reader is closed and waited, with kill/reap on deadline, from archive_db_parity's finally block. This review does not convert incomplete analysis into a passing gate.",
+      "retained_run": "ubs-20261028T235947Z"
+    },
+    "completed_rust_module_from_interrupted_aggregate": {
+      "files": 16,
+      "status": "ok",
+      "elapsed_seconds_reported": 226,
+      "critical": 3,
+      "warnings": 9110,
+      "info": 2772,
+      "aggregate_status": "interrupted before a complete Python/aggregate result",
+      "cargo_phases": "not evaluated; --no-cargo",
+      "new_critical_findings": 0,
+      "critical_attribution": {
+        "file": "crates/mcp-agent-mail-storage/src/lib.rs",
+        "rule": "rust.ownership.panic-macro",
+        "method": "Verified the exact three panic expressions against git show of the baseline commit; all are unchanged existing thread-spawn failure handling.",
+        "existing_sites": [
+          "wbq-drain thread spawn failure",
+          "archive-backlog-drain thread spawn failure",
+          "commit-coalescer worker thread spawn failure"
+        ]
+      },
+      "retained_run": "ubs-20261028T234811Z"
+    },
+    "completed_default_aggregate": {
+      "retained_run": "ubs-20261029T000126Z",
+      "files": 18,
+      "exit_code": 2,
+      "status": "partial",
+      "elapsed_seconds": 327.195,
+      "totals": {
+        "critical": 3,
+        "warnings": 9118,
+        "info": 2970
+      },
+      "rust": "Complete; the same three baseline panic expressions and warning/info inventory as the earlier Rust module.",
+      "python": "Partial; the same SQLFlowLimit diagnostic and 0 critical / 8 warning / 198 info inventory as the independent final-source Python scan.",
+      "oracle_source_hashes_equal_before_and_after": true,
+      "other_sources_changed_during_scan": [
+        "crates/mcp-agent-mail-tools/src/archive_read.rs",
+        "crates/mcp-agent-mail-tools/src/lib.rs",
+        "crates/mcp-agent-mail-tools/src/messaging.rs"
+      ],
+      "freshness_limit": "The retained Rust scan snapshot does not validate later edits to these three files. Both oracle files still match final_candidate_sha256."
+    },
+    "overall_gate": "NOT PASSED: the Python analyzer is incomplete; existing Rust critical findings are retained and attributed, not suppressed."
+  }
+}

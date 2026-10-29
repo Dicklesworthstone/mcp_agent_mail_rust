@@ -57,6 +57,7 @@ import os
 import random
 import re
 import resource
+import select
 import signal
 import socket
 import sqlite3
@@ -217,15 +218,221 @@ def archive_routing(value: object) -> dict[str, list[str]]:
     return roles
 
 
+def archive_file_bytes(storage: Path, path: Path, deadline: float) -> bytes:
+    """Read an ordinary archive copy without following a known symlink."""
+    relative = path.relative_to(storage)
+    if any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError("invalid archive copy path")
+    parent = storage
+    for component in relative.parts[:-1]:
+        if parent.is_symlink():
+            raise ValueError("archive copy ancestor symlink")
+        parent /= component
+    if parent.is_symlink():
+        raise ValueError("archive copy ancestor symlink")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("archive copy is not a regular file")
+        chunks = []
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("archive observation deadline")
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
+class ArchiveCommitSnapshot:
+    """One immutable HEAD inventory and one bounded streaming Git reader.
+
+    A working-tree file or staged blob is not durable publication. Verify the
+    real committed object as well as its name, mode and exact working bytes.
+    Canonical/outbox copies often share an OID, so read each immutable blob only
+    once in this observation. No index refresh, repair or per-message Git spawn.
+    """
+
+    def __init__(self, storage: Path, deadline: float):
+        self.storage = storage
+        self.deadline = deadline
+        self.reader: subprocess.Popen | None = None
+        self.buffer = bytearray()
+        self.verified = set()
+        git_dir = storage / ".git"
+        if git_dir.is_symlink() or not git_dir.is_dir():
+            raise ValueError("archive has no private Git directory")
+        self.command = ["git", "--no-replace-objects", f"--git-dir={git_dir}",
+                        f"--work-tree={storage}"]
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("GIT_")}
+        self.env.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull)
+        self.head = self.run("rev-parse", "--verify", "HEAD^{commit}").strip().decode("ascii")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", self.head):
+            raise ValueError("invalid archive commit identity")
+        self.algorithm = "sha1" if len(self.head) == 40 else "sha256"
+        self.entries = {}
+        inventory = self.run("ls-tree", "-rz", "--full-tree", self.head, "--", "projects")
+        for record in inventory.split(b"\0"):
+            if not record:
+                continue
+            metadata, path = record.split(b"\t", 1)
+            mode, kind, oid = metadata.decode("ascii").split()
+            name = path.decode("utf-8")
+            if name in self.entries or not re.fullmatch(r"[0-9a-f]{" + str(len(self.head)) + "}", oid):
+                raise ValueError("invalid committed archive inventory")
+            self.entries[name] = (mode, kind, oid)
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("archive observation deadline")
+        return remaining
+
+    def run(self, *args: str) -> bytes:
+        return subprocess.run([*self.command, *args], env=self.env, check=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=self.remaining()).stdout
+
+    def read_more(self) -> None:
+        assert self.reader is not None and self.reader.stdout is not None
+        descriptor = self.reader.stdout.fileno()
+        if not select.select([descriptor], [], [], self.remaining())[0]:
+            raise TimeoutError("archive Git object deadline")
+        data = os.read(descriptor, 64 * 1024)
+        if not data:
+            raise ValueError("incomplete committed archive object")
+        self.buffer.extend(data)
+
+    def read_exact(self, count: int) -> bytes:
+        while len(self.buffer) < count:
+            self.read_more()
+        result = bytes(self.buffer[:count])
+        del self.buffer[:count]
+        return result
+
+    def verify(self, path: Path, raw: bytes) -> bool:
+        self.remaining()
+        entry = self.entries.get(path.relative_to(self.storage).as_posix())
+        if entry is None or entry[0] not in ("100644", "100755") or entry[1] != "blob":
+            return False
+        oid = entry[2]
+        header = f"blob {len(raw)}\0".encode("ascii")
+        digest = hashlib.new(self.algorithm, header)
+        digest.update(raw)
+        if digest.hexdigest() != oid:
+            return False
+        if oid in self.verified:
+            return True
+        if self.reader is None:
+            self.reader = subprocess.Popen([*self.command, "cat-file", "--batch"],
+                                           env=self.env, stdin=subprocess.PIPE,
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                           bufsize=0)
+        assert self.reader.stdin is not None
+        self.reader.stdin.write((oid + "\n").encode("ascii"))
+        while b"\n" not in self.buffer:
+            if len(self.buffer) > 1024:
+                raise ValueError("invalid committed object header")
+            self.read_more()
+        end = self.buffer.index(b"\n")
+        observed = self.read_exact(end + 1).rstrip(b"\n").decode("ascii").split()
+        if observed != [oid, "blob", str(len(raw))]:
+            raise ValueError("committed archive object missing or wrong type/size")
+        digest = hashlib.new(self.algorithm, header)
+        left = len(raw)
+        while left:
+            self.remaining()
+            chunk = self.read_exact(min(left, 64 * 1024))
+            digest.update(chunk)
+            left -= len(chunk)
+        if self.read_exact(1) != b"\n" or digest.hexdigest() != oid:
+            raise ValueError("committed archive object identity mismatch")
+        self.verified.add(oid)
+        return True
+
+    def close(self) -> None:
+        if self.reader is None:
+            return
+        try:
+            if self.reader.stdin is not None:
+                try:
+                    self.reader.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            try:
+                self.reader.wait(timeout=max(0, min(1, self.deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                self.reader.kill()
+                self.reader.wait()
+        finally:
+            if self.reader.stdout is not None:
+                self.reader.stdout.close()
+
+
+def observe_message_bundle(storage: Path, project: Path, canonical: Path, raw: bytes,
+                           wanted: dict, committed: ArchiveCommitSnapshot | None,
+                           deadline: float, detail: dict) -> None:
+    """Check all direct deliveries, including redacted BCC inboxes, passively."""
+    def component(name: str) -> str:
+        name = name.strip()
+        if not name or name in (".", "..") or any(char in name for char in ("/", "\\", "\0")):
+            raise ValueError("invalid mailbox identity")
+        return name
+
+    dated = canonical.relative_to(project / "messages")
+    sender = component(wanted["from"])
+    copies = [(canonical, "canonical"), (project / "agents" / sender / "outbox" / dated, "outbox")]
+    recipients = set(wanted["to"] + wanted["cc"] + wanted["bcc"])
+    copies.extend((project / "agents" / component(name) / "inbox" / dated, "inbox")
+                  for name in sorted(recipients) if not name.startswith("project:"))
+    front, _, body = raw[8:].partition(b"\n---\n\n")
+    inbox = json.loads(front)
+    inbox["bcc"] = []
+    for path, kind in copies:
+        witness = {"id": wanted["id"], "copy": kind}
+        try:
+            observed = raw if kind == "canonical" else archive_file_bytes(storage, path, deadline)
+            if kind == "inbox":
+                envelope, separator, observed_body = observed[8:].partition(b"\n---\n\n")
+                equal = (observed.startswith(b"---json\n") and bool(separator) and observed_body == body
+                         and json.dumps(json.loads(envelope), sort_keys=True)
+                         == json.dumps(inbox, sort_keys=True))
+            else:
+                equal = observed == raw
+            if not equal:
+                detail["bundle_mismatches"].append(witness)
+            elif committed is not None and committed.verify(path, observed):
+                detail["committed_copies"] += 1
+            elif committed is not None:
+                detail["uncommitted_copies"].append(witness)
+        except FileNotFoundError:
+            detail["missing_copies"].append(witness)
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError):
+            detail["bundle_mismatches"].append(witness)
+
+
 def archive_db_parity(storage: Path, database: Path,
                       deadline: float | None = None) -> tuple[bool, dict]:
-    """Independently compare canonical message bytes/metadata with one DB snapshot.
+    """Compare working and committed canonical/mailbox copies with one DB snapshot.
 
     No server request is made: polling health during the quiet interval can
     exercise the very read-driven recovery that this qualification excludes.
     Counts alone cannot detect a replaced id, body or recipient (br-kp1in.35).
+    Canonical bytes alone cannot prove mailbox delivery or a completed Git
+    commit (GH#353); missing-copy and uncommitted-bundle controls retain the
+    previous oracle's false positives. Attachment metadata is compared here,
+    but this observer does not independently inspect attachment file contents.
     Returned diagnostics contain ids and fixed field names, never message content.
-    SQLite progress and ordinary-file reads check the elapsed deadline. These
+    One pinned Git tree and streaming object reader serve the whole observation;
+    an advancing HEAD requires a later complete observation. No Git index is
+    refreshed and no per-message Git subprocess is spawned. SQLite progress,
+    Git subprocesses/pipe reads and ordinary-file reads share the deadline. These
     cooperative checks cannot interrupt a blocked OS filesystem operation or
     prove safety against an adversarial directory replacement race.
     """
@@ -238,7 +445,8 @@ def archive_db_parity(storage: Path, database: Path,
 
     detail: dict = {"db_messages": 0, "archive_messages": 0, "invalid_files": 0,
                     "missing_ids": [], "extra_ids": [], "duplicate_ids": [],
-                    "mismatches": [], "unverifiable_reply_ids": []}
+                    "mismatches": [], "unverifiable_reply_ids": [], "missing_copies": [],
+                    "bundle_mismatches": [], "uncommitted_copies": [], "committed_copies": 0}
     expected = {}
     absent_reply = set()
     try:
@@ -351,10 +559,18 @@ def archive_db_parity(storage: Path, database: Path,
 
     seen = set()
     projects = storage / "projects"
+    committed = None
     try:
         check_deadline()
         if storage.is_symlink() or projects.is_symlink():
             raise ValueError("archive root symlink")
+        try:
+            committed = ArchiveCommitSnapshot(storage, deadline)
+            detail["git_head"] = committed.head
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            detail["git_error"] = type(error).__name__
+            if time.monotonic() >= deadline:
+                raise TimeoutError("archive observation deadline") from error
 
         def walk_error(error: OSError) -> None:
             raise error  # os.walk otherwise silently omits unreadable subtrees
@@ -386,20 +602,7 @@ def archive_db_parity(storage: Path, database: Path,
                     try:
                         if path.is_symlink():
                             raise ValueError("canonical symlink")
-                        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-                        try:
-                            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                                raise ValueError("canonical entry is not a regular file")
-                            chunks = []
-                            while True:
-                                check_deadline()
-                                chunk = os.read(descriptor, 64 * 1024)
-                                if not chunk:
-                                    break
-                                chunks.append(chunk)
-                            raw = b"".join(chunks)
-                        finally:
-                            os.close(descriptor)
+                        raw = archive_file_bytes(storage, path, deadline)
                         check_deadline()
                         if not raw.startswith(b"---json\n"):
                             raise ValueError("missing envelope")
@@ -443,22 +646,34 @@ def archive_db_parity(storage: Path, database: Path,
                                 fields.append("reply_to")
                             if fields:
                                 detail["mismatches"].append({"id": message_id, "fields": fields})
+                            else:
+                                observe_message_bundle(storage, project, path, raw, wanted,
+                                                       committed, deadline, detail)
                     except TimeoutError:
                         raise
                     except (OSError, ValueError, TypeError, KeyError, AttributeError):
                         detail["invalid_files"] += 1
         check_deadline()
-    except (OSError, ValueError) as error:
+        if committed is not None:
+            detail["git_objects_verified"] = len(committed.verified)
+            if committed.run("rev-parse", "--verify", "HEAD^{commit}").strip().decode("ascii") != committed.head:
+                detail["git_head_changed"] = True
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         detail["archive_error"] = type(error).__name__
         if time.monotonic() >= deadline:
             detail["deadline_exceeded"] = True
         return False, detail
+    finally:
+        if committed is not None:
+            committed.close()
     detail["missing_ids"] = sorted(expected.keys() - seen)
     detail["extra_ids"] = sorted(seen - expected.keys())
     ok = (detail["db_messages"] == detail["archive_messages"]
           and not any(detail[key] for key in
                       ("invalid_files", "missing_ids", "extra_ids", "duplicate_ids", "mismatches",
-                       "unverifiable_reply_ids")))
+                       "unverifiable_reply_ids", "missing_copies", "bundle_mismatches",
+                       "uncommitted_copies"))
+          and "git_error" not in detail and not detail.get("git_head_changed"))
     return ok, detail
 
 
@@ -1394,7 +1609,7 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     receipt = {"schema_version": 3,
                "harness_sha256": sha256(Path(__file__)),
-               "convergence_source": "independent read-only SQLite and canonical archive; no MCP polling",
+               "convergence_source": "independent read-only SQLite and committed canonical/inbox/outbox Git content; no MCP polling",
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "host": socket.gethostname(), "cpu_governors": cpu_governors(),
                "soak_secs": SOAK_SECS,
