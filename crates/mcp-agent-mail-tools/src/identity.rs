@@ -17,10 +17,12 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool,
-    get_coalescer_bypass_read_db_pool, get_db_pool, get_read_db_pool, legacy_tool_error,
-    resolve_existing_project, resolve_project,
+    get_coalescer_bypass_read_db_pool, get_db_pool_for_request, get_read_db_pool,
+    legacy_tool_error, resolve_existing_project, resolve_project,
 };
 
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
@@ -2599,7 +2601,7 @@ Check that all parameters have valid values."
     let base_config = Config::get();
     let config = maybe_reroute_ephemeral_storage(&base_config, &human_key).unwrap_or(base_config);
     let config = &config;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     // Log identity_mode if provided (future: resolve project identity via git remotes, etc.)
     if let Some(mode) = identity_mode {
@@ -2766,7 +2768,7 @@ pub(crate) async fn register_agent_with_token_policy(
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -3215,7 +3217,7 @@ pub async fn create_agent_identity(
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -3507,7 +3509,7 @@ pub async fn retire_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -3581,7 +3583,7 @@ pub async fn unretire_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -3642,7 +3644,7 @@ pub async fn deregister_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
