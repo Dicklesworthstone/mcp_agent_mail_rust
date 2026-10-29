@@ -201,7 +201,7 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Beads 0.5.4 still embeds the 0.3 engine. Preserve its qualified WAL,
+# beads_rust 0.6.0 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
 # The mailbox uses registry FrankenSQLite 0.4.10 (no patch).
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
@@ -236,7 +236,7 @@ fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev 
 # beads_rust =0.6.0 is published and resolves from crates.io. Do not patch it
 # to a mutable sibling: even an unused patch adds that checkout to remote
 # source discovery, and a matching sibling version changes locked resolution.
-# ftui 0.7.0, franken-agent-detection 0.2.2, and tru 0.2.4 resolve from
+# ftui 0.7.0, franken-agent-detection 0.3.7, and tru 0.2.5 resolve from
 # crates.io. Their former path patches made builds depend on whatever state
 # each machine's sibling checkout happened to be in.
 # rich_rust resolves from the registry; no local console patch is required.
