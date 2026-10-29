@@ -1473,15 +1473,35 @@ fn toml_merge_refusal(
     existing: Option<&str>,
     error: &toml::de::Error,
 ) -> String {
+    // TOML's Display includes the source line, which can contain a bearer.
+    // Even its message may include user-provided keys; report only a known
+    // category and numeric location, never config text.
+    let safe_error = |error: &toml::de::Error| {
+        let category = if error.message().starts_with("duplicate key") {
+            "duplicate key"
+        } else {
+            "syntax error"
+        };
+        error.span().map_or_else(
+            || category.to_string(),
+            |span| format!("{category} at bytes {}..{}", span.start, span.end),
+        )
+    };
     existing
         .and_then(|text| toml::from_str::<toml::Value>(text).err())
         .map_or_else(
-            || format!("refusing to write {section_header}: merged TOML does not parse: {error}"),
+            || {
+                format!(
+                    "refusing to write {section_header}: merged TOML does not parse: {}",
+                    safe_error(error)
+                )
+            },
             |existing_error| {
                 format!(
                     "refusing to write {section_header}: the existing config is not valid TOML \
                      outside the section setup manages, so setup cannot repair it \
-                     ({existing_error}); fix the file by hand and rerun setup"
+                     ({}); fix the file by hand and rerun setup",
+                    safe_error(&existing_error)
                 )
             },
         )
@@ -15844,6 +15864,44 @@ url = \"http://127.0.0.1:8766/old/\"
         let message = error.to_string();
         assert!(message.contains("not valid TOML"), "{message}");
         assert!(message.contains("duplicate key"), "{message}");
+    }
+
+    #[test]
+    fn setup_toml_refusal_never_echoes_existing_or_generated_credentials() {
+        let existing_secret = "fixture-existing-bearer-secret";
+        let corrupted = format!(
+            "[other]\n\
+             http_headers = {{ Authorization = \"Bearer {existing_secret}\" }}\n\
+             http_headers = {{ Authorization = \"Bearer {existing_secret}\" }}\n"
+        );
+        let error = merge_toml_section(
+            Some(&corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fixture-replacement-token"),
+        )
+        .expect_err("unmanaged duplicate keys must still refuse publication");
+        for message in [error.to_string(), format!("{error:?}")] {
+            assert!(message.contains("not valid TOML"), "{message}");
+            assert!(message.contains("duplicate key"), "{message}");
+            assert!(message.contains("bytes "), "{message}");
+            assert!(!message.contains(existing_secret), "{message}");
+            assert!(!message.contains("fixture-replacement-token"), "{message}");
+        }
+
+        let generated_secret = "fixture-generated-bearer-secret";
+        let invalid_value =
+            format!("{{ Authorization = \"Bearer {generated_secret}\", invalid = }}");
+        let error = merge_toml_section(
+            Some("[other]\nenabled = true\n"),
+            "[mcp_servers.mcp_agent_mail]",
+            &[("http_headers".to_string(), invalid_value)],
+        )
+        .expect_err("invalid generated TOML must still refuse publication");
+        for message in [error.to_string(), format!("{error:?}")] {
+            assert!(message.contains("merged TOML does not parse"), "{message}");
+            assert!(message.contains("bytes "), "{message}");
+            assert!(!message.contains(generated_secret), "{message}");
+        }
     }
 
     #[test]
