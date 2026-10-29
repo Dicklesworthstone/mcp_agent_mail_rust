@@ -16,8 +16,8 @@ use crate::messaging::{
     enqueue_agent_semantic_index, enqueue_message_semantic_index, try_write_message_archive,
 };
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
-    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool_for_request,
+    legacy_tool_error, resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
 };
 
 /// Contact link state (tool-facing).
@@ -406,7 +406,7 @@ pub(crate) async fn request_contact_with_intro(
         Some(resolve_existing_project(ctx, &read_pool, &project_key).await?)
     };
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = if existing_source_project.is_some() {
         resolve_existing_project(ctx, &pool, &project_key).await?
@@ -625,7 +625,7 @@ pub(crate) async fn send_contact_approved_notice(
     target_project_key: &str,
     target_agent: &str,
 ) -> McpResult<()> {
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let source_project = resolve_project(ctx, &pool, source_project_key).await?;
     let target_project = resolve_project(ctx, &pool, target_project_key).await?;
     let from_row = resolve_agent(
@@ -703,7 +703,7 @@ pub async fn respond_contact(
     let from_agent =
         mcp_agent_mail_core::models::normalize_agent_name(&from_agent).unwrap_or(from_agent);
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -957,7 +957,7 @@ pub async fn set_contact_policy(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
