@@ -2009,7 +2009,7 @@ mod tests {
             let process = crate::archive_process_lock(&archive).unwrap();
             let held = process.lock().unwrap();
             let targeted = reconcile_released_reservation(cx, pool, config, &captured, "aabb");
-            assert!(targeted.unwrap_err().contains("lock budget exhausted"));
+            assert!(targeted.unwrap_err().contains("project lock busy"));
             assert_eq!(fs::read(&stable).unwrap(), before);
 
             let mut cursor = ReservationReconcileCursor::default();

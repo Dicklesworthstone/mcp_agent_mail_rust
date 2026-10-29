@@ -1771,6 +1771,10 @@ mod tests {
             let (release_tx, release_rx) = mpsc::channel();
             let owner = std::thread::spawn(move || {
                 let _held = process.lock().unwrap();
+                // Latch the real project-lock lookup after mutation admission.
+                // Its window then stays observable until shutdown is requested,
+                // even when a fenced repair only tries the busy project once.
+                let lookup = crate::ARCHIVE_LOCK_MAP.get().unwrap().write();
                 ready_tx.send(()).unwrap();
                 // Observe the actual repair mutation window, not a timed guess
                 // about when the worker will reach the held project mutex.
@@ -1780,6 +1784,7 @@ mod tests {
                 }
                 let observed = crate::archive_mutations_active() > 0;
                 cancel.store(true, Ordering::Release);
+                drop(lookup);
                 let released = release_rx.recv_timeout(Duration::from_secs(10));
                 (observed, released)
             });

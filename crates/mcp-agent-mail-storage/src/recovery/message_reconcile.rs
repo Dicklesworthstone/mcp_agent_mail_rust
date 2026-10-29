@@ -110,10 +110,10 @@ pub fn reconcile_message_bundle(
 ///
 /// Uses the same validation, no-clobber publication and exact Git verification
 /// as [`reconcile_message_bundle`]. Immutable history is checked before the
-/// non-blocking global publication-fence admission; project mutex/flock waits
-/// share a 250 ms acquisition budget.
-/// The worker stop flag and Cx are checked before admission, while waiting for
-/// project locks, during canonical identity scans, between file publications,
+/// non-blocking global publication-fence admission; project mutex/flock
+/// contention also defers immediately instead of waiting with that fence held.
+/// The worker stop flag and Cx are checked before and after lock admission,
+/// during canonical identity scans, between file publications,
 /// and before committing. Completed
 /// files survive cancellation and are revalidated on retry, never redelivered.
 ///

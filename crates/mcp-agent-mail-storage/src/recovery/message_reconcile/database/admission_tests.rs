@@ -1760,6 +1760,10 @@ fn retention_admission_shutdown_during_project_wait_preserves_unconsumed_work() 
         let (release_tx, release_rx) = mpsc::channel();
         let owner = std::thread::spawn(move || {
             let _held = process.lock().unwrap();
+            // Retention reaches this real registry only after taking the
+            // publication fence. Latch that boundary until stop is set, so
+            // try-only project admission cannot end the observed window early.
+            let lookup = crate::ARCHIVE_LOCK_MAP.get().unwrap().write();
             ready_tx.send(()).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while crate::archive_mutations_active() == 0 && std::time::Instant::now() < deadline {
@@ -1767,6 +1771,7 @@ fn retention_admission_shutdown_during_project_wait_preserves_unconsumed_work() 
             }
             let observed = crate::archive_mutations_active() > 0;
             cancel.store(true, Ordering::Release);
+            drop(lookup);
             (observed, release_rx.recv_timeout(Duration::from_secs(5)))
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();

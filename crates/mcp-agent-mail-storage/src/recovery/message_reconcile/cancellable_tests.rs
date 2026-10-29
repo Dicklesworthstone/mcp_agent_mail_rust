@@ -191,10 +191,8 @@ fn a_busy_project_does_not_prevent_another_message_bundle_from_recovering() {
         &AtomicBool::new(false),
     );
     assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("lock budget exhausted")
+        matches!(refused, Err(StorageError::LockContention { ref message })
+        if message.contains("project lock busy"))
     );
     assert!(paths.iter().all(|path| !path.exists()));
     let progressed = reconcile_message_bundle_cancellable(
@@ -247,10 +245,8 @@ fn a_held_flock_keeps_its_owner_evidence_and_all_message_destinations() {
         &AtomicBool::new(false),
     );
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("lock budget exhausted")
+        matches!(result, Err(StorageError::LockContention { ref message })
+        if message.contains("project lock busy"))
     );
     assert_eq!(fs::read(&lock_path).unwrap(), b"foreign lock evidence");
     assert_eq!(fs::read(&owner_path).unwrap(), b"foreign owner evidence");

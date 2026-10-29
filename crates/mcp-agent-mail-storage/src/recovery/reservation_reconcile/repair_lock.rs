@@ -1,8 +1,11 @@
 //! Cooperative, bounded lock admission for replayable archive repair.
 //!
-//! Use the same process mutex and filesystem lock as ordinary archive writers,
-//! but spend one short budget across both waits. Contention defers repair; it
-//! never authorizes breaking a live lock or publishing without ownership.
+//! Use the same process mutex and filesystem lock as ordinary archive writers.
+//! A caller already holding the global publication fence must try each lock
+//! once, so a busy project cannot stall publication in unrelated projects.
+//! Outside a mutation window, spend one short budget across both waits.
+//! Contention defers repair; it never authorizes breaking a live lock or
+//! publishing without ownership.
 //! Filesystem operations, registry access, and the admitted closure are not
 //! subject to a hard deadline. Repair callers first try the archive mutation
 //! fence with `try_begin_at`; the acquired native guard spans this lock scope.
@@ -35,8 +38,9 @@ pub(super) fn with_repair_lock<T>(
 
 impl ProjectArchive {
     /// Recovery-only admission shared with message repair. Callers retain the
-    /// native publication fence before entering; both project lock layers use
-    /// the same budget and ownership protocol as terminal reservation repair.
+    /// native publication fence before entering, so both project lock layers
+    /// refuse contention immediately. The ordinary ownership protocol and
+    /// cancellation checks still apply to every successful acquisition.
     pub(in crate::recovery) fn with_repair_lock<T>(
         &self,
         cancelled: impl FnMut() -> bool,
@@ -48,6 +52,12 @@ impl ProjectArchive {
 
 fn deferred() -> StorageError {
     StorageError::LockTimeout("archive repair lock budget exhausted; repair deferred".to_string())
+}
+
+fn contended() -> StorageError {
+    StorageError::LockContention {
+        message: "archive repair project lock busy; repair deferred".to_string(),
+    }
 }
 
 fn remaining(
@@ -77,6 +87,12 @@ fn with_budget<T>(
 ) -> Result<T> {
     let started = Instant::now();
     remaining(started, budget, &mut cancelled)?;
+    // Repair callers have already admitted the native mutation window. Never
+    // spend its project-lock budget while excluding every other project from
+    // the global fence. In particular, a preparation owner may itself need
+    // that fence after dropping its project lock. Preserve fence -> project
+    // ordering, but let the caller's normal retry lane revisit contention.
+    let fenced = crate::ARCHIVE_MUTATION_DEPTH.with(|depth| depth.get() != 0);
     let process_lock = crate::archive_process_lock(archive)?;
     let project_root = crate::archive_project_root_checked(archive)?;
     let _process = loop {
@@ -84,6 +100,7 @@ fn with_budget<T>(
         match process_lock.try_lock() {
             Ok(guard) => break guard,
             Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(TryLockError::WouldBlock) if fenced => return Err(contended()),
             Err(TryLockError::WouldBlock) => std::thread::sleep(left.min(WAIT_SLICE)),
         }
     };
@@ -93,10 +110,15 @@ fn with_budget<T>(
         // it must not extend a short recovery budget. Short slices also let
         // caller cancellation interrupt contention on a foreign process lock.
         let mut candidate = FileLock::new(project_root.join(".archive.lock"))
-            .with_timeout(left.min(WAIT_SLICE))
+            .with_timeout(if fenced {
+                Duration::ZERO
+            } else {
+                left.min(WAIT_SLICE)
+            })
             .with_max_retries(0);
         match candidate.acquire() {
             Ok(()) => break candidate,
+            Err(StorageError::LockTimeout(_)) if fenced => return Err(contended()),
             Err(StorageError::LockTimeout(_)) => {}
             Err(error) => return Err(error),
         }
