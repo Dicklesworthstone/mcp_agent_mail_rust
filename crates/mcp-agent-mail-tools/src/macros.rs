@@ -26,8 +26,8 @@ use crate::messaging::InboxMessage;
 use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
-    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool_for_request,
+    legacy_tool_error, resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
 };
 use mcp_agent_mail_db::micros_to_iso;
 use serde::de::DeserializeOwned;
@@ -363,7 +363,7 @@ pub async fn macro_prepare_thread(
     // gate refuses to serve while any writer lease is active, so holding
     // `pool` across their awaits self-deadlocks until the 120 s snapshot
     // deadline (br-097bj).
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project_row = resolve_project(ctx, &pool, &project_key).await?;
     let project = ProjectResponse {
         id: project_row.id.unwrap_or(0),
@@ -802,7 +802,7 @@ pub async fn macro_contact_handshake(
     }
 
     ctx.ensure_live()?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     // register_if_missing=false means nothing is created implicitly: a missing
     // source project is NOT_FOUND here, before the contact flow's own check.
     let source_project = if register_if_missing == Some(false) {
