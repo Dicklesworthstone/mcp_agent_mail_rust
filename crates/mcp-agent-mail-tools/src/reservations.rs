@@ -33,9 +33,12 @@ use crate::resources::{
     reservation_compute_pattern_activity, reservation_open_repo_root,
     reservation_project_workspace_path,
 };
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
-    legacy_tool_error, resolve_agent, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, ensure_request_live,
+    get_authoritative_live_db_pool, get_db_pool_for_request, legacy_tool_error, resolve_agent,
+    resolve_project,
 };
 
 const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -1976,7 +1979,7 @@ pub async fn file_reservation_paths(
     let is_exclusive = exclusive.unwrap_or(true);
     let reason_str = reason.unwrap_or_default();
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     // An orphaned-project placeholder names data whose project row is gone;
     // it is readable but cannot authorize a new reservation.
@@ -2689,13 +2692,14 @@ pub async fn release_file_reservations(
 
     // Deferred releases carry authority beyond this request's lifetime. A
     // database outage cannot authorize a constrained actor by name alone.
-    let pool = match get_db_pool() {
+    let pool = match get_db_pool_for_request(ctx) {
         Ok(pool) => pool,
+        Err(error) if error.code == McpErrorCode::RequestCancelled => return Err(error),
         Err(error) => {
             if !authorization.permits_unresolved_actor(None) {
                 return Err(error);
             }
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2713,7 +2717,7 @@ pub async fn release_file_reservations(
             if !authorization.permits_unresolved_actor(None) {
                 return Err(error);
             }
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2744,7 +2748,7 @@ pub async fn release_file_reservations(
             if !authorization.permits_unresolved_actor(Some(project_id)) {
                 return Err(error);
             }
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2771,7 +2775,7 @@ pub async fn release_file_reservations(
         {
             asupersync::Outcome::Ok(rows) => rows,
             asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
-                ctx.ensure_live()?;
+                ensure_request_live(ctx)?;
                 return queued_release_intent_response(
                     &config,
                     &project_key,
@@ -2845,7 +2849,7 @@ pub async fn release_file_reservations(
     {
         asupersync::Outcome::Ok(rows) => rows,
         asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2974,7 +2978,7 @@ pub async fn renew_file_reservations(
         }
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let normalized_paths = normalize_filter_paths(&project.human_key, paths)?;
@@ -3127,7 +3131,7 @@ pub async fn force_release_file_reservation(
 
     let should_notify = notify_previous.unwrap_or(true);
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let actor = resolve_agent(
