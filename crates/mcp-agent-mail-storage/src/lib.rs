@@ -15465,6 +15465,30 @@ fn archive_project_root_canonical_checked(archive: &ProjectArchive) -> Result<Pa
 }
 
 fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    // Retain the precise component and native cause: the caller's full path
+    // alone cannot identify a failing intermediate Windows volume/root probe.
+    #[derive(Debug)]
+    struct ComponentMetadataError {
+        path: PathBuf,
+        source: std::io::Error,
+    }
+
+    impl std::fmt::Display for ComponentMetadataError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "symlink_metadata({:?}): {}",
+                self.path, self.source
+            )
+        }
+    }
+
+    impl std::error::Error for ComponentMetadataError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.source)
+        }
+    }
+
     let mut current = if path.is_absolute() {
         PathBuf::new()
     } else {
@@ -15478,7 +15502,7 @@ fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
                 current.push(prefix.as_os_str());
                 // A canonical Windows drive prefix (\\?\C:) alone names a
                 // volume, not its root directory. symlink_metadata on that
-                // intermediate path fails with ERROR_INVALID_FUNCTION. Query
+                // intermediate path can fail with ERROR_INVALID_FUNCTION. Query
                 // the complete root, then every real descendant as before.
                 // Bare and drive-relative prefixes retain their usual checks.
                 if matches!(components.peek(), Some(Component::RootDir)) {
@@ -15496,7 +15520,15 @@ fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
             Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+            Err(err) => {
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    ComponentMetadataError {
+                        path: current,
+                        source: err,
+                    },
+                ));
+            }
         }
     }
 
@@ -15534,6 +15566,81 @@ mod path_prefix_tests {
                 path.display()
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_roots_validate_in_dos_and_verbatim_spelling() {
+        use std::path::{Component, PathBuf, Prefix};
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(temp.path()).unwrap();
+        let Some(Component::Prefix(prefix)) = canonical.components().next() else {
+            panic!("canonical Windows fixture has no prefix: {canonical:?}");
+        };
+        let Prefix::VerbatimDisk(drive) = prefix.kind() else {
+            panic!("drive-root regression requires a local drive fixture: {canonical:?}");
+        };
+        for root in [
+            PathBuf::from(format!("{}:\\", char::from(drive))),
+            PathBuf::from(format!("\\\\?\\{}:\\", char::from(drive))),
+        ] {
+            assert!(fs::symlink_metadata(&root).unwrap().is_dir());
+            assert!(
+                !path_existing_prefix_has_symlink(&root).unwrap(),
+                "the complete root must be inspected without probing its bare drive prefix: {root:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_long_verbatim_paths_keep_symlink_checks() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let mut directory = root.clone();
+        for index in 0..6 {
+            directory.push(format!("checkpoint-component-{index}-{}", "x".repeat(32)));
+            fs::create_dir(&directory).unwrap();
+        }
+        assert!(directory.as_os_str().encode_wide().count() > 260);
+        let evidence = directory.join("checkpoint.json");
+        fs::write(&evidence, b"unchanged checkpoint evidence").unwrap();
+        for path in [
+            directory.clone(),
+            evidence.clone(),
+            directory.join("missing-checkpoint.json"),
+            directory.join("missing-parent").join("checkpoint.json"),
+        ] {
+            assert!(
+                !path_existing_prefix_has_symlink(&path).unwrap(),
+                "a long canonical path must remain usable: {path:?}"
+            );
+        }
+
+        let parent = directory.join("linked-parent");
+        let leaf = directory.join("linked-leaf");
+        let dangling = directory.join("dangling-leaf");
+        symlink_dir(&root, &parent).unwrap();
+        symlink_file(&evidence, &leaf).unwrap();
+        symlink_file(directory.join("missing-target"), &dangling).unwrap();
+        for path in [
+            parent.join("missing").join("checkpoint.json"),
+            leaf,
+            dangling,
+        ] {
+            assert!(
+                path_existing_prefix_has_symlink(&path).unwrap(),
+                "extended-length support must not bypass symlink refusal: {path:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(evidence).unwrap(),
+            b"unchanged checkpoint evidence"
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -15597,9 +15704,20 @@ mod path_prefix_tests {
     fn invalid_metadata_is_not_treated_as_an_absent_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
-        let error = path_existing_prefix_has_symlink(&root.join("invalid\0name"))
+        let component = root.join("invalid\0name");
+        let expected = fs::symlink_metadata(&component).unwrap_err();
+        let error = path_existing_prefix_has_symlink(&component.join("checkpoint.json"))
             .expect_err("metadata errors must fail closed");
         assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.kind(), expected.kind());
+        assert!(error.to_string().contains("symlink_metadata"));
+        assert!(error.to_string().contains(&format!("{component:?}")));
+        assert!(!error.to_string().contains("checkpoint.json"));
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the native metadata error must remain in the source chain");
+        assert_eq!(source.kind(), expected.kind());
+        assert_eq!(source.raw_os_error(), expected.raw_os_error());
     }
 }
 
