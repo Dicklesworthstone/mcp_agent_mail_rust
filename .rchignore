@@ -1,12 +1,14 @@
-.git/
-.beads/
-.codex-target/
-.doctor/
-.cargo-home-release-prep/
-**/.fastembed_cache/
-target/
-.rch-target/
-beads_compliance_audit/
-test_logs/
+# Directory patterns must also match GNU tar, used by native Windows RCH.
+.git
+.beads
+.codex-target
+.doctor
+.cargo-home-release-prep
+**/.fastembed_cache
+target
+.rch-target
+beads_compliance_audit
+test_logs
+# This tree contains six tracked perf JSON inputs; do not broaden its exclusion.
 tests/artifacts/
-tests/artifacts_native/
+tests/artifacts_native
