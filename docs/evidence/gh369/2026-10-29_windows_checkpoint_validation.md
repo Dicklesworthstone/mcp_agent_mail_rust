@@ -94,7 +94,8 @@ publication after ownership becomes available.
 | Workspace formatting | Passed | `cargo fmt --all -- --check` |
 | Workspace check across all targets | Passed | `cargo check --locked --offline --workspace --all-targets` |
 | Workspace Clippy across all targets | Passed | `cargo clippy --locked --offline --workspace --all-targets -- -D warnings` |
-| Separate production-only workspace check | Resource-limited; not a pass | The Asupersync 0.5.0 compiler was killed by SIGKILL before the workspace check completed; a constrained retry was started |
+| Separate production-only workspace check | Blocked, exit 101; not a pass | The Asupersync 0.5.0 compiler was killed by SIGKILL before the workspace check completed |
+| Affected portable production-library check | Blocked, exit 101; not a pass | The exact storage-library production command below also received SIGKILL while checking Asupersync, without a Rust diagnostic |
 
 The full storage runs used the pinned compiler and the portable feature graph.
 The container has an 8 GiB memory limit. The successful checkpoint build used
@@ -104,6 +105,10 @@ compiler resource use, not production source, selected features, or test bodies.
 The workspace checks and Clippy used one job with debug info and incremental
 compilation disabled and optimization level zero. Cargo reported a separate
 future-compatibility notice for the upstream `proc-macro-error2` dependency.
+The shared container recorded out-of-memory kills, which supports resource
+pressure as the explanation for the production compiler failures; those
+failures do not establish a source-level defect or qualify either production
+build. An additional retry without a completion receipt is not counted.
 
 The scratch Store harness retained 43 byte-identical excerpts from five
 production files, with recorded ranges and SHA-256 digests. It used actual
@@ -147,3 +152,19 @@ cargo test --locked -p mcp-agent-mail-storage --no-default-features --features p
 Native Windows symlink behavior, source/lock identity on NTFS, and the complete
 live-database recovery path must pass that native lane. No native UNC share or
 arbitrary power-loss coverage is claimed.
+
+## Publication and outstanding native execution
+
+The two substantive corrections were committed directly to `main`, preserving
+concurrent unrelated changes:
+
+- [`e460081d`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/e460081d6ce23e637359e4b1747b1b21dbcf8719): rooted Windows prefix validation, adversarial path tests, and native CI entry points.
+- [`e795a951`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/e795a9511f6ad01eaf81c0b8f2f99646dfe83e66): checkpoint ownership, operation-level diagnostics, lifecycle regressions, and execution evidence.
+
+The Actions runs API returned zero runs for both published commit SHAs during
+this session. The workflow has matching `push` filters and `workflow_dispatch`,
+but no native Windows job result was obtained. The available GitHub connection
+does not expose workflow dispatch, and the workflow browser page was signed
+out. This does not establish whether Actions or the workflow is disabled.
+An authenticated manual dispatch of Archive Fsync Matrix on the corrected
+`main` is the remaining native qualification step.
