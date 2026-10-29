@@ -1,0 +1,432 @@
+{
+  "schema": "gh353-native-retry-v1",
+  "status": "BLOCKED_UNQUALIFIED_CANDIDATE",
+  "source_base": "65852eb86673d612ddf1d222ce9209f1a7d3f18b",
+  "production_patch_applied_to_main": false,
+  "native_test_cases_executed": 0,
+  "native_compile_verdict": "Asupersync 0.5.0 rustc was killed by SIGKILL before any changed-crate or test verdict.",
+  "resource_observations": {
+    "cgroup_memory_limit_bytes": 8589934592,
+    "swap_configured": false,
+    "observed_rustc_high_water_kib": 6849744,
+    "cgroup_oom_kill_count_before": 1,
+    "cgroup_oom_kill_count_after": 2,
+    "compiler_allocator_tuning_only": "narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true"
+  },
+  "completed_checks": {
+    "cargo_fmt_all_check": {
+      "returncode": 0,
+      "toolchain": "nightly-2026-08-31"
+    },
+    "git_diff_check": {
+      "returncode": 0
+    },
+    "shared_baseline_fixture_blocks": 8
+  },
+  "claims": {
+    "incident_reproduced": false,
+    "request_latency_improvement_measured": false,
+    "publication_fence_starvation_fixed": false,
+    "busy_snapshot_fixed": false,
+    "quiet_convergence_qualified": false,
+    "full_swarm_qualified": false
+  },
+  "next_gate": "Run scripts/ci/qualify_issue353.py on a native host with sufficient memory. All candidate tests, expected baseline failures, safety controls, workspace checks, and Clippy must complete before applying the production patch.",
+  "qualification_receipt": {
+    "schema": 1,
+    "base": "65852eb86673d612ddf1d222ce9209f1a7d3f18b",
+    "toolchain": "nightly-2026-08-31",
+    "status": "failed",
+    "patches": {
+      "candidate": [
+        "2026-10-28_gh353_request_latency_candidate.patch",
+        "322ea263e8f5971ca85705233f4863615f0625c80ddc715d8b206914207e3349"
+      ],
+      "baseline": [
+        "2026-10-28_gh353_request_latency_baseline.patch",
+        "ca5e31e8a21f634ed8bb3b9fda3d38ed0ae52f06ef393c1b5e4fd726d9d681f4"
+      ]
+    },
+    "steps": [
+      {
+        "label": "base-present",
+        "argv": [
+          "git",
+          "cat-file",
+          "-e",
+          "65852eb86673d612ddf1d222ce9209f1a7d3f18b^{commit}"
+        ],
+        "log": "base-present.log",
+        "status": "passed",
+        "free_bytes_before": 19652329472,
+        "returncode": 0,
+        "elapsed_seconds": 0.006,
+        "free_bytes_after": 19652317184
+      },
+      {
+        "label": "main-native-source-matches-base",
+        "argv": [
+          "git",
+          "diff",
+          "--exit-code",
+          "65852eb86673d612ddf1d222ce9209f1a7d3f18b",
+          "HEAD",
+          "--",
+          "crates",
+          "Cargo.lock",
+          "Cargo.toml",
+          "rust-toolchain.toml",
+          ".cargo/config.toml"
+        ],
+        "log": "main-native-source-matches-base.log",
+        "status": "passed",
+        "free_bytes_before": 19652317184,
+        "returncode": 0,
+        "elapsed_seconds": 0.005,
+        "free_bytes_after": 19652317184
+      },
+      {
+        "label": "candidate-worktree",
+        "argv": [
+          "git",
+          "worktree",
+          "add",
+          "--detach",
+          "/workspace/scratch/b1120803451c/gh353-native-tuned-20261029/candidate",
+          "65852eb86673d612ddf1d222ce9209f1a7d3f18b"
+        ],
+        "log": "candidate-worktree.log",
+        "status": "passed",
+        "free_bytes_before": 19652317184,
+        "returncode": 0,
+        "elapsed_seconds": 0.868,
+        "free_bytes_after": 19553927168
+      },
+      {
+        "label": "candidate-patch",
+        "argv": [
+          "git",
+          "apply",
+          "--index",
+          "/workspace/scratch/b1120803451c/mcp_agent_mail_rust/docs/evidence/gh353/2026-10-28_gh353_request_latency_candidate.patch"
+        ],
+        "log": "candidate-patch.log",
+        "status": "passed",
+        "free_bytes_before": 19553927168,
+        "returncode": 0,
+        "elapsed_seconds": 0.215,
+        "free_bytes_after": 19553861632
+      },
+      {
+        "label": "baseline-worktree",
+        "argv": [
+          "git",
+          "worktree",
+          "add",
+          "--detach",
+          "/workspace/scratch/b1120803451c/gh353-native-tuned-20261029/baseline",
+          "65852eb86673d612ddf1d222ce9209f1a7d3f18b"
+        ],
+        "log": "baseline-worktree.log",
+        "status": "passed",
+        "free_bytes_before": 19553857536,
+        "returncode": 0,
+        "elapsed_seconds": 0.469,
+        "free_bytes_after": 19455504384
+      },
+      {
+        "label": "baseline-patch",
+        "argv": [
+          "git",
+          "apply",
+          "--index",
+          "/workspace/scratch/b1120803451c/mcp_agent_mail_rust/docs/evidence/gh353/2026-10-28_gh353_request_latency_baseline.patch"
+        ],
+        "log": "baseline-patch.log",
+        "status": "passed",
+        "free_bytes_before": 19455504384,
+        "returncode": 0,
+        "elapsed_seconds": 0.215,
+        "free_bytes_after": 19455455232
+      },
+      {
+        "label": "candidate-compile-tests",
+        "argv": [
+          "cargo",
+          "+nightly-2026-08-31",
+          "test",
+          "--locked",
+          "--no-run",
+          "--lib",
+          "--message-format=json",
+          "-p",
+          "mcp-agent-mail-db",
+          "-p",
+          "mcp-agent-mail-storage",
+          "-p",
+          "mcp-agent-mail-tools"
+        ],
+        "log": "candidate-compile-tests.log",
+        "status": "failed",
+        "free_bytes_before": 19455451136,
+        "returncode": 101,
+        "elapsed_seconds": 1197.699,
+        "free_bytes_after": 16658587648
+      }
+    ],
+    "sources": {
+      "candidate": {
+        "tree": "9e08fedee2d33c7d9fcaa0fc9321f2f382cb05bc",
+        "sha256": {
+          "crates/mcp-agent-mail-db/src/write_barrier.rs": "66da32b378c9787530b5f52b8254b4252ae8d8f134f93f0ba5ab51ed42709214",
+          "crates/mcp-agent-mail-storage/src/lib.rs": "2dda2c0cba616fae150cf2809dc00f93fd0e7e99422a79981d257599ba6f961e",
+          "crates/mcp-agent-mail-storage/src/recovery/active_reservations.rs": "fc77838923f474f4de920677b55d9012dfbedf33fb3cdd49e157a76a37effab1",
+          "crates/mcp-agent-mail-storage/src/recovery/message_reconcile.rs": "2f83bed3ea846e18758a6d4d5a3e39b440216109e93d51cfdf97c65c5a1c224b",
+          "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/cancellable_tests.rs": "34e08efba1114da981cf78c8c05e7ddc6409a52269e1683c2174121eb3d50d34",
+          "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/admission_tests.rs": "58522d2015ef507e141160b6db0b989412a6370e902c6ac215532765b3d75dcf",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "1e3c4c85e9e5efa3b969096b734b7b9748bb634b7a7706a5a7731d81b32a160e",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/repair_lock.rs": "72f838a7d20c1a3c0251072dd3a5cd53a723951a0ced38f60756e2de25fd9a7f",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/repair_lock/fence.rs": "72df0e00bcaad518103b40b0e87562439e63df3ec020eb2946692788bce4cc55",
+          "crates/mcp-agent-mail-tools/src/archive_read.rs": "edb8b1058d9d58028b976c27365b0f7bc2c34771613427dbb61c28fbda4b5504",
+          "crates/mcp-agent-mail-tools/src/build_slots.rs": "6ae5501f4c10a519171624bfda4aca22b935ba9c56a8afb9067cc672c1e4e311",
+          "crates/mcp-agent-mail-tools/src/contacts.rs": "dcc1b034dcaeb60fa97c6a5f410067bea0a24233af50c8e00199040ee596752b",
+          "crates/mcp-agent-mail-tools/src/identity.rs": "8d6d69df02fd6f46f678ba039f64e43219c7dc1be270fd9b7cb59e60d19e7395",
+          "crates/mcp-agent-mail-tools/src/lib.rs": "5e75a14fe24e75c456bd870d22bd6482fefe56f111ab569ee3da3b9721f950f5",
+          "crates/mcp-agent-mail-tools/src/macros.rs": "641b3a435ac06b793dd4c22c914be4f2d6adebc80ae4df9f594c9355cdf08d21",
+          "crates/mcp-agent-mail-tools/src/messaging.rs": "7b30346f51e0cc808d528c5b3b1ad11f87c0d9c5f1a7371fbe5117af6f0a8648",
+          "crates/mcp-agent-mail-tools/src/products.rs": "993ab43354d2eed8c88c39b954b7c8e1c1a1815899abe6226a9f5b7466ae4e86",
+          "crates/mcp-agent-mail-tools/src/reservations.rs": "fde340cd2f914664d76a99132cffde0b2d013504fc1020da33e02cf6caed6885",
+          "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+          "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+          "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+          ".cargo/config.toml": "98ca4db9d784aab50359ab6ca0c48e85c787f3f8692b28f4ce2b6fa29917489b"
+        }
+      },
+      "baseline": {
+        "tree": "2b60b14ac3396892bfa1c034080f7a5220595bf7",
+        "sha256": {
+          "crates/mcp-agent-mail-storage/src/lib.rs": "7c5e66a507dec167caf14148a102f90edc6a9bf9591403c135e59521ad21718b",
+          "crates/mcp-agent-mail-storage/src/recovery/active_reservations.rs": "fc77838923f474f4de920677b55d9012dfbedf33fb3cdd49e157a76a37effab1",
+          "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/admission_tests.rs": "58522d2015ef507e141160b6db0b989412a6370e902c6ac215532765b3d75dcf",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/repair_lock/fence.rs": "72df0e00bcaad518103b40b0e87562439e63df3ec020eb2946692788bce4cc55",
+          "crates/mcp-agent-mail-tools/src/messaging.rs": "9d1afc623583db75bdb0e5edc8cbec01a8a9b91cb83c78526ad247a73867b2db",
+          "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+          "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+          "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+          ".cargo/config.toml": "98ca4db9d784aab50359ab6ca0c48e85c787f3f8692b28f4ce2b6fa29917489b"
+        }
+      }
+    },
+    "claims": {
+      "full_swarm_qualified": false,
+      "incident_reproduced": false
+    },
+    "build_environment": {
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "CARGO_TARGET_DIR": "/workspace/scratch/b1120803451c/gh353-native-20261029/target",
+      "MALLOC_CONF": "narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true"
+    },
+    "identical_shared_fixture_blocks": 8,
+    "error": "RuntimeError: prerequisite failed: candidate-compile-tests"
+  },
+  "static_review_receipt": {
+    "added_line_review": {
+      "all_findings_in_cfg_test_scopes": true,
+      "assessment": "Test fixture assertions, expected error unwraps, owned synchronization handle clones, synchronous temporary fixture I/O, fixed test subprocess invocation, and diagnostic output. Informational division matches are string path slashes. No material added production-line finding was identified.",
+      "finding_count": 249,
+      "findings_anchored_to_added_production_lines": 0,
+      "scope_boundaries": {
+        "crates/mcp-agent-mail-db/src/write_barrier.rs": {
+          "end": 1641,
+          "kind": "cfg(test) module",
+          "start": 607
+        },
+        "crates/mcp-agent-mail-storage/src/lib.rs": {
+          "end": 30460,
+          "kind": "cfg(test) module",
+          "start": 15742
+        },
+        "crates/mcp-agent-mail-storage/src/recovery/active_reservations.rs": {
+          "end": 2006,
+          "kind": "cfg(test) module",
+          "start": 921
+        },
+        "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/admission_tests.rs": {
+          "end": 1812,
+          "kind": "module imported under cfg(test)",
+          "parent": "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database.rs",
+          "parent_lines": [
+            8,
+            9
+          ],
+          "start": 1
+        },
+        "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": {
+          "end": 2293,
+          "kind": "cfg(test) module",
+          "start": 869
+        },
+        "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/repair_lock/fence.rs": {
+          "end": 635,
+          "kind": "cfg(test) module",
+          "start": 118
+        },
+        "crates/mcp-agent-mail-tools/src/messaging.rs": {
+          "end": 11457,
+          "kind": "cfg(test) module",
+          "start": 6342
+        }
+      },
+      "severity_counts": {
+        "info": 28,
+        "warning": 221
+      }
+    },
+    "artifacts": {
+      "added-line-findings.json": {
+        "bytes": 137493,
+        "sha256": "4f5f4adca1306279b50d486d4d61eded42756a2ef51ba742171ecf92eb73f679"
+      },
+      "critical-baseline-attribution.json": {
+        "bytes": 984,
+        "sha256": "ba0318aebc2ad233609d3b67dba83ac22c0204935176982f93008af0847d901a"
+      },
+      "manifest.json": {
+        "bytes": 16940,
+        "sha256": "2c3e53e4e77037b07b64d16d0c672bd3bc2f83db8bb2519729e1ac2ad0913f92"
+      },
+      "source.diff": {
+        "bytes": 97011,
+        "sha256": "6fb732c659f8f7a279901928da433504d48d005d3201a1a8e973ed88dca6cf7e"
+      },
+      "stderr.log": {
+        "bytes": 416,
+        "sha256": "53be890e11d6d09344cf148aa401372a90478b08c58eeeab4a151444af0fcbee"
+      },
+      "stdout.json": {
+        "bytes": 7335244,
+        "sha256": "864f584b67397210a54d2d957a206098c399a0cfeb2281de91159ba966d5f15a"
+      }
+    },
+    "configuration": {
+      "automatic_updates": false,
+      "cargo_phases": "not evaluated; --no-cargo",
+      "category_suppression": false,
+      "jobs": 1,
+      "scan_cache_reads_and_writes": false,
+      "scratch_retained": true,
+      "severity": "default"
+    },
+    "critical_attribution": {
+      "all_three_preexisting": true,
+      "findings": [
+        {
+          "added_line": false,
+          "baseline_line": 1314,
+          "code": ".unwrap_or_else(|error| panic!(\"failed to spawn wbq-drain thread: {error}\"));",
+          "current_line": 1314,
+          "exact_five_line_baseline_context": true,
+          "file": "crates/mcp-agent-mail-storage/src/lib.rs",
+          "rule": "rust.ownership.panic-macro"
+        },
+        {
+          "added_line": false,
+          "baseline_line": 2570,
+          "code": ".unwrap_or_else(|error| panic!(\"failed to spawn archive-backlog-drain thread: {error}\"));",
+          "current_line": 2593,
+          "exact_five_line_baseline_context": true,
+          "file": "crates/mcp-agent-mail-storage/src/lib.rs",
+          "rule": "rust.ownership.panic-macro"
+        },
+        {
+          "added_line": false,
+          "baseline_line": 5585,
+          "code": "panic!(\"failed to spawn commit-coalescer-{worker_idx} thread: {error}\")",
+          "current_line": 5608,
+          "exact_five_line_baseline_context": true,
+          "file": "crates/mcp-agent-mail-storage/src/lib.rs",
+          "rule": "rust.ownership.panic-macro"
+        }
+      ],
+      "method": "Map unchanged source lines through the frozen diff to HEAD; compare exact five-line contexts. This is direct source attribution, not a separate baseline scanner run."
+    },
+    "execution": {
+      "elapsed_seconds": 117.299,
+      "exit_code": 1,
+      "failed_modules": [],
+      "source_hashes_match_before_after": true,
+      "source_hashes_still_match_at_review": true,
+      "status": "ok",
+      "stopped_for_memory_pressure": false
+    },
+    "full_file_totals": {
+      "critical": 3,
+      "files": 19,
+      "info": 2895,
+      "warning": 9971
+    },
+    "limitations": [
+      "The default scanner gate exited 1; this receipt does not relabel it as a clean pass.",
+      "Full-file historical warnings remain in the raw output. Only critical source attribution and findings anchored to added lines were classified.",
+      "Static analysis is not native execution or proof of request latency, archive fairness, full swarm convergence, durability, or BusySnapshot correction.",
+      "The Python result covers the qualification runner only; it does not replace historical observer-scanner limitations."
+    ],
+    "module_summaries": [
+      {
+        "critical": 3,
+        "files": 18,
+        "info": 2855,
+        "language": "rust",
+        "status": "ok",
+        "warning": 9971
+      },
+      {
+        "critical": 0,
+        "files": 1,
+        "info": 40,
+        "language": "python",
+        "status": "ok",
+        "warning": 0
+      }
+    ],
+    "reviewed_utc": "2026-10-29T17:31:25.918936+00:00",
+    "scanner": {
+      "name": "Ultimate Bug Scanner",
+      "revision": "b4113a766bb013196a763f27418a06e77a9c82c4",
+      "version": "5.5.25"
+    },
+    "schema": "gh353-static-review-v1",
+    "scope": {
+      "frozen_diff": "source.diff",
+      "python_files": 1,
+      "rust_files": 18,
+      "source_hashes": "manifest.json"
+    },
+    "source_head": "65852eb86673d612ddf1d222ce9209f1a7d3f18b"
+  },
+  "local_raw_artifacts": {
+    "gh353-evidence-tuned-20261029/receipt.json": {
+      "bytes": 8517,
+      "sha256": "69d088bd52b98e871e502254603e5b25c2386b648fc23bf554be4647426e75c5"
+    },
+    "gh353-evidence-tuned-20261029/candidate-compile-tests.log": {
+      "bytes": 246771,
+      "sha256": "032f933564bc83ce2e4e20ad7b2be06eb1e7732d80dc6c58d25e6e3331ef3fa8"
+    },
+    "evidence/gh353-ubs-65852eb8/review-receipt.json": {
+      "bytes": 5989,
+      "sha256": "7ffccd4221daa5075692695150d93bb906e72e0586d1c7780d4b399e31fd8715"
+    },
+    "evidence/gh353-ubs-65852eb8/stdout.json": {
+      "bytes": 7335244,
+      "sha256": "864f584b67397210a54d2d957a206098c399a0cfeb2281de91159ba966d5f15a"
+    },
+    "evidence/gh353-ubs-65852eb8/manifest.json": {
+      "bytes": 16940,
+      "sha256": "2c3e53e4e77037b07b64d16d0c672bd3bc2f83db8bb2519729e1ac2ad0913f92"
+    }
+  }
+}
