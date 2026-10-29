@@ -64,10 +64,15 @@ impl Binding {
         {
             return Err(invalid("checkpoint database generation is invalid"));
         }
-        let database = std::fs::canonicalize(database)?;
-        let archive = std::fs::canonicalize(archive)?;
-        let metadata = std::fs::metadata(&database)?;
-        if !metadata.is_file() || !archive.is_dir() {
+        let database = std::fs::canonicalize(database)
+            .map_err(|error| io_context("canonicalize database", database, error))?;
+        let archive = std::fs::canonicalize(archive)
+            .map_err(|error| io_context("canonicalize archive", archive, error))?;
+        let metadata = std::fs::metadata(&database)
+            .map_err(|error| io_context("read database metadata", &database, error))?;
+        let archive_metadata = std::fs::metadata(&archive)
+            .map_err(|error| io_context("read archive metadata", &archive, error))?;
+        if !metadata.is_file() || !archive_metadata.is_dir() {
             return Err(invalid(
                 "checkpoint source or archive has an invalid file type",
             ));
@@ -135,11 +140,22 @@ fn probe_existing_checkpoint_lock(database: &Path, archive: &Path) -> io::Result
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     }
-    let lock = options.open(&lock_path)?;
-    if !lock.metadata()?.is_file() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let lock = options
+        .open(&lock_path)
+        .map_err(|error| io_context("open existing lock", &lock_path, error))?;
+    if !lock
+        .metadata()
+        .map_err(|error| io_context("read opened lock metadata", &lock_path, error))?
+        .is_file()
+    {
         return Err(invalid("checkpoint lock is not a regular file"));
     }
-    FileExt::try_lock_exclusive(&lock)
+    try_lock_checkpoint(&lock, &lock_path)
 }
 
 /// GH#354: refuse known checkpoint contention BEFORE pool acquisition and the
@@ -356,6 +372,66 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[derive(Debug)]
+struct CheckpointIoError {
+    operation: &'static str,
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl std::fmt::Display for CheckpointIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "checkpoint {} ({}): {}",
+            self.operation,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CheckpointIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn io_context(operation: &'static str, path: &Path, source: io::Error) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        CheckpointIoError {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
+fn try_lock_checkpoint(lock: &File, path: &Path) -> io::Result<()> {
+    FileExt::try_lock_exclusive(lock).map_err(|source| {
+        // fs2 returns ERROR_LOCK_VIOLATION on Windows, which std does not map
+        // to WouldBlock. A live owner must defer the pass, never select the
+        // unavailable-checkpoint fallback that runs without durable progress.
+        let contended = source
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error());
+        let kind = if contended {
+            io::ErrorKind::WouldBlock
+        } else {
+            source.kind()
+        };
+        io::Error::new(
+            kind,
+            CheckpointIoError {
+                operation: "acquire exclusive lock",
+                path: path.to_path_buf(),
+                source,
+            },
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestoreState {
     Absent,
@@ -458,7 +534,9 @@ fn merge_unsaved_debt(
 }
 
 fn check_sidecar(path: &Path) -> io::Result<()> {
-    if crate::path_existing_prefix_has_symlink(path).map_err(|error| invalid(&error.to_string()))? {
+    if crate::path_existing_prefix_has_symlink(path)
+        .map_err(|error| io_context("validate path components", path, error))?
+    {
         return Err(invalid("checkpoint path has a symlinked component"));
     }
     match std::fs::symlink_metadata(path) {
@@ -476,7 +554,7 @@ fn check_sidecar(path: &Path) -> io::Result<()> {
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => Err(io_context("read sidecar metadata", path, error)),
     }
 }
 
@@ -504,8 +582,15 @@ impl Store {
                 .mode(0o600)
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
-        let lock = options.open(&lock_path)?;
-        FileExt::try_lock_exclusive(&lock)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let lock = options
+            .open(&lock_path)
+            .map_err(|error| io_context("open or create lock", &lock_path, error))?;
+        try_lock_checkpoint(&lock, &lock_path)?;
         let store = Self {
             binding,
             path,
@@ -518,8 +603,12 @@ impl Store {
 
     fn check_lock(&self) -> io::Result<()> {
         check_sidecar(&self.lock_path)?;
-        let opened = self.lock.metadata()?;
-        let named = std::fs::symlink_metadata(&self.lock_path)?;
+        let opened = self
+            .lock
+            .metadata()
+            .map_err(|error| io_context("read opened lock metadata", &self.lock_path, error))?;
+        let named = std::fs::symlink_metadata(&self.lock_path)
+            .map_err(|error| io_context("read named lock metadata", &self.lock_path, error))?;
         if !opened.is_file() || !named.is_file() {
             return Err(invalid("checkpoint lock is not a regular file"));
         }
@@ -531,7 +620,13 @@ impl Store {
             }
         }
         #[cfg(not(unix))]
-        if opened.created()? != named.created()? {
+        if opened
+            .created()
+            .map_err(|error| io_context("read opened lock creation time", &self.lock_path, error))?
+            != named.created().map_err(|error| {
+                io_context("read named lock creation time", &self.lock_path, error)
+            })?
+        {
             return Err(invalid("checkpoint lock identity changed"));
         }
         Ok(())
@@ -546,7 +641,7 @@ impl Store {
         ) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => return Err(io_context("read snapshot", &self.path, error)),
         };
         let snapshot: Snapshot = serde_json::from_slice(&bytes)
             .map_err(|error| invalid(&format!("checkpoint cannot be decoded: {error}")))?;
@@ -643,17 +738,28 @@ impl Store {
             .ok_or_else(|| invalid("checkpoint has no parent directory"))?;
         let mut candidate = tempfile::Builder::new()
             .prefix(".am-message-reconcile-")
-            .tempfile_in(parent)?;
-        candidate.write_all(&bytes)?;
-        candidate.as_file().sync_all()?;
+            .tempfile_in(parent)
+            .map_err(|error| io_context("create staged snapshot", parent, error))?;
+        candidate
+            .write_all(&bytes)
+            .map_err(|error| io_context("write staged snapshot", candidate.path(), error))?;
+        candidate
+            .as_file()
+            .sync_all()
+            .map_err(|error| io_context("sync staged snapshot", candidate.path(), error))?;
         before_publish()?;
         // A flock on an old inode grants no ownership of a replacement path.
         // Recheck after slow staging I/O, before replacing the paired hints.
         self.check_lock()?;
         check_sidecar(&self.path)?;
-        candidate.persist(&self.path).map_err(|error| error.error)?;
+        candidate
+            .persist(&self.path)
+            .map_err(|error| io_context("publish staged snapshot", &self.path, error.error))?;
         #[cfg(unix)]
-        File::open(parent)?.sync_all()?;
+        File::open(parent)
+            .map_err(|error| io_context("open snapshot directory", parent, error))?
+            .sync_all()
+            .map_err(|error| io_context("sync snapshot directory", parent, error))?;
         Ok(())
     }
 }
@@ -1678,6 +1784,259 @@ mod tests {
             conflict_backoff: VecDeque::from([(19, now + Duration::from_secs(60))]),
             ..ReconcileCursor::settled_before(123)
         }
+    }
+
+    #[test]
+    fn checkpoint_io_errors_identify_the_operation_without_erasing_the_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.sqlite3");
+        let error = Binding::at(&missing, temp.path(), GENERATION).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("canonicalize database"));
+        let cause = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<CheckpointIoError>()
+            .unwrap();
+        assert_eq!(cause.path, missing);
+        assert!(cause.source.raw_os_error().is_some());
+
+        let invalid_path = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .join("invalid\0checkpoint");
+        let error = check_sidecar(&invalid_path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("validate path components"));
+    }
+
+    // This helper is executed in fresh test processes by the lifecycle test
+    // below. Command::env avoids changing the parent test runner's environment.
+    #[test]
+    fn checkpoint_restart_child() {
+        let Some(root) = std::env::var_os("AM_TEST_CHECKPOINT_RESTART_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let database = root.join("mail.sqlite3");
+        let archive = root.join("archive");
+        let mode = std::env::var("AM_TEST_CHECKPOINT_RESTART_MODE").unwrap();
+        if mode == "contend" {
+            let refused = with_available_checkpoint(&database, &archive, || {
+                panic!("a competing process must not enter source authorization")
+            });
+            let refused: Result<(), String> = refused;
+            assert_eq!(refused.unwrap_err(), CHECKPOINT_OWNED);
+            let error = Store::open(Binding::at(&database, &archive, GENERATION).unwrap())
+                .err()
+                .expect("the authoritative lock must also refuse the contender");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(error.to_string().contains("acquire exclusive lock"));
+            std::fs::write(root.join("contender-refused"), b"owned").unwrap();
+            return;
+        }
+
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        #[cfg(windows)]
+        assert!(matches!(
+            store.path.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        match mode.as_str() {
+            "publish" => {
+                assert!(store.load().unwrap().is_none());
+                let mut cursor = debt(Instant::now());
+                store.save(&cursor).unwrap();
+                cursor.tail_after = Some(90_001);
+                // Exercise replacing an existing checkpoint, then exit without
+                // running Store's destructor. Kernel ownership must be released.
+                store.save(&cursor).unwrap();
+                std::process::exit(0);
+            }
+            "crash-after-stage" => {
+                let mut cursor = debt(Instant::now());
+                cursor.tail_after = Some(100_000);
+                cursor.retries.clear();
+                store.save_with(&cursor, || std::process::exit(77)).unwrap();
+                panic!("the child must exit after fsync and before publication");
+            }
+            "restore" => {
+                let mut cursor = ReconcileCursor::settled_before(999);
+                cursor.source_identity = "fresh process".into();
+                assert_eq!(store.restore(&mut cursor).unwrap(), RestoreState::Restored);
+                assert_eq!(cursor.tail_after, Some(90_001));
+                assert_eq!(cursor.backfill_ceiling, Some(200));
+                assert!(cursor.next_lane_is_history && cursor.next_lane_is_retry);
+                assert_eq!(
+                    cursor
+                        .retries
+                        .iter()
+                        .map(|retry| retry.id)
+                        .collect::<Vec<_>>(),
+                    [7, 80_000]
+                );
+                assert_eq!(cursor.retries[1].attempts, 6);
+                assert_eq!(cursor.settled_before_us, 999);
+                assert_eq!(cursor.source_identity, "fresh process");
+                store.save(&cursor).unwrap();
+                std::fs::write(root.join("restart-restored"), b"90001:7,80000").unwrap();
+            }
+            _ => panic!("unexpected checkpoint child mode: {mode}"),
+        }
+    }
+
+    #[test]
+    fn checkpoint_recovers_after_process_exit_during_staged_publication() {
+        let (temp, database, archive) = fixture();
+        let path = Binding::at(&database, &archive, GENERATION)
+            .unwrap()
+            .path()
+            .unwrap();
+        let run_child = |mode: &str, expected_code: i32| {
+            let module = module_path!().split_once("::").unwrap().1;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("{module}::checkpoint_restart_child"),
+                    "--nocapture",
+                ])
+                .env("AM_TEST_CHECKPOINT_RESTART_ROOT", temp.path())
+                .env("AM_TEST_CHECKPOINT_RESTART_MODE", mode)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected_code),
+                "{mode}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(!path.exists());
+        assert!(!path.with_extension("json.lock").exists());
+        run_child("publish", 0);
+        assert!(path.is_file());
+        assert!(path.with_extension("json.lock").is_file());
+        let published = std::fs::read(&path).unwrap();
+        let owner = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        run_child("contend", 0);
+        assert_eq!(
+            std::fs::read(temp.path().join("contender-refused")).unwrap(),
+            b"owned"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), published);
+        drop(owner);
+        run_child("crash-after-stage", 77);
+        assert_eq!(std::fs::read(&path).unwrap(), published);
+        run_child("restore", 0);
+        assert_eq!(
+            std::fs::read(temp.path().join("restart-restored")).unwrap(),
+            b"90001:7,80000"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_failed_atomic_replacement_preserves_the_last_checkpoint() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (_temp, database, archive) = fixture();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        let mut cursor = debt(Instant::now());
+        store.save(&cursor).unwrap();
+        let published = std::fs::read(&store.path).unwrap();
+        // Permit metadata and reads but deny deletion/rename of this exact
+        // destination. This must exercise the real failed persist operation.
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .open(&store.path)
+            .unwrap();
+        cursor.tail_after = Some(90_001);
+        let error = store.save(&cursor).unwrap_err();
+        assert!(
+            error.to_string().contains("publish staged snapshot"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), published);
+        assert_eq!(store.load().unwrap().unwrap().tail_after, Some(90_000));
+        assert_eq!(cursor.retries.len(), 2);
+        drop(blocker);
+        store.save(&cursor).unwrap();
+        drop(store);
+        let reopened = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        assert_eq!(reopened.load().unwrap().unwrap().tail_after, Some(90_001));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_checkpoint_rejects_linked_sidecars_and_lock_paths() {
+        for lock_link in [false, true] {
+            let (_temp, database, archive) = fixture();
+            let binding = Binding::at(&database, &archive, GENERATION).unwrap();
+            let path = binding.path().unwrap();
+            let linked = if lock_link {
+                path.with_extension("json.lock")
+            } else {
+                path.clone()
+            };
+            let evidence = archive.join("preserved-evidence");
+            std::fs::write(&evidence, b"do not modify").unwrap();
+            std::os::windows::fs::symlink_file(&evidence, &linked).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&linked)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the native symlink fixture must exist"
+            );
+            assert!(Store::open(binding).is_err());
+            assert_eq!(std::fs::read(&evidence).unwrap(), b"do not modify");
+            assert!(
+                std::fs::symlink_metadata(&linked)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_link_installed_after_staging_is_not_followed_or_replaced() {
+        let (_temp, database, archive) = fixture();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        store.save(&debt(Instant::now())).unwrap();
+        let original = std::fs::read(&store.path).unwrap();
+        let retained = store.path.with_extension("retained-checkpoint");
+        let evidence = archive.join("foreign-evidence");
+        std::fs::write(&evidence, b"preserve foreign evidence").unwrap();
+        let error = store
+            .save_with(&ReconcileCursor::default(), || {
+                std::fs::rename(&store.path, &retained)?;
+                std::os::windows::fs::symlink_file(&evidence, &store.path)?;
+                assert!(
+                    std::fs::symlink_metadata(&store.path)?
+                        .file_type()
+                        .is_symlink(),
+                    "the native symlink fixture must exist"
+                );
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("symlinked component"), "{error}");
+        assert_eq!(std::fs::read(&retained).unwrap(), original);
+        assert_eq!(
+            std::fs::read(&evidence).unwrap(),
+            b"preserve foreign evidence"
+        );
+        assert!(
+            std::fs::symlink_metadata(&store.path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(store.load().is_err(), "the substituted link is never read");
     }
 
     #[test]

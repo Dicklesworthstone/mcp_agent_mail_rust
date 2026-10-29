@@ -309,7 +309,19 @@ impl Store {
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
         let lock = options.open(&lock_path)?;
-        FileExt::try_lock_exclusive(&lock)?;
+        FileExt::try_lock_exclusive(&lock).map_err(|error| {
+            // Windows reports ERROR_LOCK_VIOLATION, which std does not map to
+            // WouldBlock. A live owner must defer repair, not select the
+            // memory-only fallback used for unavailable checkpoint storage.
+            if error
+                .raw_os_error()
+                .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+            {
+                io::Error::new(io::ErrorKind::WouldBlock, error)
+            } else {
+                error
+            }
+        })?;
         let store = Self {
             binding,
             path,
@@ -700,26 +712,28 @@ mod tests {
     fn store_round_trip_holds_exclusive_ownership_until_drop() {
         let temp = tempfile::tempdir().unwrap();
         let binding = binding(&temp);
+        #[cfg(windows)]
+        assert!(matches!(
+            binding.database.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
         let store = Store::open(binding.clone()).unwrap();
         assert!(store.load().unwrap().is_none());
-        store.save(&debt(Instant::now())).unwrap();
+        let mut cursor = debt(Instant::now());
+        store.save(&cursor).unwrap();
         assert_eq!(store.load().unwrap().unwrap().after, 432);
         assert_eq!(
             Store::open(binding.clone()).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         assert!(!binding.archive.join(".git").exists());
+        cursor.after = 433;
+        store.save(&cursor).unwrap();
         drop(store);
-        assert_eq!(
-            Store::open(binding)
-                .unwrap()
-                .load()
-                .unwrap()
-                .unwrap()
-                .retries
-                .len(),
-            2
-        );
+        let restored = Store::open(binding).unwrap().load().unwrap().unwrap();
+        assert_eq!(restored.after, 433);
+        assert_eq!(restored.retries.len(), 2);
     }
 
     #[test]
@@ -841,6 +855,42 @@ mod tests {
         assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
         assert!(!String::from_utf8_lossy(&bytes).contains("never-checkpoint-this-token"));
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn gh369_competing_checkpoint_owner_defers_agent_repair_without_memory_fallback() {
+        with_mailbox(|cx, pool, config, _| {
+            let stop = AtomicBool::new(false);
+            let owner = Store::open(Binding::capture(cx, pool, config, &stop).unwrap()).unwrap();
+            owner.save(&AgentReconcileCursor::default()).unwrap();
+            let saved = std::fs::read(&owner.path).unwrap();
+            let profile_path = config
+                .storage_root
+                .join("projects/project/agents/BlueLake/profile.json");
+            let mut contender = AgentReconcileCursor::default();
+            for _ in 0..3 {
+                let error = contender
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    "agent reconciliation deferred: checkpoint is owned by another worker"
+                );
+                assert_eq!(contender.after, 0);
+                assert!(!contender.retries.persistence.restore_attempted);
+                assert!(!contender.retries.persistence.warned);
+                assert!(!profile_path.exists());
+                assert_eq!(std::fs::read(&owner.path).unwrap(), saved);
+            }
+            drop(owner);
+            let resumed = contender
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!(resumed.repaired, 1);
+            profile(config);
+            let store = contender.retries.persistence.store.as_ref().unwrap();
+            assert_eq!(store.load().unwrap().unwrap().after, contender.after);
+        });
     }
 
     #[test]

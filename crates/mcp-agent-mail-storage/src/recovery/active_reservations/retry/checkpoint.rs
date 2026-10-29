@@ -275,7 +275,19 @@ impl Store {
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
         let lock = options.open(&lock_path)?;
-        FileExt::try_lock_exclusive(&lock)?;
+        FileExt::try_lock_exclusive(&lock).map_err(|error| {
+            // Windows reports ERROR_LOCK_VIOLATION, which std does not map to
+            // WouldBlock. A live owner must defer repair, not select the
+            // memory-only fallback used for unavailable checkpoint storage.
+            if error
+                .raw_os_error()
+                .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+            {
+                io::Error::new(io::ErrorKind::WouldBlock, error)
+            } else {
+                error
+            }
+        })?;
         let store = Self {
             binding,
             path,
@@ -664,9 +676,16 @@ mod tests {
     fn store_owns_the_lock_until_drop_and_restores_the_atomically_saved_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let binding = binding(&temp);
+        #[cfg(windows)]
+        assert!(matches!(
+            binding.database.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
         let store = Store::open(binding.clone()).unwrap();
         assert!(store.load().unwrap().is_none());
-        store.save(&cursor(Instant::now())).unwrap();
+        let mut cursor = cursor(Instant::now());
+        store.save(&cursor).unwrap();
         let bytes = std::fs::read(&store.path).unwrap();
         assert_eq!(
             Store::open(binding.clone()).unwrap_err().kind(),
@@ -678,10 +697,15 @@ mod tests {
             (snapshot.after, snapshot.ceiling, snapshot.retries.len()),
             (432, Some(480), 2)
         );
+        cursor.after = 433;
+        store.save(&cursor).unwrap();
+        let updated = std::fs::read(&store.path).unwrap();
         drop(store);
         let reopened = Store::open(binding).unwrap();
-        assert_eq!(std::fs::read(&reopened.path).unwrap(), bytes);
-        assert_eq!(reopened.load().unwrap().unwrap().retries[0].id, 401);
+        assert_eq!(std::fs::read(&reopened.path).unwrap(), updated);
+        let restored = reopened.load().unwrap().unwrap();
+        assert_eq!(restored.after, 433);
+        assert_eq!(restored.retries[0].id, 401);
     }
 
     #[test]
@@ -807,6 +831,46 @@ mod tests {
             }
             drop(conn);
             test(&cx, &pool, &config);
+        });
+    }
+
+    #[test]
+    fn gh369_competing_checkpoint_owner_defers_active_repair_without_memory_fallback() {
+        fixture(|cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let owner = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            owner.save(&ActiveReservationCursor::default()).unwrap();
+            let saved = std::fs::read(&owner.path).unwrap();
+            let mut contender = ActiveReservationCursor::default();
+            for _ in 0..3 {
+                let error = contender
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    "active reservation repair deferred: checkpoint is owned by another worker"
+                );
+                assert_eq!(contender.after, 0);
+                assert!(!contender.retries.persistence.restore_attempted);
+                assert!(!contender.retries.persistence.warned);
+                assert!(!config.storage_root.join("projects").exists());
+                assert_eq!(std::fs::read(&owner.path).unwrap(), saved);
+            }
+            drop(owner);
+            let resumed = contender
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!(resumed.repaired, 4);
+            let relative = "projects/project/file_reservations/id-401-gaabb.json";
+            let repo = git2::Repository::open(&config.storage_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            let entry = tree.get_path(Path::new(relative)).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                std::fs::read(config.storage_root.join(relative)).unwrap()
+            );
+            let store = contender.retries.persistence.store.as_ref().unwrap();
+            assert_eq!(store.load().unwrap().unwrap().after, contender.after);
         });
     }
 
