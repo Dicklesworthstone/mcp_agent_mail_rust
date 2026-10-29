@@ -33,6 +33,13 @@ linker = "aarch64-linux-gnu-gcc"
 # Native Build Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
+[unstable]
+# RCH preserves source mtimes. An older frozen build can finish after a newer
+# checkout was edited, making stale executables look newer than current Rust
+# inputs. The pinned nightly must compare input contents before reusing them.
+# Build-script inputs still need their own rerun tracking and source witnesses.
+checksum-freshness = true
+
 [build]
 # The experimental parallel front-end (-Z threads=4, enabled 5d8bd0a6) reliably
 # DEADLOCKS rustc nightly-2026-08-25 while compiling the mcp-agent-mail binary
