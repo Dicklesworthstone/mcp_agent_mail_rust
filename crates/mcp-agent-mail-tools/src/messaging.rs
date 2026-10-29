@@ -23,10 +23,13 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool,
-    get_db_pool, legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists,
-    resolve_agent, resolve_existing_project, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, ensure_request_live,
+    get_coalescer_bypass_read_db_pool, get_db_pool_for_request, legacy_tool_error,
+    parse_attachment_metadata_json, parse_recipients_lists, resolve_agent,
+    resolve_existing_project, resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
@@ -2895,7 +2898,7 @@ async fn try_replay_message(
     let (Some(key), Some(fingerprint)) = (key, fingerprint) else {
         return Ok(None);
     };
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = match resolve_existing_project(ctx, &pool, project_key).await {
         Ok(project) => project,
         Err(error)
@@ -3266,7 +3269,7 @@ effective_free_bytes={free}"
         return Err(durability_degraded_error());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let base_dir = Path::new(&project.human_key);
@@ -4219,7 +4222,7 @@ effective_free_bytes={free}"
         return Err(durability_degraded_error());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -5493,7 +5496,7 @@ pub async fn fetch_inbox_events(
     // archive-reconstruction read pool here: an archive snapshot has no
     // independent event sequence and would turn a degraded source into a
     // dishonest empty monitor page. Reading events never creates a project.
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent = resolve_agent(
@@ -5605,7 +5608,7 @@ pub async fn get_message_delivery_receipt(
     project_key: String,
     message_id: i64,
 ) -> McpResult<String> {
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let receipt = db_outcome_to_mcp_result(
@@ -5741,7 +5744,7 @@ pub async fn mark_message_read(
 ) -> McpResult<String> {
     let agent_name = normalize_agent_name_or_original(agent_name);
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -5847,7 +5850,7 @@ pub async fn mark_all_read(
         ),
     };
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     // Bulk mark-read is an operator/cleanup action: the project must already
     // exist — a typo'd key must never mint a project.
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
@@ -6168,13 +6171,14 @@ pub async fn acknowledge_message(
     // binding that could constrain an unresolved actor, preserve the original
     // DB error so the caller retries after authorization becomes possible.
     // Trusted-local callers and already-authorized actors keep fail-soft ACKs.
-    let pool = match get_db_pool() {
+    let pool = match get_db_pool_for_request(ctx) {
         Ok(pool) => pool,
+        Err(error) if error.code == McpErrorCode::RequestCancelled => return Err(error),
         Err(error) => {
             if !authorization.permits_unresolved_actor(None) {
                 return Err(error);
             }
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6192,7 +6196,7 @@ pub async fn acknowledge_message(
             if !authorization.permits_unresolved_actor(None) {
                 return Err(error);
             }
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6222,7 +6226,7 @@ pub async fn acknowledge_message(
             if !authorization.permits_unresolved_actor(Some(project_id)) {
                 return Err(error);
             }
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6265,7 +6269,7 @@ pub async fn acknowledge_message(
         if let Outcome::Err(error) = &idem_outcome
             && db_error_supports_ack_intent(error)
         {
-            ctx.ensure_live()?;
+            ensure_request_live(ctx)?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6298,7 +6302,7 @@ pub async fn acknowledge_message(
         {
             Outcome::Ok(value) => value,
             Outcome::Err(error) if db_error_supports_ack_intent(&error) => {
-                ctx.ensure_live()?;
+                ensure_request_live(ctx)?;
                 return queued_ack_intent_response(
                     &config,
                     &project_key,
@@ -6502,6 +6506,190 @@ mod tests {
         });
     }
 
+    fn assert_inbox_activity_touch_does_not_wait_or_bootstrap(warm: bool) {
+        const CHILD: &str = "AM_TEST_INBOX_ACTIVITY_ADMISSION_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated inbox activity test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated inbox activity test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            if let Some(measurement) = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .find(|line| line.starts_with("[GH#353 inbox activity]"))
+            {
+                eprintln!("{measurement}");
+            }
+            return;
+        }
+
+        async fn peek(ctx: &McpContext) -> McpResult<String> {
+            fetch_inbox(
+                ctx,
+                "/inbox-activity-admission".to_string(),
+                "BlueLake".to_string(),
+                None,
+                None,
+                Some(10),
+                Some(true),
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .await
+        }
+
+        with_messaging_mailbox(&[], |mailbox| {
+            use crate::tool_util::DB_POOL_BOOTSTRAP_PROMOTIONS;
+            use mcp_agent_mail_db::write_barrier::{
+                active_writer_count, current_thread_holds_promotion_barrier,
+                try_acquire_promotion_barrier_if_idle,
+            };
+            use std::sync::{atomic::Ordering, mpsc};
+            use std::time::{Duration, Instant};
+
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            // Seed a real initialized mailbox without publishing a cached
+            // write pool. The read lane must remain useful in that state.
+            let (recipient_id, message_id) = runtime.block_on(async {
+                let cx = Cx::current().expect("fixture context");
+                let pool = DbPool::new(&DbPoolConfig::from_env()).expect("fixture pool");
+                let project = ensure_project_row(&cx, &pool, "/inbox-activity-admission").await;
+                let recipient =
+                    register_agent_row(&cx, &pool, project.id.unwrap(), "BlueLake").await;
+                let recipient_id = recipient.id.unwrap();
+                let message_id = create_ack_test_message(
+                    &cx,
+                    &pool,
+                    project.id.unwrap(),
+                    recipient_id,
+                    &[(recipient_id, "to")],
+                )
+                .await;
+                (recipient_id, message_id)
+            });
+            let conn =
+                mcp_agent_mail_db::DbConn::open_file(mailbox.database_path.to_str().unwrap())
+                    .expect("seed activity timestamp");
+            conn.execute_raw("UPDATE agents SET last_active_ts = 1")
+                .expect("make activity observably old");
+            drop(conn);
+            let cfg = DbPoolConfig::from_env();
+            assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+            if warm {
+                drop(get_db_pool().expect("warm authoritative write pool"));
+            }
+            let read_pool = crate::tool_util::get_live_read_db_pool().expect("live read pool");
+            assert!(queries::agent_touch_due(&read_pool, recipient_id));
+            let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+            let owner = warm.then(|| {
+                try_acquire_promotion_barrier_if_idle().expect("hold real recovery promotion")
+            });
+            let (done_tx, done_rx) = mpsc::channel();
+            let started = Instant::now();
+            let reader = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("read runtime");
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                done_tx.send(runtime.block_on(peek(&ctx))).unwrap();
+            });
+            let response = done_rx.recv_timeout(Duration::from_secs(2));
+            let elapsed = started.elapsed();
+            let held = current_thread_holds_promotion_barrier();
+            let writers = active_writer_count();
+            let after = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+            let due = queries::agent_touch_due(&read_pool, recipient_id);
+            let read_persisted_state = || {
+                let conn =
+                    mcp_agent_mail_db::DbConn::open_file(mailbox.database_path.to_str().unwrap())
+                        .expect("independent state inspection");
+                let receipts = conn
+                    .query_sync(
+                        "SELECT message_id, read_ts, ack_ts FROM message_recipients",
+                        &[],
+                    )
+                    .expect("persisted delivery")
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<i64>("message_id").unwrap(),
+                            row.get_named::<Option<i64>>("read_ts").unwrap(),
+                            row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let activity = conn
+                    .query_sync("SELECT last_active_ts FROM agents", &[])
+                    .expect("persisted activity")[0]
+                    .get_named::<i64>("last_active_ts")
+                    .unwrap();
+                (activity, receipts)
+            };
+            let activity_before_release = read_persisted_state();
+            eprintln!(
+                "[GH#353 inbox activity] warm={warm} read_completed={} read_wait_us={} promotion_held={held} bootstrap_delta={} active_writers={writers}",
+                response.is_ok(),
+                elapsed.as_micros(),
+                after - before,
+            );
+            // Always release and join before asserting, including on the
+            // baseline where the optional touch waits behind the real owner.
+            drop(owner);
+            reader.join().expect("reader exits");
+            let response = response
+                .expect("a completed inbox read must not wait for optional write admission")
+                .expect("fetch real inbox");
+            let messages: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(messages.as_array().unwrap().len(), 1);
+            assert_eq!(messages[0]["id"], message_id);
+            assert_eq!(messages[0]["body_md"], "body");
+            assert!(messages[0]["read_ts"].is_null());
+            assert!(messages[0]["ack_ts"].is_null());
+            assert_eq!(held, warm, "the read must not release recovery ownership");
+            assert_eq!(writers, 0);
+            assert_eq!(after, before, "optional activity must never cold-bootstrap");
+            assert_eq!(
+                activity_before_release,
+                (1, vec![(message_id, None, None)]),
+                "skipped activity must preserve the timestamp and delivery state"
+            );
+            assert!(due, "skipped activity must not claim the touch throttle");
+            assert_eq!(mcp_agent_mail_db::get_cached_pool(&cfg).is_some(), warm);
+
+            // A later read still records activity once ordinary write
+            // admission and a hot authoritative pool are both available.
+            drop(get_db_pool().expect("normal writer can warm the pool"));
+            let ctx = McpContext::new(Cx::for_testing(), 2);
+            runtime.block_on(peek(&ctx)).expect("subsequent inbox read");
+            let (activity, receipts) = read_persisted_state();
+            assert!(activity > 1);
+            assert_eq!(receipts, vec![(message_id, None, None)]);
+            assert!(!queries::agent_touch_due(&read_pool, recipient_id));
+            assert_eq!(active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fetch_inbox_peek_finishes_while_recovery_holds_write_admission() {
+        assert_inbox_activity_touch_does_not_wait_or_bootstrap(true);
+    }
+
+    #[test]
+    fn fetch_inbox_peek_does_not_bootstrap_an_activity_write_pool() {
+        assert_inbox_activity_touch_does_not_wait_or_bootstrap(false);
+    }
+
     #[test]
     fn send_message_reply_is_bounded_and_db_durable_with_async_archive() {
         // br-ack-fast-storage-commit-reply-3ac88 acceptance (a)+(b): the tool reply
@@ -6636,6 +6824,369 @@ mod tests {
                 eprintln!("[ack-fast acceptance b] archive lag after convergence: {lag:?}");
             });
         });
+    }
+
+    fn assert_cancelled_coordination_requests_finish_while_admission_closed(request_local: bool) {
+        // The recovery barrier is process-wide. Keep this actual-tool test
+        // separate from unrelated pool users instead of resetting global state.
+        const CHILD: &str = "AM_TEST_COORDINATION_ADMISSION_CANCEL_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated request cancellation test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated request cancellation test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            if let Some(measurement) = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .find(|line| line.starts_with("[GH#353 write admission]"))
+            {
+                eprintln!("{measurement}");
+            }
+            return;
+        }
+
+        async fn send_probe(ctx: &McpContext, project: &str) -> McpResult<String> {
+            send_message(
+                ctx,
+                project.to_string(),
+                "BlueLake".to_string(),
+                vec!["GreenStone".to_string()],
+                "promotion admission probe".to_string(),
+                "persist only after admission".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+
+        with_messaging_mailbox(&[("CONTACT_ENFORCEMENT_ENABLED", "0")], |mailbox| {
+            use mcp_agent_mail_db::write_barrier::{
+                active_writer_count, current_thread_holds_promotion_barrier,
+                try_acquire_promotion_barrier_if_idle,
+            };
+            use std::sync::{Arc, Barrier, mpsc};
+            use std::time::{Duration, Instant};
+
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("fixture runtime");
+            let project_key = "/data/projects/coordination-admission-cancel";
+            let (message_id, reservation_id, reservation_expires, engine) =
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = get_db_pool().expect("warm configured mailbox");
+                    let project = ensure_project_row(&cx, &pool, project_key).await;
+                    let project_id = project.id.unwrap();
+                    let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                    let recipient = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                    let message_id = create_ack_test_message(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap(),
+                        &[(recipient.id.unwrap(), "to")],
+                    )
+                    .await;
+                    let leases = queries::create_file_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap(),
+                        &["src/owned.rs"],
+                        3600,
+                        true,
+                        "cancellation must preserve this lease",
+                    )
+                    .await
+                    .into_result()
+                    .expect("fixture reservation");
+                    (
+                        message_id,
+                        leases[0].id.unwrap(),
+                        leases[0].expires_ts,
+                        pool.engine_identity_key(),
+                    )
+                });
+            assert_eq!(active_writer_count(), 0);
+            let owner = try_acquire_promotion_barrier_if_idle().expect("hold real promotion");
+            let request_cx = Cx::for_testing();
+            let start = Arc::new(Barrier::new(11));
+            let (done_tx, done_rx) = mpsc::channel();
+            let mut requests = Vec::new();
+            let mut request_cancellations = Vec::new();
+            for operation in 0..10 {
+                let ctx = McpContext::new(request_cx.clone(), operation + 1);
+                request_cancellations.push(ctx.request_cancellation());
+                let start = Arc::clone(&start);
+                let done_tx = done_tx.clone();
+                requests.push(std::thread::spawn(move || {
+                    let runtime = RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("request runtime");
+                    start.wait();
+                    let result = runtime.block_on(async {
+                        match operation {
+                            0 => send_probe(&ctx, project_key).await,
+                            1 => {
+                                reply_message(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    message_id,
+                                    "GreenStone".to_string(),
+                                    "cancelled reply".to_string(),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await
+                            }
+                            2 => {
+                                acknowledge_message(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    "GreenStone".to_string(),
+                                    message_id,
+                                    None,
+                                )
+                                .await
+                            }
+                            3 => {
+                                crate::file_reservation_paths(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    "BlueLake".to_string(),
+                                    vec!["src/new.rs".to_string()],
+                                    Some(3600),
+                                    Some(true),
+                                    None,
+                                    None,
+                                )
+                                .await
+                            }
+                            4 => {
+                                crate::release_file_reservations(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    "BlueLake".to_string(),
+                                    None,
+                                    None,
+                                )
+                                .await
+                            }
+                            5 => {
+                                crate::renew_file_reservations(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    "BlueLake".to_string(),
+                                    Some(3600),
+                                    None,
+                                    None,
+                                )
+                                .await
+                            }
+                            6 => {
+                                crate::force_release_file_reservation(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    "GreenStone".to_string(),
+                                    reservation_id,
+                                    None,
+                                    None,
+                                )
+                                .await
+                            }
+                            7 => {
+                                mark_message_read(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    "GreenStone".to_string(),
+                                    message_id,
+                                )
+                                .await
+                            }
+                            8 => crate::ensure_project(&ctx, project_key.to_string(), None).await,
+                            _ => {
+                                crate::register_agent(
+                                    &ctx,
+                                    project_key.to_string(),
+                                    "codex-cli".to_string(),
+                                    "gpt-5".to_string(),
+                                    Some("RedCloud".to_string()),
+                                    Some("cancelled registration".to_string()),
+                                    Some("auto".to_string()),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await
+                            }
+                        }
+                    });
+                    done_tx
+                        .send(result.map(|_| ()).map_err(|error| error.code))
+                        .unwrap();
+                }));
+            }
+            start.wait();
+            let before_cancel = done_rx.recv_timeout(Duration::from_millis(100));
+            let cancelled_at = Instant::now();
+            let mut all_tokens_cancelled = true;
+            if request_local {
+                // These are the real FastMCP request tokens. Cancelling them
+                // must not cancel the ambient context shared with siblings.
+                for cancellation in request_cancellations {
+                    all_tokens_cancelled &= cancellation.cancel();
+                }
+            } else {
+                // The blocking HTTP dispatcher uses this runtime signal.
+                request_cx.set_cancel_requested(true);
+            }
+            let mut completed = Vec::new();
+            while completed.len() < 10 {
+                match done_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(result) => completed.push(result),
+                    Err(_) => break,
+                }
+            }
+            let completion_latency = cancelled_at.elapsed();
+            let retained_owner = current_thread_holds_promotion_barrier();
+            let counted = active_writer_count();
+            eprintln!(
+                "[GH#353 write admission] request_local={request_local} completed={}/10 cancellation_wait_us={} promotion_held={retained_owner} active_writers={counted}",
+                completed.len(),
+                completion_latency.as_micros(),
+            );
+            // Release before any assertion so the pre-fix failure still joins
+            // every request and leaves no blocked test worker behind.
+            drop(owner);
+            for request in requests {
+                request.join().expect("coordination request exits");
+            }
+            assert!(matches!(
+                before_cancel,
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(completed, vec![Err(McpError::request_cancelled().code); 10]);
+            assert!(completion_latency < Duration::from_secs(2));
+            assert!(retained_owner);
+            assert_eq!(counted, 0);
+            assert!(all_tokens_cancelled);
+            assert_eq!(
+                request_cx.is_cancel_requested(),
+                !request_local,
+                "request-local cancellation must not alter the ambient context"
+            );
+            assert_eq!(
+                mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+                    .expect("warm pool remains available")
+                    .engine_identity_key(),
+                engine,
+            );
+            for log in [
+                "acknowledge_message.jsonl",
+                "release_file_reservations.jsonl",
+            ] {
+                assert!(
+                    !mailbox
+                        .storage_root
+                        .join("degraded_intents")
+                        .join(log)
+                        .exists(),
+                    "cancelled requests must not schedule future mutations",
+                );
+            }
+            let conn =
+                mcp_agent_mail_db::DbConn::open_file(mailbox.database_path.to_str().unwrap())
+                    .expect("independent persisted-state witness");
+            let counts = conn
+                .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap();
+            assert_eq!(counts[0].get_named::<i64>("n").unwrap(), 1);
+            let agents = conn
+                .query_sync("SELECT COUNT(*) AS n FROM agents", &[])
+                .unwrap();
+            assert_eq!(agents[0].get_named::<i64>("n").unwrap(), 2);
+            let projects = conn
+                .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                .unwrap();
+            assert_eq!(projects[0].get_named::<i64>("n").unwrap(), 1);
+            let receipts = conn
+                .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("read_ts")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("ack_ts")
+                    .unwrap()
+                    .is_none()
+            );
+            let leases = conn
+                .query_sync("SELECT released_ts, expires_ts FROM file_reservations", &[])
+                .unwrap();
+            assert_eq!(leases.len(), 1);
+            assert!(
+                leases[0]
+                    .get_named::<Option<i64>>("released_ts")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                leases[0].get_named::<i64>("expires_ts").unwrap(),
+                reservation_expires
+            );
+            mcp_agent_mail_db::close_db_conn(conn, "cancelled coordination state witness");
+
+            let ctx = McpContext::new(Cx::for_testing(), 11);
+            let response = runtime
+                .block_on(send_probe(&ctx, project_key))
+                .expect("fresh send completes after recovery releases admission");
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["count"], 1);
+            assert!(response["deliveries"][0]["payload"]["id"].as_i64().unwrap() > message_id);
+        });
+    }
+
+    #[test]
+    fn cancelled_coordination_requests_finish_while_recovery_keeps_admission_closed() {
+        assert_cancelled_coordination_requests_finish_while_admission_closed(false);
+    }
+
+    #[test]
+    fn request_local_cancellation_finishes_while_recovery_keeps_admission_closed() {
+        assert_cancelled_coordination_requests_finish_while_admission_closed(true);
     }
 
     #[test]
