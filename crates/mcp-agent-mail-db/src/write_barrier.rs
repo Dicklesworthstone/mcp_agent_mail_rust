@@ -51,6 +51,9 @@ use std::time::{Duration, Instant};
 /// How long a blocked writer waits between "promotion still active" warnings.
 const WRITER_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Maximum interval between caller liveness checks while admission is parked.
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Default bound on how long corruption recovery waits for promotion ownership
 /// and for in-flight writers to drain before failing closed and deferring.
 const DEFAULT_WRITER_DRAIN_TIMEOUT_SECS: u64 = 10;
@@ -178,19 +181,42 @@ pub struct WriteActivityGuard {
 pub fn begin_write_activity() -> WriteActivityGuard {
     begin_write_activity_with(
         WRITER_WAIT_WARN_INTERVAL,
-        |waited| {
-            tracing::warn!(
-                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
-                "write path is waiting on an in-progress database recovery promotion"
-            );
-        },
-        |waited| {
-            tracing::info!(
-                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
-                "write path resumed after recovery promotion released the barrier"
-            );
-        },
+        report_writer_wait,
+        report_writer_resume,
     )
+}
+
+/// Begin write activity while observing the caller's cancellation or deadline.
+///
+/// The callback runs without the admission mutex, before admission and after
+/// each bounded wait. Returning an error admits no write; a panic cannot
+/// poison admission or leak a counted writer. The explicit promotion-owner
+/// handoff remains counted and uses the same exclusion check as ordinary
+/// admission. This does not cancel work already admitted by another caller.
+pub fn begin_write_activity_cancellable_with<E>(
+    check_live: impl FnMut() -> Result<(), E>,
+) -> Result<WriteActivityGuard, E> {
+    begin_write_activity_cancellable_impl(
+        WRITER_WAIT_WARN_INTERVAL,
+        CANCELLATION_POLL_INTERVAL,
+        check_live,
+        report_writer_wait,
+        report_writer_resume,
+    )
+}
+
+fn report_writer_wait(waited: Duration) {
+    tracing::warn!(
+        waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        "write path is waiting on an in-progress database recovery promotion"
+    );
+}
+
+fn report_writer_resume(waited: Duration) {
+    tracing::info!(
+        waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        "write path resumed after recovery promotion released the barrier"
+    );
 }
 
 /// Admit retryable background work without waiting for recovery promotion.
@@ -226,40 +252,62 @@ pub fn try_begin_write_activity() -> Option<WriteActivityGuard> {
 /// mutex, leak a counted writer, or skip a successor promotion's exclusion.
 fn begin_write_activity_with(
     warning_interval: Duration,
-    mut on_wait: impl FnMut(Duration),
+    on_wait: impl FnMut(Duration),
     on_resume: impl FnOnce(Duration),
 ) -> WriteActivityGuard {
+    match begin_write_activity_cancellable_impl(
+        warning_interval,
+        warning_interval,
+        || Ok::<(), std::convert::Infallible>(()),
+        on_wait,
+        on_resume,
+    ) {
+        Ok(guard) => guard,
+        Err(never) => match never {},
+    }
+}
+
+fn begin_write_activity_cancellable_impl<E>(
+    warning_interval: Duration,
+    check_interval: Duration,
+    mut check_live: impl FnMut() -> Result<(), E>,
+    mut on_wait: impl FnMut(Duration),
+    on_resume: impl FnOnce(Duration),
+) -> Result<WriteActivityGuard, E> {
     let b = barrier();
     let wait_started = Instant::now();
     let mut warned = false;
-    let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
-    // Raw exclusion ownership avoids self-deadlock during the explicit
-    // recovery-to-writer handoff. It does not exempt this writer from counting.
-    if !current_thread_holds_barrier() {
-        while state.promotion_active {
-            let (next, _timeout) = b
-                .promotion_released
-                .wait_timeout(state, warning_interval)
-                .unwrap_or_else(PoisonError::into_inner);
-            state = next;
-            if state.promotion_active && !warned && wait_started.elapsed() >= warning_interval {
-                warned = true;
-                drop(state);
-                on_wait(wait_started.elapsed());
-                state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
-                // A different promotion may have acquired while diagnostics
-                // ran. Recheck the predicate under the lock before admission.
+    loop {
+        check_live()?;
+        let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // Raw exclusion ownership avoids self-deadlock during the explicit
+        // recovery-to-writer handoff. It never exempts the writer from counting.
+        if !state.promotion_active || current_thread_holds_barrier() {
+            state.writers = state.writers.saturating_add(1);
+            let guard = WriteActivityGuard { _priv: () };
+            drop(state);
+            // Cancellation or a subscriber panic after admission still drops
+            // the already-counted lease; neither can strand a phantom writer.
+            check_live()?;
+            if warned {
+                on_resume(wait_started.elapsed());
             }
+            return Ok(guard);
         }
+        let (state, _timeout) = b
+            .promotion_released
+            .wait_timeout(state, check_interval.min(warning_interval))
+            .unwrap_or_else(PoisonError::into_inner);
+        let report_wait =
+            state.promotion_active && !warned && wait_started.elapsed() >= warning_interval;
+        drop(state);
+        if report_wait {
+            warned = true;
+            on_wait(wait_started.elapsed());
+        }
+        // Callbacks can re-enter observers or let a successor promotion win.
+        // Recheck liveness and exclusion before admitting this writer.
     }
-    state.writers = state.writers.saturating_add(1);
-    let guard = WriteActivityGuard { _priv: () };
-    drop(state);
-    if warned {
-        // The RAII guard already owns this count if the subscriber panics.
-        on_resume(wait_started.elapsed());
-    }
-    guard
 }
 
 impl Drop for WriteActivityGuard {
@@ -408,74 +456,112 @@ fn drain_progress(
 pub fn acquire_promotion_barrier_draining(
     timeout: Duration,
 ) -> (PromotionBarrierGuard, DrainOutcome) {
+    match acquire_promotion_barrier_draining_impl(timeout, WRITER_WAIT_WARN_INTERVAL, || {
+        Ok::<(), std::convert::Infallible>(())
+    }) {
+        Ok(acquired) => acquired,
+        Err(never) => match never {},
+    }
+}
+
+/// Acquire recovery ownership and drain writers while the caller remains live.
+///
+/// Queueing and draining retain the same shared timeout and fail-closed
+/// outcomes as [`acquire_promotion_barrier_draining`]. Liveness is checked
+/// outside the admission mutex, at most one bounded wait slice apart. An
+/// error or panic while queued cannot release another promotion. After this
+/// call acquires ownership, cancellation releases its own gate without
+/// granting promotion permission or cancelling any existing writer. A normal
+/// drain timeout still returns its guard, preserving the original contract.
+pub fn acquire_promotion_barrier_draining_cancellable_with<E>(
+    timeout: Duration,
+    check_live: impl FnMut() -> Result<(), E>,
+) -> Result<(PromotionBarrierGuard, DrainOutcome), E> {
+    acquire_promotion_barrier_draining_impl(timeout, CANCELLATION_POLL_INTERVAL, check_live)
+}
+
+fn acquire_promotion_barrier_draining_impl<E>(
+    timeout: Duration,
+    check_interval: Duration,
+    mut check_live: impl FnMut() -> Result<(), E>,
+) -> Result<(PromotionBarrierGuard, DrainOutcome), E> {
     let started = Instant::now();
     let b = barrier();
-    let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
-    if current_thread_holds_barrier() {
-        let ready = state.can_promote();
-        let remaining_writers = state.writers;
-        drop(state);
-        return if ready {
-            (PromotionBarrierGuard::new_held(), DrainOutcome::Idle)
-        } else {
-            (
-                PromotionBarrierGuard::new_unheld(),
-                DrainOutcome::TimedOut { remaining_writers },
-            )
-        };
-    }
-    // Queueing is part of the same budget as draining. A timeout here must
-    // not construct a held/nested guard: that would release another owner's
-    // gate or let this thread bypass it on a subsequent write operation.
     let mut queued = false;
-    while state.promotion_active {
-        queued = true;
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+    loop {
+        check_live()?;
+        let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if current_thread_holds_barrier() {
+            let ready = state.can_promote();
+            let remaining_writers = state.writers;
+            drop(state);
+            return Ok(if ready {
+                (PromotionBarrierGuard::new_held(), DrainOutcome::Idle)
+            } else {
+                (
+                    PromotionBarrierGuard::new_unheld(),
+                    DrainOutcome::TimedOut { remaining_writers },
+                )
+            });
+        }
+        // A queued caller owns no lease: its cancellation, timeout, or panic
+        // must leave the current owner's admission and thread depth intact.
+        if state.promotion_active {
+            queued = true;
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let outcome = DrainOutcome::TimedOut {
+                    remaining_writers: state.writers,
+                };
+                drop(state);
+                return Ok((PromotionBarrierGuard::new_unheld(), outcome));
+            }
+            let (state, _timeout) = b
+                .promotion_released
+                .wait_timeout(state, remaining.min(check_interval))
+                .unwrap_or_else(PoisonError::into_inner);
+            drop(state);
+            continue;
+        }
+        // Even a release wakeup must not reset an exhausted queue budget.
+        if queued && started.elapsed() >= timeout {
             let outcome = DrainOutcome::TimedOut {
                 remaining_writers: state.writers,
             };
             drop(state);
-            return (PromotionBarrierGuard::new_unheld(), outcome);
+            return Ok((PromotionBarrierGuard::new_unheld(), outcome));
         }
-        let (next, _timeout) = b
-            .promotion_released
-            .wait_timeout(state, remaining.min(WRITER_WAIT_WARN_INTERVAL))
-            .unwrap_or_else(PoisonError::into_inner);
-        state = next;
-    }
-    // Even a release wakeup must not reset an already exhausted queue budget.
-    if queued && started.elapsed() >= timeout {
-        let outcome = DrainOutcome::TimedOut {
-            remaining_writers: state.writers,
-        };
+        // Construct the owner before the first cancellable drain check. All
+        // callbacks run after releasing state, so unwinding this guard can
+        // lock admission safely instead of stranding it or self-deadlocking.
+        let owner = PromotionBarrierGuard::new_held();
+        state.promotion_active = true;
+        state.promotion_ready = false;
+        if state.writers == 0 {
+            state.promotion_ready = true;
+            drop(state);
+            return Ok((owner, DrainOutcome::Idle));
+        }
         drop(state);
-        return (PromotionBarrierGuard::new_unheld(), outcome);
-    }
-    state.promotion_active = true;
-    state.promotion_ready = false;
-
-    let outcome = if state.writers == 0 {
-        DrainOutcome::Idle
-    } else {
         loop {
+            check_live()?;
+            let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
             let waited = started.elapsed();
             if let Some(outcome) = drain_progress(state.writers, waited, timeout) {
-                break outcome;
+                state.promotion_ready = !matches!(outcome, DrainOutcome::TimedOut { .. });
+                drop(state);
+                return Ok((owner, outcome));
             }
             let remaining = timeout.saturating_sub(waited);
-            let (next, _timeout) = b
+            let (state, _timeout) = b
                 .writers_drained
-                .wait_timeout(state, remaining.min(WRITER_WAIT_WARN_INTERVAL))
+                .wait_timeout(state, remaining.min(check_interval))
                 .unwrap_or_else(PoisonError::into_inner);
-            state = next;
+            drop(state);
             // Re-evaluate the same deadline before accepting the zero-writer
             // wakeup. A release after the budget cannot authorize promotion.
         }
-    };
-    state.promotion_ready = !matches!(outcome, DrainOutcome::TimedOut { .. });
-    drop(state);
-    (PromotionBarrierGuard::new_held(), outcome)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,5 +1550,316 @@ mod tests {
         assert!(refused);
         assert_eq!(after, usize::MAX);
         assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn cancellable_writer_returns_while_promotion_owner_remains_held() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let owner = try_acquire_promotion_barrier_if_idle().expect("promotion owner");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut checks = 0;
+            let result = begin_write_activity_cancellable_with(|| {
+                assert!(
+                    barrier().state.try_lock().is_ok(),
+                    "callback holds the gate"
+                );
+                checks += 1;
+                if checks == 2 {
+                    waiting_tx.send(()).unwrap();
+                }
+                if worker_cancelled.load(Ordering::Acquire) {
+                    Err("request cancelled")
+                } else {
+                    Ok(())
+                }
+            })
+            .map(drop);
+            done_tx.send(result).unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let owner_retained = current_thread_holds_promotion_barrier();
+        let writers = active_writer_count();
+        drop(owner);
+        worker.join().expect("cancelled writer");
+        assert_eq!(completed.unwrap(), Err("request cancelled"));
+        assert!(owner_retained, "cancellation released a foreign promotion");
+        assert_eq!(writers, 0, "cancelled request retained a writer lease");
+        let fresh = begin_write_activity();
+        assert_eq!(active_writer_count(), 1);
+        drop(fresh);
+    }
+
+    #[test]
+    fn cancellable_writer_preserves_counted_owner_handoff() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let owner = try_acquire_promotion_barrier_if_idle().expect("bootstrap owner");
+        let refused = begin_write_activity_cancellable_with(|| Err("cancelled bootstrap"));
+        assert_eq!(refused.err(), Some("cancelled bootstrap"));
+        assert_eq!(active_writer_count(), 0);
+        assert!(current_thread_holds_promotion_barrier());
+        let writer = begin_write_activity_cancellable_with(|| Ok::<(), ()>(())).unwrap();
+        assert_eq!(active_writer_count(), 1);
+        assert_nested_promotion_refused(1);
+        drop(owner);
+        assert!(try_acquire_promotion_barrier_if_idle().is_none());
+        std::thread::spawn(move || drop(writer)).join().unwrap();
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn cancellable_writer_callback_panic_never_leaks_or_poisons_admission() {
+        if run_in_isolated_process() {
+            return;
+        }
+        for panic_at in [1, 2] {
+            let mut checks = 0;
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                begin_write_activity_cancellable_with(|| {
+                    assert!(
+                        barrier().state.try_lock().is_ok(),
+                        "callback holds the gate"
+                    );
+                    checks += 1;
+                    if checks == panic_at {
+                        panic!("liveness callback failed at check {panic_at}");
+                    }
+                    Ok::<(), ()>(())
+                })
+            }))
+            .is_err();
+            assert!(panicked);
+            assert!(!barrier().state.is_poisoned());
+            assert_eq!(active_writer_count(), 0);
+            assert!(try_acquire_promotion_barrier_if_idle().is_some());
+        }
+    }
+
+    #[test]
+    fn cancellable_queued_promotion_never_releases_the_foreign_owner() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let owner = try_acquire_promotion_barrier_if_idle().expect("first recovery");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut checks = 0;
+            let result = acquire_promotion_barrier_draining_cancellable_with(
+                Duration::from_secs(30),
+                || {
+                    assert!(
+                        barrier().state.try_lock().is_ok(),
+                        "callback holds the gate"
+                    );
+                    assert!(!current_thread_holds_barrier());
+                    checks += 1;
+                    if checks == 2 {
+                        waiting_tx.send(()).unwrap();
+                    }
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        Err("queued request cancelled")
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .map(|(guard, outcome)| {
+                drop(guard);
+                outcome
+            });
+            done_tx.send(result).unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let owner_retained = current_thread_holds_promotion_barrier();
+        drop(owner);
+        worker.join().expect("cancelled queued recovery");
+        assert_eq!(completed.unwrap(), Err("queued request cancelled"));
+        assert!(owner_retained);
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn cancellable_drain_reopens_admission_without_cancelling_live_writers() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (draining_tx, draining_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut drain_checks = 0;
+            let result = acquire_promotion_barrier_draining_cancellable_with(
+                Duration::from_secs(30),
+                || {
+                    assert!(
+                        barrier().state.try_lock().is_ok(),
+                        "callback holds the gate"
+                    );
+                    if current_thread_holds_barrier() {
+                        drain_checks += 1;
+                        if drain_checks == 2 {
+                            draining_tx.send(()).unwrap();
+                        }
+                    }
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        Err("draining request cancelled")
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .map(|(guard, outcome)| {
+                drop(guard);
+                outcome
+            });
+            done_tx.send(result).unwrap();
+        });
+        draining_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let writers = active_writer_count();
+        let fresh = try_begin_write_activity();
+        let admission_reopened = fresh.is_some();
+        drop(fresh);
+        drop(writer);
+        worker.join().expect("cancelled draining recovery");
+        assert_eq!(completed.unwrap(), Err("draining request cancelled"));
+        assert_eq!(writers, 1, "the original live writer lost its lease");
+        assert!(admission_reopened, "cancelled recovery stranded admission");
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn cancellable_drain_callback_panic_releases_its_owned_gate() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity();
+        let worker = std::thread::spawn(|| {
+            std::panic::catch_unwind(|| {
+                acquire_promotion_barrier_draining_cancellable_with(Duration::from_secs(30), || {
+                    assert!(
+                        barrier().state.try_lock().is_ok(),
+                        "callback holds the gate"
+                    );
+                    if current_thread_holds_barrier() {
+                        assert!(!current_thread_holds_promotion_barrier());
+                        panic!("drain liveness callback failed");
+                    }
+                    Ok::<(), ()>(())
+                })
+            })
+            .is_err()
+        });
+        assert!(worker.join().expect("caught drain callback panic"));
+        assert!(!barrier().state.is_poisoned());
+        assert_eq!(active_writer_count(), 1);
+        let fresh = try_begin_write_activity().expect("cancelled owner released admission");
+        drop(fresh);
+        drop(writer);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn cancellable_successful_drain_can_handoff_to_a_counted_writer() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let recovery = std::thread::spawn(move || {
+            let (owner, outcome) =
+                acquire_promotion_barrier_draining_cancellable_with(Duration::from_secs(5), || {
+                    Ok::<(), ()>(())
+                })
+                .unwrap();
+            let handoff = begin_write_activity_cancellable_with(|| Ok::<(), ()>(())).unwrap();
+            drop(owner);
+            entered_tx.send((outcome, active_writer_count())).unwrap();
+            let released = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(handoff);
+            released
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !barrier().state.lock().unwrap().promotion_active {
+            assert!(Instant::now() < deadline, "recovery never closed admission");
+            std::thread::yield_now();
+        }
+        drop(writer);
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let promotion_refused = try_acquire_promotion_barrier_if_idle().is_none();
+        let _ = release_tx.send(());
+        recovery.join().unwrap().expect("release handoff writer");
+        let (outcome, writers) = entered.unwrap();
+        assert!(matches!(outcome, DrainOutcome::Drained { .. }));
+        assert_eq!(writers, 1);
+        assert!(
+            promotion_refused,
+            "handoff exposed the live database generation"
+        );
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn cancellable_promotion_preserves_timeout_and_nested_refusal() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity();
+        let (failed, outcome) = acquire_promotion_barrier_draining_cancellable_with(
+            Duration::ZERO,
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            DrainOutcome::TimedOut {
+                remaining_writers: 1
+            }
+        );
+        let (nested, nested_outcome) = acquire_promotion_barrier_draining_cancellable_with(
+            Duration::ZERO,
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert_eq!(nested_outcome, outcome);
+        drop(nested);
+        let cancelled = acquire_promotion_barrier_draining_cancellable_with(Duration::ZERO, || {
+            Err("nested request cancelled")
+        });
+        assert_eq!(cancelled.err(), Some("nested request cancelled"));
+        assert!(barrier().state.lock().unwrap().promotion_active);
+        assert!(!current_thread_holds_promotion_barrier());
+        drop(failed);
+        assert_eq!(active_writer_count(), 1);
+        drop(writer);
+        let (idle, outcome) = acquire_promotion_barrier_draining_cancellable_with(
+            Duration::ZERO,
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome::Idle);
+        drop(idle);
     }
 }
