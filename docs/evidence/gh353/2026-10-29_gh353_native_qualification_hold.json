@@ -1,0 +1,205 @@
+{
+  "schema": "gh353-native-correction-checkpoint-v1",
+  "status": "BLOCKED_UNQUALIFIED_CANDIDATE",
+  "issue": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/353",
+  "applied_observer_commit": "3ffffa40ab85e21848f906ac07ba4055d54a7ac4",
+  "purpose": "Preserve the complete source-reviewed correction and identical baseline fixtures while native qualification is blocked. These patch files are review artifacts; this checkpoint does not apply their production code.",
+  "candidate": {
+    "head": "3ffffa40ab85e21848f906ac07ba4055d54a7ac4",
+    "patch_bytes": 89221,
+    "patch_sha256": "487be619386c073fecd45243ea83e83d008c62f81f9c966ab9c576414e15d4b5",
+    "files": [
+      "crates/mcp-agent-mail-db/src/write_barrier.rs",
+      "crates/mcp-agent-mail-storage/src/lib.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/active_reservations.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/message_reconcile.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/cancellable_tests.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/admission_tests.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/repair_lock.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/repair_lock/fence.rs",
+      "crates/mcp-agent-mail-tools/src/archive_read.rs",
+      "crates/mcp-agent-mail-tools/src/build_slots.rs",
+      "crates/mcp-agent-mail-tools/src/contacts.rs",
+      "crates/mcp-agent-mail-tools/src/identity.rs",
+      "crates/mcp-agent-mail-tools/src/lib.rs",
+      "crates/mcp-agent-mail-tools/src/macros.rs",
+      "crates/mcp-agent-mail-tools/src/messaging.rs",
+      "crates/mcp-agent-mail-tools/src/products.rs",
+      "crates/mcp-agent-mail-tools/src/reservations.rs"
+    ],
+    "patch_file": "2026-10-29_gh353_native_candidate.patch"
+  },
+  "baseline": {
+    "head": "f2c2af9d54745af23589a55347608e62dab4ca21",
+    "patch_bytes": 41549,
+    "patch_sha256": "f36f54fcd2645bb7414354b110cfa7573a3801196c5590a64580197caad44038",
+    "files": [
+      "crates/mcp-agent-mail-storage/src/lib.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/active_reservations.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/admission_tests.rs",
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/repair_lock/fence.rs",
+      "crates/mcp-agent-mail-tools/src/messaging.rs"
+    ],
+    "patch_file": "2026-10-29_gh353_baseline_regressions.patch",
+    "production_unchanged": true
+  },
+  "later_main_commit": {
+    "sha": "71642ccf258a9d52ef2662832bb140ef93cc1a5e",
+    "change": "Cargo.toml comment-only version descriptions; preserved by this checkpoint, with no dependency or feature change."
+  },
+  "implementation": {
+    "database_admission": "Add context-aware writer admission with cancellation checked outside the mutex and after at most 25ms condvar waits. Retain promotion exclusion, counted owner handoff, warm-pool retention and single-initializer admission. Migrate request writers and reject cancelled deferred ACK/release intents.",
+    "optional_read_activity": "After a completed live read, admit the best-effort activity touch only through immediate writer admission and an already-cached authoritative pool. Skip busy/cold admission without bootstrap, archive-writer bookkeeping or a throttle claim. Existing touch SQL remains potentially blocking.",
+    "repair_project_admission": "When a repair already owns the native global publication fence, attempt the project mutex and filesystem lock once and defer contention. Preserve fence-before-project ordering and native ownership. Unfenced project admission retains its existing 250ms bounded wait.",
+    "direct_reservation_cancellation": "Observe cancellation before every project-lock preflight iteration and after publication validation, immediately before staged publication. Preserve staged cleanup and existing bytes. Exclude interrupted requests from archive-breaker failure scoring.",
+    "deterministic_shutdown_fixtures": "Use the already-initialized project-lock registry as a test-only latch in two existing isolated shutdown fixtures. Retain every existing assertion; no production hook or wait was added."
+  },
+  "attribution_limits": [
+    "No current-main reproduction of the October 28 v0.3.39 8–20 second send_message / approximately 30 second list_agents incident was obtained.",
+    "The October 25 fence-deferral count is separate evidence and does not identify the cause of the post-restart incident.",
+    "The native nonblocking repair publication-fence acquisition is preserved; no fairness or full-backlog convergence claim is made.",
+    "The optional activity helper is not called by list_agents, so that correction cannot explain the reported list_agents delay.",
+    "The large-orphan 300s quiet-convergence gate and the saturation BusySnapshot gate remain open."
+  ],
+  "busy_snapshot_audit": {
+    "mailbox_engine": "registry FrankenSQLite 0.4.10 through SQLModel 0.5.0",
+    "separate_git_patch": "FrankenSQLite commit 2633b38a26bde68db23172b12aa402ed698cc309 serves the older Beads engine; it does not upgrade the mailbox engine.",
+    "finding": "The exact recorded publication-binding/reload mismatch originates from a fail-closed engine check. Agent Mail already classifies this conflict correctly for whole-transaction retries, reacquires connections per attempt and treats post-commit probe unavailability as advisory.",
+    "upstream_source": "https://github.com/Dicklesworthstone/frankensqlite/commit/93dd2b5feb2f9bcbac21ae63069eb258ba92f4cc",
+    "unproven_read_candidates": [
+      "ensure_project cache-miss SELECT/inventory",
+      "get_agent",
+      "get_agent_by_id",
+      "project lookup variants"
+    ],
+    "change": "No dependency upgrade, classifier broadening or whole-send retry was made."
+  },
+  "source_validation": {
+    "independent_reviews": [
+      "write-admission ownership/cancellation",
+      "archive publication and lock cleanup",
+      "optional-read activity admission",
+      "actual-tool fixtures",
+      "deterministic shutdown latches"
+    ],
+    "final_pinned_cargo_fmt": {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0
+    },
+    "candidate_and_baseline_diff_check": {
+      "exit_code": 0
+    },
+    "final_three_tool_files_ubs": {
+      "version": "5.5.24",
+      "commit": "c442573630f69e2988430a2d70f0a470bf70a8ea",
+      "mode": "default severity, --no-cargo, --jobs=1; no category suppression",
+      "exit_code": 0,
+      "status": "ok",
+      "critical": 0,
+      "warnings": 1545,
+      "info": 533,
+      "elapsed_seconds": 45.386,
+      "hashes_equal_before_and_after": true,
+      "sha256": {
+        "crates/mcp-agent-mail-tools/src/archive_read.rs": "49675c674577ab2b0ae7060db15df1aeb2c6c57aa91d77b505390d0c6b5e10b2",
+        "crates/mcp-agent-mail-tools/src/lib.rs": "e424332b33078d09651fe028cc6a4e2f4b3ac0420a3538b0987edc9f95b629ab",
+        "crates/mcp-agent-mail-tools/src/messaging.rs": "f0cfa35ba034d7f3255809515f4b3ffe3e9b9430bf0e7018ed9c480d6527f69f"
+      }
+    },
+    "other_static_limits": "The earlier complete-diff scan retained three unchanged storage thread-spawn panics and a Python SQLFlowLimit partial-analysis error. The two later five-line shutdown-fixture latch edits have independent source review and pinned formatting checks but no subsequent UBS run."
+  },
+  "native_attempts": {
+    "toolchain": "rustc 1.100.0-nightly (908501772 2026-08-30), nightly-2026-08-31",
+    "common_environment": [
+      "CARGO_BUILD_JOBS=1 on final attempts",
+      "CARGO_INCREMENTAL=0",
+      "CARGO_PROFILE_TEST_DEBUG=0",
+      "CARGO_PROFILE_DEV_DEBUG=0"
+    ],
+    "attempts": [
+      {
+        "command": "cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib --no-run",
+        "profile": "repository opt-level1, debug info disabled",
+        "exit_code": 101,
+        "stage": "asupersync 0.5.0 dependency code generation",
+        "diagnostic": "signal: 9, SIGKILL",
+        "native_tests_executed": 0
+      },
+      {
+        "command": "cargo test --locked --config 'profile.dev.package.asupersync.opt-level=0' -p mcp-agent-mail-storage --no-default-features --features portable --lib --no-run",
+        "profile": "optimization disabled only for the pinned Asupersync dependency",
+        "exit_code": 101,
+        "stage": "asupersync 0.5.0 dependency code generation",
+        "diagnostic": "signal: 9, SIGKILL",
+        "native_tests_executed": 0
+      },
+      {
+        "command": "cargo check --locked --workspace --all-targets",
+        "profile": "normal workspace feature graph; one job and debug info disabled",
+        "exit_code": 101,
+        "stage": "parking_lot dependency fingerprint output, before changed workspace crates",
+        "diagnostic": "No space left on device (os error 28)"
+      }
+    ],
+    "earlier_setup_failures": "The shared executor previously exhausted disk and was replaced. An in-flight output-path failure followed build-artifact relocation. These attempts produced no native test verdict and are not application regressions.",
+    "remaining_required_gates": [
+      {
+        "command": "cargo check --workspace --lib --bins",
+        "status": "BLOCKED by the exhausted shared build capacity; no passing result"
+      },
+      {
+        "command": "cargo clippy --workspace --all-targets -- -D warnings",
+        "status": "BLOCKED by the same build prerequisites; no passing result"
+      },
+      {
+        "command": "native focused tests and current-main comparison",
+        "status": "NOT EXECUTED"
+      },
+      {
+        "command": "full release saturation and300s quiet convergence",
+        "status": "NOT EXECUTED"
+      }
+    ]
+  },
+  "prepared_native_selection": {
+    "executed": 0,
+    "source_inspected_counts": {
+      "storage": 41,
+      "database_and_tools": 65
+    },
+    "entry_filters": {
+      "storage": [
+        "recovery::reservation_reconcile::repair_lock::",
+        "tests::direct_reservation_cancellation_"
+      ],
+      "database": [
+        "write_barrier::tests::",
+        "pool::tests::",
+        "pool::workload_tests::",
+        "pool_impl::tests::sqlite_init_gate_"
+      ],
+      "tools": [
+        "issue353_bootstrap_tests::",
+        "messaging::tests::cancelled_coordination_requests_finish_while_recovery_keeps_admission_closed",
+        "messaging::tests::fetch_inbox_peek_",
+        "outage_cannot_queue_unresolved_session_actors",
+        "write_failure_queues_and_replays_under_another_session",
+        "reservations::tests::replay_release_intent_"
+      ]
+    },
+    "comparison": "Build and run both arms with identical pins, features, profile overrides and temporary-directory settings. Require nonzero exact test selections and preserved ownership/bytes/debt checks. The controlled two-second observations are regression discriminators, not release latency benchmarks.",
+    "invariant_controls": "Also run all four real repair schedulers, the latched shutdown fixtures, retry-lane capacity/durable debt, canonical duplicate rejection and the100-vs-10000-file work keeper, staged fsync and epoch ordering, terminal reservation ownership, verified retention and deferred-release ownership."
+  },
+  "capacity_and_next_step": {
+    "observed_capacity": "The shared 32 GB disk was full; executor reported 9.7 GiB total RAM. Shared-memory cache was also nearly full.",
+    "deletion_rule": "AGENTS.md explicitly forbids deleting any file without express user permission, including newly created files.",
+    "proposed_cleanup_only": "Task-created public Git dependency caches and the preserved interrupted fetch, followed by reconstruction of exact pinned shallow checkouts. No repository source, evidence, user data or other workspace is included.",
+    "cache_bytes": {
+      "cargo_git": 1449164800,
+      "preserved_interrupted_fetches": 373460992,
+      "total": 1822625792
+    },
+    "authorization": "NOT REQUESTED/GRANTED in this receipt; no cache deletion has been performed."
+  }
+}
