@@ -1,5 +1,67 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## October 29 credential, transport and recovery follow-through (22:37 UTC)
+
+The useful changes through `addc201f` are preserved alongside the incoming
+checkpoint work through `b12861ad`. These are bounded repairs; the failed full
+workspace result and the engine, platform, durability and performance holds below
+remain authoritative.
+
+- Rejected legacy `DATABASE_URL` values no longer appear in diagnostics.
+  The retained installed executable reproduced the disclosure using synthetic
+  credentials. A fresh development executable refuses the same input with an
+  actionable static hint, prints neither credential marker nor the full URL, and
+  creates neither target database nor archive. All **66/66** native legacy tests
+  pass, including valid SQLite controls and three rejected URL schemes checked
+  through both Display and Debug. The full changed-file static scan still reports
+  four critical findings on reviewed metadata comparisons/test markers; it is not
+  an overall clean scan. `.73` is closed at that original scope.
+- GNU tar on the native Windows worker now respects the existing directory
+  exclusions in `.rchignore`. Actual extraction succeeds and all 3,774 frozen
+  project files match. Six tracked historical benchmark receipts remain included;
+  they are not compile-time inputs. `.72` closes the transfer defect only.
+- The stdio suite now supplies a private archive as well as a private database.
+  The old fixture correctly refused the live mailbox's owner lock. The same
+  executable passes the unchanged **18/18** assertions with private storage; a
+  fresh solo recheck also passes, with no skips. Tool listing, negotiation,
+  malformed requests, project creation and reservation release execute. Listing
+  45 tools is not functional testing of all 45. `.74` is closed; the shared
+  installed binary and live mailbox were not replaced or repaired.
+- Recovery preflight now uses the existing Windows no-follow handle/link-count
+  helpers instead of accepting aliased primary files unconditionally. The expanded
+  existing test covers both aliases and both promotion attempts, preserving
+  bytes, inode identity and candidate permissions. **10/10** native Linux recovery
+  tests pass, including real missing-primary reconstruction and parent-swap
+  refusal. Linux does not execute the new Windows branch. `br-8asz3` remains in
+  progress for native Windows and the original broader parent/engine authority
+  criteria; `br-xzgcj` and `br-hb3mk` also remain open.
+
+Workspace all-target, separate production, strict Clippy and formatting checks
+pass on merged `addc201f`; both fresh check processes match all 3,777 frozen
+inputs. Clippy's older source observer failed on incoming storage changes and is
+retained as a failure. The newer `b12861ad` checkpoint changes have been read and
+preserved; their required integrated compiler checks and native checkpoint
+re-execution are still pending in this entry. The running earlier checkpoint
+suite remains bound to `addc201f`, rather than being relabeled as newer-source
+evidence. Its actual runner/compiler inputs match all 3,777 frozen files.
+
+The native Windows default-feature core/share build reached its unchanged
+14,400-second timeout with **zero observed tests**. RCH could not confirm remote
+cleanup on Windows. The remaining original compiler was stopped through a
+guard-approved, identity-pinned single-process action; a subsequent native
+process query found no Cargo, Nextest or compiler tree. Three ordinary RCH
+cancellation attempts timed out. A fresh strict portable request then refused
+admission because the worker was unavailable. No drain override, shared-daemon
+restart, file removal or substitute platform result was used. `.49` and the
+remaining platform acceptance stay open; official native tool installation and
+source transfer are not crypto execution evidence.
+
+These closures use fresh solo re-execution against the original acceptance
+criteria, not independent review. The honesty review records excessive process
+volume; tracker updates and this bridge earn no capability credit. Detailed
+current tasks and retained command logs remain in Beads and
+`/tmp/am-agency-20261027/remaining-verification-todo-0642.md`.
+
 ## October 29 native verification follow-through (06:04 UTC)
 
 This entry supersedes the pending results in the October 28 entries below.
