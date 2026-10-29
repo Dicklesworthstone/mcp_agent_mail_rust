@@ -150,6 +150,130 @@ mod issue353_bootstrap_tests {
         ));
         assert_eq!(failed.code, fastmcp::McpErrorCode::InternalError);
     }
+
+    fn isolated_bootstrap_cancellation() -> bool {
+        let name = std::thread::current()
+            .name()
+            .expect("named bootstrap test")
+            .to_owned();
+        if std::env::var("AM_BOOTSTRAP_CANCELLATION_CHILD").as_deref() == Ok(name.as_str()) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env("AM_BOOTSTRAP_CANCELLATION_CHILD", &name)
+            .output()
+            .expect("run isolated bootstrap cancellation test");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "isolated test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    fn assert_cold_bootstrap_cancellation(request_local: bool) {
+        if isolated_bootstrap_cancellation() {
+            return;
+        }
+        let (scratch, config) = mailbox();
+        let storage_root = config.storage_root.clone().unwrap();
+        let sqlite_path = scratch.path().join("mail.sqlite3");
+        let request_cx = asupersync::Cx::for_testing();
+        let ctx = fastmcp::McpContext::new(request_cx.clone(), 1);
+        let request_cancellation = ctx.request_cancellation();
+        // Keep real writer ownership alive throughout cancellation. A cold
+        // initializer must reopen admission without draining or retiring it.
+        let writer = mcp_agent_mail_db::write_barrier::begin_write_activity();
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let worker_config = config.clone();
+        let worker_path = sqlite_path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = super::tool_util::bootstrap_db_pool_with_barrier_handoff(
+                &worker_config,
+                &storage_root,
+                Some(&worker_path),
+                Some(&ctx),
+            )
+            .map(drop);
+            done_tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let promotion_entered = loop {
+            if DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed) > before {
+                // A failed try_lock can be ordinary mutex contention. Observe
+                // a full bounded wait instead: the probe's second callback
+                // sees only the retained writer if admission really parked,
+                // or two writers if the probe itself was admitted. Either
+                // result releases the probe without changing the held writer.
+                let mut checks = 0;
+                let parked =
+                    mcp_agent_mail_db::write_barrier::begin_write_activity_cancellable_with(|| {
+                        checks += 1;
+                        if checks == 1 {
+                            Ok(())
+                        } else {
+                            Err(mcp_agent_mail_db::write_barrier::active_writer_count() == 1)
+                        }
+                    })
+                    .is_err_and(|parked| parked);
+                if parked {
+                    break true;
+                }
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        if request_local {
+            let _ = request_cancellation.cancel();
+        } else {
+            request_cx.set_cancel_requested(true);
+        }
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let writers = mcp_agent_mail_db::write_barrier::active_writer_count();
+        let admission_reopened =
+            mcp_agent_mail_db::write_barrier::try_begin_write_activity().is_some();
+        let initializer_released = DB_POOL_BOOTSTRAP_GATE.try_lock().is_ok();
+        let factory_unused =
+            !sqlite_path.exists() && mcp_agent_mail_db::get_cached_pool(&config).is_none();
+        // Release and reap before assertions, including an uncancellable
+        // implementation's failure path, so no worker survives this test.
+        drop(writer);
+        worker.join().expect("bootstrap worker");
+        assert!(promotion_entered, "cold bootstrap never entered its drain");
+        let error = completed
+            .expect("cancelled bootstrap waited for a live writer")
+            .expect_err("cancelled bootstrap admitted a write pool");
+        assert_eq!(error.code, fastmcp::McpErrorCode::RequestCancelled);
+        assert_eq!(writers, 1, "cancellation changed the live writer's lease");
+        assert!(admission_reopened, "cancelled bootstrap stranded admission");
+        assert!(
+            initializer_released,
+            "cancelled bootstrap retained its gate"
+        );
+        assert!(factory_unused, "cancelled drain reached database bootstrap");
+        if request_local {
+            assert!(
+                !request_cx.is_cancel_requested(),
+                "request-local cancellation escaped to the ambient context"
+            );
+        }
+    }
+
+    #[test]
+    fn gh353_cold_bootstrap_drain_observes_ambient_cancellation() {
+        assert_cold_bootstrap_cancellation(false);
+    }
+
+    #[test]
+    fn gh353_cold_bootstrap_drain_observes_request_local_cancellation() {
+        assert_cold_bootstrap_cancellation(true);
+    }
 }
 
 pub mod build_slots;
@@ -992,7 +1116,9 @@ pub mod tool_util {
         cfg: &DbPoolConfig,
         storage_root: &Path,
         sqlite_path: Option<&Path>,
+        ctx: Option<&McpContext>,
     ) -> McpResult<(DbPool, crate::archive_read::WriteGuard)> {
+        check_write_pool_cancellation(ctx)?;
         let _initializer = match DB_POOL_BOOTSTRAP_GATE.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
@@ -1008,18 +1134,24 @@ pub mod tool_util {
         // miss but before we acquired initializer ownership. Recheck while
         // counted as an ordinary writer; if it is now hot, return it without
         // ever closing admission behind the recovery-promotion barrier.
-        let guard = crate::archive_read::WriteGuard::begin(storage_root, sqlite_path);
+        let guard = begin_pool_write_guard(ctx, storage_root, sqlite_path)?;
         if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
+            check_write_pool_cancellation(ctx)?;
             return Ok((pool, guard));
         }
         drop(guard);
+        check_write_pool_cancellation(ctx)?;
 
         #[cfg(test)]
         DB_POOL_BOOTSTRAP_PROMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (barrier, outcome) =
-            mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
-                mcp_agent_mail_db::write_barrier::writer_drain_timeout(),
-            );
+        let timeout = mcp_agent_mail_db::write_barrier::writer_drain_timeout();
+        let (barrier, outcome) = match ctx {
+            Some(ctx) => mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining_cancellable_with(
+                timeout,
+                || ensure_request_live(ctx),
+            )?,
+            None => mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(timeout),
+        };
         if let mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut { remaining_writers } =
             outcome
         {
@@ -1028,12 +1160,13 @@ pub mod tool_util {
                 "database pool bootstrap deferred because {remaining_writers} writer(s) did not drain before the recovery barrier timeout"
             )));
         }
+        check_write_pool_cancellation(ctx)?;
         let pool = get_or_create_pool(cfg).map_err(pool_bootstrap_error)?;
         // Atomic handoff: register the caller as a writer while the promotion
         // barrier is still closed, then release the barrier. No promotion can
         // enter between cold bootstrap/recovery and the operation using this
         // pool.
-        let guard = crate::archive_read::WriteGuard::begin(storage_root, sqlite_path);
+        let guard = begin_pool_write_guard(ctx, storage_root, sqlite_path)?;
         drop(barrier);
         Ok((pool, guard))
     }
@@ -1042,7 +1175,54 @@ pub mod tool_util {
         get_db_pool_for_config(&DbPoolConfig::from_env())
     }
 
+    /// Admit a request without retaining a cancelled waiter behind recovery.
+    /// Both the hot write lease and cold bootstrap drain observe the request's
+    /// own cancellation token without cancelling a shared ambient context.
+    pub fn get_db_pool_for_request(ctx: &McpContext) -> McpResult<WriteDbPool> {
+        get_db_pool_with_admission(&DbPoolConfig::from_env(), Some(ctx))
+    }
+
+    pub(crate) fn ensure_request_live(ctx: &McpContext) -> McpResult<()> {
+        ctx.ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
+        ctx.cx()
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        Ok(())
+    }
+
+    fn check_write_pool_cancellation(ctx: Option<&McpContext>) -> McpResult<()> {
+        ctx.map_or(Ok(()), ensure_request_live)
+    }
+
+    fn begin_pool_write_guard(
+        ctx: Option<&McpContext>,
+        storage_root: &Path,
+        sqlite_path: Option<&Path>,
+    ) -> McpResult<crate::archive_read::WriteGuard> {
+        let activity = match ctx {
+            Some(ctx) => {
+                mcp_agent_mail_db::write_barrier::begin_write_activity_cancellable_with(|| {
+                    ensure_request_live(ctx)
+                })?
+            }
+            None => mcp_agent_mail_db::write_barrier::begin_write_activity(),
+        };
+        let guard =
+            crate::archive_read::WriteGuard::from_activity(storage_root, sqlite_path, activity);
+        check_write_pool_cancellation(ctx)?;
+        Ok(guard)
+    }
+
     pub(crate) fn get_db_pool_for_config(cfg: &DbPoolConfig) -> McpResult<WriteDbPool> {
+        get_db_pool_with_admission(cfg, None)
+    }
+
+    fn get_db_pool_with_admission(
+        cfg: &DbPoolConfig,
+        ctx: Option<&McpContext>,
+    ) -> McpResult<WriteDbPool> {
+        check_write_pool_cancellation(ctx)?;
         let sqlite_path =
             if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
                 None
@@ -1057,11 +1237,10 @@ pub mod tool_util {
             .storage_root
             .clone()
             .unwrap_or_else(|| Config::from_env().storage_root);
-        let guard = crate::archive_read::WriteGuard::begin(
-            &storage_root,
-            sqlite_path.as_deref().map(Path::new),
-        );
+        let guard =
+            begin_pool_write_guard(ctx, &storage_root, sqlite_path.as_deref().map(Path::new))?;
         if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
+            check_write_pool_cancellation(ctx)?;
             return Ok(WriteDbPool {
                 pool,
                 _guard: guard,
@@ -1075,6 +1254,7 @@ pub mod tool_util {
             cfg,
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
+            ctx,
         )?;
         Ok(WriteDbPool {
             pool,
@@ -1131,8 +1311,9 @@ pub mod tool_util {
     }
 
     /// [`touch_acting_agent`] for a tool that reads through a live query-only
-    /// pool. The write pool is opened only when the agent's touch is due, so a
-    /// polling agent adds no write-lane traffic between touches.
+    /// pool. Optional bookkeeping uses only a hot authoritative pool and
+    /// immediate write admission. A completed read must not start recovery or
+    /// wait behind it to update a best-effort activity timestamp.
     pub(crate) async fn touch_acting_agent_after_live_read(
         ctx: &McpContext,
         read_pool: &DbPool,
@@ -1142,15 +1323,36 @@ pub mod tool_util {
             return;
         };
         if acts_for_operator(ctx)
+            || ensure_request_live(ctx).is_err()
             || !mcp_agent_mail_db::queries::agent_touch_due(read_pool, agent_id)
         {
             return;
         }
-        match get_db_pool() {
-            Ok(pool) => touch_acting_agent(ctx, &pool, Some(agent_id)).await,
-            Err(error) => {
-                tracing::debug!(agent_id, error = %error, "agent activity touch skipped");
-            }
+        let Some(activity) = mcp_agent_mail_db::write_barrier::try_begin_write_activity() else {
+            return;
+        };
+        // Count the writer before looking up authority, so a promotion cannot
+        // retire the cached pool between lookup and use. A miss neither
+        // bootstraps a writer nor consumes the agent's activity throttle.
+        let cfg = DbPoolConfig::from_env();
+        let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) else {
+            return;
+        };
+        // The completed read may predate recovery. Numeric agent IDs from a
+        // retired generation cannot identify an agent in its replacement.
+        // Check while counted so no promotion can retire this generation
+        // between validation and the optional write.
+        if read_pool.is_closed() || pool.sqlite_path() != read_pool.sqlite_path() {
+            return;
+        }
+        let storage_root = cfg
+            .storage_root
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        let sqlite_path = (pool.sqlite_path() != ":memory:").then(|| Path::new(pool.sqlite_path()));
+        let _guard =
+            crate::archive_read::WriteGuard::from_activity(&storage_root, sqlite_path, activity);
+        if ensure_request_live(ctx).is_ok() {
+            touch_acting_agent(ctx, &pool, Some(agent_id)).await;
         }
     }
 
@@ -1217,6 +1419,7 @@ pub mod tool_util {
             &cfg,
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
+            None,
         )?;
         drop(guard);
         Ok(pool)
