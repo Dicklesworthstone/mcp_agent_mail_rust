@@ -35254,7 +35254,11 @@ first body
         if std::env::var_os(CHILD).is_none() {
             // ATC write mode is a process-lifetime choice. Keep the real tool,
             // engine and sidecar fixture isolated from other tests and mailboxes.
-            let dir = tempfile::tempdir().expect("private reservation feedback fixture");
+            let dir = tempfile::Builder::new()
+                .prefix("am-atc-reservation-feedback-")
+                .tempdir()
+                .expect("private reservation feedback fixture");
+            std::fs::create_dir(dir.path().join("project-alpha")).expect("private project root");
             let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",

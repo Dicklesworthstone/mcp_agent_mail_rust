@@ -87,6 +87,9 @@ slow-timeout = { period = "180s", terminate-after = 6, grace-period = "10s" }
 # unchanged; this reserves runner capacity, not CPU time from other processes.
 # Integration tests live in one `it` binary per crate (br-kp1in.28), so a former
 # test binary `<name>` is selected as `binary_id(<crate>::it) & test(/^<name>::/)`.
+# The opaque-reader fixture hides its descriptors from all same-user processes.
+# Run it alone so unrelated tests can still inspect their own recovery files;
+# their reader/refusal assertions and four-minute deadlines remain unchanged.
 # ---------------------------------------------------------------------------
 [[profile.default.overrides]]
 filter = '''
@@ -104,6 +107,7 @@ filter = '''
 | binary_id(mcp-agent-mail-server::golden_snapshots)
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
+| test(=recovery_retention::namespace::tests::deletion_retains_a_nondumpable_same_user_reader)
 '''
 threads-required = "num-test-threads"
 
