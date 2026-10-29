@@ -28,6 +28,9 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_stdio")"
 STDIO_DB="${WORK}/stdio_test.sqlite3"
+# Every server in this suite must use private archive authority as well as a
+# private database, even when a live operator mailbox owns the default root.
+export STORAGE_ROOT="${WORK}/storage"
 
 # Helper: write structured stdio request artifact(s) as JSON.
 write_stdio_request_artifact() {
