@@ -283,6 +283,17 @@ pub struct WriteGuard {
 impl WriteGuard {
     pub(crate) fn begin(storage_root: &Path, sqlite_path: Option<&Path>) -> Self {
         let write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+        Self::from_activity(storage_root, sqlite_path, write_activity)
+    }
+
+    /// Attach archive generation tracking to an already admitted live writer.
+    /// The caller retains the same database-promotion exclusion through this
+    /// guard; entering and leaving still invalidate every overlapping build.
+    pub(crate) fn from_activity(
+        storage_root: &Path,
+        sqlite_path: Option<&Path>,
+        write_activity: mcp_agent_mail_db::write_barrier::WriteActivityGuard,
+    ) -> Self {
         WRITERS_ACTIVE.fetch_add(1, Ordering::AcqRel);
         WRITER_EPOCH.fetch_add(1, Ordering::AcqRel);
         let slot = sqlite_path
@@ -932,7 +943,12 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
 }
 
 fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireError>) {
-    mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+    // A last snapshot owner closes its pool and removes its temporary database
+    // family. Carry both displaced and rejected snapshots out of publication
+    // exclusion: cleanup has no authority over the newly published generation.
+    let mut retired = None;
+    let mut rejected = None;
+    let completion = mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
         let mut state = slot
             .state
             .lock()
@@ -942,11 +958,10 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
             .as_ref()
             .is_none_or(|active| active.token != build.token)
         {
-            drop(state);
-            build.completion.finish(Err(AcquireError::Busy(
+            rejected = Some(result);
+            return Err(AcquireError::Busy(
                 "archive-read snapshot build ownership changed before publication".to_string(),
-            )));
-            return;
+            ));
         }
         let result = match result {
             Ok(output)
@@ -959,7 +974,7 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
                     && mcp_agent_mail_storage::archive_mutation_epoch() == build.archive_epoch
                     && state.writers == 0 =>
             {
-                state.ready = Some(Ready {
+                retired = state.ready.replace(Ready {
                     generation: output.generation,
                     cheap: output.cheap,
                     decision: output.decision,
@@ -970,7 +985,8 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
                 });
                 Ok(())
             }
-            Ok(_) => {
+            Ok(output) => {
+                rejected = Some(Ok(output));
                 tracing::debug!(
                     deadline_ok = Instant::now() < build.deadline,
                     invalidation_epoch = slot.invalidation_epoch.load(Ordering::Acquire),
@@ -991,13 +1007,14 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
             Err(error) => Err(error),
         };
         state.building = None;
-        drop(state);
-        // Finishing outside the state lock keeps lock nesting one-level
-        // (completion has its own mutex); waiters re-check under the state
-        // lock with a bounded wait, so the tiny gap is at most one slice.
-        build.completion.finish(result);
+        result
     });
+    // Publish completion and wake readers before potentially slow destruction,
+    // outside both the slot mutex and the native archive publication fence.
+    build.completion.finish(completion);
     slot.wake.notify_all();
+    drop(retired);
+    drop(rejected);
 }
 
 fn claim_build(slot: &Slot, deadline: Instant) -> Result<Option<Build>, AcquireError> {
@@ -1357,9 +1374,352 @@ pub fn writer_epoch_for_test() -> u64 {
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
-    use std::sync::Barrier;
+    use std::cell::RefCell;
+    use std::sync::{Barrier, mpsc};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SnapshotDropObserver {
+        path: PathBuf,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    std::thread_local! {
+        static SNAPSHOT_DROP_OBSERVER: RefCell<Option<SnapshotDropObserver>> =
+            const { RefCell::new(None) };
+    }
+
+    // Observe the real SharedSnapshot's last-owner destruction, immediately
+    // before its actual pool and temporary directory are dropped. No database,
+    // publication fence, or cleanup implementation is substituted by this hook.
+    impl Drop for SharedSnapshot {
+        fn drop(&mut self) {
+            let observer = SNAPSHOT_DROP_OBSERVER
+                .try_with(|slot| slot.borrow_mut().take())
+                .ok()
+                .flatten();
+            if let Some(observer) = observer {
+                assert_eq!(self.path(), observer.path);
+                observer.entered.send(()).expect("observe snapshot drop");
+                observer
+                    .release
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("release snapshot cleanup after bounded observations");
+            }
+        }
+    }
+
+    fn isolated_retirement_test() -> bool {
+        const CHILD: &str = "AM_TEST_ARCHIVE_SNAPSHOT_RETIREMENT_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .expect("run isolated snapshot retirement test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name} failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    fn retirement_fixture() -> (tempfile::TempDir, Arc<Slot>, String) {
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("snapshot retirement fixture");
+        let root = directory.path().canonicalize().expect("canonical fixture");
+        let storage_root = root.join("archive");
+        let sqlite_path = root.join("missing-live.sqlite3");
+        write_archive_fixture(&storage_root);
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let slot = slot_for(scope(&storage_root, &sqlite_path).expect("snapshot scope"))
+            .expect("snapshot slot");
+        (directory, slot, database_url)
+    }
+
+    fn retirement_build(slot: &Slot, database_url: &str) -> (Build, BuildOutput) {
+        let build = claim_build(slot, Instant::now() + BUILD_TIMEOUT)
+            .expect("claim snapshot build")
+            .expect("snapshot build owner");
+        let output = run_build(slot, database_url, &build).expect("build actual archive snapshot");
+        assert!(matches!(&output.decision, Decision::Snapshot(_)));
+        (build, output)
+    }
+
+    fn snapshot_decision_path(decision: &Decision) -> Option<PathBuf> {
+        match decision {
+            Decision::Live => None,
+            Decision::Snapshot(snapshot) => Some(snapshot.path().to_path_buf()),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RetirementCase {
+        Replacement,
+        Superseded,
+        StaleToken,
+    }
+
+    fn assert_snapshot_retirement_outside_publication(case: RetirementCase) {
+        let (_directory, slot, database_url) = retirement_fixture();
+        let live_before = snapshot_family(&slot.scope.sqlite_path);
+        let (first, output) = retirement_build(&slot, &database_url);
+        let first_path = snapshot_decision_path(&output.decision).expect("first snapshot path");
+        finish_build(&slot, &first, Ok(output));
+        assert_eq!(first.completion.result(), Some(Ok(())));
+
+        // Use the ordinary writer invalidation protocol to force a genuinely
+        // new reconstruction instead of cloning the existing ready decision.
+        drop(WriteGuard::begin(
+            &slot.scope.storage_root,
+            Some(&slot.scope.sqlite_path),
+        ));
+        let (build, output) = retirement_build(&slot, &database_url);
+        let output_path = snapshot_decision_path(&output.decision).expect("new snapshot path");
+        assert_ne!(output_path, first_path);
+        let (retiring_path, ready_path, newer_owner) = match case {
+            RetirementCase::Replacement => (first_path, output_path, None),
+            RetirementCase::Superseded => {
+                drop(WriteGuard::begin(
+                    &slot.scope.storage_root,
+                    Some(&slot.scope.sqlite_path),
+                ));
+                (output_path, first_path, None)
+            }
+            RetirementCase::StaleToken => {
+                fail_claimed_build(
+                    &slot,
+                    &build,
+                    AcquireError::Busy("fixture advanced build ownership".into()),
+                );
+                let newer = claim_build(&slot, Instant::now() + BUILD_TIMEOUT)
+                    .expect("claim newer build")
+                    .expect("newer build owner");
+                (output_path, first_path, Some(newer))
+            }
+        };
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let publisher_slot = Arc::clone(&slot);
+        let publisher_build = build.clone();
+        let observed_path = retiring_path.clone();
+        let publisher = std::thread::spawn(move || {
+            SNAPSHOT_DROP_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(SnapshotDropObserver {
+                    path: observed_path,
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            });
+            finish_build(&publisher_slot, &publisher_build, Ok(output));
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let completion_before_cleanup = build.completion.result();
+        let state_before_cleanup = slot.state.try_lock().ok().map(|state| {
+            (
+                state
+                    .ready
+                    .as_ref()
+                    .and_then(|ready| snapshot_decision_path(&ready.decision)),
+                state.building.as_ref().map(|active| active.token),
+            )
+        });
+        let file_exists_during_cleanup = retiring_path.is_file();
+        let newer_completion_untouched = newer_owner
+            .as_ref()
+            .is_none_or(|newer| newer.completion.result().is_none());
+
+        let (fence_tx, fence_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+                let _ = fence_tx.send(());
+            });
+        });
+        let (waiter_tx, waiter_rx) = mpsc::channel();
+        let waiter_slot = Arc::clone(&slot);
+        let mut waiter_build = build.clone();
+        waiter_build.deadline = waiter_build
+            .deadline
+            .min(Instant::now() + Duration::from_secs(5));
+        let waiter = std::thread::spawn(move || {
+            let result = wait_for_build(&waiter_slot, &waiter_build, &Cx::for_testing());
+            let _ = waiter_tx.send(result);
+        });
+        let fence_before_cleanup = fence_rx.recv_timeout(Duration::from_secs(2));
+        let waiter_before_cleanup = waiter_rx.recv_timeout(Duration::from_secs(2));
+
+        // Release and join even against the old implementation, which keeps
+        // the native fence (and, for replacement, the slot) inside this drop.
+        let _ = release_tx.send(());
+        let publisher_result = publisher.join();
+        let contender_result = contender.join();
+        let waiter_result = waiter.join();
+        let expected_token = newer_owner.as_ref().map(|newer| newer.token);
+        if let Some(newer) = &newer_owner {
+            fail_claimed_build(&slot, newer, AcquireError::Busy("fixture finished".into()));
+        }
+        let retired_file_removed = !retiring_path.exists();
+        let live_after = snapshot_family(&slot.scope.sqlite_path);
+        reset_for_test();
+
+        assert!(
+            entered.is_ok(),
+            "the last snapshot owner must reach cleanup"
+        );
+        assert!(publisher_result.is_ok(), "snapshot publisher panicked");
+        assert!(contender_result.is_ok(), "native fence contender panicked");
+        assert!(waiter_result.is_ok(), "snapshot waiter panicked");
+        assert!(
+            fence_before_cleanup.is_ok(),
+            "snapshot retirement held the native publication fence"
+        );
+        assert_eq!(
+            state_before_cleanup,
+            Some((Some(ready_path), expected_token)),
+            "retirement must release the slot without replacing a newer build owner"
+        );
+        let published = matches!(case, RetirementCase::Replacement);
+        assert_eq!(
+            completion_before_cleanup.as_ref().map(Result::is_ok),
+            Some(published),
+            "build completion must precede snapshot cleanup"
+        );
+        assert_eq!(
+            waiter_before_cleanup.as_ref().ok().map(Result::is_ok),
+            Some(published),
+            "a real build waiter must finish while cleanup remains blocked"
+        );
+        assert!(newer_completion_untouched);
+        assert!(file_exists_during_cleanup);
+        assert!(
+            retired_file_removed,
+            "the actual temporary family must retire"
+        );
+        assert_eq!(live_after, live_before);
+    }
+
+    #[test]
+    fn snapshot_replacement_releases_publication_before_retirement() {
+        if !isolated_retirement_test() {
+            assert_snapshot_retirement_outside_publication(RetirementCase::Replacement);
+        }
+    }
+
+    #[test]
+    fn superseded_snapshot_releases_publication_before_retirement() {
+        if !isolated_retirement_test() {
+            assert_snapshot_retirement_outside_publication(RetirementCase::Superseded);
+        }
+    }
+
+    #[test]
+    fn stale_snapshot_result_releases_publication_before_retirement() {
+        if !isolated_retirement_test() {
+            assert_snapshot_retirement_outside_publication(RetirementCase::StaleToken);
+        }
+    }
+
+    #[test]
+    fn retired_snapshot_remains_queryable_until_its_last_reader_releases_it() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = retirement_fixture();
+        let (first, output) = retirement_build(&slot, &database_url);
+        let reader = output.decision.snapshot().expect("reader owns snapshot");
+        let reader_path = reader.path().to_path_buf();
+        finish_build(&slot, &first, Ok(output));
+        drop(WriteGuard::begin(
+            &slot.scope.storage_root,
+            Some(&slot.scope.sqlite_path),
+        ));
+        let (replacement, output) = retirement_build(&slot, &database_url);
+        let replacement_path =
+            snapshot_decision_path(&output.decision).expect("replacement snapshot path");
+        finish_build(&slot, &replacement, Ok(output));
+        assert_eq!(replacement.completion.result(), Some(Ok(())));
+        assert_eq!(Arc::strong_count(&reader), 1);
+        assert!(
+            reader_path.is_file(),
+            "the old reader still owns its family"
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("query retained snapshot");
+        let cx = Cx::for_testing();
+        let conn = match runtime.block_on(reader.pool.acquire(&cx)) {
+            asupersync::Outcome::Ok(conn) => conn,
+            asupersync::Outcome::Err(error) => {
+                panic!("retired snapshot reader could not acquire its pool: {error}")
+            }
+            asupersync::Outcome::Cancelled(_) => panic!("retired snapshot reader was cancelled"),
+            asupersync::Outcome::Panicked(_) => panic!("retired snapshot reader panicked"),
+        };
+        let rows = conn
+            .query_sync("SELECT subject FROM messages WHERE id = 1", &[])
+            .expect("query old immutable snapshot after replacement");
+        assert_eq!(
+            rows[0].get_named::<String>("subject").expect("subject"),
+            "hello"
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[])
+                .expect("query-only reader")[0]
+                .get_named::<i64>("query_only")
+                .expect("query-only flag"),
+            1
+        );
+        drop(conn);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observed_path = reader_path.clone();
+        let last_reader = std::thread::spawn(move || {
+            SNAPSHOT_DROP_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(SnapshotDropObserver {
+                    path: observed_path,
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            });
+            drop(reader);
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let ready_while_reader_retires = slot.state.try_lock().ok().and_then(|state| {
+            state
+                .ready
+                .as_ref()
+                .and_then(|ready| snapshot_decision_path(&ready.decision))
+        });
+        let (fence_tx, fence_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+                let _ = fence_tx.send(());
+            });
+        });
+        let fence_before_cleanup = fence_rx.recv_timeout(Duration::from_secs(2));
+        let _ = release_tx.send(());
+        let reader_result = last_reader.join();
+        let contender_result = contender.join();
+        let retired_file_removed = !reader_path.exists();
+        reset_for_test();
+
+        assert!(entered.is_ok(), "the last reader must own actual cleanup");
+        assert!(reader_result.is_ok());
+        assert!(contender_result.is_ok());
+        assert!(fence_before_cleanup.is_ok());
+        assert_eq!(ready_while_reader_retires, Some(replacement_path));
+        assert!(retired_file_removed);
+    }
 
     /// Proves the configured stack actually carries a frame depth that would
     /// abort on the 2 MiB default, i.e. that `.stack_size()` is really applied.
