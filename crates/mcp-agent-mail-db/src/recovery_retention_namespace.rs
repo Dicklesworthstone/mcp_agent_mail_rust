@@ -690,7 +690,7 @@ fn ensure_no_mapped_file_readers(
         }
         Err(error) => return Err(error),
     };
-    let mut maps = Vec::new();
+    let mut maps = Vec::with_capacity(64 * 1024);
     match maps_file
         .take(MAX_PROCESS_MAP_BYTES + 1)
         .read_to_end(&mut maps)
@@ -760,7 +760,7 @@ fn descriptor_references_inode(
 ) -> io::Result<bool> {
     use std::io::Read as _;
 
-    let mut info = Vec::new();
+    let mut info = Vec::with_capacity(4096);
     File::open(process.join("fdinfo").join(descriptor.file_name()))?
         .take(4096)
         .read_to_end(&mut info)?;
@@ -834,7 +834,7 @@ fn read_process_status_summary(process: &Path) -> io::Result<ProcessStatusSummar
     use std::io::Read as _;
 
     const MAX_PROCESS_STATUS_BYTES: usize = 64 * 1024;
-    let mut status = Vec::new();
+    let mut status = Vec::with_capacity(4096);
     File::open(process.join("status"))?
         .take(MAX_PROCESS_STATUS_BYTES as u64 + 1)
         .read_to_end(&mut status)?;
