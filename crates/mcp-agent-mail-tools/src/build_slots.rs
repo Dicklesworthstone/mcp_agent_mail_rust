@@ -20,7 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_db_pool_for_request, legacy_tool_error, resolve_project,
+};
 
 static LEASE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -561,7 +565,7 @@ pub async fn acquire_build_slot(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent_name =
@@ -601,7 +605,7 @@ pub async fn renew_build_slot(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent_name =
@@ -635,7 +639,7 @@ pub async fn release_build_slot(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent_name =
