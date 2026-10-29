@@ -437,6 +437,51 @@ DATABASE_POOL_SIZE=50 DATABASE_MAX_OVERFLOW=150 am serve-http
 sqlite3 "$DATABASE_URL" "PRAGMA wal_checkpoint(TRUNCATE);"
 ```
 
+### Message archive reconciliation checkpoint unavailable (Windows and Unix)
+
+`message_archive_checkpoint_unavailable` means the reconciler could not use or
+publish its scheduling sidecar beside SQLite (`.am-message-reconcile-*.json`,
+with a paired `.json.lock`). These scheduling hints do not replace mailbox
+records or authorize repair. Successful messaging does not prove checkpoint
+persistence, and this warning does not establish message loss.
+
+Use the structured fields to locate the failure before changing storage:
+
+| Field | Interpretation |
+|-------|----------------|
+| `phase=initialization` | Database/archive binding, path validation, or lock opening/acquisition failed. |
+| `phase=restore` | Reading, decoding, validating, or merging saved scheduling hints failed. |
+| `phase=publication` | Revalidating the live source or staging, syncing, or publishing updated hints failed. |
+| `error_kind`, `raw_os_error` | Rust's classification and the original OS code, when present. |
+| `reason` | For filesystem failures, the operation, affected path, and underlying error; component validation also names the exact `symlink_metadata` prefix. |
+
+For Windows `Incorrect function. (os error 1)`, inspect that operation and prefix;
+do not infer a directory-flush failure from the code alone. Checkpoint directory
+sync runs only on Unix. Genuine lock contention defers the pass; it does not
+grant another worker permission to publish. Do not remove an active lock or
+disable link checks to silence a warning.
+
+Reconciliation can continue in memory while persistence is unavailable. Failed
+publication retains unsaved work for later passes; failure before replacement
+leaves the prior checkpoint intact. After restart, valid durable hints are
+replayed, or scanning starts without them. Every restored ID is checked against
+the current source. Collect the complete event, version, platform, and affected
+filesystem when reporting a repeated failure.
+
+For **native Windows** qualification, run in PowerShell from the repository root
+with the pinned Rust toolchain and permission to create test symlinks:
+
+```powershell
+$probe = Join-Path $env:TEMP ("am-checkpoint-" + [guid]::NewGuid())
+python scripts/ci/checkpoint_path_probe.py --repo . --output $probe
+cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib path_prefix_tests:: -- --test-threads=1 --nocapture
+cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::message_reconcile::database::checkpoint::tests:: -- --test-threads=1 --nocapture
+```
+
+The probe diagnoses production path validation; Cargo tests cover checkpoint
+lifecycle, restart, contention, and unsafe paths. Record results and OS: Linux,
+cross-compiles, Wine, and unexecuted tests do not establish a native Windows pass.
+
 ### Authentication failures
 
 **Symptom:** Tool calls return 401 Unauthorized

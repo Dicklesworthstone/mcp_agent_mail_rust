@@ -168,3 +168,109 @@ does not expose workflow dispatch, and the workflow browser page was signed
 out. This does not establish whether Actions or the workflow is disabled.
 An authenticated manual dispatch of Archive Fsync Matrix on the corrected
 `main` is the remaining native qualification step.
+
+## Follow-up: component diagnostics and opened-handle validation
+
+This follow-up builds on `1abf33ecf05d3080a70a6042cfc8dd7a2e2694e3` and preserves
+the preceding corrections and all 44 existing message checkpoint tests. The
+earlier execution table describes its original source revision; it must not be
+read as a fresh full-crate qualification of this follow-up.
+
+Path-validation errors now retain the exact failing `symlink_metadata`
+component, the original I/O kind, and the native error source. Message checkpoint
+warnings add `phase=initialization|restore|publication`, `error_kind`, and
+`raw_os_error`. The latter traverses the error source chain, including the
+component validator, rather than discarding the native code when context is
+added. Publication and binding capture retain typed errors through the warning
+boundary. Filesystem errors identify their operation and affected path.
+
+Both lock admission paths share a no-follow open and inspect the opened handle
+before attempting the lock. Windows checks reject reparse points and multiple
+hard links on opened locks and on checkpoint/lock sidecars. The existing Unix
+no-follow flags, permissions, device/inode checks, and directory synchronization
+remain. The checkpoint schema, binding serialization, bounded snapshot reads,
+paired cursor/retry-debt publication, and live-source authorization are unchanged.
+
+The follow-up retains the existing cross-process restart, contention,
+post-staging link-substitution, and Windows replacement-sharing tests. It adds
+long canonical Windows checkpoint creation/replacement/recovery, a real failed
+rename that preserves the preceding durable checkpoint, and dangling-link or
+linked-parent refusal. Existing unsafe-sidecar coverage now checks both lock
+and checkpoint symlinks/hardlinks on Unix and Windows, including direct lock
+opens. The process test uses bounded child polling and a reap guard and verifies
+the actual abandoned staged snapshot before a fresh process restores the old
+watermark and retry debt.
+
+### Follow-up execution evidence
+
+| Check | Result | Scope |
+|---|---|---|
+| Final path helper and inline tests, native Linux | 3 passed, 0 failed, 0 ignored | Exact final production helper and inline test module |
+| Final checkpoint filesystem component, native Linux | 29 passed, 0 failed, 0 ignored | Exact Store, binding filesystem capture, snapshot/cursor/debt logic, warning function, real filesystem/clock/locking, and selected production tests |
+| Final Windows GNU target typecheck | Blocked during disk exhaustion; no valid completion | The path command returned 101, but the disk also prevented its log/exit receipt from being written; the checkpoint cross-check was not attempted |
+| Final native Windows execution | Not run | No Windows/MSVC/NTFS lifecycle or symlink qualification obtained |
+| Final workspace formatting | Passed, exit 0 | `cargo fmt --check` with the repository-pinned toolchain |
+| Final whitespace validation | Passed, exit 0 | `git diff --check` |
+
+The focused harnesses used the repository-pinned compiler and dependency
+versions, sources, and checksums. The checkpoint harness contained 54
+byte-identical production excerpts verified by an independent reconstruction
+audit; all 105 external dependency entries matched the repository lockfile.
+It included 33 production checkpoint test definitions, of which 29 applied on
+Linux. Fourteen database/runtime test definitions and their live integration
+paths were explicitly excluded. These component results do not qualify SQLite
+authorization, the maintenance worker, or MCP messaging end to end.
+
+The attempted final Windows command was:
+
+```sh
+cargo check --tests --locked --offline --target x86_64-pc-windows-gnu
+```
+
+It was intended only to typecheck the Windows branches; even successful
+cross-compilation would not establish execution.
+Earlier draft-source Windows cross-checks are not counted as a final integrated
+source pass. No source or test was weakened to work around the resource failure.
+The failed archive copy and receipt write reported `No space left on device`;
+the incomplete Windows log is not evidence of a source-level compiler error.
+
+The validated source SHA-256 values are:
+
+```text
+crates/mcp-agent-mail-storage/src/lib.rs
+d97b5795751a9aa0d6dd79ab5f3a51c2af847bcf672d3a5660ac2bdb207c6a88
+crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/checkpoint.rs
+eaf816df41a26cc48bdcc146022ac19ff9f997f94cf97d090ee174bbac77cc2f
+```
+
+### Follow-up build limitations
+
+The separate portable production-library command was attempted with the pinned
+compiler, one build job, no incremental compilation, no debug information, and
+optimization level zero:
+
+```sh
+cargo check --locked --offline -p mcp-agent-mail-storage --no-default-features --features portable --lib
+```
+
+It exited 101 after the Asupersync 0.5.0 compiler received SIGKILL, before the
+changed storage library was checked. The container's out-of-memory kill counter
+increased during that attempt. This is a failed qualification gate, not a
+source-level compiler diagnostic or a passing production build. An earlier
+attempt without a completion receipt is not counted.
+
+The required workspace all-targets, production-only (`--lib --bins`), and
+Clippy (`--all-targets -- -D warnings`) commands were also attempted with
+`--locked --offline`. Each exited 101 because `addr2line 0.25.1` was absent from
+the cache. The shared filesystem had no generally available space, so these
+attempts did not download the rest of the workspace dependencies. No workspace
+compiler or Clippy pass is claimed for the follow-up. UBS was not installed in
+this environment.
+
+No native Windows/MSVC/NTFS execution was obtained for this follow-up. The
+Actions runs API returned zero runs for `1abf33ecf05d3080a70a6042cfc8dd7a2e2694e3`.
+The isolated Wine reproduction above identifies the bare-prefix metadata
+operation in that environment; it does not retroactively instrument the
+reporter's native v0.3.39 process. The new warning fields distinguish that
+operation from lock, read, sync, and replacement failures in a future native
+report.
