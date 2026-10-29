@@ -35291,7 +35291,13 @@ first body
 
         let config = mcp_agent_mail_core::Config::get();
         atc::init_global_atc(&config);
-        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("real mailbox pool");
+        let pool = {
+            let request_pool =
+                mcp_agent_mail_tools::tool_util::get_db_pool().expect("real mailbox pool");
+            // Retain the fixture's engine, not one request's writer lease,
+            // across the independent tool calls below.
+            (*request_pool).clone()
+        };
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx.clone(), 1);
         let project_key = std::env::current_dir()

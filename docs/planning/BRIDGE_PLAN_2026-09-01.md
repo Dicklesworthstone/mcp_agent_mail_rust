@@ -1,5 +1,87 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## October 29 native verification follow-through (06:04 UTC)
+
+This entry supersedes the pending results in the October 28 entries below.
+The completed native workspace run executed **20,435 tests: 20,431 passed,
+three failed and one timed out**, with 54 existing skips. It is a failed workspace
+run, not release qualification. Of the 95 distinct failures retained from the
+earlier matrix, 93 now pass; archive-header preservation and the empty-directory
+retention deadline still fail. The two additional failures exposed test-fixture
+problems, addressed separately without changing production safeguards.
+
+- Cross-project reply archives now retain their existing database parent.
+  Seventeen real integration/idempotency cases pass. A fresh development binary
+  passes the unchanged 46-check HTTP/CLI/stdio flow: seven database/canonical
+  messages, 21 committed canonical/inbox/outbox copies and seven immutable Git
+  objects converge in 1.039 seconds within the original 30-second bound. The first
+  run of that same binary failed initial database readiness and remains recorded;
+  the successful repeat does not establish startup reliability under load.
+  `.69` is closed; `.35` retains its original large-archive/300-second requirement.
+- Malformed setup TOML exposed an existing bearer through the parser's error
+  excerpt. Diagnostics now retain only a fixed category and numeric span. The
+  actual CLI refuses the original malformed bytes without printing either bearer
+  or changing the file. All 227 native setup cases execute successfully, including
+  the original opt-in foreign-owner fixture. `br-3cqr4` remains open for native
+  Windows and directory-durability requirements.
+- Original `.57`, `.62`, then `.53` close against their named assertions in the
+  completed run and current compiler/lint checks. These are scoped fixture/build
+  repairs, not additional features or a green workspace. That run recorded the
+  mapped-reader fixture's final reclaim failure, the original retention
+  timeout, ATC fixture project admission and archive-header preservation.
+- Commit `48440b09` repairs the ATC fixture's private project precondition and
+  isolates the sole intentional opaque same-user reader with Nextest's existing
+  full-capacity reservation. Two-core same-binary probes demonstrate that the
+  opaque fixture makes an unrelated mapping test refuse reclamation; before and
+  after that fixture, the original mapping assertions pass. All original reader
+  protections, refusal assertions and deadlines remain. The first focused native
+  run passes all five reader protections and seven project
+  guards, while ATC reaches a second fixture defect: its setup retains one
+  request's writer lease across independent tools, blocking a cold bootstrap.
+  The final fixture retains the real pool and releases that bootstrap request
+  lease. All **13/13** cases now pass with two test threads, including original
+  grants, denials, deadlock detection, release and independently reopened durable
+  same-project/other-project resolution assertions. Final all-target, separate
+  production, strict Clippy, formatting and changed-server static checks pass;
+  all 3,770 frozen project inputs match the actual compiler namespaces. `.70`
+  and `.71` are closed. The earlier 12-pass/one-fail run remains recorded.
+  The whole native workspace has not been rerun after these test-only repairs.
+  No production cache/barrier fix or performance credit is claimed.
+- The three bounded procfs buffer allocations do not establish a speedup. Both
+  retained baseline and candidate time out on the original 16,641-directory case;
+  both separately fail a permission refusal on the original 720-generation case.
+  That periodic case passes in the full run, while the empty-directory case still
+  times out at 240 seconds. Preserve both histories and keep `.63` open.
+- `.52` still publishes runtime snapshot header values 0/0 instead of 231/4242.
+  `.46` still needs the qualified published engine; `.49` needs actual native
+  Windows execution, which ordinary RCH admission refuses; a later read-only
+  status still reports its worker unreachable. No platform override, substitute
+  backend or weakened assertion was used. `br-xzgcj` remains open: four real authority controls pass,
+  but retained directory authority does not yet span the decisive engine opens.
+  `br-hb3mk` likewise still needs ownership held across format detection and open.
+
+Four additional writer-barrier controls pass on retained native producer `70f…`;
+their component source matches the current source byte for byte. Held-writer
+refusal, fresh idle handoff and original file-generation preservation still work.
+This is retained-component evidence: the fresh four-case RCH attempt timed out
+in admission without executing tests. It is separate from the current 13-case
+pass and supplies no whole-binary, engine-I/O or performance qualification.
+
+Incoming `8c80b6f3` adds a GH353 CI qualifier and unapplied patch artifacts, with
+no Rust/Cargo changes or overlap. Its classifier self-test, Python syntax and
+pinned patch hashes pass static checks. No candidate patch or native CI workload
+was executed here. Its source guard pins `48440b09`; qualification against later
+main source needs refreshed inputs and another actual run. Original `.35` and
+`.46` requirements remain open; the source guard must stay intact.
+
+The native and compiler receipts identify the actual frozen inputs and distinguish
+development/test artifacts from production checks. Changed server-file UBS has
+zero critical findings (3,239 warnings, 1,697 informational); the separate setup
+scan retains two critical findings on synthetic test-token literals, so there is
+no overall clean-scan claim. This is
+solo verification, not independent review. Detailed actions and exact local logs
+remain in `/tmp/am-agency-20261027/remaining-verification-todo-0642.md` and Beads.
+
 ## October 28 integration follow-through (19:18 UTC)
 
 The fixes through `d37756f8` were pushed, then eight incoming commits were
