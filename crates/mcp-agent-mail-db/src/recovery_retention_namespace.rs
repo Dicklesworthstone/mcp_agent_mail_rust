@@ -758,26 +758,52 @@ fn descriptor_references_inode(
     descriptor: &std::fs::DirEntry,
     retained: &Metadata,
 ) -> io::Result<bool> {
-    use std::io::Read as _;
-
-    let mut info = Vec::with_capacity(4096);
-    File::open(process.join("fdinfo").join(descriptor.file_name()))?
-        .take(4096)
-        .read_to_end(&mut info)?;
-    let inode = info
-        .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"ino:"))
-        .ok_or_else(|| invalid("open-reader descriptor has no bounded inode record"))?;
-    let inode = std::str::from_utf8(inode)
-        .map_err(io::Error::other)?
-        .trim()
-        .parse::<u64>()
-        .map_err(io::Error::other)?;
+    let inode = read_descriptor_inode(File::open(
+        process.join("fdinfo").join(descriptor.file_name()),
+    )?)?;
     if inode != retained.ino() {
         return Ok(false);
     }
     let observed = std::fs::metadata(descriptor.path())?;
     Ok(observed.dev() == retained.dev() && observed.ino() == retained.ino())
+}
+
+/// Procfs emits the inode before optional lock and descriptor-specific records.
+/// Consume its complete line without allocating or issuing an extra EOF read
+/// for every descriptor in every fresh inventory. Partial reads and EINTR do
+/// not change the 4 KiB bound; an incomplete or malformed inode never admits
+/// reclamation. This reads only procfs, without statting unrelated filesystems.
+#[cfg(target_os = "linux")]
+fn read_descriptor_inode(mut reader: impl io::Read) -> io::Result<u64> {
+    let mut info = [0_u8; 4096];
+    let mut used = 0;
+    let mut line_start = 0;
+    while used < info.len() {
+        let read = match reader.read(&mut info[used..]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let before = used;
+        used += read;
+        for end in before..used {
+            if info[end] != b'\n' {
+                continue;
+            }
+            if let Some(inode) = info[line_start..end].strip_prefix(b"ino:") {
+                return std::str::from_utf8(inode)
+                    .map_err(io::Error::other)?
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(io::Error::other);
+            }
+            line_start = end + 1;
+        }
+    }
+    Err(invalid(
+        "open-reader descriptor has no bounded inode record",
+    ))
 }
 
 /// A nondumpable process has root-owned proc entries even when its effective
@@ -1162,6 +1188,95 @@ mod tests {
         tempfile::tempdir().unwrap().keep().canonicalize().unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_inode_reassembles_short_reads_and_retries_interrupts() {
+        struct ShortReads<'a> {
+            bytes: &'a [u8],
+            reads: usize,
+        }
+        impl io::Read for ShortReads<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads % 3 == 1 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                if self.bytes.is_empty() || output.is_empty() {
+                    return Ok(0);
+                }
+                output[0] = self.bytes[0];
+                self.bytes = &self.bytes[1..];
+                Ok(1)
+            }
+        }
+
+        let mut input = ShortReads {
+            bytes: b"pos:\t0\nflags:\t0100000\nmnt_id:\t27\nino:\t18446744073709551615\nlock:",
+            reads: 0,
+        };
+        assert_eq!(read_descriptor_inode(&mut input).unwrap(), u64::MAX);
+        assert_eq!(input.bytes, b"lock:");
+        assert!(input.reads > 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_inode_rejects_missing_malformed_and_partial_records() {
+        for bytes in [
+            b"pos:\t0\n".as_slice(),
+            b"ino:\t",                       // no complete record
+            b"ino:\t17",                     // an EOF cannot complete a truncated inode
+            b"ino:\t\n",                     // empty identity
+            b"ino:\t-1\n",                   // signed identity
+            b"ino:\t\xff\n",                 // invalid identity encoding
+            b"ino:\t18446744073709551616\n", // overflowing identity
+            b"ino:\tbad\nino:\t17\n",        // do not skip a malformed first record
+        ] {
+            assert!(read_descriptor_inode(bytes).is_err(), "{bytes:?}");
+        }
+        // As before, unrelated later records do not reinterpret the first
+        // authoritative inode emitted by the kernel.
+        assert_eq!(
+            read_descriptor_inode(b"ino:\t17\nino:\tbad\n".as_slice()).unwrap(),
+            17
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_inode_keeps_the_original_scan_bound() {
+        let mut complete = vec![b'x'; 4096 - b"\nino:\t17\n".len()];
+        complete.extend_from_slice(b"\nino:\t17\n");
+        assert_eq!(complete.len(), 4096);
+        assert_eq!(read_descriptor_inode(complete.as_slice()).unwrap(), 17);
+
+        // A bound crossing must not turn the prefix of inode 174 into inode 17.
+        let mut crossing = vec![b'x'; 4096 - b"\nino:\t17".len()];
+        crossing.extend_from_slice(b"\nino:\t174\n");
+        let mut input = io::Cursor::new(crossing);
+        let error = read_descriptor_inode(&mut input).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(input.position(), 4096);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_inode_preserves_errors_before_a_complete_identity() {
+        use std::io::Read as _;
+
+        struct FailedRead(i32);
+        impl io::Read for FailedRead {
+            fn read(&mut self, _output: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(self.0))
+            }
+        }
+        for errno in [5, 13, 3] {
+            let input = io::Cursor::new(b"pos:\t0\nino:\t1").chain(FailedRead(errno));
+            let error = read_descriptor_inode(input).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+    }
+
     #[test]
     fn empty_directory_reclamation_excludes_live_batches_and_parent_claims() {
         let root = fixture();
@@ -1417,6 +1532,39 @@ mod tests {
         let bytes = delete_inventoried_file(&source, &inventoried).unwrap();
         assert_eq!(bytes.logical_bytes, inventoried.len());
         assert_eq!(bytes.allocated_bytes, inventoried.blocks().checked_mul(512));
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_clean_preflight_never_caches_authority_over_a_later_reader() {
+        let _scan_guard = reader_scan_test_guard();
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"new reader keeps its recovery evidence").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        preflight_inventoried_file_readers(&source, &inventoried).unwrap();
+
+        let reader = File::open(&source).unwrap();
+        for result in [
+            preflight_inventoried_file_readers(&source, &inventoried),
+            delete_inventoried_file(&source, &inventoried).map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        }
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"new reader keeps its recovery evidence"
+        );
+        drop(reader);
+        assert_eq!(
+            delete_inventoried_file(&source, &inventoried)
+                .unwrap()
+                .logical_bytes,
+            inventoried.len()
+        );
         assert!(!source.exists());
     }
 
