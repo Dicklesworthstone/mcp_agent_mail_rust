@@ -20,8 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, ThreadSummary};
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool_for_request, get_read_db_pool,
     legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists,
     resolve_existing_project,
 };
@@ -331,7 +333,7 @@ pub async fn ensure_product(
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     if let Some(existing) = get_product_by_key(ctx.cx(), &pool, key_raw).await? {
         let response = ProductResponse {
             id: existing.id.unwrap_or(0),
@@ -427,7 +429,7 @@ pub async fn products_link(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
