@@ -1255,7 +1255,14 @@ pub mod tool_util {
     /// Cancellation is checked between polls and after completion. An
     /// individual synchronous engine/recovery poll must enforce its own
     /// bounds; this bridge cannot interrupt it midway through a durable write.
-    fn poll_bootstrap_checkout<T, E>(
+    /// Background cleanup shares this bridge so shutdown can interrupt a
+    /// pending first checkout without moving its thread-owned promotion lease.
+    ///
+    /// # Errors
+    /// Returns the caller's liveness error, or its timeout error when pending
+    /// checkout work exhausts the supplied budget.
+    #[doc(hidden)]
+    pub fn poll_bootstrap_checkout<T, E>(
         timeout: std::time::Duration,
         mut check_live: impl FnMut() -> Result<(), E>,
         timeout_error: impl FnOnce() -> E,
