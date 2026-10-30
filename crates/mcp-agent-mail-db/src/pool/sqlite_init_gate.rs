@@ -75,14 +75,15 @@ impl SqliteInitGate {
                     #[cfg(test)]
                     self.waiters
                         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    let (state, _) = self
+                    let (guard, _) = self
                         .cv
                         .wait_timeout(state, remaining.min(LIVENESS_POLL_INTERVAL))
                         .unwrap_or_else(PoisonError::into_inner);
+                    state = guard;
+                    drop(state);
                     #[cfg(test)]
                     self.waiters
                         .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    drop(state);
                 }
             }
         }
@@ -292,9 +293,7 @@ mod tests {
                         "liveness holds the gate mutex"
                     );
                     checks += 1;
-                    if checks == panic_at {
-                        panic!("failed liveness observer");
-                    }
+                    assert!(checks != panic_at, "failed liveness observer");
                     Ok::<(), ()>(())
                 })
             }));
