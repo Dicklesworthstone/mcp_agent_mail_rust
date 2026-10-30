@@ -183,13 +183,18 @@ mod tests {
     #[test]
     fn a_foreign_flock_defers_without_changing_its_file_or_metadata() {
         use fs2::FileExt;
+        use std::io::Read;
         let temp = tempfile::tempdir().unwrap();
         let archive = archive(temp.path());
         let path = archive.root.join(".archive.lock");
         let metadata = archive.root.join(".archive.lock.owner.json");
         std::fs::write(&path, b"held lock evidence").unwrap();
         std::fs::write(&metadata, b"operator evidence").unwrap();
-        let held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         held.try_lock_exclusive().unwrap();
         let result: Result<()> = with_budget(
             &archive,
@@ -198,7 +203,11 @@ mod tests {
             || panic!("contended flock must not invoke repair"),
         );
         assert!(matches!(result, Err(StorageError::LockTimeout(_))));
-        assert_eq!(std::fs::read(&path).unwrap(), b"held lock evidence");
+        // Keep the exclusive owner alive while checking its bytes. Windows
+        // refuses a read of this range through any second file handle.
+        let mut evidence = Vec::new();
+        held.read_to_end(&mut evidence).unwrap();
+        assert_eq!(evidence, b"held lock evidence");
         assert_eq!(std::fs::read(&metadata).unwrap(), b"operator evidence");
         let contender = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         assert!(contender.try_lock_exclusive().is_err());

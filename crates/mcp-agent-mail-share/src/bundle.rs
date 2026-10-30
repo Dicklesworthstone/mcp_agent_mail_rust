@@ -3575,7 +3575,10 @@ mod tests {
 
     #[test]
     fn publish_staged_bundle_outputs_restores_existing_bundle_on_mid_publish_failure() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("bundle");
@@ -3620,7 +3623,10 @@ mod tests {
 
     #[test]
     fn publish_staged_bundle_outputs_removes_fresh_bundle_dir_on_mid_publish_failure() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("bundle");

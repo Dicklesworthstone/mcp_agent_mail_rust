@@ -353,6 +353,7 @@ mod tests {
 
     fn busy_project_does_not_hold_publication(foreign_flock: bool) {
         use fs2::FileExt;
+        use std::io::Read;
 
         let root = archive_root();
         let config = mcp_agent_mail_core::Config {
@@ -370,6 +371,7 @@ mod tests {
             std::fs::write(&lock_path, b"foreign lock evidence").unwrap();
             std::fs::write(&owner_path, b"foreign owner evidence").unwrap();
             let file = std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .open(&lock_path)
                 .unwrap();
@@ -415,12 +417,18 @@ mod tests {
         });
         let completed_while_owned = completed_rx.recv_timeout(Duration::from_secs(2));
         let owner_preserved = if foreign_flock {
+            // Windows denies reads of an exclusively locked range through a
+            // second handle, including in this process. Inspect the evidence
+            // through its still-locked owner without releasing its authority.
+            let mut owner = held_file.as_ref().expect("foreign file owner");
+            let mut evidence = Vec::new();
+            owner.read_to_end(&mut evidence).unwrap();
             let contender = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&lock_path)
                 .unwrap();
             contender.try_lock_exclusive().is_err()
-                && std::fs::read(&lock_path).unwrap() == b"foreign lock evidence"
+                && evidence == b"foreign lock evidence"
                 && std::fs::read(&owner_path).unwrap() == b"foreign owner evidence"
         } else {
             matches!(process.try_lock(), Err(TryLockError::WouldBlock))
