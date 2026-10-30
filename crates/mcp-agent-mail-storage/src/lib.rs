@@ -1202,11 +1202,14 @@ fn new_write_behind_queue() -> WriteBehindQueue {
 }
 
 fn wbq_start_inner(wbq: &WriteBehindQueue) {
-    let _lifecycle = wbq
+    let lifecycle = wbq
         .lifecycle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    wbq_start_locked(wbq, &lifecycle);
+}
 
+fn wbq_start_locked(wbq: &WriteBehindQueue, _lifecycle: &std::sync::MutexGuard<'_, ()>) {
     let should_spawn = {
         let handle = wbq.drain_handle.lock();
         handle
@@ -1324,6 +1327,19 @@ fn wbq_sender_clone(wbq: &WriteBehindQueue) -> Option<std::sync::mpsc::SyncSende
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
+}
+
+fn wbq_sender_for_enqueue(wbq: &WriteBehindQueue) -> Option<std::sync::mpsc::SyncSender<WbqMsg>> {
+    // Startup shares the same lifecycle gate as restart, shutdown, and counted
+    // publication. Request admission must not wait behind a shutdown flush or
+    // restart salvage before reaching its bounded channel-send path.
+    let lifecycle = match wbq.lifecycle.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    wbq_start_locked(wbq, &lifecycle);
+    wbq_sender_clone(wbq)
 }
 
 /// Spawn the WBQ drain thread. Safe to call multiple times.
@@ -1544,15 +1560,14 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
         .system
         .disk_pressure_level
         .load();
-
-    let wbq = WBQ.get_or_init(new_write_behind_queue);
-    wbq_start_inner(wbq);
-    let Some(sender) = wbq_sender_clone(wbq) else {
-        return WbqEnqueueResult::QueueUnavailable;
-    };
     if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
         return WbqEnqueueResult::SkippedDiskCritical;
     }
+
+    let wbq = WBQ.get_or_init(new_write_behind_queue);
+    let Some(sender) = wbq_sender_for_enqueue(wbq) else {
+        return WbqEnqueueResult::QueueUnavailable;
+    };
     wbq_enqueue_with_sender_admission(&sender, wbq.op_depth.as_ref(), op, Some(&wbq.lifecycle))
 }
 
@@ -25494,6 +25509,125 @@ mod tests {
         let metrics = mcp_agent_mail_core::global_metrics();
         assert_eq!(metrics.storage.wbq_respawn_salvaged_total.load(), 2);
         assert_eq!(metrics.storage.wbq_respawn_lost_total.load(), 0);
+        println!("{COMPLETED}");
+    }
+
+    #[test]
+    fn wbq_public_enqueue_does_not_wait_for_lifecycle_owner() {
+        const CHILD: &str = "AM_TEST_WBQ_ENQUEUE_LIFECYCLE";
+        const COMPLETED: &str = "WBQ public enqueue lifecycle bound verified";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_public_enqueue_does_not_wait_for_lifecycle_owner",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("STORAGE_ROOT", isolated.path())
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                .output()
+                .expect("isolated public WBQ admission");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            return;
+        }
+
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(15));
+            eprintln!("WBQ public enqueue lifecycle watchdog expired");
+            std::process::exit(1);
+        });
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "enqueue-lifecycle".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/enqueue-lifecycle/agents/{agent}.signal"))
+        };
+        let wbq = WBQ.get_or_init(new_write_behind_queue);
+
+        for (rejected, accepted, prior_enqueued) in [
+            ("ColdRejected", "ColdAccepted", 0),
+            ("LiveRejected", "LiveAccepted", 1),
+        ] {
+            // Exercise the actual public entrypoint both before first startup
+            // and with a healthy worker. The producer must finish while the
+            // lifecycle owner still holds its guard, not after its release.
+            let lifecycle = wbq.lifecycle.lock().unwrap();
+            let op = signal_op(rejected);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let producer = std::thread::spawn(move || done_tx.send(wbq_enqueue(op)));
+            let result = done_rx.recv_timeout(Duration::from_secs(1));
+
+            // Critical pressure must still select the explicit disk guard,
+            // even while startup is unavailable. QueueUnavailable would send
+            // this operation to the durable backlog instead of skipping it.
+            let pressure = &mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level;
+            pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+            let critical_agent = format!("{rejected}Critical");
+            let critical_op = signal_op(&critical_agent);
+            let (critical_tx, critical_rx) = std::sync::mpsc::sync_channel(1);
+            let critical_producer =
+                std::thread::spawn(move || critical_tx.send(wbq_enqueue(critical_op)));
+            let critical_result = critical_rx.recv_timeout(Duration::from_secs(1));
+            pressure.set(0);
+            drop(lifecycle);
+            producer
+                .join()
+                .expect("public enqueue producer")
+                .expect("publish enqueue result");
+            critical_producer
+                .join()
+                .expect("public enqueue critical-pressure producer")
+                .expect("publish critical-pressure enqueue result");
+            assert_eq!(
+                result,
+                Ok(WbqEnqueueResult::QueueUnavailable),
+                "lifecycle contention must reach fallback before the owner releases its lock"
+            );
+            assert_eq!(
+                critical_result,
+                Ok(WbqEnqueueResult::SkippedDiskCritical),
+                "critical disk pressure must skip archive work even when startup is contended"
+            );
+            assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+            assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+            assert_eq!(wbq_stats().enqueued, prior_enqueued);
+            assert!(!signal_path(rejected).exists());
+            assert!(!signal_path(&critical_agent).exists());
+            if prior_enqueued == 0 {
+                assert!(wbq.drain_handle.lock().is_none());
+                assert!(wbq_sender_clone(wbq).is_none());
+            }
+
+            // Contention must not poison startup or a running queue. Accepted
+            // work still reaches the real archive writer after the gate opens.
+            assert_eq!(wbq_enqueue(signal_op(accepted)), WbqEnqueueResult::Enqueued);
+            assert_eq!(wbq_flush_status(), WbqFlushOutcome::Drained);
+            assert!(signal_path(accepted).is_file());
+            assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+            assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+            assert_eq!(wbq_stats().enqueued, prior_enqueued + 1);
+            assert_eq!(wbq_stats().drained, prior_enqueued + 1);
+        }
+        wbq_shutdown();
         println!("{COMPLETED}");
     }
 
