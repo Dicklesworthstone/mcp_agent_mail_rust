@@ -1,4 +1,586 @@
 {
+  "cold_bootstrap_and_reservation_admission_follow_up": {
+    "schema": 1,
+    "recorded_at_utc": "2026-10-30 02:20:45 UTC",
+    "status": "production corrections committed; component lifecycle qualified; native integration and saturation remain open",
+    "initial_main": "ed6759a2df74a88e088e4f23f3ed3a3df691c21e",
+    "concurrent_main_preserved": [
+      "c8e15b6b992f3311825c31f797d64393e6d0845b",
+      "546563be447e8107248286045468e52a83a935ec"
+    ],
+    "commits": [
+      {
+        "sha": "6dcb7a415eef6b3baa6bdf784613ec857726ae26",
+        "scope": "Atomic storage/server reservation lease, generation-bound checkpoint and partial progress correction"
+      },
+      {
+        "sha": "043d9fd592409c4064ef3452daef0ab30ddd6cb9",
+        "scope": "Successful checkout readiness and exact adopted initializer cache restoration"
+      },
+      {
+        "sha": "a6d04074f4aa0c9ce59b00574d0745279fdaebef",
+        "scope": "Complete real lazy checkout before promotion-to-writer handoff"
+      }
+    ],
+    "findings": {
+      "cold_bootstrap": "Pool construction is lazy. Previously tools relinquished promotion exclusion after construction and counted their request as a writer before the first real checkout. Archive-backed recovery during that checkout could then wait for the initiating request's own lease. Readiness now requires a full successful checkout, and bootstrap completes it before handing off the writer.",
+      "adopted_owner": "Recovery removed the exact adopted initializer's weak lookup entry along with old generations. Only that retirement's successfully adopted owner regains its former vacant entries. Other engines remain retired; a failed or abandoned adopted owner is still closed.",
+      "reservation_progress": "A pass-wide activity lease previously excluded promotion across every selected release, decision logging and checkpoint I/O. Source selections and attempts now admit separately; successful partial reports survive temporary admission closure so repair counts and last-repair health observations remain visible.",
+      "checkpoint_authority": "Load/stage/fsync run outside database activity. Hints are revalidated before restore; final source generation/file binding and owner checks occur under fresh activity immediately before atomic rename. Parent directory fsync retains the independent checkpoint flock but no database activity.",
+      "incident_attribution": "These are source-supported defects and corrections. No October 28 reproduction or causal attribution of those post-restart stalls to the publication fence is claimed."
+    },
+    "source_files": {
+      "crates/mcp-agent-mail-db/src/pool.rs": {
+        "sha256": "6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d",
+        "git_blob": "14e50046e409245bd2a5091979382ba04c291109",
+        "bytes": 1796218
+      },
+      "crates/mcp-agent-mail-tools/src/lib.rs": {
+        "sha256": "b3ee6e68ddfe71c2195e3bf238a9c052685bca9bb9d5d96ad8819d91648eef96",
+        "git_blob": "5c018d2e5aea78b5f6207323e085973be5cf7595",
+        "bytes": 176199
+      },
+      "crates/mcp-agent-mail-server/src/retention/archive/reservation_catch_up.rs": {
+        "sha256": "3f39d500370cb6f4c73c0754281cf62db0f08966feff5177d16013a991e1b9e6",
+        "git_blob": "595de16ceec8077ee306fdb84e7190259457f677",
+        "bytes": 34609
+      },
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": {
+        "sha256": "2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552",
+        "git_blob": "7547750bfcaf219e46a6c8a2c1a55f007bd5a8bd",
+        "bytes": 97184
+      },
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs": {
+        "sha256": "b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c",
+        "git_blob": "704728acd0ec5311bbcca16ed1f6194e594dc4e8",
+        "bytes": 70610
+      },
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs": {
+        "sha256": "c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89",
+        "git_blob": "274fe1eae591fdab770936993767ce4b927572f8",
+        "bytes": 48784
+      }
+    },
+    "preserved_guarantees": [
+      "Bounded strong warm-pool ownership in pool_registry.rs and single cold constructor admission",
+      "Separate opened-connection owner-adoption signal; no exemption for ordinary counted writers",
+      "Exact request/ambient Cx and promotion-owning thread; no production test context or nested FastMCP bridge",
+      "Native nonblocking publication-fence admission, final source/ownership proofs and existing durable archive publication",
+      "Bounded retry debt and selection budgets; generation mismatch refuses before consuming the candidate",
+      "Prior direct reservation publication-window and canonical-ID batch-scaling improvements",
+      "Concurrent main commits were retained; no PR or branch-protection bypass"
+    ],
+    "validation": {
+      "exact_component": {
+        "artifact_bytes": 991455,
+        "crate_attributes_sha256": "2f8415627009fdeeeb332c85038832930b0e2556fc6f665608d629131d6affb2",
+        "limits": {
+          "owned_artifact_bytes": 33554432,
+          "process_family_rss_bytes": 536870912,
+          "seconds_per_command": 120
+        },
+        "oom_after": {
+          "oom": 142,
+          "oom_kill": 40
+        },
+        "oom_before": {
+          "oom": 142,
+          "oom_kill": 40
+        },
+        "proof_sha256": "adf728ce35d92cb93ec35fbc16c0c6c7573aa389608e4bd6c26804c86b2c10a7",
+        "results": [
+          {
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--version",
+              "--verbose"
+            ],
+            "elapsed_seconds": 0.031,
+            "exit_code": 0,
+            "log": "toolchain.log",
+            "log_sha256": "afa0463fc538f7e3dfa46074095886a69302c98f037fcf29238678c8b5000cd9",
+            "name": "toolchain",
+            "oom_after": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "oom_before": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "peak_family_rss_bytes": 24010752,
+            "rss_samples": 2,
+            "stop_reason": null
+          },
+          {
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact.rs",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact_tests"
+            ],
+            "elapsed_seconds": 1.9275,
+            "exit_code": 0,
+            "log": "compile_first.log",
+            "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "name": "compile_first",
+            "oom_after": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "oom_before": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "peak_family_rss_bytes": 139644928,
+            "rss_samples": 121,
+            "stop_reason": null
+          },
+          {
+            "argv": [
+              "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact_tests",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "elapsed_seconds": 0.0124,
+            "exit_code": 0,
+            "log": "tests_first.log",
+            "log_sha256": "f6074893d4be5835595c2188848401145aa826b10ccfa8fb195b5618e6560af7",
+            "name": "tests_first",
+            "oom_after": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "oom_before": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "peak_family_rss_bytes": 81920,
+            "rss_samples": 1,
+            "stop_reason": null,
+            "test_counts": [
+              [
+                "ok",
+                "6",
+                "0",
+                "0",
+                "0",
+                "0"
+              ]
+            ]
+          },
+          {
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/clippy-driver",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "--test",
+              "--emit=metadata",
+              "-Dunsafe_code",
+              "--check-cfg=cfg(docsrs,test)",
+              "--check-cfg=cfg(fuzzing)",
+              "-Wclippy::pedantic",
+              "-Wclippy::nursery",
+              "-Aclippy::missing_errors_doc",
+              "-Aclippy::missing_panics_doc",
+              "-Aclippy::module_name_repetitions",
+              "-Dwarnings",
+              "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact.rs",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact_clippy.rmeta"
+            ],
+            "elapsed_seconds": 0.284,
+            "exit_code": 0,
+            "log": "clippy_first.log",
+            "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "name": "clippy_first",
+            "oom_after": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "oom_before": {
+              "oom": 142,
+              "oom_kill": 40
+            },
+            "peak_family_rss_bytes": 131031040,
+            "rss_samples": 25,
+            "stop_reason": null
+          }
+        ],
+        "runner_sha256": "9c144f7ed19c6be11ee153b2c07b490f5acab51112b4aed93ebfbc761745c321",
+        "scope": "Exact std-only production polling loop and six existing adjacent std tests. No Cx/runtime/dependency mocks; no DB, recovery, request, saturation, latency, or speedup qualification.",
+        "slice_sha256_after": "6b1687859dff8f989a66a429af8c0c98fc3875fc3605aba107bdbc400887719f",
+        "slice_sha256_before": "6b1687859dff8f989a66a429af8c0c98fc3875fc3605aba107bdbc400887719f",
+        "source": "/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759/crates/mcp-agent-mail-tools/src/lib.rs",
+        "source_lines": [
+          1258,
+          1456
+        ],
+        "source_sha256_after": "98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc",
+        "source_sha256_before": "98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc",
+        "source_unchanged": true,
+        "workspace_manifest_sha256": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe"
+      },
+      "published_poll_slice_sha256": "6b1687859dff8f989a66a429af8c0c98fc3875fc3605aba107bdbc400887719f",
+      "published_poll_slice_matches_executed_source": true,
+      "post_proof_tools_change": "Preserved one concurrently added blank documentation line outside the tested slice; exact function/test slice unchanged and final tools formatting passed.",
+      "changed_file_format_and_whitespace": {
+        "status": "passed",
+        "files": [
+          "crates/mcp-agent-mail-db/src/pool.rs",
+          "crates/mcp-agent-mail-tools/src/lib.rs",
+          "crates/mcp-agent-mail-server/src/retention/archive/reservation_catch_up.rs",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs"
+        ],
+        "commands": [
+          "pinned rustfmt --check --edition 2024 --config skip_children=true on changed Rust files",
+          "git diff --check"
+        ]
+      },
+      "independent_reviews": {
+        "reservation": "No source-review blocker after adding typed temporary refusal and preserving partial completed reports.",
+        "cold_bootstrap": "No source-review ownership/runtime blocker; real pinned Pool/FrankenSQLite/FastMCP/Asupersync inline and pending paths inspected."
+      },
+      "baseline_production_check": {
+        "scope": "Actual unmodified pinned dependency graph; compiler metadata only, not runtime or saturation qualification",
+        "base": "ed6759a2df74a88e088e4f23f3ed3a3df691c21e",
+        "argv": [
+          "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+          "check",
+          "--locked",
+          "--offline",
+          "--workspace",
+          "--lib",
+          "--bins"
+        ],
+        "workdir": "/workspace/scratch/b1120803451c/gh353-repair-baseline-ed6759",
+        "environment": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "CARGO_TARGET_DIR": "/workspace/scratch/b1120803451c/gh353-native-20261029/target",
+          "RUSTC": "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc"
+        },
+        "exit_code": -15,
+        "stop_reason": "owned compiler family exceeded 2304 MiB RSS budget",
+        "elapsed_seconds": 54.097,
+        "peak_family_rss_bytes": 2422984704,
+        "oom_before": {
+          "oom": 139,
+          "oom_kill": 38
+        },
+        "oom_after": {
+          "oom": 139,
+          "oom_kill": 38
+        },
+        "free_bytes_before": 4489437184,
+        "free_bytes_after": 4338290688,
+        "source_hashes_before": {
+          "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+          "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+          "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+          ".cargo/config.toml": "29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918",
+          "crates/mcp-agent-mail-db/src/pool.rs": "f878b4034f16c11ae27a7267b87f1c13a984a5aa1ce7b51064ae671153ef9008",
+          "crates/mcp-agent-mail-tools/src/lib.rs": "21b2941a550f8d4f590ef547343b24b106c7775ff72a7c23551b4e8af4e7d1c0",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "1e3c4c85e9e5efa3b969096b734b7b9748bb634b7a7706a5a7731d81b32a160e",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs": "21ca7594eea6dfed5533bc66c8584e040b2fb6e25ce9079360c89c14abfbab0c",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs": "555f7bafee8a7b6b6114ab163882a0a1143245311635ff889fdf91730266fbb7"
+        },
+        "source_hashes_after": {
+          "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+          "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+          "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+          ".cargo/config.toml": "29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918",
+          "crates/mcp-agent-mail-db/src/pool.rs": "f878b4034f16c11ae27a7267b87f1c13a984a5aa1ce7b51064ae671153ef9008",
+          "crates/mcp-agent-mail-tools/src/lib.rs": "21b2941a550f8d4f590ef547343b24b106c7775ff72a7c23551b4e8af4e7d1c0",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "1e3c4c85e9e5efa3b969096b734b7b9748bb634b7a7706a5a7731d81b32a160e",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs": "21ca7594eea6dfed5533bc66c8584e040b2fb6e25ce9079360c89c14abfbab0c",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs": "555f7bafee8a7b6b6114ab163882a0a1143245311635ff889fdf91730266fbb7"
+        },
+        "source_unchanged": true,
+        "log": "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/baseline-production.log",
+        "log_sha256": "ba5ede5fd051faeb6a8f2022ae246129dbb33cef6ae03b8f3d6e0257d058c503",
+        "runner_sha256": "1e55947e208a2f02491c197918d4619961264213ff91eac3837d52c08a0dafd4"
+      },
+      "candidate_production_check": {
+        "scope": "Actual unmodified pinned dependency graph; compiler metadata only, not runtime or saturation qualification",
+        "base": "ed6759a2df74a88e088e4f23f3ed3a3df691c21e",
+        "argv": [
+          "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+          "check",
+          "--locked",
+          "--offline",
+          "--workspace",
+          "--lib",
+          "--bins"
+        ],
+        "workdir": "/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759",
+        "environment": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "CARGO_TARGET_DIR": "/workspace/scratch/b1120803451c/gh353-native-20261029/target",
+          "RUSTC": "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc"
+        },
+        "exit_code": -15,
+        "stop_reason": "cgroup OOM counter increased",
+        "elapsed_seconds": 136.273,
+        "peak_family_rss_bytes": 1914646528,
+        "oom_before": {
+          "oom": 142,
+          "oom_kill": 40
+        },
+        "oom_after": {
+          "oom": 143,
+          "oom_kill": 41
+        },
+        "free_bytes_before": 3864100864,
+        "free_bytes_after": 3854131200,
+        "source_hashes_before": {
+          "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+          "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+          "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+          ".cargo/config.toml": "29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918",
+          "crates/mcp-agent-mail-db/src/pool.rs": "6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d",
+          "crates/mcp-agent-mail-tools/src/lib.rs": "98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs": "b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs": "c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89"
+        },
+        "source_hashes_after": {
+          "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+          "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+          "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+          ".cargo/config.toml": "29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918",
+          "crates/mcp-agent-mail-db/src/pool.rs": "6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d",
+          "crates/mcp-agent-mail-tools/src/lib.rs": "98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs": "b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c",
+          "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs": "c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89"
+        },
+        "source_unchanged": true,
+        "log": "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-production.log",
+        "log_sha256": "c7c2b7e4434b3cfabda8c6728342aaea0200c81ed67cd92c7fda3963ea0fd65a",
+        "runner_sha256": "1e55947e208a2f02491c197918d4619961264213ff91eac3837d52c08a0dafd4"
+      },
+      "check_scope": "Real pinned production Cargo graph, normal backend and no feature/dependency changes. Both checks stopped before project compilation. Their elapsed times are not a performance A/B; dependencies/cache work differed.",
+      "candidate_source_scope": "The candidate check included c8e15b6b's source changes. Later unrelated main updates were preserved on publication. The only later overlap in the committed tools file was the documented blank line outside the tested slice.",
+      "workspace_format_attempts": [
+        {
+          "argv": [
+            "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+            "fmt",
+            "--all",
+            "--",
+            "--check"
+          ],
+          "exit_code": 1,
+          "elapsed_seconds": 17.354,
+          "log": "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format.log",
+          "output_bytes": 544
+        },
+        {
+          "status": "timed out",
+          "timeout_seconds": 55,
+          "log": "candidate-complete-format.log",
+          "log_bytes": 0,
+          "reason": "After materializing original tracked root tests, the full Cargo fmt command timed out. No formatter child remained; changed-file formatting then passed."
+        },
+        {
+          "scope": "Actual unmodified pinned dependency graph; compiler metadata only, not runtime or saturation qualification",
+          "base": "ed6759a2df74a88e088e4f23f3ed3a3df691c21e",
+          "argv": [
+            "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+            "fmt",
+            "--all",
+            "--",
+            "--check"
+          ],
+          "workdir": "/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759",
+          "environment": {
+            "CARGO_BUILD_JOBS": "1",
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_TEST_DEBUG": "0",
+            "CARGO_TARGET_DIR": "/workspace/scratch/b1120803451c/gh353-native-20261029/target",
+            "RUSTC": "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc"
+          },
+          "exit_code": -15,
+          "stop_reason": "retained artifact disk budget reached",
+          "elapsed_seconds": 10.912,
+          "peak_family_rss_bytes": 253976576,
+          "oom_before": {
+            "oom": 144,
+            "oom_kill": 42
+          },
+          "oom_after": {
+            "oom": 144,
+            "oom_kill": 42
+          },
+          "free_bytes_before": 3282702336,
+          "free_bytes_after": 3202338816,
+          "source_hashes_before": {
+            "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+            "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+            "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+            ".cargo/config.toml": "29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918",
+            "crates/mcp-agent-mail-db/src/pool.rs": "6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d",
+            "crates/mcp-agent-mail-tools/src/lib.rs": "98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc",
+            "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552",
+            "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs": "b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c",
+            "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs": "c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89"
+          },
+          "source_hashes_after": {
+            "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+            "Cargo.toml": "ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe",
+            "rust-toolchain.toml": "b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a",
+            ".cargo/config.toml": "29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918",
+            "crates/mcp-agent-mail-db/src/pool.rs": "6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d",
+            "crates/mcp-agent-mail-tools/src/lib.rs": "98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc",
+            "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552",
+            "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs": "b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c",
+            "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs": "c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89"
+          },
+          "source_unchanged": true,
+          "log": "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format-final.log",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "runner_sha256": "1e55947e208a2f02491c197918d4619961264213ff91eac3837d52c08a0dafd4"
+        }
+      ],
+      "workspace_format_verdict": "Not qualified. The final monitored attempt stopped at the retained-artifact free-disk guard with no source-format diagnostic. Changed-file checks passed.",
+      "resource_scope": "OOM counters are cgroup-wide. The candidate command was stopped when the counter increased; no project-code diagnostic or isolated dependency-build verdict can be inferred. No compiler or formatter remains running from these checks."
+    },
+    "added_real_regressions": {
+      "reservation": [
+        "promotion_can_begin_after_selection_without_consuming_the_page",
+        "promotion_can_begin_between_terminal_releases_and_later_work_resumes",
+        "changed_pass_generation_does_not_consume_the_next_retained_release",
+        "checkpoint_staging_and_directory_sync_do_not_retain_database_activity",
+        "promotion_during_staging_preserves_checkpoint_and_retry_until_resume",
+        "loaded_checkpoint_is_revalidated_before_restoring_hints",
+        "staged_checkpoint_cannot_publish_after_same_inode_generation_change",
+        "cancellation_during_staging_preserves_previous_checkpoint_and_debt",
+        "publication_rechecks_checkpoint_owner_after_source_admission"
+      ],
+      "database": [
+        "checkout_readiness_requires_success_and_is_shared_until_retirement",
+        "cancelled_first_checkout_leaves_lazy_pool_retriable_and_unready",
+        "Extended existing exact recovery-owner adoption/cancellation fixtures with cache identity and readiness assertions"
+      ],
+      "tools": [
+        "gh353_cached_lazy_pool_is_not_admitted_as_warm",
+        "gh353_cold_checkout_completes_inside_existing_bridge_before_handoff",
+        "gh353_missing_database_recovers_archive_before_writer_handoff",
+        "bootstrap_checkout_polling_preserves_context_and_drops_cancelled_work"
+      ],
+      "server": "Extended admission_after_progress_preserves_observations_and_recovers_next_turn with partial repaired=1 and repaired=4 counts, exact observer delivery, short retry and resumed completion.",
+      "execution_status": "These real DB/storage/tools/server regressions are written but unexecuted. Only the six exact std polling lifecycle tests ran."
+    },
+    "remaining_limits": [
+      "A synchronous engine/init-gate/recovery poll retains its own internal bounds; the outer polling timeout covers pending polling, not total bootstrap wall time.",
+      "Pinned sqlmodel-pool 0.5 decrements its capacity waiter count after Notify/Sleep rather than in a Drop guard. Dropping a pending capacity wait on cancellation/timeout can leave pending_requests inflated. Active factory/slot ownership is guarded; no dependency change or gauge-cleanup qualification is claimed.",
+      "Full workspace all-targets check and workspace Clippy have not completed; production Cargo checks stopped before project compilation.",
+      "No end-to-end send_message/list_agents latency, native archive cache A/B, saturation convergence or release qualification was completed.",
+      "Publication-fence starvation freedom, quiet convergence and BusySnapshot remain unresolved qualification work; br-kp1in.35 and related blockers were not closed."
+    ],
+    "claims": {
+      "production_request_latency_improvement_measured": false,
+      "october_28_incident_reproduced": false,
+      "publication_fence_starvation_fixed": false,
+      "busy_snapshot_fixed": false,
+      "quiet_convergence_qualified": false,
+      "full_native_integration_passed": false,
+      "dependency_or_gate_weakened": false
+    },
+    "next_gate": "Run the new real DB/tools/storage/server regressions under the unchanged production graph on a resource-sufficient runner, then the named current-main versus candidate request/saturation and 300-second quiet-convergence probes.",
+    "raw_artifacts": {
+      "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/exact_component_receipt.json": {
+        "sha256": "098508c58aa630279cf4a09cdf0b7bb22e011b7e98245b95d44ae343a1d1cd3d",
+        "bytes": 5126,
+        "content": "{\n  \"artifact_bytes\": 991455,\n  \"crate_attributes_sha256\": \"2f8415627009fdeeeb332c85038832930b0e2556fc6f665608d629131d6affb2\",\n  \"limits\": {\n    \"owned_artifact_bytes\": 33554432,\n    \"process_family_rss_bytes\": 536870912,\n    \"seconds_per_command\": 120\n  },\n  \"oom_after\": {\n    \"oom\": 142,\n    \"oom_kill\": 40\n  },\n  \"oom_before\": {\n    \"oom\": 142,\n    \"oom_kill\": 40\n  },\n  \"proof_sha256\": \"adf728ce35d92cb93ec35fbc16c0c6c7573aa389608e4bd6c26804c86b2c10a7\",\n  \"results\": [\n    {\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"--version\",\n        \"--verbose\"\n      ],\n      \"elapsed_seconds\": 0.031,\n      \"exit_code\": 0,\n      \"log\": \"toolchain.log\",\n      \"log_sha256\": \"afa0463fc538f7e3dfa46074095886a69302c98f037fcf29238678c8b5000cd9\",\n      \"name\": \"toolchain\",\n      \"oom_after\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"oom_before\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"peak_family_rss_bytes\": 24010752,\n      \"rss_samples\": 2,\n      \"stop_reason\": null\n    },\n    {\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact.rs\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact_tests\"\n      ],\n      \"elapsed_seconds\": 1.9275,\n      \"exit_code\": 0,\n      \"log\": \"compile_first.log\",\n      \"log_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\n      \"name\": \"compile_first\",\n      \"oom_after\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"oom_before\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"peak_family_rss_bytes\": 139644928,\n      \"rss_samples\": 121,\n      \"stop_reason\": null\n    },\n    {\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact_tests\",\n        \"--test-threads=1\",\n        \"--nocapture\"\n      ],\n      \"elapsed_seconds\": 0.0124,\n      \"exit_code\": 0,\n      \"log\": \"tests_first.log\",\n      \"log_sha256\": \"f6074893d4be5835595c2188848401145aa826b10ccfa8fb195b5618e6560af7\",\n      \"name\": \"tests_first\",\n      \"oom_after\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"oom_before\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"peak_family_rss_bytes\": 81920,\n      \"rss_samples\": 1,\n      \"stop_reason\": null,\n      \"test_counts\": [\n        [\n          \"ok\",\n          \"6\",\n          \"0\",\n          \"0\",\n          \"0\",\n          \"0\"\n        ]\n      ]\n    },\n    {\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/clippy-driver\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"--test\",\n        \"--emit=metadata\",\n        \"-Dunsafe_code\",\n        \"--check-cfg=cfg(docsrs,test)\",\n        \"--check-cfg=cfg(fuzzing)\",\n        \"-Wclippy::pedantic\",\n        \"-Wclippy::nursery\",\n        \"-Aclippy::missing_errors_doc\",\n        \"-Aclippy::missing_panics_doc\",\n        \"-Aclippy::module_name_repetitions\",\n        \"-Dwarnings\",\n        \"/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact.rs\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact_clippy.rmeta\"\n      ],\n      \"elapsed_seconds\": 0.284,\n      \"exit_code\": 0,\n      \"log\": \"clippy_first.log\",\n      \"log_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\n      \"name\": \"clippy_first\",\n      \"oom_after\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"oom_before\": {\n        \"oom\": 142,\n        \"oom_kill\": 40\n      },\n      \"peak_family_rss_bytes\": 131031040,\n      \"rss_samples\": 25,\n      \"stop_reason\": null\n    }\n  ],\n  \"runner_sha256\": \"9c144f7ed19c6be11ee153b2c07b490f5acab51112b4aed93ebfbc761745c321\",\n  \"scope\": \"Exact std-only production polling loop and six existing adjacent std tests. No Cx/runtime/dependency mocks; no DB, recovery, request, saturation, latency, or speedup qualification.\",\n  \"slice_sha256_after\": \"6b1687859dff8f989a66a429af8c0c98fc3875fc3605aba107bdbc400887719f\",\n  \"slice_sha256_before\": \"6b1687859dff8f989a66a429af8c0c98fc3875fc3605aba107bdbc400887719f\",\n  \"source\": \"/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759/crates/mcp-agent-mail-tools/src/lib.rs\",\n  \"source_lines\": [\n    1258,\n    1456\n  ],\n  \"source_sha256_after\": \"98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc\",\n  \"source_sha256_before\": \"98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc\",\n  \"source_unchanged\": true,\n  \"workspace_manifest_sha256\": \"ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe\"\n}\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/tests_first.log": {
+        "sha256": "f6074893d4be5835595c2188848401145aa826b10ccfa8fb195b5618e6560af7",
+        "bytes": 983,
+        "content": "\nrunning 6 tests\ntest bootstrap_checkout_poll_tests::cancellation_before_first_poll_drops_unstarted_checkout ... ok\ntest bootstrap_checkout_poll_tests::cancellation_while_pending_drops_checkout ... ok\ntest bootstrap_checkout_poll_tests::completed_checkout_is_dropped_when_liveness_changes_during_poll ... ok\ntest bootstrap_checkout_poll_tests::pending_checkout_observes_a_cross_thread_wake ... ok\ntest bootstrap_checkout_poll_tests::pending_timeout_and_unwind_release_checkout_ownership ... \nthread 'bootstrap_checkout_poll_tests::pending_timeout_and_unwind_release_checkout_ownership' (382400) panicked at /workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/polling_exact.rs:156:21:\ncheckout panic\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nok\ntest bootstrap_checkout_poll_tests::ready_checkout_completes_with_zero_pending_budget ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/clippy_first.log": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0,
+        "content": ""
+      },
+      "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/compile_first.log": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0,
+        "content": ""
+      },
+      "/workspace/scratch/b1120803451c/gh353-bootstrap-poll-proof-ed6759/run_exact_component.py": {
+        "sha256": "9c144f7ed19c6be11ee153b2c07b490f5acab51112b4aed93ebfbc761745c321",
+        "bytes": 8892,
+        "content": "#!/usr/bin/env python3\n\"\"\"Bounded exact-source polling component proof; no runtime substitutes.\"\"\"\n\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport signal\nimport subprocess\nimport time\n\n\nROOT = Path(__file__).resolve().parent\nWORKTREE = Path('/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759')\nSOURCE = WORKTREE / 'crates/mcp-agent-mail-tools/src/lib.rs'\nMANIFEST = WORKTREE / 'Cargo.toml'\nTOOLCHAIN = Path('/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin')\nRSS_LIMIT = 512 * 1024 * 1024\nSECONDS_LIMIT = 120\nARTIFACT_LIMIT = 32 * 1024 * 1024\n\n\ndef sha(data):\n    return hashlib.sha256(data).hexdigest()\n\n\ndef oom_counts():\n    values = dict(line.split() for line in Path('/sys/fs/cgroup/memory.events').read_text().splitlines())\n    return {key: int(values[key]) for key in ('oom', 'oom_kill')}\n\n\ndef free_bytes():\n    stat = os.statvfs(ROOT)\n    return stat.f_bavail * stat.f_frsize\n\n\ndef artifact_bytes():\n    return sum(path.stat().st_size for path in ROOT.rglob('*') if path.is_file())\n\n\ndef family_rss(pid):\n    pending = [pid]\n    seen = set()\n    total = 0\n    samples = 0\n    while pending:\n        member = pending.pop()\n        if member in seen:\n            continue\n        seen.add(member)\n        proc = Path('/proc') / str(member)\n        try:\n            match = re.search(r'^VmRSS:\\s+(\\d+)\\s+kB$', proc.joinpath('status').read_text(), re.MULTILINE)\n            if match:\n                total += int(match.group(1)) * 1024\n                samples += 1\n            for thread in proc.joinpath('task').iterdir():\n                try:\n                    pending.extend(int(value) for value in thread.joinpath('children').read_text().split())\n                except (FileNotFoundError, ProcessLookupError):\n                    pass\n        except (FileNotFoundError, ProcessLookupError):\n            pass\n    return total if samples else None\n\n\ndef stop_owned_group(child):\n    if child.poll() is not None:\n        return\n    try:\n        os.killpg(child.pid, signal.SIGTERM)\n    except ProcessLookupError:\n        pass\n    try:\n        child.wait(timeout=1)\n    except subprocess.TimeoutExpired:\n        try:\n            os.killpg(child.pid, signal.SIGKILL)\n        except ProcessLookupError:\n            pass\n        child.wait(timeout=2)\n\n\ndef run(name, argv):\n    if free_bytes() < 64 * 1024 * 1024:\n        raise RuntimeError('insufficient free disk for bounded component proof')\n    before = oom_counts()\n    started = time.monotonic()\n    peak_rss = 0\n    samples = 0\n    stop_reason = None\n    log_path = ROOT / (name + '.log')\n    with log_path.open('xb') as log:\n        child = subprocess.Popen(\n            [str(value) for value in argv], cwd=ROOT,\n            stdout=log, stderr=subprocess.STDOUT,\n            env=dict(os.environ, TMPDIR=str(ROOT / 'tmp')),\n            start_new_session=True,\n        )\n        try:\n            while child.poll() is None:\n                rss = family_rss(child.pid)\n                if rss is not None:\n                    peak_rss = max(peak_rss, rss)\n                    samples += 1\n                now_oom = oom_counts()\n                if any(now_oom[key] != before[key] for key in before):\n                    stop_reason = 'cgroup OOM counter changed'\n                elif rss is not None and rss > RSS_LIMIT:\n                    stop_reason = '512 MiB process-family RSS limit'\n                elif time.monotonic() - started > SECONDS_LIMIT:\n                    stop_reason = '120 second command limit'\n                elif artifact_bytes() > ARTIFACT_LIMIT:\n                    stop_reason = '32 MiB owned artifact limit'\n                elif free_bytes() < 32 * 1024 * 1024:\n                    stop_reason = '32 MiB free disk floor'\n                if stop_reason:\n                    stop_owned_group(child)\n                    break\n                time.sleep(0.01)\n            code = child.wait()\n        finally:\n            stop_owned_group(child)\n    result = {\n        'name': name,\n        'argv': [str(value) for value in argv],\n        'exit_code': code,\n        'elapsed_seconds': round(time.monotonic() - started, 4),\n        'peak_family_rss_bytes': peak_rss,\n        'rss_samples': samples,\n        'stop_reason': stop_reason,\n        'oom_before': before,\n        'oom_after': oom_counts(),\n        'log': log_path.name,\n        'log_sha256': sha(log_path.read_bytes()),\n    }\n    text = log_path.read_text(errors='replace')\n    counts = re.findall(r'test result: (\\w+)\\. (\\d+) passed; (\\d+) failed; (\\d+) ignored; (\\d+) measured; (\\d+) filtered out', text)\n    if counts:\n        result['test_counts'] = counts\n    print(json.dumps(result, sort_keys=True), flush=True)\n    return result\n\n\ndef main():\n    receipt_path = ROOT / 'exact_component_receipt.json'\n    if any((ROOT / name).exists() for name in ('exact_component_receipt.json', 'polling_exact.rs', 'toolchain.log', 'compile_first.log', 'tests_first.log', 'clippy_first.log')):\n        raise RuntimeError('refuse to overwrite retained evidence')\n    (ROOT / 'tmp').mkdir(exist_ok=True)\n    source_before = SOURCE.read_bytes()\n    source_text = source_before.decode()\n    start = source_text.index('    fn poll_bootstrap_checkout<T, E>(\\n')\n    end = source_text.index('    fn initialize_pool_for_handoff(\\n', start)\n    exact_slice = source_text[start:end].encode()\n    attributes_start = source_text.index('#![forbid(unsafe_code)]')\n    attributes_end = source_text.index('mod archive_read;\\n', attributes_start)\n    exact_attributes = source_text[attributes_start:attributes_end].encode()\n    proof = ROOT / 'polling_exact.rs'\n    with proof.open('xb') as output:\n        output.write(exact_attributes + exact_slice)\n    receipt = {\n        'scope': 'Exact std-only production polling loop and six existing adjacent std tests. No Cx/runtime/dependency mocks; no DB, recovery, request, saturation, latency, or speedup qualification.',\n        'source': str(SOURCE),\n        'source_sha256_before': sha(source_before),\n        'slice_sha256_before': sha(exact_slice),\n        'source_lines': [source_text[:start].count('\\n') + 1, source_text[:end].count('\\n')],\n        'crate_attributes_sha256': sha(exact_attributes),\n        'workspace_manifest_sha256': sha(MANIFEST.read_bytes()),\n        'proof_sha256': sha(proof.read_bytes()),\n        'runner_sha256': sha(Path(__file__).read_bytes()),\n        'limits': {'process_family_rss_bytes': RSS_LIMIT, 'seconds_per_command': SECONDS_LIMIT, 'owned_artifact_bytes': ARTIFACT_LIMIT},\n        'oom_before': oom_counts(),\n        'results': [],\n    }\n    common = ['--edition=2024', '-Cpanic=unwind', '-Copt-level=0', '-Cdebuginfo=0', '-Ccodegen-units=1', '-Cstrip=symbols']\n    receipt['results'].append(run('toolchain', [TOOLCHAIN / 'rustc', '--version', '--verbose']))\n    compile_result = run('compile_first', [TOOLCHAIN / 'rustc', *common, '--test', proof, '-o', ROOT / 'polling_exact_tests'])\n    receipt['results'].append(compile_result)\n    if compile_result['exit_code'] == 0 and compile_result['stop_reason'] is None:\n        receipt['results'].append(run('tests_first', [ROOT / 'polling_exact_tests', '--test-threads=1', '--nocapture']))\n        receipt['results'].append(run('clippy_first', [\n            TOOLCHAIN / 'clippy-driver', *common, '--test', '--emit=metadata',\n            '-Dunsafe_code', '--check-cfg=cfg(docsrs,test)', '--check-cfg=cfg(fuzzing)',\n            '-Wclippy::pedantic', '-Wclippy::nursery',\n            '-Aclippy::missing_errors_doc', '-Aclippy::missing_panics_doc', '-Aclippy::module_name_repetitions',\n            '-Dwarnings', proof, '-o', ROOT / 'polling_exact_clippy.rmeta',\n        ]))\n    source_after = SOURCE.read_bytes()\n    after_text = source_after.decode()\n    after_start = after_text.index('    fn poll_bootstrap_checkout<T, E>(\\n')\n    after_end = after_text.index('    fn initialize_pool_for_handoff(\\n', after_start)\n    receipt.update(\n        source_sha256_after=sha(source_after),\n        slice_sha256_after=sha(after_text[after_start:after_end].encode()),\n        source_unchanged=source_before == source_after,\n        oom_after=oom_counts(),\n        artifact_bytes=artifact_bytes(),\n    )\n    with receipt_path.open('x') as output:\n        json.dump(receipt, output, indent=2, sort_keys=True)\n        output.write('\\n')\n    passed = (\n        len(receipt['results']) == 4\n        and all(result['exit_code'] == 0 and result['stop_reason'] is None for result in receipt['results'])\n        and receipt['source_unchanged']\n        and receipt['oom_before'] == receipt['oom_after']\n    )\n    print(json.dumps({'receipt': str(receipt_path), 'passed': passed, 'source_sha256': receipt['source_sha256_after'], 'slice_sha256': receipt['slice_sha256_after']}), flush=True)\n    raise SystemExit(0 if passed else 1)\n\n\nif __name__ == '__main__':\n    main()\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/baseline-production.json": {
+        "sha256": "f43f38ff906a8b8dbe8357ce05f0c0e2c357de9f552cd2cc9cfe3bdf3c8c31cd",
+        "bytes": 3616,
+        "content": "{\n  \"scope\": \"Actual unmodified pinned dependency graph; compiler metadata only, not runtime or saturation qualification\",\n  \"base\": \"ed6759a2df74a88e088e4f23f3ed3a3df691c21e\",\n  \"argv\": [\n    \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo\",\n    \"check\",\n    \"--locked\",\n    \"--offline\",\n    \"--workspace\",\n    \"--lib\",\n    \"--bins\"\n  ],\n  \"workdir\": \"/workspace/scratch/b1120803451c/gh353-repair-baseline-ed6759\",\n  \"environment\": {\n    \"CARGO_BUILD_JOBS\": \"1\",\n    \"CARGO_INCREMENTAL\": \"0\",\n    \"CARGO_PROFILE_DEV_DEBUG\": \"0\",\n    \"CARGO_PROFILE_TEST_DEBUG\": \"0\",\n    \"CARGO_TARGET_DIR\": \"/workspace/scratch/b1120803451c/gh353-native-20261029/target\",\n    \"RUSTC\": \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\"\n  },\n  \"exit_code\": -15,\n  \"stop_reason\": \"owned compiler family exceeded 2304 MiB RSS budget\",\n  \"elapsed_seconds\": 54.097,\n  \"peak_family_rss_bytes\": 2422984704,\n  \"oom_before\": {\n    \"oom\": 139,\n    \"oom_kill\": 38\n  },\n  \"oom_after\": {\n    \"oom\": 139,\n    \"oom_kill\": 38\n  },\n  \"free_bytes_before\": 4489437184,\n  \"free_bytes_after\": 4338290688,\n  \"source_hashes_before\": {\n    \"Cargo.lock\": \"a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157\",\n    \"Cargo.toml\": \"ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe\",\n    \"rust-toolchain.toml\": \"b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a\",\n    \".cargo/config.toml\": \"29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918\",\n    \"crates/mcp-agent-mail-db/src/pool.rs\": \"f878b4034f16c11ae27a7267b87f1c13a984a5aa1ce7b51064ae671153ef9008\",\n    \"crates/mcp-agent-mail-tools/src/lib.rs\": \"21b2941a550f8d4f590ef547343b24b106c7775ff72a7c23551b4e8af4e7d1c0\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs\": \"1e3c4c85e9e5efa3b969096b734b7b9748bb634b7a7706a5a7731d81b32a160e\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs\": \"21ca7594eea6dfed5533bc66c8584e040b2fb6e25ce9079360c89c14abfbab0c\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs\": \"555f7bafee8a7b6b6114ab163882a0a1143245311635ff889fdf91730266fbb7\"\n  },\n  \"source_hashes_after\": {\n    \"Cargo.lock\": \"a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157\",\n    \"Cargo.toml\": \"ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe\",\n    \"rust-toolchain.toml\": \"b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a\",\n    \".cargo/config.toml\": \"29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918\",\n    \"crates/mcp-agent-mail-db/src/pool.rs\": \"f878b4034f16c11ae27a7267b87f1c13a984a5aa1ce7b51064ae671153ef9008\",\n    \"crates/mcp-agent-mail-tools/src/lib.rs\": \"21b2941a550f8d4f590ef547343b24b106c7775ff72a7c23551b4e8af4e7d1c0\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs\": \"1e3c4c85e9e5efa3b969096b734b7b9748bb634b7a7706a5a7731d81b32a160e\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs\": \"21ca7594eea6dfed5533bc66c8584e040b2fb6e25ce9079360c89c14abfbab0c\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs\": \"555f7bafee8a7b6b6114ab163882a0a1143245311635ff889fdf91730266fbb7\"\n  },\n  \"source_unchanged\": true,\n  \"log\": \"/workspace/scratch/b1120803451c/gh353-repair-check-evidence/baseline-production.log\",\n  \"log_sha256\": \"ba5ede5fd051faeb6a8f2022ae246129dbb33cef6ae03b8f3d6e0257d058c503\",\n  \"runner_sha256\": \"1e55947e208a2f02491c197918d4619961264213ff91eac3837d52c08a0dafd4\"\n}\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/baseline-production.log": {
+        "sha256": "ba5ede5fd051faeb6a8f2022ae246129dbb33cef6ae03b8f3d6e0257d058c503",
+        "bytes": 1048,
+        "content": "    Checking num-bigint v0.4.8\n   Compiling synstructure v0.13.2\n   Compiling asn1-rs-derive v0.6.0\n    Checking rusticata-macros v4.1.0\n   Compiling generic-array v0.14.7\n   Compiling asn1-rs-impl v0.2.0\n   Compiling same-file v1.0.6\n   Compiling walkdir v2.5.0\n    Checking asn1-rs v0.7.2\n    Checking rustls-pki-types v1.15.1\n   Compiling bitflags v2.13.2\n    Checking untrusted v0.9.0\n    Checking ring v0.17.14\n   Compiling once_cell v1.21.4\n    Checking rustls-webpki v0.103.15\n    Checking oid-registry v0.8.1\n   Compiling block-buffer v0.10.4\n   Compiling crypto-common v0.1.7\n    Checking der-parser v10.0.0\n    Checking franken-evidence v0.5.0\n   Compiling crc32fast v1.5.2\n    Checking franken-kernel v0.5.0\n   Compiling asupersync v0.5.0\n    Checking regex-syntax v0.8.11\n    Checking stable_deref_trait v1.2.1\n   Compiling pkg-config v0.3.34\n    Checking franken-decision v0.5.0\n    Checking x509-parser v0.18.1\n   Compiling digest v0.10.7\n    Checking rustls v0.23.45\n    Checking webpki-roots v1.0.9\n    Checking xxhash-rust v0.8.19\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-production.json": {
+        "sha256": "ed130ae9ba7999beea83fd84a7a1e95961d49b68716185b3341c65a8c66e7fa7",
+        "bytes": 3597,
+        "content": "{\n  \"scope\": \"Actual unmodified pinned dependency graph; compiler metadata only, not runtime or saturation qualification\",\n  \"base\": \"ed6759a2df74a88e088e4f23f3ed3a3df691c21e\",\n  \"argv\": [\n    \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo\",\n    \"check\",\n    \"--locked\",\n    \"--offline\",\n    \"--workspace\",\n    \"--lib\",\n    \"--bins\"\n  ],\n  \"workdir\": \"/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759\",\n  \"environment\": {\n    \"CARGO_BUILD_JOBS\": \"1\",\n    \"CARGO_INCREMENTAL\": \"0\",\n    \"CARGO_PROFILE_DEV_DEBUG\": \"0\",\n    \"CARGO_PROFILE_TEST_DEBUG\": \"0\",\n    \"CARGO_TARGET_DIR\": \"/workspace/scratch/b1120803451c/gh353-native-20261029/target\",\n    \"RUSTC\": \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\"\n  },\n  \"exit_code\": -15,\n  \"stop_reason\": \"cgroup OOM counter increased\",\n  \"elapsed_seconds\": 136.273,\n  \"peak_family_rss_bytes\": 1914646528,\n  \"oom_before\": {\n    \"oom\": 142,\n    \"oom_kill\": 40\n  },\n  \"oom_after\": {\n    \"oom\": 143,\n    \"oom_kill\": 41\n  },\n  \"free_bytes_before\": 3864100864,\n  \"free_bytes_after\": 3854131200,\n  \"source_hashes_before\": {\n    \"Cargo.lock\": \"a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157\",\n    \"Cargo.toml\": \"ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe\",\n    \"rust-toolchain.toml\": \"b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a\",\n    \".cargo/config.toml\": \"29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918\",\n    \"crates/mcp-agent-mail-db/src/pool.rs\": \"6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d\",\n    \"crates/mcp-agent-mail-tools/src/lib.rs\": \"98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs\": \"2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs\": \"b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs\": \"c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89\"\n  },\n  \"source_hashes_after\": {\n    \"Cargo.lock\": \"a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157\",\n    \"Cargo.toml\": \"ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe\",\n    \"rust-toolchain.toml\": \"b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a\",\n    \".cargo/config.toml\": \"29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918\",\n    \"crates/mcp-agent-mail-db/src/pool.rs\": \"6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d\",\n    \"crates/mcp-agent-mail-tools/src/lib.rs\": \"98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs\": \"2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs\": \"b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs\": \"c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89\"\n  },\n  \"source_unchanged\": true,\n  \"log\": \"/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-production.log\",\n  \"log_sha256\": \"c7c2b7e4434b3cfabda8c6728342aaea0200c81ed67cd92c7fda3963ea0fd65a\",\n  \"runner_sha256\": \"1e55947e208a2f02491c197918d4619961264213ff91eac3837d52c08a0dafd4\"\n}\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-production.log": {
+        "sha256": "c7c2b7e4434b3cfabda8c6728342aaea0200c81ed67cd92c7fda3963ea0fd65a",
+        "bytes": 31,
+        "content": "    Checking asupersync v0.5.0\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format.json": {
+        "sha256": "54d6f084b28b477b9a6ad6e6d5789a8c4c385de590e551fe4ce3a44ba14a0f67",
+        "bytes": 351,
+        "content": "{\n  \"argv\": [\n    \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo\",\n    \"fmt\",\n    \"--all\",\n    \"--\",\n    \"--check\"\n  ],\n  \"exit_code\": 1,\n  \"elapsed_seconds\": 17.354,\n  \"log\": \"/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format.log\",\n  \"output_bytes\": 544\n}"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format.log": {
+        "sha256": "ce4bac12f3b5c2463a12e11917cd990822fa0f5871ca7d93fe933de258351366",
+        "bytes": 544,
+        "content": "error: couldn't find file `/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759/crates/mcp-agent-mail-conformance/tests/../../../tests/docs_drift_ci.rs`\n  --> /workspace/scratch/b1120803451c/gh353-repair-admission-ed6759/crates/mcp-agent-mail-conformance/tests/it.rs:54:1\n   |\n54 | mod docs_drift_ci;\n   | ^^^^^^^^^^^^^^^^^^\n\nError writing files: failed to resolve mod `docs_drift_ci`: /workspace/scratch/b1120803451c/gh353-repair-admission-ed6759/crates/mcp-agent-mail-conformance/tests/../../../tests/docs_drift_ci.rs does not exist\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format-final.json": {
+        "sha256": "3a5a5bc77e677071c6f9099f5336fe19ac1d91e9b4fb664b15abb10d2870cb0a",
+        "bytes": 3573,
+        "content": "{\n  \"scope\": \"Actual unmodified pinned dependency graph; compiler metadata only, not runtime or saturation qualification\",\n  \"base\": \"ed6759a2df74a88e088e4f23f3ed3a3df691c21e\",\n  \"argv\": [\n    \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo\",\n    \"fmt\",\n    \"--all\",\n    \"--\",\n    \"--check\"\n  ],\n  \"workdir\": \"/workspace/scratch/b1120803451c/gh353-repair-admission-ed6759\",\n  \"environment\": {\n    \"CARGO_BUILD_JOBS\": \"1\",\n    \"CARGO_INCREMENTAL\": \"0\",\n    \"CARGO_PROFILE_DEV_DEBUG\": \"0\",\n    \"CARGO_PROFILE_TEST_DEBUG\": \"0\",\n    \"CARGO_TARGET_DIR\": \"/workspace/scratch/b1120803451c/gh353-native-20261029/target\",\n    \"RUSTC\": \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\"\n  },\n  \"exit_code\": -15,\n  \"stop_reason\": \"retained artifact disk budget reached\",\n  \"elapsed_seconds\": 10.912,\n  \"peak_family_rss_bytes\": 253976576,\n  \"oom_before\": {\n    \"oom\": 144,\n    \"oom_kill\": 42\n  },\n  \"oom_after\": {\n    \"oom\": 144,\n    \"oom_kill\": 42\n  },\n  \"free_bytes_before\": 3282702336,\n  \"free_bytes_after\": 3202338816,\n  \"source_hashes_before\": {\n    \"Cargo.lock\": \"a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157\",\n    \"Cargo.toml\": \"ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe\",\n    \"rust-toolchain.toml\": \"b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a\",\n    \".cargo/config.toml\": \"29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918\",\n    \"crates/mcp-agent-mail-db/src/pool.rs\": \"6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d\",\n    \"crates/mcp-agent-mail-tools/src/lib.rs\": \"98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs\": \"2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs\": \"b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs\": \"c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89\"\n  },\n  \"source_hashes_after\": {\n    \"Cargo.lock\": \"a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157\",\n    \"Cargo.toml\": \"ec359af291c63f1ac13bfd4e269e3954e826ec231f8808af253024f92cfc9abe\",\n    \"rust-toolchain.toml\": \"b19e45ae96538262d4d0e65bdfa8c8a9a7c8b7e1cc03e9f6b9739a8c2456171a\",\n    \".cargo/config.toml\": \"29a276d2f5169a1fd25838e351bfe5e7f349a4840018d4c4414ba6fe56099918\",\n    \"crates/mcp-agent-mail-db/src/pool.rs\": \"6b42798e256c28a6407e014bd47e2560cead05d3383382ffa97b7a9d46dcb02d\",\n    \"crates/mcp-agent-mail-tools/src/lib.rs\": \"98d9ce275bff5bf3fe669d6abcb1b106022c67fcb2e278345a1268f0ea525bdc\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs\": \"2a0d091deae2ac0d9f649380c7ec4fed46fb54e897823ba8eef35b83c1015552\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs\": \"b390e0063ca535ca0e76c649b2db3ed2cfd574e2ed507ccd95b5c8644a50bb0c\",\n    \"crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs\": \"c7556c923ced8778b6bdc3642dd6af32fc668556130ecb3efabd69825ce7aa89\"\n  },\n  \"source_unchanged\": true,\n  \"log\": \"/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format-final.log\",\n  \"log_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\n  \"runner_sha256\": \"1e55947e208a2f02491c197918d4619961264213ff91eac3837d52c08a0dafd4\"\n}\n"
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/candidate-workspace-format-final.log": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0,
+        "content": ""
+      },
+      "/workspace/scratch/b1120803451c/gh353-repair-check-evidence/run_check.py": {
+        "sha256": "1e55947e208a2f02491c197918d4619961264213ff91eac3837d52c08a0dafd4",
+        "bytes": 6514,
+        "content": "#!/usr/bin/env python3\n\"\"\"Run one real Cargo check with retained logs and strict resource bounds.\"\"\"\n\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport signal\nimport subprocess\nimport sys\nimport time\n\n\nROOT = Path(__file__).resolve().parent\nWORKSPACE = Path('/workspace/scratch/b1120803451c')\nTOOLCHAIN = WORKSPACE / 'rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin'\nMAX_RSS = 2304 * 1024 * 1024\nMAX_SECONDS = 900\nMIN_FREE = 3 * 1024 * 1024 * 1024\nMAX_ADDED_BYTES = 2 * 1024 * 1024 * 1024\n\n\ndef memory_events():\n    fields = dict(line.split() for line in Path('/sys/fs/cgroup/memory.events').read_text().splitlines())\n    return {key: int(fields[key]) for key in ('oom', 'oom_kill')}\n\n\ndef free_bytes():\n    stat = os.statvfs(ROOT)\n    return stat.f_bavail * stat.f_frsize\n\n\ndef family_rss(group):\n    total = 0\n    for entry in Path('/proc').iterdir():\n        if not entry.name.isdigit():\n            continue\n        try:\n            if os.getpgid(int(entry.name)) != group:\n                continue\n            for line in (entry / 'status').read_text().splitlines():\n                if line.startswith('VmRSS:'):\n                    total += int(line.split()[1]) * 1024\n                    break\n        except (FileNotFoundError, PermissionError, ProcessLookupError):\n            pass\n    return total\n\n\ndef stop_owned(child):\n    if child.poll() is not None:\n        return\n    os.killpg(child.pid, signal.SIGTERM)\n    try:\n        child.wait(timeout=1)\n    except subprocess.TimeoutExpired:\n        os.killpg(child.pid, signal.SIGKILL)\n        child.wait(timeout=2)\n\n\ndef witnesses(workdir):\n    paths = ['Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml',\n             'crates/mcp-agent-mail-db/src/pool.rs',\n             'crates/mcp-agent-mail-tools/src/lib.rs',\n             'crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs',\n             'crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs',\n             'crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs']\n    return {path: hashlib.sha256((workdir / path).read_bytes()).hexdigest() for path in paths}\n\n\ndef main():\n    label, workdir_arg, *cargo_args = sys.argv[1:]\n    workdir = Path(workdir_arg)\n    log_path = ROOT / (label + '.log')\n    receipt_path = ROOT / (label + '.json')\n    if log_path.exists() or receipt_path.exists():\n        raise RuntimeError('Refusing to overwrite retained validation artifacts')\n    env = os.environ.copy()\n    env.update({\n        'CARGO_HOME': str(WORKSPACE / 'cargo'),\n        'RUSTUP_HOME': str(WORKSPACE / 'rustup'),\n        'RUSTC': str(TOOLCHAIN / 'rustc'),\n        'PATH': str(TOOLCHAIN) + os.pathsep + env.get('PATH', ''),\n        'CARGO_BUILD_JOBS': '1',\n        'CARGO_INCREMENTAL': '0',\n        'CARGO_PROFILE_DEV_DEBUG': '0',\n        'CARGO_PROFILE_TEST_DEBUG': '0',\n        'CARGO_TARGET_DIR': str(WORKSPACE / 'gh353-native-20261029/target'),\n    })\n    argv = [str(TOOLCHAIN / 'cargo'), *cargo_args]\n    before = witnesses(workdir)\n    initial_oom = memory_events()\n    initial_free = free_bytes()\n    if initial_free < MIN_FREE:\n        raise RuntimeError('Insufficient initial free disk for bounded validation')\n    start = time.monotonic()\n    reason = None\n    peak_rss = 0\n    with log_path.open('x') as log:\n        child = subprocess.Popen(argv, cwd=workdir, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\n        print(json.dumps({'label': label, 'pid': child.pid, 'argv': argv, 'workdir': str(workdir)}), flush=True)\n        last_report = start\n        try:\n            while child.poll() is None:\n                elapsed = time.monotonic() - start\n                peak_rss = max(peak_rss, family_rss(child.pid))\n                current_oom = memory_events()\n                available = free_bytes()\n                if any(current_oom[key] > initial_oom[key] for key in initial_oom):\n                    reason = 'cgroup OOM counter increased'\n                elif peak_rss > MAX_RSS:\n                    reason = 'owned compiler family exceeded 2304 MiB RSS budget'\n                elif elapsed > MAX_SECONDS:\n                    reason = 'owned check exceeded 900 second budget'\n                elif available < MIN_FREE or initial_free - available > MAX_ADDED_BYTES:\n                    reason = 'retained artifact disk budget reached'\n                elif log_path.stat().st_size > 8 * 1024 * 1024:\n                    reason = 'unexpected compiler output exceeded 8 MiB'\n                if reason:\n                    stop_owned(child)\n                    break\n                if time.monotonic() - last_report >= 30:\n                    print(json.dumps({'label': label, 'elapsed_seconds': round(elapsed, 1), 'peak_family_rss_bytes': peak_rss, 'log_bytes': log_path.stat().st_size}), flush=True)\n                    last_report = time.monotonic()\n                time.sleep(0.1)\n            code = child.wait(timeout=2)\n        finally:\n            stop_owned(child)\n    after = witnesses(workdir)\n    receipt = {\n        'scope': 'Actual unmodified pinned dependency graph; compiler metadata only, not runtime or saturation qualification',\n        'base': 'ed6759a2df74a88e088e4f23f3ed3a3df691c21e',\n        'argv': argv,\n        'workdir': str(workdir),\n        'environment': {key: env[key] for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG', 'CARGO_TARGET_DIR', 'RUSTC')},\n        'exit_code': code,\n        'stop_reason': reason,\n        'elapsed_seconds': round(time.monotonic() - start, 3),\n        'peak_family_rss_bytes': peak_rss,\n        'oom_before': initial_oom,\n        'oom_after': memory_events(),\n        'free_bytes_before': initial_free,\n        'free_bytes_after': free_bytes(),\n        'source_hashes_before': before,\n        'source_hashes_after': after,\n        'source_unchanged': before == after,\n        'log': str(log_path),\n        'log_sha256': hashlib.sha256(log_path.read_bytes()).hexdigest(),\n        'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),\n    }\n    with receipt_path.open('x') as output:\n        json.dump(receipt, output, indent=2)\n        output.write('\\n')\n    print(json.dumps(receipt), flush=True)\n    print('\\n'.join(log_path.read_text().splitlines()[-12:]), flush=True)\n    raise SystemExit(0 if code == 0 and reason is None and before == after else 1)\n\n\nif __name__ == '__main__':\n    main()\n"
+      }
+    }
+  },
   "schema": "gh353-native-retry-v1",
   "status": "BLOCKED_UNQUALIFIED_CANDIDATE",
   "source_base": "65852eb86673d612ddf1d222ce9209f1a7d3f18b",
