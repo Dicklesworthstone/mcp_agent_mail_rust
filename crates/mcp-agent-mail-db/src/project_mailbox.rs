@@ -48,6 +48,7 @@ use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::sync::InboxBodyPolicy;
 use crate::sync::InboxFetchOptions;
 use sqlmodel_core::Value;
+use std::collections::HashMap;
 
 /// Recipient `kind` reported for a project mailbox delivery. It never appears
 /// in `message_recipients`.
@@ -230,6 +231,165 @@ pub fn has_project_mailbox_deliveries(
     project_id: i64,
 ) -> Result<bool, DbError> {
     crate::sync::inbox::with_snapshot(conn, || has_project_deliveries(conn, project_id))
+}
+
+/// Unread messages for every agent in a project, including eligible shared mail.
+/// Direct and shared receipts are observed together; a direct delivery takes
+/// precedence even when its own receipt is already read. Shared history is
+/// visited in bounded delivery pages instead of rescanned for every agent.
+pub fn project_inbox_unread_counts_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+) -> Result<HashMap<i64, i64>, DbError> {
+    crate::sync::inbox::with_snapshot(conn, || {
+        let mut counts = HashMap::new();
+        let rows = conn
+            .query_sync(
+                "SELECT r.agent_id, COUNT(DISTINCT r.message_id) AS unread \
+                 FROM message_recipients r JOIN messages m ON m.id = r.message_id \
+                 WHERE m.project_id = ? AND r.read_ts IS NULL GROUP BY r.agent_id",
+                &[Value::BigInt(project_id)],
+            )
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        merge_unread_counts(&mut counts, rows, None)?;
+        if !has_project_deliveries(conn, project_id)? {
+            return Ok(counts);
+        }
+        let mut floor = None;
+        let mut skip_at_floor = 0;
+        loop {
+            let ids = project_mailbox_count_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
+            if ids.is_empty() {
+                return Ok(counts);
+            }
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!(
+                "SELECT viewer.id AS agent_id, COUNT(DISTINCT d.message_id) AS unread \
+                 FROM project_mailbox_deliveries d \
+                 JOIN messages m ON m.id = d.message_id \
+                 JOIN agents viewer ON viewer.project_id = d.project_id \
+                 LEFT JOIN project_mailbox_receipts pr \
+                     ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+                 WHERE d.project_id = ? AND d.message_id IN ({placeholders}) \
+                     AND {VISIBLE_TO_VIEWER_SQL} AND pr.read_ts IS NULL \
+                 GROUP BY viewer.id"
+            );
+            let mut params = vec![Value::BigInt(project_id)];
+            params.extend(ids.iter().copied().map(Value::BigInt));
+            let rows = conn
+                .query_sync(&sql, &params)
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            merge_unread_counts(&mut counts, rows, Some(ids.len()))?;
+            if ids.len() < 128 {
+                return Ok(counts);
+            }
+        }
+    })
+}
+
+fn merge_unread_counts(
+    counts: &mut HashMap<i64, i64>,
+    rows: Vec<sqlmodel_core::Row>,
+    maximum: Option<usize>,
+) -> Result<(), DbError> {
+    for row in rows {
+        let agent_id = row
+            .get_named::<i64>("agent_id")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let unread = row
+            .get_named::<i64>("unread")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        if agent_id <= 0
+            || unread < 0
+            || maximum.is_some_and(|bound| usize::try_from(unread).map_or(true, |n| n > bound))
+        {
+            return Err(DbError::Internal(
+                "invalid project unread count".to_string(),
+            ));
+        }
+        let total = counts.entry(agent_id).or_default();
+        *total = total
+            .checked_add(unread)
+            .ok_or_else(|| DbError::Internal("project unread count overflow".to_string()))?;
+    }
+    Ok(())
+}
+
+/// Canonical shared-mailbox addresses and their durable to/cc delivery slots
+/// for an outbox page. No agent roster or BCC addresses are returned.
+pub fn project_mailbox_recipients_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    message_ids: &[i64],
+) -> Result<HashMap<i64, (String, String)>, DbError> {
+    if message_ids.len() > MAX_IN_CLAUSE_ITEMS {
+        return Err(DbError::invalid(
+            "message_ids",
+            "outbox page exceeds 500 messages",
+        ));
+    }
+    if message_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    crate::sync::inbox::with_snapshot(conn, || {
+        let mut recipients = HashMap::new();
+        let placeholders = vec!["?"; message_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT d.message_id, d.project_id, d.kind, \
+                    m.project_id AS message_project_id, p.slug \
+             FROM project_mailbox_deliveries d \
+             LEFT JOIN messages m ON m.id = d.message_id \
+             LEFT JOIN projects p ON p.id = d.project_id \
+             WHERE d.message_id IN ({placeholders})"
+        );
+        let params: Vec<Value> = message_ids.iter().copied().map(Value::BigInt).collect();
+        let rows = match conn.query_sync(&sql, &params) {
+            Ok(rows) => rows,
+            Err(error) => {
+                allow_absent_shared_schema(conn, &error.to_string())?;
+                return Ok(recipients);
+            }
+        };
+        conn.query_sync(
+            "SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts LIMIT 0",
+            &[],
+        )
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        for row in rows {
+            let id = row
+                .get_named::<i64>("message_id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let delivery_project = row
+                .get_named::<i64>("project_id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let message_project = row
+                .get_named::<i64>("message_project_id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let kind = row
+                .get_named::<String>("kind")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let slug = row
+                .get_named::<String>("slug")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            if delivery_project != project_id || message_project != project_id {
+                return Err(DbError::Internal(
+                    "project mailbox delivery identity mismatch".to_string(),
+                ));
+            }
+            if !matches!(kind.as_str(), "to" | "cc") || slug.trim().is_empty() {
+                return Err(DbError::Internal(
+                    "invalid project mailbox recipient".to_string(),
+                ));
+            }
+            let address = project_mailbox_address(&slug);
+            if recipients.insert(id, (address, kind)).is_some() {
+                return Err(DbError::Internal(
+                    "duplicate project mailbox delivery".to_string(),
+                ));
+            }
+        }
+        Ok(recipients)
+    })
 }
 
 /// An agent's shared-mail obligations, excluding messages delivered directly.
@@ -1160,6 +1320,10 @@ mod tests {
             project_mailbox_inbox_counts_from_conn(&conn, 1, 99, 150_000).unwrap(),
             ProjectMailboxInboxCounts::default()
         );
+        assert_eq!(
+            project_inbox_unread_counts_from_conn(&conn, 1).unwrap(),
+            HashMap::from([(2, 254)])
+        );
         let receipts = conn
             .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
             .unwrap();
@@ -1168,6 +1332,114 @@ mod tests {
             .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
             .unwrap();
         assert_eq!(activity[0].get_named::<i64>("n").unwrap(), 0);
+    }
+
+    fn resource_delivery_fixture() -> DbConn {
+        let conn = test_conn();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'backend', '/backend', 0), (2, 'other', '/other', 0);
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                    (2, 1, 'Reader', 'test', 'test', 0, 0),
+                    (3, 1, 'Peer', 'test', 'test', 0, 0),
+                    (4, 1, 'Blocked', 'test', 'test', 0, 0),
+                    (5, 1, 'Retired', 'test', 'test', 0, 0),
+                    (6, 1, 'Late', 'test', 'test', 2000, 0),
+                    (7, 2, 'Foreign', 'test', 'test', 0, 0),
+                    (8, 1, 'Hidden', 'test', 'test', 0, 0);
+             UPDATE agents SET contact_policy = 'BLOCK_ALL' WHERE id = 4;
+             UPDATE agents SET retired_at = 2000 WHERE id = 5;
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, importance)
+             VALUES (100, 1, 1, 'Shared ordinary', '', 100, 'normal'),
+                    (101, 1, 1, 'Mixed urgent', '', 200, 'urgent'),
+                    (102, 1, 1, 'Direct ordinary', '', 300, 'normal');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (100, 1, 'to', 100), (101, 1, 'cc', 200);
+             INSERT INTO message_recipients (message_id, agent_id, kind, read_ts)
+             VALUES (101, 2, 'to', 400), (101, 8, 'bcc', NULL), (102, 2, 'to', NULL);
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts)
+             VALUES (100, 2, 400);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn resource_delivery_helpers_preserve_visibility_receipts_and_slots() {
+        let conn = resource_delivery_fixture();
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        assert_eq!(
+            project_inbox_unread_counts_from_conn(&conn, 1).unwrap(),
+            HashMap::from([(2, 1), (3, 2), (8, 2)])
+        );
+        assert!(
+            project_inbox_unread_counts_from_conn(&conn, 2)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            project_mailbox_recipients_from_conn(&conn, 1, &[100, 101, 102]).unwrap(),
+            HashMap::from([
+                (100, ("project:backend".to_string(), "to".to_string())),
+                (101, ("project:backend".to_string(), "cc".to_string())),
+            ])
+        );
+        assert!(project_mailbox_recipients_from_conn(&conn, 2, &[100]).is_err());
+        assert!(project_mailbox_recipients_from_conn(&conn, 1, &[100; 501]).is_err());
+        let receipts = conn
+            .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+            .unwrap();
+        assert_eq!(receipts[0].get_named::<i64>("n").unwrap(), 1);
+        let direct = conn
+            .query_sync("SELECT COUNT(*) AS n FROM message_recipients", &[])
+            .unwrap();
+        assert_eq!(direct[0].get_named::<i64>("n").unwrap(), 3);
+        let activity = conn
+            .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+            .unwrap();
+        assert_eq!(activity[0].get_named::<i64>("n").unwrap(), 0);
+    }
+
+    #[test]
+    fn outbox_project_delivery_rejects_invalid_kind_and_identity() {
+        for mutation in [
+            "UPDATE project_mailbox_deliveries SET kind = 'bcc' WHERE message_id = 100",
+            "UPDATE project_mailbox_deliveries SET project_id = 2 WHERE message_id = 100",
+            "PRAGMA foreign_keys = OFF; UPDATE project_mailbox_deliveries SET project_id = 999 WHERE message_id = 100",
+            "PRAGMA foreign_keys = OFF; UPDATE project_mailbox_deliveries SET message_id = 999 WHERE message_id = 100",
+            "UPDATE projects SET slug = '' WHERE id = 1",
+        ] {
+            let conn = resource_delivery_fixture();
+            conn.execute_raw(mutation).unwrap();
+            assert!(
+                project_mailbox_recipients_from_conn(&conn, 1, &[100, 999]).is_err(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_delivery_helpers_reject_incomplete_or_broken_shared_schema() {
+        for mutation in [
+            "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+            "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+            "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;
+             ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+            "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;
+             CREATE VIEW project_mailbox_deliveries AS SELECT * FROM missing_delivery_source",
+        ] {
+            let conn = resource_delivery_fixture();
+            conn.execute_raw(mutation).unwrap();
+            assert!(
+                project_inbox_unread_counts_from_conn(&conn, 1).is_err(),
+                "{mutation}"
+            );
+            assert!(
+                project_mailbox_recipients_from_conn(&conn, 1, &[100]).is_err(),
+                "{mutation}"
+            );
+        }
     }
 
     fn receipt_fixture(test: impl FnOnce(&DbConn)) {
@@ -1628,6 +1900,15 @@ mod tests {
         assert_eq!(
             project_mailbox_delivery_from_conn(&*conn, 100).unwrap(),
             None
+        );
+        assert_eq!(
+            project_inbox_unread_counts_from_conn(&*conn, 1).unwrap(),
+            HashMap::from([(20, 1)])
+        );
+        assert!(
+            project_mailbox_recipients_from_conn(&*conn, 1, &[100])
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -1008,27 +1008,13 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
         mcp_agent_mail_db::queries::list_agent_roster(ctx.cx(), &pool, project_id).await,
     )?;
 
-    // Get unread counts for all agents in one query
+    // Direct and eligible shared deliveries must agree with each agent's inbox.
     let conn = acquire_resource_conn(ctx.cx(), &pool).await?;
-    let sql = "SELECT r.agent_id, COUNT(*) as unread \
-               FROM message_recipients r \
-               JOIN messages m ON m.id = r.message_id \
-               WHERE m.project_id = ? AND r.read_ts IS NULL \
-               GROUP BY r.agent_id";
-    let params = [mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)];
-    let start = mcp_agent_mail_db::query_timer();
-    let unread_rows = conn.query_sync(sql, &params);
-    mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
-    let unread_rows =
-        unread_rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
-
-    let mut unread_counts: std::collections::HashMap<i64, i64> =
-        std::collections::HashMap::with_capacity(agents.len());
-    for row in unread_rows {
-        let agent_id: i64 = row.get_named("agent_id").unwrap_or(0);
-        let count: i64 = row.get_named("unread").unwrap_or(0);
-        unread_counts.insert(agent_id, count);
-    }
+    let unread_counts = mcp_agent_mail_db::project_mailbox::project_inbox_unread_counts_from_conn(
+        &*conn, project_id,
+    )
+    .map_err(db_error_to_mcp_error)?;
+    drop(conn);
 
     let mut active_agents = Vec::new();
     let mut retired_agents = Vec::new();
@@ -3995,9 +3981,21 @@ async fn load_outbox_messages(
     mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
     let rows = rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
 
-    // Cap at 200 to limit the N+1 recipient queries per message.
-    // Each message triggers one recipient query, so 200 messages = 201 queries.
+    // Cap at 200 to bound per-message direct-recipient lookups;
+    // shared addresses are fetched once below.
     let capped_rows: Vec<_> = rows.into_iter().take(200).collect();
+    let message_ids: Vec<i64> = capped_rows
+        .iter()
+        .map(|row| row.get_as(0))
+        .collect::<Result<_, _>>()
+        .map_err(|error| resource_sync_db_error_to_mcp_error(error.to_string()))?;
+    let mut project_recipients =
+        mcp_agent_mail_db::project_mailbox::project_mailbox_recipients_from_conn(
+            &*conn,
+            options.project_id,
+            &message_ids,
+        )
+        .map_err(db_error_to_mcp_error)?;
     let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(capped_rows.len());
     for row in capped_rows {
         let id: i64 = row.get_as(0).unwrap_or(0);
@@ -4011,7 +4009,14 @@ async fn load_outbox_messages(
         mcp_agent_mail_db::record_query(recip_sql, mcp_agent_mail_db::elapsed_us(recip_start));
         let recip_rows =
             recip_rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
-        let (to_list, cc_list, bcc_list) = split_outbox_recipient_lists(recip_rows);
+        let (mut to_list, mut cc_list, bcc_list) = split_outbox_recipient_lists(recip_rows);
+        if let Some((address, kind)) = project_recipients.remove(&id) {
+            if kind == "cc" {
+                cc_list.push(address);
+            } else {
+                to_list.push(address);
+            }
+        }
         messages.push(outbox_message_from_row(
             &options, &row, to_list, cc_list, bcc_list,
         ));
@@ -6643,6 +6648,150 @@ mod resource_shape_tests {
             "last_active_ts": agents[0].get_named::<i64>("last_active_ts").unwrap(),
             "retired_at": agents[0].get_named::<Option<i64>>("retired_at").unwrap(),
         })
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shared_delivery_roster_and_outbox_resources_preserve_receipts_and_bcc() {
+        with_serialized_resources_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            || {
+                run_async(|cx| async move {
+                    let pool = seed_pool();
+                    let project = ensure_project(&cx, &pool, "/shared resource parity").await;
+                    let project_id = project.id.unwrap();
+                    let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let reader = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                    register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                    let hidden = register_agent(&cx, &pool, project_id, "DarkRose").await;
+                    let sender_id = sender.id.unwrap();
+                    let reader_id = reader.id.unwrap();
+                    let hidden_id = hidden.id.unwrap();
+                    let mut ids = Vec::new();
+                    for (subject, shared_kind, importance, recipients) in [
+                        ("Project to", "to", "normal", vec![]),
+                        (
+                            "Mixed cc",
+                            "cc",
+                            "urgent",
+                            vec![(reader_id, "to"), (hidden_id, "bcc")],
+                        ),
+                        ("Recent shared", "to", "normal", vec![]),
+                    ] {
+                        let message = queries::create_message_with_recipients_topic(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender_id,
+                            subject,
+                            "body",
+                            Some("resource-parity"),
+                            None,
+                            None,
+                            importance,
+                            true,
+                            "[]",
+                            &recipients,
+                            Some(shared_kind),
+                        )
+                        .await
+                        .into_result()
+                        .expect("shared delivery fixture");
+                        ids.push(message.id.unwrap());
+                    }
+                    for id in &ids[..2] {
+                        queries::mark_message_read(&cx, &pool, reader_id, *id)
+                            .await
+                            .into_result()
+                            .expect("reader's own receipt");
+                    }
+                    let before = inbox_read_only_witness(&cx, &pool, reader_id).await;
+                    let state = fastmcp_core::SessionState::new();
+                    let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                    crate::session_identity::bind(&ctx, project_id, sender_id, &sender.name);
+                    let mut router = fastmcp_server::Router::new();
+                    router.add_resource(AgentsListResource);
+                    router.add_resource(OutboxResource);
+                    let roster_response = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://agents/{}", project.slug),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("mounted agent roster with one connection");
+                    let roster_response = serde_json::to_value(roster_response).unwrap();
+                    let roster =
+                        parse_json(roster_response["contents"][0]["text"].as_str().unwrap());
+                    for (name, unread) in [
+                        ("BlueLake", 0),
+                        ("RedPeak", 1),
+                        ("GreenCastle", 3),
+                        ("DarkRose", 3),
+                    ] {
+                        let entry = roster["agents"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|entry| entry["name"] == name)
+                            .expect("registered agent");
+                        assert_eq!(entry["unread_count"], unread, "{name}");
+                    }
+                    let outbox_response = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://outbox/BlueLake?project={}", project.slug),
+                                meta: None,
+                            },
+                            state,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("mounted outbox with one connection");
+                    let outbox_response = serde_json::to_value(outbox_response).unwrap();
+                    let outbox_text = outbox_response["contents"][0]["text"].as_str().unwrap();
+                    let outbox = parse_json(outbox_text);
+                    let messages = outbox["messages"].as_array().unwrap();
+                    assert_eq!(messages.len(), 3);
+                    let address = format!("project:{}", project.slug);
+                    let to = messages
+                        .iter()
+                        .find(|message| message["id"] == ids[0])
+                        .unwrap();
+                    assert_eq!(to["to"], serde_json::json!([address]));
+                    assert_eq!(to["cc"], serde_json::json!([]));
+                    let cc = messages
+                        .iter()
+                        .find(|message| message["id"] == ids[1])
+                        .unwrap();
+                    assert_eq!(cc["to"], serde_json::json!(["RedPeak"]));
+                    assert_eq!(cc["cc"], serde_json::json!([address]));
+                    assert!(
+                        messages
+                            .iter()
+                            .all(|message| message["bcc"] == serde_json::json!([]))
+                    );
+                    assert!(!outbox_text.contains("DarkRose"));
+                    assert_eq!(inbox_read_only_witness(&cx, &pool, reader_id).await, before);
+                    let conn = acquire_resource_conn(&cx, &pool).await.unwrap();
+                    let direct = conn
+                        .query_sync("SELECT COUNT(*) AS n FROM message_recipients", &[])
+                        .unwrap();
+                    assert_eq!(
+                        direct[0].get_named::<i64>("n").unwrap(),
+                        2,
+                        "shared mail never fans out"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
