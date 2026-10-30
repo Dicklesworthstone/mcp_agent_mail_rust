@@ -56,6 +56,9 @@ glob.workspace = true
 walkdir.workspace = true
 sha2.workspace = true
 fs2.workspace = true
+# cleanup.rs tells a non-Git workspace from an unborn HEAD with libgit2; storage,
+# tools and guard already link it, so this adds no new native code to the binary.
+git2.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db", default-features = false }
 mcp-agent-mail-share = { path = "../mcp-agent-mail-share", default-features = false }
@@ -96,7 +99,6 @@ browser-dashboard = []
 # the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
-git2.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 ftui-harness.workspace = true
