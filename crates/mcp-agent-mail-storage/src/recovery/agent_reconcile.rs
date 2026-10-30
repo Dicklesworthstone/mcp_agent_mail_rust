@@ -6,6 +6,7 @@
 //! maintenance pass repairs those profiles without changing mailbox rows or
 //! relying on another registration, message, or client read.
 
+mod observation;
 mod retry;
 
 use std::collections::HashSet;
@@ -505,6 +506,34 @@ fn reconcile_agent(
     #[cfg(test)]
     let checkout = tests::observe_checkout_pending(checkout);
     let conn = outcome(block_on(checkout)).map_err(Failure::transient)?;
+    // Most roster entries already have their complete profile in Git. Do not
+    // make these read-only observations compete with unrelated publishers or
+    // rewrite the archive epoch merely to discover there is nothing to repair.
+    // This proof never authorizes publication: a failed observation is dropped
+    // before the ordinary guarded path rereads both source and archive below.
+    if let Some(observed) = observation::complete_profile(config, original) {
+        checkpoint(cx, stop)?;
+        #[cfg(test)]
+        tests::after_profile_observation(&conn);
+        let source = match read_source_connection(&conn, original.id) {
+            Ok(source) => source,
+            Err(error) => {
+                if error.transient {
+                    mcp_agent_mail_db::close_db_conn(
+                        conn.detach(),
+                        "failed agent archive observation source read",
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let complete = observed.matches_source(&source).unwrap_or(false)
+            && observed.still_complete().unwrap_or(false);
+        checkpoint(cx, stop)?;
+        if complete {
+            return Ok(false);
+        }
+    }
     // Profile recovery shares the archive-maintenance worker with messages
     // and release history. Never retain its source lease behind an unrelated
     // archive publisher, or bypass that publisher to restore a tombstone.
@@ -567,95 +596,38 @@ fn publish_profile(
     stop: &AtomicBool,
 ) -> crate::Result<bool> {
     checkpoint(cx, stop)?;
-    let root = crate::archive_project_root_checked(archive)?;
-    let name = source.profile["name"]
-        .as_str()
-        .ok_or_else(|| invalid("agent source lacks name"))?;
-    let profile_path = root.join("agents").join(name).join("profile.json");
-    let project_path = root.join("project.json");
-    let profile_rel = crate::rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
-    let project_rel = crate::rel_path_cached(&archive.canonical_repo_root, &project_path)?;
-    let repo_root = crate::archive_repo_root_checked(archive)?;
-    let repo = Repository::open(repo_root)?;
-    let tree = head_tree(&repo)?;
-    let working_profile = read_artifact(&profile_path)?;
-    let committed_profile = committed_artifact(&repo, tree.as_ref(), &profile_rel)?;
-    let working_project = read_artifact(&project_path)?;
-    let committed_project = committed_artifact(&repo, tree.as_ref(), &project_rel)?;
-    for artifact in [working_profile.as_ref(), committed_profile.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        validate_profile(source, &artifact.value)?;
-    }
-    for artifact in [working_project.as_ref(), committed_project.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        validate_project(source, &artifact.value)?;
-    }
-    let profile = merge_metadata(
-        committed_profile.as_ref(),
-        working_profile.as_ref(),
-        &source.profile,
-        true,
-    );
-    let project = merge_metadata(
-        committed_project.as_ref(),
-        working_project.as_ref(),
-        &json!({
-            "slug": source.project_slug, "human_key": source.project_key,
-        }),
-        false,
-    );
-    let profile_bytes = serialized_metadata(&profile)?;
-    let project_bytes = serialized_metadata(&project)?;
-    let targets = [
-        (
-            &profile_path,
-            &profile_rel,
-            &profile_bytes,
-            working_profile.as_ref(),
-            committed_profile.as_ref(),
-        ),
-        (
-            &project_path,
-            &project_rel,
-            &project_bytes,
-            working_project.as_ref(),
-            committed_project.as_ref(),
-        ),
-    ];
-    if targets.iter().all(|(_, _, bytes, working, committed)| {
-        working.is_some_and(|artifact| artifact.bytes == **bytes)
-            && committed.is_some_and(|artifact| artifact.bytes == **bytes)
-    }) {
+    let plan = observation::ProfilePlan::read(archive, source)?;
+    if plan.is_complete() {
         return Ok(false);
     }
     // All artifacts and source authority are validated before the first
     // replacement. Unrelated staged files never enter this explicit path set.
-    for (path, _, bytes, working, _) in &targets {
+    for target in &plan.targets {
         checkpoint(cx, stop)?;
-        if working.is_none_or(|artifact| artifact.bytes != **bytes) {
-            crate::ensure_parent_dir(path)?;
-            crate::atomic_write_bytes(path, bytes, true)?;
+        if target
+            .working
+            .as_ref()
+            .is_none_or(|artifact| artifact.bytes != target.bytes)
+        {
+            crate::ensure_parent_dir(&target.path)?;
+            crate::atomic_write_bytes(&target.path, &target.bytes, true)?;
         }
     }
     checkpoint(cx, stop)?;
     crate::commit_paths_with_retry(
-        repo_root,
+        &plan.repo_root,
         config,
-        &format!("repair: reconcile agent {name} profile"),
-        &[&profile_rel, &project_rel],
+        &format!("repair: reconcile agent {} profile", plan.name),
+        &[&plan.targets[0].relative, &plan.targets[1].relative],
     )?;
-    let verified = Repository::open(repo_root)?;
+    let verified = Repository::open(&plan.repo_root)?;
     let verified_tree =
         head_tree(&verified)?.ok_or_else(|| invalid("agent profile commit lacks HEAD"))?;
-    for (_, relative, bytes, _, _) in targets {
-        let entry = verified_tree.get_path(Path::new(relative))?;
+    for target in plan.targets {
+        let entry = verified_tree.get_path(Path::new(&target.relative))?;
         if entry.kind() != Some(ObjectType::Blob)
             || !matches!(entry.filemode(), 0o100644 | 0o100755)
-            || entry.id() != Oid::hash_object(ObjectType::Blob, bytes)?
+            || entry.id() != Oid::hash_object(ObjectType::Blob, &target.bytes)?
         {
             return Err(invalid(
                 "agent profile Git verification failed; files retained",
@@ -664,7 +636,7 @@ fn publish_profile(
         // A tree reference alone cannot prove that its object survived a
         // failed/corrupt object write. Verify the stored payload as well.
         let blob = verified.find_blob(entry.id())?;
-        if blob.content() != bytes.as_slice() {
+        if blob.content() != target.bytes.as_slice() {
             return Err(invalid(
                 "agent profile Git blob differs from repaired bytes; files retained",
             ));
@@ -696,6 +668,9 @@ fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
 /// read. Transient archive/source failures retain ID-only retry obligations
 /// with bounded backoff. Retry and roster work share the original batch budget;
 /// a full retry queue never discards debt or advances past unadmitted scan work.
+/// Already complete profiles use a bounded read-only source/working/HEAD proof
+/// without publication admission. This is a point-in-time observation, not an
+/// index-parity claim or authority to reuse a plan after any lock wait.
 /// Publication uses the native repair fence and bounded project-lock admission.
 /// Filesystem, SQL and Git operations after admission have no hard deadline.
 ///
@@ -821,11 +796,22 @@ pub fn reconcile_agent_batch(
 mod tests {
     use super::*;
 
+    type ProfileObservationHook = Box<dyn FnOnce(&DbConn)>;
+
     std::thread_local! {
         static CHECKOUT_PENDING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
             const { std::cell::RefCell::new(None) };
         static SOURCE_READ_PANIC: std::cell::Cell<Option<(i64, bool, usize)>> =
             const { std::cell::Cell::new(None) };
+        static PROFILE_OBSERVATION_AFTER_PREPARE: std::cell::RefCell<Option<ProfileObservationHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_profile_observation(conn: &DbConn) {
+        let hook = PROFILE_OBSERVATION_AFTER_PREPARE.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(conn);
+        }
     }
 
     // Inject an unwind only at a real source-read boundary. The query and
@@ -1665,6 +1651,300 @@ mod tests {
     #[test]
     fn busy_fence_cannot_initialize_a_missing_profile_archive() {
         exercise_busy_fence(false);
+    }
+
+    fn during_native_mutation<T>(config: &Config, observe: impl FnOnce() -> T) -> T {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = config.storage_root.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            // An actual mutation window keeps the native fence and active
+            // epoch owned throughout the observation. A global quiet-epoch
+            // shortcut would reproduce the incumbent's unnecessary deferral.
+            let _mutation = crate::ArchiveMutationGuard::begin_at(&root);
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10))
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = observe();
+        let still_owned = crate::archive_publication_fence_holder().is_some();
+        let _ = release_tx.send(());
+        assert!(
+            owner.join().unwrap().is_ok(),
+            "profile observation waited for publication ownership to expire"
+        );
+        assert!(
+            still_owned,
+            "observation must complete while the fence is held"
+        );
+        result
+    }
+
+    #[test]
+    fn complete_profile_advances_during_unrelated_publication_without_touching_staged_evidence() {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+
+        with_mailbox(|cx, pool, config, _| {
+            assert_eq!(reconcile(cx, pool, config).repaired, 1);
+            crate::flush_async_commits();
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let staged = config.storage_root.join("operator-evidence.txt");
+            fs::write(&staged, b"private staged evidence").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("operator-evidence.txt")).unwrap();
+            index.write().unwrap();
+            let index_before = fs::read(repo.path().join("index")).unwrap();
+            let profile_before = fs::read(profile_path(config)).unwrap();
+            let head_before = repo.head().unwrap().target();
+            // An ordinary activity flush is allowed by the same merge rules
+            // as guarded reconciliation and does not create new repair debt.
+            PROFILE_OBSERVATION_AFTER_PREPARE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|conn| {
+                    conn.execute_raw("UPDATE agents SET last_active_ts = 3000000 WHERE id = 101")
+                        .unwrap();
+                }));
+            });
+            let mut cursor = AgentReconcileCursor::default();
+            let report = during_native_mutation(config, || {
+                let epoch = crate::archive_mutation_epoch();
+                let active = crate::archive_mutations_active();
+                let token_path = repo.path().join(crate::ARCHIVE_EPOCH_FILE_NAME);
+                let token = fs::read(&token_path).unwrap();
+                let report =
+                    reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(crate::archive_mutation_epoch(), epoch);
+                assert_eq!(crate::archive_mutations_active(), active);
+                assert!(active > 0);
+                assert_eq!(fs::read(&token_path).unwrap(), token);
+                assert_eq!(repo.head().unwrap().target(), head_before);
+                assert_eq!(fs::read(profile_path(config)).unwrap(), profile_before);
+                assert_eq!(fs::read(repo.path().join("index")).unwrap(), index_before);
+                assert_eq!(active_writer_count(), 0);
+                let promotion = try_acquire_promotion_barrier_if_idle();
+                assert!(
+                    promotion.is_some(),
+                    "read-only progress retained a source lease"
+                );
+                drop(promotion);
+                report
+            });
+            assert_eq!(
+                (
+                    report.scanned,
+                    report.unchanged,
+                    report.repaired,
+                    report.deferred,
+                    report.retry_len
+                ),
+                (1, 1, 0, 0, 0)
+            );
+            assert_eq!((cursor.after, cursor.ceiling), (101, None));
+            assert_eq!(fs::read(staged).unwrap(), b"private staged evidence");
+            assert_profile_committed(config);
+        });
+    }
+
+    #[test]
+    fn complete_profile_observation_rejects_lifecycle_working_and_head_races() {
+        if isolate_admission_test() {
+            return;
+        }
+        // Mutations happen only at the real post-observation boundary. The
+        // DB, native fence, working files and Git objects remain real.
+        for race in 0..3 {
+            with_mailbox(|cx, pool, config, _| {
+                assert_eq!(reconcile(cx, pool, config).repaired, 1);
+                crate::flush_async_commits();
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let head = repo.head().unwrap().peel_to_commit().unwrap();
+                let head_id = head.id();
+                let previous_head = head.parent_id(0).unwrap();
+                let path = profile_path(config);
+                let root = config.storage_root.clone();
+                let before = fs::read(&path).unwrap();
+                let mut changed: Value = serde_json::from_slice(&before).unwrap();
+                changed["extension"] = json!("retain concurrent working evidence");
+                let changed_bytes = serde_json::to_vec_pretty(&changed).unwrap();
+                let hook_bytes = changed_bytes.clone();
+                let hook_path = path.clone();
+                PROFILE_OBSERVATION_AFTER_PREPARE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |conn| match race {
+                        0 => {
+                            conn.execute_raw(
+                                "UPDATE agents SET retired_at = 123456789 WHERE id = 101",
+                            )
+                            .unwrap();
+                        }
+                        1 => fs::write(&hook_path, &hook_bytes).unwrap(),
+                        2 => Repository::open(&root)
+                            .unwrap()
+                            .set_head_detached(previous_head)
+                            .unwrap(),
+                        _ => unreachable!(),
+                    }));
+                });
+                let mut cursor = AgentReconcileCursor::default();
+                let report = during_native_mutation(config, || {
+                    let epoch = crate::archive_mutation_epoch();
+                    let report = reconcile_agent_batch(
+                        cx,
+                        pool,
+                        config,
+                        &mut cursor,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    assert_eq!(crate::archive_mutation_epoch(), epoch);
+                    report
+                });
+                assert_eq!(
+                    (
+                        report.scanned,
+                        report.unchanged,
+                        report.repaired,
+                        report.deferred_transient,
+                        report.retry_len
+                    ),
+                    (1, 0, 0, 1, 1),
+                    "race {race}: {report:?}"
+                );
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    if race == 1 { changed_bytes } else { before },
+                    "a refused optimistic observation must not replace evidence"
+                );
+                if race == 2 {
+                    // Keep the deliberate HEAD change's evidence, then restore
+                    // the original committed generation for guarded retry.
+                    repo.set_head_detached(head_id).unwrap();
+                }
+                let resumed =
+                    reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!((resumed.deferred, resumed.retry_len), (0, 0));
+                assert_eq!(resumed.repaired, usize::from(race != 2));
+                let profile = assert_profile_committed(config);
+                if race == 0 {
+                    assert_eq!(profile["retired_at"], timestamp(123_456_789).unwrap());
+                } else if race == 1 {
+                    assert_eq!(profile["extension"], "retain concurrent working evidence");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn changed_complete_observation_rebuilds_source_and_extension_plan_in_the_same_call() {
+        with_mailbox(|cx, pool, config, _| {
+            assert_eq!(reconcile(cx, pool, config).repaired, 1);
+            crate::flush_async_commits();
+            let path = profile_path(config);
+            let mut changed = assert_profile_committed(config);
+            changed["extension"] = json!("retain new working extension");
+            let changed_bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            PROFILE_OBSERVATION_AFTER_PREPARE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |conn| {
+                    conn.execute_raw("UPDATE agents SET retired_at = 123456789 WHERE id = 101")
+                        .unwrap();
+                    fs::write(&path, &changed_bytes).unwrap();
+                }));
+            });
+            let report = reconcile(cx, pool, config);
+            assert_eq!(
+                (
+                    report.unchanged,
+                    report.repaired,
+                    report.deferred,
+                    report.retry_len
+                ),
+                (0, 1, 0, 0)
+            );
+            let profile = assert_profile_committed(config);
+            assert_eq!(profile["retired_at"], timestamp(123_456_789).unwrap());
+            assert_eq!(profile["extension"], "retain new working extension");
+        });
+    }
+
+    #[test]
+    fn unrelated_head_publication_does_not_invalidate_complete_managed_profiles() {
+        with_mailbox(|cx, pool, config, _| {
+            assert_eq!(reconcile(cx, pool, config).repaired, 1);
+            crate::flush_async_commits();
+            let before = fs::read(profile_path(config)).unwrap();
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let head_before = repo.head().unwrap().target();
+            let other_config = config.clone();
+            PROFILE_OBSERVATION_AFTER_PREPARE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |_| {
+                    let path = other_config.storage_root.join("unrelated-publication.json");
+                    crate::atomic_write_bytes(&path, b"{\"other\":true}", true).unwrap();
+                    crate::commit_paths_with_retry(
+                        &other_config.storage_root,
+                        &other_config,
+                        "test: unrelated publication during profile observation",
+                        &["unrelated-publication.json"],
+                    )
+                    .unwrap();
+                }));
+            });
+            let report = reconcile(cx, pool, config);
+            assert_eq!(
+                (
+                    report.unchanged,
+                    report.repaired,
+                    report.deferred,
+                    report.retry_len
+                ),
+                (1, 0, 0, 0)
+            );
+            assert_ne!(repo.head().unwrap().target(), head_before);
+            assert_eq!(fs::read(profile_path(config)).unwrap(), before);
+            assert_profile_committed(config);
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            let entry = tree
+                .get_path(Path::new("unrelated-publication.json"))
+                .unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                b"{\"other\":true}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_profile_observation_rejects_project_root_replaced_with_a_symlink() {
+        with_mailbox(|cx, pool, config, scratch| {
+            assert_eq!(reconcile(cx, pool, config).repaired, 1);
+            crate::flush_async_commits();
+            let root = config.storage_root.join("projects/project");
+            let retained = scratch.join("retained-project-root");
+            let before = fs::read(profile_path(config)).unwrap();
+            let hook_root = root.clone();
+            let hook_retained = retained.clone();
+            PROFILE_OBSERVATION_AFTER_PREPARE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |_| {
+                    fs::rename(&hook_root, &hook_retained).unwrap();
+                    std::os::unix::fs::symlink(&hook_retained, &hook_root).unwrap();
+                }));
+            });
+            let report = during_native_mutation(config, || reconcile(cx, pool, config));
+            assert_eq!(
+                (report.unchanged, report.repaired, report.deferred),
+                (0, 0, 1)
+            );
+            assert_eq!(
+                fs::read(retained.join("agents/BlueLake/profile.json")).unwrap(),
+                before
+            );
+            assert!(fs::symlink_metadata(root).unwrap().file_type().is_symlink());
+        });
     }
 
     #[test]
