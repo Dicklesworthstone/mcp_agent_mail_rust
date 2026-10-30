@@ -2,6 +2,11 @@
 //!
 //! Uses `sqlmodel_pool` for efficient connection management.
 
+#[path = "pool/sqlite_init_gate.rs"]
+mod sqlite_init_gate;
+
+use sqlite_init_gate::{SqliteInitGate, SqliteInitGateClaim, SqliteInitGateCompletion};
+
 use crate::DbConn;
 use crate::error::{DbError, DbResult, is_lock_error};
 use crate::integrity;
@@ -32,7 +37,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone)]
@@ -4240,10 +4245,21 @@ impl DbPool {
                         // every other acquire bounds its wait so a wedged or
                         // slow initialization surfaces as an attributed,
                         // retryable error instead of parking this dispatch
-                        // thread forever.
-                        match init_gate.claim_or_wait(SQLITE_INIT_GATE_WAIT_BUDGET) {
-                            SqliteInitGateClaim::Ready => {}
-                            SqliteInitGateClaim::TimedOut => {
+                        // thread forever. A cancelled waiter must also return
+                        // its reserved pool slot while the initializer remains
+                        // active, without resetting that owner's gate.
+                        match init_gate.claim_or_wait_with(SQLITE_INIT_GATE_WAIT_BUDGET, || {
+                            cx2.checkpoint().map_err(|_| {
+                                cx2.cancel_reason().unwrap_or_else(|| {
+                                    asupersync::CancelReason::user(
+                                        "pooled connection initialization wait cancelled",
+                                    )
+                                })
+                            })
+                        }) {
+                            Err(reason) => return Outcome::Cancelled(reason),
+                            Ok(SqliteInitGateClaim::Ready) => {}
+                            Ok(SqliteInitGateClaim::TimedOut) => {
                                 return Outcome::Err(SqlError::Custom(format!(
                                     "database initialization still in progress after {}s; \
                                      the mailbox is warming up or its archive reconcile is \
@@ -4251,7 +4267,7 @@ impl DbPool {
                                     SQLITE_INIT_GATE_WAIT_BUDGET.as_secs()
                                 )));
                             }
-                            SqliteInitGateClaim::Initialize => {
+                            Ok(SqliteInitGateClaim::Initialize) => {
                                 let mut completion = SqliteInitGateCompletion {
                                     gate: &init_gate,
                                     success: false,
@@ -7654,117 +7670,6 @@ fn sqlite_init_gate_key(
 /// [`DbError::ResourceBusy`]. Tied to [`DEFAULT_POOL_TIMEOUT_MS`] so the
 /// bound matches the pool's own acquire budget.
 const SQLITE_INIT_GATE_WAIT_BUDGET: Duration = Duration::from_millis(DEFAULT_POOL_TIMEOUT_MS);
-
-/// Outcome of [`SqliteInitGate::claim_or_wait`].
-enum SqliteInitGateClaim {
-    /// The caller won the initializer role and MUST run initialization, then
-    /// call [`SqliteInitGate::complete`] (or rely on
-    /// [`SqliteInitGateCompletion`]'s drop guard).
-    Initialize,
-    /// Initialization already completed successfully.
-    Ready,
-    /// Another task is still initializing and the wait budget elapsed.
-    TimedOut,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SqliteInitGateState {
-    NotStarted,
-    Running,
-    Done,
-}
-
-/// One-time DB init gate with BOUNDED waiting (GH#245 stall hunt, finding F1).
-///
-/// The previous shape was an `asupersync` `OnceCell<()>`: cancellation-correct,
-/// but every non-initializing caller awaited it with no deadline. When the
-/// initializer wedged (archive reconcile behind the storage publication fence,
-/// a slow migration, a filesystem stall), every DB-needing tool call parked
-/// forever in that await — dispatch threads in `futex_do_wait`, process idle,
-/// every request reported as an unattributed 30s timeout: the GH#245 outage
-/// shape. Now only the initializer runs unboundedly; waiters bound their wait
-/// with [`SQLITE_INIT_GATE_WAIT_BUDGET`] and surface a retryable, ATTRIBUTED
-/// error instead. std sync primitives on purpose: this path runs under
-/// `block_on` on dedicated dispatch threads and must not depend on async
-/// timers (GH#203).
-struct SqliteInitGate {
-    state: Mutex<SqliteInitGateState>,
-    cv: Condvar,
-}
-
-impl SqliteInitGate {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(SqliteInitGateState::NotStarted),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// Claim the initializer role, or wait (bounded) for the current one.
-    ///
-    /// Failure semantics mirror the old `OnceCell::get_or_try_init`: a failed
-    /// or cancelled initialization resets to `NotStarted` (via
-    /// [`Self::complete`]) so a later caller retries it.
-    fn claim_or_wait(&self, budget: Duration) -> SqliteInitGateClaim {
-        let deadline = Instant::now() + budget;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            match *state {
-                SqliteInitGateState::Done => return SqliteInitGateClaim::Ready,
-                SqliteInitGateState::NotStarted => {
-                    *state = SqliteInitGateState::Running;
-                    return SqliteInitGateClaim::Initialize;
-                }
-                SqliteInitGateState::Running => {
-                    let now = Instant::now();
-                    let Some(remaining) = deadline.checked_duration_since(now) else {
-                        return SqliteInitGateClaim::TimedOut;
-                    };
-                    if remaining.is_zero() {
-                        return SqliteInitGateClaim::TimedOut;
-                    }
-                    let (guard, _) = self
-                        .cv
-                        .wait_timeout(state, remaining)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    state = guard;
-                }
-            }
-        }
-    }
-
-    /// Publish the initializer's outcome and wake every bounded waiter.
-    fn complete(&self, success: bool) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = if success {
-            SqliteInitGateState::Done
-        } else {
-            SqliteInitGateState::NotStarted
-        };
-        drop(state);
-        self.cv.notify_all();
-    }
-}
-
-/// Drop guard so the gate can never be stranded in `Running` — an initializer
-/// that unwinds (or forgets to report) resets the gate to retryable instead of
-/// condemning every future waiter to bounded timeouts with no retry.
-struct SqliteInitGateCompletion<'a> {
-    gate: &'a SqliteInitGate,
-    success: bool,
-}
-
-impl Drop for SqliteInitGateCompletion<'_> {
-    fn drop(&mut self) {
-        self.gate.complete(self.success);
-    }
-}
 
 fn sqlite_init_gate(
     sqlite_identity: Option<&Path>,
@@ -24127,81 +24032,8 @@ mod tests {
         );
     }
 
-    /// GH#245 / F1: waiters on one-time DB init are BOUNDED; only the
-    /// initializer runs unboundedly, and failure/unwind resets the gate so
-    /// initialization is retryable.
     #[test]
-    fn sqlite_init_gate_bounds_waiters_and_resets_on_failure() {
-        let gate = SqliteInitGate::new();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_millis(10)),
-            SqliteInitGateClaim::Initialize
-        ));
-
-        // While Running, another caller times out instead of parking forever.
-        let start = Instant::now();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_millis(50)),
-            SqliteInitGateClaim::TimedOut
-        ));
-        assert!(start.elapsed() >= Duration::from_millis(45));
-
-        // Failure resets to NotStarted: the next caller retries init.
-        gate.complete(false);
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_millis(10)),
-            SqliteInitGateClaim::Initialize
-        ));
-
-        // Success publishes Done: everyone proceeds instantly.
-        gate.complete(true);
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Ready
-        ));
-    }
-
-    #[test]
-    fn sqlite_init_gate_completion_guard_resets_on_unwind_path() {
-        let gate = SqliteInitGate::new();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Initialize
-        ));
-        // Dropping the guard without marking success (what an unwinding
-        // initializer does) must reset the gate to retryable.
-        drop(SqliteInitGateCompletion {
-            gate: &gate,
-            success: false,
-        });
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Initialize
-        ));
-    }
-
-    #[test]
-    fn sqlite_init_gate_wakes_waiters_when_initializer_completes() {
-        let gate = Arc::new(SqliteInitGate::new());
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Initialize
-        ));
-        let signaller = Arc::clone(&gate);
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            signaller.complete(true);
-        });
-        let start = Instant::now();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_secs(5)),
-            SqliteInitGateClaim::Ready
-        ));
-        assert!(
-            start.elapsed() < Duration::from_secs(4),
-            "waiter must wake on completion, not run out its full budget"
-        );
-        handle.join().expect("signaller thread");
+    fn pool_recycle_and_capacity_defaults() {
         assert_eq!(
             DEFAULT_POOL_RECYCLE_MS,
             30 * 60 * 1000,
@@ -24212,6 +24044,92 @@ mod tests {
         assert_eq!(cfg.min_connections, 25);
         assert_eq!(cfg.max_connections, 100); // 25 + 75
         assert_eq!(cfg.max_lifetime_ms, 1_800_000); // 30 min in ms
+    }
+
+    #[test]
+    fn cancelled_lazy_initializer_wait_returns_its_pool_slot_before_owner_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cancelled-init.sqlite3");
+        let storage = temp.path().join("archive");
+        std::fs::create_dir_all(&storage).unwrap();
+        let config = DbPoolConfig {
+            database_url: sqlite_url_from_path(&database),
+            storage_root: Some(storage),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+        let gate = sqlite_init_gate(pool.sqlite_identity.as_deref(), &pool.storage_root);
+        assert!(matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::Initialize
+        ));
+        let owner = SqliteInitGateCompletion {
+            gate: &gate,
+            success: false,
+        };
+        let cx = Cx::for_testing();
+        let waiter_cx = cx.clone();
+        let waiter_pool = pool.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(waiter_pool.acquire(&waiter_cx)).map(drop);
+            done_tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.waiter_count() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let parked = gate.waiter_count() != 0;
+        let reserved = pool.pool.stats();
+        cx.set_cancel_requested(true);
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let released = pool.pool.stats();
+        let owner_retained = matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::TimedOut
+        );
+        let database_unopened = !database.exists();
+        // Even an uncancellable implementation is released and reaped before
+        // a timeout assertion, so this regression never leaves a parked worker.
+        drop(owner);
+        waiter.join().expect("initialization waiter");
+        assert!(parked, "checkout did not reach the actual initializer gate");
+        assert_eq!(reserved.total_connections, 1);
+        assert_eq!(reserved.active_connections, 1);
+        assert!(matches!(
+            completed.expect("cancelled waiter retained its pool slot"),
+            Outcome::Cancelled(_)
+        ));
+        assert_eq!(released.total_connections, 0);
+        assert_eq!(released.active_connections, 0);
+        assert_eq!(released.pending_requests, 0);
+        assert!(
+            owner_retained,
+            "the waiter released the foreign initializer"
+        );
+        assert!(
+            database_unopened,
+            "the cancelled waiter opened the database"
+        );
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let conn = pool
+                .acquire(&Cx::for_testing())
+                .await
+                .into_result()
+                .expect("a fresh caller can initialize and use the returned slot");
+            let rows = conn.query_sync("SELECT 1 AS value", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 1);
+        });
     }
 
     /// GH#245 regression guard: the default pool acquire timeout must stay

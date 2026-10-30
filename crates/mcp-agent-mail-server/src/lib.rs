@@ -6767,7 +6767,13 @@ fn record_atc_operator_execution(
 }
 
 fn atc_status_consumes_cooldown(status: &str) -> bool {
-    !status.starts_with("failed:") && status != "suppressed:missing_project_precondition"
+    !status.starts_with("failed:")
+        && !matches!(
+            status,
+            "suppressed:missing_project_precondition"
+                | "suppressed:agent_capacity"
+                | "suppressed:agent_coverage_unavailable"
+        )
 }
 
 const ATC_QUEUE_BACKPRESSURE_STATUS: &str = "throttled:pending_queue_capacity";
@@ -8360,6 +8366,13 @@ fn execute_atc_effect(
                 let Some(project_key) = effect.project_key.as_deref() else {
                     return "suppressed:missing_project_precondition".to_string();
                 };
+                // A queued proposal may predate a capacity refusal. Recheck at
+                // execution admission, outside hydration/delivery locks, and
+                // release the engine lock before entering the reservation tool.
+                // A refusal after this boundary does not cancel admitted work.
+                if let Err(reason) = atc::atc_release_capacity_admission() {
+                    return format!("suppressed:{reason}");
+                }
                 let Some(runtime) = runtime else {
                     return "failed:executor_unavailable".to_string();
                 };
@@ -23207,6 +23220,79 @@ first body
     }
 
     #[test]
+    fn queued_atc_release_rechecks_capacity_before_dispatch() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_POPULATION_LIMIT", "1")],
+            || {
+                atc::reset_global_atc_state_for_test(&config);
+                atc::atc_register_agent("AlphaAgent", "claude-code");
+                let mut effect = sample_probe_effect();
+                effect.kind = "release_reservations_requested".to_string();
+                effect.category = "liveness".to_string();
+                effect.semantics = sample_effect_semantics(
+                    "reservation_release",
+                    "AlphaAgent",
+                    effect.project_key.as_deref(),
+                );
+                let mut ensured_projects = AtcExecutorProjectCache::default();
+                assert_eq!(
+                    execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect,),
+                    "failed:executor_unavailable",
+                    "a full engine with complete coverage still admits release execution"
+                );
+
+                // The stored effect is unchanged; coverage becomes incomplete
+                // while it waits for the executor, without another planning tick.
+                atc::atc_register_agent("BeyondCapacity", "codex-cli");
+                let mut cooldowns = AtcOperatorCooldowns::new(i64::MAX, 4);
+                let status = cooldowns.execute(
+                    &effect.semantics.cooldown_key,
+                    &effect.semantics.family,
+                    effect.semantics.cooldown_micros,
+                    effect.timestamp_micros,
+                    || {
+                        execute_atc_effect(
+                            None,
+                            AtcExecutorMode::Live,
+                            &mut ensured_projects,
+                            &effect,
+                        )
+                    },
+                );
+                assert_eq!(status, "suppressed:agent_capacity");
+                assert!(cooldowns.last_action_by_key.is_empty());
+                assert!(ensured_projects.projects.is_empty());
+                let capture = atc_execution_capture(&status);
+                assert_eq!(capture.state, ExperienceState::Suppressed);
+                assert_eq!(capture.classification, "policy_suppression");
+                assert!(matches!(
+                    capture.non_execution_reason,
+                    Some(NonExecutionReason::SafetyGate { ref gate_name, .. })
+                        if gate_name == "agent_capacity"
+                ));
+                for (mode, expected) in [
+                    (AtcExecutorMode::Shadow, "suppressed:executor_mode_shadow"),
+                    (AtcExecutorMode::DryRun, "suppressed:executor_mode_dry_run"),
+                    (
+                        AtcExecutorMode::Canary,
+                        "suppressed:executor_mode_canary_release",
+                    ),
+                ] {
+                    assert_eq!(
+                        execute_atc_effect(None, mode, &mut ensured_projects, &effect),
+                        expected
+                    );
+                }
+            },
+        );
+        atc::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
     fn resolution_anchor_prefers_execution_timestamp() {
         let experience = sample_resolution_experience(
             1_700_000_000_000_000,
@@ -23468,6 +23554,15 @@ first body
         assert!(!atc_status_consumes_cooldown(
             "suppressed:missing_project_precondition"
         ));
+        for status in [
+            "suppressed:agent_capacity",
+            "suppressed:agent_coverage_unavailable",
+        ] {
+            assert!(!atc_status_consumes_cooldown(status));
+            let capture = atc_execution_capture(status);
+            assert_eq!(capture.state, ExperienceState::Suppressed);
+            assert_eq!(capture.classification, "policy_suppression");
+        }
     }
 
     #[test]

@@ -47,7 +47,7 @@ fn reject_ancestor_entries(
             // Prefix lookup returns the first stage of an exact name before
             // any descendants. Compare raw bytes so sparse trailing slashes
             // are not normalized away by platform Path conversion.
-            if entry.path == name.as_bytes() {
+            if &entry.path[..] == name.as_bytes() {
                 return Err(invalid(
                     "staged entry obstructs the canonical namespace; repair refused",
                 ));
