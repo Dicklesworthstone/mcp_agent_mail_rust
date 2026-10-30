@@ -472,7 +472,7 @@ const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 const WBQ_FLUSH_BUDGET_SECS: u64 = 30;
 /// Budget for delivering the Shutdown message at `wbq_shutdown`. Short and
 /// separate from the flush budget: if the channel is still full after the
-/// flush phase, the thread is wedged and we detach instead of hanging.
+/// flush phase, retain the worker for later reaping instead of hanging.
 const WBQ_SHUTDOWN_SEND_BUDGET_SECS: u64 = 5;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
@@ -1420,7 +1420,7 @@ fn wbq_try_send_counted(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
     msg: WbqMsg,
-    lifecycle: Option<&Mutex<()>>,
+    queue: Option<&WriteBehindQueue>,
 ) -> std::result::Result<(), std::sync::mpsc::TrySendError<WbqMsg>> {
     // Restart/shutdown own this mutex while replacing the receiver and its
     // counters. Serialize only this nonblocking admission attempt: a reserve
@@ -1428,7 +1428,7 @@ fn wbq_try_send_counted(
     // and no accepted op may arrive after the salvage pass has finished.
     // Contention shares the bounded channel-full retry path; neither shutdown
     // nor another producer can extend admission by holding us in a mutex wait.
-    let _admission = match lifecycle.map(Mutex::try_lock) {
+    let _admission = match queue.map(|wbq| wbq.lifecycle.try_lock()) {
         Some(Ok(guard)) => Some(guard),
         Some(Err(std::sync::TryLockError::Poisoned(error))) => Some(error.into_inner()),
         Some(Err(std::sync::TryLockError::WouldBlock)) => {
@@ -1436,6 +1436,17 @@ fn wbq_try_send_counted(
         }
         None => None,
     };
+    // A producer may have captured this sender before shutdown acquired the
+    // lifecycle gate. Retired workers retain their receiver until they exit;
+    // do not acknowledge new work into that channel after admission closes.
+    if queue.is_some_and(|wbq| {
+        wbq.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }) {
+        return Err(std::sync::mpsc::TrySendError::Disconnected(msg));
+    }
     // Account for the op BEFORE the receiver can observe it. Incrementing
     // after try_send lets a fast drain subtract from zero; saturating counters
     // then strand a phantom queued op and eventually report a false stall.
@@ -1489,7 +1500,7 @@ fn wbq_enqueue_with_sender_admission(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
     op: WriteOp,
-    lifecycle: Option<&Mutex<()>>,
+    queue: Option<&WriteBehindQueue>,
 ) -> WbqEnqueueResult {
     let envelope = WbqOpEnvelope {
         enqueued_at: Instant::now(),
@@ -1497,7 +1508,7 @@ fn wbq_enqueue_with_sender_admission(
     };
 
     let msg = WbqMsg::Op(envelope);
-    match wbq_try_send_counted(sender, op_depth, msg, lifecycle) {
+    match wbq_try_send_counted(sender, op_depth, msg, queue) {
         Ok(()) => WbqEnqueueResult::Enqueued,
         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => WbqEnqueueResult::QueueUnavailable,
         Err(std::sync::mpsc::TrySendError::Full(msg)) => {
@@ -1515,7 +1526,7 @@ fn wbq_enqueue_with_sender_admission(
             let mut backoff = Duration::from_millis(1);
             let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
             loop {
-                match wbq_try_send_counted(sender, op_depth, cur, lifecycle) {
+                match wbq_try_send_counted(sender, op_depth, cur, queue) {
                     Ok(()) => break WbqEnqueueResult::Enqueued,
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                         break WbqEnqueueResult::QueueUnavailable;
@@ -1568,7 +1579,7 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
     let Some(sender) = wbq_sender_for_enqueue(wbq) else {
         return WbqEnqueueResult::QueueUnavailable;
     };
-    wbq_enqueue_with_sender_admission(&sender, wbq.op_depth.as_ref(), op, Some(&wbq.lifecycle))
+    wbq_enqueue_with_sender_admission(&sender, wbq.op_depth.as_ref(), op, Some(wbq))
 }
 
 /// Execute a write op synchronously on the caller thread.
@@ -3076,82 +3087,107 @@ pub fn wbq_flush() {
 /// its loop.  Without this, the thread would block on `recv_timeout`
 /// indefinitely because the sender lives in a `OnceLock` static and is
 /// never dropped.
+/// An unfinished worker remains registered after an unsuccessful shutdown;
+/// startup can reap it and salvage its channel only after it actually exits.
 pub fn wbq_shutdown() {
     if let Some(wbq) = WBQ.get() {
-        let _lifecycle = wbq
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Join only when the drain thread demonstrably keeps consuming (flush
-        // acknowledged and Shutdown delivered) or is already gone. A wedged
-        // thread with a full channel must not hang shutdown forever (br-lrrry).
-        let mut safe_to_join = true;
-        if let Some(sender) = wbq_sender_clone(wbq) {
-            let deadline = Instant::now() + Duration::from_secs(WBQ_FLUSH_BUDGET_SECS);
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-            match wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline) {
-                Ok(()) => {
-                    match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                        Ok(()) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            tracing::warn!(
-                                "wbq_shutdown: flush timed out after {WBQ_FLUSH_BUDGET_SECS}s; \
-                                 drain thread may be stuck"
-                            );
-                            safe_to_join = false;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            tracing::warn!("wbq_shutdown: drain thread channel disconnected");
-                        }
+        wbq_shutdown_inner(
+            wbq,
+            Duration::from_secs(WBQ_FLUSH_BUDGET_SECS),
+            Duration::from_secs(WBQ_SHUTDOWN_SEND_BUDGET_SECS),
+        );
+    }
+}
+
+fn wbq_shutdown_inner(
+    wbq: &WriteBehindQueue,
+    flush_budget: Duration,
+    shutdown_send_budget: Duration,
+) {
+    let _lifecycle = wbq
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Join only when the drain thread demonstrably keeps consuming (flush
+    // acknowledged and Shutdown delivered) or is already gone. A wedged
+    // thread with a full channel must not hang shutdown forever (br-lrrry).
+    // In particular, a second shutdown with no sender must not join a
+    // still-running worker retained by an earlier timeout.
+    let mut flush_acked = false;
+    let mut shutdown_delivered = false;
+    if let Some(sender) = wbq_sender_clone(wbq) {
+        let deadline = Instant::now() + flush_budget;
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        match wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline) {
+            Ok(()) => {
+                match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(()) => flush_acked = true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        tracing::warn!(
+                            "wbq_shutdown: flush timed out after {flush_budget:?}; \
+                             drain thread may be stuck"
+                        );
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::warn!("wbq_shutdown: drain thread channel disconnected");
                     }
                 }
-                Err(WbqControlSendError::TimedOut) => {
-                    tracing::warn!(
-                        "wbq_shutdown: could not deliver flush request within \
-                         {WBQ_FLUSH_BUDGET_SECS}s (channel full); drain thread may be stuck"
-                    );
-                    safe_to_join = false;
-                }
-                Err(WbqControlSendError::Disconnected) => {}
             }
-            // Tell the drain thread to exit, bounded for the same reason.
-            match wbq_send_control_with_deadline(
-                &sender,
-                WbqMsg::Shutdown,
-                Instant::now() + Duration::from_secs(WBQ_SHUTDOWN_SEND_BUDGET_SECS),
-            ) {
-                Ok(()) => {}
-                Err(WbqControlSendError::TimedOut) => {
-                    tracing::warn!(
-                        "wbq_shutdown: could not deliver Shutdown within \
-                         {WBQ_SHUTDOWN_SEND_BUDGET_SECS}s (channel full); detaching drain \
-                         thread without join"
-                    );
-                    safe_to_join = false;
-                }
-                Err(WbqControlSendError::Disconnected) => {}
-            }
-        }
-        // Dropping the stored sender (and our clone above, at scope end) lets
-        // the channel disconnect once in-flight clones die, which is a second
-        // exit path for the drain loop even if Shutdown was never delivered.
-        *wbq.sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let handle = {
-            let mut guard = wbq.drain_handle.lock();
-            guard.take()
-        };
-        if let Some(h) = handle {
-            if safe_to_join || h.is_finished() {
-                let _ = h.join();
-            } else {
+            Err(WbqControlSendError::TimedOut) => {
                 tracing::warn!(
-                    "wbq_shutdown: detaching wedged drain thread; ops it still holds will be \
-                     salvaged if the queue is restarted"
+                    "wbq_shutdown: could not deliver flush request within \
+                     {flush_budget:?} (channel full); drain thread may be stuck"
                 );
             }
+            Err(WbqControlSendError::Disconnected) => {}
         }
+        // Tell the drain thread to exit, bounded for the same reason.
+        match wbq_send_control_with_deadline(
+            &sender,
+            WbqMsg::Shutdown,
+            Instant::now() + shutdown_send_budget,
+        ) {
+            Ok(()) => shutdown_delivered = true,
+            Err(WbqControlSendError::TimedOut) => {
+                tracing::warn!(
+                    "wbq_shutdown: could not deliver Shutdown within \
+                     {shutdown_send_budget:?} (channel full); retaining drain \
+                     thread for later reaping"
+                );
+            }
+            Err(WbqControlSendError::Disconnected) => {}
+        }
+    }
+    // Dropping the stored sender (and our clone above, at scope end) lets
+    // the channel disconnect once in-flight clones die, which is a second
+    // exit path for the drain loop even if Shutdown was never delivered.
+    *wbq.sender
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let safe_to_join = flush_acked && shutdown_delivered;
+    let (handle, retained) = {
+        let mut guard = wbq.drain_handle.lock();
+        if safe_to_join
+            || guard
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            (guard.take(), false)
+        } else {
+            (None, guard.is_some())
+        }
+    };
+    if let Some(h) = handle {
+        let _ = h.join();
+    }
+    if retained {
+        // The worker still reads the shared receiver slot between batches.
+        // Losing its identity would let startup replace that slot beneath
+        // it and run two drain generations against one queue and counters.
+        tracing::warn!(
+            "wbq_shutdown: retaining unfinished drain thread; queue restart remains \
+             unavailable until it exits"
+        );
     }
 }
 
@@ -25394,7 +25430,7 @@ mod tests {
                 &producer_sender,
                 producer_wbq.op_depth.as_ref(),
                 admitted_op,
-                Some(&producer_wbq.lifecycle),
+                Some(&producer_wbq),
             )
         });
         reserved_rx
@@ -25433,7 +25469,7 @@ mod tests {
                 &old_sender,
                 wbq.op_depth.as_ref(),
                 signal_op("BronzeHare"),
-                Some(&wbq.lifecycle),
+                Some(&wbq),
             ),
             WbqEnqueueResult::Enqueued
         );
@@ -25468,7 +25504,7 @@ mod tests {
                 &old_sender,
                 wbq.op_depth.as_ref(),
                 signal_op("CobaltRobin"),
-                Some(&wbq.lifecycle),
+                Some(&wbq),
             ),
             WbqEnqueueResult::QueueUnavailable,
             "an old sender cannot publish behind the completed salvage pass"
@@ -25493,7 +25529,7 @@ mod tests {
                 &old_sender,
                 wbq.op_depth.as_ref(),
                 signal_op("SilverFox"),
-                Some(&wbq.lifecycle),
+                Some(&wbq),
             ),
             WbqEnqueueResult::QueueUnavailable
         );
@@ -25628,6 +25664,229 @@ mod tests {
             assert_eq!(wbq_stats().drained, prior_enqueued + 1);
         }
         wbq_shutdown();
+        println!("{COMPLETED}");
+    }
+
+    #[test]
+    fn wbq_timed_out_shutdown_retains_worker_until_restart_is_safe() {
+        const CHILD: &str = "AM_TEST_WBQ_RETIRED_WORKER";
+        const COMPLETED: &str = "WBQ retired worker ownership verified";
+        let Ok(scenario) = std::env::var(CHILD) else {
+            for scenario in ["flush_timeout", "delivery_timeout"] {
+                let isolated = TempDir::new().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::wbq_timed_out_shutdown_retains_worker_until_restart_is_safe",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, scenario)
+                    .env("STORAGE_ROOT", isolated.path())
+                    .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                    .output()
+                    .expect("isolated WBQ worker retirement");
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            }
+            return;
+        };
+
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(20));
+            eprintln!("WBQ worker retirement watchdog expired");
+            std::process::exit(1);
+        });
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "worker-retirement".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/worker-retirement/agents/{agent}.signal"))
+        };
+        let wbq = WBQ.get_or_init(new_write_behind_queue);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        *wbq.sender.lock().unwrap() = Some(sender.clone());
+        *wbq.receiver_slot.lock().unwrap() = Some(receiver);
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &sender,
+                wbq.op_depth.as_ref(),
+                signal_op("OldInFlight"),
+                Some(wbq),
+            ),
+            WbqEnqueueResult::Enqueued,
+        );
+
+        // Install the existing execution hook on the actual worker thread,
+        // after dequeue/accounting but before the real notification write.
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_slot = Arc::clone(&wbq.receiver_slot);
+        let worker_depth = Arc::clone(&wbq.op_depth);
+        let worker = std::thread::spawn(move || {
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release retired archive worker");
+                }));
+            });
+            wbq_drain_loop(worker_slot, worker_depth, 4, 1);
+        });
+        let old_worker_id = worker.thread().id();
+        *wbq.drain_handle.lock() = Some(worker);
+        paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old worker must be executing its first accepted operation");
+
+        let delivery_timeout = scenario == "delivery_timeout";
+        let buffered: u64 = if delivery_timeout { 4 } else { 1 };
+        for index in 0..buffered {
+            assert_eq!(
+                wbq_enqueue(signal_op(&format!("OldBuffered{index}"))),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        let mut captured_sender = Some(wbq_sender_for_enqueue(wbq).unwrap());
+        drop(sender);
+        let inflight_since = WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed);
+        let inflight_oldest = WBQ_INFLIGHT_OLDEST_ENQUEUED_US.load(Ordering::Relaxed);
+        let last_progress = WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed);
+        assert!(inflight_since > 0);
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let salvaged_before = metrics.storage.wbq_respawn_salvaged_total.load();
+        let lost_before = metrics.storage.wbq_respawn_lost_total.load();
+        let budget = Duration::from_millis(10);
+
+        // Exercise the real shutdown path with short budgets, both when Flush
+        // is delivered but cannot be acknowledged and when both controls find
+        // a full channel. Neither outcome grants ownership to a replacement.
+        let started = Instant::now();
+        wbq_shutdown_inner(wbq, budget, budget);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(wbq_sender_clone(wbq).is_none());
+        {
+            let handle = wbq.drain_handle.lock();
+            let worker = handle.as_ref().expect("unfinished worker must stay owned");
+            assert_eq!(worker.thread().id(), old_worker_id);
+            assert!(!worker.is_finished());
+        }
+
+        // A repeated shutdown must not infer termination from sender=None.
+        let started = Instant::now();
+        wbq_shutdown_inner(wbq, budget, budget);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            wbq_enqueue(signal_op("NewRejected")),
+            WbqEnqueueResult::QueueUnavailable,
+        );
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                captured_sender.as_ref().unwrap(),
+                wbq.op_depth.as_ref(),
+                signal_op("CapturedRejected"),
+                Some(wbq),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+            "a producer captured before shutdown must not publish after admission closes",
+        );
+        wbq_start_inner(wbq);
+        assert!(wbq_sender_clone(wbq).is_none());
+        assert_eq!(
+            wbq.drain_handle.lock().as_ref().unwrap().thread().id(),
+            old_worker_id,
+        );
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), buffered);
+        assert_eq!(archive_lag_snapshot().wbq_depth, buffered);
+        assert_eq!(
+            WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed),
+            inflight_since
+        );
+        assert_eq!(
+            WBQ_INFLIGHT_OLDEST_ENQUEUED_US.load(Ordering::Relaxed),
+            inflight_oldest,
+        );
+        assert_eq!(WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed), last_progress);
+        assert_eq!(
+            metrics.storage.wbq_respawn_salvaged_total.load(),
+            salvaged_before,
+        );
+        assert_eq!(metrics.storage.wbq_respawn_lost_total.load(), lost_before);
+        assert_eq!(wbq_stats().enqueued, buffered + 1);
+        assert_eq!(wbq_stats().drained, 0);
+        assert!(!signal_path("OldInFlight").exists());
+        for index in 0..buffered {
+            assert!(!signal_path(&format!("OldBuffered{index}")).exists());
+        }
+
+        // If neither control fit, releasing the last captured sender supplies
+        // the normal disconnect exit path. Otherwise keep it to prove restart
+        // eventually disconnects this exact retired channel.
+        if delivery_timeout {
+            drop(captured_sender.take());
+        }
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if wbq.drain_handle.lock().as_ref().unwrap().is_finished() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "old drain must finish its own work"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(signal_path("OldInFlight").is_file());
+        for index in 0..buffered {
+            assert!(signal_path(&format!("OldBuffered{index}")).is_file());
+        }
+        assert!(!signal_path("NewRejected").exists());
+        assert!(!signal_path("CapturedRejected").exists());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed), 0);
+        assert_eq!(wbq_stats().enqueued, buffered + 1);
+        assert_eq!(wbq_stats().drained, buffered + 1);
+        assert_eq!(wbq_stats().errors, 0);
+
+        wbq_start_inner(wbq);
+        assert_ne!(
+            wbq.drain_handle.lock().as_ref().unwrap().thread().id(),
+            old_worker_id,
+        );
+        if let Some(sender) = captured_sender {
+            assert!(matches!(
+                sender.try_send(WbqMsg::Shutdown),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)),
+            ));
+        }
+        assert_eq!(
+            wbq_enqueue(signal_op("FreshAccepted")),
+            WbqEnqueueResult::Enqueued
+        );
+        assert_eq!(wbq_flush_status(), WbqFlushOutcome::Drained);
+        assert!(signal_path("FreshAccepted").is_file());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(wbq_stats().enqueued, buffered + 2);
+        assert_eq!(wbq_stats().drained, buffered + 2);
+        wbq_shutdown();
+        assert!(wbq.drain_handle.lock().is_none());
         println!("{COMPLETED}");
     }
 
