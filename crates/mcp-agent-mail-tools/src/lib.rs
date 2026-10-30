@@ -1176,6 +1176,7 @@ pub mod tool_util {
     }
 
     /// Admit a request without retaining a cancelled waiter behind recovery.
+    ///
     /// Both the hot write lease and cold bootstrap drain observe the request's
     /// own cancellation token without cancelling a shared ambient context.
     pub fn get_db_pool_for_request(ctx: &McpContext) -> McpResult<WriteDbPool> {
