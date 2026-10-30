@@ -28,10 +28,12 @@ const HYDRATION_SLICE: Duration = Duration::from_millis(2);
 type AgentKey = (i64, String);
 
 /// Process-local hydration progress, not another durable telemetry stream.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AtcPopulationHydrationStats {
     pub snapshot_agents: usize,
     pub pending_agents: usize,
+    /// Completed hydration update calls; engine admission can still refuse a
+    /// row at capacity, so this is not a count of successfully tracked agents.
     pub applied_agents: usize,
     pub unchanged_agents: usize,
     pub last_slice_agents: usize,
@@ -50,6 +52,34 @@ pub struct AtcPopulationHydrationStats {
     pub scope_actions_withheld: u64,
     pub last_scope_effects_withheld: usize,
     pub last_scope_actions_withheld: usize,
+}
+
+/// A nonblocking observation of population hydration work. `complete` means
+/// this queue and its final yield are finished, not that every row was admitted
+/// by the engine or that overall ATC coverage and execution are healthy. Engine
+/// capacity and other safety gates remain independent. Missing progress is
+/// unknown, never a fabricated empty or completed population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct AtcPopulationHealthSnapshot {
+    pub status: &'static str,
+    pub reason: Option<&'static str>,
+    pub progress: Option<AtcPopulationHydrationStats>,
+    /// Age of the unfinished population, including its final inference yield.
+    pub backlog_age_ms: Option<u64>,
+    /// Whether hydration defers inference; false grants no execution authority.
+    pub inference_deferred_by_hydration: Option<bool>,
+}
+
+impl AtcPopulationHealthSnapshot {
+    const fn unavailable(status: &'static str, reason: Option<&'static str>) -> Self {
+        Self {
+            status,
+            reason,
+            progress: None,
+            backlog_age_ms: None,
+            inference_deferred_by_hydration: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +103,43 @@ struct HydrationState {
 }
 
 impl HydrationState {
+    fn health_snapshot(&self, now_micros: i64) -> AtcPopulationHealthSnapshot {
+        let backlog = !self.pending.is_empty() || self.resume_pending;
+        let inference_deferred =
+            self.active_refresh.is_some() || self.progress.refresh_failed || backlog;
+        let (status, reason) = if self.active_refresh.is_some() {
+            ("degraded", Some("population_refresh_in_progress"))
+        } else if self.progress.refresh_failed {
+            ("degraded", Some("population_refresh_failed"))
+        } else if backlog {
+            ("degraded", Some("population_hydration_incomplete"))
+        } else if self.progress.scope_unresolved_names > 0
+            || self.progress.last_scope_effects_withheld > 0
+            || self.progress.last_scope_actions_withheld > 0
+        {
+            ("degraded", Some("population_scope_restricted"))
+        } else if self.scope.is_none() {
+            ("unknown", Some("population_not_observed"))
+        } else {
+            ("complete", None)
+        };
+        AtcPopulationHealthSnapshot {
+            status,
+            reason,
+            progress: Some(self.progress),
+            backlog_age_ms: backlog.then(|| {
+                u64::try_from(
+                    now_micros
+                        .saturating_sub(self.progress.snapshot_started_at_micros)
+                        .max(0)
+                        / 1_000,
+                )
+                .unwrap_or(u64::MAX)
+            }),
+            inference_deferred_by_hydration: Some(inference_deferred),
+        }
+    }
+
     // Not `const fn`: `VecDeque::is_empty` is not callable in a const context
     // (E0015), and marking this const breaks the build outright.
     fn should_defer_refresh(&self) -> bool {
@@ -372,6 +439,36 @@ pub fn atc_population_hydration_stats() -> AtcPopulationHydrationStats {
         .progress
 }
 
+/// Sample population health without joining a refresh, engine update or reset.
+///
+/// The caller supplies its server's configured enablement; reading health must
+/// not acquire the engine lock or initialize ATC state. Contention and poison
+/// are explicit unknown observations, rather than stale or zero-valued success.
+#[must_use]
+pub fn atc_population_health_snapshot(
+    enabled: bool,
+    now_micros: i64,
+) -> AtcPopulationHealthSnapshot {
+    if !enabled {
+        return AtcPopulationHealthSnapshot::unavailable("disabled", None);
+    }
+    let Some(state) = HYDRATION.get() else {
+        return AtcPopulationHealthSnapshot::unavailable(
+            "unknown",
+            Some("population_not_observed"),
+        );
+    };
+    match state.try_lock() {
+        Ok(state) => state.health_snapshot(now_micros),
+        Err(TryLockError::WouldBlock) => {
+            AtcPopulationHealthSnapshot::unavailable("unknown", Some("population_state_busy"))
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            AtcPopulationHealthSnapshot::unavailable("unknown", Some("population_state_poisoned"))
+        }
+    }
+}
+
 /// Fetch the bounded recent population and apply at most one hydration slice.
 ///
 /// Returned counts describe the database snapshot, not completion of all engine
@@ -541,6 +638,190 @@ mod tests {
                 last_active_ts: 1_000_000,
             })
             .collect()
+    }
+
+    #[test]
+    fn population_health_snapshot_tracks_backlog_through_the_final_yield() {
+        let mut state = HydrationState::default();
+        assert_eq!(state.health_snapshot(1_000_000).status, "unknown");
+        state.refresh_with(1_000_000, || Ok(rows(940))).unwrap();
+        state.drain_with(|_| {}, || true);
+        let pending = state.health_snapshot(6_000_000);
+        assert_eq!(pending.status, "degraded");
+        assert_eq!(pending.reason, Some("population_hydration_incomplete"));
+        assert_eq!(pending.backlog_age_ms, Some(5_000));
+        assert_eq!(pending.inference_deferred_by_hydration, Some(true));
+        let progress = pending.progress.unwrap();
+        assert_eq!(progress.snapshot_agents, 940);
+        assert_eq!(progress.applied_agents, MAX_AGENTS_PER_SLICE);
+        assert_eq!(progress.pending_agents, 940 - MAX_AGENTS_PER_SLICE);
+        assert_eq!(state.health_snapshot(0).backlog_age_ms, Some(0));
+
+        while !state.pending.is_empty() {
+            state.drain_with(|_| {}, || true);
+        }
+        let final_slice = state.health_snapshot(7_000_000);
+        assert_eq!(final_slice.progress.unwrap().pending_agents, 0);
+        assert_eq!(
+            final_slice.status, "degraded",
+            "the inference yield is unfinished work"
+        );
+        assert_eq!(final_slice.inference_deferred_by_hydration, Some(true));
+        assert_eq!(final_slice.backlog_age_ms, Some(6_000));
+        // The next public tick consumes this yield before inference; an
+        // unchanged refresh then retains the population without replaying it.
+        state.resume_pending = false;
+        assert_eq!(state.health_snapshot(8_000_000).status, "complete");
+        state.refresh_with(9_000_000, || Ok(rows(940))).unwrap();
+        let unchanged = state.health_snapshot(10_000_000);
+        assert_eq!(unchanged.status, "complete");
+        assert_eq!(unchanged.progress.unwrap().unchanged_agents, 940);
+        assert_eq!(unchanged.backlog_age_ms, None);
+
+        state.progress.scope_unresolved_names = 1;
+        let restricted = state.health_snapshot(10_000_000);
+        assert_eq!(restricted.status, "degraded");
+        assert_eq!(restricted.reason, Some("population_scope_restricted"));
+        assert_eq!(restricted.inference_deferred_by_hydration, Some(false));
+    }
+
+    #[test]
+    fn population_health_snapshot_completion_does_not_claim_engine_admission() {
+        let mut engine = engine::AtcEngine::new(engine::AtcConfig {
+            max_tracked_agents: 1,
+            ..engine::AtcConfig::default()
+        });
+        assert!(engine.register_agent("OldAgent", "codex-cli", Some("/hydration")));
+        let mut state = HydrationState::default();
+        state.refresh_with(10, || Ok(rows(1))).unwrap();
+        let mut refusals = 0;
+        state.drain_with(
+            |row| {
+                if !engine.register_agent(&row.name, &row.program, Some(&row.project_key)) {
+                    refusals += 1;
+                }
+            },
+            || true,
+        );
+        assert_eq!(refusals, 1);
+        assert_eq!(engine.tracked_agents(), vec!["OldAgent"]);
+        assert_eq!(state.health_snapshot(20).status, "degraded");
+        state.resume_pending = false;
+        let completed = state.health_snapshot(30);
+        assert_eq!(completed.progress.unwrap().pending_agents, 0);
+        assert_eq!(completed.progress.unwrap().applied_agents, 1);
+        assert_eq!(
+            completed.status, "complete",
+            "queue processing must never claim overall engine health"
+        );
+        assert_eq!(completed.inference_deferred_by_hydration, Some(false));
+        assert_eq!(
+            engine.tracked_agents(),
+            vec!["OldAgent"],
+            "completing hydration grants no capacity admission"
+        );
+    }
+
+    #[test]
+    fn population_health_snapshot_observes_real_refresh_failure_and_recovery() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        assert_eq!(atc_population_health_snapshot(true, 10).status, "unknown");
+        sync_population_with(10, || {
+            let refreshing = atc_population_health_snapshot(true, 11);
+            assert_eq!(refreshing.status, "degraded");
+            assert_eq!(refreshing.reason, Some("population_refresh_in_progress"));
+            assert_eq!(refreshing.inference_deferred_by_hydration, Some(true));
+            assert!(refreshing.progress.unwrap().refresh_in_flight);
+            Ok(Vec::new())
+        })
+        .unwrap();
+        let empty = atc_population_health_snapshot(true, 20);
+        assert_eq!(
+            empty.status, "complete",
+            "a successfully observed empty roster is authoritative"
+        );
+        assert_eq!(empty.progress.unwrap().snapshot_agents, 0);
+        assert_eq!(empty.inference_deferred_by_hydration, Some(false));
+        assert!(sync_population_with(30, || Err("database unavailable".into())).is_err());
+        let failed = atc_population_health_snapshot(true, 40);
+        assert_eq!(failed.status, "degraded");
+        assert_eq!(failed.reason, Some("population_refresh_failed"));
+        assert_eq!(failed.inference_deferred_by_hydration, Some(true));
+        assert_eq!(failed.progress.unwrap().refresh_failures, 1);
+        assert!(failed.progress.unwrap().refresh_failed);
+        sync_population_with(50, || Ok(Vec::new())).unwrap();
+        let recovered = atc_population_health_snapshot(true, 60);
+        assert_eq!(recovered.status, "complete");
+        assert_eq!(recovered.progress.unwrap().refresh_failures, 1);
+        assert!(!recovered.progress.unwrap().refresh_failed);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn population_health_snapshot_and_readiness_never_wait_on_hydration() {
+        let _serial = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let held = hydration().lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker_config = config.clone();
+        let worker = std::thread::spawn(move || {
+            let snapshot = atc_population_health_snapshot(true, 10);
+            let disabled = atc_population_health_snapshot(false, 10);
+            let mut body = serde_json::json!({"status":"ready","durability_state":"not_probed"});
+            crate::enrich_readiness_response(
+                &worker_config,
+                &Mutex::new(crate::HealthEnrichmentCache::default()),
+                &mut body,
+            );
+            let _ = send.send((snapshot, disabled, body));
+        });
+        let observed = receive.recv_timeout(Duration::from_secs(1));
+        // Always release the lock and join, including a regression to a
+        // blocking implementation, so a failed assertion cannot strand a worker.
+        drop(held);
+        worker.join().unwrap();
+        let (snapshot, disabled, body) = observed.expect("health waited for the hydration lock");
+        assert_eq!(snapshot.status, "unknown");
+        assert_eq!(snapshot.reason, Some("population_state_busy"));
+        assert_eq!(snapshot.progress, None);
+        assert_eq!(snapshot.inference_deferred_by_hydration, None);
+        assert_eq!(disabled.status, "disabled");
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["durability_state"], "not_probed");
+        assert_eq!(body["atc_population_hydration"]["status"], "unknown");
+        assert_eq!(
+            body["atc_population_hydration"]["reason"],
+            "population_state_busy"
+        );
+        assert!(body["atc_population_hydration"]["progress"].is_null());
+
+        let _ = std::panic::catch_unwind(|| {
+            let _held = hydration().lock().unwrap();
+            panic!("interrupted hydration update");
+        });
+        let poisoned = atc_population_health_snapshot(true, 20);
+        assert_eq!(poisoned.status, "unknown");
+        assert_eq!(poisoned.reason, Some("population_state_poisoned"));
+        assert_eq!(poisoned.progress, None);
+        assert!(
+            hydration().is_poisoned(),
+            "health must not silently repair poison"
+        );
+        super::super::reset_global_atc_state_for_test(&config);
     }
 
     #[test]

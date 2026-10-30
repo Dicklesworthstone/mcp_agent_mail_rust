@@ -16826,6 +16826,10 @@ fn enrich_readiness_response(
     body: &mut serde_json::Value,
 ) {
     body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    body["atc_population_hydration"] = serde_json::json!(atc::atc_population_health_snapshot(
+        config.atc_enabled,
+        mcp_agent_mail_core::timestamps::now_micros(),
+    ));
     let cache = lock_mutex(cache);
     body["database_path"] = cache.database_path.clone();
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
@@ -30602,6 +30606,25 @@ first body
                     .is_some_and(|share| share > 0),
                 "ATC sidecar should report a non-zero share of the combined footprint"
             );
+        });
+    }
+
+    #[test]
+    fn health_readiness_exposes_disabled_atc_population_without_changing_admission() {
+        with_serialized_health_route(|| {
+            let config = mcp_agent_mail_core::Config {
+                atc_enabled: false,
+                ..isolated_health_config()
+            };
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let response = block_on(state.handle(req));
+            assert_eq!(response.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["atc_population_hydration"]["status"], "disabled");
+            assert!(body["atc_population_hydration"]["progress"].is_null());
+            assert!(body["atc_population_hydration"]["backlog_age_ms"].is_null());
         });
     }
 

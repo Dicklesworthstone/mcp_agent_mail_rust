@@ -19,7 +19,8 @@ pub use engine::*;
 #[path = "atc_population.rs"]
 mod population;
 pub use population::{
-    AtcPopulationHydrationStats, atc_population_hydration_stats, atc_sync_population_from_db,
+    AtcPopulationHealthSnapshot, AtcPopulationHydrationStats, atc_population_health_snapshot,
+    atc_population_hydration_stats, atc_sync_population_from_db,
 };
 
 #[path = "atc_delivery.rs"]
