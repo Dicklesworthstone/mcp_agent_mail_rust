@@ -1398,6 +1398,10 @@ std::thread_local! {
     // backoff, so liveness tests do not depend on catching a timed sleep.
     static WBQ_BEFORE_RETRY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    // Observe the real drain between publication groups, after their project
+    // locks and fence have been released. Never pause inside a mutation window.
+    static WBQ_BETWEEN_GROUPS_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -4069,6 +4073,9 @@ fn wbq_drain_loop(
                 note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
             }
             idx = end;
+            if idx < batch.len() {
+                wbq_yield_between_groups();
+            }
         }
 
         metrics.storage.wbq_drained_total.add(drained_u64);
@@ -4176,19 +4183,113 @@ fn message_bundle_batch_group_key(op: &WriteOp) -> Option<(&str, &Path, &str, &s
     }
 }
 
+// A dequeued burst is not one publication transaction. Bound how much of it
+// can stage/fsync while excluding unrelated publishers (GH#344, br-kp1in.13).
+// A single bundle is indivisible and may exceed either target; it runs alone.
+const WBQ_MESSAGE_BATCH_MAX_FILES: usize = 64;
+const WBQ_MESSAGE_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Count the pretty-printed envelope without allocating another payload.
+/// Going over the target makes the entire bundle a singleton; the ordinary
+/// writer remains responsible for validation and publication errors.
+#[derive(Default)]
+struct WbqMessageByteCount(usize);
+
+impl IoWrite for WbqMessageByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        if self.0 > WBQ_MESSAGE_BATCH_MAX_BYTES {
+            return Err(std::io::Error::other("message batch byte target exceeded"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn message_bundle_batch_cost(op: &WriteOp) -> (usize, usize) {
+    let WriteOp::MessageBundle {
+        message_json,
+        body_md,
+        recipients,
+        extra_paths,
+        ..
+    } = op
+    else {
+        return (usize::MAX, usize::MAX);
+    };
+    let copies = 2usize.saturating_add(recipients.len());
+    // Charge each digest append and attachment reference too, even when a
+    // shared thread/path makes this conservative. Do not deduplicate copies:
+    // the existing writer also stages repeated recipient destinations.
+    let files = copies
+        .saturating_add(extra_paths.len())
+        .saturating_add(usize::from(
+            message_json
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|thread| !thread.trim().is_empty()),
+        ));
+    let mut frontmatter = WbqMessageByteCount::default();
+    let bytes = if serde_json::to_writer_pretty(&mut frontmatter, message_json).is_ok() {
+        frontmatter
+            .0
+            .saturating_add(body_md.len())
+            .saturating_add("---json\n\n---\n\n".len())
+            .saturating_mul(copies)
+    } else {
+        usize::MAX
+    };
+    // This bounds rendered message copies, not attachment contents or an
+    // existing thread digest. BCC-redacted inboxes can only be smaller than
+    // the full-envelope upper bound. No body or private routing is logged.
+    (files, bytes)
+}
+
 fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize {
     let Some(anchor_key) = message_bundle_batch_group_key(batch[start].op.as_ref()) else {
         return start + 1;
     };
 
+    let (mut files, mut bytes) = message_bundle_batch_cost(batch[start].op.as_ref());
     let mut end = start + 1;
-    while end < batch.len() {
+    while end < batch.len()
+        && files < WBQ_MESSAGE_BATCH_MAX_FILES
+        && bytes < WBQ_MESSAGE_BATCH_MAX_BYTES
+    {
         if message_bundle_batch_group_key(batch[end].op.as_ref()) != Some(anchor_key) {
             break;
         }
+        let (next_files, next_bytes) = message_bundle_batch_cost(batch[end].op.as_ref());
+        let next_files = files.saturating_add(next_files);
+        let next_bytes = bytes.saturating_add(next_bytes);
+        if next_files > WBQ_MESSAGE_BATCH_MAX_FILES || next_bytes > WBQ_MESSAGE_BATCH_MAX_BYTES {
+            break;
+        }
+        files = next_files;
+        bytes = next_bytes;
         end += 1;
     }
     end
+}
+
+fn wbq_yield_between_groups() {
+    #[cfg(test)]
+    {
+        let mut hook = WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook.as_mut() {
+            hook();
+        }
+        WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+    // Immutable-message fast admission uses a try-lock, so it otherwise
+    // bypasses FenceLease::acquire's give-way for waiting request writers.
+    // Yield only after all group guards have unwound, with the same bounded
+    // waiter policy and no change to an individual bundle's durability.
+    give_way_to_direct_writers();
+    std::thread::yield_now();
 }
 
 /// Keep an archive-writer panic inside its group, after mutation and project
@@ -24009,6 +24110,292 @@ mod tests {
         let archive = ensure_archive(&config, project_slug).unwrap();
         let commits = get_recent_commits(&archive, 3, None).unwrap();
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
+    }
+
+    #[test]
+    fn wbq_message_batch_bounds_preserve_complete_bundles_and_group_identity() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let envelope = |id| WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(backlog_test_message_op(&config, "bounded", id)),
+        };
+        // Three message copies and one thread append per bundle: sixteen
+        // complete bundles exactly fill the 64-path publication target.
+        let batch: Vec<_> = (1..=33).map(envelope).collect();
+        assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 16);
+        assert_eq!(wbq_message_bundle_batch_end(&batch, 16), 32);
+        assert_eq!(wbq_message_bundle_batch_end(&batch, 32), 33);
+
+        for boundary in ["project", "root", "author", "email", "other-op"] {
+            let mut batch: Vec<_> = (1..=3).map(envelope).collect();
+            let WriteOp::MessageBundle {
+                project_slug,
+                config,
+                ..
+            } = batch[1].op.as_mut()
+            else {
+                unreachable!();
+            };
+            match boundary {
+                "project" => project_slug.push_str("-other"),
+                "root" => config.storage_root.push("other"),
+                "author" => config.git_author_name.push_str(" other"),
+                "email" => config.git_author_email.push_str(".other"),
+                "other-op" => batch[1].op = Box::new(wbq_test_clear_signal_op("bounded")),
+                _ => unreachable!(),
+            }
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 1, "{boundary}");
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 1), 2, "{boundary}");
+        }
+
+        for oversized in [false, true] {
+            let mut batch: Vec<_> = (1..=3).map(envelope).collect();
+            let WriteOp::MessageBundle { extra_paths, .. } = batch[1].op.as_mut() else {
+                unreachable!();
+            };
+            *extra_paths = vec!["attachments/proven.webp".into(); if oversized { 70 } else { 60 }];
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 1);
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 1), 2);
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 2), 3);
+        }
+    }
+
+    #[test]
+    fn wbq_message_batch_bytes_include_fanout_escaping_and_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut op = backlog_test_message_op(&config, "byte-bound", 1);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            recipients,
+            ..
+        } = &mut op
+        else {
+            unreachable!();
+        };
+        *body_md = "Unicode 🦀 and a literal newline\n".into();
+        message_json["subject"] = serde_json::json!("Quotes \" and newline\n and slash \\");
+        message_json["bcc"] = serde_json::json!(["HiddenAgent"]);
+        recipients.push("HiddenAgent".into());
+        let full = render_message_bundle_content(message_json, body_md).unwrap();
+        let redacted =
+            render_message_bundle_content(&redact_message_bcc_for_inbox(message_json), body_md)
+                .unwrap();
+        let (files, bytes) = message_bundle_batch_cost(&op);
+        assert_eq!(files, 5, "four message copies and one thread append");
+        assert_eq!(bytes, 4 * full.len());
+        assert!(bytes >= 2 * full.len() + 2 * redacted.len());
+
+        for large_metadata in [false, true] {
+            let mut op = backlog_test_message_op(&config, "byte-bound", 2);
+            let WriteOp::MessageBundle {
+                message_json,
+                body_md,
+                ..
+            } = &mut op
+            else {
+                unreachable!();
+            };
+            if large_metadata {
+                // JSON doubles these newline bytes before fanout. A body-only
+                // budget or compact-string-length estimate misses this case.
+                message_json["extension"] =
+                    serde_json::Value::String("\n".repeat(WBQ_MESSAGE_BATCH_MAX_BYTES / 8));
+            } else {
+                *body_md = "x".repeat(WBQ_MESSAGE_BATCH_MAX_BYTES / 4);
+            }
+            let cost = message_bundle_batch_cost(&op).1;
+            assert!(cost <= WBQ_MESSAGE_BATCH_MAX_BYTES);
+            assert!(cost * 2 > WBQ_MESSAGE_BATCH_MAX_BYTES);
+            let batch: Vec<_> = [op.clone(), op]
+                .into_iter()
+                .map(|op| WbqOpEnvelope {
+                    enqueued_at: Instant::now(),
+                    op: Box::new(op),
+                })
+                .collect();
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 1);
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 1), 2);
+        }
+
+        let mut count = WbqMessageByteCount(usize::MAX - 1);
+        assert!(count.write(b"overflow").is_err());
+        assert_eq!(
+            count.0,
+            usize::MAX,
+            "size overflow cannot wrap into admission"
+        );
+    }
+
+    #[test]
+    fn wbq_drain_releases_publication_between_bounded_message_groups() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_drain_releases_publication_between_bounded_message_groups",
+        ) {
+            return;
+        }
+
+        for oversized in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let project = "bounded-publication";
+            let archive = ensure_archive(&config, project).unwrap();
+            let count = if oversized { 3 } else { 35 };
+            let mut ops: Vec<_> = (1..=count)
+                .map(|id| backlog_test_message_op(&config, project, id))
+                .collect();
+            if oversized {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    recipients,
+                    ..
+                } = &mut ops[1]
+                else {
+                    unreachable!();
+                };
+                *recipients = (0..70).map(|i| format!("Recipient{i}")).collect();
+                message_json["to"] = serde_json::json!(recipients);
+            }
+
+            let expected_boundaries = if oversized { vec![1, 2] } else { vec![16, 32] };
+            let observed = Arc::new(AtomicUsize::new(0));
+            let observed_hook = Arc::clone(&observed);
+            let observed_archive = archive.clone();
+            let reservation_config = config.clone();
+            WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let index = observed_hook.fetch_add(1, Ordering::Relaxed);
+                    let expected = *expected_boundaries
+                        .get(index)
+                        .expect("unexpected extra window");
+                    assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+                    let threads = observed_archive.root.join("messages/threads");
+                    let canonical_count =
+                        list_message_files(&observed_archive.root.join("messages"))
+                            .unwrap()
+                            .into_iter()
+                            .filter(|path| !path.starts_with(&threads))
+                            .count();
+                    assert_eq!(
+                        canonical_count, expected,
+                        "the next window has not published"
+                    );
+
+                    // A different thread cannot borrow a nested guard. This
+                    // actual same-project reservation needs BOTH the global
+                    // fence and the project lock released between windows.
+                    let reservation = publication_test_reservation(
+                        200 + i64::try_from(index).unwrap(),
+                        "aabbccdd",
+                    );
+                    let op = WriteOp::FileReservation {
+                        project_slug: project.into(),
+                        config: reservation_config.clone(),
+                        reservations: vec![reservation.clone()],
+                    };
+                    let result = std::thread::spawn(move || write_op_sync_direct(&op))
+                        .join()
+                        .unwrap();
+                    assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+                    flush_async_commits();
+                    for path in [
+                        publication_test_paths(&observed_archive, &reservation).0,
+                        publication_test_paths(&observed_archive, &reservation).1,
+                    ] {
+                        let published: serde_json::Value =
+                            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                        assert_eq!(published, reservation);
+                    }
+                }));
+            });
+
+            let capacity = ops.len() + 1;
+            let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+            let depth = Arc::new(AtomicU64::new(0));
+            let before = wbq_stats();
+            for op in &ops {
+                assert_eq!(
+                    wbq_enqueue_with_sender(&tx, &depth, op.clone()),
+                    WbqEnqueueResult::Enqueued,
+                );
+            }
+            tx.send(WbqMsg::Shutdown).unwrap();
+            let synced_before = archive_group_syncs();
+            wbq_drain_loop(
+                Arc::new(Mutex::new(Some(rx))),
+                Arc::clone(&depth),
+                capacity,
+                capacity,
+            );
+            WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+            let synced = archive_group_syncs() - synced_before;
+            assert_eq!(synced, if oversized { 78 } else { 105 });
+            assert_eq!(observed.load(Ordering::Relaxed), 2);
+            assert_eq!(depth.load(Ordering::Relaxed), 0);
+            let after = wbq_stats();
+            assert_eq!(
+                after.enqueued - before.enqueued,
+                u64::try_from(count).unwrap()
+            );
+            assert_eq!(
+                after.drained - before.drained,
+                u64::try_from(count).unwrap()
+            );
+            assert_eq!(after.errors, before.errors);
+            assert_eq!(after.unrecoverable_errors, before.unrecoverable_errors);
+            flush_async_commits();
+
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for op in &ops {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    body_md,
+                    sender,
+                    recipients,
+                    ..
+                } = op
+                else {
+                    unreachable!();
+                };
+                let paths = message_paths_for_bundle(&archive, message_json, sender, recipients)
+                    .unwrap()
+                    .0;
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(&paths.inbox)
+                {
+                    let (message, body) = read_message_file(path).unwrap();
+                    assert_eq!(&message, message_json);
+                    assert_eq!(body.trim(), body_md);
+                    let entry = tree
+                        .get_path(path.strip_prefix(&archive.repo_root).unwrap())
+                        .unwrap();
+                    assert_eq!(
+                        repo.find_blob(entry.id()).unwrap().content(),
+                        fs::read(path).unwrap()
+                    );
+                }
+            }
+            let digest =
+                fs::read_to_string(archive.root.join("messages/threads/ACK-FAST.md")).unwrap();
+            let mut previous = None;
+            for id in 1..=count {
+                let marker = format!("### ack-fast backlog {id}\n");
+                let offset = digest
+                    .find(&marker)
+                    .expect("every message reached its thread");
+                assert_eq!(digest.matches(&marker).count(), 1, "no duplicated message");
+                assert!(
+                    previous.is_none_or(|previous| previous < offset),
+                    "no reorder"
+                );
+                previous = Some(offset);
+            }
+            assert!(temp_files_under(&archive.root).is_empty());
+        }
     }
 
     #[test]
