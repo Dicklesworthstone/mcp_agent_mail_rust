@@ -1,4 +1,648 @@
 {
+  "cleanup_profile_and_coalescer_follow_up": {
+    "schema": 1,
+    "recorded_at_utc": "2026-10-30 03:24:28 UTC",
+    "status": "Three production corrections committed directly to main; native grouping and harness witnesses passed; native DB/Git integration and saturation remain unqualified",
+    "issue": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/353",
+    "initial_main": "0199ffca819ee349dbdc962f5bc8f16d6a846c54",
+    "last_incumbent_main": "a91eba1739a6035916c3b81c53a79c23b6620560",
+    "code_head": "ed7ad0e8328f9e8f25b5cf7c183a15f44e9863e8",
+    "concurrent_main_preserved": [
+      "9e2e4154443f51977da3fd7821b0f5c9e64c0e6a",
+      "33878023fea68466342774092881f92a12fa0f8c",
+      "a91eba1739a6035916c3b81c53a79c23b6620560"
+    ],
+    "commits": [
+      {
+        "sha": "e778ae39693d9ca49f0049316101b3615484e692",
+        "change": "Complete-profile reconciliation without publication admission; changed observations always rebuild source and plan under existing fence/project ownership"
+      },
+      {
+        "sha": "fe8ed321ed00a1795216ce9999f2951958499009",
+        "change": "Contiguous same-author, disjoint-path coalescer groups; retain conflict boundaries, failed-request age/order and real group-size statistics; optional additional full-strength archive-contention swarm"
+      },
+      {
+        "sha": "ed7ad0e8328f9e8f25b5cf7c183a15f44e9863e8",
+        "change": "Cleanup probes outside database activity leases; expected-generation mutation readmission; bounded cancellation-aware first checkout; configured archive root and retired-pool replacement; bounded nonwaiting Git probes with captured-commit history"
+      }
+    ],
+    "publication": {
+      "mechanism": "GitHub Git data tools; atomic per-correction file sets; non-forced main ref updates with expected parent leases",
+      "pull_requests_created": 0,
+      "reviewed_git_blob_identities_verified_before_each_ref_update": true
+    },
+    "final_code_files": [
+      {
+        "path": "crates/mcp-agent-mail-storage/src/recovery/agent_reconcile.rs",
+        "mode": "100644",
+        "sha256": "65523febde9cb3c95537d4f5303c6a66362c0ea20310533390ada9c2cea8730d",
+        "git_blob": "ec27ceec3ca651d374434605a8927db3c0ba6279"
+      },
+      {
+        "path": "crates/mcp-agent-mail-storage/src/recovery/agent_reconcile/observation.rs",
+        "mode": "100644",
+        "sha256": "51502ae384d764798895dd92d9a08c2e9cfd4397e9663abf0ec2261d37e79abb",
+        "git_blob": "b1d0fde4a10b7eef0ff2ecb07790eaf921484175"
+      },
+      {
+        "path": "crates/mcp-agent-mail-server/src/cleanup.rs",
+        "mode": "100644",
+        "sha256": "04985a44b78f03a312fe6409d58c8f4a492a4158fe3226c1ceb4e5860538de40",
+        "git_blob": "b730040b43f8ce5c1ab616b2c19ebeeed0ad32c5"
+      },
+      {
+        "path": "crates/mcp-agent-mail-tools/src/lib.rs",
+        "mode": "100644",
+        "sha256": "29dbd6e35cdf0c8e06d141b92c366b098c5a73ed3c902b6e9e90714f40480c52",
+        "git_blob": "b000bd741a07363b36236a963ce2c893a7794bb3"
+      },
+      {
+        "path": "crates/mcp-agent-mail-storage/src/lib.rs",
+        "sha256": "820378b839aa06f375e25f3cfec318997091a72f7c9eef32f5752c8de325ec43",
+        "git_blob": "4eaa7a182cee205645f0bbdc8b6c3dda8fb9f039"
+      },
+      {
+        "path": "scripts/tests/test_release_smoke_swarm.py",
+        "sha256": "c98e90c03bbdefaa04531b0127cfc2a4b740a973fa86136671eba94c4929b2dc",
+        "git_blob": "7dad9756a76db9fb84ad80087b710c508f3e9771"
+      },
+      {
+        "path": "tests/e2e/lib/release_smoke.py",
+        "sha256": "04210cb8d6f92e73319890cda0393462624dfea432cf2e324a855918ac59df2d",
+        "git_blob": "165f46975d1bf27d66078aa7abd4e1ad039fec7d"
+      },
+      {
+        "path": "tests/e2e/test_release_smoke.sh",
+        "sha256": "ea8d196592478aae7fc5bbd68e7d0003b15ab03c14b979c3a8bbcd48ea502fe2",
+        "git_blob": "c9151aad5427e640692239c59940f9dab154074c"
+      }
+    ],
+    "changes": {
+      "profile": {
+        "proof": "Existing archive only; two bounded no-follow working artifacts and stored blobs from immutable Git trees; exact authoritative source reread; repeat managed-target and archive-root checks. Unrelated publication can remain active. Failed observations never authorize mutation or reuse an optimistic plan.",
+        "preserved": [
+          "lifecycle and permanent tombstone authority",
+          "last_active_ts-only existing tolerance",
+          "extension metadata and secret stripping",
+          "existing staged-index semantics; no new index-parity claim",
+          "guarded source/plan rebuild on fallback"
+        ],
+        "native_regressions_added_not_run": [
+          "complete_profile_advances_during_unrelated_publication_without_touching_staged_evidence",
+          "complete_profile_observation_rejects_lifecycle_working_and_head_races",
+          "changed_complete_observation_rebuilds_source_and_extension_plan_in_the_same_call",
+          "unrelated_head_publication_does_not_invalidate_complete_managed_profiles",
+          "complete_profile_observation_rejects_project_root_replaced_with_a_symlink"
+        ]
+      },
+      "cleanup": {
+        "proof": "Short source-selection and mutation/artifact leases; filesystem/Git probes retain no database activity lease. Fresh admission must match captured generation; the existing real transaction still revalidates reservation, heartbeat and mail facts.",
+        "cold_checkout": "A warm live pool is reused. Cold cleanup tries write-idle promotion without draining active requests, then uses the unchanged production bootstrap poller on the owning thread with exact Cx, shutdown checks, and a one-second Pending bound. Retired engines reset numeric-project probe caches.",
+        "git": "HEAD/history/list probes use native bounded child execution, skip project mutex/flock and retain claims on unavailable evidence. History explicitly queries the validated captured OID used as the cache key.",
+        "native_regression_scopes_added_not_run": [
+          "resolved database/archive ownership",
+          "cold admission/cancellation before disk materialization",
+          "real missing-database archive reconstruction before writer activity",
+          "actual capacity-one pool Pending followed by shutdown/cancellation/deadline; ordinary admission before connection release",
+          "recovery retirement, replacement engine, cache reset and warm reuse",
+          "source generation changed after real workspace scan",
+          "atomic renewed-reservation and heartbeat revalidation",
+          "promotion while a real delayed Git child is active",
+          "real Git probes while project mutex/flock remain held",
+          "history timeout preserves claim and retries without negative cache",
+          "HEAD moves from recent commit to older absent-path commit; captured revision remains authoritative"
+        ]
+      },
+      "saturation": {
+        "extension": "AM_RELEASE_SMOKE_ARCHIVE_CONTENTION=1 / --archive-contention adds a second full-strength swarm; original swarm is retained. Three projects; one shared thread every 16 send attempts offset per agent, otherwise per-agent/per-sequence unique threads. Each project must acknowledge repeated shared and unique traffic.",
+        "comparison": "Both binaries receive identical phases/knobs in one invocation. AM_RELEASE_SMOKE_CONTROL_FIRST=1 / --control-first permits alternating order across retained invocations; candidate verdict is selected by identity, not array position.",
+        "unchanged_release_gates": {
+          "minimum_agents": 60,
+          "minimum_swarm_seconds": 480,
+          "projects": 3,
+          "midpoint": "SIGKILL and restart",
+          "quiet_convergence_max_seconds": 300,
+          "quiet_observer": "independent read-only database and committed canonical/inbox/outbox content; no MCP polling",
+          "send_reserve_release_p99_seconds": 5,
+          "soak_fetch_inbox_p99_seconds": 2
+        },
+        "executed_against_agent_mail_binaries": false
+      }
+    },
+    "native_grouping": {
+      "proof_class": "exact production std-only grouping module plus source-derived incumbent decision; not Git, storage integration or request latency",
+      "current_main_identity": {
+        "base_commit": "0199ffca819ee349dbdc962f5bc8f16d6a846c54",
+        "current_main_commit": "33878023fea68466342774092881f92a12fa0f8c",
+        "batch_executor_byte_identical": true,
+        "batch_executor_sha256": "5027dce07cd3f7f12b0a8ecf00d199a3c7f533db571799d58b523f246156f710",
+        "batch_and_git_retry_region_byte_identical": true,
+        "batch_and_git_retry_region_sha256": "c4d2c6cd36b4376b45fb22d3cba5de96b785d7ad4368c7b4982fb1b21a53d979"
+      },
+      "candidate_module_sha256": "b3877aad051448e8a2becb6bd66e246cd7f12f3d5af82e709200c7d8af85230a",
+      "candidate_storage_file_sha256": "25d424f5340cebb658000420ca2cdeb191d4428d81365e283d6ccae211c6e6d6",
+      "compile": {
+        "command": [
+          "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+          "--edition",
+          "2024",
+          "--test",
+          "comparison.rs",
+          "-o",
+          "grouping-tests"
+        ],
+        "exit_code": 0,
+        "elapsed_s": 0.6738701319991378,
+        "max_rss_kib": 152640
+      },
+      "native_test": {
+        "command": [
+          "./grouping-tests",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_code": 0,
+        "elapsed_s": 0.00923943700036034,
+        "max_rss_kib": 9344,
+        "comparisons": [
+          {
+            "fixture": "author_boundaries",
+            "scope": "direct_call_guard_current_worker_already_splits_authors",
+            "incumbent_groups": [
+              4
+            ],
+            "candidate_groups": [
+              1,
+              1,
+              2
+            ]
+          },
+          {
+            "fixture": "empty",
+            "scope": "empty_control",
+            "incumbent_groups": [],
+            "candidate_groups": []
+          },
+          {
+            "fixture": "all_conflicting",
+            "scope": "valid_worker_batch_work_count",
+            "incumbent_groups": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "candidate_groups": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ]
+          },
+          {
+            "fixture": "all_disjoint",
+            "scope": "valid_worker_batch_work_count",
+            "incumbent_groups": [
+              32
+            ],
+            "candidate_groups": [
+              32
+            ]
+          },
+          {
+            "fixture": "size_boundary",
+            "scope": "direct_call_guard_current_worker_already_limits_batch_size",
+            "incumbent_groups": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "candidate_groups": [
+              3,
+              3,
+              1
+            ]
+          },
+          {
+            "fixture": "sparse_thread_conflict",
+            "scope": "valid_worker_batch_work_count",
+            "incumbent_groups": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "candidate_groups": [
+              16,
+              16
+            ]
+          }
+        ]
+      },
+      "tests_passed": 12,
+      "clippy": {
+        "command": [
+          "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/clippy-driver",
+          "--edition",
+          "2024",
+          "--test",
+          "comparison.rs",
+          "--emit=metadata",
+          "-o",
+          "grouping-clippy.rmeta",
+          "-W",
+          "clippy::all",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0,
+        "elapsed_s": 0.22686574399995152,
+        "max_rss_kib": 120352,
+        "lint_scope": "storage crate attributes forbid unsafe_code and allow clippy::collapsible_if copied; storage Cargo.toml does not inherit workspace pedantic/nursery"
+      },
+      "rustfmt": {
+        "command": [
+          "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt",
+          "--edition",
+          "2024",
+          "--check",
+          "--config",
+          "skip_children=true",
+          "crates/mcp-agent-mail-storage/src/lib.rs"
+        ],
+        "exit_code": 0,
+        "elapsed_s": 0.7459385199981625
+      },
+      "native_git_tests_added_not_run": [
+        "coalescer_sparse_thread_conflict_commits_two_ordered_git_groups",
+        "coalescer_repeated_path_preserves_each_git_commit_boundary",
+        "coalescer_group_failure_retains_exact_requests_and_queue_age",
+        "coalescer_group_stats_record_unequal_sizes_and_author_boundaries"
+      ],
+      "limitations": [
+        "No full storage/core/DB dependency compilation or native Git test execution in this receipt.",
+        "No real request latency, archive-convergence, BusySnapshot or fairness outcome established.",
+        "The initial /usr/bin/time wrapper was unavailable. First comparison compile failed on a JSON-output brace in the proof harness; corrected without changing production source. Earlier launch/error logs are retained.",
+        "Author and oversize comparisons cover direct-call guards; current worker already enforces those boundaries."
+      ],
+      "artifacts_sha256": {
+        "candidate-grouping.rs": "b3877aad051448e8a2becb6bd66e246cd7f12f3d5af82e709200c7d8af85230a",
+        "clippy-component.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "clippy-result.json": "eb94229e6860ff9236fb6c86d77488eeb817e56e5a85e11e914d850075451a33",
+        "coalescer-change.patch": "35755f2545edf4aa405b6b043d7d9debdf2f092ed037ec01df250f494122ef0d",
+        "comparison.rs": "3fd89dab7b003da7937ed807a7e1c09a372ba3e79ac87bf05d18deae6be90892",
+        "compile-native-v2.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "compile-native.log": "6a4ecd0d679f0177eabd67dd5913c53b1b07ee38e0d2b7480300f4f284338160",
+        "compile-result-v2.json": "d556c7daf0e1612cbce0cf731b64a2d4e600f5a43ab6b95f113939906e1bdae8",
+        "compile-result.json": "46e73ba2670ae7a37b3515af780be4b619c4a63f7f0b5594d8f26221d0b8ae8e",
+        "compile.log": "3e737f6a9117cec194b02103b357f8668fae9adb86a8a8cd0bf25efab8948548",
+        "current-main-coalescer-source.rs.txt": "5027dce07cd3f7f12b0a8ecf00d199a3c7f533db571799d58b523f246156f710",
+        "current-main-identity.json": "f4a936c722028064bd39d1d5af215fb2cea857e5e5fa063c443b8e41829bd01f",
+        "grouping-clippy.rmeta": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "grouping-tests": "8b084fabd731dd26cc8985adc6f9f090c9914525c3e95146fbe98960cf54c1b0",
+        "incumbent-coalescer-source.rs.txt": "5027dce07cd3f7f12b0a8ecf00d199a3c7f533db571799d58b523f246156f710",
+        "incumbent-decision.rs": "a28665b98b0de9a78d6512724bf8249d07ab85fc5aa94c5094f7d72ff5b220f0",
+        "rustc-version.txt": "afa0463fc538f7e3dfa46074095886a69302c98f037fcf29238678c8b5000cd9",
+        "rustfmt-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "rustfmt-result.json": "527eec27fde797277c70965ae5ca81904570d300befd052664d11eeb407ca8a9",
+        "source-manifest.json": "6ad395984995b89f44f50fd4dce105030b86ac3f7195ba1d34bc3e26d5c71685",
+        "tests-native.log": "4e18ecc0f0285eb67a8cb1073cf880f84106d7e61a0df8f4add1361ca5195e24",
+        "tests-result.json": "9a9fe2bbede952d146c30c7a63bdd275df4d71d27f8821bec09536e301ab8631"
+      }
+    },
+    "native_grouping_replay_payloads": {
+      "comparison.rs": {
+        "sha256": "3fd89dab7b003da7937ed807a7e1c09a372ba3e79ac87bf05d18deae6be90892",
+        "content": "#![forbid(unsafe_code)]\n#![allow(clippy::collapsible_if)]\n\n// This binary proves grouping decisions only. It does not substitute for the\n// real Git tests added to storage/src/lib.rs or qualify request latency.\nuse std::collections::HashSet;\n\ninclude!(\"candidate-grouping.rs\");\ninclude!(\"incumbent-decision.rs\");\n\nstruct FixtureRequest {\n    name: &'static str,\n    email: &'static str,\n    rel_paths: Vec<String>,\n}\n\nfn unique_requests(count: usize) -> Vec<FixtureRequest> {\n    (0..count)\n        .map(|index| FixtureRequest {\n            name: \"Test\",\n            email: \"test@example.com\",\n            rel_paths: vec![format!(\"projects/p{}/message-{index}.md\", index % 3)],\n        })\n        .collect()\n}\n\nfn compare(\n    fixture: &str,\n    scope: &str,\n    requests: &[FixtureRequest],\n    max_batch_size: usize,\n    expected_incumbent: &[usize],\n    expected_candidate: &[usize],\n) {\n    let incumbent = incumbent_group_sizes(requests, max_batch_size);\n    let candidate = coalescer_batch_groups::contiguous_ranges(\n        requests\n            .iter()\n            .map(|request| (request.name, request.email, request.rel_paths.as_slice())),\n        max_batch_size,\n    );\n    let candidate_sizes = candidate.iter().map(std::ops::Range::len).collect::<Vec<_>>();\n    assert_eq!(incumbent, expected_incumbent);\n    assert_eq!(candidate_sizes, expected_candidate);\n    assert_eq!(incumbent.iter().sum::<usize>(), requests.len());\n    assert_eq!(candidate_sizes.iter().sum::<usize>(), requests.len());\n    assert_eq!(\n        candidate.iter().cloned().flatten().collect::<Vec<_>>(),\n        (0..requests.len()).collect::<Vec<_>>()\n    );\n    println!(\n        \"comparison {{\\\"fixture\\\":\\\"{fixture}\\\",\\\"scope\\\":\\\"{scope}\\\",\\\"incumbent_groups\\\":{incumbent:?},\\\"candidate_groups\\\":{candidate_sizes:?}}}\"\n    );\n}\n\n#[test]\nfn compare_sparse_thread_conflict_with_current_main() {\n    let mut requests = unique_requests(32);\n    requests[0]\n        .rel_paths\n        .push(\"projects/p0/threads/shared.md\".to_string());\n    requests[16]\n        .rel_paths\n        .push(\"projects/p0/threads/shared.md\".to_string());\n    compare(\n        \"sparse_thread_conflict\",\n        \"valid_worker_batch_work_count\",\n        &requests,\n        32,\n        &[1; 32],\n        &[16, 16],\n    );\n}\n\n#[test]\nfn compare_every_request_conflicts_with_current_main() {\n    let mut requests = unique_requests(32);\n    for request in &mut requests {\n        request.rel_paths.push(\"threads/shared.md\".to_string());\n    }\n    compare(\n        \"all_conflicting\",\n        \"valid_worker_batch_work_count\",\n        &requests,\n        32,\n        &[1; 32],\n        &[1; 32],\n    );\n}\n\n#[test]\nfn compare_fully_disjoint_batch_with_current_main() {\n    compare(\n        \"all_disjoint\",\n        \"valid_worker_batch_work_count\",\n        &unique_requests(32),\n        32,\n        &[32],\n        &[32],\n    );\n}\n\n#[test]\nfn compare_author_boundary_direct_call_guards_with_current_main() {\n    let mut requests = unique_requests(4);\n    requests[1].name = \"Other\";\n    requests[2].name = \"Other\";\n    requests[3].name = \"Other\";\n    requests[2].email = \"other@example.com\";\n    requests[3].email = \"other@example.com\";\n    compare(\n        \"author_boundaries\",\n        \"direct_call_guard_current_worker_already_splits_authors\",\n        &requests,\n        32,\n        &[4],\n        &[1, 1, 2],\n    );\n}\n\n#[test]\nfn compare_size_boundary_direct_call_guards_with_current_main() {\n    compare(\n        \"size_boundary\",\n        \"direct_call_guard_current_worker_already_limits_batch_size\",\n        &unique_requests(7),\n        3,\n        &[1; 7],\n        &[3, 3, 1],\n    );\n}\n\n#[test]\nfn compare_empty_batch_with_current_main() {\n    compare(\"empty\", \"empty_control\", &[], 32, &[], &[]);\n}\n"
+      },
+      "candidate-grouping.rs": {
+        "sha256": "b3877aad051448e8a2becb6bd66e246cd7f12f3d5af82e709200c7d8af85230a",
+        "content": "mod coalescer_batch_groups {\n    use std::collections::HashSet;\n    use std::ops::Range;\n\n    /// Keep request order while merging only disjoint paths from one author.\n    /// A conflict ends the current group, not batching for the entire drain.\n    /// Paths are borrowed; grouping never clones or rewrites queued requests.\n    pub(super) fn contiguous_ranges<'a>(\n        requests: impl IntoIterator<Item = (&'a str, &'a str, &'a [String])>,\n        max_batch_size: usize,\n    ) -> Vec<Range<usize>> {\n        let max_batch_size = max_batch_size.max(1);\n        let mut ranges = Vec::new();\n        let mut paths = HashSet::new();\n        let mut author = None;\n        let mut start = 0;\n        let mut end = 0;\n        for (index, (name, email, request_paths)) in requests.into_iter().enumerate() {\n            if index > start\n                && (index - start >= max_batch_size\n                    || author != Some((name, email))\n                    || request_paths\n                        .iter()\n                        .any(|path| paths.contains(path.as_str())))\n            {\n                ranges.push(start..index);\n                paths.clear();\n                start = index;\n            }\n            author = Some((name, email));\n            paths.extend(request_paths.iter().map(String::as_str));\n            end = index + 1;\n        }\n        if start < end {\n            ranges.push(start..end);\n        }\n        ranges\n    }\n\n    #[cfg(test)]\n    mod tests {\n        use super::contiguous_ranges;\n\n        fn paths(names: &[&str]) -> Vec<String> {\n            names.iter().map(|name| (*name).to_string()).collect()\n        }\n\n        #[test]\n        fn sparse_conflict_keeps_unrelated_requests_batched_in_order() {\n            let mut requests = (0..32)\n                .map(|index| vec![format!(\"projects/p{}/message-{index}.md\", index % 3)])\n                .collect::<Vec<_>>();\n            requests[0].push(\"projects/p0/threads/shared.md\".to_string());\n            requests[16].push(\"projects/p0/threads/shared.md\".to_string());\n\n            assert_eq!(\n                contiguous_ranges(\n                    requests\n                        .iter()\n                        .map(|paths| (\"Test\", \"test@example.com\", paths.as_slice())),\n                    32,\n                ),\n                vec![0..16, 16..32],\n            );\n        }\n\n        #[test]\n        fn repeated_mutable_path_keeps_every_commit_boundary() {\n            let shared = paths(&[\"threads/shared.md\"]);\n            assert_eq!(\n                contiguous_ranges(\n                    (0..32).map(|_| (\"Test\", \"test@example.com\", shared.as_slice())),\n                    32\n                ),\n                (0..32).map(|index| index..index + 1).collect::<Vec<_>>(),\n            );\n        }\n\n        #[test]\n        fn size_bound_splits_disjoint_requests_without_reordering() {\n            let requests = (0..7)\n                .map(|index| vec![format!(\"{index}.md\")])\n                .collect::<Vec<_>>();\n            assert_eq!(\n                contiguous_ranges(\n                    requests\n                        .iter()\n                        .map(|paths| (\"Test\", \"test@example.com\", paths.as_slice())),\n                    3,\n                ),\n                vec![0..3, 3..6, 6..7],\n            );\n            assert_eq!(\n                contiguous_ranges(\n                    requests\n                        .iter()\n                        .map(|paths| (\"Test\", \"test@example.com\", paths.as_slice())),\n                    0,\n                ),\n                (0..7).map(|index| index..index + 1).collect::<Vec<_>>(),\n            );\n        }\n\n        #[test]\n        fn author_name_and_email_changes_each_end_a_group() {\n            let a = paths(&[\"a.md\"]);\n            let b = paths(&[\"b.md\"]);\n            let c = paths(&[\"c.md\"]);\n            let d = paths(&[\"d.md\"]);\n            assert_eq!(\n                contiguous_ranges(\n                    [\n                        (\"First\", \"same@example.com\", a.as_slice()),\n                        (\"Second\", \"same@example.com\", b.as_slice()),\n                        (\"Second\", \"other@example.com\", c.as_slice()),\n                        (\"Second\", \"other@example.com\", d.as_slice()),\n                    ],\n                    32,\n                ),\n                vec![0..1, 1..2, 2..4],\n            );\n        }\n\n        #[test]\n        fn duplicate_paths_within_one_request_do_not_block_disjoint_neighbors() {\n            let a = paths(&[\"a.md\", \"a.md\"]);\n            let b = paths(&[\"b.md\"]);\n            let c = paths(&[\"a.md\"]);\n            assert_eq!(\n                contiguous_ranges(\n                    [&a, &b, &c].map(|paths| (\"Test\", \"test@example.com\", paths.as_slice())),\n                    32,\n                ),\n                vec![0..2, 2..3],\n            );\n        }\n\n        #[test]\n        fn empty_input_has_no_commit_group() {\n            assert!(contiguous_ranges(std::iter::empty(), 32).is_empty());\n        }\n    }\n}\n"
+      },
+      "incumbent-decision.rs": {
+        "sha256": "a28665b98b0de9a78d6512724bf8249d07ab85fc5aa94c5094f7d72ff5b220f0",
+        "content": "// Source-derived work-count adapter, not a native Git implementation.\n// The conflict scan below is copied byte-for-byte from incumbent 0199ffca.\n// Commit branches become request-count groups; the configured size is an input.\nfn incumbent_group_sizes(requests: &[FixtureRequest], max_batch_size: usize) -> Vec<usize> {\n    if requests.is_empty() {\n        return Vec::new();\n    }\n    // Check for path conflicts\n    let mut all_paths = HashSet::new();\n    let mut can_merge = true;\n    for req in requests {\n        for p in &req.rel_paths {\n            if !all_paths.insert(p.clone()) {\n                can_merge = false;\n                break;\n            }\n        }\n        if !can_merge {\n            break;\n        }\n    }\n\n    if requests.len() == 1 {\n        vec![1]\n    } else if can_merge && requests.len() <= max_batch_size {\n        vec![requests.len()]\n    } else {\n        vec![1; requests.len()]\n    }\n}\n"
+      },
+      "tests-native.log": {
+        "sha256": "4e18ecc0f0285eb67a8cb1073cf880f84106d7e61a0df8f4add1361ca5195e24",
+        "content": "\nrunning 12 tests\ntest coalescer_batch_groups::tests::author_name_and_email_changes_each_end_a_group ... ok\ntest coalescer_batch_groups::tests::duplicate_paths_within_one_request_do_not_block_disjoint_neighbors ... ok\ntest coalescer_batch_groups::tests::empty_input_has_no_commit_group ... ok\ntest coalescer_batch_groups::tests::repeated_mutable_path_keeps_every_commit_boundary ... ok\ntest coalescer_batch_groups::tests::size_bound_splits_disjoint_requests_without_reordering ... ok\ntest coalescer_batch_groups::tests::sparse_conflict_keeps_unrelated_requests_batched_in_order ... ok\ntest compare_author_boundary_direct_call_guards_with_current_main ... comparison {\"fixture\":\"author_boundaries\",\"scope\":\"direct_call_guard_current_worker_already_splits_authors\",\"incumbent_groups\":[4],\"candidate_groups\":[1, 1, 2]}\nok\ntest compare_empty_batch_with_current_main ... comparison {\"fixture\":\"empty\",\"scope\":\"empty_control\",\"incumbent_groups\":[],\"candidate_groups\":[]}\nok\ntest compare_every_request_conflicts_with_current_main ... comparison {\"fixture\":\"all_conflicting\",\"scope\":\"valid_worker_batch_work_count\",\"incumbent_groups\":[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],\"candidate_groups\":[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]}\nok\ntest compare_fully_disjoint_batch_with_current_main ... comparison {\"fixture\":\"all_disjoint\",\"scope\":\"valid_worker_batch_work_count\",\"incumbent_groups\":[32],\"candidate_groups\":[32]}\nok\ntest compare_size_boundary_direct_call_guards_with_current_main ... comparison {\"fixture\":\"size_boundary\",\"scope\":\"direct_call_guard_current_worker_already_limits_batch_size\",\"incumbent_groups\":[1, 1, 1, 1, 1, 1, 1],\"candidate_groups\":[3, 3, 1]}\nok\ntest compare_sparse_thread_conflict_with_current_main ... comparison {\"fixture\":\"sparse_thread_conflict\",\"scope\":\"valid_worker_batch_work_count\",\"incumbent_groups\":[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],\"candidate_groups\":[16, 16]}\nok\n\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n"
+      }
+    },
+    "post_run_source_integration": {
+      "current_main_executor_identical_through": "a91eba1739a6035916c3b81c53a79c23b6620560",
+      "exact_tested_candidate_module_is_substring_of_final_storage_source": true,
+      "candidate_module_sha256": "b3877aad051448e8a2becb6bd66e246cd7f12f3d5af82e709200c7d8af85230a",
+      "final_storage_sha256": "820378b839aa06f375e25f3cfec318997091a72f7c9eef32f5752c8de325ec43",
+      "scope": "Native comparisons measure grouping decisions/work counts. The real Git executor, publication fairness and request latency were not executed in this proof."
+    },
+    "saturation_harness_tests": {
+      "command": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p test_release_smoke_swarm.py -v",
+      "log_sha256": "450ab66fddb66b338bf4267300a1c666c5eea80273c4394d32e56ce259e6af81",
+      "log": "test_bcc_only_inbox_has_empty_visible_routing_without_losing_delivery (test_release_smoke_swarm.ArchiveParityTests.test_bcc_only_inbox_has_empty_visible_routing_without_losing_delivery) ... ok\ntest_cached_routing_cannot_hide_a_missing_delivery (test_release_smoke_swarm.ArchiveParityTests.test_cached_routing_cannot_hide_a_missing_delivery) ... ok\ntest_cached_routing_cannot_hide_changed_delivery_roles (test_release_smoke_swarm.ArchiveParityTests.test_cached_routing_cannot_hide_changed_delivery_roles) ... ok\ntest_committed_bcc_leak_in_recipient_copy_is_rejected (test_release_smoke_swarm.ArchiveParityTests.test_committed_bcc_leak_in_recipient_copy_is_rejected) ... ok\ntest_complete_working_bundle_must_also_be_committed (test_release_smoke_swarm.ArchiveParityTests.test_complete_working_bundle_must_also_be_committed) ... ok\ntest_expensive_sqlite_observation_cannot_pass_after_its_deadline (test_release_smoke_swarm.ArchiveParityTests.test_expensive_sqlite_observation_cannot_pass_after_its_deadline) ... ok\ntest_expired_observation_deadline_cannot_pass_matching_content (test_release_smoke_swarm.ArchiveParityTests.test_expired_observation_deadline_cannot_pass_matching_content) ... ok\ntest_explicit_project_mailbox_delivery_preserves_routing_and_scope (test_release_smoke_swarm.ArchiveParityTests.test_explicit_project_mailbox_delivery_preserves_routing_and_scope) ... ok\ntest_invalid_reply_parent_types_or_missing_thread_are_rejected (test_release_smoke_swarm.ArchiveParityTests.test_invalid_reply_parent_types_or_missing_thread_are_rejected) ... ok\ntest_json_metadata_types_cannot_alias_boolean_and_numeric_values (test_release_smoke_swarm.ArchiveParityTests.test_json_metadata_types_cannot_alias_boolean_and_numeric_values) ... ok\ntest_known_reply_absence_refuses_an_added_archive_parent (test_release_smoke_swarm.ArchiveParityTests.test_known_reply_absence_refuses_an_added_archive_parent) ... ok\ntest_legacy_empty_cache_uses_complete_delivery_rows (test_release_smoke_swarm.ArchiveParityTests.test_legacy_empty_cache_uses_complete_delivery_rows) ... ok\ntest_legacy_null_reply_authority_is_explicitly_unverifiable (test_release_smoke_swarm.ArchiveParityTests.test_legacy_null_reply_authority_is_explicitly_unverifiable) ... ok\ntest_live_client_prevents_quiet_claim_then_stopped_client_allows_it (test_release_smoke_swarm.ArchiveParityTests.test_live_client_prevents_quiet_claim_then_stopped_client_allows_it) ... ok\ntest_mailbox_symlink_is_refused_without_reading_its_target (test_release_smoke_swarm.ArchiveParityTests.test_mailbox_symlink_is_refused_without_reading_its_target) ... ok\ntest_missing_inbox_cannot_pass_complete_canonical_counts (test_release_smoke_swarm.ArchiveParityTests.test_missing_inbox_cannot_pass_complete_canonical_counts) ... ok\ntest_missing_real_git_blob_cannot_be_supplied_by_working_copies (test_release_smoke_swarm.ArchiveParityTests.test_missing_real_git_blob_cannot_be_supplied_by_working_copies) ... ok\ntest_missing_sender_outbox_is_not_archive_convergence (test_release_smoke_swarm.ArchiveParityTests.test_missing_sender_outbox_is_not_archive_convergence) ... ok\ntest_multiple_messages_share_one_reader_without_reusing_their_verdicts (test_release_smoke_swarm.ArchiveParityTests.test_multiple_messages_share_one_reader_without_reusing_their_verdicts) ... ok\ntest_nonregular_canonical_entry_is_refused (test_release_smoke_swarm.ArchiveParityTests.test_nonregular_canonical_entry_is_refused) ... ok\ntest_one_pinned_tree_does_not_mix_copies_from_later_commits (test_release_smoke_swarm.ArchiveParityTests.test_one_pinned_tree_does_not_mix_copies_from_later_commits) ... ok\ntest_orphaned_or_foreign_recipient_identity_is_rejected (test_release_smoke_swarm.ArchiveParityTests.test_orphaned_or_foreign_recipient_identity_is_rejected) ... ok\ntest_project_root_symlink_is_refused_without_following_it (test_release_smoke_swarm.ArchiveParityTests.test_project_root_symlink_is_refused_without_following_it) ... ok\ntest_real_snapshot_and_lossless_body_pass_without_server_requests (test_release_smoke_swarm.ArchiveParityTests.test_real_snapshot_and_lossless_body_pass_without_server_requests) ... ok\ntest_recipient_objects_cannot_masquerade_as_name_arrays (test_release_smoke_swarm.ArchiveParityTests.test_recipient_objects_cannot_masquerade_as_name_arrays) ... ok\ntest_same_count_modified_body_is_rejected_without_echoing_content (test_release_smoke_swarm.ArchiveParityTests.test_same_count_modified_body_is_rejected_without_echoing_content) ... ok\ntest_same_count_unrelated_id_cannot_replace_the_expected_message (test_release_smoke_swarm.ArchiveParityTests.test_same_count_unrelated_id_cannot_replace_the_expected_message) ... ok\ntest_same_count_wrong_recipient_role_is_rejected (test_release_smoke_swarm.ArchiveParityTests.test_same_count_wrong_recipient_role_is_rejected) ... ok\ntest_semantically_correct_uncommitted_inbox_is_not_durable (test_release_smoke_swarm.ArchiveParityTests.test_semantically_correct_uncommitted_inbox_is_not_durable) ... ok\ntest_dispatch_deadline_is_a_timeout (test_release_smoke_swarm.ClassifyCallTests.test_dispatch_deadline_is_a_timeout) ... ok\ntest_other_errors_are_tool_errors (test_release_smoke_swarm.ClassifyCallTests.test_other_errors_are_tool_errors) ... ok\ntest_success_is_ok (test_release_smoke_swarm.ClassifyCallTests.test_success_is_ok) ... ok\ntest_control_first_never_uses_control_verdict_as_candidate_verdict (test_release_smoke_swarm.ContentionWorkloadTests.test_control_first_never_uses_control_verdict_as_candidate_verdict) ... ok\ntest_original_shared_thread_schedule_is_unchanged (test_release_smoke_swarm.ContentionWorkloadTests.test_original_shared_thread_schedule_is_unchanged) ... ok\ntest_skipped_contention_phase_cannot_pass (test_release_smoke_swarm.ContentionWorkloadTests.test_skipped_contention_phase_cannot_pass) ... ok\ntest_sparse_conflicts_mix_repeated_and_unique_paths_in_every_project (test_release_smoke_swarm.ContentionWorkloadTests.test_sparse_conflicts_mix_repeated_and_unique_paths_in_every_project) ... ok\ntest_an_empty_queue_without_progress_is_idle_not_stalled (test_release_smoke_swarm.DrainWindowTests.test_an_empty_queue_without_progress_is_idle_not_stalled) ... ok\ntest_progress_with_queued_work_passes (test_release_smoke_swarm.DrainWindowTests.test_progress_with_queued_work_passes) ... ok\ntest_queued_work_without_progress_is_a_stall (test_release_smoke_swarm.DrainWindowTests.test_queued_work_without_progress_is_a_stall) ... ok\ntest_interpreter_header_is_dynamic (test_release_smoke_swarm.ElfTargetTests.test_interpreter_header_is_dynamic) ... ok\ntest_no_interpreter_is_static (test_release_smoke_swarm.ElfTargetTests.test_no_interpreter_is_static) ... ok\ntest_non_elf_and_truncated_headers_are_unknown (test_release_smoke_swarm.ElfTargetTests.test_non_elf_and_truncated_headers_are_unknown) ... ok\ntest_the_running_python_is_recognised (test_release_smoke_swarm.ElfTargetTests.test_the_running_python_is_recognised) ... ok\ntest_call_finished_before_the_kill_is_not_excused (test_release_smoke_swarm.KillWindowTests.test_call_finished_before_the_kill_is_not_excused) ... ok\ntest_call_in_flight_at_the_kill_is_excused (test_release_smoke_swarm.KillWindowTests.test_call_in_flight_at_the_kill_is_excused) ... ok\ntest_call_long_after_restart_is_not_excused (test_release_smoke_swarm.KillWindowTests.test_call_long_after_restart_is_not_excused) ... ok\ntest_call_started_just_after_restart_is_excused (test_release_smoke_swarm.KillWindowTests.test_call_started_just_after_restart_is_excused) ... ok\ntest_no_kill_excuses_nothing (test_release_smoke_swarm.KillWindowTests.test_no_kill_excuses_nothing) ... ok\ntest_fewer_agents_or_a_shorter_run_cannot_pass (test_release_smoke_swarm.KnobTests.test_fewer_agents_or_a_shorter_run_cannot_pass) ... ok\ntest_release_strength_can_pass (test_release_smoke_swarm.KnobTests.test_release_strength_can_pass) ... ok\ntest_skipped_phase_records_no_checks_so_it_is_no_verdict (test_release_smoke_swarm.KnobTests.test_skipped_phase_records_no_checks_so_it_is_no_verdict) ... ok\ntest_connection_errors_outside_the_kill_window_are_failures (test_release_smoke_swarm.ToolStatsTests.test_connection_errors_outside_the_kill_window_are_failures) ... ok\ntest_timed_out_calls_count_at_full_duration (test_release_smoke_swarm.ToolStatsTests.test_timed_out_calls_count_at_full_duration) ... ok\ntest_without_a_kill_every_connection_error_counts (test_release_smoke_swarm.ToolStatsTests.test_without_a_kill_every_connection_error_counts) ... ok\n\n----------------------------------------------------------------------\nRan 54 tests in 5.067s\n\nOK\n",
+      "passed": 54,
+      "failed": 0,
+      "scope": "Harness judgement/workload logic and independent real SQLite/Git content witnesses; not the Agent Mail server or new native Rust integration tests."
+    },
+    "static_checks": {
+      "pinned_toolchain": "nightly-2026-08-31-x86_64-unknown-linux-gnu",
+      "final_changed_rust_files_format_check": "PASS: rustfmt --edition 2024 --check --config skip_children=true on all five changed Rust files after incoming main changes",
+      "diff_whitespace_check": "PASS",
+      "shell_syntax_check": "PASS",
+      "ubs": {
+        "ubs-coalescer": {
+          "report_sha256": "63bb7552ae18050db86f1d3677643b7d89baedf4cec9dd97d62e0371aa975540",
+          "status": "partial",
+          "scanners": [
+            {
+              "language": "python",
+              "status": "partial",
+              "files": 2,
+              "critical": 0,
+              "warning": 9,
+              "info": 198
+            },
+            {
+              "language": "bash",
+              "status": "ok",
+              "files": 1,
+              "critical": 0,
+              "warning": 0,
+              "info": 0
+            },
+            {
+              "language": "rust",
+              "status": "ok",
+              "files": 1,
+              "critical": 0,
+              "warning": 1953,
+              "info": 565
+            }
+          ],
+          "failed_modules": [
+            {
+              "language": "python",
+              "status": "partial",
+              "module_error": "ANALYZER_ERROR",
+              "message": "Python analysis did not complete: detector sql_injection: SQLFlowLimit: SQL unknown generator consumer is unsupported; analysis is incomplete"
+            }
+          ]
+        },
+        "ubs-profile-cleanup": {
+          "report_sha256": "b06ce30a554e30da3df2bf8df413d666ba276c7cd71c930f9e4fbb71e8bbaeb2",
+          "status": "ok",
+          "scanners": [
+            {
+              "language": "rust",
+              "status": "ok",
+              "files": 4,
+              "critical": 0,
+              "warning": 737,
+              "info": 273
+            }
+          ],
+          "failed_modules": []
+        }
+      },
+      "ubs_scope_note": "Static scanner outcomes are not compiler/test qualification. Python analysis remained partial with SQLFlowLimit; warnings in large existing source/test files are retained, not hidden by an overall clean-pass claim."
+    },
+    "optional_native_git_component": {
+      "recorded_at_utc": "2026-10-30T03:00:42.279877+00:00",
+      "status": "BLOCKED_BEFORE_CARGO_LAUNCH",
+      "reason": "free_disk_below_authorized1.5GiB_floor",
+      "observed_free_disk_at_attempt_bytes": 1217941504,
+      "required_free_disk_bytes": 1610612736,
+      "current_free_disk_bytes": 1217536000,
+      "compiler_or_metadata_process_launched": false,
+      "target_directory_exists": false,
+      "tests_executed": 0,
+      "direct_manifest_pins_match_repository_lock": [
+        {
+          "name": "mcp-agent-mail-core",
+          "source": "actual repository path",
+          "path": "/workspace/scratch/b1120803451c/gh353-critical-0199ffca/crates/mcp-agent-mail-core"
+        },
+        {
+          "name": "fs2",
+          "version": "0.4.3",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+        },
+        {
+          "name": "git2",
+          "version": "0.21.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "ddddbf932745a6be37109b6112d3ee09696106f848449069d3a57bba937ab82e"
+        },
+        {
+          "name": "regex",
+          "version": "1.13.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+        },
+        {
+          "name": "rustix",
+          "version": "1.1.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+        },
+        {
+          "name": "serde",
+          "version": "1.0.229",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+        },
+        {
+          "name": "serde_json",
+          "version": "1.0.151",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+        },
+        {
+          "name": "sha2",
+          "version": "0.11.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+        },
+        {
+          "name": "shellexpand",
+          "version": "3.1.2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
+        },
+        {
+          "name": "tempfile",
+          "version": "3.27.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+        },
+        {
+          "name": "thiserror",
+          "version": "2.0.21",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+        },
+        {
+          "name": "tracing",
+          "version": "0.1.44",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+        }
+      ],
+      "resolved_dependency_graph_verification": "NOT_RUN: offline Cargo metadata was not launched; no transitive version/source proof claimed",
+      "source_manifest": {
+        "source_root": "/workspace/scratch/b1120803451c/gh353-critical-0199ffca",
+        "current_main": "33878023fea68466342774092881f92a12fa0f8c",
+        "exact_source_items": {
+          "normalize_path_pattern_key": "5c48428a0ac670588207a2f323d8e9e2837271965ed5abe18d315bff6374803c",
+          "PathProbeCacheEntry_and_CleanupProbeCache": "4e7143ed8f99409781e8946398aecb6d06fd28edb1377402b5d460d948f714f4",
+          "cleanup_observation_region": "4be47b6ee76a0e80ce3761f837ed2a97a939d8588e225a0a92bf5ab601b77fee"
+        },
+        "module_sources": {
+          "crates/mcp-agent-mail-core/src/git_binary.rs": "3a62dd1b2c3b19b4e88aa4911cb6d6a163204c0f63b2cd453dc4e15955b9b8d9",
+          "crates/mcp-agent-mail-core/src/git_cmd.rs": "ce6fbcce3d18843b74559c6652728828bb6d40e5cf973ba833daf2ed4b365fa0",
+          "crates/mcp-agent-mail-core/src/git_lock.rs": "cb57a452d5b004a6b990bb39f454afd078eae53220bf9f3916f7ab6cd112d635"
+        },
+        "scope": "Actual production core library and native Git modules plus exact cleanup observation/cache source. No DB recovery, writer admission, pool, Asupersync or request latency proof.",
+        "repository_lock_sha256": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157"
+      },
+      "prepared_native_tests": [
+        "actual_head_and_history_bypass_held_locks_while_incumbent_waits",
+        "actual_history_is_pinned_to_observed_head_after_branch_changes",
+        "actual_timed_out_history_preserves_activity_and_does_not_negative_cache"
+      ],
+      "scope": "Native Git child-process, mutex/flock, captured-HEAD and cache observation component only; DB/recovery/request outcomes remain unqualified.",
+      "files_sha256": {
+        "Cargo.lock": "a43a1f671233f733abea6b173b5487e859ba9f40dfe5202c625fd8caa3898157",
+        "Cargo.toml": "90d73fb5c5ac5123151c38fc28b43399ea9900af28c7916d8aa9f680264f6c12",
+        "incumbent-head-log.rs.txt": "89ca74ddee0968012b071f319e1fd1cf4eac9f358feea6959e110c924cd364ea",
+        "run_monitored.py": "068e2c6c319c54edf118ff8b44f5c21c685e070d0e2260d9ef838dec0d6bcbe3",
+        "source-manifest.json": "d506bf873957bc0f3b21955a55072052df92cd31bc0021d91a303a3347e7821e",
+        "src/cleanup_observation.rs": "350ac8722633b64deacc2dadce95cd7ec412ea86b4565f8a172b133249dac536",
+        "src/cleanup_tests.rs": "311d506427fa0ec02c44d371695e77948e3e548d71f3377def9a20d6cf7b3cc9",
+        "src/lib.rs": "a1318d544b663ede2be1f90989f08d8387b159eea0f1cc23717cfdab3eda436e"
+      }
+    },
+    "build_feasibility": {
+      "inspected_locked_graph": "All 19 workspace manifests and Cargo.lock matched the complete native checkout used for offline cargo tree.",
+      "asupersync_production_features": [
+        "default",
+        "nightly-outcome-try",
+        "proc-macros",
+        "tls",
+        "tls-webpki-roots"
+      ],
+      "targeted_storage_production_reduces_failing_runtime_compilation": false,
+      "targeted_storage_tests_adds": "test-internals",
+      "action": "No repeat of the already blocked full compiler path; no dependencies, features, engine backend, target or gates changed.",
+      "prior_production_failure": "The prior exact workspace production check stopped inside Asupersync before application code after the cgroup OOM counter increased; see retained cold_bootstrap_and_reservation_admission_follow_up evidence. Cgroup-wide OOM does not attribute every event to this task."
+    },
+    "required_gates_not_qualified": [
+      "cargo check --workspace --all-targets",
+      "cargo check --workspace --lib --bins on the final combined source",
+      "cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo fmt --check across the entire workspace",
+      "new native storage/server DB-Git integration regressions",
+      "full real-binary incumbent/candidate saturation and 300-second quiet convergence"
+    ],
+    "remaining": [
+      "No reproduction or causal attribution of the October 28 incident on current main.",
+      "Actual mutation repairs still use nonblocking publication-fence admission; healthy-profile progress is not a general starvation/fairness guarantee.",
+      "Cold cleanup try-if-idle does not guarantee admission under continuously active writers; analogous archive/active/pending maintenance cold paths remain separate work.",
+      "A synchronous engine/recovery/filesystem operation inside one poll cannot be interrupted midway by the pending-checkout deadline.",
+      "BusySnapshot under saturation and incomplete quiet convergence remain unresolved qualification failures.",
+      "MCP health_check can still synchronously rescan archive inventory under active publication; HTTP cached enrichment is a separate path.",
+      "Published sqlmodel-pool 0.5 pending-request diagnostics appear to retain a waiter count when a Pending acquire is dropped; capacity ownership is separate and this dependency was not changed.",
+      "No bead closure, release readiness or published binary parity claim."
+    ]
+  },
   "cold_bootstrap_and_reservation_admission_follow_up": {
     "schema": 1,
     "recorded_at_utc": "2026-10-30 02:20:45 UTC",
