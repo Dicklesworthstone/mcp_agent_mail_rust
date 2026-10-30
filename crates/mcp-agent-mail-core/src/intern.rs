@@ -716,9 +716,12 @@ mod tests {
                         if index % 128 == 0 {
                             survivors.push(handle);
                         }
-                        let retained = table.read().unwrap();
-                        assert!(retained.entries.len() <= 32);
-                        assert!(retained.retained_bytes <= 256);
+                        let (entries, retained_bytes) = {
+                            let retained = table.read().unwrap();
+                            (retained.entries.len(), retained.retained_bytes)
+                        };
+                        assert!(entries <= 32);
+                        assert!(retained_bytes <= 256);
                     }
                     survivors
                 })
@@ -758,7 +761,7 @@ mod tests {
         let first = intern("first-miss");
         let first_weak = Arc::downgrade(&first.0);
         drop(first);
-        for index in 0..INTERN_MAX_ENTRIES + 1 {
+        for index in 0..=INTERN_MAX_ENTRIES {
             let _ = intern(&format!("missing-project-{index}"));
         }
         assert!(first_weak.upgrade().is_none());
@@ -770,11 +773,12 @@ mod tests {
             .collect();
         let preload_refs: Vec<&str> = preload.iter().map(String::as_str).collect();
         pre_intern(&preload_refs);
-        {
+        let (entries, retained_bytes) = {
             let retained = INTERNER.read().unwrap();
-            assert!(retained.entries.len() < INTERN_MAX_ENTRIES);
-            assert!(retained.retained_bytes <= INTERN_MAX_BYTES);
-        }
+            (retained.entries.len(), retained.retained_bytes)
+        };
+        assert!(entries < INTERN_MAX_ENTRIES);
+        assert!(retained_bytes <= INTERN_MAX_BYTES);
         let hot = intern("retained-hit");
         let oversized = "x".repeat(INTERN_MAX_STRING_BYTES + 1);
         let uncached = intern(&oversized);

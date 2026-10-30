@@ -1633,9 +1633,10 @@ mod tests {
                         "callback holds the gate"
                     );
                     checks += 1;
-                    if checks == panic_at {
-                        panic!("liveness callback failed at check {panic_at}");
-                    }
+                    assert!(
+                        checks != panic_at,
+                        "liveness callback failed at check {panic_at}"
+                    );
                     Ok::<(), ()>(())
                 })
             }))

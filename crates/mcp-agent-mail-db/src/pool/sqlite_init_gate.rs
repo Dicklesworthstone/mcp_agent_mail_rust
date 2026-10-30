@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SqliteInitGateClaim {
+pub enum SqliteInitGateClaim {
     /// This caller must finish initialization under a completion guard.
     Initialize,
     /// Initialization already completed successfully.
@@ -28,7 +28,7 @@ enum SqliteInitGateState {
     Done,
 }
 
-pub(crate) struct SqliteInitGate {
+pub struct SqliteInitGate {
     state: Mutex<SqliteInitGateState>,
     cv: Condvar,
     #[cfg(test)]
@@ -118,7 +118,7 @@ impl SqliteInitGate {
 }
 
 /// A failed or unwinding initializer makes the gate retryable on drop.
-pub(crate) struct SqliteInitGateCompletion<'a> {
+pub struct SqliteInitGateCompletion<'a> {
     pub(crate) gate: &'a SqliteInitGate,
     pub(crate) success: bool,
 }
