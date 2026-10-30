@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -371,7 +372,19 @@ impl Store {
         Ok(Some(snapshot))
     }
 
+    #[cfg(test)]
     fn save(&self, cursor: &ReservationReconcileCursor) -> io::Result<()> {
+        self.save_with(cursor, || Ok(()))
+    }
+
+    /// Stage durable bytes before reacquiring source authority. The returned
+    /// guard covers only final ownership checks and atomic publication, not
+    /// serialization, staged-file fsync or directory fsync.
+    fn save_with<T>(
+        &self,
+        cursor: &ReservationReconcileCursor,
+        before_publish: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<()> {
         self.check_owner()?;
         let current = Binding::at(
             &self.binding.database,
@@ -404,7 +417,32 @@ impl Store {
             .tempfile_in(parent)?;
         candidate.write_all(&bytes)?;
         candidate.as_file().sync_all()?;
+        #[cfg(test)]
+        tests::observe_boundary(tests::Boundary::Staged);
+        let admission = before_publish()?;
+        // Slow staging cannot preserve ownership of a swapped checkpoint
+        // path or attach these hints to a replaced source file.
+        self.check_owner()?;
+        if Binding::at(
+            &self.binding.database,
+            &self.binding.archive,
+            self.binding.generation.clone(),
+        )? != self.binding
+        {
+            return Err(invalid(
+                "checkpoint database was replaced before publication",
+            ));
+        }
+        check_sidecar(&self.path)?;
+        #[cfg(test)]
+        tests::observe_boundary(tests::Boundary::Admitted);
         candidate.persist(&self.path).map_err(|error| error.error)?;
+        drop(admission);
+        #[cfg(test)]
+        tests::observe_boundary(tests::Boundary::Published);
+        // A later promotion may now proceed. The published hints still name
+        // the old binding, so their durability cannot grant authority to the
+        // new generation. Retain our independent checkpoint flock throughout.
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
         Ok(())
@@ -419,11 +457,9 @@ fn warn_unavailable(error: &io::Error) {
     );
 }
 
-/// Called only after ordinary source, writable-pool and corruption admission.
-///
-/// The caller retains its write-activity lease through save, but no archive
-/// lock or database connection is held during checkpoint I/O.
-pub(super) fn run_admitted(
+/// Ordinary writable-source admission has completed, but no database activity
+/// or connection spans this wrapper. Each source scope admits independently.
+pub(super) fn run(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
@@ -431,7 +467,7 @@ pub(super) fn run_admitted(
     stop: &AtomicBool,
 ) -> Result<ReservationReconcileReport, String> {
     if !cursor.retries.checkpoint.enabled {
-        return super::run_admitted(cx, pool, config, cursor, stop);
+        return super::run_batch(cx, pool, config, cursor, stop, None);
     }
     let mut state = std::mem::take(&mut cursor.retries.checkpoint);
     let result = run_with_state(cx, pool, config, cursor, stop, &mut state);
@@ -447,7 +483,10 @@ fn run_with_state(
     stop: &AtomicBool,
     state: &mut State,
 ) -> Result<ReservationReconcileReport, String> {
-    let binding = Binding::capture(cx, pool, config)?;
+    let binding = {
+        let _admission = super::admit_source(pool, config, Some(&cursor.source_identity))?;
+        Binding::capture(cx, pool, config)?
+    };
     if state
         .binding
         .as_ref()
@@ -464,10 +503,23 @@ fn run_with_state(
     state.binding = Some(binding.clone());
     let mut restored = false;
     if state.store.is_none() && !state.memory_only {
-        match Store::open(binding) {
+        match Store::open(binding.clone()) {
             Ok(store) => {
                 match store.load() {
                     Ok(Some(snapshot)) => {
+                        #[cfg(test)]
+                        tests::observe_boundary(tests::Boundary::Loaded);
+                        // Checkpoint I/O deliberately ran without promotion
+                        // exclusion. Revalidate before applying any old hint.
+                        let _admission =
+                            super::admit_source(pool, config, Some(&cursor.source_identity))?;
+                        if Binding::capture(cx, pool, config)? != binding {
+                            cursor.source_identity.clear();
+                            return Err(
+                                "reservation checkpoint source changed before restore; rescan required"
+                                    .into(),
+                            );
+                        }
                         snapshot.restore(cursor, Instant::now(), mcp_agent_mail_db::now_micros());
                         restored = true;
                     }
@@ -483,11 +535,18 @@ fn run_with_state(
             }
         }
     }
-    let result = super::run_admitted(cx, pool, config, cursor, stop);
+    let result = super::run_batch(
+        cx,
+        pool,
+        config,
+        cursor,
+        stop,
+        Some(binding.generation.as_deref()),
+    );
     let saved = if corruption_circuit_breaker().is_tripped() {
         false
     } else if let Some(store) = &state.store {
-        match store.save(cursor) {
+        match save_current(cx, pool, config, cursor, stop, store) {
             Ok(()) => true,
             Err(error) => {
                 warn_unavailable(&error);
@@ -505,9 +564,358 @@ fn run_with_state(
     result
 }
 
+/// Stage without database activity, then bind the short rename window to a
+/// fresh live-source observation. Failed admission preserves the old snapshot
+/// and all in-memory debt; the independent flock prevents a competing writer
+/// from replacing it while this cursor retries.
+fn save_current(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReservationReconcileCursor,
+    stop: &AtomicBool,
+    store: &Store,
+) -> io::Result<()> {
+    let check_live = || {
+        if stop.load(Ordering::Acquire)
+            || cx.checkpoint().is_err()
+            || corruption_circuit_breaker().is_tripped()
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "reservation checkpoint publication interrupted",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_live()?;
+    let source_identity = cursor.source_identity.clone();
+    let mut changed = false;
+    let result = store.save_with(cursor, || {
+        check_live()?;
+        let admission =
+            super::admit_source(pool, config, Some(&source_identity)).map_err(io::Error::other)?;
+        if Binding::capture(cx, pool, config).map_err(io::Error::other)? != store.binding {
+            changed = true;
+            return Err(invalid(
+                "reservation checkpoint source changed during reconciliation",
+            ));
+        }
+        check_live()?;
+        Ok(admission)
+    });
+    if changed {
+        // A subsequent pass must discard this binding's in-memory positions
+        // as well as refusing its staged durable snapshot.
+        cursor.source_identity.clear();
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Boundary {
+        Loaded,
+        Staged,
+        Admitted,
+        Published,
+    }
+
+    type BoundaryObserver = Box<dyn FnMut(Boundary)>;
+
+    std::thread_local! {
+        static BOUNDARY_OBSERVER: std::cell::RefCell<Option<BoundaryObserver>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_boundary(boundary: Boundary) {
+        BOUNDARY_OBSERVER.with(|slot| {
+            if let Some(observer) = slot.borrow_mut().as_mut() {
+                observer(boundary);
+            }
+        });
+    }
+
+    struct ObserveBoundary;
+
+    impl ObserveBoundary {
+        fn new(observer: impl FnMut(Boundary) + 'static) -> Self {
+            BOUNDARY_OBSERVER.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(observer));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ObserveBoundary {
+        fn drop(&mut self) {
+            BOUNDARY_OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    #[test]
+    fn checkpoint_staging_and_directory_sync_do_not_retain_database_activity() {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        super::super::super::tests::fixture(|cx, pool, config| {
+            let binding = Binding::capture(cx, pool, config).unwrap();
+            let observations = Rc::new(RefCell::new(Vec::new()));
+            let observed = Rc::clone(&observations);
+            let observer_binding = binding.clone();
+            let observer = ObserveBoundary::new(move |stage| {
+                let writers = active_writer_count();
+                let promotion = try_acquire_promotion_barrier_if_idle();
+                let checkpoint_owned =
+                    Store::open(observer_binding.clone()).is_err_and(|error| contended(&error));
+                observed
+                    .borrow_mut()
+                    .push((stage, writers, promotion.is_some(), checkpoint_owned));
+            });
+            let mut cursor = ReservationReconcileCursor::default();
+            let result = cursor.reconcile_checkpointed(cx, pool, config, &AtomicBool::new(false));
+            drop(observer);
+            assert_eq!(result.unwrap().repaired, 1);
+            assert_eq!(
+                *observations.borrow(),
+                [
+                    (Boundary::Staged, 0, true, true),
+                    (Boundary::Admitted, 1, false, true),
+                    (Boundary::Published, 0, true, true),
+                ]
+            );
+            let bytes = std::fs::read(binding.path().unwrap()).unwrap();
+            let snapshot: Snapshot = serde_json::from_slice(&bytes).unwrap();
+            snapshot.validate(&binding).unwrap();
+            assert!(snapshot.retries.is_empty());
+            assert_eq!(active_writer_count(), 0);
+        });
+    }
+
+    fn persisted_retry(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+    ) -> (ReservationReconcileCursor, Binding, Vec<u8>) {
+        let archive = crate::ensure_archive(config, "project").unwrap();
+        let process = crate::archive_process_lock(&archive).unwrap();
+        let _held = process.lock().unwrap();
+        let mut cursor = ReservationReconcileCursor::default();
+        let report = cursor
+            .reconcile_checkpointed(cx, pool, config, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!((report.deferred_transient, report.retry_len), (1, 1));
+        let binding = Binding::capture(cx, pool, config).unwrap();
+        let bytes = std::fs::read(binding.path().unwrap()).unwrap();
+        (cursor, binding, bytes)
+    }
+
+    fn save_pending(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        cursor: &mut ReservationReconcileCursor,
+        stop: &AtomicBool,
+    ) -> io::Result<()> {
+        let state = std::mem::take(&mut cursor.retries.checkpoint);
+        let result = save_current(
+            cx,
+            pool,
+            config,
+            cursor,
+            stop,
+            state.store.as_ref().unwrap(),
+        );
+        cursor.retries.checkpoint = state;
+        result
+    }
+
+    #[test]
+    fn promotion_during_staging_preserves_checkpoint_and_retry_until_resume() {
+        use mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        super::super::super::tests::fixture(|cx, pool, config| {
+            let (mut cursor, binding, previous) = persisted_retry(cx, pool, config);
+            let stop = AtomicBool::new(false);
+            let held = Rc::new(RefCell::new(None));
+            let observer_held = Rc::clone(&held);
+            let stages = Rc::new(RefCell::new(Vec::new()));
+            let observer_stages = Rc::clone(&stages);
+            let observer = ObserveBoundary::new(move |stage| {
+                observer_stages.borrow_mut().push(stage);
+                if stage == Boundary::Staged {
+                    *observer_held.borrow_mut() = Some(
+                        try_acquire_promotion_barrier_if_idle()
+                            .expect("staged checkpoint retained promotion exclusion"),
+                    );
+                }
+            });
+            let error = save_pending(cx, pool, config, &mut cursor, &stop).unwrap_err();
+            drop(observer);
+            let promotion_admitted = held.borrow().is_some();
+            drop(held.borrow_mut().take());
+            assert!(promotion_admitted);
+            assert!(error.to_string().contains("admission contention"));
+            assert_eq!(*stages.borrow(), [Boundary::Staged]);
+            assert_eq!(std::fs::read(binding.path().unwrap()).unwrap(), previous);
+            assert_eq!(cursor.retries.pending.len(), 1);
+            assert_eq!(cursor.retries.pending[0].id, 401);
+            assert_eq!(cursor.retries.pending[0].attempts, 0);
+            assert!(contended(&Store::open(binding.clone()).unwrap_err()));
+
+            save_pending(cx, pool, config, &mut cursor, &stop).unwrap();
+            let snapshot: Snapshot =
+                serde_json::from_slice(&std::fs::read(binding.path().unwrap()).unwrap()).unwrap();
+            snapshot.validate(&binding).unwrap();
+            assert_eq!(snapshot.retries[0].id, 401);
+            let report = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!((report.repaired, report.retry_len), (1, 0));
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    fn exercise_generation_change(boundary: Boundary) {
+        use mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::super::tests::fixture(|cx, pool, config| {
+            let (mut cursor, binding, previous) = persisted_retry(cx, pool, config);
+            if boundary == Boundary::Loaded {
+                // Drop the real checkpoint flock as an exiting worker would.
+                cursor = ReservationReconcileCursor::default();
+            }
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let process = crate::archive_process_lock(&archive).unwrap();
+            let held = process.lock().unwrap();
+            let changed = Rc::new(Cell::new(false));
+            let observer_changed = Rc::clone(&changed);
+            let observer_pool = pool.clone();
+            let observer_cx = cx.clone();
+            let observer = ObserveBoundary::new(move |stage| {
+                if stage != boundary || observer_changed.replace(true) {
+                    return;
+                }
+                let _promotion = try_acquire_promotion_barrier_if_idle()
+                    .expect("checkpoint I/O retained promotion exclusion");
+                let conn = outcome(block_on(observer_pool.acquire(&observer_cx))).unwrap();
+                conn.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0")
+                    .unwrap();
+            });
+            let stop = AtomicBool::new(false);
+            let result = cursor.reconcile_checkpointed(cx, pool, config, &stop);
+            drop(observer);
+            drop(held);
+            assert!(changed.get());
+            if boundary == Boundary::Loaded {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("source changed before restore")
+                );
+                assert_eq!(cursor.history.after, 0);
+                assert!(
+                    cursor.retries.pending.is_empty(),
+                    "foreign hints were restored"
+                );
+            } else {
+                assert_eq!(result.unwrap().deferred_transient, 1);
+                assert_eq!(cursor.retries.pending.len(), 1);
+                assert_eq!(
+                    (
+                        cursor.retries.pending[0].id,
+                        cursor.retries.pending[0].attempts
+                    ),
+                    (401, 1)
+                );
+            }
+            assert!(cursor.source_identity.is_empty());
+            assert_eq!(std::fs::read(binding.path().unwrap()).unwrap(), previous);
+            for generation in ["aabb", "ccdd"] {
+                assert!(
+                    !config
+                        .storage_root
+                        .join(format!(
+                            "projects/project/file_reservations/id-401-g{generation}.json"
+                        ))
+                        .exists()
+                );
+            }
+            let current = Binding::capture(cx, pool, config).unwrap();
+            assert_eq!(current.file_identity, binding.file_identity);
+            assert_eq!(current.generation.as_deref(), Some("ccdd"));
+            let resumed = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!((resumed.repaired, resumed.retry_len), (1, 0));
+            assert!(
+                config
+                    .storage_root
+                    .join("projects/project/file_reservations/id-401-gccdd.json")
+                    .is_file()
+            );
+            let snapshot: Snapshot =
+                serde_json::from_slice(&std::fs::read(current.path().unwrap()).unwrap()).unwrap();
+            snapshot.validate(&current).unwrap();
+            assert!(snapshot.retries.is_empty());
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn loaded_checkpoint_is_revalidated_before_restoring_hints() {
+        exercise_generation_change(Boundary::Loaded);
+    }
+
+    #[test]
+    fn staged_checkpoint_cannot_publish_after_same_inode_generation_change() {
+        exercise_generation_change(Boundary::Staged);
+    }
+
+    #[test]
+    fn cancellation_during_staging_preserves_previous_checkpoint_and_debt() {
+        use std::sync::Arc;
+
+        super::super::super::tests::fixture(|cx, pool, config| {
+            let (mut cursor, binding, previous) = persisted_retry(cx, pool, config);
+            let stop = Arc::new(AtomicBool::new(false));
+            let observer_stop = Arc::clone(&stop);
+            let observer = ObserveBoundary::new(move |stage| {
+                assert_eq!(stage, Boundary::Staged);
+                observer_stop.store(true, Ordering::Release);
+            });
+            let result = save_pending(cx, pool, config, &mut cursor, &stop);
+            drop(observer);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert_eq!(std::fs::read(binding.path().unwrap()).unwrap(), previous);
+            assert_eq!(cursor.retries.pending.len(), 1);
+            assert_eq!(
+                (
+                    cursor.retries.pending[0].id,
+                    cursor.retries.pending[0].attempts
+                ),
+                (401, 0)
+            );
+            assert!(contended(&Store::open(binding).unwrap_err()));
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+            stop.store(false, Ordering::Release);
+            save_pending(cx, pool, config, &mut cursor, &stop).unwrap();
+        });
+    }
 
     fn binding_fixture() -> (tempfile::TempDir, Binding) {
         let temp = tempfile::tempdir().unwrap();
@@ -668,6 +1076,41 @@ mod tests {
         assert!(store.save(&debt(Instant::now())).is_err());
         assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_rechecks_checkpoint_owner_after_source_admission() {
+        let (temp, binding) = binding_fixture();
+        let store = Store::open(binding).unwrap();
+        let cursor = debt(Instant::now());
+        store.save(&cursor).unwrap();
+        let previous = std::fs::read(&store.path).unwrap();
+        let old_lock = temp.path().join("old-lock");
+        let result = store.save_with(&cursor, || {
+            std::fs::rename(&store.lock_path, &old_lock)?;
+            std::fs::write(&store.lock_path, b"replacement owner")?;
+            Ok(())
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("owner inode changed")
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), previous);
+        assert_eq!(
+            std::fs::read(&store.lock_path).unwrap(),
+            b"replacement owner"
+        );
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(old_lock)
+            .unwrap();
+        assert!(contended(
+            &FileExt::try_lock_exclusive(&contender).unwrap_err()
+        ));
     }
 
     #[test]

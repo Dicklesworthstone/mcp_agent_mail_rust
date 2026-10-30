@@ -853,8 +853,10 @@ pub fn reconcile_released_reservation(
 /// finite history for manual review, not the contention retry lane. Retry debt
 /// is process-local; restarting safely starts new finite source scans.
 /// Source connections are acquired before archive locks and released before
-/// Git I/O; a write-activity lease prevents recovery promotion from replacing
-/// the source during the pass.
+/// Git I/O. Each selection and individual publication has its own source
+/// admission lease; recovery promotion can proceed between items. Checkpoint
+/// preparation holds no database activity, and its atomic publication rechecks
+/// the live source binding under a fresh lease.
 /// Closed or contended admission defers without advancing cursors or retries.
 pub fn reconcile_reservation_releases(
     cx: &Cx,

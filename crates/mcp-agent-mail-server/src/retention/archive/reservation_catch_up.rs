@@ -101,10 +101,11 @@ fn run_with(
                         | "reservation reconciliation deferred: checkpoint owned by another worker"
                 ) =>
             {
-                // No reservation scan or release was admitted. Retain the
-                // healthy pool/cursor and yield to the short worker pause,
-                // rather than retiring the pool or discarding checkpoint
-                // ownership. Source/generation failures remain errors below.
+                // These refusals carry no completed report. A pass that
+                // completed source work before deferring returns its partial
+                // report instead. Retain the healthy pool/cursor and yield
+                // without discarding checkpoint ownership. Source/generation
+                // failures remain errors below.
                 if cancelled() {
                     return Ok(false);
                 }
@@ -513,35 +514,62 @@ mod tests {
 
     #[test]
     fn admission_after_progress_preserves_observations_and_recovers_next_turn() {
-        let mut calls = 0;
-        let mut observed = Vec::new();
-        let backlog = run_with(
-            || {
-                calls += 1;
-                if calls == 1 {
-                    Ok(busy_report())
-                } else {
-                    Err("reservation reconciliation deferred: recovery promotion or admission contention"
-                        .to_string())
-                }
-            },
-            |report| observed.push(report.repaired),
-            || Duration::ZERO,
-            || false,
-        )
-        .unwrap();
-        assert!(backlog);
-        assert_eq!(calls, 2);
-        assert_eq!(observed, [4]);
-        assert!(
-            !run_with(
-                || Ok(ReservationReconcileReport::default()),
-                |_| {},
+        // Storage can yield after one publication when promotion starts
+        // between items. Its partial report must reach the health observer
+        // exactly once, just like a completed four-publication batch.
+        for completed in [1, 4] {
+            let mut calls = 0;
+            let mut observed = Vec::new();
+            let backlog = run_with(
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        Ok(ReservationReconcileReport {
+                            scanned: completed,
+                            attempted: completed,
+                            repaired: completed,
+                            budget_exhausted: true,
+                            ..Default::default()
+                        })
+                    } else {
+                        Err("reservation reconciliation deferred: recovery promotion or admission contention"
+                            .to_string())
+                    }
+                },
+                |report| {
+                    observed.push((report.scanned, report.attempted, report.repaired));
+                },
                 || Duration::ZERO,
                 || false,
             )
-            .unwrap()
-        );
+            .unwrap();
+            assert!(backlog);
+            assert_eq!(calls, 2);
+            assert_eq!(observed, [(completed, completed, completed)]);
+            assert_eq!(
+                super::super::next_poll_interval(Duration::from_secs(60), backlog),
+                Duration::from_secs(1)
+            );
+            assert!(
+                !run_with(
+                    || {
+                        Ok(ReservationReconcileReport {
+                            scanned: 1,
+                            attempted: 1,
+                            repaired: 1,
+                            ..Default::default()
+                        })
+                    },
+                    |report| {
+                        observed.push((report.scanned, report.attempted, report.repaired));
+                    },
+                    || Duration::ZERO,
+                    || false,
+                )
+                .unwrap()
+            );
+            assert_eq!(observed, [(completed, completed, completed), (1, 1, 1)]);
+        }
     }
 
     #[test]
