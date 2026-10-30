@@ -106,6 +106,11 @@ impl Binding {
     fn at(database: &Path, archive: &Path, generation: Option<String>) -> io::Result<Self> {
         let database = std::fs::canonicalize(database)?;
         let archive = std::fs::canonicalize(archive)?;
+        #[cfg(windows)]
+        let source = mcp_agent_mail_core::disk::open_regular_file_no_follow(&database)?;
+        #[cfg(windows)]
+        let metadata = source.metadata()?;
+        #[cfg(not(windows))]
         let metadata = std::fs::metadata(&database)?;
         if !metadata.is_file() {
             return Err(invalid("checkpoint source is not a regular database file"));
@@ -120,7 +125,16 @@ impl Binding {
             use std::os::unix::fs::MetadataExt;
             format!("{}:{}:{created:?}", metadata.dev(), metadata.ino())
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let file_identity = {
+            let (volume, index) = mcp_agent_mail_core::disk::windows_file_identity(&source)?;
+            let created =
+                created.ok_or_else(|| invalid("checkpoint source has no stable file identity"))?;
+            // NTFS can preserve creation time when a different file replaces
+            // this path. Bind to the opened file's identity as well.
+            format!("{volume}:{index}:{created:?}")
+        };
+        #[cfg(not(any(unix, windows)))]
         let file_identity = format!(
             "{:?}",
             created.ok_or_else(|| invalid("checkpoint source has no stable file identity"))?
@@ -327,6 +341,12 @@ impl Store {
                 .mode(0o600)
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
         let lock = options.open(&lock_path)?;
         let store = Self {
             binding,
@@ -351,6 +371,16 @@ impl Store {
             use std::os::unix::fs::MetadataExt;
             if held.nlink() != 1 || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
                 return Err(invalid("checkpoint owner inode changed"));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let named_file =
+                mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.lock_path)?;
+            if mcp_agent_mail_core::disk::windows_file_identity(&self.lock)?
+                != mcp_agent_mail_core::disk::windows_file_identity(&named_file)?
+            {
+                return Err(invalid("checkpoint owner file identity changed"));
             }
         }
         Ok(())
@@ -927,6 +957,19 @@ mod tests {
         (temp, binding)
     }
 
+    #[cfg(windows)]
+    fn match_creation_time(path: &Path, original: &File) {
+        use std::os::windows::fs::FileTimesExt as _;
+
+        let created = original.metadata().unwrap().created().unwrap();
+        let replacement =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path).unwrap();
+        replacement
+            .set_times(std::fs::FileTimes::new().set_created(created))
+            .unwrap();
+        assert_eq!(replacement.metadata().unwrap().created().unwrap(), created);
+    }
+
     fn debt(now: Instant) -> ReservationReconcileCursor {
         let mut cursor = ReservationReconcileCursor {
             source_identity: "current-process".into(),
@@ -1014,8 +1057,13 @@ mod tests {
         snapshot.retries[0].wait_us = 60_000_001;
         assert!(snapshot.validate(&binding).is_err());
         snapshot.retries[0].wait_us = 0;
+        #[cfg(windows)]
+        let retained =
+            mcp_agent_mail_core::disk::open_regular_file_no_follow(&binding.database).unwrap();
         std::fs::rename(&binding.database, temp.path().join("old.sqlite3")).unwrap();
         std::fs::write(&binding.database, b"replacement source").unwrap();
+        #[cfg(windows)]
+        match_creation_time(&binding.database, &retained);
         let replacement = Binding::at(
             &binding.database,
             &binding.archive,
@@ -1078,7 +1126,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn publication_rechecks_checkpoint_owner_after_source_admission() {
         let (temp, binding) = binding_fixture();
@@ -1090,13 +1138,23 @@ mod tests {
         let result = store.save_with(&cursor, || {
             std::fs::rename(&store.lock_path, &old_lock)?;
             std::fs::write(&store.lock_path, b"replacement owner")?;
+            #[cfg(windows)]
+            match_creation_time(&store.lock_path, &store.lock);
             Ok(())
         });
+        #[cfg(unix)]
         assert!(
             result
                 .unwrap_err()
                 .to_string()
                 .contains("owner inode changed")
+        );
+        #[cfg(windows)]
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("owner file identity changed")
         );
         assert_eq!(std::fs::read(&store.path).unwrap(), previous);
         assert_eq!(

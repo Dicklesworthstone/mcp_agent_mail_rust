@@ -274,3 +274,173 @@ operation in that environment; it does not retroactively instrument the
 reporter's native v0.3.39 process. The new warning fields distinguish that
 operation from lock, read, sync, and replacement failures in a future native
 report.
+
+## 2026-10-30 follow-up: native availability, file identity, and publication ownership
+
+### Native qualification is still outstanding
+
+The investigation resumed at `6bbadb7a95b22aa2af6dca3ea14b6751e52a27ea` and
+incorporated concurrent changes through
+`a40050d666086a4b005f4068581944ccd90f097d` without replacing unrelated work.
+
+The repository Actions runs API returned zero runs created on or after
+2026-10-29 and zero runs for each of `e460081d`, `e795a951`, `b12861ad`, and
+the inspected main revisions. The most recent Archive Fsync Matrix run found
+was [32154617836](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/actions/runs/32154617836),
+from August 18, before these fixes; its jobs did not include Windows.
+
+The execution blocker is now directly identified: the authenticated
+[repository Actions settings](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/settings/actions)
+showed **Disable actions** selected, with the explanation that the Actions tab
+is hidden and no workflows can run. No repository execution policy was changed.
+Rerunning an August job would execute the old source and cannot qualify this
+correction. No available native Windows worker was obtained.
+
+### Additional correctness defects and corrections
+
+**Creation timestamps are not Windows file identity.** The Windows source
+bindings and message/agent/active checkpoint ownership checks used creation
+time alone; terminal checkpoints had no corresponding Windows file-identity
+comparison. NTFS can retain creation time across rename/recreation through its
+tunnel cache. This is documented by Microsoft in
+[GetFileTime](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletime)
+and [FltGetTunneledName](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltgettunneledname).
+A different file can therefore pass a timestamp-only comparison.
+
+The new shared `windows_file_identity` helper obtains the volume serial number
+and 64-bit file index from an already-open handle using the existing pinned
+`cap-std`/`cap-fs-ext` dependencies. Their pinned `winx` implementation calls
+`GetFileInformationByHandle` and propagates native failure; there is no
+timestamp or placeholder-ID fallback. Microsoft documents
+[volume/file-index comparison](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle)
+as a way to identify the same underlying target. No dependency or unsafe
+repository code was added.
+
+All four checkpoint bindings now read Windows source metadata from a no-follow
+regular-file handle and include its volume/file index alongside the existing
+creation timestamp. Ownership checks compare the retained lock with a freshly
+opened no-follow handle for the named lock. The three adjacent stores also
+open Windows lock leaves with `FILE_FLAG_OPEN_REPARSE_POINT`; the message
+store retains its existing opened-handle reparse/hard-link validation.
+
+The serialized schema and logical mailbox-generation checks are unchanged.
+Previously written Windows bindings containing only timestamps no longer
+match and take the existing conservative rescan path. This changes scheduling
+hints, not mailbox authority. Ordinary writes must still preserve the binding.
+The helper exposes the API's 64-bit identity; no full ReFS 128-bit identity or
+UNC-share qualification is claimed.
+
+**Active-reservation publication needed a final ownership check.** That store
+previously validated ownership only before staging. It now revalidates the
+lock, checkpoint target, and source binding after the actual staged write and
+file sync, immediately before atomic publication. A private callback allows
+tests to replace a lock or database at that precise boundary; production uses
+a no-op. Previous checkpoint bytes remain intact when revalidation fails.
+
+The existing bounded reads, private same-directory staging, complete staged
+writes and sync, atomic replacement, retry-debt/cursor validation, live-source
+authorization, and Unix safeguards remain. No delete-then-rename publication
+or Wine-specific assertion relaxation was introduced.
+
+### Regressions and completed execution
+
+Windows regression fixtures explicitly copy the original creation timestamp
+onto a distinct replacement using the stable `FileTimesExt::set_created` API.
+They do not depend on tunnel-cache timing. Coverage includes stable identity
+across ordinary writes/reopening/hard links/rename, source replacement with an
+unchanged logical generation, old-owner read/write refusal, legitimate new-owner
+continuation, and replacement during staged publication.
+
+The message lifecycle component also retains the real subprocess restart
+test: a child exits after syncing the staged candidate, and a fresh process
+restores the prior paired watermark/retry debt. That is a specific process-exit
+boundary, not arbitrary crash timing or power loss.
+
+| Check on this follow-up | Result | Exact scope |
+|---|---|---|
+| Native Linux filesystem components, overlay-backed fixtures | 54 passed, 0 failed, 0 ignored; exit 0 | 29 message, 9 active-reservation, 7 agent, 6 terminal-reservation, and 3 path tests |
+| Final restored Linux component rerun, tmpfs fixtures | 54 passed, 0 failed, 0 ignored; exit 0 | Same final production excerpts and repository-matching dependency lock, after the negative control |
+| Intentional scratch negative control | 1 passed, 2 expected failures; exit 101 | Removing only active post-staging revalidation let both stale publications incorrectly succeed; the unchanged terminal control passed |
+| Final Windows MSVC component typecheck from Linux | Passed; exit 0 | `cargo check --tests --locked --offline --target x86_64-pc-windows-msvc`; all four filesystem components, core identity helper, and selected Windows test bodies; **no Windows execution** |
+| Source/dependency reconstruction audit | Passed | 95 byte-identical production excerpts; every byte of 8 generated files accounted for by those excerpts and declared import/module glue; 14 source-file hashes matched; all 106 external versions, sources, and checksums matched the repository lockfile |
+| Workspace formatting and whitespace | Passed; exit 0 | Pinned `cargo fmt --all -- --check` and `git diff --check` |
+| Workflow static validation | Passed | YAML parsing, Bash syntax, and preservation of all five existing test gates |
+| Native Windows/MSVC/NTFS runtime | Not run | Blocked by repository Actions policy; no alternate native host was available |
+| Wine | Not run in this follow-up | Earlier Wine failures and their limits remain unchanged |
+
+The component harness extracts production code and tests without changing
+their algorithms or assertions. It explicitly excludes live database
+capture/authorization, reconciliation-worker integration, Git operations, and
+MCP execution. Real filesystem, subprocess, serialization, clock, and locking
+implementations are retained. These passes do not qualify the complete storage
+crate or a shipped Windows binary. A harness-only unused-import warning remains
+because the corresponding live-database tests are excluded.
+
+The final checks used `nightly-2026-08-31`,
+`rustc 1.100.0-nightly (908501772 2026-08-30)`. The Windows target standard library
+was verified against its official distribution checksum. The initial matched
+54-test Linux run completed before the shared overlay filled. An attempted
+post-control rerun then failed with `No space left on device`; preserving all
+files, the final checks were completed with an approved memory-backed target
+and temporary directory. This is why the final Linux rerun is explicitly
+identified as tmpfs evidence.
+
+Completed log SHA-256 receipts:
+
+```text
+Linux overlay component run (54 passed)
+b4a2ae76eaa8caf14e9bbd9978c0b0e74ba991341a92945fde3aa43436a71ebb
+Linux final tmpfs component run (54 passed)
+89e8b54a8c47ebf92de12707f0746b390ad2906b4919a79cb5f3a2babc63c93c
+Final Windows MSVC cross-target typecheck (exit 0)
+66aea41a9dd374cfd588f353cbaa2433c4fb7501af1d0512ad59b178ec7a4dff
+Final negative-control run (two expected active-publication failures)
+1c9f5711f16dcb629620dfbcc18c9f163425059f6b71a00fb685ad1d8276e4fc
+Component dependency lockfile
+e3096b2eaddeefb5e9044d8bfed42048a8df8fc6eeceaa4131200141c3398d24
+```
+
+### Full-build limitations
+
+The full portable storage checkpoint suite was attempted with the pinned
+compiler, the repository lockfile, one Cargo job, no incremental compilation,
+no debug information, optimization level zero, and 512 test-profile codegen
+units. It exited 101 when the Asupersync 0.5.0 compiler received SIGKILL before
+the changed storage crate was compiled. The shared 8 GiB cgroup's OOM-kill
+counter increased, and the shared overlay also exhausted its available space.
+This is a failed full-crate gate, not a storage compiler diagnostic or a pass.
+
+The separate portable production-library gate,
+`cargo check --locked --offline -p mcp-agent-mail-storage --no-default-features
+--features portable --lib`, was also attempted in the memory-backed target.
+It exited 101 when Asupersync's compiler received signal 9 (SIGKILL), before
+compiling the changed storage crate. Its log SHA-256 is
+`db822c908ba83946ce58bb72fe6204da528a4da51f831e1669dadf48efaecfa1`.
+This production gate remains unverified.
+
+The required workspace all-targets check, production-only `--lib --bins`
+check, and Clippy `--all-targets -- -D warnings` were each attempted with
+`--locked --offline`. All exited 101 because `addr2line 0.25.1` was not cached;
+the full disk prevented further ordinary dependency downloads. No workspace
+build or Clippy pass is claimed. UBS was not installed.
+
+### Prepared native workflow and remaining qualification
+
+Archive Fsync Matrix retains its independent production-library check and all
+five nonempty, nonignored path/checkpoint test gates. It now also:
+
+- Triggers on changes to the shared core disk helpers.
+- Requires an actual `x86_64-pc-windows-msvc` compiler host.
+- Compiles and runs a native Rust probe for the test fixture temporary directory.
+- Resolves a real witness file's volume with `Get-Volume -FilePath`, requires
+  NTFS, and records a JSON environment receipt even if the check fails.
+- Keeps subsequent Cargo tests on that measured temporary directory and MSVC target.
+- Executes the core Windows file-identity regression and retains its log.
+
+The PowerShell environment gate has not executed in this session. Native
+canonical/long-path behavior, symlink/reparse and hard-link rejection, actual
+NTFS identity, Windows lock contention, interrupted publication, atomic
+replacement, and persistence across fresh Windows processes still require a
+successful run of the prepared workflow on the corrected source. The complete
+live-database recovery path and production feature graph must also pass.
+Issue #369 remains open pending that native qualification.

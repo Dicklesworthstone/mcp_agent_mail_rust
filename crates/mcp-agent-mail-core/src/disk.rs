@@ -15,6 +15,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Bytes per MiB.
 const MIB: u64 = 1024 * 1024;
 
+/// Read the Windows volume serial number and 64-bit file index from an open file.
+///
+/// These identify the retained file on NTFS even when its name is replaced by
+/// another file with the same creation time. NTFS can preserve creation times
+/// through file tunneling, so timestamps alone are not ownership evidence.
+/// This uses the same stable capability metadata API as the link-count probe;
+/// it does not reopen a pathname or substitute timestamps on failure. The
+/// underlying API exposes 64-bit indexes, not ReFS's full 128-bit file IDs.
+#[cfg(windows)]
+pub fn windows_file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+    let retained = cap_std::fs::File::from_std(file.try_clone()?);
+    let metadata = retained.metadata()?;
+    Ok((
+        cap_fs_ext::MetadataExt::dev(&metadata),
+        cap_fs_ext::MetadataExt::ino(&metadata),
+    ))
+}
+
 /// Read the Windows hard-link count from an already-open file authority.
 ///
 /// The capability metadata wrapper supplies stable handle information. Cloning
@@ -1298,6 +1316,46 @@ mod tests {
         ] {
             assert!(!is_host_storage_exhaustion_message(text), "{text}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_survives_writes_and_distinguishes_equal_creation_time_replacement() {
+        use std::os::windows::fs::FileTimesExt as _;
+
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let alias = dir.path().join("alias");
+        let moved = dir.path().join("moved");
+        std::fs::write(&source, b"original").unwrap();
+        let authority = open_regular_file_no_follow(&source).unwrap();
+        let identity = windows_file_identity(&authority).unwrap();
+        std::fs::write(&source, b"ordinary writes change length and mtime").unwrap();
+        assert_eq!(windows_file_identity(&authority).unwrap(), identity);
+        let reopened = open_regular_file_no_follow(&source).unwrap();
+        assert_eq!(windows_file_identity(&reopened).unwrap(), identity);
+
+        std::fs::hard_link(&source, &alias).unwrap();
+        let linked = open_regular_file_no_follow(&alias).unwrap();
+        assert_eq!(windows_file_identity(&linked).unwrap(), identity);
+        std::fs::rename(&source, &moved).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        let replacement = open_regular_file_read_write_no_follow(&source).unwrap();
+        // Make the collision deterministic, without depending on the volume's
+        // optional tunneling cache or on timestamp resolution.
+        let created = authority.metadata().unwrap().created().unwrap();
+        replacement
+            .set_times(std::fs::FileTimes::new().set_created(created))
+            .unwrap();
+        assert_eq!(replacement.metadata().unwrap().created().unwrap(), created);
+        assert_eq!(windows_file_identity(&authority).unwrap(), identity);
+        assert_eq!(windows_file_identity(&linked).unwrap(), identity);
+        assert_ne!(windows_file_identity(&replacement).unwrap(), identity);
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(&moved).unwrap(),
+            b"ordinary writes change length and mtime"
+        );
     }
 
     #[cfg(windows)]

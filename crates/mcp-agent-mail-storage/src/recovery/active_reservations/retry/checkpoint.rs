@@ -61,6 +61,11 @@ impl Binding {
         }
         let database = std::fs::canonicalize(database)?;
         let archive = std::fs::canonicalize(archive)?;
+        #[cfg(windows)]
+        let source = mcp_agent_mail_core::disk::open_regular_file_no_follow(&database)?;
+        #[cfg(windows)]
+        let metadata = source.metadata()?;
+        #[cfg(not(windows))]
         let metadata = std::fs::metadata(&database)?;
         if !metadata.is_file() || !archive.is_dir() {
             return Err(invalid(
@@ -77,7 +82,15 @@ impl Binding {
             use std::os::unix::fs::MetadataExt;
             format!("{}:{}:{created:?}", metadata.dev(), metadata.ino())
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let file_identity = {
+            let (volume, index) = mcp_agent_mail_core::disk::windows_file_identity(&source)?;
+            let created = created.ok_or_else(|| invalid("source has no stable file identity"))?;
+            // NTFS can preserve creation time when a different file replaces
+            // this path. Bind to the opened file's identity as well.
+            format!("{volume}:{index}:{created:?}")
+        };
+        #[cfg(not(any(unix, windows)))]
         let file_identity = format!(
             "{:?}",
             created.ok_or_else(|| invalid("source has no stable file identity"))?
@@ -274,6 +287,12 @@ impl Store {
                 .mode(0o600)
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
         let lock = options.open(&lock_path)?;
         FileExt::try_lock_exclusive(&lock).map_err(|error| {
             // Windows reports ERROR_LOCK_VIOLATION, which std does not map to
@@ -312,6 +331,16 @@ impl Store {
                 return Err(invalid("checkpoint lock identity changed"));
             }
         }
+        #[cfg(windows)]
+        {
+            let named_file =
+                mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.lock_path)?;
+            if mcp_agent_mail_core::disk::windows_file_identity(&self.lock)?
+                != mcp_agent_mail_core::disk::windows_file_identity(&named_file)?
+            {
+                return Err(invalid("checkpoint lock identity changed"));
+            }
+        }
         #[cfg(not(unix))]
         if opened.created()? != named.created()? {
             return Err(invalid("checkpoint lock identity changed"));
@@ -336,10 +365,28 @@ impl Store {
     }
 
     fn save(&self, cursor: &ActiveReservationCursor) -> io::Result<()> {
+        self.save_with(cursor, || Ok(()))
+    }
+
+    // The callback is a deterministic seam after the real staged write/fsync.
+    // Production passes a no-op; no external input controls this boundary.
+    fn save_with(
+        &self,
+        cursor: &ActiveReservationCursor,
+        before_publish: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         self.check_lock()?;
         check_path(&self.path)?;
+        let current = Binding::at(
+            &self.binding.database,
+            &self.binding.archive,
+            self.binding.generation.clone(),
+        )?;
+        if current != self.binding {
+            return Err(invalid("checkpoint source changed during reconciliation"));
+        }
         let snapshot = Snapshot::capture(
-            self.binding.clone(),
+            current,
             cursor,
             Instant::now(),
             mcp_agent_mail_db::now_micros(),
@@ -358,6 +405,19 @@ impl Store {
             .tempfile_in(parent)?;
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
+        before_publish()?;
+        // Staging can be slow. Revalidate ownership, the target, and source
+        // identity at publication rather than relying on pre-staging checks.
+        self.check_lock()?;
+        check_path(&self.path)?;
+        if Binding::at(
+            &self.binding.database,
+            &self.binding.archive,
+            self.binding.generation.clone(),
+        )? != self.binding
+        {
+            return Err(invalid("checkpoint source changed before publication"));
+        }
         temporary.persist(&self.path).map_err(|error| error.error)?;
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
@@ -517,6 +577,19 @@ mod tests {
         Binding::at(&db, &archive, "aabb".into()).unwrap()
     }
 
+    #[cfg(windows)]
+    fn match_creation_time(path: &Path, original: &File) {
+        use std::os::windows::fs::FileTimesExt as _;
+
+        let created = original.metadata().unwrap().created().unwrap();
+        let replacement =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path).unwrap();
+        replacement
+            .set_times(std::fs::FileTimes::new().set_created(created))
+            .unwrap();
+        assert_eq!(replacement.metadata().unwrap().created().unwrap(), created);
+    }
+
     fn cursor(now: Instant) -> ActiveReservationCursor {
         let mut cursor = ActiveReservationCursor {
             identity: "live-only-pool-identity".into(),
@@ -661,12 +734,17 @@ mod tests {
         let other_archive = Binding::at(&original.database, &other_root, "aabb".into()).unwrap();
         assert_ne!(original.path().unwrap(), other_archive.path().unwrap());
         assert!(snapshot.validate(&other_archive).is_err());
+        #[cfg(windows)]
+        let retained =
+            mcp_agent_mail_core::disk::open_regular_file_no_follow(&original.database).unwrap();
         std::fs::rename(
             &original.database,
             temp.path().join("retained-old-database"),
         )
         .unwrap();
         std::fs::write(&original.database, b"replacement").unwrap();
+        #[cfg(windows)]
+        match_creation_time(&original.database, &retained);
         let replacement =
             Binding::at(&original.database, &original.archive, "aabb".into()).unwrap();
         assert!(snapshot.validate(&replacement).is_err());
@@ -726,6 +804,100 @@ mod tests {
             .set_len(MAX_BYTES + 1)
             .unwrap();
         assert!(store.load().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replaced_lock_with_equal_creation_time_cannot_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(&temp);
+        let original = Store::open(binding.clone()).unwrap();
+        let mut cursor = cursor(Instant::now());
+        original.save(&cursor).unwrap();
+        let previous = std::fs::read(&original.path).unwrap();
+        std::fs::rename(&original.lock_path, temp.path().join("retained-lock")).unwrap();
+        std::fs::write(&original.lock_path, b"replacement owner").unwrap();
+        match_creation_time(&original.lock_path, &original.lock);
+        let replacement = Store::open(binding).unwrap();
+        assert!(original.load().is_err());
+        cursor.after = 433;
+        assert!(original.save(&cursor).is_err());
+        assert_eq!(std::fs::read(&original.path).unwrap(), previous);
+        replacement.save(&cursor).unwrap();
+        assert_eq!(replacement.load().unwrap().unwrap().after, 433);
+        let published = std::fs::read(&replacement.path).unwrap();
+        assert!(original.save(&cursor).is_err());
+        assert_eq!(std::fs::read(&replacement.path).unwrap(), published);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn publication_rechecks_lock_ownership_after_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(&temp);
+        let store = Store::open(binding.clone()).unwrap();
+        let mut cursor = cursor(Instant::now());
+        store.save(&cursor).unwrap();
+        let previous = std::fs::read(&store.path).unwrap();
+        cursor.after = 433;
+        let mut replacement = None;
+        let error = store
+            .save_with(&cursor, || {
+                std::fs::rename(&store.lock_path, temp.path().join("retained-lock"))?;
+                std::fs::write(&store.lock_path, b"replacement owner")?;
+                #[cfg(windows)]
+                match_creation_time(&store.lock_path, &store.lock);
+                replacement = Some(Store::open(binding.clone())?);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint lock identity changed")
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), previous);
+        let replacement = replacement.expect("the new owner acquired the replacement lock");
+        assert_eq!(replacement.load().unwrap().unwrap().after, 432);
+        replacement.save(&cursor).unwrap();
+        assert_eq!(replacement.load().unwrap().unwrap().after, 433);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn publication_rechecks_source_identity_after_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(binding(&temp)).unwrap();
+        let mut cursor = cursor(Instant::now());
+        store.save(&cursor).unwrap();
+        let previous = std::fs::read(&store.path).unwrap();
+        cursor.after = 433;
+        #[cfg(windows)]
+        let retained =
+            mcp_agent_mail_core::disk::open_regular_file_no_follow(&store.binding.database)
+                .unwrap();
+        let error = store
+            .save_with(&cursor, || {
+                std::fs::rename(
+                    &store.binding.database,
+                    temp.path().join("retained-database"),
+                )?;
+                std::fs::write(&store.binding.database, b"replacement database")?;
+                #[cfg(windows)]
+                match_creation_time(&store.binding.database, &retained);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint source changed before publication")
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), previous);
+        assert_eq!(
+            std::fs::read(&store.binding.database).unwrap(),
+            b"replacement database"
+        );
     }
 
     #[cfg(unix)]

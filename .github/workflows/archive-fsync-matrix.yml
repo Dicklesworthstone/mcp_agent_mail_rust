@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/archive-fsync-matrix.yml"
       - "scripts/ci/checkpoint_path_probe.py"
+      - "crates/mcp-agent-mail-core/src/disk.rs"
       - "crates/mcp-agent-mail-storage/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -16,6 +17,7 @@ on:
       - ".github/workflows/archive-fsync-matrix.yml"
       - "scripts/bench_archive_fsync_matrix.sh"
       - "scripts/ci/checkpoint_path_probe.py"
+      - "crates/mcp-agent-mail-core/src/disk.rs"
       - "crates/mcp-agent-mail-storage/**"
       - "benches/BUDGETS.md"
       - "docs/OPERATOR_RUNBOOK.md"
@@ -98,11 +100,83 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal
           rustc -vV | tee "$RUNNER_TEMP/checkpoint-evidence/compiler.log"
           git config --global core.longpaths true
+      - name: Require native Windows MSVC and the actual NTFS test volume
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'checkpoint-evidence'
+          New-Item -ItemType Directory -Force $evidence | Out-Null
+          $receipt = [ordered]@{
+            commit = $env:GITHUB_SHA
+            operating_system = [Environment]::OSVersion.VersionString
+            compiler = $null
+            test_temp_root = $null
+            volume = $null
+            environment_confirmed = $false
+            error = $null
+          }
+          try {
+            $compiler = @(& rustc -vV 2>&1)
+            $compilerExit = $LASTEXITCODE
+            $receipt.compiler = $compiler -join "`n"
+            $compiler | Tee-Object -FilePath (Join-Path $evidence 'windows-compiler.log')
+            if ($compilerExit -ne 0) { throw "rustc -vV failed with exit $compilerExit" }
+            if ($compiler -notcontains 'host: x86_64-pc-windows-msvc') {
+              throw 'Native Windows/MSVC qualification requires an x86_64-pc-windows-msvc host'
+            }
+            # Ask the same Rust stdlib used by tempfile for its real fixture
+            # root; neither RUNNER_TEMP nor a drive-letter guess proves it.
+            $source = Join-Path $evidence 'native_temp_probe.rs'
+            $executable = Join-Path $evidence 'native_temp_probe.exe'
+            @'
+          fn main() {
+              assert!(cfg!(all(windows, target_env = "msvc")));
+              println!("{}", std::env::temp_dir().display());
+          }
+          '@ | Set-Content -Encoding utf8 $source
+            & rustc --edition=2024 --target x86_64-pc-windows-msvc $source -o $executable 2>&1 |
+              Tee-Object -FilePath (Join-Path $evidence 'native-temp-compile.log')
+            if ($LASTEXITCODE -ne 0) { throw "native temp probe compilation failed: $LASTEXITCODE" }
+            $nativeTemp = @(& $executable 2>&1 |
+              Tee-Object -FilePath (Join-Path $evidence 'native-temp-run.log'))
+            if ($LASTEXITCODE -ne 0 -or $nativeTemp.Count -ne 1) {
+              throw 'native temp probe did not return exactly one fixture root'
+            }
+            $receipt.test_temp_root = $nativeTemp[0]
+            $witness = Join-Path $nativeTemp[0] ('gh369-volume-' + [guid]::NewGuid().ToString('N') + '.txt')
+            [IO.File]::WriteAllText($witness, 'GH369 native filesystem qualification witness')
+            $volumes = @(Get-Volume -FilePath $witness)
+            if ($volumes.Count -ne 1) { throw 'Could not resolve the actual fixture volume' }
+            $receipt.volume = $volumes[0] | Select-Object Path, FileSystem, DriveType, Size, SizeRemaining
+            if ($volumes[0].FileSystem -ne 'NTFS') {
+              throw "Native checkpoint qualification requires NTFS, found $($volumes[0].FileSystem)"
+            }
+            # Keep subsequent Bash/Cargo steps on the exact native temp root
+            # measured above, even if a shell supplies its own temp defaults.
+            "TMP=$($nativeTemp[0])" | Add-Content -Encoding utf8 $env:GITHUB_ENV
+            "TEMP=$($nativeTemp[0])" | Add-Content -Encoding utf8 $env:GITHUB_ENV
+            'CARGO_BUILD_TARGET=x86_64-pc-windows-msvc' | Add-Content -Encoding utf8 $env:GITHUB_ENV
+            $receipt.environment_confirmed = $true
+          } catch {
+            $receipt.error = $_.ToString()
+            throw
+          } finally {
+            $receipt | ConvertTo-Json -Depth 5 |
+              Tee-Object -FilePath (Join-Path $evidence 'windows-environment.json')
+          }
       - uses: Swatinem/rust-cache@v2
       - name: Check production storage feature graph
         run: |
           set -euo pipefail
           cargo check --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/check-production.log"
+      - name: Test native Windows file identity against equal-creation-time replacement
+        if: always() && runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-core --lib disk::tests::windows_file_identity -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/windows-file-identity.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/windows-file-identity.log"
       - name: Test real canonical and adversarial prefix validation
         if: always()
         run: |

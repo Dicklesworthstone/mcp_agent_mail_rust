@@ -73,6 +73,14 @@ impl Binding {
             .map_err(|error| io_context("canonicalize database", database, error))?;
         let archive = std::fs::canonicalize(archive)
             .map_err(|error| io_context("canonicalize archive", archive, error))?;
+        #[cfg(windows)]
+        let database_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&database)
+            .map_err(|error| io_context("open database identity", &database, error))?;
+        #[cfg(windows)]
+        let metadata = database_file
+            .metadata()
+            .map_err(|error| io_context("read database metadata", &database, error))?;
+        #[cfg(not(windows))]
         let metadata = std::fs::metadata(&database)
             .map_err(|error| io_context("read database metadata", &database, error))?;
         let archive_metadata = std::fs::metadata(&archive)
@@ -114,6 +122,21 @@ impl Binding {
                         io::Error::new(io::ErrorKind::InvalidData, error),
                     )
                 })?;
+            #[cfg(windows)]
+            {
+                // NTFS can tunnel the creation time from a renamed file to a
+                // replacement at the same path. Retain the timestamp, but bind
+                // it to the volume and file index from this opened authority.
+                let (volume, index) = mcp_agent_mail_core::disk::windows_file_identity(
+                    &database_file,
+                )
+                .map_err(|error| io_context("read database file identity", &database, error))?;
+                format!(
+                    "{volume}:{index}:{:?}",
+                    (created.as_secs(), created.subsec_nanos())
+                )
+            }
+            #[cfg(not(windows))]
             format!("{:?}", (created.as_secs(), created.subsec_nanos()))
         };
         Ok(Self {
@@ -733,6 +756,25 @@ impl Store {
         {
             use std::os::unix::fs::MetadataExt;
             if opened.nlink() != 1 || (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+                return Err(io_context(
+                    "validate lock identity",
+                    &self.lock_path,
+                    invalid("checkpoint lock identity changed"),
+                ));
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Creation times alone do not establish ownership: Windows can
+            // preserve them when a lock pathname is renamed and recreated.
+            // Compare both real handles, after the named handle has passed
+            // the same no-follow, regular-file and hard-link checks.
+            let named_lock = open_lock(&self.lock_path, false)?;
+            let opened_identity = mcp_agent_mail_core::disk::windows_file_identity(&self.lock)
+                .map_err(|error| io_context("read opened lock identity", &self.lock_path, error))?;
+            let named_identity = mcp_agent_mail_core::disk::windows_file_identity(&named_lock)
+                .map_err(|error| io_context("read named lock identity", &self.lock_path, error))?;
+            if opened_identity != named_identity {
                 return Err(io_context(
                     "validate lock identity",
                     &self.lock_path,
@@ -1673,7 +1715,7 @@ mod tests {
         assert_eq!(saved.retries[0].id, 77);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn replaced_lock_refuses_old_owner_reads_and_writes() {
         let (_temp, database, archive) = fixture();
@@ -1686,16 +1728,24 @@ mod tests {
         )
         .unwrap();
         let current = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        #[cfg(windows)]
+        match_creation_time(&old.lock, &current.lock);
+        let read_error = old.load().unwrap_err();
         assert!(
-            old.load().is_err(),
-            "old flock is not ownership of the new path"
+            read_error.to_string().contains("validate lock identity"),
+            "the displaced owner must fail identity validation: {read_error}"
         );
-        assert!(old.save(&ReconcileCursor::default()).is_err());
+        let save_error = old.save(&ReconcileCursor::default()).unwrap_err();
+        assert!(
+            save_error.to_string().contains("validate lock identity"),
+            "the displaced owner must not publish: {save_error}"
+        );
         assert_eq!(std::fs::read(&old.path).unwrap(), before);
         assert_eq!(current.load().unwrap().unwrap().tail_after, Some(90_000));
+        current.save(&debt(Instant::now())).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn lock_replacement_during_real_staging_prevents_stale_checkpoint_publication() {
         let (_temp, database, archive) = fixture();
@@ -1708,12 +1758,16 @@ mod tests {
                 &store.lock_path,
                 store.lock_path.with_extension("retained-lock"),
             )?;
-            replacement = Some(Store::open(Binding::at(&database, &archive, GENERATION)?)?);
+            let current = Store::open(Binding::at(&database, &archive, GENERATION)?)?;
+            #[cfg(windows)]
+            match_creation_time(&store.lock, &current.lock);
+            replacement = Some(current);
             Ok(())
         });
+        let error = result.unwrap_err();
         assert!(
-            result.is_err(),
-            "publication must recheck ownership after fsync"
+            error.to_string().contains("validate lock identity"),
+            "publication must recheck ownership after fsync: {error}"
         );
         assert_eq!(std::fs::read(&store.path).unwrap(), before);
         assert_eq!(
@@ -1938,6 +1992,25 @@ mod tests {
         std::fs::write(&database, b"source generation").unwrap();
         std::fs::create_dir(&archive).unwrap();
         (temp, database, archive)
+    }
+
+    #[cfg(windows)]
+    fn match_creation_time(source: &File, replacement: &File) {
+        use std::os::windows::fs::FileTimesExt as _;
+
+        // Make the NTFS tunneling case deterministic even when the runner has
+        // disabled its tunnel cache. Equal timestamps must never alias two
+        // distinct files or grant a displaced checkpoint owner authority.
+        let created = source.metadata().unwrap().created().unwrap();
+        replacement
+            .set_times(std::fs::FileTimes::new().set_created(created))
+            .unwrap();
+        assert_eq!(replacement.metadata().unwrap().created().unwrap(), created);
+        assert_ne!(
+            mcp_agent_mail_core::disk::windows_file_identity(source).unwrap(),
+            mcp_agent_mail_core::disk::windows_file_identity(replacement).unwrap(),
+            "the regression must retain two distinct file authorities",
+        );
     }
 
     fn debt(now: Instant) -> ReconcileCursor {
@@ -2420,6 +2493,50 @@ mod tests {
         std::fs::write(&database, b"replacement").unwrap();
         assert!(reopened.save(&debt(Instant::now())).is_err());
         assert_eq!(std::fs::read(&reopened.path).unwrap(), bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_same_creation_time_cannot_alias_a_replacement_database() {
+        let (_temp, database, archive) = fixture();
+        let source = mcp_agent_mail_core::disk::open_regular_file_no_follow(&database).unwrap();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        store.save(&debt(Instant::now())).unwrap();
+        let published = std::fs::read(&store.path).unwrap();
+
+        std::fs::rename(&database, database.with_extension("retained-database")).unwrap();
+        let mut replacement = File::create(&database).unwrap();
+        replacement.write_all(b"replacement database").unwrap();
+        match_creation_time(&source, &replacement);
+        // Keep the logical mailbox generation equal as it would be for a
+        // copied database; only the actual file authority distinguishes it.
+        let binding = Binding::at(&database, &archive, GENERATION).unwrap();
+        assert_eq!(
+            binding.database_generation,
+            store.binding.database_generation
+        );
+        assert_ne!(binding.generation, store.binding.generation);
+        assert_eq!(binding.path().unwrap(), store.path);
+        let error = store.save(&ReconcileCursor::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("validate publication source"),
+            "a replacement with the same creation time must refuse stale progress: {error}",
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), published);
+        drop(store);
+
+        let current = Store::open(binding).unwrap();
+        let mut cursor = ReconcileCursor::settled_before(999);
+        let error = current.restore(&mut cursor).unwrap_err();
+        assert!(
+            error.to_string().contains("restore snapshot binding"),
+            "{error}"
+        );
+        assert_eq!(cursor.tail_after, None);
+        assert!(cursor.retries.is_empty());
+        assert_eq!(std::fs::read(&current.path).unwrap(), published);
+        current.save(&cursor).unwrap();
+        assert_eq!(current.load().unwrap().unwrap().tail_after, None);
     }
 
     #[cfg(windows)]
