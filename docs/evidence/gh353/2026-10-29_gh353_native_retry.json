@@ -2664,5 +2664,954 @@
       "sqlite_archive_durability_integration_qualified": false
     },
     "remaining_work": "Run complete tools, storage, recovery and saturation gates with sufficient native resources. Demonstrate repair publication before competing traffic stops while preserving direct-writer progress; resolve BusySnapshot and meet unchanged large-archive/quiet-convergence criteria. The historical passive patch and baseline expectations require explicit rebasing before reuse."
+  },
+  "initializer_and_archive_follow_up": {
+    "status": "PRODUCTION_CORRECTIONS_COMMITTED_COMPONENT_QUALIFIED_FULL_INTEGRATION_UNQUALIFIED",
+    "record_scope": "This independent follow-up records the five-file lazy-initializer, warm-repair metadata and compact-index correction. All preceding top-level fields and the admission_and_snapshot_follow_up remain unchanged historical records. This section does not qualify the earlier passive candidate, full DbPool integration, full storage integration, or the production incident.",
+    "recorded_at_utc": "2026-10-30T01:04:20Z",
+    "source_checkout_base": "7f188230631d22c60d97bafc3f53962e5dafe163",
+    "main_parent_before_series": "89a67bc0cb48d93e2ac230a580dc2a8042f99eed",
+    "production_series_tip": "21153bbc60ecdd8722d7e8eaeda063186f608933",
+    "branch": "main",
+    "pull_request_created": false,
+    "commits": [
+      {
+        "sha": "a08d631e5e4f3e154855ca0b8856b615d0c7abe7",
+        "purpose": "Add the cancellation-aware lazy-initializer gate module."
+      },
+      {
+        "sha": "2198a0425a7735d9a50f9da873729e0481d604e3",
+        "purpose": "Wire ambient Cx cancellation into the real lazy connection factory and add its pool-slot regression."
+      },
+      {
+        "sha": "6a8474efcf6af371a0d49ed8631acc68c12856c6",
+        "purpose": "Avoid preliminary fence acquisition for warm read-only repair metadata, retain cold admission and final publication checks."
+      },
+      {
+        "sha": "490de9b98c4a60bf08d68ede248b19e3a1f362be",
+        "purpose": "Make staged-name byte comparison compatible with owned and borrowed paths."
+      },
+      {
+        "sha": "0f0d62c8ae9332eb66ddc0cb60c8f4a83c8fb0a8",
+        "purpose": "Retain native-validated v2/v3 path ranges within the existing decoded-generation capacity and preserve native/v4 fallback."
+      },
+      {
+        "sha": "21153bbc60ecdd8722d7e8eaeda063186f608933",
+        "purpose": "Make post-wait guard release explicit and complete final focused native/lint proof without adding lint allowances."
+      }
+    ],
+    "source_manifest": [
+      {
+        "path": "crates/mcp-agent-mail-db/src/pool.rs",
+        "git_blob": "f582e68c4efb16221a15ac017c82a52b271b6d0b",
+        "sha256": "f878b4034f16c11ae27a7267b87f1c13a984a5aa1ce7b51064ae671153ef9008",
+        "verified_at_commit": "21153bbc60ecdd8722d7e8eaeda063186f608933"
+      },
+      {
+        "path": "crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+        "git_blob": "8de5d9a52b4915821a45251627e94d35343f9014",
+        "sha256": "be02c888a8fe4169042bca70b53a9b9b3fdf911142e0eac93c7c1e4ff98c9bef",
+        "verified_at_commit": "21153bbc60ecdd8722d7e8eaeda063186f608933"
+      },
+      {
+        "path": "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database.rs",
+        "git_blob": "ececedf6e1e3b54ecfa2de0c478aa0baff398a8b",
+        "sha256": "6114b952955c22681644e993625ada789d08cbec9dd971b5b064495f7af3dcf7",
+        "verified_at_commit": "21153bbc60ecdd8722d7e8eaeda063186f608933"
+      },
+      {
+        "path": "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/identity/staged.rs",
+        "git_blob": "0e15cad4913e48835536de20684b194e0b6da01b",
+        "sha256": "ece2e8bff90e9be6422d8413ce9d540850744932df5a9639c0dc68a1a70eea23",
+        "verified_at_commit": "21153bbc60ecdd8722d7e8eaeda063186f608933"
+      },
+      {
+        "path": "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/identity/staged/decoded.rs",
+        "git_blob": "e11ad4c7bd4afa92c591b0951ed1104d1921da1f",
+        "sha256": "0a51982245db46caf4aa384bfc8cb4db210a91093d79a735a40d428b7a987b79",
+        "verified_at_commit": "21153bbc60ecdd8722d7e8eaeda063186f608933"
+      }
+    ],
+    "verified_remote_blobs_match_reviewed_files": true,
+    "toolchain": {
+      "rust": "1.100.0-nightly",
+      "pinned_toolchain": "nightly-2026-08-31-x86_64-unknown-linux-gnu",
+      "rust_commit": "90850177249efe0321573c569aec5d12b257f8d6",
+      "llvm": "23.1.0",
+      "git_cli": "2.51.1",
+      "codegen_backend": "standard LLVM",
+      "panic_strategy": "unwind"
+    },
+    "production_changes": [
+      {
+        "area": "lazy database initialization",
+        "behavior": "Waiting callers check the ambient Cx outside the gate mutex between condvar slices of at most 25 ms, within the original absolute timeout. Cancellation returns Outcome::Cancelled while the initializer retains ownership. The existing completion guard retains failure/unwind reset semantics.",
+        "qualification": "The exact standard-library gate is natively tested. Actual sqlmodel-pool 0.5.0 source confirms factory cancellation releases ActiveSlotGuard; the real DbPool integration fixture remains unexecuted. This does not bound the initializer's own I/O or prove that every external request token reaches the ambient Cx."
+      },
+      {
+        "area": "warm message repair metadata",
+        "behavior": "An initialized archive uses open_archive plus the existing per-process repository-cache predicate to collect read-only metadata without a preliminary mutation window. Cold creation/configuration remains try-fenced. Final native admission, project ownership, current target/HEAD/identity checks, no-clobber and durability behavior remain.",
+        "qualification": "Formatting and independent source review passed. Held-fence/conflict and cold-directory storage regressions were added/strengthened but not executed. This removes an avoidable contention point; it does not establish fair final admission."
+      },
+      {
+        "area": "decoded Git index retention",
+        "behavior": "Use checked byte ranges only when they exactly match native-decoded v2/v3 names; cached get borrows the retained names. Preserve owned fallback for v4 and any unproved layout. Encoded input may exceed the former 16 MiB cutoff only if encoded bytes, entry metadata, owned capacities and container/Arc overhead still fit 32 MiB.",
+        "qualification": "The 32 MiB bound applies to each retained decoded generation, not process peak across concurrent old observations and transient native decodes. Fresh bounded no-follow bytes and exact object-format/byte equality remain prerequisites. Helper interoperability passed; full native cache retention/A-B and production cancellation budget execution remain unqualified."
+      }
+    ],
+    "native_component_results": {
+      "initializer_baseline": {
+        "passed": 3,
+        "failed": 0,
+        "source_equivalence": "Exact gate implementation and three original gate-control portions verified against 7f188230. Unrelated default pool assertions from the third test were excluded from this component harness and remain in real pool.rs tests.",
+        "baseline_segment_sha256": {
+          "production_gate": "7ed3b7d5815910c7c396b196bd892e42080366e0e043c8f09a5eb278d7c305c0",
+          "sqlite_init_gate_bounds_waiters_and_resets_on_failure": "8fa926e931387cc408f15654b698e162ad6d46f1b8c12591e87e31e40e9aafb9",
+          "sqlite_init_gate_completion_guard_resets_on_unwind_path": "e567e6b674781350b7dcea9020e294978da3d8c8d64c87b00ad0a0917eefc748",
+          "sqlite_init_gate_wakes_waiters_when_initializer_completes": "42dced04856991ff1f15d2b264b154fc17143c825a46718d6abe2915eb4d36d4"
+        }
+      },
+      "initializer_final": {
+        "passed": 8,
+        "failed": 0,
+        "scope": "Entire final exact production sqlite_init_gate.rs; standard LLVM/unwind. Source SHA and commands in receipts.initializer_final."
+      },
+      "held_owner_actual_api_comparison": {
+        "passed": true,
+        "fixture_runs_both_implementations_in_same_invocation": true,
+        "baseline_owner_hold_after_cancellation_ms": 500.133376,
+        "baseline_completion_after_cancellation_ms": 504.049238,
+        "baseline_outcome": "Ready only after owner release",
+        "candidate_completion_after_cancellation_ms": 25.027234,
+        "candidate_outcome": "Cancelled while foreign initializer remains held",
+        "interpretation": "Controlled gate-component liveness observation, not MCP request latency. The actual old API is invoked; missing callback support is not itself counted as a failing test.",
+        "baseline_handshake_limit": "The baseline has no parked-waiter instrumentation. Its handshake occurs immediately before its actual gate call, followed by 50 ms without completion. The candidate's separate module regression observes an actual bounded waiting interval."
+      },
+      "initializer_production_configuration_metadata": {
+        "passed": true,
+        "scope": "Exact gate module compiled without cfg(test); isolated dead_code warnings retained in log. Not a production workspace or DbPool compile."
+      },
+      "initializer_focused_clippy": {
+        "passed": true,
+        "scope": "Exact gate module under test configuration, -Dwarnings plus actual crate lint allowances. No new suppression was added. Not full workspace Clippy."
+      },
+      "index_helper": {
+        "passed": 4,
+        "failed": 0,
+        "scope": "Exact EncodedPaths and two boundary tests, exact-source witness test, and real Git CLI interoperability. No substituted git2/budget/Cx types.",
+        "real_index_cases": [
+          "sha1 v2",
+          "sha1 v3 with extended flags",
+          "sha1 v4 declined ranges",
+          "sha256 v2",
+          "sha256 v3 with extended flags",
+          "sha256 v4 declined ranges"
+        ],
+        "guarantees_exercised": [
+          "checked 20/32-byte OID layouts",
+          "long names and eight-byte padding",
+          "native-listed names and conflict stages",
+          "truncation and invalid widths",
+          "name mismatch and corrupt terminators/padding",
+          "overflow and unsupported layout refusal",
+          "live index bytes unchanged"
+        ]
+      }
+    },
+    "final_format_and_whitespace_checks": [
+      {
+        "argv": [
+          "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt",
+          "--check",
+          "--edition",
+          "2024",
+          "--config",
+          "skip_children=true",
+          "crates/mcp-agent-mail-db/src/pool.rs",
+          "crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+          "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database.rs",
+          "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/identity/staged.rs",
+          "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/identity/staged/decoded.rs"
+        ],
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    ],
+    "added_or_strengthened_integration_regressions": [
+      {
+        "name": "cancelled_lazy_initializer_wait_returns_its_pool_slot_before_owner_completion",
+        "status": "UNEXECUTED",
+        "purpose": "Real DbPool factory, ambient Cx, reserved/released counters and later successful checkout."
+      },
+      {
+        "name": "prepared_repair_releases_metadata_fence_and_rechecks_surviving_reply",
+        "status": "STRENGTHENED_UNEXECUTED",
+        "purpose": "Warm metadata proceeds while a foreign native fence owner remains held; final success and late-survivor-conflict cases retain final publication checks."
+      },
+      {
+        "name": "an_existing_project_directory_cannot_bypass_cold_repository_admission",
+        "status": "UNEXECUTED",
+        "purpose": "Directory existence cannot bypass cold repository admission or advance epochs/create .git under foreign contention."
+      },
+      {
+        "name": "compact_paths_reuse_native_decoding_within_the_same_retention_limit",
+        "status": "UNEXECUTED",
+        "purpose": "Real git2 fixed 64 KiB same-capacity candidate/baseline discriminator; duplicate native path storage exceeds capacity while verified ranges fit."
+      },
+      {
+        "name": "native_versions_extended_flags_and_merge_stages_keep_their_exact_interpretation",
+        "status": "UNEXECUTED",
+        "purpose": "Real git2 v2/v3/v4 interpretation, flags, stages, prefix lookup and v4 owned-cache fallback."
+      }
+    ],
+    "environment_and_limits": {
+      "initial_failure": "A subsequent 43-byte evidence write returned ENOSPC despite f_bfree reporting 16 MiB. Baseline/metadata/further tests were paused; no files were deleted or truncated.",
+      "recovery": "After environment reconnection, readable source hashes matched and usable disk space returned. The baseline, final gate and Git helper proofs were then completed with bounded sequential native compilers.",
+      "initial_receipt_rss_caveat": "The initial candidate_component.json peak_family_rss_bytes value of 0 means no RSS sample was captured for short-lived processes, not zero memory use.",
+      "final_native_proofs_oom_delta": 0,
+      "full_dependency_limit": "Retained build artifacts lack real Asupersync/git2/libgit2-sys libraries for these full crate tests. Prior full builds exhausted the 8 GiB cgroup. No dependency replacement, fake cancellation budget, alternate codegen backend, feature weakening or new engine pin was introduced.",
+      "automated_ci_observation": {
+        "commit": "0f0d62c8ae9332eb66ddc0cb60c8f4a83c8fb0a8",
+        "endpoint": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/actions/runs?head_sha=0f0d62c8ae9332eb66ddc0cb60c8f4a83c8fb0a8&per_page=20",
+        "total_count": 0,
+        "interpretation": "No CI result was available from this query; absence is not a pass."
+      }
+    },
+    "claims": {
+      "production_files_committed_directly_to_main": true,
+      "exact_initializer_component_tested": true,
+      "original_initializer_controls_compared": true,
+      "cancellation_component_difference_measured": true,
+      "real_DbPool_integration_executed": false,
+      "full_native_cache_tests_executed": false,
+      "native_cache_retention_baseline_candidate_comparison_executed": false,
+      "full_workspace_build_and_clippy_qualified": false,
+      "incident_reproduced": false,
+      "request_latency_improvement_measured": false,
+      "publication_fence_starvation_fixed": false,
+      "busy_snapshot_fixed": false,
+      "quiet_convergence_qualified": false,
+      "full_swarm_qualified": false
+    },
+    "remaining_work": [
+      "Run actual DbPool and storage regressions with real pinned dependencies, then the existing saturation/crash/recovery/no-read convergence gates against current main.",
+      "A complete fairness correction needs shared admission across every native-fence route and typed message/reservation continuations that wait without DB activity or pooled connections. Reservation retry currently retains a source guard across its pass; split and revalidate checkpoint scopes before any such wait.",
+      "An expiring admission turn alone cannot prove starvation freedom when fresh checkout/source validation can outlast it. Preserve checkout-before-fence order and qualify both foreground request completion and repair progress under sustained traffic.",
+      "BusySnapshot after restart remains the independently tracked upstream engine issue. No statement replay, engine override or unqualified dependency adoption is part of this correction.",
+      "Keep the October 25 fence-deferral observation separate from the October 28 post-restart latency evidence; these changes do not establish that the fence caused that incident."
+    ],
+    "receipts": {
+      "initializer_initial": {
+        "scope": "Exact entire production initializer-gate module; not full DbPool/SQLModel or MCP integration",
+        "source": "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+        "sha256": "c44f24dd2d17e634344e4496f71636c3d3fbc4ff00094a533242e86f5ed6219b",
+        "results": [
+          {
+            "name": "candidate_compile",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+              "--crate-name",
+              "sqlite_init_gate",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_tests"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.947,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 0,
+            "oom_kills_delta": 0,
+            "log": "candidate_compile.log",
+            "log_bytes": 0,
+            "free_bytes": 21008384
+          },
+          {
+            "name": "candidate_tests",
+            "argv": [
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_tests",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.256,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 0,
+            "oom_kills_delta": 0,
+            "log": "candidate_tests.log",
+            "log_bytes": 1295,
+            "free_bytes": 21004288,
+            "test_counts": [
+              "ok",
+              "8",
+              "0",
+              "0",
+              "0",
+              "0"
+            ]
+          }
+        ],
+        "artifact_bytes": 1035343
+      },
+      "initializer_baseline": {
+        "scope": "Exact baseline gate and original component controls, plus held-owner comparison of actual APIs; no database or request integration",
+        "sources": {
+          "base": "7f188230631d22c60d97bafc3f53962e5dafe163",
+          "exact_baseline_segments_sha256": {
+            "production_gate": "7ed3b7d5815910c7c396b196bd892e42080366e0e043c8f09a5eb278d7c305c0",
+            "sqlite_init_gate_bounds_waiters_and_resets_on_failure": "8fa926e931387cc408f15654b698e162ad6d46f1b8c12591e87e31e40e9aafb9",
+            "sqlite_init_gate_completion_guard_resets_on_unwind_path": "e567e6b674781350b7dcea9020e294978da3d8c8d64c87b00ad0a0917eefc748",
+            "sqlite_init_gate_wakes_waiters_when_initializer_completes": "42dced04856991ff1f15d2b264b154fc17143c825a46718d6abe2915eb4d36d4"
+          },
+          "baseline_harness_sha256": "ed235ac2489c66901901fb3405dcb0bc1c7fda6c07a55502237fda1934324190",
+          "driver_sha256": "22050cc045dd1e4d59e7b64bfcdc09d13e9e0705da57614bb10f90cd2fe25777",
+          "candidate_sha256": "c44f24dd2d17e634344e4496f71636c3d3fbc4ff00094a533242e86f5ed6219b",
+          "third_control_scope": "exact original gate test through thread join; unrelated pool-default assertions excluded and retained in real pool.rs tests"
+        },
+        "limits": {
+          "family_rss_bytes": 536870912,
+          "command_seconds": 120,
+          "initial_free_bytes": 8388608,
+          "runtime_free_floor_bytes": 4194304,
+          "artifact_bytes": 12582912
+        },
+        "results": [
+          {
+            "name": "baseline_compile",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_gate_controls.rs",
+              "--crate-name",
+              "baseline_gate_controls",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_tests"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.464,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 124342272,
+            "rss_samples": 22,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12890021888,
+            "log": "baseline_compile.log",
+            "log_bytes": 0
+          },
+          {
+            "name": "baseline_tests",
+            "argv": [
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_tests",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.1044,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 1785856,
+            "rss_samples": 4,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12889432064,
+            "log": "baseline_tests.log",
+            "log_bytes": 338,
+            "test_counts": [
+              [
+                "ok",
+                "3",
+                "0",
+                "0",
+                "0",
+                "0"
+              ]
+            ]
+          },
+          {
+            "name": "comparison_compile",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_gate_controls.rs",
+              "--cfg",
+              "cancellation_comparison",
+              "--crate-name",
+              "initializer_comparison",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_tests"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.5044,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 146878464,
+            "rss_samples": 24,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12886802432,
+            "log": "comparison_compile.log",
+            "log_bytes": 0
+          },
+          {
+            "name": "cancellation_comparison",
+            "argv": [
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_tests",
+              "--exact",
+              "cancellation_driver::held_owner_cancellation_comparison",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.6456,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 1957888,
+            "rss_samples": 31,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12887715840,
+            "log": "cancellation_comparison.log",
+            "log_bytes": 674,
+            "test_counts": [
+              [
+                "ok",
+                "1",
+                "0",
+                "0",
+                "0",
+                "11"
+              ]
+            ]
+          },
+          {
+            "name": "candidate_production_metadata",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+              "--crate-type",
+              "lib",
+              "--emit=metadata",
+              "--crate-name",
+              "sqlite_init_gate",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_production.rmeta"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.083,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 80162816,
+            "rss_samples": 3,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12887650304,
+            "log": "candidate_production_metadata.log",
+            "log_bytes": 2050
+          },
+          {
+            "name": "candidate_focused_clippy",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/clippy-driver",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+              "--emit=metadata",
+              "--crate-name",
+              "sqlite_init_gate",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-Funsafe_code",
+              "-Dwarnings",
+              "-Wclippy::pedantic",
+              "-Wclippy::nursery",
+              "-Aclippy::missing_errors_doc",
+              "-Aclippy::missing_panics_doc",
+              "-Aclippy::module_name_repetitions",
+              "-Aclippy::result_large_err",
+              "-Aclippy::match_same_arms",
+              "-Aclippy::sliced_string_as_bytes",
+              "-Aclippy::needless_pass_by_value",
+              "-Aclippy::ref_option",
+              "-Aclippy::cast_precision_loss",
+              "-Aclippy::too_many_lines",
+              "-Aclippy::manual_let_else",
+              "-Aclippy::option_if_let_else",
+              "-Aclippy::too_many_arguments",
+              "-Aclippy::items_after_statements",
+              "-Aclippy::bool_to_int_with_if",
+              "-Aclippy::redundant_clone",
+              "-Aclippy::doc_markdown",
+              "-Aclippy::unused_async",
+              "-Aclippy::uninlined_format_args",
+              "-Aclippy::missing_const_for_fn",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_clippy.rmeta"
+            ],
+            "started": true,
+            "exit_code": 1,
+            "seconds": 0.1311,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 115617792,
+            "rss_samples": 6,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12887642112,
+            "log": "candidate_focused_clippy.log",
+            "log_bytes": 2035
+          }
+        ],
+        "artifact_bytes": 3074020
+      },
+      "initializer_final": {
+        "scope": "Final exact production gate module after focused lint corrections, normal LLVM/unwind; full DbPool/SQLModel/request integration remains unexecuted",
+        "source": "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+        "sha256": "be02c888a8fe4169042bca70b53a9b9b3fdf911142e0eac93c7c1e4ff98c9bef",
+        "baseline_source_receipt": "resumed_native_component.json",
+        "results": [
+          {
+            "name": "candidate_verified_format",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt",
+              "--check",
+              "--edition",
+              "2024",
+              "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.1703,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 36388864,
+            "rss_samples": 7,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12598722560,
+            "log": "candidate_verified_format.log",
+            "log_bytes": 0
+          },
+          {
+            "name": "candidate_verified_clippy",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/clippy-driver",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+              "--emit=metadata",
+              "--crate-name",
+              "sqlite_init_gate",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-Funsafe_code",
+              "-Dwarnings",
+              "-Wclippy::pedantic",
+              "-Wclippy::nursery",
+              "-Aclippy::missing_errors_doc",
+              "-Aclippy::missing_panics_doc",
+              "-Aclippy::module_name_repetitions",
+              "-Aclippy::result_large_err",
+              "-Aclippy::match_same_arms",
+              "-Aclippy::sliced_string_as_bytes",
+              "-Aclippy::needless_pass_by_value",
+              "-Aclippy::ref_option",
+              "-Aclippy::cast_precision_loss",
+              "-Aclippy::too_many_lines",
+              "-Aclippy::manual_let_else",
+              "-Aclippy::option_if_let_else",
+              "-Aclippy::too_many_arguments",
+              "-Aclippy::items_after_statements",
+              "-Aclippy::bool_to_int_with_if",
+              "-Aclippy::redundant_clone",
+              "-Aclippy::doc_markdown",
+              "-Aclippy::unused_async",
+              "-Aclippy::uninlined_format_args",
+              "-Aclippy::missing_const_for_fn",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_clippy.rmeta"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.3988,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 130797568,
+            "rss_samples": 19,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12598722560,
+            "log": "candidate_verified_clippy.log",
+            "log_bytes": 0
+          },
+          {
+            "name": "candidate_verified_compile",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+              "--crate-name",
+              "sqlite_init_gate",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_tests"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.6148,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 141029376,
+            "rss_samples": 29,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12596011008,
+            "log": "candidate_verified_compile.log",
+            "log_bytes": 0
+          },
+          {
+            "name": "candidate_verified_tests",
+            "argv": [
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_tests",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.2322,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 2002944,
+            "rss_samples": 11,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12595916800,
+            "log": "candidate_verified_tests.log",
+            "log_bytes": 1295,
+            "test_counts": [
+              [
+                "ok",
+                "8",
+                "0",
+                "0",
+                "0",
+                "0"
+              ]
+            ]
+          },
+          {
+            "name": "comparison_verified_compile",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--test",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_gate_controls.rs",
+              "--cfg",
+              "cancellation_comparison",
+              "--crate-name",
+              "initializer_comparison",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_verified_tests"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.6203,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 148402176,
+            "rss_samples": 28,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12593496064,
+            "log": "comparison_verified_compile.log",
+            "log_bytes": 0
+          },
+          {
+            "name": "cancellation_comparison_verified",
+            "argv": [
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_verified_tests",
+              "--exact",
+              "cancellation_driver::held_owner_cancellation_comparison",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.64,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 1970176,
+            "rss_samples": 29,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12590116864,
+            "log": "cancellation_comparison_verified.log",
+            "log_bytes": 675,
+            "test_counts": [
+              [
+                "ok",
+                "1",
+                "0",
+                "0",
+                "0",
+                "11"
+              ]
+            ]
+          },
+          {
+            "name": "candidate_verified_production_metadata",
+            "argv": [
+              "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs",
+              "--crate-type",
+              "lib",
+              "--emit=metadata",
+              "--crate-name",
+              "sqlite_init_gate",
+              "--edition=2024",
+              "-Cpanic=unwind",
+              "-Copt-level=0",
+              "-Cdebuginfo=0",
+              "-Ccodegen-units=1",
+              "-Cstrip=symbols",
+              "-o",
+              "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_production.rmeta"
+            ],
+            "started": true,
+            "exit_code": 0,
+            "seconds": 0.0736,
+            "stop_reason": null,
+            "peak_family_rss_bytes": 95621120,
+            "rss_samples": 3,
+            "oom_delta": {
+              "oom": 0,
+              "oom_kill": 0
+            },
+            "free_bytes": 12589965312,
+            "log": "candidate_verified_production_metadata.log",
+            "log_bytes": 2050
+          }
+        ],
+        "artifact_bytes": 7411498
+      },
+      "index_helper": {
+        "compiler": {
+          "artifact_bytes": 1038450,
+          "command": [
+            "/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+            "--edition=2024",
+            "--test",
+            "-C",
+            "opt-level=0",
+            "-C",
+            "debuginfo=0",
+            "-C",
+            "strip=symbols",
+            "-C",
+            "codegen-units=1",
+            "/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/encoded_paths.rs",
+            "-o",
+            "/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/encoded_paths_tests"
+          ],
+          "elapsed_seconds": 0.415,
+          "exit_code": 0,
+          "free_bytes": 12865880064,
+          "oom_after": {
+            "oom": 129,
+            "oom_kill": 34
+          },
+          "oom_before": {
+            "oom": 129,
+            "oom_kill": 34
+          },
+          "output": "",
+          "peak_owned_family_rss_bytes": 157626368,
+          "stop_reason": null
+        },
+        "helper_sha256": "0860a6364b324429d75dd07753ee88f03f559ca8afda6bfda35360a2f5b9cdc4",
+        "runner_sha256": "dee53e6b268e1cf2a999ea228aca42ed4edd1004fac1c1c372cd219d2834755c",
+        "scope": "Exact production checked-offset helper and real Git CLI index interoperability only; not git2/cache, cancellation, SQLite, repair publication, saturation, or request latency qualification.",
+        "source_sha256_after": "0a51982245db46caf4aa384bfc8cb4db210a91093d79a735a40d428b7a987b79",
+        "source_sha256_before": "0a51982245db46caf4aa384bfc8cb4db210a91093d79a735a40d428b7a987b79",
+        "tests": {
+          "artifact_bytes": 1044950,
+          "command": [
+            "/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/encoded_paths_tests",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "elapsed_seconds": 0.268,
+          "exit_code": 0,
+          "free_bytes": 12866031616,
+          "oom_after": {
+            "oom": 129,
+            "oom_kill": 34
+          },
+          "oom_before": {
+            "oom": 129,
+            "oom_kill": 34
+          },
+          "output": "\nrunning 4 tests\ntest tests::actual_git_indexes_keep_v2_v3_names_and_decline_v4_ranges ... Git CLI fixture: sha1 v2, 8 native-listed entries, 888 bytes, preserved index\nGit CLI fixture: sha1 v3, 8 native-listed entries, 888 bytes, preserved index\nGit CLI fixture: sha1 v4, 8 native-listed entries, 834 bytes, preserved index\nGit CLI fixture: sha256 v2, 8 native-listed entries, 972 bytes, preserved index\nGit CLI fixture: sha256 v3, 8 native-listed entries, 980 bytes, preserved index\nGit CLI fixture: sha256 v4, 8 native-listed entries, 942 bytes, preserved index\nok\ntest tests::encoded_ranges_follow_padding_extensions_and_both_object_widths ... ok\ntest tests::helper_and_checked_layout_tests_are_exact_production_source ... ok\ntest tests::unproved_encoded_ranges_disable_offsets_without_guessing ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s\n\n",
+          "peak_owned_family_rss_bytes": 3584000,
+          "stop_reason": null
+        }
+      }
+    },
+    "raw_proof_artifacts": {
+      "initializer_initial_receipt": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_component.json",
+        "bytes": 1819,
+        "sha256": "497129f44f639dd004b95d82760bacc1d12e9476d76a15ca2158b975f0f6bd27",
+        "content": "{\n  \"scope\": \"Exact entire production initializer-gate module; not full DbPool/SQLModel or MCP integration\",\n  \"source\": \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n  \"sha256\": \"c44f24dd2d17e634344e4496f71636c3d3fbc4ff00094a533242e86f5ed6219b\",\n  \"results\": [\n    {\n      \"name\": \"candidate_compile\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n        \"--crate-name\",\n        \"sqlite_init_gate\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_tests\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.947,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 0,\n      \"oom_kills_delta\": 0,\n      \"log\": \"candidate_compile.log\",\n      \"log_bytes\": 0,\n      \"free_bytes\": 21008384\n    },\n    {\n      \"name\": \"candidate_tests\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_tests\",\n        \"--test-threads=1\",\n        \"--nocapture\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.256,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 0,\n      \"oom_kills_delta\": 0,\n      \"log\": \"candidate_tests.log\",\n      \"log_bytes\": 1295,\n      \"free_bytes\": 21004288,\n      \"test_counts\": [\n        \"ok\",\n        \"8\",\n        \"0\",\n        \"0\",\n        \"0\",\n        \"0\"\n      ]\n    }\n  ],\n  \"artifact_bytes\": 1035343\n}\n"
+      },
+      "initializer_baseline_receipt": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/resumed_native_component.json",
+        "bytes": 7809,
+        "sha256": "bf15cb07dc7affd84258f2ddc98de7cc8f48216627e5d8657f75ed361d6458f1",
+        "content": "{\n  \"scope\": \"Exact baseline gate and original component controls, plus held-owner comparison of actual APIs; no database or request integration\",\n  \"sources\": {\n    \"base\": \"7f188230631d22c60d97bafc3f53962e5dafe163\",\n    \"exact_baseline_segments_sha256\": {\n      \"production_gate\": \"7ed3b7d5815910c7c396b196bd892e42080366e0e043c8f09a5eb278d7c305c0\",\n      \"sqlite_init_gate_bounds_waiters_and_resets_on_failure\": \"8fa926e931387cc408f15654b698e162ad6d46f1b8c12591e87e31e40e9aafb9\",\n      \"sqlite_init_gate_completion_guard_resets_on_unwind_path\": \"e567e6b674781350b7dcea9020e294978da3d8c8d64c87b00ad0a0917eefc748\",\n      \"sqlite_init_gate_wakes_waiters_when_initializer_completes\": \"42dced04856991ff1f15d2b264b154fc17143c825a46718d6abe2915eb4d36d4\"\n    },\n    \"baseline_harness_sha256\": \"ed235ac2489c66901901fb3405dcb0bc1c7fda6c07a55502237fda1934324190\",\n    \"driver_sha256\": \"22050cc045dd1e4d59e7b64bfcdc09d13e9e0705da57614bb10f90cd2fe25777\",\n    \"candidate_sha256\": \"c44f24dd2d17e634344e4496f71636c3d3fbc4ff00094a533242e86f5ed6219b\",\n    \"third_control_scope\": \"exact original gate test through thread join; unrelated pool-default assertions excluded and retained in real pool.rs tests\"\n  },\n  \"limits\": {\n    \"family_rss_bytes\": 536870912,\n    \"command_seconds\": 120,\n    \"initial_free_bytes\": 8388608,\n    \"runtime_free_floor_bytes\": 4194304,\n    \"artifact_bytes\": 12582912\n  },\n  \"results\": [\n    {\n      \"name\": \"baseline_compile\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_gate_controls.rs\",\n        \"--crate-name\",\n        \"baseline_gate_controls\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_tests\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.464,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 124342272,\n      \"rss_samples\": 22,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12890021888,\n      \"log\": \"baseline_compile.log\",\n      \"log_bytes\": 0\n    },\n    {\n      \"name\": \"baseline_tests\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_tests\",\n        \"--test-threads=1\",\n        \"--nocapture\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.1044,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 1785856,\n      \"rss_samples\": 4,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12889432064,\n      \"log\": \"baseline_tests.log\",\n      \"log_bytes\": 338,\n      \"test_counts\": [\n        [\n          \"ok\",\n          \"3\",\n          \"0\",\n          \"0\",\n          \"0\",\n          \"0\"\n        ]\n      ]\n    },\n    {\n      \"name\": \"comparison_compile\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_gate_controls.rs\",\n        \"--cfg\",\n        \"cancellation_comparison\",\n        \"--crate-name\",\n        \"initializer_comparison\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_tests\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.5044,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 146878464,\n      \"rss_samples\": 24,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12886802432,\n      \"log\": \"comparison_compile.log\",\n      \"log_bytes\": 0\n    },\n    {\n      \"name\": \"cancellation_comparison\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_tests\",\n        \"--exact\",\n        \"cancellation_driver::held_owner_cancellation_comparison\",\n        \"--test-threads=1\",\n        \"--nocapture\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.6456,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 1957888,\n      \"rss_samples\": 31,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12887715840,\n      \"log\": \"cancellation_comparison.log\",\n      \"log_bytes\": 674,\n      \"test_counts\": [\n        [\n          \"ok\",\n          \"1\",\n          \"0\",\n          \"0\",\n          \"0\",\n          \"11\"\n        ]\n      ]\n    },\n    {\n      \"name\": \"candidate_production_metadata\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n        \"--crate-type\",\n        \"lib\",\n        \"--emit=metadata\",\n        \"--crate-name\",\n        \"sqlite_init_gate\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_production.rmeta\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.083,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 80162816,\n      \"rss_samples\": 3,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12887650304,\n      \"log\": \"candidate_production_metadata.log\",\n      \"log_bytes\": 2050\n    },\n    {\n      \"name\": \"candidate_focused_clippy\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/clippy-driver\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n        \"--emit=metadata\",\n        \"--crate-name\",\n        \"sqlite_init_gate\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-Funsafe_code\",\n        \"-Dwarnings\",\n        \"-Wclippy::pedantic\",\n        \"-Wclippy::nursery\",\n        \"-Aclippy::missing_errors_doc\",\n        \"-Aclippy::missing_panics_doc\",\n        \"-Aclippy::module_name_repetitions\",\n        \"-Aclippy::result_large_err\",\n        \"-Aclippy::match_same_arms\",\n        \"-Aclippy::sliced_string_as_bytes\",\n        \"-Aclippy::needless_pass_by_value\",\n        \"-Aclippy::ref_option\",\n        \"-Aclippy::cast_precision_loss\",\n        \"-Aclippy::too_many_lines\",\n        \"-Aclippy::manual_let_else\",\n        \"-Aclippy::option_if_let_else\",\n        \"-Aclippy::too_many_arguments\",\n        \"-Aclippy::items_after_statements\",\n        \"-Aclippy::bool_to_int_with_if\",\n        \"-Aclippy::redundant_clone\",\n        \"-Aclippy::doc_markdown\",\n        \"-Aclippy::unused_async\",\n        \"-Aclippy::uninlined_format_args\",\n        \"-Aclippy::missing_const_for_fn\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_clippy.rmeta\"\n      ],\n      \"started\": true,\n      \"exit_code\": 1,\n      \"seconds\": 0.1311,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 115617792,\n      \"rss_samples\": 6,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12887642112,\n      \"log\": \"candidate_focused_clippy.log\",\n      \"log_bytes\": 2035\n    }\n  ],\n  \"artifact_bytes\": 3074020\n}\n"
+      },
+      "initializer_final_receipt": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/verified_native_component.json",
+        "bytes": 7745,
+        "sha256": "99848d97e4653339345014257a312f333df1c93b2e4e400d616e0162217ff7b9",
+        "content": "{\n  \"scope\": \"Final exact production gate module after focused lint corrections, normal LLVM/unwind; full DbPool/SQLModel/request integration remains unexecuted\",\n  \"source\": \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n  \"sha256\": \"be02c888a8fe4169042bca70b53a9b9b3fdf911142e0eac93c7c1e4ff98c9bef\",\n  \"baseline_source_receipt\": \"resumed_native_component.json\",\n  \"results\": [\n    {\n      \"name\": \"candidate_verified_format\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt\",\n        \"--check\",\n        \"--edition\",\n        \"2024\",\n        \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.1703,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 36388864,\n      \"rss_samples\": 7,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12598722560,\n      \"log\": \"candidate_verified_format.log\",\n      \"log_bytes\": 0\n    },\n    {\n      \"name\": \"candidate_verified_clippy\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/clippy-driver\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n        \"--emit=metadata\",\n        \"--crate-name\",\n        \"sqlite_init_gate\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-Funsafe_code\",\n        \"-Dwarnings\",\n        \"-Wclippy::pedantic\",\n        \"-Wclippy::nursery\",\n        \"-Aclippy::missing_errors_doc\",\n        \"-Aclippy::missing_panics_doc\",\n        \"-Aclippy::module_name_repetitions\",\n        \"-Aclippy::result_large_err\",\n        \"-Aclippy::match_same_arms\",\n        \"-Aclippy::sliced_string_as_bytes\",\n        \"-Aclippy::needless_pass_by_value\",\n        \"-Aclippy::ref_option\",\n        \"-Aclippy::cast_precision_loss\",\n        \"-Aclippy::too_many_lines\",\n        \"-Aclippy::manual_let_else\",\n        \"-Aclippy::option_if_let_else\",\n        \"-Aclippy::too_many_arguments\",\n        \"-Aclippy::items_after_statements\",\n        \"-Aclippy::bool_to_int_with_if\",\n        \"-Aclippy::redundant_clone\",\n        \"-Aclippy::doc_markdown\",\n        \"-Aclippy::unused_async\",\n        \"-Aclippy::uninlined_format_args\",\n        \"-Aclippy::missing_const_for_fn\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_clippy.rmeta\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.3988,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 130797568,\n      \"rss_samples\": 19,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12598722560,\n      \"log\": \"candidate_verified_clippy.log\",\n      \"log_bytes\": 0\n    },\n    {\n      \"name\": \"candidate_verified_compile\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n        \"--crate-name\",\n        \"sqlite_init_gate\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_tests\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.6148,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 141029376,\n      \"rss_samples\": 29,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12596011008,\n      \"log\": \"candidate_verified_compile.log\",\n      \"log_bytes\": 0\n    },\n    {\n      \"name\": \"candidate_verified_tests\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_tests\",\n        \"--test-threads=1\",\n        \"--nocapture\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.2322,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 2002944,\n      \"rss_samples\": 11,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12595916800,\n      \"log\": \"candidate_verified_tests.log\",\n      \"log_bytes\": 1295,\n      \"test_counts\": [\n        [\n          \"ok\",\n          \"8\",\n          \"0\",\n          \"0\",\n          \"0\",\n          \"0\"\n        ]\n      ]\n    },\n    {\n      \"name\": \"comparison_verified_compile\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"--test\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_gate_controls.rs\",\n        \"--cfg\",\n        \"cancellation_comparison\",\n        \"--crate-name\",\n        \"initializer_comparison\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_verified_tests\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.6203,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 148402176,\n      \"rss_samples\": 28,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12593496064,\n      \"log\": \"comparison_verified_compile.log\",\n      \"log_bytes\": 0\n    },\n    {\n      \"name\": \"cancellation_comparison_verified\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_verified_tests\",\n        \"--exact\",\n        \"cancellation_driver::held_owner_cancellation_comparison\",\n        \"--test-threads=1\",\n        \"--nocapture\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.64,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 1970176,\n      \"rss_samples\": 29,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12590116864,\n      \"log\": \"cancellation_comparison_verified.log\",\n      \"log_bytes\": 675,\n      \"test_counts\": [\n        [\n          \"ok\",\n          \"1\",\n          \"0\",\n          \"0\",\n          \"0\",\n          \"11\"\n        ]\n      ]\n    },\n    {\n      \"name\": \"candidate_verified_production_metadata\",\n      \"argv\": [\n        \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n        \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\",\n        \"--crate-type\",\n        \"lib\",\n        \"--emit=metadata\",\n        \"--crate-name\",\n        \"sqlite_init_gate\",\n        \"--edition=2024\",\n        \"-Cpanic=unwind\",\n        \"-Copt-level=0\",\n        \"-Cdebuginfo=0\",\n        \"-Ccodegen-units=1\",\n        \"-Cstrip=symbols\",\n        \"-o\",\n        \"/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_production.rmeta\"\n      ],\n      \"started\": true,\n      \"exit_code\": 0,\n      \"seconds\": 0.0736,\n      \"stop_reason\": null,\n      \"peak_family_rss_bytes\": 95621120,\n      \"rss_samples\": 3,\n      \"oom_delta\": {\n        \"oom\": 0,\n        \"oom_kill\": 0\n      },\n      \"free_bytes\": 12589965312,\n      \"log\": \"candidate_verified_production_metadata.log\",\n      \"log_bytes\": 2050\n    }\n  ],\n  \"artifact_bytes\": 7411498\n}\n"
+      },
+      "initializer_baseline_harness": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_gate_controls.rs",
+        "bytes": 7435,
+        "sha256": "ed235ac2489c66901901fb3405dcb0bc1c7fda6c07a55502237fda1934324190",
+        "content": "//! Native component controls copied from main 7f188230631d22c60d97bafc3f53962e5dafe163.\n//!\n//! The implementation below is byte-identical to the gate block in pool.rs.\n//! The first two controls are byte-identical; the third preserves its complete\n//! gate control through the thread join. Its unrelated pool-default assertions\n//! remain in the real database test suite, not this std-only component harness.\n\nuse std::sync::{Condvar, Mutex};\nuse std::time::{Duration, Instant};\n\n#[cfg(cancellation_comparison)]\n#[path = \"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs\"]\nmod candidate;\n\n#[cfg(cancellation_comparison)]\n#[path = \"cancellation_driver.rs\"]\nmod cancellation_driver;\n\n/// Outcome of [`SqliteInitGate::claim_or_wait`].\nenum SqliteInitGateClaim {\n    /// The caller won the initializer role and MUST run initialization, then\n    /// call [`SqliteInitGate::complete`] (or rely on\n    /// [`SqliteInitGateCompletion`]'s drop guard).\n    Initialize,\n    /// Initialization already completed successfully.\n    Ready,\n    /// Another task is still initializing and the wait budget elapsed.\n    TimedOut,\n}\n\n#[derive(Clone, Copy, PartialEq, Eq)]\nenum SqliteInitGateState {\n    NotStarted,\n    Running,\n    Done,\n}\n\n/// One-time DB init gate with BOUNDED waiting (GH#245 stall hunt, finding F1).\n///\n/// The previous shape was an `asupersync` `OnceCell<()>`: cancellation-correct,\n/// but every non-initializing caller awaited it with no deadline. When the\n/// initializer wedged (archive reconcile behind the storage publication fence,\n/// a slow migration, a filesystem stall), every DB-needing tool call parked\n/// forever in that await — dispatch threads in `futex_do_wait`, process idle,\n/// every request reported as an unattributed 30s timeout: the GH#245 outage\n/// shape. Now only the initializer runs unboundedly; waiters bound their wait\n/// with [`SQLITE_INIT_GATE_WAIT_BUDGET`] and surface a retryable, ATTRIBUTED\n/// error instead. std sync primitives on purpose: this path runs under\n/// `block_on` on dedicated dispatch threads and must not depend on async\n/// timers (GH#203).\nstruct SqliteInitGate {\n    state: Mutex<SqliteInitGateState>,\n    cv: Condvar,\n}\n\nimpl SqliteInitGate {\n    fn new() -> Self {\n        Self {\n            state: Mutex::new(SqliteInitGateState::NotStarted),\n            cv: Condvar::new(),\n        }\n    }\n\n    /// Claim the initializer role, or wait (bounded) for the current one.\n    ///\n    /// Failure semantics mirror the old `OnceCell::get_or_try_init`: a failed\n    /// or cancelled initialization resets to `NotStarted` (via\n    /// [`Self::complete`]) so a later caller retries it.\n    fn claim_or_wait(&self, budget: Duration) -> SqliteInitGateClaim {\n        let deadline = Instant::now() + budget;\n        let mut state = self\n            .state\n            .lock()\n            .unwrap_or_else(std::sync::PoisonError::into_inner);\n        loop {\n            match *state {\n                SqliteInitGateState::Done => return SqliteInitGateClaim::Ready,\n                SqliteInitGateState::NotStarted => {\n                    *state = SqliteInitGateState::Running;\n                    return SqliteInitGateClaim::Initialize;\n                }\n                SqliteInitGateState::Running => {\n                    let now = Instant::now();\n                    let Some(remaining) = deadline.checked_duration_since(now) else {\n                        return SqliteInitGateClaim::TimedOut;\n                    };\n                    if remaining.is_zero() {\n                        return SqliteInitGateClaim::TimedOut;\n                    }\n                    let (guard, _) = self\n                        .cv\n                        .wait_timeout(state, remaining)\n                        .unwrap_or_else(std::sync::PoisonError::into_inner);\n                    state = guard;\n                }\n            }\n        }\n    }\n\n    /// Publish the initializer's outcome and wake every bounded waiter.\n    fn complete(&self, success: bool) {\n        let mut state = self\n            .state\n            .lock()\n            .unwrap_or_else(std::sync::PoisonError::into_inner);\n        *state = if success {\n            SqliteInitGateState::Done\n        } else {\n            SqliteInitGateState::NotStarted\n        };\n        drop(state);\n        self.cv.notify_all();\n    }\n}\n\n/// Drop guard so the gate can never be stranded in `Running` — an initializer\n/// that unwinds (or forgets to report) resets the gate to retryable instead of\n/// condemning every future waiter to bounded timeouts with no retry.\nstruct SqliteInitGateCompletion<'a> {\n    gate: &'a SqliteInitGate,\n    success: bool,\n}\n\nimpl Drop for SqliteInitGateCompletion<'_> {\n    fn drop(&mut self) {\n        self.gate.complete(self.success);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Arc;\n\n    #[test]\n    fn sqlite_init_gate_bounds_waiters_and_resets_on_failure() {\n        let gate = SqliteInitGate::new();\n        assert!(matches!(\n            gate.claim_or_wait(Duration::from_millis(10)),\n            SqliteInitGateClaim::Initialize\n        ));\n\n        // While Running, another caller times out instead of parking forever.\n        let start = Instant::now();\n        assert!(matches!(\n            gate.claim_or_wait(Duration::from_millis(50)),\n            SqliteInitGateClaim::TimedOut\n        ));\n        assert!(start.elapsed() >= Duration::from_millis(45));\n\n        // Failure resets to NotStarted: the next caller retries init.\n        gate.complete(false);\n        assert!(matches!(\n            gate.claim_or_wait(Duration::from_millis(10)),\n            SqliteInitGateClaim::Initialize\n        ));\n\n        // Success publishes Done: everyone proceeds instantly.\n        gate.complete(true);\n        assert!(matches!(\n            gate.claim_or_wait(Duration::ZERO),\n            SqliteInitGateClaim::Ready\n        ));\n    }\n\n    #[test]\n    fn sqlite_init_gate_completion_guard_resets_on_unwind_path() {\n        let gate = SqliteInitGate::new();\n        assert!(matches!(\n            gate.claim_or_wait(Duration::ZERO),\n            SqliteInitGateClaim::Initialize\n        ));\n        // Dropping the guard without marking success (what an unwinding\n        // initializer does) must reset the gate to retryable.\n        drop(SqliteInitGateCompletion {\n            gate: &gate,\n            success: false,\n        });\n        assert!(matches!(\n            gate.claim_or_wait(Duration::ZERO),\n            SqliteInitGateClaim::Initialize\n        ));\n    }\n\n    #[test]\n    fn sqlite_init_gate_wakes_waiters_when_initializer_completes() {\n        let gate = Arc::new(SqliteInitGate::new());\n        assert!(matches!(\n            gate.claim_or_wait(Duration::ZERO),\n            SqliteInitGateClaim::Initialize\n        ));\n        let signaller = Arc::clone(&gate);\n        let handle = std::thread::spawn(move || {\n            std::thread::sleep(Duration::from_millis(30));\n            signaller.complete(true);\n        });\n        let start = Instant::now();\n        assert!(matches!(\n            gate.claim_or_wait(Duration::from_secs(5)),\n            SqliteInitGateClaim::Ready\n        ));\n        assert!(\n            start.elapsed() < Duration::from_secs(4),\n            \"waiter must wake on completion, not run out its full budget\"\n        );\n        handle.join().expect(\"signaller thread\");\n    }\n}\n"
+      },
+      "initializer_comparison_driver": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_driver.rs",
+        "bytes": 6337,
+        "sha256": "22050cc045dd1e4d59e7b64bfcdc09d13e9e0705da57614bb10f90cd2fe25777",
+        "content": "//! Component comparison of actual old and new gate calls, with a held owner.\n//!\n//! The baseline calls its original API and records what actually happens. API\n//! absence is never treated as a failure. This fixture models a liveness flag;\n//! it does not exercise Cx, SQLModel, request dispatch, or database operations.\n\nuse super::{SqliteInitGate, SqliteInitGateClaim, SqliteInitGateState, candidate};\nuse std::sync::Arc;\nuse std::sync::atomic::{AtomicBool, Ordering};\nuse std::sync::mpsc;\nuse std::time::{Duration, Instant};\n\nconst WAIT_BUDGET: Duration = Duration::from_secs(5);\nconst CANCEL_OBSERVATION_WINDOW: Duration = Duration::from_millis(500);\n\n#[derive(Clone)]\nenum Gate {\n    Baseline(Arc<SqliteInitGate>),\n    Candidate(Arc<candidate::SqliteInitGate>),\n}\n\n#[derive(Debug, PartialEq, Eq)]\nenum WaitOutcome {\n    Initialize,\n    Ready,\n    TimedOut,\n    Cancelled,\n}\n\nimpl Gate {\n    fn claim_owner(&self) {\n        let outcome = self.wait(Duration::ZERO, &AtomicBool::new(false));\n        assert_eq!(outcome, WaitOutcome::Initialize);\n    }\n\n    fn wait(&self, budget: Duration, cancelled: &AtomicBool) -> WaitOutcome {\n        match self {\n            // This is the exact old production API, not a stub or an adapter\n            // that fabricates an unsupported cancellation outcome.\n            Self::Baseline(gate) => match gate.claim_or_wait(budget) {\n                SqliteInitGateClaim::Initialize => WaitOutcome::Initialize,\n                SqliteInitGateClaim::Ready => WaitOutcome::Ready,\n                SqliteInitGateClaim::TimedOut => WaitOutcome::TimedOut,\n            },\n            Self::Candidate(gate) => {\n                let result = gate.claim_or_wait_with(budget, || {\n                    if cancelled.load(Ordering::Acquire) {\n                        Err(())\n                    } else {\n                        Ok(())\n                    }\n                });\n                match result {\n                    Ok(candidate::SqliteInitGateClaim::Initialize) => WaitOutcome::Initialize,\n                    Ok(candidate::SqliteInitGateClaim::Ready) => WaitOutcome::Ready,\n                    Ok(candidate::SqliteInitGateClaim::TimedOut) => WaitOutcome::TimedOut,\n                    Err(()) => WaitOutcome::Cancelled,\n                }\n            }\n        }\n    }\n\n    fn owner_retained(&self) -> bool {\n        match self {\n            Self::Baseline(gate) => {\n                *gate.state.lock().unwrap() == SqliteInitGateState::Running\n            }\n            Self::Candidate(gate) => matches!(\n                gate.claim_or_wait(Duration::ZERO),\n                candidate::SqliteInitGateClaim::TimedOut\n            ),\n        }\n    }\n\n    fn complete(&self) {\n        match self {\n            Self::Baseline(gate) => gate.complete(true),\n            Self::Candidate(gate) => gate.complete(true),\n        }\n    }\n}\n\n#[derive(Debug)]\nstruct Observation {\n    waiter_started: bool,\n    completed_before_cancellation: bool,\n    completed_while_owner_held: bool,\n    owner_retained_at_release: bool,\n    outcome: WaitOutcome,\n    owner_hold_after_cancel: Duration,\n    completion_after_cancel: Duration,\n}\n\nfn observe(gate: Gate) -> Observation {\n    gate.claim_owner();\n    let cancelled = Arc::new(AtomicBool::new(false));\n    let worker_gate = gate.clone();\n    let worker_cancelled = Arc::clone(&cancelled);\n    let (entered_tx, entered_rx) = mpsc::channel();\n    let (done_tx, done_rx) = mpsc::channel();\n    let worker = std::thread::spawn(move || {\n        // The baseline has no waiter instrumentation. This handshake is\n        // immediately before its actual gate call; the parent then gives the\n        // waiting thread 50 ms before changing liveness. New production tests\n        // separately witness an actual bounded wait interval in the candidate.\n        entered_tx.send(()).unwrap();\n        let outcome = worker_gate.wait(WAIT_BUDGET, &worker_cancelled);\n        done_tx.send((outcome, Instant::now())).unwrap();\n    });\n    let waiter_started = entered_rx.recv_timeout(Duration::from_secs(2)).is_ok();\n    let before_cancel = done_rx.recv_timeout(Duration::from_millis(50));\n    let completed_before_cancellation = before_cancel.is_ok();\n    let cancelled_at = Instant::now();\n    cancelled.store(true, Ordering::Release);\n    let during_hold = match before_cancel {\n        Ok(result) => Some(result),\n        Err(_) => done_rx.recv_timeout(CANCEL_OBSERVATION_WINDOW).ok(),\n    };\n    let completed_while_owner_held = during_hold.is_some();\n    let owner_retained_at_release = gate.owner_retained();\n    let owner_hold_after_cancel = cancelled_at.elapsed();\n    // Every assertion follows owner release and worker join, including on a\n    // regression, so the comparison never abandons a blocked waiter.\n    gate.complete();\n    let final_result = match during_hold {\n        Some(result) => Some(result),\n        None => done_rx.recv_timeout(WAIT_BUDGET).ok(),\n    };\n    let joined = worker.join();\n    joined.expect(\"comparison waiter\");\n    let (outcome, completed_at) = final_result.expect(\"gate waiter eventually completes\");\n    Observation {\n        waiter_started,\n        completed_before_cancellation,\n        completed_while_owner_held,\n        owner_retained_at_release,\n        outcome,\n        owner_hold_after_cancel,\n        completion_after_cancel: completed_at.saturating_duration_since(cancelled_at),\n    }\n}\n\n#[test]\nfn held_owner_cancellation_comparison() {\n    let baseline = observe(Gate::Baseline(Arc::new(SqliteInitGate::new())));\n    let candidate = observe(Gate::Candidate(Arc::new(candidate::SqliteInitGate::new())));\n    eprintln!(\"BASELINE {baseline:?}\");\n    eprintln!(\"CANDIDATE {candidate:?}\");\n    assert!(baseline.waiter_started && candidate.waiter_started);\n    assert!(!baseline.completed_before_cancellation);\n    assert!(!candidate.completed_before_cancellation);\n    assert!(baseline.owner_retained_at_release);\n    assert!(candidate.owner_retained_at_release);\n    assert!(!baseline.completed_while_owner_held);\n    assert_eq!(baseline.outcome, WaitOutcome::Ready);\n    assert!(baseline.owner_hold_after_cancel >= CANCEL_OBSERVATION_WINDOW);\n    assert!(candidate.completed_while_owner_held);\n    assert_eq!(candidate.outcome, WaitOutcome::Cancelled);\n    assert!(candidate.completion_after_cancel < CANCEL_OBSERVATION_WINDOW);\n}\n"
+      },
+      "initializer_runner": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/run_native_followup.py",
+        "bytes": 10267,
+        "sha256": "d66cc1214288a24b0499e52d3454797ac2af76925bd2188e6e1652237ebf6c49",
+        "content": "#!/usr/bin/env python3\n\"\"\"Bounded, additive native component verification; no dependency build.\"\"\"\n\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport signal\nimport subprocess\nimport time\n\n\nEVIDENCE = Path('/workspace/scratch/b1120803451c/gh353-initializer-evidence')\nWORKTREE = Path('/workspace/scratch/b1120803451c/gh353-continuation-7f188230')\nTOOLCHAIN = Path('/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin')\nCANDIDATE = WORKTREE / 'crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs'\nBASELINE = EVIDENCE / 'baseline_gate_controls.rs'\nBASE = '7f188230631d22c60d97bafc3f53962e5dafe163'\nEXPECTED_CANDIDATE_SHA = 'c44f24dd2d17e634344e4496f71636c3d3fbc4ff00094a533242e86f5ed6219b'\nRSS_CAP = 512 * 1024 * 1024\nINITIAL_FREE = 8 * 1024 * 1024\nFREE_FLOOR = 4 * 1024 * 1024\nARTIFACT_CAP = 12 * 1024 * 1024\nTIMEOUT = 120\n\n\ndef free_bytes():\n    stat = os.statvfs(EVIDENCE)\n    return stat.f_bfree * stat.f_frsize\n\n\ndef artifact_bytes():\n    return sum(path.stat().st_size for path in EVIDENCE.rglob('*') if path.is_file())\n\n\ndef oom_counts():\n    fields = dict(line.split() for line in Path('/sys/fs/cgroup/memory.events').read_text().splitlines())\n    return {key: int(fields[key]) for key in ('oom', 'oom_kill')}\n\n\ndef family_rss(pid):\n    pending = [pid]\n    seen = set()\n    total = 0\n    observed = False\n    while pending:\n        member = pending.pop()\n        if member in seen:\n            continue\n        seen.add(member)\n        proc = Path('/proc') / str(member)\n        try:\n            status = proc.joinpath('status').read_text()\n            match = re.search(r'^VmRSS:\\s+(\\d+)\\s+kB$', status, re.MULTILINE)\n            if match:\n                total += int(match.group(1)) * 1024\n                observed = True\n            for task in proc.joinpath('task').iterdir():\n                try:\n                    pending.extend(int(child) for child in task.joinpath('children').read_text().split())\n                except (FileNotFoundError, ProcessLookupError):\n                    pass\n        except (FileNotFoundError, ProcessLookupError):\n            pass\n    return total if observed else None\n\n\ndef run(name, argv):\n    result = {'name': name, 'argv': [str(arg) for arg in argv], 'started': False}\n    if free_bytes() < INITIAL_FREE:\n        return dict(result, stop_reason='initial disk floor', free_bytes=free_bytes())\n    if artifact_bytes() >= ARTIFACT_CAP:\n        return dict(result, stop_reason='artifact budget exhausted')\n    before = oom_counts()\n    environment = dict(os.environ, TMPDIR=str(EVIDENCE / 'tmp'))\n    log_path = EVIDENCE / (name + '.log')\n    started = time.monotonic()\n    stop_reason = None\n    peak_rss = None\n    sample_count = 0\n    with log_path.open('xb') as log:\n        child = subprocess.Popen(\n            result['argv'], stdout=log, stderr=subprocess.STDOUT,\n            cwd=WORKTREE, env=environment, start_new_session=True,\n        )\n        result['started'] = True\n        while child.poll() is None:\n            rss = family_rss(child.pid)\n            if rss is not None:\n                peak_rss = max(peak_rss or 0, rss)\n                sample_count += 1\n            current_oom = oom_counts()\n            if any(current_oom[key] > before[key] for key in before):\n                stop_reason = 'cgroup OOM counter increased'\n            elif rss is not None and rss > RSS_CAP:\n                stop_reason = 'process family RSS cap exceeded'\n            elif free_bytes() < FREE_FLOOR:\n                stop_reason = 'runtime disk floor'\n            elif artifact_bytes() > ARTIFACT_CAP:\n                stop_reason = 'artifact budget exceeded'\n            elif time.monotonic() - started > TIMEOUT:\n                stop_reason = '120-second command limit'\n            if stop_reason:\n                try:\n                    os.killpg(child.pid, signal.SIGTERM)\n                except ProcessLookupError:\n                    pass\n                try:\n                    child.wait(timeout=1)\n                except subprocess.TimeoutExpired:\n                    try:\n                        os.killpg(child.pid, signal.SIGKILL)\n                    except ProcessLookupError:\n                        pass\n                    child.wait(timeout=2)\n                break\n            time.sleep(0.02)\n        exit_code = child.wait()\n    after = oom_counts()\n    result.update(\n        exit_code=exit_code,\n        seconds=round(time.monotonic() - started, 4),\n        stop_reason=stop_reason,\n        peak_family_rss_bytes=peak_rss,\n        rss_samples=sample_count,\n        oom_delta={key: after[key] - before[key] for key in before},\n        free_bytes=free_bytes(),\n        log=log_path.name,\n        log_bytes=log_path.stat().st_size,\n    )\n    output = log_path.read_text(errors='replace')\n    counts = re.findall(r'test result: (\\w+)\\. (\\d+) passed; (\\d+) failed; (\\d+) ignored; (\\d+) measured; (\\d+) filtered out', output)\n    if counts:\n        result['test_counts'] = counts\n    print(json.dumps(result), flush=True)\n    return result\n\n\ndef verify_sources():\n    original = subprocess.check_output(\n        ['git', 'show', BASE + ':crates/mcp-agent-mail-db/src/pool.rs'], cwd=WORKTREE,\n    ).decode()\n    baseline = BASELINE.read_text()\n    block_start = '/// Outcome of [`SqliteInitGate::claim_or_wait`].\\n'\n    original_block = original[original.index(block_start):original.index('\\nfn sqlite_init_gate(\\n')]\n    baseline_block = baseline[baseline.index(block_start):baseline.index('\\n#[cfg(test)]\\nmod tests {')]\n    assert baseline_block == original_block, 'baseline production gate differs from exact main'\n    checks = {'production_gate': hashlib.sha256(original_block.encode()).hexdigest()}\n    names = [\n        'sqlite_init_gate_bounds_waiters_and_resets_on_failure',\n        'sqlite_init_gate_completion_guard_resets_on_unwind_path',\n        'sqlite_init_gate_wakes_waiters_when_initializer_completes',\n    ]\n    for index, name in enumerate(names):\n        start = '    #[test]\\n    fn ' + name + '() {\\n'\n        original_start = original.index(start)\n        baseline_start = baseline.index(start)\n        if index < 2:\n            original_end = original.index('\\n    #[test]\\n', original_start + len(start))\n            baseline_end = baseline.index('\\n    #[test]\\n', baseline_start + len(start))\n        else:\n            join = '        handle.join().expect(\"signaller thread\");\\n'\n            original_end = original.index(join, original_start) + len(join)\n            baseline_end = baseline.index(join, baseline_start) + len(join)\n        expected = original[original_start:original_end]\n        actual = baseline[baseline_start:baseline_end]\n        assert actual == expected, 'baseline control differs: ' + name\n        checks[name] = hashlib.sha256(expected.encode()).hexdigest()\n    candidate_sha = hashlib.sha256(CANDIDATE.read_bytes()).hexdigest()\n    assert candidate_sha == EXPECTED_CANDIDATE_SHA, 'candidate source changed'\n    return {\n        'base': BASE,\n        'exact_baseline_segments_sha256': checks,\n        'baseline_harness_sha256': hashlib.sha256(BASELINE.read_bytes()).hexdigest(),\n        'driver_sha256': hashlib.sha256((EVIDENCE / 'cancellation_driver.rs').read_bytes()).hexdigest(),\n        'candidate_sha256': candidate_sha,\n        'third_control_scope': 'exact original gate test through thread join; unrelated pool-default assertions excluded and retained in real pool.rs tests',\n    }\n\n\ndef main():\n    receipt = {\n        'scope': 'Exact baseline gate and original component controls, plus held-owner comparison of actual APIs; no database or request integration',\n        'sources': verify_sources(),\n        'limits': {'family_rss_bytes': RSS_CAP, 'command_seconds': TIMEOUT, 'initial_free_bytes': INITIAL_FREE, 'runtime_free_floor_bytes': FREE_FLOOR, 'artifact_bytes': ARTIFACT_CAP},\n        'results': [],\n    }\n    common = ['--edition=2024', '-Cpanic=unwind', '-Copt-level=0', '-Cdebuginfo=0', '-Ccodegen-units=1', '-Cstrip=symbols']\n    rustc = TOOLCHAIN / 'rustc'\n    clippy = TOOLCHAIN / 'clippy-driver'\n    allowances = [\n        'missing_errors_doc', 'missing_panics_doc', 'module_name_repetitions',\n        'result_large_err', 'match_same_arms', 'sliced_string_as_bytes',\n        'needless_pass_by_value', 'ref_option', 'cast_precision_loss',\n        'too_many_lines', 'manual_let_else', 'option_if_let_else',\n        'too_many_arguments', 'items_after_statements', 'bool_to_int_with_if',\n        'redundant_clone', 'doc_markdown', 'unused_async',\n        'uninlined_format_args', 'missing_const_for_fn',\n    ]\n    jobs = [\n        ('baseline_compile', [rustc, '--test', BASELINE, '--crate-name', 'baseline_gate_controls', *common, '-o', EVIDENCE / 'baseline_tests']),\n        ('baseline_tests', [EVIDENCE / 'baseline_tests', '--test-threads=1', '--nocapture']),\n        ('comparison_compile', [rustc, '--test', BASELINE, '--cfg', 'cancellation_comparison', '--crate-name', 'initializer_comparison', *common, '-o', EVIDENCE / 'cancellation_comparison_tests']),\n        ('cancellation_comparison', [EVIDENCE / 'cancellation_comparison_tests', '--exact', 'cancellation_driver::held_owner_cancellation_comparison', '--test-threads=1', '--nocapture']),\n        ('candidate_production_metadata', [rustc, CANDIDATE, '--crate-type', 'lib', '--emit=metadata', '--crate-name', 'sqlite_init_gate', *common, '-o', EVIDENCE / 'candidate_production.rmeta']),\n        ('candidate_focused_clippy', [clippy, '--test', CANDIDATE, '--emit=metadata', '--crate-name', 'sqlite_init_gate', *common, '-Funsafe_code', '-Dwarnings', '-Wclippy::pedantic', '-Wclippy::nursery', *['-Aclippy::' + lint for lint in allowances], '-o', EVIDENCE / 'candidate_clippy.rmeta']),\n    ]\n    for name, argv in jobs:\n        result = run(name, argv)\n        receipt['results'].append(result)\n        if result.get('exit_code') != 0 or result.get('stop_reason'):\n            break\n    receipt['artifact_bytes'] = artifact_bytes()\n    with (EVIDENCE / 'resumed_native_component.json').open('x') as handle:\n        json.dump(receipt, handle, indent=2)\n        handle.write('\\n')\n    print('receipt', EVIDENCE / 'resumed_native_component.json', flush=True)\n\n\nif __name__ == '__main__':\n    main()\n"
+      },
+      "initializer_baseline_log": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/baseline_tests.log",
+        "bytes": 338,
+        "sha256": "c7f98e56c21a770a86df3020d3f35694bdadb19ed0afdf0d73a7d530feb01e13",
+        "content": "\nrunning 3 tests\ntest tests::sqlite_init_gate_bounds_waiters_and_resets_on_failure ... ok\ntest tests::sqlite_init_gate_completion_guard_resets_on_unwind_path ... ok\ntest tests::sqlite_init_gate_wakes_waiters_when_initializer_completes ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s\n\n"
+      },
+      "initializer_final_test_log": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_tests.log",
+        "bytes": 1295,
+        "sha256": "d02b95bb43a4ca3e01a0d9b905d80c1a7c45bdb7a88a928053de52dbd3abe87c",
+        "content": "\nrunning 8 tests\ntest tests::cancellation_after_completion_does_not_erase_readiness ... ok\ntest tests::cancellation_before_claim_never_owns_or_reopens_the_gate ... ok\ntest tests::cancelled_waiter_returns_without_releasing_the_initializer ... ok\ntest tests::liveness_panic_keeps_foreign_ownership_and_an_unpoisoned_mutex ... \nthread 'tests::liveness_panic_keeps_foreign_ownership_and_an_unpoisoned_mutex' (317641) panicked at /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:296:21:\nfailed liveness observer\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nthread 'tests::liveness_panic_keeps_foreign_ownership_and_an_unpoisoned_mutex' (317641) panicked at /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:296:21:\nfailed liveness observer\nok\ntest tests::spurious_notifications_do_not_restart_the_wait_budget ... ok\ntest tests::sqlite_init_gate_bounds_waiters_and_resets_on_failure ... ok\ntest tests::sqlite_init_gate_completion_guard_resets_on_unwind_path ... ok\ntest tests::sqlite_init_gate_wakes_waiters_when_initializer_completes ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s\n\n"
+      },
+      "initializer_final_comparison_log": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/cancellation_comparison_verified.log",
+        "bytes": 675,
+        "sha256": "5a5a71d54df5c52d1ad810c972085eb1c7f240e5917c34b787bb385794dd41bd",
+        "content": "\nrunning 1 test\ntest cancellation_driver::held_owner_cancellation_comparison ... BASELINE Observation { waiter_started: true, completed_before_cancellation: false, completed_while_owner_held: false, owner_retained_at_release: true, outcome: Ready, owner_hold_after_cancel: 500.133376ms, completion_after_cancel: 504.049238ms }\nCANDIDATE Observation { waiter_started: true, completed_before_cancellation: false, completed_while_owner_held: true, owner_retained_at_release: true, outcome: Cancelled, owner_hold_after_cancel: 25.079699ms, completion_after_cancel: 25.027234ms }\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.63s\n\n"
+      },
+      "initializer_final_clippy_log": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_clippy.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": ""
+      },
+      "initializer_final_metadata_log": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-initializer-evidence/candidate_verified_production_metadata.log",
+        "bytes": 2050,
+        "sha256": "dcb135f0f7b47e26686d4e61ef577e44d8e85abc8ab419ced033ef7d4d72d785",
+        "content": "warning: constant `LIVENESS_POLL_INTERVAL` is never used\n  --> /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:12:7\n   |\n12 | const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(25);\n   |       ^^^^^^^^^^^^^^^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: enum `SqliteInitGateClaim` is never used\n  --> /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:15:17\n   |\n15 | pub(crate) enum SqliteInitGateClaim {\n   |                 ^^^^^^^^^^^^^^^^^^^\n\nwarning: enum `SqliteInitGateState` is never used\n  --> /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:25:6\n   |\n25 | enum SqliteInitGateState {\n   |      ^^^^^^^^^^^^^^^^^^^\n\nwarning: struct `SqliteInitGate` is never constructed\n  --> /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:31:19\n   |\n31 | pub(crate) struct SqliteInitGate {\n   |                   ^^^^^^^^^^^^^^\n\nwarning: associated items `new`, `claim_or_wait_with`, and `complete` are never used\n  --> /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:39:25\n   |\n38 | impl SqliteInitGate {\n   | ------------------- associated items in this implementation\n39 |     pub(crate) const fn new() -> Self {\n   |                         ^^^\n...\n55 |     pub(crate) fn claim_or_wait_with<E>(\n   |                   ^^^^^^^^^^^^^^^^^^\n...\n93 |     pub(crate) fn complete(&self, success: bool) {\n   |                   ^^^^^^^^\n\nwarning: struct `SqliteInitGateCompletion` is never constructed\n   --> /workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-db/src/pool/sqlite_init_gate.rs:121:19\n    |\n121 | pub(crate) struct SqliteInitGateCompletion<'a> {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: 6 warnings emitted\n\n"
+      },
+      "index_helper_receipt": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/helper_evidence.json",
+        "bytes": 2858,
+        "sha256": "9f76e2f7f7e4e1cf86b4e2fff93c185973f115f72f1f85ae04474cd391da8c7c",
+        "content": "{\n  \"compiler\": {\n    \"artifact_bytes\": 1038450,\n    \"command\": [\n      \"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\",\n      \"--edition=2024\",\n      \"--test\",\n      \"-C\",\n      \"opt-level=0\",\n      \"-C\",\n      \"debuginfo=0\",\n      \"-C\",\n      \"strip=symbols\",\n      \"-C\",\n      \"codegen-units=1\",\n      \"/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/encoded_paths.rs\",\n      \"-o\",\n      \"/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/encoded_paths_tests\"\n    ],\n    \"elapsed_seconds\": 0.415,\n    \"exit_code\": 0,\n    \"free_bytes\": 12865880064,\n    \"oom_after\": {\n      \"oom\": 129,\n      \"oom_kill\": 34\n    },\n    \"oom_before\": {\n      \"oom\": 129,\n      \"oom_kill\": 34\n    },\n    \"output\": \"\",\n    \"peak_owned_family_rss_bytes\": 157626368,\n    \"stop_reason\": null\n  },\n  \"helper_sha256\": \"0860a6364b324429d75dd07753ee88f03f559ca8afda6bfda35360a2f5b9cdc4\",\n  \"runner_sha256\": \"dee53e6b268e1cf2a999ea228aca42ed4edd1004fac1c1c372cd219d2834755c\",\n  \"scope\": \"Exact production checked-offset helper and real Git CLI index interoperability only; not git2/cache, cancellation, SQLite, repair publication, saturation, or request latency qualification.\",\n  \"source_sha256_after\": \"0a51982245db46caf4aa384bfc8cb4db210a91093d79a735a40d428b7a987b79\",\n  \"source_sha256_before\": \"0a51982245db46caf4aa384bfc8cb4db210a91093d79a735a40d428b7a987b79\",\n  \"tests\": {\n    \"artifact_bytes\": 1044950,\n    \"command\": [\n      \"/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/encoded_paths_tests\",\n      \"--test-threads=1\",\n      \"--nocapture\"\n    ],\n    \"elapsed_seconds\": 0.268,\n    \"exit_code\": 0,\n    \"free_bytes\": 12866031616,\n    \"oom_after\": {\n      \"oom\": 129,\n      \"oom_kill\": 34\n    },\n    \"oom_before\": {\n      \"oom\": 129,\n      \"oom_kill\": 34\n    },\n    \"output\": \"\\nrunning 4 tests\\ntest tests::actual_git_indexes_keep_v2_v3_names_and_decline_v4_ranges ... Git CLI fixture: sha1 v2, 8 native-listed entries, 888 bytes, preserved index\\nGit CLI fixture: sha1 v3, 8 native-listed entries, 888 bytes, preserved index\\nGit CLI fixture: sha1 v4, 8 native-listed entries, 834 bytes, preserved index\\nGit CLI fixture: sha256 v2, 8 native-listed entries, 972 bytes, preserved index\\nGit CLI fixture: sha256 v3, 8 native-listed entries, 980 bytes, preserved index\\nGit CLI fixture: sha256 v4, 8 native-listed entries, 942 bytes, preserved index\\nok\\ntest tests::encoded_ranges_follow_padding_extensions_and_both_object_widths ... ok\\ntest tests::helper_and_checked_layout_tests_are_exact_production_source ... ok\\ntest tests::unproved_encoded_ranges_disable_offsets_without_guessing ... ok\\n\\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s\\n\\n\",\n    \"peak_owned_family_rss_bytes\": 3584000,\n    \"stop_reason\": null\n  }\n}\n"
+      },
+      "index_helper_harness": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/encoded_paths.rs",
+        "bytes": 11773,
+        "sha256": "0860a6364b324429d75dd07753ee88f03f559ca8afda6bfda35360a2f5b9cdc4",
+        "content": "#![forbid(unsafe_code)]\n\n// Exact production helper plus exact checked-layout tests. The additional Git\n// CLI test exercises actual serialized indexes; it does not qualify git2 cache,\n// scan-budget cancellation, publication, SQLite, or request-latency behavior.\nuse std::ops::Range;\n\nstruct EncodedPaths {\n    next: Option<usize>,\n}\n\nimpl EncodedPaths {\n    fn new(encoded: &[u8]) -> Self {\n        let version = encoded\n            .get(4..8)\n            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())\n            .map(u32::from_be_bytes);\n        Self {\n            next: matches!(version, Some(2 | 3)).then_some(12),\n        }\n    }\n\n    fn take(&mut self, encoded: &[u8], expected: &[u8], oid_bytes: usize) -> Option<Range<usize>> {\n        // Remove the cursor first. Any failed bound/equality check disables\n        // subsequent ranges, instead of guessing where the next entry starts.\n        let start = self.next.take()?;\n        if !matches!(oid_bytes, 20 | 32) {\n            return None;\n        }\n        let flags_start = start.checked_add(40)?.checked_add(oid_bytes)?;\n        let flags_end = flags_start.checked_add(2)?;\n        let flags = u16::from_be_bytes(encoded.get(flags_start..flags_end)?.try_into().ok()?);\n        let path_start = flags_end.checked_add(if flags & 0x4000 == 0 { 0 } else { 2 })?;\n        let path_end = path_start.checked_add(expected.len())?;\n        if encoded.get(path_start..path_end)? != expected || *encoded.get(path_end)? != 0 {\n            return None;\n        }\n        let used = path_end.checked_add(1)?.checked_sub(start)?;\n        let padded = used.checked_add(7)? & !7;\n        let next = start.checked_add(padded)?;\n        // Padding belongs to this entry. It must be in bounds and zero; the\n        // native decoder remains the authority for all following extensions.\n        if encoded.get(path_end..next)?.iter().any(|byte| *byte != 0) {\n            return None;\n        }\n        self.next = Some(next);\n        Some(path_start..path_end)\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::io::Write;\n    use std::path::Path;\n    use std::process::{Command, Stdio};\n\n    fn encoded_path_fixture(\n        version: u32,\n        oid_bytes: usize,\n        extended: bool,\n    ) -> (Vec<u8>, Vec<Vec<u8>>) {\n        let names = [b\"a\".to_vec(), b\"aligned/path\".to_vec(), vec![b'x'; 4096]];\n        let mut bytes = b\"DIRC\".to_vec();\n        bytes.extend(version.to_be_bytes());\n        bytes.extend(3_u32.to_be_bytes());\n        for name in &names {\n            let start = bytes.len();\n            bytes.resize(start + 40 + oid_bytes, 0);\n            bytes.extend(if extended { 0x4000_u16 } else { 0 }.to_be_bytes());\n            if extended {\n                bytes.extend(0x4000_u16.to_be_bytes());\n            }\n            bytes.extend(name);\n            bytes.push(0);\n            let size = (bytes.len() - start + 7) & !7;\n            bytes.resize(start + size, 0);\n        }\n        (bytes, names.to_vec())\n    }\n\n    #[test]\n    fn encoded_ranges_follow_padding_extensions_and_both_object_widths() {\n        for version in [2, 3] {\n            for oid_bytes in [20, 32] {\n                for extended in [false, true] {\n                    let (bytes, names) = encoded_path_fixture(version, oid_bytes, extended);\n                    let mut paths = EncodedPaths::new(&bytes);\n                    for name in &names {\n                        let range = paths.take(&bytes, name, oid_bytes).unwrap();\n                        assert_eq!(&bytes[range], name);\n                    }\n                    assert_eq!(paths.next, Some(bytes.len()));\n                    assert!(paths.take(&bytes, b\"unexpected\", oid_bytes).is_none());\n                    assert!(paths.next.is_none());\n                }\n            }\n        }\n    }\n\n    #[test]\n    fn unproved_encoded_ranges_disable_offsets_without_guessing() {\n        let (bytes, names) = encoded_path_fixture(2, 20, false);\n        for end in 0..12 + 64 {\n            let truncated = &bytes[..end];\n            let mut paths = EncodedPaths::new(truncated);\n            assert!(paths.take(truncated, &names[0], 20).is_none());\n            assert!(paths.next.is_none());\n        }\n        for invalid_width in [0, 19, 21, 31, 33, usize::MAX] {\n            let mut paths = EncodedPaths::new(&bytes);\n            assert!(paths.take(&bytes, &names[0], invalid_width).is_none());\n            assert!(paths.next.is_none());\n        }\n        let mut mismatched = EncodedPaths::new(&bytes);\n        assert!(mismatched.take(&bytes, b\"b\", 20).is_none());\n        assert!(mismatched.take(&bytes, &names[0], 20).is_none());\n        let mut corrupt = bytes.clone();\n        corrupt[12 + 63] = 1; // First entry's terminating NUL/padding.\n        let mut paths = EncodedPaths::new(&corrupt);\n        assert!(paths.take(&corrupt, &names[0], 20).is_none());\n        let mut overflow = EncodedPaths {\n            next: Some(usize::MAX),\n        };\n        assert!(overflow.take(&bytes, &names[0], 20).is_none());\n        for version in [0, 1, 4, u32::MAX] {\n            let mut other = bytes.clone();\n            other[4..8].copy_from_slice(&version.to_be_bytes());\n            let mut paths = EncodedPaths::new(&other);\n            assert!(paths.take(&other, &names[0], 20).is_none());\n        }\n    }\n\n    #[test]\n    fn helper_and_checked_layout_tests_are_exact_production_source() {\n        let production = include_str!(\"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-storage/src/recovery/message_reconcile/identity/staged/decoded.rs\");\n        let harness = include_str!(\"encoded_paths.rs\");\n        let helper_start = production.find(\"struct EncodedPaths {\").unwrap();\n        let helper_end = production.find(\"\\nstruct Decoded {\").unwrap();\n        assert!(harness.contains(&production[helper_start..helper_end]));\n        let tests_start = production.find(\"    fn encoded_path_fixture(\").unwrap();\n        let tests_end = production\n            .find(\"    #[test]\\n    fn exact_bytes_reuse_decoding_and_preserve_native_prefix_verdicts\")\n            .unwrap();\n        assert!(harness.contains(&production[tests_start..tests_end]));\n    }\n\n    fn git(directory: &Path, arguments: &[&str], input: Option<&[u8]>) -> Vec<u8> {\n        let mut command = Command::new(\"git\");\n        command\n            .current_dir(directory)\n            .env_clear()\n            .env(\"PATH\", \"/usr/bin:/bin\")\n            .env(\"LC_ALL\", \"C\")\n            .env(\"GIT_CONFIG_NOSYSTEM\", \"1\")\n            .env(\"GIT_CONFIG_GLOBAL\", \"/dev/null\")\n            .env(\"GIT_CONFIG_SYSTEM\", \"/dev/null\")\n            .args([\n                \"-c\",\n                \"core.hooksPath=/dev/null\",\n                \"-c\",\n                \"gc.auto=0\",\n                \"-c\",\n                \"maintenance.auto=false\",\n            ])\n            .args(arguments)\n            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })\n            .stdout(Stdio::piped())\n            .stderr(Stdio::piped());\n        let mut child = command.spawn().unwrap();\n        if let Some(input) = input {\n            child.stdin.take().unwrap().write_all(input).unwrap();\n        }\n        let output = child.wait_with_output().unwrap();\n        assert!(\n            output.status.success(),\n            \"git {arguments:?}: {}\",\n            String::from_utf8_lossy(&output.stderr)\n        );\n        output.stdout\n    }\n\n    #[test]\n    fn actual_git_indexes_keep_v2_v3_names_and_decline_v4_ranges() {\n        let root = std::env::var_os(\"GH353_INDEX_HELPER_FIXTURES\")\n            .expect(\"set GH353_INDEX_HELPER_FIXTURES to the retained task fixture directory\");\n        let root = Path::new(&root);\n        std::fs::create_dir_all(root).unwrap();\n        for format in [\"sha1\", \"sha256\"] {\n            for version in [2_u32, 3, 4] {\n                let dir = root.join(format!(\"{format}-v{version}-{}\", std::process::id()));\n                std::fs::create_dir(&dir).unwrap();\n                git(\n                    &dir,\n                    &[\n                        \"init\",\n                        \"--quiet\",\n                        \"--template=\",\n                        \"--initial-branch=main\",\n                        &format!(\"--object-format={format}\"),\n                        \".\",\n                    ],\n                    None,\n                );\n                let oid = git(&dir, &[\"hash-object\", \"-w\", \"--stdin\"], Some(b\"real index fixture\\n\"));\n                let oid = std::str::from_utf8(&oid).unwrap().trim();\n                let width = oid.len() / 2;\n                assert_eq!(width, if format == \"sha1\" { 20 } else { 32 });\n                let long_name = format!(\"long/{}\", \"x\".repeat(240));\n                for name in [\"Alpha\", \"alpha\", \"folder-neighbor/a\", \"folder/file\", &long_name] {\n                    git(\n                        &dir,\n                        &[\"update-index\", \"--add\", \"--cacheinfo\", &format!(\"100644,{oid},{name}\")],\n                        None,\n                    );\n                }\n                let mut conflicts = String::new();\n                for stage in 1..=3 {\n                    conflicts.push_str(&format!(\"100644 {oid} {stage}\\tconflict/item\\n\"));\n                }\n                git(&dir, &[\"update-index\", \"--index-info\"], Some(conflicts.as_bytes()));\n                if version == 3 {\n                    git(&dir, &[\"update-index\", \"--skip-worktree\", \"--\", \"alpha\"], None);\n                }\n                git(&dir, &[\"update-index\", &format!(\"--index-version={version}\")], None);\n                let listing = git(&dir, &[\"ls-files\", \"--stage\", \"-z\"], None);\n                let records: Vec<&[u8]> = listing.split(|byte| *byte == 0)\n                    .filter(|record| !record.is_empty()).collect();\n                let expected: Vec<&[u8]> = records.iter().map(|record| {\n                    let tab = record.iter().position(|byte| *byte == b'\\t').unwrap();\n                    &record[tab + 1..]\n                }).collect();\n                assert_eq!(expected.iter().filter(|name| **name == b\"conflict/item\").count(), 3);\n                let index_path = dir.join(\".git/index\");\n                let bytes = std::fs::read(&index_path).unwrap();\n                assert_eq!(&bytes[..4], b\"DIRC\");\n                assert_eq!(u32::from_be_bytes(bytes[4..8].try_into().unwrap()), version);\n                assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize, expected.len());\n                let mut paths = EncodedPaths::new(&bytes);\n                for name in &expected {\n                    if version == 4 {\n                        assert!(paths.take(&bytes, name, width).is_none());\n                        assert!(paths.next.is_none());\n                    } else {\n                        let start = paths.next.unwrap();\n                        let range = paths.take(&bytes, name, width).unwrap();\n                        assert_eq!(&bytes[range], *name);\n                        if version == 3 && *name == b\"alpha\" {\n                            let flags_at = start + 40 + width;\n                            let flags = u16::from_be_bytes(bytes[flags_at..flags_at + 2].try_into().unwrap());\n                            let extended = u16::from_be_bytes(bytes[flags_at + 2..flags_at + 4].try_into().unwrap());\n                            assert_ne!(flags & 0x4000, 0);\n                            assert_ne!(extended & 0x4000, 0);\n                        }\n                    }\n                }\n                assert_eq!(std::fs::read(&index_path).unwrap(), bytes);\n                println!(\"Git CLI fixture: {format} v{version}, {} native-listed entries, {} bytes, preserved index\", expected.len(), bytes.len());\n            }\n        }\n    }\n}\n"
+      },
+      "index_helper_runner": {
+        "local_path": "/workspace/scratch/b1120803451c/gh353-index-cache-proof-7f188230/run_helper.py",
+        "bytes": 6541,
+        "sha256": "dee53e6b268e1cf2a999ea228aca42ed4edd1004fac1c1c372cd219d2834755c",
+        "content": "#!/usr/bin/env python3\n\"\"\"Bounded, single-compiler proof runner. Retains every created artifact.\"\"\"\n\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport selectors\nimport signal\nimport subprocess\nimport time\n\n\nROOT = Path(__file__).resolve().parent\nSOURCE = Path(\"/workspace/scratch/b1120803451c/gh353-continuation-7f188230/crates/mcp-agent-mail-storage/src/recovery/message_reconcile/identity/staged/decoded.rs\")\nRUSTC = Path(\"/workspace/scratch/b1120803451c/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc\")\nMEMORY_EVENTS = Path(\"/sys/fs/cgroup/memory.events\")\nMAX_RSS = 256 * 1024 * 1024\nMAX_SECONDS = 120\nMAX_ARTIFACT_BYTES = 4 * 1024 * 1024\nMIN_FREE = 4 * 1024 * 1024\n\n\ndef digest(path):\n    return hashlib.sha256(path.read_bytes()).hexdigest()\n\n\ndef oom_counts():\n    fields = dict(line.split() for line in MEMORY_EVENTS.read_text().splitlines())\n    return {name: int(fields[name]) for name in (\"oom\", \"oom_kill\")}\n\n\ndef family_rss(pgid):\n    total = 0\n    for entry in Path(\"/proc\").iterdir():\n        if not entry.name.isdigit():\n            continue\n        try:\n            if os.getpgid(int(entry.name)) != pgid:\n                continue\n            for line in (entry / \"status\").read_text().splitlines():\n                if line.startswith(\"VmRSS:\"):\n                    total += int(line.split()[1]) * 1024\n                    break\n        except (FileNotFoundError, ProcessLookupError, PermissionError):\n            pass\n    return total\n\n\ndef artifact_bytes():\n    total = 0\n    for directory, _, names in os.walk(ROOT):\n        for name in names:\n            try:\n                total += (Path(directory) / name).stat().st_size\n            except FileNotFoundError:\n                pass\n    return total\n\n\ndef free_bytes():\n    stat = os.statvfs(ROOT)\n    return stat.f_bfree * stat.f_frsize\n\n\ndef stop_owned_group(child):\n    if child.poll() is not None:\n        return\n    os.killpg(child.pid, signal.SIGTERM)\n    try:\n        child.wait(timeout=1)\n    except subprocess.TimeoutExpired:\n        os.killpg(child.pid, signal.SIGKILL)\n        child.wait(timeout=2)\n\n\ndef run(command, extra_env=None):\n    initial_oom = oom_counts()\n    if free_bytes() < 8 * 1024 * 1024:\n        raise RuntimeError(\"insufficient initial free disk\")\n    if artifact_bytes() > MAX_ARTIFACT_BYTES:\n        raise RuntimeError(\"artifact allowance already exceeded\")\n    environment = os.environ.copy()\n    if extra_env:\n        environment.update(extra_env)\n    started = time.monotonic()\n    child = subprocess.Popen(\n        [str(part) for part in command],\n        cwd=ROOT,\n        env=environment,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.STDOUT,\n        start_new_session=True,\n    )\n    output = bytearray()\n    peak_rss = 0\n    reason = None\n    selector = selectors.DefaultSelector()\n    selector.register(child.stdout, selectors.EVENT_READ)\n    try:\n        while child.poll() is None:\n            for key, _ in selector.select(timeout=0.025):\n                chunk = os.read(key.fileobj.fileno(), 65536)\n                if chunk:\n                    output.extend(chunk)\n                else:\n                    selector.unregister(key.fileobj)\n            elapsed = time.monotonic() - started\n            peak_rss = max(peak_rss, family_rss(child.pid))\n            current_oom = oom_counts()\n            if any(current_oom[key] > initial_oom[key] for key in initial_oom):\n                reason = \"cgroup OOM counter increased\"\n            elif peak_rss > MAX_RSS:\n                reason = \"owned process-family RSS exceeded256MiB\"\n            elif elapsed > MAX_SECONDS:\n                reason = \"owned command exceeded120seconds\"\n            elif free_bytes() < MIN_FREE:\n                reason = \"free disk fell below4MiB\"\n            elif artifact_bytes() > MAX_ARTIFACT_BYTES:\n                reason = \"own artifacts exceeded4MiB\"\n            elif len(output) > 1024 * 1024:\n                reason = \"unexpected output exceeds1MiB\"\n            if reason:\n                stop_owned_group(child)\n                break\n        output.extend(child.stdout.read())\n        returncode = child.wait(timeout=2)\n    finally:\n        selector.close()\n        stop_owned_group(child)\n    result = {\n        \"command\": [str(part) for part in command],\n        \"exit_code\": returncode,\n        \"elapsed_seconds\": round(time.monotonic() - started, 3),\n        \"peak_owned_family_rss_bytes\": peak_rss,\n        \"oom_before\": initial_oom,\n        \"oom_after\": oom_counts(),\n        \"artifact_bytes\": artifact_bytes(),\n        \"free_bytes\": free_bytes(),\n        \"stop_reason\": reason,\n        \"output\": output.decode(\"utf-8\", errors=\"replace\"),\n    }\n    print(json.dumps(result, sort_keys=True), flush=True)\n    return result\n\n\ndef main():\n    binary = ROOT / \"encoded_paths_tests\"\n    evidence_path = ROOT / \"helper_evidence.json\"\n    if binary.exists() or evidence_path.exists():\n        raise RuntimeError(\"refuse to overwrite retained proof artifacts\")\n    before = digest(SOURCE)\n    compiler = run([\n        RUSTC,\n        \"--edition=2024\",\n        \"--test\",\n        \"-C\", \"opt-level=0\",\n        \"-C\", \"debuginfo=0\",\n        \"-C\", \"strip=symbols\",\n        \"-C\", \"codegen-units=1\",\n        ROOT / \"encoded_paths.rs\",\n        \"-o\", binary,\n    ])\n    tests = None\n    if compiler[\"exit_code\"] == 0 and compiler[\"stop_reason\"] is None:\n        tests = run(\n            [binary, \"--test-threads=1\", \"--nocapture\"],\n            {\"GH353_INDEX_HELPER_FIXTURES\": str(ROOT / \"git-fixtures\")},\n        )\n    evidence = {\n        \"scope\": \"Exact production checked-offset helper and real Git CLI index interoperability only; not git2/cache, cancellation, SQLite, repair publication, saturation, or request latency qualification.\",\n        \"source_sha256_before\": before,\n        \"source_sha256_after\": digest(SOURCE),\n        \"helper_sha256\": digest(ROOT / \"encoded_paths.rs\"),\n        \"runner_sha256\": digest(Path(__file__)),\n        \"compiler\": compiler,\n        \"tests\": tests,\n    }\n    with evidence_path.open(\"x\") as output:\n        json.dump(evidence, output, indent=2, sort_keys=True)\n        output.write(\"\\n\")\n    success = (\n        compiler[\"exit_code\"] == 0\n        and compiler[\"stop_reason\"] is None\n        and tests is not None\n        and tests[\"exit_code\"] == 0\n        and tests[\"stop_reason\"] is None\n        and evidence[\"source_sha256_before\"] == evidence[\"source_sha256_after\"]\n    )\n    raise SystemExit(0 if success else 1)\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    }
   }
 }
