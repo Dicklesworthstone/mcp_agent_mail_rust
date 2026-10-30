@@ -281,6 +281,7 @@ pub struct WriteGuard {
 }
 
 impl WriteGuard {
+    #[cfg(test)]
     pub(crate) fn begin(storage_root: &Path, sqlite_path: Option<&Path>) -> Self {
         let write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         Self::from_activity(storage_root, sqlite_path, write_activity)
