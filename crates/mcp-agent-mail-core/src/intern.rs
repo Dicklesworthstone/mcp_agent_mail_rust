@@ -3,16 +3,19 @@
 //! Agent names, project slugs, policy strings, and thread IDs are duplicated
 //! many times across caches, query results, and JSON responses.  `InternedStr`
 //! is a newtype over `Arc<str>` that deduplicates these strings in a global
-//! intern table.
+//! intern table. The table bounds both retained entries and UTF-8 payload bytes;
+//! cache misses cannot retain every identifier seen over the daemon's lifetime.
+//! Eviction releases only the table's ownership, so existing handles stay valid.
 //!
 //! **Clone cost:** one atomic ref-count increment (vs. heap alloc + memcpy for String).
 //!
-//! **Interning cost:** one mutex acquisition on first encounter; subsequent
-//! lookups of the same string value return the existing `Arc` (O(1) amortized).
+//! **Interning cost:** a read lock for a retained value, and a write lock on a
+//! miss. FIFO admission and eviction are O(1) amortized. Values larger than the
+//! per-string limit are returned without retaining or locking the table.
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -26,15 +29,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A reference-counted, interned string.
 ///
-/// Cheap to clone (atomic ref-count bump), cheap to compare by pointer when
-/// both sides came from the same interner, and transparently usable as `&str`.
+/// Cheap to clone (atomic ref-count bump), with a pointer-equality fast path and
+/// content-based equality/hash semantics. Equal values can have distinct
+/// allocations after eviction or when too large to retain.
 #[derive(Clone)]
 pub struct InternedStr(Arc<str>);
 
 impl InternedStr {
     /// Intern a string slice, returning a shared handle.
     ///
-    /// If the string was seen before, the existing `Arc` is reused.
+    /// If the string is still retained, the existing `Arc` is reused.
     #[inline]
     #[must_use]
     pub fn new(s: &str) -> Self {
@@ -56,8 +60,8 @@ impl InternedStr {
         self.0
     }
 
-    /// Pointer-equality fast path: true when both handles point to the
-    /// same interned allocation.  Falls back to byte comparison otherwise.
+    /// Whether both handles share an allocation. This can be false for equal
+    /// strings after eviction; use `PartialEq` for the content-based comparison.
     #[inline]
     #[must_use]
     pub fn ptr_eq(&self, other: &Self) -> bool {
@@ -177,7 +181,7 @@ impl From<String> for InternedStr {
 impl From<Arc<str>> for InternedStr {
     #[inline]
     fn from(arc: Arc<str>) -> Self {
-        // Re-intern to ensure deduplication.
+        // Reuse a retained allocation when one is available.
         intern(&arc)
     }
 }
@@ -209,62 +213,117 @@ impl<'de> Deserialize<'de> for InternedStr {
 // Global interner
 // ---------------------------------------------------------------------------
 
-/// The global intern table.  Uses a plain `RwLock` because
-/// the interner is a leaf lock that is never held while acquiring other locks.
-static INTERNER: LazyLock<RwLock<HashSet<Arc<str>>>> =
-    LazyLock::new(|| RwLock::new(HashSet::with_capacity(256)));
+// Entry and byte limits bound both the identifier payload and the set/FIFO
+// bookkeeping. Caller-owned handles are separate from this retained cache.
+const INTERN_MAX_ENTRIES: usize = 16_384;
+const INTERN_MAX_BYTES: usize = 8 * 1024 * 1024;
+const INTERN_MAX_STRING_BYTES: usize = 16 * 1024;
+
+struct InternTable {
+    entries: HashSet<Arc<str>>,
+    order: VecDeque<Arc<str>>,
+    retained_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl InternTable {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashSet::with_capacity(max_entries.min(256)),
+            order: VecDeque::with_capacity(max_entries.min(256)),
+            retained_bytes: 0,
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    fn intern(&mut self, s: &str) -> InternedStr {
+        // An uncacheable value must not evict useful retained identifiers.
+        if self.max_entries == 0 || s.len() > self.max_bytes || s.len() > INTERN_MAX_STRING_BYTES {
+            return InternedStr(Arc::from(s));
+        }
+        if let Some(existing) = self.entries.get(s) {
+            return InternedStr(Arc::clone(existing));
+        }
+
+        while self.entries.len() >= self.max_entries
+            || s.len() > self.max_bytes.saturating_sub(self.retained_bytes)
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                // Keep admission bounded even if bookkeeping is unavailable.
+                return InternedStr(Arc::from(s));
+            };
+            if self.entries.remove(oldest.as_ref()) {
+                self.retained_bytes -= oldest.len();
+            }
+        }
+
+        let arc: Arc<str> = Arc::from(s);
+        self.retained_bytes += arc.len();
+        self.entries.insert(Arc::clone(&arc));
+        self.order.push_back(Arc::clone(&arc));
+        InternedStr(arc)
+    }
+}
+
+/// The interner is a leaf lock, never held while acquiring another lock.
+static INTERNER: LazyLock<RwLock<InternTable>> =
+    LazyLock::new(|| RwLock::new(InternTable::new(INTERN_MAX_ENTRIES, INTERN_MAX_BYTES)));
 
 /// Intern a string, returning a shared `InternedStr`.
 ///
-/// Thread-safe.  Optimized for concurrent reads: the write lock is only
-/// acquired on the first encounter of a new string value.
+/// Thread-safe. Retained hits use only a read lock. New values obey finite
+/// entry/byte budgets; eviction never invalidates an outstanding handle.
+#[must_use]
 pub fn intern(s: &str) -> InternedStr {
+    intern_in(&INTERNER, s)
+}
+
+fn intern_in(interner: &RwLock<InternTable>, s: &str) -> InternedStr {
+    // Do not hash a giant cache-miss key while holding a process-global lock.
+    if s.len() > INTERN_MAX_STRING_BYTES {
+        return InternedStr(Arc::from(s));
+    }
     // Fast path: try to get the existing Arc under a read lock.
     {
-        let table = INTERNER
+        let table = interner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = table.get(s) {
+        if let Some(existing) = table.entries.get(s) {
             return InternedStr(Arc::clone(existing));
         }
     }
 
-    // Slow path: acquire write lock to insert new string.
-    let mut table = INTERNER
+    // Re-check under the write lock before bounded admission, so concurrent
+    // misses for the same value cannot create duplicate retained entries.
+    let mut table = interner
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    // Re-check under write lock to avoid double-insertion.
-    if let Some(existing) = table.get(s).cloned() {
-        drop(table);
-        return InternedStr(existing);
-    }
-
-    let arc: Arc<str> = Arc::from(s);
-    table.insert(Arc::clone(&arc));
+    let handle = table.intern(s);
     drop(table);
-    InternedStr(arc)
+    handle
 }
 
-/// Number of unique strings currently interned.
+/// Number of unique strings currently retained by the bounded intern table.
+/// This is not a lifetime distinct-value count and can decrease on eviction.
 #[must_use]
 pub fn intern_count() -> usize {
     INTERNER
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
         .len()
 }
 
 /// Pre-intern a set of known strings (e.g., policy values).
 ///
-/// Call once at startup to avoid mutex contention on the first real request.
+/// Call once at startup to avoid first-request admission work. Preloading obeys
+/// the same limits as normal lookups; it cannot pin an unbounded set of values.
 pub fn pre_intern(strings: &[&str]) {
-    let mut table = INTERNER
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for &s in strings {
-        if !table.contains(s) {
-            table.insert(Arc::from(s));
+        if s.len() <= INTERN_MAX_STRING_BYTES {
+            let _ = intern(s);
         }
     }
 }
@@ -366,11 +425,14 @@ mod tests {
     }
 
     #[test]
-    fn intern_count_increases() {
-        let before = intern_count();
-        let unique = format!("unique_{before}");
-        let _ = intern(&unique);
-        assert!(intern_count() > before);
+    fn retained_count_increases_until_capacity() {
+        let table = RwLock::new(InternTable::new(2, 64));
+        let _ = intern_in(&table, "first");
+        assert_eq!(table.read().unwrap().entries.len(), 1);
+        let _ = intern_in(&table, "second");
+        assert_eq!(table.read().unwrap().entries.len(), 2);
+        let _ = intern_in(&table, "third");
+        assert_eq!(table.read().unwrap().entries.len(), 2);
     }
 
     #[test]
@@ -561,16 +623,167 @@ mod tests {
     }
 
     #[test]
-    fn intern_count_reflects_unique_strings() {
-        let unique_prefix = format!("count_test_{}", std::process::id());
-        let before = intern_count();
-        let _ = intern(&format!("{unique_prefix}_1"));
-        let _ = intern(&format!("{unique_prefix}_2"));
+    fn retained_count_reflects_unique_strings() {
+        let table = RwLock::new(InternTable::new(4, 64));
+        let _ = intern_in(&table, "one");
+        let _ = intern_in(&table, "two");
         // Duplicate insert should not increase the interner size.
-        let _ = intern(&format!("{unique_prefix}_1"));
-        // Tests run in parallel and share a global interner, so require at least
-        // the two inserts from this test.
-        assert!(intern_count() >= before + 2);
+        let _ = intern_in(&table, "one");
+        let retained = table.read().unwrap();
+        assert_eq!(retained.entries.len(), 2);
+        assert_eq!(retained.retained_bytes, 6);
+    }
+
+    #[test]
+    fn eviction_preserves_live_handle_equality_and_releases_cache_ownership() {
+        let table = RwLock::new(InternTable::new(2, 128));
+        let original = intern_in(&table, "evicted-key");
+        let weak = Arc::downgrade(&original.0);
+        let _ = intern_in(&table, "second");
+        let _ = intern_in(&table, "third");
+        let replacement = intern_in(&table, "evicted-key");
+        assert!(!original.ptr_eq(&replacement));
+        assert_eq!(original, replacement);
+        assert_eq!(&*original, "evicted-key");
+
+        // Database caches use these values as hash keys. Eviction must not
+        // change lookups by a newly interned equal value or by borrowed text.
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(original.clone(), 42);
+        assert_eq!(cache.get(&replacement), Some(&42));
+        assert_eq!(cache.get("evicted-key"), Some(&42));
+        drop(cache);
+        drop(original);
+        assert!(
+            weak.upgrade().is_none(),
+            "the FIFO must release its Arc too"
+        );
+        assert_eq!(&*replacement, "evicted-key");
+    }
+
+    #[test]
+    fn byte_budget_counts_utf8_and_oversized_values_do_not_displace_hits() {
+        let table = RwLock::new(InternTable::new(16, 5));
+        let unicode = intern_in(&table, "éé");
+        let weak = Arc::downgrade(&unicode.0);
+        assert_eq!(table.read().unwrap().retained_bytes, 4);
+        let ordinary = intern_in(&table, "abc");
+        assert_eq!(table.read().unwrap().retained_bytes, 3);
+        drop(unicode);
+        assert!(weak.upgrade().is_none());
+
+        let oversized = intern_in(&table, "too large");
+        let oversized_weak = Arc::downgrade(&oversized.0);
+        assert_eq!(&*oversized, "too large");
+        drop(oversized);
+        assert!(oversized_weak.upgrade().is_none());
+        assert!(ordinary.ptr_eq(&intern_in(&table, "abc")));
+        let retained = table.read().unwrap();
+        assert_eq!(retained.entries.len(), 1);
+        assert_eq!(retained.retained_bytes, 3);
+    }
+
+    #[test]
+    fn zero_capacity_and_empty_values_remain_valid() {
+        let disabled = RwLock::new(InternTable::new(0, 32));
+        let uncached = intern_in(&disabled, "value");
+        let weak = Arc::downgrade(&uncached.0);
+        drop(uncached);
+        assert!(weak.upgrade().is_none());
+        assert!(disabled.read().unwrap().entries.is_empty());
+
+        let empty_only = RwLock::new(InternTable::new(1, 0));
+        let empty = intern_in(&empty_only, "");
+        assert!(empty.ptr_eq(&intern_in(&empty_only, "")));
+        assert_eq!(&*intern_in(&empty_only, "x"), "x");
+        let retained = empty_only.read().unwrap();
+        assert_eq!(retained.entries.len(), 1);
+        assert_eq!(retained.retained_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_lookup_misses_keep_retention_bounded() {
+        let table = Arc::new(RwLock::new(InternTable::new(32, 256)));
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let table = Arc::clone(&table);
+                std::thread::spawn(move || {
+                    let mut survivors = Vec::new();
+                    for index in 0..512 {
+                        let value = format!("miss-{worker}-{index}");
+                        let handle = intern_in(&table, &value);
+                        assert_eq!(handle.as_ref(), value);
+                        if index % 128 == 0 {
+                            survivors.push(handle);
+                        }
+                        let retained = table.read().unwrap();
+                        assert!(retained.entries.len() <= 32);
+                        assert!(retained.retained_bytes <= 256);
+                    }
+                    survivors
+                })
+            })
+            .collect();
+        for worker in workers {
+            for survivor in worker.join().unwrap() {
+                assert_eq!(survivor, intern_in(&table, &survivor));
+            }
+        }
+    }
+
+    #[test]
+    fn public_lookup_and_preload_share_retention_limits() {
+        const CHILD: &str = "AM_TEST_BOUNDED_INTERNER";
+        const COMPLETED: &str = "bounded public interner verified";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "intern::tests::public_lookup_and_preload_share_retention_limits",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated public interner regression");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            return;
+        }
+
+        let first = intern("first-miss");
+        let first_weak = Arc::downgrade(&first.0);
+        drop(first);
+        for index in 0..INTERN_MAX_ENTRIES + 1 {
+            let _ = intern(&format!("missing-project-{index}"));
+        }
+        assert!(first_weak.upgrade().is_none());
+        assert_eq!(intern_count(), INTERN_MAX_ENTRIES);
+
+        let payload = "x".repeat(INTERN_MAX_STRING_BYTES - 32);
+        let preload: Vec<String> = (0..INTERN_MAX_BYTES / payload.len() + 2)
+            .map(|index| format!("preload-{index}-{payload}"))
+            .collect();
+        let preload_refs: Vec<&str> = preload.iter().map(String::as_str).collect();
+        pre_intern(&preload_refs);
+        {
+            let retained = INTERNER.read().unwrap();
+            assert!(retained.entries.len() < INTERN_MAX_ENTRIES);
+            assert!(retained.retained_bytes <= INTERN_MAX_BYTES);
+        }
+        let hot = intern("retained-hit");
+        let oversized = "x".repeat(INTERN_MAX_STRING_BYTES + 1);
+        let uncached = intern(&oversized);
+        let uncached_weak = Arc::downgrade(&uncached.0);
+        pre_intern(&[&oversized]);
+        drop(uncached);
+        assert!(uncached_weak.upgrade().is_none());
+        assert!(hot.ptr_eq(&intern("retained-hit")));
+        println!("{COMPLETED}");
     }
 
     #[test]
