@@ -78,6 +78,139 @@ mod issue353_bootstrap_tests {
     }
 
     #[test]
+    fn gh353_cached_lazy_pool_is_not_admitted_as_warm() {
+        if isolated_bootstrap_cancellation() {
+            return;
+        }
+        let (scratch, config) = mailbox();
+        let lazy = mcp_agent_mail_db::get_or_create_pool(&config).unwrap();
+        assert!(!lazy.is_initialized());
+        assert!(mcp_agent_mail_db::get_cached_pool(&config).is_some());
+        let _initializer = DB_POOL_BOOTSTRAP_GATE.lock().unwrap();
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let Err(error) = get_db_pool_for_config(&config) else {
+            panic!("cached construction must not bypass the cold initializer");
+        };
+        assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+        assert_eq!(DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed), before);
+        assert!(!lazy.is_initialized());
+        assert!(!scratch.path().join("mail.sqlite3").exists());
+        assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+    }
+
+    #[test]
+    fn gh353_cold_checkout_completes_inside_existing_bridge_before_handoff() {
+        if isolated_bootstrap_cancellation() {
+            return;
+        }
+        let (scratch, config) = mailbox();
+        let lazy = mcp_agent_mail_db::get_or_create_pool(&config).unwrap();
+        let storage_root = config.storage_root.as_ref().unwrap();
+        let sqlite_path = scratch.path().join("mail.sqlite3");
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        fastmcp_core::block_on(async {
+            let cx = asupersync::Cx::current().expect("real runtime context");
+            let ctx = fastmcp::McpContext::new(cx, 1);
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+            let (pool, guard) = super::tool_util::bootstrap_db_pool_with_barrier_handoff(
+                &config,
+                storage_root,
+                Some(&sqlite_path),
+                Some(&ctx),
+            )
+            .expect("first checkout within an already-running synchronous bridge");
+            assert!(pool.is_initialized());
+            assert!(lazy.is_initialized());
+            assert_eq!(pool.engine_identity_key(), lazy.engine_identity_key());
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 1);
+            let conn = pool.acquire(ctx.cx()).await.into_result().unwrap();
+            conn.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+                .expect("bootstrap returned an initialized schema");
+            drop(conn);
+            drop(guard);
+        });
+        assert_eq!(
+            DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed) - before,
+            1
+        );
+        assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+
+        // Keep the initialized engine alive while proving the true hot path
+        // bypasses initializer admission and performs no further checkout.
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let _initializer = DB_POOL_BOOTSTRAP_GATE.lock().unwrap();
+        let warm = get_db_pool_for_config(&config).expect("initialized cached engine is warm");
+        assert!(warm.is_initialized());
+        assert_eq!(warm.engine_identity_key(), lazy.engine_identity_key());
+        assert_eq!(DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn gh353_missing_database_recovers_archive_before_writer_handoff() {
+        if isolated_bootstrap_cancellation() {
+            return;
+        }
+        let (scratch, config) = mailbox();
+        let storage_root = config.storage_root.as_ref().unwrap();
+        let project = storage_root.join("projects").join("bootstrap-recovery");
+        let agent = project.join("agents").join("Alice");
+        let messages = project.join("messages").join("2026").join("10");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"bootstrap-recovery","human_key":"/bootstrap-recovery"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-10-28T00:00:00Z","last_active_ts":"2026-10-28T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages.join("2026-10-28T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-10-28T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+        let lazy = mcp_agent_mail_db::get_or_create_pool(&config).unwrap();
+        let sqlite_path = scratch.path().join("mail.sqlite3");
+        assert!(!sqlite_path.exists());
+        assert!(!lazy.is_initialized());
+
+        // The archive reconstruction really acquires the recovery barrier.
+        // It cannot succeed if this request is already a counted writer when
+        // lazy initialization reaches that nested promotion.
+        let request = get_db_pool_for_config(&config)
+            .expect("cold tool bootstrap must not drain its own write lease");
+        assert!(request.is_initialized());
+        assert_eq!(request.engine_identity_key(), lazy.engine_identity_key());
+        let cached = mcp_agent_mail_db::get_cached_pool(&config)
+            .expect("recovered initializer remains published in the cache");
+        assert!(cached.is_initialized());
+        assert_eq!(cached.engine_identity_key(), request.engine_identity_key());
+        fastmcp_core::block_on(async {
+            let cx = asupersync::Cx::current().expect("real runtime context");
+            let conn = request.acquire(&cx).await.into_result().unwrap();
+            let rows = conn
+                .query_sync("SELECT id, subject, body_md FROM messages", &[])
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
+            assert_eq!(rows[0].get_named::<String>("subject").unwrap(), "First");
+            assert!(
+                rows[0]
+                    .get_named::<String>("body_md")
+                    .unwrap()
+                    .contains("first body")
+            );
+        });
+        mcp_agent_mail_db::forensics::verify_recovery_receipt_state(storage_root, &sqlite_path)
+            .expect("real reconstruction preserved a durable recovery receipt");
+        drop(request);
+        assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+    }
+
+    #[test]
     fn gh353_hot_requests_bypass_initializer_gate() {
         let _serial = TEST_LOCK.lock().unwrap();
         let (_scratch, config) = mailbox();
@@ -1112,6 +1245,263 @@ pub mod tool_util {
         }
     }
 
+    /// Poll only the first database checkout on its promotion-owning thread.
+    /// Tool handlers may already be inside a FastMCP synchronous bridge, so
+    /// entering `block_on` or `poll_on_cx` here would panic on nested entry.
+    /// The real FrankenSQLite factory, ping, and close run inline; a pool
+    /// capacity wait observes notifications and time on each pending poll.
+    /// This does not run children or replace the caller's runtime.
+    ///
+    /// Cancellation is checked between polls and after completion. An
+    /// individual synchronous engine/recovery poll must enforce its own
+    /// bounds; this bridge cannot interrupt it midway through a durable write.
+    fn poll_bootstrap_checkout<T, E>(
+        timeout: std::time::Duration,
+        mut check_live: impl FnMut() -> Result<(), E>,
+        timeout_error: impl FnOnce() -> E,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, E> {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CheckoutWake(std::thread::Thread);
+
+        impl Wake for CheckoutWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(CheckoutWake(std::thread::current())));
+        let mut task_cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        let started = std::time::Instant::now();
+        loop {
+            check_live()?;
+            if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
+                check_live()?;
+                return Ok(output);
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(timeout_error());
+            }
+            std::thread::park_timeout(remaining.min(std::time::Duration::from_millis(1)));
+        }
+    }
+
+    #[cfg(test)]
+    mod bootstrap_checkout_poll_tests {
+        use super::poll_bootstrap_checkout;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::task::{Poll, Waker};
+        use std::time::Duration;
+
+        struct CheckoutDrop(Arc<AtomicUsize>);
+
+        impl Drop for CheckoutDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        #[test]
+        fn ready_checkout_completes_with_zero_pending_budget() {
+            let result = poll_bootstrap_checkout(
+                Duration::ZERO,
+                || Ok::<_, &str>(()),
+                || "timeout",
+                std::future::ready(42),
+            );
+            assert_eq!(result, Ok(42));
+        }
+
+        #[test]
+        fn cancellation_before_first_poll_drops_unstarted_checkout() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let owned = CheckoutDrop(Arc::clone(&drops));
+            let future = std::future::poll_fn(move |_| -> Poll<()> {
+                let _held = &owned;
+                panic!("cancelled checkout must not start its factory");
+            });
+            let result = poll_bootstrap_checkout(
+                Duration::from_secs(1),
+                || Err("cancelled"),
+                || "timeout",
+                future,
+            );
+            assert_eq!(result, Err("cancelled"));
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+        }
+
+        #[test]
+        fn cancellation_while_pending_drops_checkout() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let owned = CheckoutDrop(Arc::clone(&drops));
+            let cancelled = AtomicBool::new(false);
+            let signal = &cancelled;
+            let future = std::future::poll_fn(move |_| {
+                let _held = &owned;
+                signal.store(true, Ordering::Release);
+                Poll::<()>::Pending
+            });
+            let result = poll_bootstrap_checkout(
+                Duration::from_secs(1),
+                || {
+                    if cancelled.load(Ordering::Acquire) {
+                        Err("cancelled")
+                    } else {
+                        Ok(())
+                    }
+                },
+                || "timeout",
+                future,
+            );
+            assert_eq!(result, Err("cancelled"));
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+        }
+
+        #[test]
+        fn completed_checkout_is_dropped_when_liveness_changes_during_poll() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut owned = Some(CheckoutDrop(Arc::clone(&drops)));
+            let cancelled = AtomicBool::new(false);
+            let signal = &cancelled;
+            let future = std::future::poll_fn(move |_| {
+                signal.store(true, Ordering::Release);
+                Poll::Ready(owned.take().unwrap())
+            });
+            let result = poll_bootstrap_checkout(
+                Duration::from_secs(1),
+                || {
+                    if cancelled.load(Ordering::Acquire) {
+                        Err("cancelled")
+                    } else {
+                        Ok(())
+                    }
+                },
+                || "timeout",
+                future,
+            );
+            assert!(matches!(result, Err("cancelled")));
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+        }
+
+        #[test]
+        fn pending_timeout_and_unwind_release_checkout_ownership() {
+            for panic in [false, true] {
+                let drops = Arc::new(AtomicUsize::new(0));
+                let owned = CheckoutDrop(Arc::clone(&drops));
+                let future = std::future::poll_fn(move |_| {
+                    let _held = &owned;
+                    assert!(!panic, "checkout panic");
+                    Poll::<()>::Pending
+                });
+                let result = std::panic::catch_unwind(|| {
+                    poll_bootstrap_checkout(
+                        Duration::ZERO,
+                        || Ok::<_, &str>(()),
+                        || "timeout",
+                        future,
+                    )
+                });
+                if panic {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), Err("timeout"));
+                }
+                assert_eq!(drops.load(Ordering::Acquire), 1);
+            }
+        }
+
+        #[test]
+        fn pending_checkout_observes_a_cross_thread_wake() {
+            let ready = Arc::new(AtomicBool::new(false));
+            let wake = Arc::new(Mutex::new(None::<Waker>));
+            let (polled_tx, polled_rx) = mpsc::channel();
+            let worker_ready = Arc::clone(&ready);
+            let worker_wake = Arc::clone(&wake);
+            let worker = std::thread::spawn(move || {
+                if polled_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    worker_ready.store(true, Ordering::Release);
+                    worker_wake.lock().unwrap().take().unwrap().wake();
+                }
+            });
+            let mut polled_tx = Some(polled_tx);
+            let future = std::future::poll_fn(move |cx| {
+                if ready.load(Ordering::Acquire) {
+                    return Poll::Ready(42);
+                }
+                *wake.lock().unwrap() = Some(cx.waker().clone());
+                if let Some(tx) = polled_tx.take() {
+                    tx.send(()).unwrap();
+                }
+                Poll::Pending
+            });
+            let result = poll_bootstrap_checkout(
+                Duration::from_secs(5),
+                || Ok::<_, &str>(()),
+                || "timeout",
+                future,
+            );
+            worker.join().unwrap();
+            assert_eq!(result, Ok(42));
+        }
+    }
+
+    fn initialize_pool_for_handoff(
+        pool: &DbPool,
+        cfg: &DbPoolConfig,
+        ctx: Option<&McpContext>,
+    ) -> McpResult<()> {
+        if pool.is_initialized() {
+            return Ok(());
+        }
+        // Requests retain their exact cancellation and driver capabilities.
+        // Legacy synchronous callers borrow an ambient context when present;
+        // a bare worker uses the same runtime-backed context entry as other
+        // synchronous server workers, never a test-only context constructor.
+        let cx = ctx
+            .map(|ctx| ctx.cx().clone())
+            .or_else(Cx::current)
+            .unwrap_or_else(|| {
+                fastmcp_core::block_on(async {
+                    Cx::current().expect("Runtime::block_on installs an ambient context")
+                })
+            });
+        let _current = Cx::set_current(Some(cx.clone()));
+        let outcome = poll_bootstrap_checkout(
+            std::time::Duration::from_millis(cfg.acquire_timeout_ms),
+            || match ctx {
+                Some(ctx) => ensure_request_live(ctx),
+                None => cx.checkpoint().map_err(|_| McpError::request_cancelled()),
+            },
+            || {
+                db_error_to_mcp_error(DbError::ResourceBusy(
+                    "database pool initialization checkout timed out; retry the operation".into(),
+                ))
+            },
+            pool.acquire(&cx),
+        )?;
+        match outcome {
+            Outcome::Ok(conn) => {
+                drop(conn);
+                Ok(())
+            }
+            Outcome::Err(error) => Err(db_error_to_mcp_error(DbError::Sqlite(error.to_string()))),
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(payload) => Err(McpError::internal_error(format!(
+                "database pool initialization panicked: {}",
+                payload.message()
+            ))),
+        }
+    }
+
     pub(super) fn bootstrap_db_pool_with_barrier_handoff(
         cfg: &DbPoolConfig,
         storage_root: &Path,
@@ -1135,7 +1525,7 @@ pub mod tool_util {
         // counted as an ordinary writer; if it is now hot, return it without
         // ever closing admission behind the recovery-promotion barrier.
         let guard = begin_pool_write_guard(ctx, storage_root, sqlite_path)?;
-        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg).filter(DbPool::is_initialized) {
             check_write_pool_cancellation(ctx)?;
             return Ok((pool, guard));
         }
@@ -1162,6 +1552,12 @@ pub mod tool_util {
         }
         check_write_pool_cancellation(ctx)?;
         let pool = get_or_create_pool(cfg).map_err(pool_bootstrap_error)?;
+        // Pool construction/cache publication is lazy. Its first checkout can
+        // reconstruct a missing or damaged mailbox and acquire this same
+        // promotion barrier. Complete that work before counting this request
+        // as a writer, or recovery waits for the very request doing the init.
+        initialize_pool_for_handoff(&pool, cfg, ctx)?;
+        check_write_pool_cancellation(ctx)?;
         // Atomic handoff: register the caller as a writer while the promotion
         // barrier is still closed, then release the barrier. No promotion can
         // enter between cold bootstrap/recovery and the operation using this
@@ -1240,7 +1636,7 @@ pub mod tool_util {
             .unwrap_or_else(|| Config::from_env().storage_root);
         let guard =
             begin_pool_write_guard(ctx, &storage_root, sqlite_path.as_deref().map(Path::new))?;
-        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg).filter(DbPool::is_initialized) {
             check_write_pool_cancellation(ctx)?;
             return Ok(WriteDbPool {
                 pool,
@@ -1336,7 +1732,8 @@ pub mod tool_util {
         // retire the cached pool between lookup and use. A miss neither
         // bootstraps a writer nor consumes the agent's activity throttle.
         let cfg = DbPoolConfig::from_env();
-        let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) else {
+        let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg).filter(DbPool::is_initialized)
+        else {
             return;
         };
         // The completed read may predate recovery. Numeric agent IDs from a
@@ -1393,7 +1790,8 @@ pub mod tool_util {
     /// initialize, migrate, or recover the mailbox.
     pub(crate) fn get_authoritative_live_db_pool() -> McpResult<DbPool> {
         let cfg = DbPoolConfig::from_env();
-        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg).filter(DbPool::is_initialized)
+        {
             return Ok(pool);
         }
         let sqlite_path =
@@ -2377,6 +2775,85 @@ pub mod tool_util {
                 .build()
                 .expect("build test runtime");
             runtime.block_on(f(cx))
+        }
+
+        #[test]
+        fn bootstrap_checkout_polling_preserves_context_and_drops_cancelled_work() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::task::Poll;
+            use std::time::Duration;
+
+            struct OwnedCheckout(Arc<AtomicBool>);
+
+            impl Drop for OwnedCheckout {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+
+            for case in ["request", "ambient", "completed", "timeout", "panic"] {
+                let outer = Cx::for_testing();
+                let _outer = Cx::set_current(Some(outer.clone()));
+                let request_cx = Cx::for_testing();
+                let ctx = McpContext::new(request_cx.clone(), 1);
+                let cancellation = ctx.request_cancellation();
+                let dropped = Arc::new(AtomicBool::new(false));
+                let mut owned = Some(OwnedCheckout(Arc::clone(&dropped)));
+                let future = std::future::poll_fn(move |_| match case {
+                    "request" => {
+                        cancellation.cancel();
+                        Poll::Pending
+                    }
+                    "ambient" => {
+                        // This must be the exact request context installed by
+                        // the bridge, not the unrelated surrounding context.
+                        Cx::current().unwrap().set_cancel_requested(true);
+                        Poll::Pending
+                    }
+                    "completed" => {
+                        cancellation.cancel();
+                        Poll::Ready(owned.take().unwrap())
+                    }
+                    "timeout" => Poll::Pending,
+                    "panic" => panic!("checkout poll panicked"),
+                    _ => unreachable!(),
+                });
+                // The closure owns the checkout. Both a pending drop and a
+                // completed-but-cancelled result must release it.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _current = Cx::set_current(Some(request_cx.clone()));
+                    poll_bootstrap_checkout(
+                        Duration::from_millis(5),
+                        || ensure_request_live(&ctx),
+                        || {
+                            db_error_to_mcp_error(DbError::ResourceBusy(
+                                "bootstrap checkout test timeout".into(),
+                            ))
+                        },
+                        future,
+                    )
+                }));
+                match (case, outcome) {
+                    ("panic", Err(_)) => {}
+                    ("timeout", Ok(Err(error))) => {
+                        assert_eq!(tool_error_code(&error), Some("RESOURCE_BUSY"));
+                    }
+                    ("request" | "ambient" | "completed", Ok(Err(error))) => {
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    }
+                    _ => panic!("unexpected bootstrap polling outcome for {case}"),
+                }
+                assert!(
+                    dropped.load(Ordering::Acquire),
+                    "{case} retained checkout ownership"
+                );
+                assert!(
+                    !outer.is_cancel_requested(),
+                    "{case} cancelled the outer context"
+                );
+                assert!(!Cx::current().unwrap().is_cancel_requested());
+                assert_eq!(request_cx.is_cancel_requested(), case == "ambient");
+            }
         }
 
         #[test]
