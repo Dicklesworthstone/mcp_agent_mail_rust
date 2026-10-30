@@ -2156,10 +2156,24 @@ struct ArchiveBacklogEntry {
     /// recovery (the pre-crash age is not recoverable and not worth persisting).
     first_enqueued_at: Instant,
     attempts: u32,
+    /// Once materialization or dead-lettering completes, retry only journal
+    /// retirement. Reapplying a mutable op while its journal move is blocked
+    /// could overwrite newer archive state.
+    retirement: Option<ArchiveBacklogRetirement>,
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveBacklogRetirement {
+    Resolved,
+    Failed,
 }
 
 struct ArchiveRetryBacklog {
     queue: Mutex<VecDeque<ArchiveBacklogEntry>>,
+    /// Canonical paths owned by publishing, queued, executing, or retiring
+    /// entries. Publication registers before the final rename, and ownership
+    /// ends only after the journal leaves the active recovery directory.
+    owned_journals: Mutex<BTreeSet<PathBuf>>,
     drain_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     lifecycle: Mutex<()>,
     depth: AtomicU64,
@@ -2193,12 +2207,16 @@ enum ArchiveBacklogDrainStep {
     /// The front op exhausted [`ARCHIVE_BACKLOG_MAX_ATTEMPTS`] and was moved to
     /// the dead-letter ledger; the queue advanced to the next entry.
     DeadLettered,
+    /// A completed op still owns a journal whose retirement failed. It was
+    /// rotated behind unprocessed work, so the drainer should continue now.
+    RetirementDeferred,
 }
 
 impl ArchiveRetryBacklog {
     const fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            owned_journals: Mutex::new(BTreeSet::new()),
             drain_handle: Mutex::new(None),
             lifecycle: Mutex::new(()),
             depth: AtomicU64::new(0),
@@ -2254,7 +2272,7 @@ impl ArchiveRetryBacklog {
             self.reserved.fetch_add(1, Ordering::Relaxed);
         }
         // Journal outside the queue lock: syncs must not stall other pushers.
-        let journal = archive_backlog_journal_write(&op);
+        let journal = archive_backlog_journal_write(&op, Some(self));
         let durable = journal.as_ref().is_some_and(|journal| journal.durable);
         let journal_path = journal.map(|journal| journal.path);
         {
@@ -2269,6 +2287,7 @@ impl ArchiveRetryBacklog {
                 journal_path,
                 first_enqueued_at: Instant::now(),
                 attempts: 0,
+                retirement: None,
             });
             self.store_depth(&queue);
         }
@@ -2289,8 +2308,47 @@ impl ArchiveRetryBacklog {
         }
     }
 
-    /// Enqueue an op recovered from its on-disk journal (already durable).
-    fn push_recovered(&self, op: WriteOp, journal_path: PathBuf) {
+    fn claim_journal(&self, path: PathBuf) -> Option<ArchiveBacklogJournalClaim<'_>> {
+        let inserted = self
+            .owned_journals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone());
+        inserted.then(|| ArchiveBacklogJournalClaim {
+            backlog: self,
+            path: Some(path),
+        })
+    }
+
+    fn owns_journal(&self, path: &Path) -> bool {
+        archive_backlog_journal_key(path).is_ok_and(|path| {
+            self.owned_journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&path)
+        })
+    }
+
+    /// Enqueue an unowned surviving journal. Repeated recovery must not append
+    /// another copy of work already publishing, queued, executing, or retiring.
+    fn push_recovered(&self, op: WriteOp, journal_path: PathBuf) -> bool {
+        let journal_path = match archive_backlog_journal_key(&journal_path) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(error = %error, path = %journal_path.display(), "archive backlog: recovery candidate is no longer available");
+                return false;
+            }
+        };
+        let Some(claim) = self.claim_journal(journal_path.clone()) else {
+            return false;
+        };
+        // A scanner can have read this candidate before the preceding owner
+        // retired it. Revalidate after taking exclusive ownership, rather than
+        // enqueueing its stale parsed payload once that owner releases the key.
+        if let Err(error) = mcp_agent_mail_core::disk::open_regular_file_no_follow(&journal_path) {
+            tracing::warn!(error = %error, path = %journal_path.display(), "archive backlog: recovery candidate changed before admission");
+            return false;
+        }
         let mut queue = self
             .queue
             .lock()
@@ -2300,10 +2358,13 @@ impl ArchiveRetryBacklog {
             journal_path: Some(journal_path),
             first_enqueued_at: Instant::now(),
             attempts: 0,
+            retirement: None,
         });
         self.store_depth(&queue);
         drop(queue);
+        claim.retain();
         self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Current `(depth, oldest_age_us)` of the backlog.
@@ -2313,9 +2374,13 @@ impl ArchiveRetryBacklog {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-        let oldest = queue.front().map_or(0, |entry| {
-            duration_as_micros_u64(entry.first_enqueued_at.elapsed())
-        });
+        let oldest = queue
+            .iter()
+            .map(|entry| entry.first_enqueued_at)
+            .min()
+            .map_or(0, |enqueued_at| {
+                duration_as_micros_u64(enqueued_at.elapsed())
+            });
         (depth, oldest)
     }
 
@@ -2325,6 +2390,15 @@ impl ArchiveRetryBacklog {
     /// AND enqueues the batched async git commit — so the journal is removed only
     /// once the artifact is on disk.
     fn drain_step(&self) -> ArchiveBacklogDrainStep {
+        let retiring = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .is_some_and(|entry| entry.retirement.is_some());
+        if retiring {
+            return self.retire_front();
+        }
         let front = {
             let queue = self
                 .queue
@@ -2332,35 +2406,22 @@ impl ArchiveRetryBacklog {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             queue
                 .front()
-                .map(|entry| (entry.op.clone(), entry.attempts, entry.journal_path.clone()))
+                .map(|entry| (entry.op.clone(), entry.attempts))
         };
-        let Some((op, attempts, journal_path)) = front else {
+        let Some((op, attempts)) = front else {
             return ArchiveBacklogDrainStep::Empty;
         };
         match write_op_sync(&op) {
             Ok(()) => {
-                let mut queue = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                queue.pop_front();
-                self.store_depth(&queue);
-                drop(queue);
-                self.drained_total.fetch_add(1, Ordering::Relaxed);
-                if let Some(path) = journal_path {
-                    // Op is now durable in the archive: retire the journal
-                    // entry non-destructively (RULE 1) so recovery won't replay it.
-                    archive_backlog_journal_resolve(&path);
-                }
-                ArchiveBacklogDrainStep::Materialized
+                self.mark_front_for_retirement(ArchiveBacklogRetirement::Resolved);
+                self.retire_front()
             }
             Err(error) => {
                 let next_attempts = attempts.saturating_add(1);
                 if next_attempts >= ARCHIVE_BACKLOG_MAX_ATTEMPTS {
                     // F3: a permanently-failing head must not block the queue
                     // forever. Move it to the dead-letter ledger and advance.
-                    self.dead_letter_front(&op, next_attempts, &error);
-                    return ArchiveBacklogDrainStep::DeadLettered;
+                    return self.dead_letter_front(&op, next_attempts, &error);
                 }
                 tracing::warn!(
                     error = %error,
@@ -2393,20 +2454,121 @@ impl ArchiveRetryBacklog {
     /// Ordering: ledger append happens BEFORE the queue pop / journal
     /// quarantine. If the process dies in between, restart replays the journal
     /// idempotently and, at worst, appends a duplicate ledger line.
-    fn dead_letter_front(&self, op: &WriteOp, attempts: u32, error: &StorageError) {
+    fn dead_letter_front(
+        &self,
+        op: &WriteOp,
+        attempts: u32,
+        error: &StorageError,
+    ) -> ArchiveBacklogDrainStep {
         archive_backlog_dead_letter_append(op, attempts, error);
-        let journal_path = {
-            let mut queue = self
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = queue.pop_front();
-            self.store_depth(&queue);
-            entry.and_then(|entry| entry.journal_path)
+        self.mark_front_for_retirement(ArchiveBacklogRetirement::Failed);
+        self.retire_front()
+    }
+
+    fn mark_front_for_retirement(&self, retirement: ArchiveBacklogRetirement) {
+        if let Some(front) = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front_mut()
+        {
+            front.retirement = Some(retirement);
+        }
+    }
+
+    fn retire_front(&self) -> ArchiveBacklogDrainStep {
+        let pending = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .and_then(|entry| {
+                entry
+                    .retirement
+                    .map(|retirement| (retirement, entry.journal_path.clone()))
+            });
+        let Some((retirement, journal_path)) = pending else {
+            return ArchiveBacklogDrainStep::Empty;
         };
-        self.dead_lettered_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(path) = journal_path.as_ref() {
+            let result = match retirement {
+                ArchiveBacklogRetirement::Resolved => archive_backlog_journal_resolve(path),
+                ArchiveBacklogRetirement::Failed => archive_backlog_quarantine_file(path, "failed"),
+            };
+            if let Err(error) = result {
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let attempts = queue.front_mut().map_or(1, |entry| {
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    entry.attempts
+                });
+                if let Some(entry) = queue.pop_front() {
+                    queue.push_back(entry);
+                }
+                let has_unprocessed = queue.iter().any(|entry| entry.retirement.is_none());
+                tracing::warn!(
+                    error = %error,
+                    path = %path.display(),
+                    attempts,
+                    "archive backlog: journal retirement failed; retaining ownership and retrying the move"
+                );
+                return if has_unprocessed {
+                    ArchiveBacklogDrainStep::RetirementDeferred
+                } else {
+                    ArchiveBacklogDrainStep::RetryLater(attempts)
+                };
+            }
+        }
+
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.pop_front();
+        self.store_depth(&queue);
+        drop(queue);
         if let Some(path) = journal_path {
-            archive_backlog_quarantine_file(&path, "failed");
+            self.owned_journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+        }
+        match retirement {
+            ArchiveBacklogRetirement::Resolved => {
+                self.drained_total.fetch_add(1, Ordering::Relaxed);
+                ArchiveBacklogDrainStep::Materialized
+            }
+            ArchiveBacklogRetirement::Failed => {
+                self.dead_lettered_total.fetch_add(1, Ordering::Relaxed);
+                ArchiveBacklogDrainStep::DeadLettered
+            }
+        }
+    }
+}
+
+/// Releases an unpublished/rejected claim on early return or unwind. Once its
+/// entry is queued, the drainer owns the claim until journal retirement succeeds.
+struct ArchiveBacklogJournalClaim<'a> {
+    backlog: &'a ArchiveRetryBacklog,
+    path: Option<PathBuf>,
+}
+
+impl ArchiveBacklogJournalClaim<'_> {
+    fn retain(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for ArchiveBacklogJournalClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.as_ref() {
+            self.backlog
+                .owned_journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(path);
         }
     }
 }
@@ -2503,6 +2665,19 @@ fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
     archive_storage_root(config).join(".archive_backlog")
 }
 
+/// Alias spellings of the directory share one key, but the leaf is never
+/// resolved through a symlink into another directory's retirement target.
+fn archive_backlog_journal_key(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("journal path has no filename"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
 /// Borrow the runtime `Config` carried by any `WriteOp` variant.
 const fn write_op_config(op: &WriteOp) -> &Config {
     match op {
@@ -2569,7 +2744,10 @@ fn archive_backlog_sync_journal_ancestry(dir: &Path) -> std::io::Result<()> {
 /// step succeeded. Keep a complete post-rename candidate even when directory
 /// sync fails, so it remains replayable and its successful drain can retire it.
 /// None means no complete candidate was published; only memory backs the op.
-fn archive_backlog_journal_write(op: &WriteOp) -> Option<ArchiveBacklogJournal> {
+fn archive_backlog_journal_write(
+    op: &WriteOp,
+    owner: Option<&ArchiveRetryBacklog>,
+) -> Option<ArchiveBacklogJournal> {
     let dir = archive_backlog_journal_dir_for(write_op_config(op));
     if let Err(error) = fs::create_dir_all(&dir) {
         tracing::warn!(
@@ -2579,6 +2757,15 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<ArchiveBacklogJournal> 
         );
         return None;
     }
+    // Freeze the same physical spelling used by recovery before registering
+    // ownership. Alias spellings must not admit a second copy of a live op.
+    let dir = match fs::canonicalize(&dir) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(error = %error, dir = %dir.display(), "archive backlog: cannot resolve journal dir; in-memory only");
+            return None;
+        }
+    };
     let persisted = PersistedWriteOp::from_op(op);
     let bytes = match serde_json::to_vec(&persisted) {
         Ok(bytes) => bytes,
@@ -2594,14 +2781,23 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<ArchiveBacklogJournal> 
         std::process::id()
     ));
     let tmp_path = final_path.with_extension("json.tmp");
+    let claim = if let Some(owner) = owner {
+        let Some(claim) = owner.claim_journal(final_path.clone()) else {
+            tracing::warn!(path = %final_path.display(), "archive backlog: journal name is already owned; in-memory only");
+            return None;
+        };
+        Some(claim)
+    } else {
+        None
+    };
     if let Err(error) = archive_backlog_write_tmp(&tmp_path, &bytes) {
         tracing::warn!(error = %error, "archive backlog: journal write failed; in-memory only");
-        archive_backlog_quarantine_file(&tmp_path, "failed");
+        let _ = archive_backlog_quarantine_file(&tmp_path, "failed");
         return None;
     }
     if let Err(error) = fs::rename(&tmp_path, &final_path) {
         tracing::warn!(error = %error, "archive backlog: journal rename failed; in-memory only");
-        archive_backlog_quarantine_file(&tmp_path, "failed");
+        let _ = archive_backlog_quarantine_file(&tmp_path, "failed");
         return None;
     }
     #[cfg(unix)]
@@ -2621,6 +2817,9 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<ArchiveBacklogJournal> 
     // the portable standard library has no directory-fsync equivalent there.
     #[cfg(not(unix))]
     let durable = true;
+    if let Some(claim) = claim {
+        claim.retain();
+    }
     Some(ArchiveBacklogJournal {
         path: final_path,
         durable,
@@ -2629,49 +2828,49 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<ArchiveBacklogJournal> 
 
 /// RULE 1: the ack-fast backlog NEVER deletes journal files. Instead of removing
 /// `path`, move it into a `<journal-dir>/<subdir>/` sibling (created on demand),
-/// preserving the record for forensics/operator reclaim. Best-effort: a missing
-/// source is a no-op; a failed move leaves the file in place (recovery re-materializes
-/// idempotently, so a stray journal is never a correctness problem, only tidiness).
+/// preserving the record for forensics/operator reclaim. A missing source is a
+/// no-op; other failures retain the source and are returned to the drainer so
+/// it keeps ownership until retirement succeeds.
 ///
 /// The `resolved/`/`failed/` subdirs are NOT re-scanned by [`archive_backlog_recover`]
 /// (it reads only top-level `*.json`), so quarantined entries are never replayed.
 /// In practice these dirs stay small because the backlog is used only on the
 /// degraded WBQ-unavailable fallback path; operators reclaim them like other
 /// `.doctor`/recovery debris.
-fn archive_backlog_quarantine_file(path: &Path, subdir: &str) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let quarantine_dir = parent.join(subdir);
-    if let Err(error) = fs::create_dir_all(&quarantine_dir) {
-        tracing::debug!(
-            error = %error,
-            dir = %quarantine_dir.display(),
-            "archive backlog: cannot create {subdir} quarantine dir; leaving journal in place"
-        );
-        return;
+fn archive_backlog_quarantine_file(path: &Path, subdir: &str) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
     }
-    let Some(name) = path.file_name() else {
-        return;
-    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("journal path has no parent"))?;
+    let quarantine_dir = parent.join(subdir);
+    fs::create_dir_all(&quarantine_dir)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("journal path has no filename"))?;
     let dest = quarantine_dir.join(name);
-    if let Err(error) = fs::rename(path, &dest) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::debug!(
-                error = %error,
-                from = %path.display(),
-                to = %dest.display(),
-                "archive backlog: quarantine move failed (recovery replays idempotently)"
-            );
+    match fs::rename(path, &dest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The destination directory can disappear too. Do not release
+            // ownership while the original active journal still exists.
+            match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(error),
+            }
         }
+        Err(error) => Err(error),
     }
 }
 
 /// Retire a durably-materialized journal entry non-destructively (RULE 1): its
 /// op is now durable in the git archive, so the entry is moved into `resolved/`
 /// rather than deleted, and recovery no longer replays it.
-fn archive_backlog_journal_resolve(path: &Path) {
-    archive_backlog_quarantine_file(path, "resolved");
+fn archive_backlog_journal_resolve(path: &Path) -> std::io::Result<()> {
+    archive_backlog_quarantine_file(path, "resolved")
 }
 
 fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
@@ -2720,7 +2919,9 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
             // Materialized: loop immediately to drain the next entry with no sleep.
             // DeadLettered (F3): the poisoned head was ledgered and removed;
             // likewise continue immediately with the next entry.
-            ArchiveBacklogDrainStep::Materialized | ArchiveBacklogDrainStep::DeadLettered => {}
+            ArchiveBacklogDrainStep::Materialized
+            | ArchiveBacklogDrainStep::DeadLettered
+            | ArchiveBacklogDrainStep::RetirementDeferred => {}
             ArchiveBacklogDrainStep::RetryLater(attempts) => {
                 let backoff = ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS
                     .saturating_mul(u64::from(attempts.min(50)))
@@ -2781,6 +2982,9 @@ pub fn archive_backlog_recover(config: &Config) {
     let backlog = &*ARCHIVE_BACKLOG;
     let mut recovered = 0u64;
     for path in files {
+        if backlog.owns_journal(&path) {
+            continue;
+        }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -2801,8 +3005,9 @@ pub fn archive_backlog_recover(config: &Config) {
             }
         };
         let op = persisted.into_op(config.clone());
-        backlog.push_recovered(op, path);
-        recovered = recovered.saturating_add(1);
+        if backlog.push_recovered(op, path) {
+            recovered = recovered.saturating_add(1);
+        }
     }
     if recovered > 0 {
         tracing::warn!(
@@ -24446,16 +24651,22 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let op = backlog_test_message_op(&config, "journal-proj", 9);
-        let journal = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op, None).expect("journal write");
         assert!(journal.durable);
         let path = journal.path;
         assert!(path.exists());
-        assert!(path.starts_with(config.storage_root.join(".archive_backlog")));
+        assert!(
+            path.starts_with(
+                fs::canonicalize(&config.storage_root)
+                    .unwrap()
+                    .join(".archive_backlog")
+            )
+        );
         let bytes = std::fs::read(&path).unwrap();
         let parsed: PersistedWriteOp = serde_json::from_slice(&bytes).unwrap();
         assert!(matches!(parsed, PersistedWriteOp::MessageBundle { .. }));
         // RULE 1: resolve moves the journal into `resolved/` rather than deleting.
-        archive_backlog_journal_resolve(&path);
+        archive_backlog_journal_resolve(&path).unwrap();
         assert!(!path.exists(), "original journal path no longer present");
         let resolved = path
             .parent()
@@ -24694,6 +24905,275 @@ mod tests {
             .join("resolved")
             .join(path.file_name().unwrap());
         assert_eq!(fs::read(resolved).unwrap(), candidate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_recovery_cannot_duplicate_a_live_publisher() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovery_cannot_duplicate_a_live_publisher",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp.path().join("storage"));
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "owned-journal".to_string(),
+            agent_name: "OwnedSignal".to_string(),
+            metadata: None,
+        };
+        let backlog = &*ARCHIVE_BACKLOG;
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let publisher = std::thread::spawn(move || {
+            let mut paused = false;
+            let _hook = install_archive_backlog_directory_sync_test_hook(move |_| {
+                if !paused {
+                    paused = true;
+                    published_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release live journal publisher");
+                }
+                Ok(())
+            });
+            backlog.push(op, 8)
+        });
+        published_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("journal must be visible before the publisher queues its op");
+        assert_eq!(backlog.reserved.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 0);
+        let journal = backlog
+            .owned_journals
+            .lock()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        let parsed: PersistedWriteOp =
+            serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+
+        // The actual recovery entrypoint must ignore both the in-flight
+        // publisher and an alias spelling of its configured directory.
+        archive_backlog_recover(&config);
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&config.storage_root, &alias).unwrap();
+        let mut aliased = config.clone();
+        aliased.storage_root = alias;
+        archive_backlog_recover(&aliased);
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 1);
+        assert!(backlog.drain_handle.lock().unwrap().is_none());
+        resume_tx.send(()).unwrap();
+        assert_eq!(publisher.join().unwrap(), ArchiveBacklogPush::Queued);
+
+        archive_backlog_recover(&config);
+        archive_backlog_recover(&aliased);
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 1);
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert!(
+            config
+                .notifications_signals_dir
+                .join("projects/owned-journal/agents/OwnedSignal.signal")
+                .is_file()
+        );
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        // This parsed observation predates retirement. Once the old owner
+        // releases its key, it still must not become a new queued mutation.
+        assert!(!backlog.push_recovered(parsed.into_op(config), journal));
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_failed_retirement_keeps_ownership_without_reapplying() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_failed_retirement_keeps_ownership_without_reapplying",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "retirement-retry".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/retirement-retry/agents/{agent}.signal"))
+        };
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(
+            backlog.push(signal_op("OldSignal"), 8),
+            ArchiveBacklogPush::Queued
+        );
+        let (journal, oldest) = {
+            let queue = backlog.queue.lock().unwrap();
+            let entry = queue.front().unwrap();
+            (entry.journal_path.clone().unwrap(), entry.first_enqueued_at)
+        };
+        let journal_bytes = fs::read(&journal).unwrap();
+        let dir = journal.parent().unwrap();
+        fs::write(dir.join("resolved"), b"retirement blocker").unwrap();
+        assert_eq!(
+            backlog.push(signal_op("HealthySignal"), 8),
+            ArchiveBacklogPush::Queued
+        );
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetirementDeferred
+        ));
+        assert!(signal_path("OldSignal").is_file());
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        assert!(backlog.owns_journal(&journal));
+        assert!(!backlog.push_recovered(signal_op("OldSignal"), journal.clone()));
+        assert!(!backlog.push_recovered(signal_op("OldSignal"), journal.clone()));
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 2);
+        assert_eq!(backlog.backlog_state().0, 2);
+        let old_age = duration_as_micros_u64(oldest.elapsed());
+        assert!(backlog.backlog_state().1 >= old_age);
+
+        // Later archive state must survive every retirement retry. A retained
+        // entry no longer executes its original mutation after materialization.
+        fs::write(signal_path("OldSignal"), b"newer archive state").unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        assert!(signal_path("HealthySignal").is_file());
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        assert_eq!(
+            fs::read(signal_path("OldSignal")).unwrap(),
+            b"newer archive state"
+        );
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 2);
+
+        // Preserve the obstruction as evidence, then let both retained
+        // candidates finish normal retirement without re-running either op.
+        fs::rename(dir.join("resolved"), dir.join("resolved-blocker-preserved")).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+        }
+        assert_eq!(
+            fs::read(signal_path("OldSignal")).unwrap(),
+            b"newer archive state"
+        );
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 2);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(dir.join("resolved").join(journal.file_name().unwrap())).unwrap(),
+            journal_bytes
+        );
+
+        // A journal that is already absent needs no destination directory.
+        fs::write(dir.join("blocked-destination"), b"preserved").unwrap();
+        assert!(
+            archive_backlog_quarantine_file(&dir.join("absent.json"), "blocked-destination")
+                .is_ok()
+        );
+        assert_eq!(
+            fs::read(dir.join("blocked-destination")).unwrap(),
+            b"preserved"
+        );
+    }
+
+    #[test]
+    fn archive_backlog_failed_dead_letter_retirement_does_not_repeat_the_ledger() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_failed_dead_letter_retirement_does_not_repeat_the_ledger",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        fs::write(&config.notifications_signals_dir, b"signal write blocker").unwrap();
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "dead-letter-retirement".to_string(),
+            agent_name: "FailedSignal".to_string(),
+            metadata: None,
+        };
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push(op, 8), ArchiveBacklogPush::Queued);
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let dir = journal.parent().unwrap();
+        fs::write(dir.join("failed"), b"dead-letter retirement blocker").unwrap();
+        for _ in 0..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+        }
+        let ledger_path = config.storage_root.join("doctor/backlog_dead_letter.jsonl");
+        let ledger = fs::read(&ledger_path).unwrap();
+        assert_eq!(
+            String::from_utf8(ledger.clone()).unwrap().lines().count(),
+            1
+        );
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(backlog.owns_journal(&journal));
+        fs::rename(
+            &config.notifications_signals_dir,
+            tmp.path().join("signal-blocker-preserved"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+            assert_eq!(fs::read(&ledger_path).unwrap(), ledger);
+            assert!(!config.notifications_signals_dir.exists());
+        }
+        fs::rename(dir.join("failed"), dir.join("failed-blocker-preserved")).unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert_eq!(fs::read(&ledger_path).unwrap(), ledger);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert!(!config.notifications_signals_dir.exists());
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -25134,7 +25614,7 @@ mod tests {
 
         // Simulate the crash gap: journal exists, archive bundle does not.
         let op = backlog_test_message_op(&config, project_slug, 4242);
-        let journal = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op, None).expect("journal write");
         assert!(journal.durable);
         let journal_path = journal.path;
         assert!(journal_path.exists(), "journaled op present pre-recovery");
@@ -25271,11 +25751,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let op = backlog_test_message_op(&config, "resolved-proj", 11);
-        let journal = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op, None).expect("journal write");
         assert!(journal.durable);
         let journal_path = journal.path;
 
-        archive_backlog_journal_resolve(&journal_path);
+        archive_backlog_journal_resolve(&journal_path).unwrap();
         assert!(
             !journal_path.exists(),
             "moved out of the top-level journal dir"
