@@ -4584,6 +4584,9 @@ impl FileLock {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
+        if file_meta.file_type() != path_meta.file_type() {
+            return Ok(false);
+        }
 
         #[cfg(unix)]
         {

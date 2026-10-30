@@ -51,7 +51,7 @@ pub enum SetupError {
         path: PathBuf,
         retained: Option<PathBuf>,
         #[source]
-        source: Box<SetupError>,
+        source: Box<Self>,
     },
 
     #[error("{0}")]

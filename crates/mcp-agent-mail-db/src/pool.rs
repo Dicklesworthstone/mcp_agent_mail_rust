@@ -1337,7 +1337,7 @@ fn lock_neutral_sqlite_generation_fingerprint_with_observer(
     let Ok(parent_after) = std::fs::symlink_metadata(parent_path) else {
         return "unreadable".to_string();
     };
-    if !parent_after.file_type().is_dir() {
+    if parent_before.file_type() != parent_after.file_type() {
         return "unreadable".to_string();
     }
     #[cfg(unix)]
@@ -6391,6 +6391,7 @@ impl DbPoolAuthority {
 struct FrozenDirectoryAuthority {
     target_path: PathBuf,
     authority_name: &'static str,
+    #[cfg(unix)]
     expect_directory_leaf: bool,
     #[cfg(unix)]
     anchor_dir: std::fs::File,
@@ -6691,11 +6692,10 @@ impl FrozenDirectoryAuthority {
 
         #[cfg(not(unix))]
         {
-            let _ = field;
+            let _ = (field, expect_directory_leaf);
             Ok(Self {
                 target_path: target_path.to_path_buf(),
                 authority_name,
-                expect_directory_leaf,
             })
         }
     }
@@ -7376,7 +7376,13 @@ impl FrozenDirectoryAuthority {
             match std::fs::read(&path) {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(DbError::Io(error)),
+                Err(error) => Err(DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: format!(
+                        "{context}: cannot read search_index/{file_name} under {}: {error}; refusing to cross archive authority",
+                        self.target_path.display()
+                    ),
+                }),
             }
         }
     }

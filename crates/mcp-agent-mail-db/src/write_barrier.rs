@@ -294,13 +294,13 @@ fn begin_write_activity_cancellable_impl<E>(
             }
             return Ok(guard);
         }
-        let (state, _timeout) = b
+        let (wait_state, _timeout) = b
             .promotion_released
             .wait_timeout(state, check_interval.min(warning_interval))
             .unwrap_or_else(PoisonError::into_inner);
         let report_wait =
-            state.promotion_active && !warned && wait_started.elapsed() >= warning_interval;
-        drop(state);
+            wait_state.promotion_active && !warned && wait_started.elapsed() >= warning_interval;
+        drop(wait_state);
         if report_wait {
             warned = true;
             on_wait(wait_started.elapsed());
@@ -553,11 +553,11 @@ fn acquire_promotion_barrier_draining_impl<E>(
                 return Ok((owner, outcome));
             }
             let remaining = timeout.saturating_sub(waited);
-            let (state, _timeout) = b
+            let (wait_state, _timeout) = b
                 .writers_drained
                 .wait_timeout(state, remaining.min(check_interval))
                 .unwrap_or_else(PoisonError::into_inner);
-            drop(state);
+            drop(wait_state);
             // Re-evaluate the same deadline before accepting the zero-writer
             // wakeup. A release after the budget cannot authorize promotion.
         }
