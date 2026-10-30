@@ -3272,6 +3272,10 @@ struct MessageIdAllocatorEntry {
 struct PoolMessageIdState {
     allocator: Mutex<Arc<crate::id_floor::MessageIdAllocator>>,
     opened_connection: AtomicBool,
+    /// A full pool checkout, including initialization, validation, and any
+    /// connection retuning, completed successfully for this engine pool.
+    /// Opening a handle alone does not establish this readiness.
+    successful_checkout: AtomicBool,
 }
 
 /// A capability held by the exact pool that claimed its first init gate.
@@ -3396,6 +3400,7 @@ fn shared_message_id_allocator(
     let state = Arc::new(PoolMessageIdState {
         allocator: Mutex::new(allocator),
         opened_connection: AtomicBool::new(false),
+        successful_checkout: AtomicBool::new(false),
     });
     let generation = NEXT_POOL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
     per_pool_entries.insert(
@@ -4081,6 +4086,22 @@ impl DbPool {
         self.pool.is_closed()
     }
 
+    /// Whether this live engine pool has completed at least one successful
+    /// checkout. Cache publication only constructs a lazy pool; it does not
+    /// imply that startup initialization or recovery has finished.
+    ///
+    /// This is shared across wrappers of the same engine and is not a health
+    /// probe. Recovery retirement closes the engine, making it unready even
+    /// if an earlier generation completed a checkout.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        !self.pool.is_closed()
+            && self
+                .message_id_state
+                .successful_checkout
+                .load(Ordering::Acquire)
+    }
+
     #[must_use]
     pub fn engine_identity_key(&self) -> String {
         let identity = self.cache_identity_namespace();
@@ -4493,7 +4514,11 @@ impl DbPool {
         let metrics = mcp_agent_mail_core::global_metrics();
         metrics.db.pool_acquires_total.inc();
         metrics.db.pool_acquire_latency_us.record(dur_us);
-        if !matches!(out, Outcome::Ok(_)) {
+        if matches!(out, Outcome::Ok(_)) {
+            self.message_id_state
+                .successful_checkout
+                .store(true, Ordering::Release);
+        } else {
             metrics.db.pool_acquire_errors_total.inc();
         }
 
@@ -6010,7 +6035,7 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
     trigger: &str,
     initializing_owner: Option<&InitializingPoolOwner>,
 ) {
-    let mut retired_pools = {
+    let (mut retired_pools, initializing_cache_keys) = {
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
         let mut guard = cache.write();
@@ -6020,13 +6045,18 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
             .cloned()
             .collect::<Vec<_>>();
         let mut pools = Vec::new();
+        let mut initializing_cache_keys = Vec::new();
         for key in &matching_keys {
-            if let Some(pool) = guard.remove(key).and_then(|weak| weak.upgrade())
-                && !pools
+            if let Some(pool) = guard.remove(key).and_then(|weak| weak.upgrade()) {
+                if initializing_owner.is_some_and(|owner| Arc::ptr_eq(&owner.pool, &pool)) {
+                    initializing_cache_keys.push(key.clone());
+                }
+                if !pools
                     .iter()
                     .any(|existing: &Arc<Pool<DbConn>>| Arc::ptr_eq(existing, &pool))
-            {
-                pools.push(pool);
+                {
+                    pools.push(pool);
+                }
             }
         }
         drop(guard);
@@ -6047,10 +6077,10 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
                 false
             });
         }
-        pools
+        (pools, initializing_cache_keys)
     };
 
-    let (message_id_allocator_invalidated, retired_generations) = {
+    let (message_id_allocator_invalidated, retired_generations, adopted_initializing_owner) = {
         let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
         let guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
         // Match constructor lock order. Retirement and the one permitted
@@ -6064,6 +6094,7 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
         let previous_allocator = previous
             .as_ref()
             .and_then(|entry| entry.allocator.upgrade());
+        let mut adopted_initializing_owner = false;
         if let Some(allocator) = &previous_allocator {
             allocator.retire();
         }
@@ -6122,11 +6153,12 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
                 *allocator = replacement;
                 drop(allocator);
                 retired_pools.retain(|pool| !Arc::ptr_eq(pool, &owner.pool));
+                adopted_initializing_owner = true;
             }
         }
         drop(logical);
         drop(guard);
-        (previous.is_some(), generations)
+        (previous.is_some(), generations, adopted_initializing_owner)
     };
 
     for pool in &retired_pools {
@@ -6150,6 +6182,25 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
         });
         before.saturating_sub(guard.len())
     };
+
+    // Retirement removed the lazy initializer's cache publication along with
+    // old generations. Only the exact owner adopted by this retirement may
+    // regain its former weak entries. A later failed/cancelled initializer
+    // closes that engine; lookup then rejects it. Never replace a cache entry
+    // another caller published after the retirement.
+    if adopted_initializing_owner
+        && let Some(owner) = initializing_owner
+        && !owner.pool.is_closed()
+    {
+        let cache =
+            POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+        let mut guard = cache.write();
+        for key in initializing_cache_keys {
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::downgrade(&owner.pool));
+        }
+    }
 
     if let Some(cache) = RECENT_RECONSTRUCT_CACHE.get() {
         let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
@@ -23977,6 +24028,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkout_readiness_requires_success_and_is_shared_until_retirement() {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".into(),
+            storage_root: Some(scratch.path().to_path_buf()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let mut pool = get_or_create_pool(&config).unwrap();
+        let cached = get_cached_pool(&config).expect("published lazy pool");
+        assert!(!pool.is_initialized());
+        assert!(!cached.is_initialized());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+
+        // Fail after the real engine has opened and initialized its schema.
+        // The owner-adoption opened_connection bit must not make this pool
+        // eligible for request admission after failed connection setup.
+        pool.init_sql = Arc::new("THIS IS NOT VALID SQL".into());
+        assert!(matches!(
+            runtime.block_on(pool.acquire(&cx)),
+            Outcome::Err(_)
+        ));
+        assert!(
+            pool.message_id_state
+                .opened_connection
+                .load(Ordering::Acquire)
+        );
+        assert!(!pool.is_initialized());
+        assert!(!cached.is_initialized());
+        assert_eq!(pool.pool.stats().active_connections, 0);
+
+        // A separately rehydrated wrapper has the valid connection setup and
+        // may retry the same engine. Readiness is then visible to both.
+        let conn = runtime
+            .block_on(cached.acquire(&cx))
+            .into_result()
+            .expect("retry lazy pool after failed first checkout");
+        conn.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+            .expect("real schema initialized");
+        drop(conn);
+        assert!(pool.is_initialized());
+        assert!(cached.is_initialized());
+
+        pool.pool.close();
+        assert!(!pool.is_initialized());
+        assert!(!cached.is_initialized());
+        assert!(get_cached_pool(&config).is_none());
+    }
+
+    #[test]
+    fn cancelled_first_checkout_leaves_lazy_pool_retriable_and_unready() {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".into(),
+            storage_root: Some(scratch.path().to_path_buf()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = get_or_create_pool(&config).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            runtime.block_on(pool.acquire(&cancelled)),
+            Outcome::Cancelled(_)
+        ));
+        assert!(!pool.is_initialized());
+        assert!(
+            !pool
+                .message_id_state
+                .opened_connection
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(pool.pool.stats().active_connections, 0);
+        assert_eq!(pool.pool.stats().pending_requests, 0);
+
+        let cached = get_cached_pool(&config).expect("cancelled lazy wrapper can be retried");
+        assert!(!cached.is_initialized());
+        let live = Cx::for_testing();
+        drop(
+            runtime
+                .block_on(cached.acquire(&live))
+                .into_result()
+                .expect("fresh caller initializes the same engine"),
+        );
+        assert!(pool.is_initialized());
+        assert!(cached.is_initialized());
+    }
+
     // ── DbPoolConfig coverage ─────────────────────────────────────────
 
     #[test]
@@ -30185,7 +30335,7 @@ mod tests {
                     storage_root: Some(configured_storage_root.clone()),
                     ..Default::default()
                 };
-                let pool = DbPool::new(&config).unwrap();
+                let pool = get_or_create_pool(&config).unwrap();
                 let competing = DbPool::new(&config).expect("competing unopened pool");
                 let old_allocator = pool.message_id_allocator();
                 assert!(Arc::ptr_eq(
@@ -30223,6 +30373,11 @@ mod tests {
                         !pool.is_closed(),
                         "the actual initializer survives its promotion"
                     );
+                    assert!(pool.is_initialized());
+                    let cached = get_cached_pool(&config)
+                        .expect("successful initializer keeps its cache publication");
+                    assert!(cached.is_initialized());
+                    assert_eq!(cached.engine_identity_key(), pool.engine_identity_key());
                     assert!(
                         competing.is_closed(),
                         "an unopened competitor gets no exemption"
@@ -30288,7 +30443,7 @@ mod tests {
                 let conn = old.acquire(&cx).await.into_result().unwrap();
                 conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL); INSERT INTO marker VALUES('old-live');").unwrap();
             });
-            let unopened = DbPool::new(&config).unwrap();
+            let unopened = get_or_create_pool(&config).unwrap();
             let competing = DbPool::new(&config).unwrap();
             let selected = if case == "opened_owner" {
                 &old
@@ -30379,6 +30534,11 @@ mod tests {
                     !unopened.is_closed(),
                     "failed promotion grants no exemption to clean up"
                 );
+                assert!(!unopened.is_initialized());
+                assert_eq!(
+                    get_cached_pool(&config).unwrap().engine_identity_key(),
+                    unopened.engine_identity_key()
+                );
                 continue;
             }
             result.expect("real candidate promotion");
@@ -30389,16 +30549,25 @@ mod tests {
             crate::forensics::verify_recovery_receipt_state(&storage, &primary).unwrap();
             assert!(old.is_closed(), "older live owners always retire");
             assert!(competing.is_closed(), "other unopened owners also retire");
+            assert!(!old.is_initialized());
+            assert!(!competing.is_initialized());
             assert!(previous.is_retired());
             if case == "opened_owner" {
                 assert!(!owner.adopted.load(Ordering::Acquire));
                 assert!(unopened.is_closed());
+                assert!(get_cached_pool(&config).is_none());
                 continue;
             }
             assert!(owner.adopted.load(Ordering::Acquire));
             assert!(!unopened.is_closed());
             assert!(!Arc::ptr_eq(&previous, &unopened.message_id_allocator()));
             assert!(!unopened.message_id_allocator().is_retired());
+            let cached = get_cached_pool(&config).expect("adopted owner's former weak entry");
+            assert_eq!(cached.engine_identity_key(), unopened.engine_identity_key());
+            assert!(
+                !cached.is_initialized(),
+                "promotion alone is not a checkout"
+            );
             if case == "dropped_future" {
                 // Poll a real owning future to its suspension point, then
                 // cancel it by dropping it. Neither completion guard may leak.
@@ -30418,6 +30587,8 @@ mod tests {
                     unopened.is_closed(),
                     "cancelled initialization retires its adopted pool"
                 );
+                assert!(!cached.is_initialized());
+                assert!(get_cached_pool(&config).is_none());
                 assert!(matches!(
                     gate.claim_or_wait(Duration::ZERO),
                     SqliteInitGateClaim::Initialize
