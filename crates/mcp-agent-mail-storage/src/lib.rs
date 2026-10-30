@@ -1908,9 +1908,9 @@ pub fn write_agent_reaper_exemption_sync_direct(
 //
 // This backlog replaces that inline fallback with a durable retry queue drained
 // by a dedicated background thread:
-//   * `archive_backlog_push` is non-blocking for the reply path except for a
-//     single small local-disk journal write (bounded by fsync, NOT git) so the
-//     op survives a crash — the tool reply is never gated on the archive.
+//   * `archive_backlog_push` performs a small local-disk journal publication
+//     on the reply path: file sync plus directory-ancestry sync on Unix, never
+//     a git commit. Other platforms retain the existing file-flush contract.
 //   * A dedicated `archive-backlog-drain` thread retries `wbq_enqueue`; after a
 //     bounded number of failed re-enqueues it materializes the op with
 //     `write_op_sync` ON THE BACKLOG THREAD (never the request thread).
@@ -1920,9 +1920,9 @@ pub fn write_agent_reaper_exemption_sync_direct(
 //     the message on restart via `archive_backlog_recover` (messages have no
 //     DB->archive reconcile-on-read, unlike reservations, so the journal is the
 //     crash-safety mechanism).
-//   * On backlog overflow (or a journal-write failure) the op is dropped: the
-//     DB row stays authoritative and the loss is bounded and surfaced via the
-//     `dropped_total` counter and the archive-lag health metric.
+//   * On backlog overflow the op is dropped; unconfirmed journal durability
+//     instead yields a best-effort in-memory entry. Both outcomes are surfaced
+//     by backlog counters and archive-lag health; the DB stays authoritative.
 
 /// Default cap on ops held in the archive retry backlog before overflow drops
 /// the op (DB stays authoritative). Overridable via `AM_ARCHIVE_BACKLOG_CAP`.
@@ -1981,15 +1981,18 @@ pub fn archive_lag_critical_threshold_us() -> u64 {
 /// Outcome of pushing an op onto the archive retry backlog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveBacklogPush {
-    /// The op was **durably** journaled to local disk (fsync + atomic rename)
-    /// AND enqueued for background retry. It survives a crash: `archive_backlog_recover`
-    /// replays it on the next boot.
+    /// The op was journaled and enqueued after publication flushes succeeded.
+    /// Unix flushes file data and the containing directory's full ancestry, so
+    /// the pending journal survives a crash and can be replayed on next boot.
+    /// Other platforms retain file flush + atomic rename without claiming
+    /// Unix directory-fsync guarantees.
     Queued,
     /// The op was enqueued in memory for best-effort background retry, but its
-    /// durable journal could NOT be written (local-disk error). It is drained if
-    /// the process survives, but a crash before materialization loses the archive
-    /// write — the DB row stays authoritative and the archive-lag health metric
-    /// counts it. Callers MUST NOT report this as a durable acknowledgment
+    /// journal durability could NOT be confirmed (local-disk error). A complete
+    /// candidate may still be available for recovery, but a crash before
+    /// materialization can lose the archive write. The DB stays authoritative
+    /// and archive-lag health counts it. Callers MUST NOT report this as a
+    /// durable acknowledgment
     /// (br-ack-fast: "do not report queued/durable unless the journal persisted").
     QueuedEphemeral,
     /// The backlog was at capacity; the op was dropped. The DB row remains
@@ -2144,8 +2147,10 @@ impl PersistedWriteOp {
 
 struct ArchiveBacklogEntry {
     op: WriteOp,
-    /// On-disk journal file backing this entry (None if journaling was disabled
-    /// or the journal write failed; then the entry is in-memory only).
+    /// On-disk journal candidate backing this entry. Retain it even when a
+    /// post-rename directory sync failed: recovery can replay it, and successful
+    /// materialization must retire it. None means no complete candidate was
+    /// published.
     journal_path: Option<PathBuf>,
     /// Monotonic enqueue instant, used for the archive-lag age. Reset on
     /// recovery (the pre-crash age is not recoverable and not worth persisting).
@@ -2214,12 +2219,13 @@ impl ArchiveRetryBacklog {
     }
 
     /// Durably journal and enqueue an op. `cap` bounds the in-memory queue; on
-    /// overflow the op is dropped (DB stays authoritative). Non-blocking apart
-    /// from the single local-disk journal fsync.
+    /// overflow the op is dropped (DB stays authoritative). The request path
+    /// performs journal file sync and, on Unix, directory-ancestry sync.
     ///
     /// Capacity is *reserved* under the queue lock before the (unlocked) journal
-    /// fsync and released when the entry is enqueued, so concurrent pushers can
-    /// never exceed `cap` (br-ack-fast: fixed a check-then-enqueue TOCTOU race).
+    /// publication and released when the entry is enqueued, so concurrent
+    /// pushers can never exceed `cap` (br-ack-fast: fixed a check-then-enqueue
+    /// TOCTOU race).
     /// The return value reflects **actual durability**: [`ArchiveBacklogPush::Queued`]
     /// only when the journal persisted, else [`ArchiveBacklogPush::QueuedEphemeral`].
     fn push(&self, op: WriteOp, cap: u64) -> ArchiveBacklogPush {
@@ -2247,9 +2253,10 @@ impl ArchiveRetryBacklog {
             // next pusher's capacity check.
             self.reserved.fetch_add(1, Ordering::Relaxed);
         }
-        // Journal outside the queue lock: the fsync must not stall other pushers.
-        let journal_path = archive_backlog_journal_write(&op);
-        let durable = journal_path.is_some();
+        // Journal outside the queue lock: syncs must not stall other pushers.
+        let journal = archive_backlog_journal_write(&op);
+        let durable = journal.as_ref().is_some_and(|journal| journal.durable);
+        let journal_path = journal.map(|journal| journal.path);
         {
             let mut queue = self
                 .queue
@@ -2269,13 +2276,13 @@ impl ArchiveRetryBacklog {
         if durable {
             ArchiveBacklogPush::Queued
         } else {
-            // The op is in memory only; a crash before the drain thread
-            // materializes it loses the archive write. Surface it — never claim
-            // durability the disk did not provide.
+            // No confirmed durable journal backs this entry. A complete
+            // candidate may still exist, but its directory publication was not
+            // confirmed. Never claim durability the disk did not provide.
             self.ephemeral_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                "archive retry backlog: op enqueued WITHOUT a durable journal \
-                 (local-disk journal write failed); a crash before drain loses the \
+                "archive retry backlog: op enqueued WITHOUT confirmed journal durability \
+                 (local-disk publication failed); a crash before drain can lose the \
                  archive materialization (DB authoritative; surfaced via archive-lag metric)"
             );
             ArchiveBacklogPush::QueuedEphemeral
@@ -2520,10 +2527,49 @@ fn archive_backlog_write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Durably journal an op; returns the final journal path, or `None` if
-/// journaling is unavailable (the entry then lives in memory only and heals via
-/// reconcile on the next successful drain or is bounded-lost on crash).
-fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
+struct ArchiveBacklogJournal {
+    path: PathBuf,
+    /// All publication flushes supported by this platform completed. Unix
+    /// includes directory ancestry; other platforms retain file-flush behavior.
+    durable: bool,
+}
+
+#[cfg(all(test, unix))]
+type ArchiveBacklogDirectorySyncTestHook = Box<dyn FnMut(&Path) -> std::io::Result<()>>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK:
+        std::cell::RefCell<Option<ArchiveBacklogDirectorySyncTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Confirm the published journal's directory entries on Unix. Always sync the
+/// complete physical ancestry: another pusher may have just created a parent
+/// that exists but whose own parent entry has not reached disk yet. Canonical
+/// paths also keep relative or symlink-spelled storage roots from truncating
+/// the chain. This uses the existing trusted, stable directory namespace.
+#[cfg(unix)]
+fn archive_backlog_sync_journal_ancestry(dir: &Path) -> std::io::Result<()> {
+    let canonical = fs::canonicalize(dir)?;
+    for directory in canonical.ancestors() {
+        #[cfg(test)]
+        ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(directory)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
+        fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Publish a journal candidate and report whether every supported durability
+/// step succeeded. Keep a complete post-rename candidate even when directory
+/// sync fails, so it remains replayable and its successful drain can retire it.
+/// None means no complete candidate was published; only memory backs the op.
+fn archive_backlog_journal_write(op: &WriteOp) -> Option<ArchiveBacklogJournal> {
     let dir = archive_backlog_journal_dir_for(write_op_config(op));
     if let Err(error) = fs::create_dir_all(&dir) {
         tracing::warn!(
@@ -2558,7 +2604,27 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
         archive_backlog_quarantine_file(&tmp_path, "failed");
         return None;
     }
-    Some(final_path)
+    #[cfg(unix)]
+    let durable = match archive_backlog_sync_journal_ancestry(&dir) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %final_path.display(),
+                "archive backlog: journal directory sync failed; candidate retained \
+                 without confirmed durability"
+            );
+            false
+        }
+    };
+    // Keep the existing file-flush/atomic-rename receipt on other platforms;
+    // the portable standard library has no directory-fsync equivalent there.
+    #[cfg(not(unix))]
+    let durable = true;
+    Some(ArchiveBacklogJournal {
+        path: final_path,
+        durable,
+    })
 }
 
 /// RULE 1: the ack-fast backlog NEVER deletes journal files. Instead of removing
@@ -2668,8 +2734,9 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
 /// Durably queue an archive write op for strictly-asynchronous background retry.
 ///
 /// This is the ack-fast replacement for the inline `write_op_sync` fallback used
-/// when the write-behind queue is unavailable: the reply path incurs at most one
-/// small local-disk journal fsync (not a git commit), then returns.
+/// when the write-behind queue is unavailable: the reply path publishes a small
+/// local-disk journal with file sync and, on Unix, directory-ancestry sync. Git
+/// archive materialization remains on the background worker.
 #[must_use]
 pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
     let backlog = &*ARCHIVE_BACKLOG;
@@ -24303,7 +24370,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let op = backlog_test_message_op(&config, "journal-proj", 9);
-        let path = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op).expect("journal write");
+        assert!(journal.durable);
+        let path = journal.path;
         assert!(path.exists());
         assert!(path.starts_with(config.storage_root.join(".archive_backlog")));
         let bytes = std::fs::read(&path).unwrap();
@@ -24321,6 +24390,234 @@ mod tests {
             resolved.exists(),
             "journal preserved under resolved/ (not deleted)"
         );
+    }
+
+    #[cfg(unix)]
+    struct ArchiveBacklogDirectorySyncTestGuard;
+
+    #[cfg(unix)]
+    impl Drop for ArchiveBacklogDirectorySyncTestGuard {
+        fn drop(&mut self) {
+            ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_archive_backlog_directory_sync_test_hook(
+        hook: impl FnMut(&Path) -> std::io::Result<()> + 'static,
+    ) -> ArchiveBacklogDirectorySyncTestGuard {
+        ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        ArchiveBacklogDirectorySyncTestGuard
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_journal_syncs_full_ancestry_with_concurrent_creator() {
+        // A relative storage root through a symlink must still sync the real
+        // directory chain all the way to the filesystem root.
+        let tmp = tempfile::Builder::new()
+            .prefix("backlog-ancestry-")
+            .tempdir_in(".")
+            .unwrap();
+        let physical = fs::canonicalize(tmp.path()).unwrap().join("physical");
+        fs::create_dir(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, tmp.path().join("alias")).unwrap();
+        let relative =
+            PathBuf::from(tmp.path().file_name().unwrap()).join("alias/new/parent/storage");
+        assert!(relative.is_relative());
+        let config = test_config(&relative);
+        let backlog = Arc::new(ArchiveRetryBacklog::new());
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let first_backlog = Arc::clone(&backlog);
+        let first_op = backlog_test_message_op(&config, "directory-race", 1);
+        let first = std::thread::spawn(move || {
+            let mut first_sync = true;
+            let _hook = install_archive_backlog_directory_sync_test_hook(move |_| {
+                if first_sync {
+                    first_sync = false;
+                    created_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("resume the pusher that created the directory tree");
+                }
+                Ok(())
+            });
+            first_backlog.push(first_op, 8)
+        });
+        created_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first pusher must create directories and publish before directory sync");
+
+        // The second pusher sees an existing tree whose parent links have not
+        // been synced by its creator. It must establish durability itself,
+        // rather than stop at whichever ancestor happens to exist already.
+        let canonical = fs::canonicalize(archive_backlog_journal_dir_for(&config)).unwrap();
+        let expected: Vec<PathBuf> = canonical.ancestors().map(Path::to_path_buf).collect();
+        assert_eq!(expected.last().unwrap(), Path::new("/"));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_syncs = Arc::clone(&observed);
+        let hook = install_archive_backlog_directory_sync_test_hook(move |directory| {
+            observed_syncs.lock().unwrap().push(directory.to_path_buf());
+            Ok(())
+        });
+        let second = backlog.push(backlog_test_message_op(&config, "directory-race", 2), 8);
+        drop(hook);
+        assert_eq!(second, ArchiveBacklogPush::Queued);
+        assert_eq!(*observed.lock().unwrap(), expected);
+        assert!(!first.is_finished(), "the original creator is still paused");
+        resume_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), ArchiveBacklogPush::Queued);
+        assert_eq!(backlog.backlog_state().0, 2);
+        assert_eq!(backlog.reserved.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_directory_sync_failure_preserves_and_retires_candidate() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_directory_sync_failure_preserves_and_retires_candidate",
+        ) {
+            return;
+        }
+        for fail_at_leaf in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let root = fs::canonicalize(tmp.path()).unwrap().join("new/storage");
+            let mut config = test_config(&root);
+            config.notifications_enabled = true;
+            config.notifications_signals_dir = root.join("signals");
+            let fail_at = if fail_at_leaf {
+                root.join(".archive_backlog")
+            } else {
+                root.parent().unwrap().to_path_buf()
+            };
+            let op = WriteOp::NotificationSignal {
+                config: config.clone(),
+                project_slug: "directory-failure".to_string(),
+                agent_name: "RetainedSignal".to_string(),
+                metadata: None,
+            };
+            let expected = serde_json::to_vec(&PersistedWriteOp::from_op(&op)).unwrap();
+            let hook = install_archive_backlog_directory_sync_test_hook(move |directory| {
+                if directory == fail_at {
+                    return Err(std::io::Error::other("injected directory sync failure"));
+                }
+                Ok(())
+            });
+            let backlog = ArchiveRetryBacklog::new();
+            assert_eq!(backlog.push(op, 8), ArchiveBacklogPush::QueuedEphemeral);
+            drop(hook);
+            assert_eq!(backlog.backlog_state().0, 1);
+            assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+            assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 1);
+            assert_eq!(backlog.reserved.load(Ordering::Relaxed), 0);
+            let path = backlog
+                .queue
+                .lock()
+                .unwrap()
+                .front()
+                .unwrap()
+                .journal_path
+                .clone()
+                .expect("a complete candidate must remain tracked after directory sync failure");
+            assert_eq!(path.parent().unwrap(), root.join(".archive_backlog"));
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert!(!root.join(".archive_backlog/failed").exists());
+
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+            assert_eq!(backlog.backlog_state().0, 0);
+            assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+            assert!(
+                config
+                    .notifications_signals_dir
+                    .join("projects/directory-failure/agents/RetainedSignal.signal")
+                    .is_file()
+            );
+            assert!(
+                !path.exists(),
+                "materialization must retire the tracked candidate"
+            );
+            let resolved = path
+                .parent()
+                .unwrap()
+                .join("resolved")
+                .join(path.file_name().unwrap());
+            assert_eq!(fs::read(resolved).unwrap(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_recovers_candidate_after_directory_sync_failure() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovers_candidate_after_directory_sync_failure",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "directory-recovery".to_string(),
+            agent_name: "RecoveredSignal".to_string(),
+            metadata: None,
+        };
+        let hook = install_archive_backlog_directory_sync_test_hook(|_| {
+            Err(std::io::Error::other("injected directory sync failure"))
+        });
+        let abandoned = ArchiveRetryBacklog::new();
+        assert_eq!(abandoned.push(op, 8), ArchiveBacklogPush::QueuedEphemeral);
+        drop(hook);
+        let path = abandoned
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let candidate = fs::read(&path).unwrap();
+        drop(abandoned);
+
+        // Simulate loss of the original in-memory queue. The real recovery
+        // scanner and background writer must still find and retire the valid
+        // candidate; a failed durability receipt must not quarantine it away.
+        archive_backlog_recover(&config);
+        assert!(archive_backlog_flush_blocking(Duration::from_secs(10)));
+        assert!(
+            config
+                .notifications_signals_dir
+                .join("projects/directory-recovery/agents/RecoveredSignal.signal")
+                .is_file()
+        );
+        // The worker pops the materialized entry immediately before moving
+        // its journal. Wait for that real retirement, not just queue depth.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "recovery must retire its journal"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let resolved = path
+            .parent()
+            .unwrap()
+            .join("resolved")
+            .join(path.file_name().unwrap());
+        assert_eq!(fs::read(resolved).unwrap(), candidate);
     }
 
     #[test]
@@ -24761,7 +25058,9 @@ mod tests {
 
         // Simulate the crash gap: journal exists, archive bundle does not.
         let op = backlog_test_message_op(&config, project_slug, 4242);
-        let journal_path = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op).expect("journal write");
+        assert!(journal.durable);
+        let journal_path = journal.path;
         assert!(journal_path.exists(), "journaled op present pre-recovery");
 
         // Restart path replays and drains.
@@ -24896,7 +25195,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let op = backlog_test_message_op(&config, "resolved-proj", 11);
-        let journal_path = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op).expect("journal write");
+        assert!(journal.durable);
+        let journal_path = journal.path;
 
         archive_backlog_journal_resolve(&journal_path);
         assert!(
