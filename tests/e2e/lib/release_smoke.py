@@ -33,6 +33,10 @@ control, usually the previous release) runs the same phases:
                  window, send/reserve/release p99 under budget with zero
                  30 s dispatch timeouts or tool errors, no connection errors
                  outside the kill window, and archive convergence after load.
+  archive_contention (optional) a second full-strength swarm with recurring
+                 thread digests interleaved with unique threads across the
+                 same 3 projects. Retains every swarm gate and independently
+                 witnesses both classes of acknowledged traffic per project.
 
 It exists because two opposite defects reached artifacts in September 2026
 while every in-process suite was green: v0.3.36 leaked descriptors to EMFILE
@@ -41,7 +45,8 @@ swarm phase exists because shipped v0.3.38 passed every other phase but, at
 60 agents, timed reservation tools out at 30 s and left crash orphans out of
 the archive for hours (br-kp1in.34, br-kp1in.35, br-9bwnb).
 
-Usage:  release_smoke.py --bin PATH [--control-bin PATH] --out DIR
+Usage:  release_smoke.py --bin PATH [--control-bin PATH] [--control-first]
+                        [--archive-contention] --out DIR
 Exit 0 only when every phase of the CANDIDATE passes. A phase that raises
 before recording a failure, or runs with looser-than-release knobs, is
 NO_VERDICT, which also fails. The control arm is recorded, never gating.
@@ -1336,8 +1341,23 @@ def swarm_knob_shortfall(agents: int, secs: int) -> str | None:
             f"{RELEASE_MIN_SWARM_AGENTS} x {RELEASE_MIN_SWARM_SECS}s")
 
 
-def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
-    extra: dict = {"agents": SWARM_AGENTS, "secs": SWARM_SECS}
+def swarm_thread_id(agent: int, sequence: int, sampled: int, sparse_conflicts: bool) -> str:
+    """Keep the original seeded workload, or interleave mutable shared paths
+    with distinct threads. Offset each agent so a burst does not put every
+    client on the shared digest at once. Unique names never alias another
+    agent's send, including after its MCP session is renewed after SIGKILL.
+    """
+    if not sparse_conflicts:
+        return f"swarm-{sampled}"
+    if (agent + sequence) % 16 == 0:
+        return "swarm-contention-shared"
+    return f"swarm-contention-{agent}-{sequence}"
+
+
+def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = False) -> dict:
+    phase_name = "archive_contention" if sparse_conflicts else "swarm"
+    extra: dict = {"agents": SWARM_AGENTS, "secs": SWARM_SECS,
+                   "thread_workload": "sparse_conflicts" if sparse_conflicts else "shared_50"}
     shortfall = swarm_knob_shortfall(SWARM_AGENTS, SWARM_SECS)
     if shortfall:
         extra["cannot_pass"] = shortfall
@@ -1370,10 +1390,18 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
     stop = threading.Event()
     restarting = threading.Event()
     clock = {"kill_t": None, "restarted_t": None}
+    send_workload = {proj: {"shared_attempts": 0, "unique_attempts": 0,
+                            "shared_ok": 0, "unique_ok": 0} for proj in projects}
 
     def timed(sess: Session, tool: str, args: dict) -> tuple[bool, object] | None:
         if stop.is_set():
             return None  # do not launch another read after the load stops
+        send_kind = None
+        if tool == "send_message":
+            send_kind = ("shared" if not sparse_conflicts
+                         or args["thread_id"] == "swarm-contention-shared" else "unique")
+            with lock:
+                send_workload[args["project_key"]][send_kind + "_attempts"] += 1
         t0 = time.time()
         try:
             e, p = sess.call(tool, args, timeout=60)
@@ -1385,6 +1413,8 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
         code = error_code(p) if outcome != "ok" else ""
         with lock:
             records.append((tool, t0, time.time(), outcome, code))
+            if send_kind and outcome == "ok":
+                send_workload[args["project_key"]][send_kind + "_ok"] += 1
             if code:  # a code alone cannot name the failing site; keep a few payloads
                 kept = error_samples.setdefault(f"{tool} {code}", [])
                 if len(kept) < 3:
@@ -1396,6 +1426,7 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
         rnd = random.Random(idx)  # recorded seed per agent: the plan replays
         sess = Session(arm.url)
         others = [n for n in peers[proj] if n != me]
+        send_sequence = 0
         while not stop.is_set():
             if restarting.is_set():
                 time.sleep(0.2)
@@ -1405,7 +1436,10 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
                 "project_key": proj, "sender_name": me, "to": rnd.sample(others, k=min(2, len(others))),
                 "subject": f"swarm {me} {rnd.randrange(1 << 30)}",
                 "body_md": "swarm body " * rnd.randint(1, 40),
-                "thread_id": f"swarm-{rnd.randint(1, 50)}", "ack_required": rnd.random() < 0.25})
+                "thread_id": swarm_thread_id(idx, send_sequence, rnd.randint(1, 50),
+                                              sparse_conflicts),
+                "ack_required": rnd.random() < 0.25})
+            send_sequence += 1
             if r is None:
                 sess = Session(arm.url)
                 time.sleep(0.5)
@@ -1475,11 +1509,15 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
         return extra  # no quiet or archive-convergence claim from a live client
     load_secs = time.time() - started
     # Every call, so a latency tail can be placed in time (restart, backup, checkpoint).
-    with (arm.root / "out" / "swarm_calls.jsonl").open("w") as f:
+    with (arm.root / "out" / f"{phase_name}_calls.jsonl").open("w") as f:
         for tool, start, end, outcome, code in records:
             f.write(json.dumps([tool, round(start - started, 3), round(end - start, 3),
                                 outcome, code]) + "\n")
     stats = swarm_tool_stats(records, clock["kill_t"], clock["restarted_t"])
+    if sparse_conflicts:
+        check(c, "each project acknowledges repeated shared and unique thread traffic",
+              all(s["shared_ok"] >= 2 and s["unique_ok"] >= 1 for s in send_workload.values()),
+              send_workload)
     stalled = [w for seg in segments for w in drain_stalled_windows(seg)]
     for tool in SWARM_GATED_TOOLS:
         s = stats.get(tool, {})
@@ -1529,6 +1567,7 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
                       if clock["kill_t"] and clock["restarted_t"] else None),
         "acked_sends": len(acked), "sends_per_s": round(len(acked) / load_secs, 2),
         "tools": stats, "tool_error_samples": error_samples, "sqlite_fds_max": fds_max,
+        "send_workload": send_workload,
         "zombies_max": zombies_max, "wbq_samples": [len(s) for s in segments],
         "stalled_windows": len(stalled)})
     if CONVERGE_SECS > RELEASE_CONVERGE_SECS:
@@ -1536,15 +1575,20 @@ def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
     return extra
 
 
+def phase_archive_contention(arm: Arm, state: dict, c: list) -> dict:
+    return phase_swarm(arm, state, c, sparse_conflicts=True)
+
+
 PHASES = (("flow", phase_flow), ("cross_project", phase_cross_project),
           ("storm", phase_storm), ("crash", phase_crash), ("soak", phase_soak),
           ("swarm", phase_swarm))
 
 
-def run_arm(name: str, binary: Path, out: Path) -> dict:
+def run_arm(name: str, binary: Path, out: Path, *, archive_contention: bool = False) -> dict:
     # A fresh directory per run: never delete earlier evidence.
     root = out / f"{name}-{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
     arm = Arm(name, binary, root)
+    phases = PHASES + (("archive_contention", phase_archive_contention),) if archive_contention else PHASES
     # Host load is recorded per arm: a verdict measured on a saturated shared
     # host is a signal to re-run, never a pass or a clean loss.
     with binary.open("rb") as f:
@@ -1562,7 +1606,7 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
         result["server_nofile_soft_hard"] = [soft, hard]
         result["server_threads_start"] = arm.threads()
         state: dict = {}
-        for phase_name, phase in PHASES:
+        for phase_name, phase in phases:
             log(f"{name}: phase {phase_name}")
             c: list = []
             extra: dict = {}
@@ -1594,7 +1638,7 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
         pass
     result["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
     verdicts = [p.get("verdict") for p in result["phases"].values()]
-    result["verdict"] = ("PASS" if len(verdicts) == len(PHASES)
+    result["verdict"] = ("PASS" if len(verdicts) == len(phases)
                          and all(v == "PASS" for v in verdicts)
                          and result["clean_shutdown"] else "FAIL")
     return result
@@ -1604,8 +1648,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--bin", required=True, type=Path, help="candidate `am` binary")
     ap.add_argument("--control-bin", type=Path, help="control binary (e.g. previous release)")
+    ap.add_argument("--control-first", action="store_true",
+                    help="run the control first to alternate A/B order across retained invocations")
+    ap.add_argument("--archive-contention", action="store_true",
+                    help="also run a full swarm with sparse shared-thread path conflicts")
     ap.add_argument("--out", required=True, type=Path, help="output directory for the receipt")
     args = ap.parse_args()
+    if args.control_first and not args.control_bin:
+        ap.error("--control-first requires --control-bin")
     args.out.mkdir(parents=True, exist_ok=True)
     receipt = {"schema_version": 3,
                "harness_sha256": sha256(Path(__file__)),
@@ -1617,13 +1667,21 @@ def main() -> int:
                "fetch_inbox_p99_budget_s": FETCH_INBOX_P99_BUDGET_S,
                "swarm_agents": SWARM_AGENTS, "swarm_secs": SWARM_SECS,
                "swarm_tool_p99_budget_s": SWARM_TOOL_P99_BUDGET_S,
+               "archive_contention": args.archive_contention,
                "loadavg_start": Path("/proc/loadavg").read_text().split()[:3], "arms": []}
-    receipt["arms"].append(run_arm("candidate", args.bin.resolve(), args.out))
+    schedule = [("candidate", args.bin.resolve())]
     if args.control_bin:
-        receipt["arms"].append(run_arm("control", args.control_bin.resolve(), args.out))
+        schedule.append(("control", args.control_bin.resolve()))
+    if args.control_first:
+        schedule.reverse()
+    receipt["arm_order"] = [name for name, _ in schedule]
+    for name, binary in schedule:
+        receipt["arms"].append(run_arm(name, binary, args.out,
+                                        archive_contention=args.archive_contention))
     receipt["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     receipt["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
-    receipt["candidate_verdict"] = receipt["arms"][0]["verdict"]
+    receipt["candidate_verdict"] = next(arm["verdict"] for arm in receipt["arms"]
+                                          if arm["arm"] == "candidate")
     (args.out / "release_smoke_receipt.json").write_text(json.dumps(receipt, indent=2))
     log(f"receipt: {args.out / 'release_smoke_receipt.json'}")
     for arm in receipt["arms"]:

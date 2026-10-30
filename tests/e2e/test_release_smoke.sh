@@ -23,6 +23,10 @@
 #        AM_RELEASE_SMOKE_CONVERGE_SECS (default and release maximum 300),
 #        AM_RELEASE_SMOKE_SWARM_AGENTS (default and release minimum 60; 0 skips),
 #        AM_RELEASE_SMOKE_SWARM_SECS (default and release minimum 480).
+#        AM_RELEASE_SMOKE_ARCHIVE_CONTENTION=1 adds a second full swarm with
+#        sparse recurring-thread conflicts interleaved across the 3 projects.
+#        AM_RELEASE_SMOKE_CONTROL_FIRST=1 reverses the A/B order; use with a
+#        control binary and alternate across retained comparison invocations.
 # A shorter soak, a smaller or shorter swarm, or a looser convergence bound
 # can run for development but yields NO_VERDICT, never PASS.
 
@@ -49,6 +53,12 @@ fi
 CONTROL_ARGS=()
 if [ -n "${AM_RELEASE_SMOKE_CONTROL_BIN:-}" ]; then
     CONTROL_ARGS=(--control-bin "${AM_RELEASE_SMOKE_CONTROL_BIN}")
+fi
+if [ "${AM_RELEASE_SMOKE_CONTROL_FIRST:-0}" = "1" ]; then
+    CONTROL_ARGS+=(--control-first)
+fi
+if [ "${AM_RELEASE_SMOKE_ARCHIVE_CONTENTION:-0}" = "1" ]; then
+    CONTROL_ARGS+=(--archive-contention)
 fi
 e2e_log "candidate: ${CANDIDATE}"
 e2e_log "control:   ${AM_RELEASE_SMOKE_CONTROL_BIN:-<none>}"

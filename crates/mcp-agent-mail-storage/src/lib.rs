@@ -7030,172 +7030,248 @@ fn coalescer_commit_spilled_work(
     }
 }
 
-/// Commit a batch of requests targeting the same repository.
+/// Pure grouping policy, independent of Git, runtime and queue ownership.
+mod coalescer_batch_groups {
+    use std::collections::HashSet;
+    use std::ops::Range;
+
+    /// Keep request order while merging only disjoint paths from one author.
+    /// A conflict ends the current group, not batching for the entire drain.
+    /// Paths are borrowed; grouping never clones or rewrites queued requests.
+    pub(super) fn contiguous_ranges<'a>(
+        requests: impl IntoIterator<Item = (&'a str, &'a str, &'a [String])>,
+        max_batch_size: usize,
+    ) -> Vec<Range<usize>> {
+        let max_batch_size = max_batch_size.max(1);
+        let mut ranges = Vec::new();
+        let mut paths = HashSet::new();
+        let mut author = None;
+        let mut start = 0;
+        let mut end = 0;
+        for (index, (name, email, request_paths)) in requests.into_iter().enumerate() {
+            if index > start
+                && (index - start >= max_batch_size
+                    || author != Some((name, email))
+                    || request_paths
+                        .iter()
+                        .any(|path| paths.contains(path.as_str())))
+            {
+                ranges.push(start..index);
+                paths.clear();
+                start = index;
+            }
+            author = Some((name, email));
+            paths.extend(request_paths.iter().map(String::as_str));
+            end = index + 1;
+        }
+        if start < end {
+            ranges.push(start..end);
+        }
+        ranges
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::contiguous_ranges;
+
+        fn paths(names: &[&str]) -> Vec<String> {
+            names.iter().map(|name| (*name).to_string()).collect()
+        }
+
+        #[test]
+        fn sparse_conflict_keeps_unrelated_requests_batched_in_order() {
+            let mut requests = (0..32)
+                .map(|index| vec![format!("projects/p{}/message-{index}.md", index % 3)])
+                .collect::<Vec<_>>();
+            requests[0].push("projects/p0/threads/shared.md".to_string());
+            requests[16].push("projects/p0/threads/shared.md".to_string());
+
+            assert_eq!(
+                contiguous_ranges(
+                    requests
+                        .iter()
+                        .map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    32,
+                ),
+                vec![0..16, 16..32],
+            );
+        }
+
+        #[test]
+        fn repeated_mutable_path_keeps_every_commit_boundary() {
+            let shared = paths(&["threads/shared.md"]);
+            assert_eq!(
+                contiguous_ranges(
+                    (0..32).map(|_| ("Test", "test@example.com", shared.as_slice())),
+                    32
+                ),
+                (0..32).map(|index| index..index + 1).collect::<Vec<_>>(),
+            );
+        }
+
+        #[test]
+        fn size_bound_splits_disjoint_requests_without_reordering() {
+            let requests = (0..7)
+                .map(|index| vec![format!("{index}.md")])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                contiguous_ranges(
+                    requests
+                        .iter()
+                        .map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    3,
+                ),
+                vec![0..3, 3..6, 6..7],
+            );
+            assert_eq!(
+                contiguous_ranges(
+                    requests
+                        .iter()
+                        .map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    0,
+                ),
+                (0..7).map(|index| index..index + 1).collect::<Vec<_>>(),
+            );
+        }
+
+        #[test]
+        fn author_name_and_email_changes_each_end_a_group() {
+            let a = paths(&["a.md"]);
+            let b = paths(&["b.md"]);
+            let c = paths(&["c.md"]);
+            let d = paths(&["d.md"]);
+            assert_eq!(
+                contiguous_ranges(
+                    [
+                        ("First", "same@example.com", a.as_slice()),
+                        ("Second", "same@example.com", b.as_slice()),
+                        ("Second", "other@example.com", c.as_slice()),
+                        ("Second", "other@example.com", d.as_slice()),
+                    ],
+                    32,
+                ),
+                vec![0..1, 1..2, 2..4],
+            );
+        }
+
+        #[test]
+        fn duplicate_paths_within_one_request_do_not_block_disjoint_neighbors() {
+            let a = paths(&["a.md", "a.md"]);
+            let b = paths(&["b.md"]);
+            let c = paths(&["a.md"]);
+            assert_eq!(
+                contiguous_ranges(
+                    [&a, &b, &c].map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    32,
+                ),
+                vec![0..2, 2..3],
+            );
+        }
+
+        #[test]
+        fn empty_input_has_no_commit_group() {
+            assert!(contiguous_ranges(std::iter::empty(), 32).is_empty());
+        }
+    }
+}
+
+/// Commit one nonempty, same-author group whose requests have disjoint paths.
+fn coalescer_commit_group(repo_root: &Path, requests: &[CoalescerCommitFields]) -> Result<()> {
+    let first = &requests[0];
+    let config = Config {
+        git_author_name: first.git_author_name.clone(),
+        git_author_email: first.git_author_email.clone(),
+        ..Config::default()
+    };
+    if requests.len() == 1 {
+        return coalescer_commit_with_retry(repo_root, &config, &first.message, &first.rel_paths);
+    }
+
+    let merged_paths = requests
+        .iter()
+        .flat_map(|request| request.rel_paths.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut combined_msg = coalescer_batch_commit_message(requests);
+    combined_msg.push_str("\n\n");
+    for (index, request) in requests.iter().enumerate() {
+        if index > 0 {
+            combined_msg.push('\n');
+        }
+        combined_msg.push_str("- ");
+        combined_msg.push_str(request.message.lines().next().unwrap_or(""));
+    }
+    coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
+}
+
+/// Commit a repository batch as ordered, bounded, conflict-free groups.
 ///
-/// Merges non-conflicting paths into a single commit. Falls back to
-/// sequential commits if paths conflict (same file modified by multiple requests).
+/// Conflicting paths retain separate commit boundaries. A repeated thread
+/// digest must not force unrelated projects' requests into individual commits,
+/// each of which holds the publication fence during blob/tree/ref writes.
 fn coalescer_commit_batch(
     repo_root: &Path,
     requests: &[CoalescerCommitFields],
     stats: &Arc<Mutex<CommitQueueStats>>,
     batch_sizes: &Arc<Mutex<VecDeque<usize>>>,
 ) -> CoalescerCommitOutcome {
-    if requests.is_empty() {
-        return CoalescerCommitOutcome {
-            committed_requests: 0,
-            committed_commits: 0,
-            failed_requests: Vec::new(),
-        };
+    let groups = coalescer_batch_groups::contiguous_ranges(
+        requests.iter().map(|request| {
+            (
+                request.git_author_name.as_str(),
+                request.git_author_email.as_str(),
+                request.rel_paths.as_slice(),
+            )
+        }),
+        configured_coalescer_batch_size(),
+    );
+    let mut committed_requests = 0;
+    let mut successful_sizes = Vec::with_capacity(groups.len());
+    let mut failed_commits = 0;
+    let mut failed_requests = Vec::new();
+    for range in groups {
+        let group = &requests[range];
+        match coalescer_commit_group(repo_root, group) {
+            Ok(()) => {
+                committed_requests += group.len();
+                successful_sizes.push(group.len());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    requests = group.len(),
+                    error = %error,
+                    "[commit-coalescer] commit group failed; retaining requests for retry"
+                );
+                failed_commits += 1;
+                // Keep original enqueue instants and order. The worker owns
+                // requeueing and progress accounting, exactly as before.
+                failed_requests.extend_from_slice(group);
+            }
+        }
     }
-
-    // Use the first request's author info
-    let author_name = &requests[0].git_author_name;
-    let author_email = &requests[0].git_author_email;
-    let config = Config {
-        git_author_name: author_name.clone(),
-        git_author_email: author_email.clone(),
-        ..Config::default()
-    };
-
-    // Check for path conflicts
-    let mut all_paths = HashSet::new();
-    let mut can_merge = true;
-    for req in requests {
-        for p in &req.rel_paths {
-            if !all_paths.insert(p.clone()) {
-                can_merge = false;
-                break;
-            }
-        }
-        if !can_merge {
-            break;
+    if !requests.is_empty() {
+        mcp_agent_mail_core::global_metrics()
+            .storage
+            .commit_errors_total
+            .add(u64::try_from(failed_commits).unwrap_or(u64::MAX));
+        let mut stats = stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.commits += successful_sizes.len();
+        stats.batched += committed_requests;
+        stats.errors += failed_commits;
+        let mut sizes = batch_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Groups need not have equal sizes: record their actual samples,
+        // rather than an integer mean that loses partial-batch information.
+        for &size in &successful_sizes {
+            record_batch_size_samples(&mut stats, &mut sizes, size, 1);
         }
     }
-
-    // Keep batch commits bounded to avoid enormous commits under load.
-    let commit_result = if requests.len() == 1 {
-        // Single request - commit directly.
-        coalescer_commit_with_retry(
-            repo_root,
-            &config,
-            &requests[0].message,
-            &requests[0].rel_paths,
-        )
-        .map(|()| (1, 1))
-    } else if can_merge && requests.len() <= configured_coalescer_batch_size() {
-        // Merge all into a single commit
-        let merged_paths: Vec<String> = requests
-            .iter()
-            .flat_map(|r| r.rel_paths.iter().cloned())
-            .collect();
-
-        let summary_lines: Vec<String> = requests
-            .iter()
-            .map(|r| {
-                let first = r.message.lines().next().unwrap_or("");
-                format!("- {first}")
-            })
-            .collect();
-
-        let mut combined_msg = coalescer_batch_commit_message(requests);
-        if !summary_lines.is_empty() {
-            combined_msg.push_str("\n\n");
-            combined_msg.push_str(&summary_lines.join("\n"));
-        }
-
-        coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
-            .map(|()| (1, requests.len()))
-    } else {
-        // Path conflicts — commit sequentially
-        let mut total = 0;
-        let mut failed_requests = Vec::new();
-        for req in requests {
-            let r_config = Config {
-                git_author_name: req.git_author_name.clone(),
-                git_author_email: req.git_author_email.clone(),
-                ..Config::default()
-            };
-            match coalescer_commit_with_retry(repo_root, &r_config, &req.message, &req.rel_paths) {
-                Ok(()) => total += 1,
-                Err(e) => {
-                    tracing::warn!(
-                        "[commit-coalescer] sequential request commit failed: paths={} err={e}",
-                        req.rel_paths.len()
-                    );
-                    failed_requests.push(req.clone());
-                }
-            }
-        }
-        if failed_requests.is_empty() {
-            Ok((total, total))
-        } else {
-            let committed = requests.len().saturating_sub(failed_requests.len());
-            tracing::warn!(
-                "[commit-coalescer] partial failure in sequential batch: committed={committed} failed={} total={}",
-                failed_requests.len(),
-                requests.len()
-            );
-            mcp_agent_mail_core::global_metrics()
-                .storage
-                .commit_errors_total
-                .add(u64::try_from(failed_requests.len()).unwrap_or(u64::MAX));
-            let mut s = stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.commits += total;
-            s.batched += total;
-            s.errors += failed_requests.len();
-
-            let mut sizes = batch_sizes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            record_batch_size_samples(&mut s, &mut sizes, 1, total);
-
-            return CoalescerCommitOutcome {
-                committed_requests: u64::try_from(committed).unwrap_or(u64::MAX),
-                committed_commits: u64::try_from(committed).unwrap_or(u64::MAX),
-                failed_requests,
-            };
-        }
-    };
-
-    // Update stats
-    match commit_result {
-        Ok((num_commits, batched_items)) => {
-            let mut s = stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.commits += num_commits;
-            s.batched += batched_items;
-
-            let mut sizes = batch_sizes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(mean_batch_size) = batched_items.checked_div(num_commits) {
-                record_batch_size_samples(&mut s, &mut sizes, mean_batch_size, num_commits);
-            }
-            CoalescerCommitOutcome {
-                committed_requests: u64::try_from(batched_items).unwrap_or(u64::MAX),
-                committed_commits: u64::try_from(num_commits).unwrap_or(u64::MAX),
-                failed_requests: Vec::new(),
-            }
-        }
-        Err(e) => {
-            tracing::warn!("[commit-coalescer] batch commit error: {e}");
-            mcp_agent_mail_core::global_metrics()
-                .storage
-                .commit_errors_total
-                .inc();
-            let mut s = stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.errors += 1;
-            CoalescerCommitOutcome {
-                committed_requests: 0,
-                committed_commits: 0,
-                failed_requests: requests.to_vec(),
-            }
-        }
+    CoalescerCommitOutcome {
+        committed_requests: u64::try_from(committed_requests).unwrap_or(u64::MAX),
+        committed_commits: u64::try_from(successful_sizes.len()).unwrap_or(u64::MAX),
+        failed_requests,
     }
 }
 
@@ -28254,6 +28330,266 @@ mod tests {
         assert_eq!(stats.commits, 1);
         assert_eq!(stats.batched, 1);
         assert_eq!(stats.errors, 1);
+    }
+
+    fn coalescer_group_test_request(
+        message: String,
+        rel_paths: Vec<String>,
+    ) -> CoalescerCommitFields {
+        CoalescerCommitFields {
+            enqueued_at: Instant::now(),
+            enqueued_wall: Utc::now(),
+            git_author_name: "Test".to_string(),
+            git_author_email: "test@example.com".to_string(),
+            message,
+            rel_paths,
+        }
+    }
+
+    #[test]
+    fn coalescer_sparse_thread_conflict_commits_two_ordered_git_groups() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "32")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).expect("init repository");
+            let shared = "projects/p0/threads/shared.md";
+            fs::create_dir_all(tmp.path().join("projects/p0/threads")).unwrap();
+            fs::write(tmp.path().join(shared), "thread digest\n").unwrap();
+            let requests = (0..32)
+                .map(|index| {
+                    let path = format!("projects/p{}/message-{index}.md", index % 3);
+                    let target = tmp.path().join(&path);
+                    fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    fs::write(&target, format!("message {index}\n")).unwrap();
+                    let mut paths = vec![path];
+                    if index == 0 || index == 16 {
+                        paths.push(shared.to_string());
+                    }
+                    coalescer_group_test_request(format!("request {index}"), paths)
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 32);
+            assert_eq!(outcome.committed_commits, 2);
+            assert!(outcome.failed_requests.is_empty());
+            let newest = repo.head().unwrap().peel_to_commit().unwrap();
+            let first = newest.parent(0).expect("second group follows first");
+            assert_eq!(newest.parent_count(), 1);
+            assert_eq!(first.parent_count(), 0, "exactly two Git commits");
+            assert_eq!(newest.author().name(), Some("Test"));
+            assert_eq!(first.author().email(), Some("test@example.com"));
+            let first_tree = first.tree().unwrap();
+            let final_tree = newest.tree().unwrap();
+            for (index, request) in requests.iter().enumerate() {
+                let path = Path::new(&request.rel_paths[0]);
+                assert_eq!(first_tree.get_path(path).is_ok(), index < 16);
+                let blob = repo
+                    .find_blob(final_tree.get_path(path).unwrap().id())
+                    .unwrap();
+                assert_eq!(blob.content(), format!("message {index}\n").as_bytes());
+                let summary = format!("- request {index}");
+                assert_eq!(
+                    first.message().unwrap().lines().any(|line| line == summary),
+                    index < 16
+                );
+                assert_eq!(
+                    newest
+                        .message()
+                        .unwrap()
+                        .lines()
+                        .any(|line| line == summary),
+                    index >= 16
+                );
+            }
+            assert!(first_tree.get_path(Path::new(shared)).is_ok());
+            assert!(final_tree.get_path(Path::new(shared)).is_ok());
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.commits, 2);
+            assert_eq!(stats.batched, 32);
+            assert_eq!(stats.errors, 0);
+            assert_eq!(stats.batch_size_histogram, BTreeMap::from([(16, 2)]));
+            assert_eq!(stats.avg_batch_size, 16.0);
+        });
+    }
+
+    #[test]
+    fn coalescer_repeated_path_preserves_each_git_commit_boundary() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "32")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            fs::write(tmp.path().join("shared.md"), "latest shared contents\n").unwrap();
+            let requests = (0..4)
+                .map(|index| {
+                    let path = format!("message-{index}.md");
+                    fs::write(tmp.path().join(&path), format!("message {index}\n")).unwrap();
+                    coalescer_group_test_request(
+                        format!("request {index}"),
+                        vec!["shared.md".to_string(), path],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 4);
+            assert_eq!(outcome.committed_commits, 4);
+            assert!(outcome.failed_requests.is_empty());
+            let mut commit = repo.head().unwrap().peel_to_commit().unwrap();
+            for index in (0..4).rev() {
+                assert_eq!(commit.summary(), Some(format!("request {index}").as_str()));
+                let tree = commit.tree().unwrap();
+                for message in 0..4 {
+                    assert_eq!(
+                        tree.get_path(Path::new(&format!("message-{message}.md")))
+                            .is_ok(),
+                        message <= index,
+                    );
+                }
+                if index == 0 {
+                    assert_eq!(commit.parent_count(), 0);
+                } else {
+                    commit = commit.parent(0).unwrap();
+                }
+            }
+            assert_eq!(
+                stats.lock().unwrap().batch_size_histogram,
+                BTreeMap::from([(1, 4)])
+            );
+        });
+    }
+
+    #[test]
+    fn coalescer_group_failure_retains_exact_requests_and_queue_age() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "32")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            for path in ["shared.md", "a.md", "b.md", "c.md", "d.md", "e.md"] {
+                fs::write(tmp.path().join(path), format!("{path}\n")).unwrap();
+            }
+            let request_paths = [
+                vec!["shared.md", "a.md"],
+                vec!["b.md"],
+                vec!["shared.md", "../invalid.md"],
+                vec!["c.md"],
+                vec!["shared.md", "d.md"],
+                vec!["e.md"],
+            ];
+            let requests = request_paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, paths)| {
+                    coalescer_group_test_request(
+                        format!("request {index}"),
+                        paths.into_iter().map(str::to_string).collect(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 4);
+            assert_eq!(outcome.committed_commits, 2);
+            assert_eq!(outcome.failed_requests.len(), 2);
+            for (failed, original) in outcome.failed_requests.iter().zip(&requests[2..4]) {
+                assert_eq!(failed.message, original.message);
+                assert_eq!(failed.rel_paths, original.rel_paths);
+                assert_eq!(failed.enqueued_at, original.enqueued_at);
+                assert_eq!(failed.enqueued_wall, original.enqueued_wall);
+            }
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for path in ["shared.md", "a.md", "b.md", "d.md", "e.md"] {
+                assert!(tree.get_path(Path::new(path)).is_ok());
+            }
+            assert!(tree.get_path(Path::new("c.md")).is_err());
+            let rq = RepoQueue::default();
+            coalescer_requeue_requests(&rq, outcome.failed_requests);
+            assert_eq!(rq.depth.load(Ordering::Relaxed), 2);
+            let queue = rq.queue.lock().unwrap();
+            assert_eq!(queue[0].message, requests[2].message);
+            assert_eq!(queue[1].message, requests[3].message);
+            assert_eq!(queue[0].enqueued_at, requests[2].enqueued_at);
+            assert_eq!(queue[1].enqueued_at, requests[3].enqueued_at);
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.commits, 2);
+            assert_eq!(stats.batched, 4);
+            assert_eq!(
+                stats.errors, 1,
+                "one failed Git group, two retained requests"
+            );
+            assert_eq!(stats.batch_size_histogram, BTreeMap::from([(2, 2)]));
+        });
+    }
+
+    #[test]
+    fn coalescer_group_stats_record_unequal_sizes_and_author_boundaries() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "3")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            let requests = (0..7)
+                .map(|index| {
+                    let path = format!("message-{index}.md");
+                    fs::write(tmp.path().join(&path), format!("message {index}\n")).unwrap();
+                    let mut request =
+                        coalescer_group_test_request(format!("request {index}"), vec![path]);
+                    if index >= 5 {
+                        request.git_author_name = "Other".to_string();
+                        request.git_author_email = "other@example.com".to_string();
+                    }
+                    request
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 7);
+            assert_eq!(outcome.committed_commits, 3);
+            assert!(outcome.failed_requests.is_empty());
+            let newest = repo.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(newest.author().name(), Some("Other"));
+            assert_eq!(newest.author().email(), Some("other@example.com"));
+            let middle = newest.parent(0).unwrap();
+            let first = middle.parent(0).unwrap();
+            assert_eq!(middle.author().name(), Some("Test"));
+            assert_eq!(first.author().name(), Some("Test"));
+            assert_eq!(first.parent_count(), 0);
+            assert!(
+                first
+                    .tree()
+                    .unwrap()
+                    .get_path(Path::new("message-3.md"))
+                    .is_err()
+            );
+            assert!(
+                middle
+                    .tree()
+                    .unwrap()
+                    .get_path(Path::new("message-4.md"))
+                    .is_ok()
+            );
+            assert!(
+                middle
+                    .tree()
+                    .unwrap()
+                    .get_path(Path::new("message-5.md"))
+                    .is_err()
+            );
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.commits, 3);
+            assert_eq!(stats.batched, 7);
+            assert_eq!(stats.errors, 0);
+            assert_eq!(stats.batch_size_histogram, BTreeMap::from([(2, 2), (3, 1)]));
+            assert_eq!(stats.avg_batch_size, 2.33);
+            assert_eq!(*batch_sizes.lock().unwrap(), VecDeque::from([3, 2, 2]));
+        });
     }
 
     #[test]

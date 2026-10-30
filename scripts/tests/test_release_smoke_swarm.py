@@ -132,6 +132,61 @@ class KnobTests(unittest.TestCase):
         self.assertIn('cannot_pass', extra)
 
 
+class ContentionWorkloadTests(unittest.TestCase):
+    def test_original_shared_thread_schedule_is_unchanged(self):
+        for sampled in range(1, 51):
+            self.assertEqual(smoke.swarm_thread_id(17, 23, sampled, False), f'swarm-{sampled}')
+
+    def test_sparse_conflicts_mix_repeated_and_unique_paths_in_every_project(self):
+        projects = [set() for _ in range(smoke.SWARM_PROJECTS)]
+        shared = [0] * smoke.SWARM_PROJECTS
+        unique = set()
+        for agent in range(smoke.RELEASE_MIN_SWARM_AGENTS):
+            for sequence in range(32):
+                thread = smoke.swarm_thread_id(agent, sequence, 1, True)
+                project = agent % smoke.SWARM_PROJECTS
+                projects[project].add(thread)
+                if thread == 'swarm-contention-shared':
+                    shared[project] += 1
+                else:
+                    self.assertNotIn(thread, unique)
+                    unique.add(thread)
+        self.assertTrue(all(count >= 2 for count in shared))
+        self.assertTrue(all(len(threads) > 1 for threads in projects))
+        self.assertEqual(len(unique) + sum(shared), smoke.RELEASE_MIN_SWARM_AGENTS * 32)
+
+    def test_skipped_contention_phase_cannot_pass(self):
+        with patch.object(smoke, 'SWARM_AGENTS', 0):
+            checks = []
+            extra = smoke.phase_archive_contention(None, {}, checks)
+        self.assertEqual(smoke.verdict(checks), 'NO_VERDICT')
+        self.assertEqual(extra['thread_workload'], 'sparse_conflicts')
+        self.assertIn('cannot_pass', extra)
+
+    def test_control_first_never_uses_control_verdict_as_candidate_verdict(self):
+        # This qualifies harness judgement only; no fake server verdict is
+        # evidence for Agent Mail. Keep a real receipt so the order is auditable.
+        for candidate_verdict, control_verdict, expected_rc in [('FAIL', 'PASS', 1),
+                                                                ('PASS', 'FAIL', 0)]:
+            root = Path(tempfile.mkdtemp(prefix='am-release-arm-order-'))
+            calls = []
+
+            def run_arm(name, binary, out, *, archive_contention=False):
+                calls.append((name, archive_contention))
+                return {'arm': name, 'phases': {},
+                        'verdict': candidate_verdict if name == 'candidate' else control_verdict}
+
+            argv = ['release_smoke.py', '--bin', sys.executable, '--control-bin', sys.executable,
+                    '--control-first', '--archive-contention', '--out', str(root)]
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'run_arm', run_arm), \
+                    patch.object(smoke, 'log'):
+                self.assertEqual(smoke.main(), expected_rc)
+            receipt = json.loads((root / 'release_smoke_receipt.json').read_text())
+            self.assertEqual(calls, [('control', True), ('candidate', True)])
+            self.assertEqual(receipt['arm_order'], ['control', 'candidate'])
+            self.assertEqual(receipt['candidate_verdict'], candidate_verdict)
+
+
 class ArchiveParityTests(unittest.TestCase):
     def setUp(self):
         # Retain evidence; never delete even private fixture files (AGENTS.md).
