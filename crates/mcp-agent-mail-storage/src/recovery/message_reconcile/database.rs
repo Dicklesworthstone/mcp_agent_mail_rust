@@ -809,16 +809,28 @@ fn reconcile_prepared_inner(
             Err(error) => return Err(error),
         }
     }
-    // Admit before ensure_archive: even creating a missing archive must not
-    // wait behind an unrelated publisher while retaining the DB source lease.
-    // Keep mutable metadata collection in one native mutation window. Bundle
-    // repair revalidates the captured bytes before publishing, so release this
-    // window before its immutable Git-history proof: scanning old messages must
-    // not exclude unrelated live archive writers.
-    let metadata_mutation = control
-        .map(|control| control.begin_at(&config.storage_root))
-        .transpose()?;
-    let archive = crate::ensure_archive(config, &prepared.project_slug)?;
+    // A warm archive needs only read-only metadata selection here. Its
+    // surviving files, pinned Git objects and private index snapshot carry no
+    // publication authority: the bundle path revalidates all destinations and
+    // identities under the final native fence and project lock. Do not make
+    // every repair win a separate fence window just to read that metadata.
+    // A cold archive still needs guarded creation/configuration. Reuse the
+    // existing initialization predicate, including per-process migrations,
+    // and preserve the test-harness refusal on the warm path as well.
+    let archive = match crate::open_archive(config, &prepared.project_slug)? {
+        Some(archive) if crate::repo_cache_contains(&archive.repo_root) => {
+            crate::refuse_default_storage_root_under_test_harness(&archive.repo_root)?;
+            archive
+        }
+        _ => {
+            // Never wait for creation behind an unrelated publisher while
+            // retaining the database source lease.
+            let _initialization = control
+                .map(|control| control.begin_at(&config.storage_root))
+                .transpose()?;
+            crate::ensure_archive(config, &prepared.project_slug)?
+        }
+    };
     let paths = crate::message_paths_for_bundle(
         &archive,
         &prepared.message,
@@ -928,7 +940,6 @@ fn reconcile_prepared_inner(
         recipients: &prepared.recipients,
         extra_paths: &[],
     };
-    drop(metadata_mutation);
     match control {
         Some(control) => super::reconcile_message_bundle_cancellable(
             control.cx,
@@ -2001,6 +2012,61 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_project_directory_cannot_bypass_cold_repository_admission() {
+        if super::super::cancellable_tests::isolated() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let original = prepared();
+        // The directory alone is not proof that repository initialization and
+        // per-process configuration have completed.
+        let project = temp.path().join("projects").join(&original.project_slug);
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(
+            crate::open_archive(&config, &original.project_slug)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!crate::repo_cache_contains(&config.storage_root));
+        let epoch = crate::archive_mutation_epoch();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            crate::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(20))
+            })
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let cx = Cx::for_testing();
+        let stop = AtomicBool::new(false);
+        let result = reconcile_prepared_inner(
+            &config,
+            &original,
+            Some(RepairControl {
+                cx: &cx,
+                stop: &stop,
+            }),
+            true,
+        );
+        let initialized = temp.path().join(".git").exists();
+        let unchanged_epoch = crate::archive_mutation_epoch() == epoch;
+        let _ = release_tx.send(());
+        assert!(owner.join().unwrap().is_ok());
+        let error = result.unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert!(error.detail.contains("publication fence busy"), "{error:?}");
+        assert!(!initialized && unchanged_epoch);
+        assert!(!crate::repo_cache_contains(&config.storage_root));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn prepared_repair_releases_metadata_fence_and_rechecks_surviving_reply() {
         use super::super::cancellable_tests::{ObserveScan, isolated};
@@ -2049,10 +2115,38 @@ mod tests {
             let survivor = paths.inbox[0].clone();
             let visited = std::sync::Arc::new(AtomicBool::new(false));
             let hook_visited = visited.clone();
+            let metadata_read_while_busy = std::sync::Arc::new(AtomicBool::new(false));
+            let hook_metadata_read_while_busy = metadata_read_while_busy.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (released_tx, released_rx) = std::sync::mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                let result = crate::with_archive_snapshot_publication_fence(|| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv_timeout(std::time::Duration::from_secs(30))
+                });
+                let _ = released_tx.send(());
+                result
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let release_for_hook = release_tx.clone();
             let observer = ObserveScan::new(move |stage| {
                 if stage != "git blob" || hook_visited.swap(true, Ordering::AcqRel) {
                     return;
                 }
+                // This scan follows real surviving-metadata selection. A
+                // preliminary try-fence would have refused before reaching
+                // it; the final publication still needs its own admission.
+                hook_metadata_read_while_busy.store(
+                    crate::archive_publication_fence_holder().is_some(),
+                    Ordering::Release,
+                );
+                release_for_hook.send(()).unwrap();
+                released_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
                 let op = op.clone();
                 let result = std::thread::spawn(move || crate::write_op_sync_direct(&op))
                     .join()
@@ -2078,7 +2172,13 @@ mod tests {
                 true,
             );
             drop(observer);
+            // Release and reap even if an older implementation refused before
+            // the observer, so a causal failure leaves no publisher behind.
+            let _ = release_tx.send(());
+            let owner_released = owner.join().unwrap();
+            assert!(owner_released.is_ok(), "waited for the owner's timeout");
             assert!(visited.load(Ordering::Acquire));
+            assert!(metadata_read_while_busy.load(Ordering::Acquire));
             let reservation: Value = serde_json::from_slice(
                 &fs::read(other.root.join("file_reservations/id-1.json")).unwrap(),
             )
