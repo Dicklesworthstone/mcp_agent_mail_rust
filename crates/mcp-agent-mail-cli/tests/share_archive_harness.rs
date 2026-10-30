@@ -1619,7 +1619,7 @@ fn archive_save_diagnostics_cli_reports_phases_counters_and_preserves_scrub_sema
             let entry = zip.by_index(index).unwrap();
             assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
             zip_bytes += entry.size();
-            if entry.name().starts_with("storage_repo/") {
+            if entry.name().unwrap().starts_with("storage_repo/") {
                 storage_files += 1;
                 storage_bytes += entry.size();
             }

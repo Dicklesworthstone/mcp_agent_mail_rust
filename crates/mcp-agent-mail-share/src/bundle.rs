@@ -2975,7 +2975,14 @@ mod tests {
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .unwrap()
+                    .name()
+                    .unwrap()
+                    .into_owned()
+            })
             .collect();
 
         assert_eq!(names, vec!["a.txt", "nested/b.txt"]);

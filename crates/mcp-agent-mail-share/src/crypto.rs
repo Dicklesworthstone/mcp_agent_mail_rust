@@ -1694,7 +1694,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(file).unwrap();
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).unwrap();
-            let output = output_dir.join(entry.name());
+            let output = output_dir.join(&*entry.name().unwrap());
             if entry.is_dir() {
                 std::fs::create_dir_all(&output).unwrap();
                 continue;

@@ -24646,7 +24646,11 @@ fn extract_zip(archive_data: &[u8], dest_dir: &Path) -> Result<(), String> {
         let Some(enclosed_name) = file.enclosed_name() else {
             continue;
         };
-        let name = file.name().to_string(); // Keep original name for executable checks
+        // Keep original name for executable checks
+        let name = file
+            .name()
+            .map_err(|e| format!("zip entry name error: {e}"))?
+            .into_owned();
         let outpath = dest_dir.join(enclosed_name);
         if file.is_dir() {
             std::fs::create_dir_all(&outpath)
@@ -57443,7 +57447,7 @@ http_headers = { Authorization = "Bearer secret" }
 
             for i in 0..base_zip.len() {
                 let mut entry = base_zip.by_index(i).unwrap();
-                let name = entry.name().to_string();
+                let name = entry.name().unwrap().into_owned();
                 let mut bytes = Vec::new();
                 entry.read_to_end(&mut bytes).unwrap();
 
@@ -58125,7 +58129,7 @@ http_headers = { Authorization = "Bearer secret" }
         }
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
         for index in 0..zip.len() {
-            let name = zip.by_index(index).unwrap().name().to_string();
+            let name = zip.by_index(index).unwrap().name().unwrap().into_owned();
             assert!(!name.contains(".snapshot-namespace."));
             assert!(!name.contains("mailbox-archive-"));
         }
@@ -58348,7 +58352,7 @@ http_headers = { Authorization = "Bearer secret" }
         let mut zip = zip::ZipArchive::new(file).unwrap();
         let mut names = Vec::new();
         for i in 0..zip.len() {
-            names.push(zip.by_index(i).unwrap().name().to_string());
+            names.push(zip.by_index(i).unwrap().name().unwrap().into_owned());
         }
 
         assert!(
@@ -89649,7 +89653,10 @@ fn verify_saved_archive(
             .map_err(|error| CliError::Other(format!("archive verification failed: {error}")))?;
         // CRC covers member payloads, not central-directory names or sizes.
         // Compare the exact inventory before accepting a verified archive.
-        if member.name() != expected_name {
+        let member_name = member
+            .name()
+            .map_err(|error| CliError::Other(format!("archive verification failed: {error}")))?;
+        if member_name != expected_name {
             return Err(CliError::Other(format!(
                 "archive verification found a member name mismatch at index {index}"
             )));
@@ -89660,8 +89667,7 @@ fn verify_saved_archive(
                 "archive verification found a member size mismatch at index {index}"
             )));
         }
-        let recovery = member
-            .name()
+        let recovery = member_name
             .strip_prefix("storage_repo/")
             .is_some_and(|relative| {
                 archive_recovery_relative_path_is_excluded(Path::new(relative))
@@ -91305,7 +91311,9 @@ fn archive_restore_state<G>(
     let mut has_storage = false;
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i)
-            && file.name().starts_with(&prefix_string)
+            && file
+                .name()
+                .is_ok_and(|name| name.starts_with(&prefix_string))
         {
             has_storage = true;
             break;
