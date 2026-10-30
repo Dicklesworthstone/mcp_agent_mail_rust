@@ -6470,6 +6470,15 @@ struct FrozenDirectoryAuthority {
     latched_suffix_dirs: Mutex<Vec<(u64, u64)>>,
 }
 
+/// The `(st_dev, st_ino)` identity that frozen directory authorities record and compare.
+// stat field widths differ across Unix targets (macOS st_dev is i32); std's
+// dev() widens with the same `as u64`, so both sides compare alike.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+const fn stat_dir_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
+}
+
 impl FrozenDirectoryAuthority {
     #[must_use]
     fn existing_chain_ids(&self) -> Vec<(u64, u64)> {
@@ -6623,8 +6632,7 @@ impl FrozenDirectoryAuthority {
                 ),
             })?;
             let mut anchor_dir = std::fs::File::from(root_fd);
-            let mut ancestor_chain =
-                vec![(PathBuf::from("/"), (root_stat.st_dev, root_stat.st_ino))];
+            let mut ancestor_chain = vec![(PathBuf::from("/"), stat_dir_identity(&root_stat))];
             let mut unresolved_suffix = Vec::new();
             let mut current_path = PathBuf::from("/");
 
@@ -6667,10 +6675,8 @@ impl FrozenDirectoryAuthority {
                                         }
                                     })?;
                                 anchor_dir = resolved_file;
-                                ancestor_chain.push((
-                                    resolved.clone(),
-                                    (resolved_stat.st_dev, resolved_stat.st_ino),
-                                ));
+                                ancestor_chain
+                                    .push((resolved.clone(), stat_dir_identity(&resolved_stat)));
                                 current_path = resolved;
                                 continue;
                             }
@@ -6726,8 +6732,7 @@ impl FrozenDirectoryAuthority {
                             });
                         }
                         anchor_dir = std::fs::File::from(next_fd);
-                        ancestor_chain
-                            .push((current_path.clone(), (next_stat.st_dev, next_stat.st_ino)));
+                        ancestor_chain.push((current_path.clone(), stat_dir_identity(&next_stat)));
                     }
                     Err(rustix::io::Errno::NOENT) => {
                         missing_started = true;
@@ -6817,7 +6822,7 @@ impl FrozenDirectoryAuthority {
             ))
         })?;
         if let Some((_, expected_root)) = self.ancestor_chain.first()
-            && (root_stat.st_dev, root_stat.st_ino) != *expected_root
+            && stat_dir_identity(&root_stat) != *expected_root
         {
             return Err(SqlError::Custom(format!(
                 "{context}: root directory identity changed while verifying {} authority {}; refusing to cross {} authority",
@@ -6900,7 +6905,7 @@ impl FrozenDirectoryAuthority {
                     self.authority_name
                 ))
             })?;
-            if (walk_stat.st_dev, walk_stat.st_ino) != *expected_id {
+            if stat_dir_identity(&walk_stat) != *expected_id {
                 return Err(SqlError::Custom(format!(
                     "{context}: frozen {} ancestor {} was replaced with a different directory inode; refusing to cross {} authority",
                     self.authority_name,
@@ -7008,7 +7013,7 @@ impl FrozenDirectoryAuthority {
                             self.authority_name
                         )));
                     }
-                    let observed_id = (next_stat.st_dev, next_stat.st_ino);
+                    let observed_id = stat_dir_identity(&next_stat);
                     if let Some(expected_id) = latched.get(idx).copied() {
                         if observed_id != expected_id {
                             return Err(SqlError::Custom(format!(
