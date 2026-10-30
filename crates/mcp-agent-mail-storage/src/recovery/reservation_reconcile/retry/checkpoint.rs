@@ -304,6 +304,13 @@ fn check_sidecar(path: &Path) -> io::Result<()> {
                     return Err(invalid("checkpoint path has multiple hard links"));
                 }
             }
+            #[cfg(windows)]
+            {
+                let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+                if mcp_agent_mail_core::disk::windows_file_link_count(&file)? != 1 {
+                    return Err(invalid("checkpoint path has multiple hard links"));
+                }
+            }
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1124,6 +1131,30 @@ mod tests {
         assert!(store.save(&debt(Instant::now())).is_err());
         assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
         assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardlinked_checkpoint_and_lock_paths_fail_closed() {
+        for is_lock in [false, true] {
+            let (temp, binding) = binding_fixture();
+            let checkpoint = binding.path().unwrap();
+            let lock = checkpoint.with_extension("json.lock");
+            let unsafe_path = if is_lock { &lock } else { &checkpoint };
+            let evidence = temp.path().join(if is_lock {
+                "lock-evidence"
+            } else {
+                "checkpoint-evidence"
+            });
+            std::fs::write(&evidence, b"preserve me").unwrap();
+            std::fs::hard_link(&evidence, unsafe_path).unwrap();
+
+            let error = Store::open(binding).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            assert!(error.to_string().contains("multiple hard links"), "{error}");
+            assert_eq!(std::fs::read(&evidence).unwrap(), b"preserve me");
+            assert_eq!(std::fs::read(unsafe_path).unwrap(), b"preserve me");
+        }
     }
 
     #[cfg(any(unix, windows))]
