@@ -4424,13 +4424,11 @@ impl AtcEngine {
         if !exclusive || paths.is_empty() {
             return;
         }
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
         let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
     pub(crate) fn note_reservation_released(
@@ -4452,13 +4450,11 @@ impl AtcEngine {
             paths: paths.to_vec(),
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
     pub(crate) fn note_reservation_renewed(
@@ -4481,13 +4477,11 @@ impl AtcEngine {
             timestamp_micros,
         });
         if !paths.is_empty() {
-            let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+            let Some(graph) = self.conflict_graphs.get_mut(project) else {
+                return;
+            };
             let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
-            if cleared > 0 {
-                self.dirty_projects.insert(project.to_string());
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-            }
+            self.finish_conflict_resolution(project, cleared, timestamp_micros);
         }
     }
 
@@ -4510,13 +4504,11 @@ impl AtcEngine {
             paths: paths.to_vec(),
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
     pub(crate) fn note_reservation_conflicts(
@@ -4555,6 +4547,34 @@ impl AtcEngine {
             self.dirty_projects.insert(project.to_string());
             self.session_summary
                 .absorb(&SynthesisEvent::ConflictDetected { timestamp_micros });
+        } else {
+            // Invalid/self-conflicts can leave a newly allocated graph empty.
+            self.finish_conflict_resolution(project, 0, timestamp_micros);
+        }
+    }
+
+    fn finish_conflict_resolution(&mut self, project: &str, cleared: usize, timestamp_micros: i64) {
+        if self
+            .conflict_graphs
+            .get(project)
+            .is_some_and(|graph| graph.hard_edges.is_empty())
+        {
+            // Project identities must live only as long as their conflicts.
+            // Keeping empty graphs also grows the deadlock cache and makes
+            // every future tick revisit all historical reservation projects.
+            self.conflict_graphs.remove(project);
+            self.dirty_projects.remove(project);
+            if let Some(cached) = self.deadlock_cache.remove(project) {
+                self.deadlock_cycle_total = self
+                    .deadlock_cycle_total
+                    .saturating_sub(cached.cycles.len());
+            }
+        } else if cleared > 0 {
+            self.dirty_projects.insert(project.to_string());
+        }
+        if cleared > 0 {
+            self.session_summary
+                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
         }
     }
 
@@ -4787,31 +4807,19 @@ impl AtcEngine {
                 .conflict_graphs
                 .get_mut(&project)
                 .map_or(0, |graph| graph.prune_stale_edges(cutoff));
-            if removed > 0 {
-                self.dirty_projects.insert(project);
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved {
-                        timestamp_micros: now_micros,
-                    });
-            }
+            self.finish_conflict_resolution(&project, removed, now_micros);
         }
     }
 
     fn prune_agent_from_conflict_graphs(&mut self, agent_name: &str) {
         let dirty_projects: Vec<String> = self.conflict_graphs.keys().cloned().collect();
+        let timestamp_micros = mcp_agent_mail_core::timestamps::now_micros();
         for project in dirty_projects {
             let removed = self
                 .conflict_graphs
                 .get_mut(&project)
                 .map_or(0, |graph| graph.remove_agent(agent_name));
-            if removed > 0 {
-                self.dirty_projects.insert(project);
-                // Also note conflict resolved so UI updates
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved {
-                        timestamp_micros: mcp_agent_mail_core::timestamps::now_micros(),
-                    });
-            }
+            self.finish_conflict_resolution(&project, removed, timestamp_micros);
         }
     }
 
@@ -6980,6 +6988,192 @@ mod engine_tests {
         assert_eq!(deadlocks[0].0, "test-project");
         assert_eq!(deadlocks[0].1.len(), 1);
         assert_eq!(deadlocks[0].1[0].len(), 2);
+    }
+
+    fn note_test_conflict_cycle(
+        engine: &mut AtcEngine,
+        project: &str,
+        first: &str,
+        second: &str,
+        timestamp_micros: i64,
+    ) {
+        for (requester, holder) in [(first, second), (second, first)] {
+            engine.note_reservation_conflicts(
+                requester,
+                project,
+                &[(
+                    holder.to_string(),
+                    "src/lib.rs".to_string(),
+                    "src/lib.rs".to_string(),
+                )],
+                timestamp_micros,
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_project_churn_retains_only_active_projects() {
+        let mut engine = AtcEngine::new_for_testing();
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", 1);
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        let paths = ["src/lib.rs".to_string()];
+
+        for index in 0_i64..4_096 {
+            let project = format!("completed-project-{index}");
+            let timestamp = index + 2;
+            match index % 5 {
+                0 => engine.note_reservation_granted("BlueFox", &paths, true, &project, timestamp),
+                1 => engine.note_reservation_released("BlueFox", &paths, &project, timestamp),
+                2 => engine.note_reservation_renewed("BlueFox", &paths, &project, timestamp),
+                3 => engine.note_reservation_force_released("BlueFox", &paths, &project, timestamp),
+                _ => engine.note_reservation_conflicts(
+                    "BlueFox",
+                    &project,
+                    &[("BlueFox".to_string(), paths[0].clone(), paths[0].clone())],
+                    timestamp,
+                ),
+            }
+        }
+
+        assert_eq!(engine.conflict_graphs.len(), 1);
+        assert!(engine.conflict_graphs.contains_key("active-project"));
+        assert_eq!(engine.deadlock_cache.len(), 1);
+        assert!(engine.dirty_projects.is_empty());
+        let deadlocks = engine.detect_deadlocks();
+        assert_eq!(deadlocks.len(), 1);
+        assert_eq!(deadlocks[0].0, "active-project");
+        assert_eq!(engine.deadlock_cycle_total, 1);
+    }
+
+    #[test]
+    fn conflict_project_resolution_retires_all_reservation_paths() {
+        for kind in [
+            ReservationEventKind::Granted,
+            ReservationEventKind::Renewed,
+            ReservationEventKind::Released,
+            ReservationEventKind::ForceReleased,
+        ] {
+            let mut engine = AtcEngine::new_for_testing();
+            for project in ["resolved-project", "active-project"] {
+                note_test_conflict_cycle(&mut engine, project, "BlueFox", "RedOwl", 1);
+            }
+            assert_eq!(engine.detect_deadlocks().len(), 2);
+            assert_eq!(engine.deadlock_cycle_total, 2);
+            let paths = ["src/lib.rs".to_string()];
+
+            for agent in ["BlueFox", "RedOwl"] {
+                match kind {
+                    ReservationEventKind::Granted => {
+                        engine.note_reservation_granted(agent, &paths, true, "resolved-project", 2)
+                    }
+                    ReservationEventKind::Renewed => {
+                        engine.note_reservation_renewed(agent, &paths, "resolved-project", 2)
+                    }
+                    ReservationEventKind::Released => {
+                        engine.note_reservation_released(agent, &paths, "resolved-project", 2)
+                    }
+                    ReservationEventKind::ForceReleased => {
+                        engine.note_reservation_force_released(agent, &paths, "resolved-project", 2)
+                    }
+                    ReservationEventKind::Conflicted => unreachable!("resolution paths only"),
+                }
+                if agent == "BlueFox" {
+                    assert_eq!(
+                        engine.conflict_graphs["resolved-project"].hard_edges.len(),
+                        1
+                    );
+                    assert!(engine.dirty_projects.contains("resolved-project"));
+                }
+            }
+
+            assert!(!engine.conflict_graphs.contains_key("resolved-project"));
+            assert!(!engine.deadlock_cache.contains_key("resolved-project"));
+            assert!(engine.dirty_projects.is_empty());
+            assert_eq!(engine.deadlock_cycle_total, 1);
+            let remaining = engine.detect_deadlocks();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].0, "active-project");
+
+            // A new graph restarts its generation. An old cache entry must not
+            // hide a new cycle when the same project encounters contention again.
+            note_test_conflict_cycle(&mut engine, "resolved-project", "BlueFox", "RedOwl", 3);
+            assert_eq!(engine.detect_deadlocks().len(), 2);
+            assert_eq!(engine.deadlock_cycle_total, 2);
+        }
+    }
+
+    #[test]
+    fn conflict_project_expiry_retires_cache_before_next_tick() {
+        let mut engine = AtcEngine::new_for_testing();
+        let now = engine.conflict_edge_ttl_micros() + 2;
+        note_test_conflict_cycle(&mut engine, "expired-project", "BlueFox", "RedOwl", 1);
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", now);
+        assert_eq!(engine.detect_deadlocks().len(), 2);
+
+        engine.prune_stale_conflicts(now);
+        assert!(!engine.conflict_graphs.contains_key("expired-project"));
+        assert!(!engine.deadlock_cache.contains_key("expired-project"));
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 1);
+        let report = engine.run_tick(now);
+        assert_eq!(report.summary.deadlock_cycles, 1);
+        assert!(report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("Deadlock in active-project")
+        )));
+        assert!(!report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("expired-project")
+        )));
+
+        let report = engine.run_tick(now + engine.conflict_edge_ttl_micros() + 1);
+        assert_eq!(report.summary.deadlock_cycles, 0);
+        assert!(engine.conflict_graphs.is_empty());
+        assert!(engine.deadlock_cache.is_empty());
+        assert!(engine.dirty_projects.is_empty());
+    }
+
+    #[test]
+    fn conflict_project_dead_agent_cleanup_preserves_other_cycles() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("DeadConflictHolder", "claude-code", Some("expired-project"));
+        // Keep this fixture independent of the process-global population prior.
+        engine.agents.get_mut("DeadConflictHolder").unwrap().rhythm = AgentRhythm::new(60.0);
+        for index in 0..10 {
+            engine.observe_activity("DeadConflictHolder", None, index * 60_000_000);
+        }
+        let entry = engine.agents.get_mut("DeadConflictHolder").unwrap();
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+        let now = 9 * 60_000_000 + 600_000_000;
+        note_test_conflict_cycle(
+            &mut engine,
+            "expired-project",
+            "DeadConflictHolder",
+            "BlockedAgent",
+            now - 1,
+        );
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", now - 1);
+        assert_eq!(engine.detect_deadlocks().len(), 2);
+
+        let evaluation = engine.evaluate_liveness(now);
+        assert!(evaluation.actions.iter().any(|(agent, action)| {
+            agent == "DeadConflictHolder" && *action == LivenessAction::ReleaseReservations
+        }));
+        assert!(!engine.conflict_graphs.contains_key("expired-project"));
+        assert!(!engine.deadlock_cache.contains_key("expired-project"));
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 1);
+        let remaining = engine.detect_deadlocks();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "active-project");
     }
 
     #[test]
