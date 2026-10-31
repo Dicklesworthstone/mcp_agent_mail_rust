@@ -1,9 +1,10 @@
-//! Reconstruct missing stable ACTIVE reservation artifacts without client traffic.
+//! Reconstruct missing or incompletely renewed ACTIVE reservation artifacts.
 //!
-//! Publication is create-only: ordinary reservation writers do not all take the
-//! project lock, so an active repair must never replace an existing file. A
-//! concurrent release/renewal wins the destination instead. Only generation-
-//! stamped stable paths are repaired; reusable digest aliases are never written.
+//! Missing files use create-only publication. An existing generation-stamped
+//! artifact can advance only its expiry, with matching owner, creation, intent
+//! and live database authority. Ordinary reservation writers and repair hold the
+//! same publication fence and project locks; a published terminal release or
+//! newer expiry always wins. Reusable digest aliases are never written.
 //! Transient failures retain bounded ID-only retry debt, independently of the
 //! finite discovery round. Retrying never restores a captured ACTIVE payload.
 
@@ -476,6 +477,10 @@ fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, Repa
 }
 
 fn validate_evidence(source: &Source, value: &Value) -> crate::Result<()> {
+    // Share ordinary writers' lifecycle checks, including the guard's
+    // agent_name/path aliases. The stricter checks below also require every
+    // canonical identity field before recovery can replace existing evidence.
+    crate::validate_reservation_publication_version(source.id, &source.artifact, value)?;
     for field in [
         "id",
         "project",
@@ -617,15 +622,35 @@ fn repair_one(
             validate_evidence(original, &artifact.value)?;
         }
         let bytes = if let Some(working) = &working {
-            // Existing files are never rewritten, even to extend an old expiry.
-            for field in ["expires_ts", "reason"] {
-                if working.value[field] != original.artifact[field] {
+            // An expiry is monotone; a reason or exclusivity change has no
+            // durable revision ordering. Restrict replacement to a lost renewal
+            // with the same intent, retaining every unknown surviving field.
+            if working.value["reason"] != original.artifact["reason"] {
+                return Err(invalid(
+                    "existing active reservation intent differs; renewal repair refused",
+                ));
+            }
+            if timestamp(&working.value["expires_ts"])
+                == timestamp(&original.artifact["expires_ts"])
+            {
+                working.bytes.clone()
+            } else {
+                // validate_evidence already proved that the surviving expiry
+                // is valid and strictly older than the live source. Unlike a
+                // commit-only retry, replacing an existing artifact also needs
+                // agreement from any surviving committed intent.
+                if committed
+                    .as_ref()
+                    .is_some_and(|a| a.value["reason"] != original.artifact["reason"])
+                {
                     return Err(invalid(
-                        "existing active artifact differs; create-only repair refused",
+                        "committed active reservation intent differs; renewal repair refused",
                     ));
                 }
+                let mut renewed = working.value.clone();
+                renewed["expires_ts"] = original.artifact["expires_ts"].clone();
+                serde_json::to_vec_pretty(&renewed)?
             }
-            working.bytes.clone()
         } else {
             let mut value = committed
                 .as_ref()
@@ -646,9 +671,28 @@ fn repair_one(
         if bytes.len() > ARTIFACT_BYTES {
             return Err(invalid("active reservation artifact exceeds byte bound"));
         }
-        if working.is_some() && committed.as_ref().is_some_and(|a| a.bytes == bytes) {
+        if working.as_ref().is_some_and(|a| a.bytes == bytes)
+            && committed.as_ref().is_some_and(|a| a.bytes == bytes)
+        {
             return Ok(false);
         }
+        let staged_renewal = if working.as_ref().is_some_and(|a| a.bytes != bytes) {
+            // All ordinary grant/renew/release writers converge on
+            // publish_reservation_writes, which takes this same fence, process
+            // mutex and .archive.lock before its renames. Stage within that
+            // ownership, then recheck the live source and exact destination
+            // after the potentially slow fsync. A cancelled or superseded
+            // candidate drops its private stage without publishing it.
+            checkpoint(cx, stop)?;
+            *attempted = true;
+            let staged = crate::StagedArchiveWrites::stage(vec![(path.clone(), bytes.clone())])?;
+            #[cfg(test)]
+            tests::after_renewal_stage(conn.as_ref().expect("retained source connection"), &path);
+            Some(staged)
+        } else {
+            None
+        };
+        checkpoint(cx, stop)?;
         if read_source_connection(
             conn.as_ref().expect("retained source connection"),
             original.id,
@@ -667,19 +711,27 @@ fn repair_one(
         // Publication needs the outer generation lease, not a pool slot.
         // Release capacity before filesystem syncs and Git commit work.
         drop(conn.take());
+        if read_artifact(&path)?.as_ref().map(|a| &a.bytes) != working.as_ref().map(|a| &a.bytes) {
+            return Err(invalid(
+                "active reservation artifact changed during verification; preserved",
+            ));
+        }
         checkpoint(cx, stop)?;
         *attempted = true;
-        if working.is_none() {
+        if let Some(staged) = staged_renewal {
+            staged.publish()?;
+            #[cfg(unix)]
+            fs::File::open(path.parent().expect("reservation parent"))?.sync_all()?;
+        } else if working.is_none() {
             publish_missing(&path, &bytes)?;
         }
-        // The commit helper reads the current file, not the captured ACTIVE
-        // payload. A racing terminal writer can therefore only supersede it;
-        // no stale active WriteOp is ever queued for a later overwrite.
+        // The commit helper reads the current file under the same project
+        // ownership. No captured ACTIVE WriteOp is queued for later overwrite.
         checkpoint(cx, stop)?;
         crate::commit_paths_with_retry(
             repo_root,
             config,
-            &format!("repair: missing active reservation {}", original.id),
+            &format!("repair: active reservation {} coverage", original.id),
             &[relative.as_str()],
         )?;
         let verified = Repository::open(repo_root)?;
@@ -818,8 +870,10 @@ fn select_ids(
     })
 }
 
-/// Repair missing generation-stamped stable artifacts for settled active leases.
-/// The pass never modifies database rows or overwrites an occupied destination.
+/// Repair missing artifacts and lost renewals for settled active leases.
+/// The pass never modifies database rows. Existing generation-stamped artifacts
+/// may only advance their expiry with matching identity and unchanged intent;
+/// terminal, newer, malformed or conflicting evidence remains untouched.
 /// Thirty-second-old grants are eligible; expired, released, unversioned and
 /// ambiguous sources remain untouched. Row selection and writes are bounded,
 /// but this is not a hard deadline on SQLite, Git or filesystem operations.
@@ -990,9 +1044,22 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    type RenewalStageHook = Box<dyn FnOnce(&DbConn, &Path)>;
+
     std::thread_local! {
         static CHECKOUT_PENDING: std::cell::RefCell<Option<mpsc::Sender<()>>> =
             const { std::cell::RefCell::new(None) };
+        static AFTER_RENEWAL_STAGE: std::cell::RefCell<Option<RenewalStageHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // Observe the actual fsynced candidate before its final source/destination
+    // checks. The hook changes real SQL/files; it never supplies a source read
+    // or replaces the archive publication result.
+    pub(super) fn after_renewal_stage(conn: &DbConn, path: &Path) {
+        if let Some(hook) = AFTER_RENEWAL_STAGE.with(|slot| slot.borrow_mut().take()) {
+            hook(conn, path);
+        }
     }
 
     // Observe a real blocked checkout without substituting its outcome.
@@ -1442,10 +1509,10 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_publication_is_committed_but_existing_expiry_is_never_rewritten() {
+    fn interrupted_publication_and_lost_renewal_both_converge_without_client_traffic() {
         fixture(|cx, pool, config| {
             let source = read_source(cx, pool, 401).unwrap().unwrap();
-            crate::ensure_archive(config, &source.slug).unwrap();
+            let archive = crate::ensure_archive(config, &source.slug).unwrap();
             let path = target(config);
             let mut value = source.artifact.clone();
             value["operator_note"] = json!("retain exact surviving formatting");
@@ -1459,9 +1526,341 @@ mod tests {
             )
             .unwrap();
             drop(conn);
+            let renewed = read_source(cx, pool, 401).unwrap().unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let before = repo.head().unwrap().target().unwrap();
             let report = pass(cx, pool, config);
-            assert_eq!((report.repaired, report.deferred), (0, 1));
-            assert_eq!(fs::read(path).unwrap(), bytes);
+            assert_eq!(
+                (report.attempted, report.repaired, report.deferred),
+                (1, 1, 0)
+            );
+            value["expires_ts"] = renewed.artifact["expires_ts"].clone();
+            let repaired = read_artifact(&path).unwrap().unwrap();
+            assert_eq!(repaired.value, value, "renewal changes only the expiry");
+            assert_ne!(repaired.bytes, bytes);
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), &relative)
+                    .unwrap()
+                    .unwrap()
+                    .bytes,
+                repaired.bytes,
+            );
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), renewed);
+            let repaired_head = repo.head().unwrap().target().unwrap();
+            assert_ne!(repaired_head, before);
+            let repeated = pass(cx, pool, config);
+            assert_eq!((repeated.unchanged, repeated.repaired), (1, 0));
+            assert_eq!(repo.head().unwrap().target().unwrap(), repaired_head);
+
+            // A renewed HEAD alone is not complete when the working artifact
+            // still has its pre-renewal bytes (for example after restoration).
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(pass(cx, pool, config).repaired, 1);
+            assert_eq!(fs::read(path).unwrap(), repaired.bytes);
+        });
+    }
+
+    fn seed_lost_renewal(cx: &Cx, pool: &DbPool, config: &Config) -> Source {
+        let source = read_source(cx, pool, 401).unwrap().unwrap();
+        let archive = crate::ensure_archive(config, &source.slug).unwrap();
+        let path = target(config);
+        publish_missing(&path, &serde_json::to_vec(&source.artifact).unwrap()).unwrap();
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+        crate::commit_paths_with_retry(
+            &archive.repo_root,
+            config,
+            "fixture: original grant",
+            &[&relative],
+        )
+        .unwrap();
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw("UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id=401")
+            .unwrap();
+        drop(conn);
+        read_source(cx, pool, 401).unwrap().unwrap()
+    }
+
+    #[test]
+    fn lost_renewals_share_the_four_write_budget_and_finish_the_round() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..=409 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT {id}, project_id, agent_id, 'src/{id}.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401")).unwrap();
+            }
+            drop(conn);
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let mut paths = Vec::new();
+            for id in 401..=409 {
+                let source = read_source(cx, pool, id).unwrap().unwrap();
+                let path = archive
+                    .root
+                    .join("file_reservations")
+                    .join(reservation_artifact_filename(Some("aabb"), id));
+                publish_missing(&path, &serde_json::to_vec(&source.artifact).unwrap()).unwrap();
+                paths.push(crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap());
+            }
+            crate::commit_paths_with_retry(
+                &archive.repo_root,
+                config,
+                "fixture: original grant batch",
+                &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id BETWEEN 401 AND 409")
+                .unwrap();
+            drop(conn);
+            let mut cursor = ActiveReservationCursor::default();
+            for expected in [4, 4, 1] {
+                let report = reconcile_active_reservations(
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(
+                    (report.attempted, report.repaired, report.deferred),
+                    (expected, expected, 0)
+                );
+                assert!(report.scanned <= usize::try_from(IDS_PER_PASS).unwrap());
+                assert_eq!(report.more, expected == 4);
+            }
+            for id in 401..=409 {
+                assert_committed(cx, pool, config, id);
+            }
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            let repeated = pass(cx, pool, config);
+            assert_eq!(
+                (repeated.unchanged, repeated.attempted, repeated.repaired),
+                (9, 0, 0)
+            );
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        });
+    }
+
+    #[test]
+    fn renewal_refuses_terminal_newer_foreign_or_conflicting_surviving_evidence() {
+        if isolated() {
+            return;
+        }
+        for field in [
+            "released_ts",
+            "expires_ts",
+            "db_generation",
+            "project",
+            "agent",
+            "agent_name",
+            "path_pattern",
+            "created_ts",
+            "exclusive",
+            "reason",
+            "missing_expiry",
+            "malformed",
+        ] {
+            fixture(|cx, pool, config| {
+                let source = seed_lost_renewal(cx, pool, config);
+                let path = target(config);
+                let mut value = read_artifact(&path).unwrap().unwrap().value;
+                match field {
+                    "released_ts" => value[field] = json!("1970-01-01T00:00:05Z"),
+                    "expires_ts" => {
+                        value[field] = json!(timestamp(&source.artifact[field]).unwrap() + 1)
+                    }
+                    "db_generation" => value[field] = json!("ccdd"),
+                    "project" => value[field] = json!("/other-project"),
+                    "agent" | "agent_name" => value[field] = json!("RedFox"),
+                    "path_pattern" => value[field] = json!("other/*.rs"),
+                    "created_ts" => value[field] = json!(2_000_000),
+                    "exclusive" => value[field] = json!(false),
+                    "reason" => value[field] = json!("different reservation intent"),
+                    "missing_expiry" => value["expires_ts"] = Value::Null,
+                    "malformed" => {}
+                    _ => unreachable!(),
+                }
+                let bytes = if field == "malformed" {
+                    b"{not valid reservation JSON".to_vec()
+                } else {
+                    serde_json::to_vec(&value).unwrap()
+                };
+                fs::write(&path, &bytes).unwrap();
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let head = repo.head().unwrap().target().unwrap();
+                let report = pass(cx, pool, config);
+                assert_eq!(
+                    (report.attempted, report.repaired, report.deferred),
+                    (0, 0, 1),
+                    "{field}"
+                );
+                assert_eq!(fs::read(path).unwrap(), bytes, "{field}");
+                assert_eq!(repo.head().unwrap().target().unwrap(), head, "{field}");
+                assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+            });
+        }
+    }
+
+    #[test]
+    fn renewal_preserves_conflicting_intent_that_survives_only_in_head() {
+        fixture(|cx, pool, config| {
+            let source = seed_lost_renewal(cx, pool, config);
+            let archive = crate::ensure_archive(config, &source.slug).unwrap();
+            let path = target(config);
+            let working = read_artifact(&path).unwrap().unwrap();
+            let mut conflicting = working.value;
+            conflicting["reason"] = json!("different committed reservation intent");
+            fs::write(&path, serde_json::to_vec(&conflicting).unwrap()).unwrap();
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            crate::commit_paths_with_retry(
+                &archive.repo_root,
+                config,
+                "fixture: committed intent conflicts",
+                &[&relative],
+            )
+            .unwrap();
+            fs::write(&path, &working.bytes).unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            let report = pass(cx, pool, config);
+            assert_eq!(
+                (report.attempted, report.repaired, report.deferred),
+                (0, 0, 1)
+            );
+            assert_eq!(fs::read(path).unwrap(), working.bytes);
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+        });
+    }
+
+    #[test]
+    fn staged_renewal_observes_independent_source_commits_and_preserves_archive_winners() {
+        if isolated() {
+            return;
+        }
+        for change in [
+            "release",
+            "renewal",
+            "generation",
+            "terminal_file",
+            "newer_file",
+            "cancel",
+        ] {
+            fixture(|cx, pool, config| {
+                let source = seed_lost_renewal(cx, pool, config);
+                let path = target(config);
+                let before = fs::read(&path).unwrap();
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let head = repo.head().unwrap().target().unwrap();
+                let mut winner = source.artifact.clone();
+                if change == "terminal_file" {
+                    winner["released_ts"] = json!("1970-01-01T00:00:05Z");
+                } else {
+                    winner["expires_ts"] =
+                        json!(timestamp(&source.artifact["expires_ts"]).unwrap() + 1);
+                }
+                let winner_bytes = serde_json::to_vec(&winner).unwrap();
+                let expected = if change.ends_with("_file") {
+                    winner_bytes.clone()
+                } else {
+                    before
+                };
+                let database = pool.sqlite_path().to_string();
+                let stop = std::sync::Arc::new(AtomicBool::new(false));
+                let stop_after_stage = std::sync::Arc::clone(&stop);
+                AFTER_RENEWAL_STAGE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |held, path| {
+                        // The repair already read through this retained native
+                        // connection. An independent writer must invalidate that
+                        // observation before the final publication check.
+                        assert!(read_source_connection(held, 401).unwrap().is_some());
+                        if change == "cancel" {
+                            stop_after_stage.store(true, Ordering::Release);
+                            return;
+                        }
+                        if change.ends_with("_file") {
+                            fs::write(path, &winner_bytes).unwrap();
+                            return;
+                        }
+                        let writer = DbConn::open_file(&database).unwrap();
+                        writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+                        writer.execute_raw(match change {
+                            "release" => "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)",
+                            "renewal" => "UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id=401",
+                            "generation" => "UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0",
+                            _ => unreachable!(),
+                        }).unwrap();
+                        writer.execute_raw("COMMIT").unwrap();
+                        mcp_agent_mail_db::close_db_conn(writer, "independent renewal race writer");
+                    }));
+                });
+                let mut attempted = false;
+                let result = repair_one(cx, pool, config, &source, &mut attempted, &stop);
+                assert!(
+                    result.is_err(),
+                    "stale renewal published after {change}: {result:?}"
+                );
+                assert!(attempted, "the native renewal stage must have been reached");
+                AFTER_RENEWAL_STAGE.with(|slot| assert!(slot.borrow().is_none()));
+                assert_eq!(fs::read(path).unwrap(), expected, "{change}");
+                assert_eq!(repo.head().unwrap().target().unwrap(), head, "{change}");
+                assert!(
+                    fs::read_dir(target(config).parent().unwrap())
+                        .unwrap()
+                        .all(|entry| !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".tmp-")),
+                    "a refused {change} must discard only its private stage"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn renewal_and_ordinary_terminal_writer_share_publication_ownership() {
+        fixture(|cx, pool, config| {
+            let source = seed_lost_renewal(cx, pool, config);
+            let archive = crate::ensure_archive(config, &source.slug).unwrap();
+            let mut terminal = source.artifact.clone();
+            terminal["released_ts"] = json!("1970-01-01T00:00:05Z");
+            let writer_archive = archive.clone();
+            let writer_config = config.clone();
+            let writer_record = terminal.clone();
+            AFTER_RENEWAL_STAGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |_, path| {
+                    let before = fs::read(path).unwrap();
+                    let blocked = crate::write_file_reservation_record(
+                        &writer_archive,
+                        &writer_config,
+                        &writer_record,
+                    );
+                    assert!(
+                        matches!(blocked, Err(crate::StorageError::LockContention { .. })),
+                        "{blocked:?}"
+                    );
+                    assert_eq!(fs::read(path).unwrap(), before);
+                }));
+            });
+            assert_eq!(pass(cx, pool, config).repaired, 1);
+            AFTER_RENEWAL_STAGE.with(|slot| assert!(slot.borrow().is_none()));
+            // Once repair returns ownership, the real ordinary terminal writer
+            // wins. Later recovery cannot resurrect the still-active DB row.
+            crate::write_file_reservation_record(&archive, config, &terminal).unwrap();
+            let published = fs::read(target(config)).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&published).unwrap(),
+                terminal
+            );
+            let report = pass(cx, pool, config);
+            assert_eq!(
+                (report.attempted, report.repaired, report.deferred),
+                (0, 0, 1)
+            );
+            assert_eq!(fs::read(target(config)).unwrap(), published);
         });
     }
 
