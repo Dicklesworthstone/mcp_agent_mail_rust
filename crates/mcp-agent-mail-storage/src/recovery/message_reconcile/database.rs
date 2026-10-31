@@ -1280,6 +1280,8 @@ fn reconcile_message_batch_at(
     let selected_identity = cursor.source_identity.clone();
     let tail_started_after = selected.tail_started_after;
     let tail_next_id = selected.tail_next_id;
+    let history_started_at = cursor.backfill_ceiling;
+    let startup_started_at = cursor.startup_tail.as_ref().map(|range| range.ceiling);
     let now = Instant::now();
     let mut retries = cursor
         .retries
@@ -1429,10 +1431,15 @@ fn reconcile_message_batch_at(
     // crash left no older orphans. Continue this finite startup history round
     // using the worker's existing one-second catch-up poll. No loop, SQL page,
     // repair count, payload bound, retry cooldown, or publication guard changes.
-    // A cancelled or wholly blocked pass does not request extra polling here.
+    // Consuming a page of cooling conflicts also advances that finite round:
+    // no payload is scanned, but an older unvisited orphan can be on its next
+    // page. Keep the short cadence without retrying a cooling ID early. A
+    // cancelled or wholly blocked pass does not request extra polling here.
+    let startup_scan_advanced = cursor.backfill_ceiling != history_started_at
+        || cursor.startup_tail.as_ref().map(|range| range.ceiling) != startup_started_at;
     if cursor.persist_progress
         && (!cursor.startup_backfill_complete || cursor.startup_tail.is_some())
-        && report.scanned > 0
+        && (report.scanned > 0 || startup_scan_advanced)
         && !report.interrupted
     {
         report.budget_exhausted = true;
@@ -3358,6 +3365,146 @@ mod tests {
             let end = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
             assert!(!end.budget_exhausted);
             assert!(restarted.startup_backfill_complete);
+        });
+    }
+
+    #[test]
+    fn startup_cooling_pages_keep_catch_up_until_an_unvisited_orphan() {
+        retention_fixture(32, |cx, pool, config| {
+            archive_fixture_range(cx, pool, config, 902..933);
+            let stop = AtomicBool::new(false);
+            let now = Instant::now();
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            // The forward cursor is already caught up, so its lookahead
+            // cannot request another pass. Recent history is covered by
+            // cooldowns retained from an earlier forward observation.
+            cursor.tail_after = Some(932);
+            cursor.backfill_ceiling = Some(932);
+            cursor.conflict_backoff = (917..933).map(|id| (id, now + MAX_RETRY_BACKOFF)).collect();
+
+            let cooling = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (
+                    cooling.scanned,
+                    cooling.repaired,
+                    cooling.deferred,
+                    cooling.retry_len,
+                ),
+                (0, 0, 0, 0),
+                "cooldowns must not be bypassed or turned into attempted repairs"
+            );
+            assert_eq!(cursor.tail_after, Some(932));
+            assert_eq!(cursor.backfill_ceiling, Some(916));
+            assert!(cursor.startup_tail.is_none());
+            assert!(
+                cooling.budget_exhausted,
+                "cursor-only startup progress must retain the short follow-up for older orphans"
+            );
+            assert_eq!(cooling.checkpoint_saved, Some(true));
+
+            // Resume the real checkpoint with a fresh worker. The old orphan
+            // is next-page history; no client read or message resend repairs it.
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let repaired =
+                reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(repaired.checkpoint_restored);
+            assert_eq!(repaired.repaired, 1);
+            assert_eq!(repaired.files_created, 4);
+            assert_eq!(repaired.deferred, 0);
+            assert_eq!(restarted.conflict_backoff.len(), 16);
+            assert!(repaired.scanned <= MAX_IDS_PER_PASS);
+            assert!(repaired.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(
+                reconcile_prepared(config, &original).unwrap(),
+                ReconcileResult::default()
+            );
+            assert!(
+                verify_retention_archive(
+                    &crate::open_archive(config, "project").unwrap().unwrap(),
+                    &original,
+                    &mut 0,
+                )
+                .unwrap()
+                .is_some()
+            );
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..933).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn cooling_startup_tail_keeps_catch_up_behind_a_young_forward_barrier() {
+        retention_fixture(40, |cx, pool, config| {
+            let anchor = mcp_agent_mail_db::now_micros();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE messages SET created_ts = {} WHERE id = 902",
+                anchor + 3_600_000_000,
+            ))
+            .unwrap();
+            drop(conn);
+            let mut cursor = ReconcileCursor::settled_before(anchor);
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(901);
+            cursor.backfill_ceiling = Some(0);
+            cursor.conflict_backoff = (925..941)
+                .map(|id| (id, Instant::now() + MAX_RETRY_BACKOFF))
+                .collect();
+            let stop = AtomicBool::new(false);
+
+            let cooling = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (cooling.scanned, cooling.deferred, cooling.retry_len),
+                (0, 0, 0)
+            );
+            assert!(cursor.startup_backfill_complete);
+            assert_eq!(
+                cursor.tail_after,
+                Some(901),
+                "young mail still blocks the forward lane"
+            );
+            assert_eq!(
+                cursor.startup_tail.as_ref().map(|range| range.ceiling),
+                Some(924)
+            );
+            assert!(
+                cooling.budget_exhausted,
+                "the startup-tail lane still has older settled mail"
+            );
+            assert_eq!(cooling.checkpoint_saved, Some(true));
+
+            let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(repaired.repaired, MAX_REPAIRS_PER_BATCH);
+            assert_eq!(repaired.deferred, 0);
+            assert_eq!(cursor.tail_after, Some(901));
+            assert_eq!(cursor.conflict_backoff.len(), 16);
+            let older = prepare_message(cx, pool, 924).unwrap();
+            assert_eq!(
+                reconcile_prepared(config, &older).unwrap(),
+                ReconcileResult::default()
+            );
+            let young = prepare_message(cx, pool, 902).unwrap();
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &young.message,
+                &young.sender,
+                &young.recipients,
+            )
+            .unwrap()
+            .0;
+            assert!(
+                !paths.canonical.exists(),
+                "the young forward barrier was bypassed"
+            );
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..941).collect::<Vec<_>>()
+            );
         });
     }
 
