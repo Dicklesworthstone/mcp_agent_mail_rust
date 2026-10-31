@@ -2101,14 +2101,29 @@ mod tests {
         use mcp_agent_mail_db::snapshot::{
             latest_verified_snapshot, record_snapshot_metadata, snapshot_bak_path,
         };
+        use std::os::unix::fs::MetadataExt as _;
 
-        if !isolated_default_retention_child() || !owner_processes_fully_observable() {
+        if !isolated_default_retention_child() {
+            return;
+        }
+        // A sibling test's exiting process hides its descriptors for a moment,
+        // so only a table that stays hidden can excuse this test.
+        let observable = (0..60).any(|_| {
+            let observable = owner_processes_fully_observable();
+            if !observable {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            observable
+        });
+        if !observable {
+            eprintln!("not asserting publication: a process of this user hides its open files");
             return;
         }
         for refusals_clear in [false, true] {
             let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
             let (primary, pool) = retention_mailbox(&root);
-            std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+            let slot = snapshot_bak_path(&primary);
+            std::fs::copy(&primary, &slot).unwrap();
             let published = record_snapshot_metadata(&primary, 1_700_000_000_000_000).unwrap();
             let image = |day: u32| root.join(format!("mail.sqlite3.bak.2000010{day}_000000"));
             let refused = [1, 2, 3, 4, 5, 6].map(image);
@@ -2134,13 +2149,22 @@ mod tests {
                     std::fs::copy(&primary, path).unwrap();
                 }
             }
+            let slot_before = std::fs::metadata(&slot).unwrap().ino();
             let mut schedule = AutomaticBackupSchedule::default();
             assert!(run_automatic_backup(&pool, &root, &mut schedule));
             assert_eq!(schedule.consecutive_failures(), 0);
-            let next = latest_verified_snapshot(&primary).expect("a verified snapshot remains");
-            assert!(
-                next.created_us > published.created_us,
+            assert_ne!(
+                std::fs::metadata(&slot).unwrap().ino(),
+                slot_before,
                 "refusals_clear={refusals_clear}: no new image followed the pass"
+            );
+            // Cleared refusals return to ordinary admission, whose first hour
+            // is a proactive refresh. Only the over-budget repair is verified.
+            let next = latest_verified_snapshot(&primary).expect("a verified snapshot remains");
+            assert_eq!(
+                next.created_us > published.created_us,
+                !refusals_clear,
+                "refusals_clear={refusals_clear}"
             );
         }
     }
