@@ -5917,17 +5917,23 @@ pub async fn mark_all_read(
 // shared because the reservation predicates remain private to `reservations.rs`
 // pending the Track-F single-mutation-chokepoint work.
 
-const fn db_error_supports_ack_intent(error: &DbError) -> bool {
-    matches!(
-        error,
-        DbError::Pool(_)
-            | DbError::Sqlite(_)
-            | DbError::Schema(_)
-            | DbError::ResourceBusy(_)
-            | DbError::PoolExhausted { .. }
-            | DbError::CircuitBreakerOpen { .. }
-            | DbError::IntegrityCorruption { .. }
-    )
+fn db_error_supports_ack_intent(error: &DbError) -> bool {
+    match error {
+        // Exhausting one request's retry budget does not make a temporary
+        // storage failure permanent. Keep its durable intent for a later
+        // recovery pass without starting another immediate retry loop.
+        DbError::RetryBudgetExhausted { inner, .. } => db_error_supports_ack_intent(inner),
+        _ => matches!(
+            error,
+            DbError::Pool(_)
+                | DbError::Sqlite(_)
+                | DbError::Schema(_)
+                | DbError::ResourceBusy(_)
+                | DbError::PoolExhausted { .. }
+                | DbError::CircuitBreakerOpen { .. }
+                | DbError::IntegrityCorruption { .. }
+        ),
+    }
 }
 
 fn mcp_error_supports_ack_intent(error: &McpError) -> bool {
@@ -7735,6 +7741,332 @@ mod tests {
         .expect("create acknowledgement test message")
         .id
         .expect("message ID")
+    }
+
+    #[test]
+    fn ack_retry_exhaustion_does_not_reclassify_permanent_errors() {
+        let wrap = |inner| DbError::RetryBudgetExhausted {
+            operation: "acknowledge_message",
+            attempts: 1,
+            budget: 1,
+            elapsed_ms: 0,
+            inner: Box::new(inner),
+        };
+        let missing = DbError::not_found("MessageRecipient", "1:2");
+        assert!(!db_error_supports_ack_intent(&wrap(wrap(missing))));
+        let invalid = DbError::invalid("message_id", "invalid acknowledgement target");
+        assert!(!db_error_supports_ack_intent(&wrap(invalid)));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ack_retry_exhaustion_keeps_intents_until_database_recovers() {
+        // The retry budget and transaction mode are process-wide LazyLocks.
+        // Initialize them in a private process so this exercises real lock
+        // exhaustion promptly without changing another test's retry policy.
+        const CHILD: &str = "AM_TEST_ACK_RETRY_EXHAUSTION_CHILD";
+        const KEY: &str = "private-ack-contention-key";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .env("FSQLITE_CONCURRENT_RETRIES", "0")
+                .env("FSQLITE_CONCURRENT_MODE", "false")
+                .output()
+                .expect("run isolated acknowledgement contention test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated acknowledgement contention test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        with_messaging_mailbox(
+            &[
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("FSQLITE_CONCURRENT_RETRIES", "0"),
+                ("FSQLITE_CONCURRENT_MODE", "false"),
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+            ],
+            |mailbox| {
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("runtime installs test context");
+                    let pool = get_db_pool().expect("live mailbox pool");
+                    let project = ensure_project_row(&cx, &pool, "/ack-retry-exhaustion").await;
+                    let project_id = project.id.unwrap();
+                    let recipient = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                    let other = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                    let recipient_id = recipient.id.unwrap();
+                    let other_id = other.id.unwrap();
+                    let plain_id = create_ack_test_message(
+                        &cx,
+                        &pool,
+                        project_id,
+                        other_id,
+                        &[(recipient_id, "to"), (other_id, "cc")],
+                    )
+                    .await;
+                    let keyed_id = create_ack_test_message(
+                        &cx,
+                        &pool,
+                        project_id,
+                        other_id,
+                        &[(recipient_id, "to"), (other_id, "cc")],
+                    )
+                    .await;
+                    let recipient_ctx =
+                        McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+                    let other_ctx =
+                        McpContext::with_state(cx.clone(), 2, fastmcp_core::SessionState::new());
+                    crate::session_identity::bind(
+                        &recipient_ctx,
+                        project_id,
+                        recipient_id,
+                        &recipient.name,
+                    );
+                    crate::session_identity::bind(&other_ctx, project_id, other_id, &other.name);
+
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("warm sole checkout");
+                    conn.execute_sync("PRAGMA busy_timeout = 0", &[])
+                        .expect("do not wait inside the contended SQL call");
+                    drop(conn);
+                    let blocker = mcp_agent_mail_db::DbConn::open_file(
+                        mailbox.database_path.to_str().unwrap(),
+                    )
+                    .expect("independent competing writer");
+                    blocker
+                        .execute_raw("BEGIN IMMEDIATE")
+                        .expect("hold a real SQLite writer lock");
+
+                    let error =
+                        match queries::acknowledge_message(&cx, &pool, recipient_id, plain_id).await {
+                            Outcome::Err(error) => error,
+                            outcome => panic!(
+                                "the competing writer must exhaust the actual ACK transaction: {outcome:?}"
+                            ),
+                        };
+                    assert!(
+                        matches!(
+                            &error,
+                            DbError::RetryBudgetExhausted {
+                                operation: "acknowledge_message",
+                                attempts: 1,
+                                budget: 1,
+                                ..
+                            }
+                        ),
+                        "expected real retry exhaustion, got {error:?}"
+                    );
+
+                    let unauthorized = acknowledge_message(
+                        &recipient_ctx,
+                        project.human_key.clone(),
+                        other.name.clone(),
+                        keyed_id,
+                        Some(KEY.to_string()),
+                    )
+                    .await
+                    .expect_err("contention cannot authorize a borrowed recipient");
+                    assert_eq!(
+                        crate::tool_error_code(&unauthorized),
+                        Some("SESSION_IDENTITY_MISMATCH")
+                    );
+                    let config = Config::get();
+                    assert!(
+                        crate::degraded_intents::read_queued_ack_intents(&config)
+                            .unwrap()
+                            .is_empty()
+                    );
+
+                    // Both supported ACK modes must survive contention. The
+                    // later claim for another agent and missing message can
+                    // only be diagnosed once storage becomes writable again.
+                    for (ctx, agent, message_id, key) in [
+                        (&recipient_ctx, &recipient.name, plain_id, None),
+                        (&recipient_ctx, &recipient.name, keyed_id, Some(KEY)),
+                        (&other_ctx, &other.name, keyed_id, Some(KEY)),
+                        (&recipient_ctx, &recipient.name, i64::MAX, None),
+                    ] {
+                        let response = acknowledge_message(
+                            ctx,
+                            project.human_key.clone(),
+                            agent.clone(),
+                            message_id,
+                            key.map(|key| format!("  {key}  ")),
+                        )
+                        .await
+                        .expect("real exhausted ACK must preserve a durable intent");
+                        let response_json: Value = serde_json::from_str(&response).unwrap();
+                        assert_eq!(response_json["queued"], true);
+                        assert_eq!(response_json["acknowledged"], false);
+                        assert!(
+                            !response.contains(KEY),
+                            "queued responses redact retry keys"
+                        );
+                    }
+                    let pending = crate::degraded_intents::read_queued_ack_intents(&config)
+                        .expect("read durable contention intents");
+                    assert_eq!(pending.len(), 4);
+                    assert!(pending.iter().all(|intent| {
+                        intent.failure.stage == "acknowledge_message"
+                            && intent
+                                .failure
+                                .error_detail
+                                .contains("retry budget exhausted")
+                    }));
+                    assert!(pending[0].idempotency.is_none());
+                    assert_eq!(
+                        pending[1].idempotency,
+                        Some(ack_retry_claim(&recipient.name, keyed_id, KEY))
+                    );
+                    assert_eq!(
+                        pending[2].idempotency,
+                        Some(ack_retry_claim(&other.name, keyed_id, KEY))
+                    );
+
+                    replay_queued_ack_intents(&recipient_ctx, &pool, &config).await;
+                    assert_eq!(
+                        crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                        pending,
+                        "exhausting replay's budget must leave every intent pending"
+                    );
+                    let log = crate::degraded_intents::log_path(
+                        &config,
+                        crate::degraded_intents::ACK_INTENT_LOG_FILE,
+                    );
+                    let read_markers = || {
+                        std::fs::read_to_string(&log)
+                            .expect("ack replay journal")
+                            .lines()
+                            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                            .filter(|record| {
+                                record["kind"] == crate::degraded_intents::ACK_INTENT_REPLAY_KIND
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let failed = read_markers();
+                    assert_eq!(failed.len(), 4);
+                    assert!(failed.iter().all(|record| {
+                        record["status"] == crate::degraded_intents::REPLAY_STATUS_FAILED
+                            && record["error_detail"]
+                                .as_str()
+                                .unwrap()
+                                .contains("retry budget exhausted")
+                    }));
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("read receipts");
+                    let changed = conn
+                        .query_sync(
+                            "SELECT COUNT(*) AS n FROM message_recipients \
+                             WHERE read_ts IS NOT NULL OR ack_ts IS NOT NULL",
+                            &[],
+                        )
+                        .expect("writer contention leaves receipts untouched");
+                    assert_eq!(changed[0].get_named::<i64>("n").unwrap(), 0);
+                    drop(conn);
+
+                    blocker
+                        .execute_raw("ROLLBACK")
+                        .expect("release competing writer");
+                    drop(blocker);
+                    replay_queued_ack_intents(&other_ctx, &pool, &config).await;
+                    assert!(
+                        crate::degraded_intents::read_queued_ack_intents(&config)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let completed = read_markers();
+                    assert_eq!(completed.len(), 8);
+                    for (record, intent) in completed[4..].iter().zip(&pending) {
+                        assert_eq!(record["intent_id"], intent.intent_id);
+                        assert_eq!(record["intent_content_sha256"], intent.content_sha256);
+                    }
+                    for record in &completed[4..6] {
+                        assert_eq!(
+                            record["status"],
+                            crate::degraded_intents::REPLAY_STATUS_REPLAYED
+                        );
+                    }
+                    for record in &completed[6..] {
+                        assert_eq!(
+                            record["status"],
+                            crate::degraded_intents::REPLAY_STATUS_ABANDONED
+                        );
+                    }
+                    assert!(
+                        completed[6]["error_detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("IDEMPOTENCY_KEY_CONFLICT")
+                    );
+                    assert!(
+                        completed[7]["error_detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("MessageRecipient")
+                    );
+
+                    let inbox =
+                        queries::fetch_inbox(&cx, &pool, project_id, recipient_id, false, None, 10)
+                            .await
+                            .into_result()
+                            .expect("recovered recipient receipts");
+                    assert_eq!(inbox.len(), 2);
+                    assert!(inbox.iter().all(|row| {
+                        row.ack_ts.is_some_and(|timestamp| timestamp > 0)
+                            && row.read_ts == row.ack_ts
+                    }));
+                    let keyed = inbox
+                        .iter()
+                        .find(|row| row.message.id == Some(keyed_id))
+                        .unwrap();
+                    let original = (keyed.read_ts.unwrap(), keyed.ack_ts.unwrap());
+                    let other_inbox =
+                        queries::fetch_inbox(&cx, &pool, project_id, other_id, false, None, 10)
+                            .await
+                            .into_result()
+                            .expect("independent recipient receipts");
+                    assert_eq!(other_inbox.len(), 2);
+                    assert!(
+                        other_inbox
+                            .iter()
+                            .all(|row| { row.read_ts.is_none() && row.ack_ts.is_none() })
+                    );
+
+                    let journal_before_retry = std::fs::read(&log).unwrap();
+                    let retry: Value = serde_json::from_str(
+                        &acknowledge_message(
+                            &recipient_ctx,
+                            project.human_key,
+                            recipient.name,
+                            keyed_id,
+                            Some(KEY.to_string()),
+                        )
+                        .await
+                        .expect("original keyed ACK remains replayable after recovery"),
+                    )
+                    .unwrap();
+                    assert_eq!(retry["idempotent_replay"], true);
+                    assert_eq!(retry["read_at"], micros_to_iso(original.0));
+                    assert_eq!(retry["acknowledged_at"], micros_to_iso(original.1));
+                    assert_eq!(std::fs::read(log).unwrap(), journal_before_retry);
+                });
+            },
+        );
     }
 
     #[test]
