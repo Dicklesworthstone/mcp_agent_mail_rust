@@ -24893,7 +24893,11 @@ first body
             |_| {
                 let config = mail_rbac_test_config();
                 let storage_root = config.storage_root.clone();
-                let state = build_state(config);
+                let state = Arc::new(build_state(config));
+                // The server sets this, and it sends mail posts to a blocking
+                // worker. Inline, the archive scan's blocking task has no
+                // runtime worker to start on.
+                let _ = state.self_ref.set(Arc::downgrade(&state));
                 let runtime = RuntimeBuilder::current_thread()
                     .build()
                     .expect("fixture runtime");
