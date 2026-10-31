@@ -685,7 +685,10 @@ fn assert_archive_storage(
     exclude_recovery: bool,
 ) -> serde_json::Value {
     let mut archive = zip::ZipArchive::new(fs::File::open(archive_path).unwrap()).unwrap();
-    let names: BTreeSet<_> = archive.file_names().map(str::to_string).collect();
+    let names: BTreeSet<_> = archive
+        .file_names()
+        .map(|name| name.unwrap().into_owned())
+        .collect();
     assert!(names.contains(ARCHIVE_SNAPSHOT_ENTRY));
     for (relative, expected) in &fixture.storage_hashes {
         let name = format!(
