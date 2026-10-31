@@ -24550,7 +24550,7 @@ mod tests {
                 }
             }
             let digest =
-                fs::read_to_string(archive.root.join("messages/threads/ACK-FAST.md")).unwrap();
+                fs::read_to_string(archive.root.join("messages/threads/ack-fast.md")).unwrap();
             let mut previous = None;
             for id in 1..=count {
                 let marker = format!("### ack-fast backlog {id}\n");
