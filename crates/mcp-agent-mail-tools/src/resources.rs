@@ -6663,7 +6663,7 @@ mod resource_shape_tests {
                     let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
                     let reader = register_agent(&cx, &pool, project_id, "RedPeak").await;
                     register_agent(&cx, &pool, project_id, "GreenCastle").await;
-                    let hidden = register_agent(&cx, &pool, project_id, "DarkRose").await;
+                    let hidden = register_agent(&cx, &pool, project_id, "DarkLake").await;
                     let sender_id = sender.id.unwrap();
                     let reader_id = reader.id.unwrap();
                     let hidden_id = hidden.id.unwrap();
@@ -6732,7 +6732,7 @@ mod resource_shape_tests {
                         ("BlueLake", 0),
                         ("RedPeak", 1),
                         ("GreenCastle", 3),
-                        ("DarkRose", 3),
+                        ("DarkLake", 3),
                     ] {
                         let entry = agent_roster["agents"]
                             .as_array()
@@ -6778,7 +6778,7 @@ mod resource_shape_tests {
                             .iter()
                             .all(|message| message["bcc"] == serde_json::json!([]))
                     );
-                    assert!(!outbox_text.contains("DarkRose"));
+                    assert!(!outbox_text.contains("DarkLake"));
                     assert_eq!(inbox_read_only_witness(&cx, &pool, reader_id).await, before);
                     let conn = acquire_resource_conn(&cx, &pool).await.unwrap();
                     let direct = conn
