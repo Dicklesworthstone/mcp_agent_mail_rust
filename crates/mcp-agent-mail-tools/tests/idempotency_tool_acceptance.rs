@@ -327,6 +327,45 @@ fn assert_exact_replay(fresh: &Value, replay: &str) {
     assert_eq!(&replay, fresh);
 }
 
+fn while_recovery_blocks_writers<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce(McpContext) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    use mcp_agent_mail_db::write_barrier::{
+        active_writer_count, current_thread_holds_promotion_barrier,
+        try_acquire_promotion_barrier_if_idle,
+    };
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let owner = try_acquire_promotion_barrier_if_idle().expect("hold real recovery promotion");
+    let (done_tx, done_rx) = mpsc::channel();
+    // Promotion ownership is reentrant on its own thread, so retries must run
+    // on another thread to prove they do not request a writer handoff.
+    let reader = std::thread::spawn(move || {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("retry runtime");
+        let result = runtime.block_on(async {
+            let ctx = McpContext::new(Cx::current().expect("retry context"), 2);
+            f(ctx).await
+        });
+        assert!(done_tx.send(result).is_ok(), "return retry result");
+    });
+    let result = done_rx.recv_timeout(Duration::from_secs(5));
+    let held = current_thread_holds_promotion_barrier();
+    let writers = active_writer_count();
+    // Release before joining or asserting: the pre-fix implementation parks
+    // behind this barrier and must still finish without leaking a worker.
+    drop(owner);
+    reader.join().expect("retry worker exits");
+    assert!(held, "replays must not release recovery ownership");
+    assert_eq!(writers, 0, "replays must not acquire writer leases");
+    result.expect("committed retries must finish while recovery blocks writers")
+}
+
 #[derive(Default)]
 struct ReplyOptions {
     to: Option<Vec<String>>,
@@ -640,7 +679,8 @@ fn reply_message_attachment_replay_ignores_missing_and_changed_sources() {
 }
 
 #[test]
-fn attachment_replays_require_current_sender_proof_and_keep_redacted_receipts() {
+#[allow(clippy::too_many_lines)]
+fn attachment_replays_require_current_sender_proof_during_recovery() {
     run_with_storage_env(
         &[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "1")],
         |cx, storage_root| async move {
@@ -674,49 +714,69 @@ fn attachment_replays_require_current_sender_proof_and_keep_redacted_receipts() 
             mcp_agent_mail_storage::wbq_flush();
             let files = snapshot_delivery_files(&storage_root);
             let inbox = inbox_snapshot(&ctx, &project_key).await;
+            let counts = delivery_counts(&ctx).await;
             std::fs::rename(&source, source.with_extension("retained.bin")).unwrap();
 
-            for (parent, fresh) in [(None, fresh_send), (Some(parent), fresh_reply)] {
-                for (proof, expected) in [
-                    (None, "SENDER_TOKEN_REQUIRED"),
-                    (
-                        Some("incorrect-registration-token"),
-                        "SENDER_TOKEN_MISMATCH",
-                    ),
-                ] {
-                    let error =
-                        attachment_request(&ctx, &project_key, &source, parent, body, proof)
-                            .await
-                            .expect_err(
-                                "a prior accepted key must not bypass current sender proof",
-                            );
-                    assert_error_type(&error, expected);
+            let replay_project = project_key.clone();
+            while_recovery_blocks_writers(move |ctx| async move {
+                for (parent, fresh) in [(None, fresh_send), (Some(parent), fresh_reply)] {
+                    for (proof, expected) in [
+                        (None, "SENDER_TOKEN_REQUIRED"),
+                        (
+                            Some("incorrect-registration-token"),
+                            "SENDER_TOKEN_MISMATCH",
+                        ),
+                    ] {
+                        let error =
+                            attachment_request(&ctx, &replay_project, &source, parent, body, proof)
+                                .await
+                                .expect_err("a committed key must not bypass current sender proof");
+                        assert_error_type(&error, expected);
+                    }
+                    let replay = attachment_request(
+                        &ctx,
+                        &replay_project,
+                        &source,
+                        parent,
+                        body,
+                        Some(&token),
+                    )
+                    .await
+                    .expect("verified replay after the source was moved");
+                    assert_exact_replay(&fresh, &replay);
+                    let conflict = attachment_request(
+                        &ctx,
+                        &replay_project,
+                        &source,
+                        parent,
+                        "changed body",
+                        Some(&token),
+                    )
+                    .await
+                    .expect_err("changed retries must conflict during recovery");
+                    assert_error_type(&conflict, "IDEMPOTENCY_KEY_CONFLICT");
+                    assert_eq!(fresh["receipt_mode"], "redacted");
+                    assert_eq!(fresh["verified_sender"], true);
+                    for field in [
+                        "subject",
+                        "body_md",
+                        "attachments",
+                        "deliveries",
+                        "to",
+                        "cc",
+                        "bcc",
+                    ] {
+                        assert!(
+                            fresh.get(field).is_none(),
+                            "redacted receipt exposed {field}"
+                        );
+                    }
                 }
-                let replay =
-                    attachment_request(&ctx, &project_key, &source, parent, body, Some(&token))
-                        .await
-                        .expect("verified replay after the source was moved");
-                assert_exact_replay(&fresh, &replay);
-                assert_eq!(fresh["receipt_mode"], "redacted");
-                assert_eq!(fresh["verified_sender"], true);
-                for field in [
-                    "subject",
-                    "body_md",
-                    "attachments",
-                    "deliveries",
-                    "to",
-                    "cc",
-                    "bcc",
-                ] {
-                    assert!(
-                        fresh.get(field).is_none(),
-                        "redacted receipt exposed {field}"
-                    );
-                }
-            }
+            });
             mcp_agent_mail_storage::wbq_flush();
             assert_eq!(snapshot_delivery_files(&storage_root), files);
             assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+            assert_eq!(delivery_counts(&ctx).await, counts);
         },
     );
 }

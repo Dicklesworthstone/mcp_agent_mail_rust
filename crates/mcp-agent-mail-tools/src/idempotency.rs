@@ -24,6 +24,52 @@ use mcp_agent_mail_db::IdempotencyConflict;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+/// Read committed receipts without entering write admission or initializing a
+/// mailbox. A missing or virgin database has no read-side schema yet; callers
+/// must enter their ordinary guarded write path and recheck there. Errors in
+/// existing history are never evidence that a key is absent.
+pub(crate) async fn replay_read_pool(
+    ctx: &McpContext,
+) -> McpResult<Option<mcp_agent_mail_db::DbPool>> {
+    use crate::tool_util::{
+        db_error_to_mcp_error, db_outcome_to_mcp_result, ensure_request_live,
+        get_coalescer_bypass_read_db_pool,
+    };
+
+    ensure_request_live(ctx)?;
+    let config = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let resolved = mcp_agent_mail_db::resolve_mailbox_sqlite_path(&config.database_url)
+        .map_err(db_error_to_mcp_error)?;
+    if resolved.canonical_path == ":memory:" {
+        // The generic read helper initializes an in-memory pool when absent.
+        // Reuse only already-initialized memory; cold calls need write admission.
+        return Ok(mcp_agent_mail_db::get_cached_pool(&config)
+            .filter(mcp_agent_mail_db::DbPool::is_initialized));
+    }
+    match std::fs::metadata(&resolved.canonical_path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(McpError::internal_error(format!(
+                "Cannot inspect database for committed idempotency receipts: {error}"
+            )));
+        }
+    }
+
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let conn = db_outcome_to_mcp_result(pool.acquire(ctx.cx()).await)?;
+    let schema = conn
+        .query_sync("SELECT name FROM sqlite_master LIMIT 1", &[])
+        .map_err(|error| {
+            db_error_to_mcp_error(mcp_agent_mail_db::DbError::Sqlite(error.to_string()))
+        })?;
+    drop(conn);
+    // Do not treat a missing idempotency table in an otherwise initialized
+    // mailbox as an empty history. Its lookup must report the schema error.
+    Ok((!schema.is_empty()).then_some(pool))
+}
+
 /// Maximum accepted idempotency-key length. Keys are opaque client tokens
 /// (UUID/ULID/hash sized); the bound keeps the `idempotency_keys` table from
 /// storing pathologically large keys.
@@ -150,6 +196,158 @@ pub fn with_replay_marker(response_json: String, replayed: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_read_pool_only_reuses_initialized_memory() {
+        use asupersync::Cx;
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
+
+        let root = tempfile::tempdir().expect("isolated in-memory fixture");
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", "sqlite:///:memory:"),
+                ("STORAGE_ROOT", root.path().to_str().unwrap()),
+            ],
+            || {
+                Config::reset_cached();
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                runtime.block_on(async {
+                    let ctx = McpContext::new(Cx::current().expect("fixture context"), 1);
+                    let config = mcp_agent_mail_db::DbPoolConfig::from_env();
+                    assert!(replay_read_pool(&ctx).await.unwrap().is_none());
+                    assert!(mcp_agent_mail_db::get_cached_pool(&config).is_none());
+
+                    let writer = crate::tool_util::get_db_pool_for_request(&ctx)
+                        .expect("ordinary admitted memory bootstrap");
+                    let project = mcp_agent_mail_db::queries::ensure_project(
+                        ctx.cx(),
+                        &writer,
+                        "/memory-replay",
+                    )
+                    .await
+                    .into_result()
+                    .expect("seed original memory state");
+                    let engine = writer.engine_identity_key();
+                    let _server_pool = mcp_agent_mail_db::get_cached_pool(&config)
+                        .expect("retain the initialized server pool");
+                    drop(writer);
+
+                    let reader = replay_read_pool(&ctx)
+                        .await
+                        .unwrap()
+                        .expect("reuse initialized memory");
+                    assert_eq!(reader.engine_identity_key(), engine);
+                    let observed = mcp_agent_mail_db::queries::get_project_by_human_key(
+                        ctx.cx(),
+                        &reader,
+                        "/memory-replay",
+                    )
+                    .await
+                    .into_result()
+                    .expect("read the existing memory state");
+                    assert_eq!(observed.id, project.id);
+                    assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                });
+                Config::reset_cached();
+            },
+        );
+    }
+
+    #[test]
+    fn replay_read_pool_preserves_cold_bootstrap_and_unavailable_history() {
+        use asupersync::Cx;
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
+
+        for fixture in [
+            "missing",
+            "zero_bytes",
+            "empty_schema",
+            "partial_schema",
+            "corrupt",
+        ] {
+            let root = tempfile::tempdir().expect("isolated replay fixture");
+            let database = root.path().join("mail.sqlite3");
+            match fixture {
+                "zero_bytes" => std::fs::write(&database, []).unwrap(),
+                "empty_schema" | "partial_schema" => {
+                    let conn = mcp_agent_mail_db::DbConn::open_file(database.to_str().unwrap())
+                        .expect("seed SQLite fixture");
+                    conn.execute_raw("PRAGMA user_version = 1").unwrap();
+                    if fixture == "partial_schema" {
+                        conn.execute_raw("CREATE TABLE preserved_data (id INTEGER PRIMARY KEY)")
+                            .unwrap();
+                    }
+                }
+                "corrupt" => std::fs::write(&database, b"not a SQLite database").unwrap(),
+                _ => {}
+            }
+            let database_url = format!("sqlite://{}", database.display());
+            let storage_root = root.path().join("archive");
+            with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+                ],
+                || {
+                    Config::reset_cached();
+                    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                    runtime.block_on(async {
+                        let ctx = McpContext::new(Cx::current().expect("fixture context"), 1);
+                        let result = replay_read_pool(&ctx).await;
+                        match fixture {
+                            "corrupt" => assert!(
+                                result.is_err(),
+                                "unreadable history must not become an idempotency miss"
+                            ),
+                            "partial_schema" => {
+                                let pool = result.unwrap().expect("existing schema is not virgin");
+                                let claim = mcp_agent_mail_db::IdempotencyClaim {
+                                    project_id: 1,
+                                    tool: "send_message",
+                                    key: "existing-key",
+                                    fingerprint: "payload",
+                                };
+                                let lookup =
+                                    mcp_agent_mail_db::queries::lookup_idempotency_result::<Value>(
+                                        ctx.cx(),
+                                        &pool,
+                                        claim,
+                                    )
+                                    .await;
+                                assert!(
+                                    matches!(lookup, asupersync::Outcome::Err(_)),
+                                    "a missing receipt table must fail, not return a key miss"
+                                );
+                            }
+                            _ => assert!(result.unwrap().is_none(), "cold fixture: {fixture}"),
+                        }
+                        assert!(
+                            mcp_agent_mail_db::get_cached_pool(
+                                &mcp_agent_mail_db::DbPoolConfig::from_env()
+                            )
+                            .is_none(),
+                            "receipt probing must not bootstrap an authoritative writer"
+                        );
+                    });
+                    Config::reset_cached();
+                },
+            );
+            assert!(
+                !storage_root.exists(),
+                "receipt probing must not create archives"
+            );
+            if fixture == "missing" {
+                assert!(
+                    !database.exists(),
+                    "receipt probing must not create a database"
+                );
+            } else if fixture == "zero_bytes" {
+                assert_eq!(std::fs::metadata(&database).unwrap().len(), 0);
+            }
+        }
+    }
 
     #[test]
     fn normalize_blank_and_missing_are_none() {

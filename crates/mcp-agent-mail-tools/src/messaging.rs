@@ -2898,7 +2898,9 @@ async fn try_replay_message(
     let (Some(key), Some(fingerprint)) = (key, fingerprint) else {
         return Ok(None);
     };
-    let pool = get_db_pool_for_request(ctx)?;
+    let Some(pool) = crate::idempotency::replay_read_pool(ctx).await? else {
+        return Ok(None);
+    };
     let project = match resolve_existing_project(ctx, &pool, project_key).await {
         Ok(project) => project,
         Err(error)
