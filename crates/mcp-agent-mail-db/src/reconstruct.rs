@@ -2423,7 +2423,13 @@ fn discover_agents(
         let last_active_ts = parse_ts_from_json(&profile, "last_active_ts")
             .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
-        let retired_at = parse_ts_from_json(&profile, "retired_at");
+        let retired_at = parse_reconstructed_agent_lifecycle_timestamp(
+            &profile,
+            "retired_at",
+            last_active_ts,
+            &profile_source,
+            stats,
+        );
         // Exempt agents must remain exempt after rebuilding from the archive;
         // otherwise the inactivity reaper can retire an identity that the
         // operator explicitly protected. Older profiles omit this field.
@@ -2440,8 +2446,14 @@ fn discover_agents(
             crate::models::deregistered_task_timestamp_micros(task_description)
                 .unwrap_or(last_active_ts)
         });
-        let deregistered_at =
-            parse_ts_from_json(&profile, "deregistered_at").or(legacy_deregistered_at);
+        let deregistered_at = parse_reconstructed_agent_lifecycle_timestamp(
+            &profile,
+            "deregistered_at",
+            legacy_deregistered_at.unwrap_or(last_active_ts),
+            &profile_source,
+            stats,
+        )
+        .or(legacy_deregistered_at);
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
@@ -6811,6 +6823,31 @@ fn parse_ts_from_json(value: &serde_json::Value, key: &str) -> Option<i64> {
     }
 }
 
+/// An unreadable lifecycle timestamp still records an inactive identity.
+/// Archive-only recovery must preserve that evidence just as live-DB salvage
+/// does: treating a malformed non-null marker as absence would silently
+/// restore permission to send, receive, and acquire new reservations. Keep
+/// valid timestamps unchanged and allow absent/null fields from active or
+/// older profiles; substitute an observed profile timestamp only when the
+/// marker is present but cannot be decoded, and report the uncertainty.
+fn parse_reconstructed_agent_lifecycle_timestamp(
+    profile: &serde_json::Value,
+    field: &str,
+    fallback: i64,
+    source: &str,
+    stats: &mut ReconstructStats,
+) -> Option<i64> {
+    if profile.get(field).is_none_or(serde_json::Value::is_null) {
+        return None;
+    }
+    parse_ts_from_json(profile, field).or_else(|| {
+        stats.push_warning(format!(
+            "{source} has an unparseable {field} value; preserving the inactive state with fallback timestamp {fallback}"
+        ));
+        Some(fallback)
+    })
+}
+
 /// Query the ID of a row by a unique text column, or the last inserted row.
 fn query_last_insert_or_existing_id(
     conn: &DbConn,
@@ -8942,6 +8979,214 @@ mod tests {
                 .get_named::<i64>("deregistered_at")
                 .expect("deregistered_at"),
             crate::iso_to_micros("2026-02-22T13:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn reconstructed_agent_lifecycle_timestamp_preserves_active_and_valid_states() {
+        let mut stats = ReconstructStats::default();
+        for field in ["retired_at", "deregistered_at"] {
+            for profile in [serde_json::json!({}), serde_json::json!({field: null})] {
+                assert_eq!(
+                    parse_reconstructed_agent_lifecycle_timestamp(
+                        &profile,
+                        field,
+                        4_000_000,
+                        "test profile",
+                        &mut stats,
+                    ),
+                    None,
+                    "absent and explicit null markers must retain active state"
+                );
+            }
+            for timestamp in [
+                serde_json::json!(2_000_000),
+                serde_json::json!("2000000"),
+                serde_json::json!("1970-01-01T00:00:02Z"),
+            ] {
+                assert_eq!(
+                    parse_reconstructed_agent_lifecycle_timestamp(
+                        &serde_json::json!({field: timestamp}),
+                        field,
+                        4_000_000,
+                        "test profile",
+                        &mut stats,
+                    ),
+                    Some(2_000_000),
+                    "valid lifecycle evidence must not be replaced by a fallback"
+                );
+            }
+        }
+        assert!(stats.warnings.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_preserves_malformed_agent_lifecycle_markers_and_history() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("lifecycle.db");
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects/demo");
+        let write_profile = |name: &str, lifecycle: serde_json::Value| {
+            let agent_dir = project_dir.join("agents").join(name);
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let mut profile = serde_json::json!({
+                "name": name,
+                "program": "claude-code",
+                "model": "opus-4.6",
+                "inception_ts": 1_000_000,
+                "last_active_ts": 4_000_000,
+            });
+            profile
+                .as_object_mut()
+                .unwrap()
+                .extend(lifecycle.as_object().unwrap().clone());
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                serde_json::to_vec(&profile).unwrap(),
+            )
+            .unwrap();
+        };
+        let malformed = [
+            serde_json::json!("private-invalid-timestamp"),
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!(u64::MAX),
+            serde_json::json!([]),
+            serde_json::json!({"timestamp": 2_000_000}),
+        ];
+        for (index, marker) in malformed.iter().enumerate() {
+            write_profile(
+                &format!("Retired{index}"),
+                serde_json::json!({"retired_at": marker}),
+            );
+            write_profile(
+                &format!("Deregistered{index}"),
+                serde_json::json!({"deregistered_at": marker}),
+            );
+        }
+        write_profile(
+            "Active",
+            serde_json::json!({"retired_at": null, "deregistered_at": null}),
+        );
+        write_profile("Legacy", serde_json::json!({}));
+        write_profile(
+            "LegacyEnded",
+            serde_json::json!({
+                "task_description": "[DEREGISTERED 1970-01-01T00:00:02Z] completed work",
+                "contact_policy": "block_all",
+                "deregistered_at": "invalid",
+            }),
+        );
+        let messages_dir = project_dir.join("messages/2026/01");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            messages_dir.join("2026-01-01T00-00-00Z__history__77.md"),
+            "---json\n{\"id\":77,\"from\":\"Retired0\",\"to\":[\"Deregistered0\"],\"subject\":\"Retained history\",\"importance\":\"normal\",\"created_ts\":\"2026-01-01T00:00:00Z\"}\n---\n\nretained transcript\n",
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("reconstruct archive");
+        assert_eq!(stats.agents, malformed.len() * 2 + 3);
+        assert_eq!(
+            (stats.messages, stats.recipients, stats.parse_errors),
+            (1, 1, 0)
+        );
+        for (field, count) in [
+            ("retired_at", malformed.len()),
+            ("deregistered_at", malformed.len() + 1),
+        ] {
+            assert_eq!(
+                stats
+                    .warnings
+                    .iter()
+                    .filter(|warning| warning.contains(&format!("unparseable {field}")))
+                    .count(),
+                count,
+                "every uncertain lifecycle marker must be reported"
+            );
+        }
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("private-invalid-timestamp"))
+        );
+
+        // Reopen the actual reconstructed database: both lifecycle columns
+        // and the deregistration ledger must survive candidate construction.
+        let conn =
+            DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen rebuilt DB");
+        for index in 0..malformed.len() {
+            for (prefix, retired_at, deregistered_at) in [
+                ("Retired", Some(4_000_000), None),
+                ("Deregistered", None, Some(4_000_000)),
+            ] {
+                let rows = conn
+                    .query_sync(
+                        "SELECT a.retired_at, d.deregistered_at FROM agents a \
+                     LEFT JOIN agent_deregistrations d ON d.agent_id = a.id WHERE a.name = ?",
+                        &[Value::Text(format!("{prefix}{index}"))],
+                    )
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("retired_at").unwrap(),
+                    retired_at
+                );
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("deregistered_at").unwrap(),
+                    deregistered_at
+                );
+            }
+        }
+        let legacy = conn
+            .query_sync(
+                "SELECT d.deregistered_at FROM agent_deregistrations d \
+             JOIN agents a ON a.id = d.agent_id WHERE a.name = 'LegacyEnded'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            legacy[0].get_named::<i64>("deregistered_at").unwrap(),
+            2_000_000
+        );
+        let active = conn.query_sync(
+            "SELECT a.name FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.retired_at IS NULL AND d.agent_id IS NULL ORDER BY a.name",
+            &[],
+        ).unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .map(|row| row.get_named::<String>("name").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Active", "Legacy"],
+            "malformed inactive markers must not restore eligibility for new work"
+        );
+        let history = conn
+            .query_sync(
+                "SELECT m.body_md, sender.name AS sender, recipient.name AS recipient \
+             FROM messages m JOIN agents sender ON sender.id = m.sender_id \
+             JOIN message_recipients r ON r.message_id = m.id \
+             JOIN agents recipient ON recipient.id = r.agent_id WHERE m.id = 77",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].get_named::<String>("body_md").unwrap(),
+            "retained transcript\n"
+        );
+        assert_eq!(
+            history[0].get_named::<String>("sender").unwrap(),
+            "Retired0"
+        );
+        assert_eq!(
+            history[0].get_named::<String>("recipient").unwrap(),
+            "Deregistered0"
         );
     }
 
