@@ -11765,6 +11765,12 @@ impl HttpState {
         // MCP JSON-RPC path uses, so a wedged mail request can only consume a
         // dispatch permit and a worker thread, never the async runtime.
         if path == "/mail" || path.starts_with("/mail/") {
+            if let Some(resp) = self
+                .check_mail_write_access_with_cx(&auth_cx, &req, &path)
+                .await
+            {
+                return resp;
+            }
             return self.dispatch_mail_route_blocking(req, path).await;
         }
 
@@ -12192,6 +12198,54 @@ impl HttpState {
     fn csrf_forbidden(&self, req: &Http1Request, detail: &str) -> Http1Response {
         let body = serde_json::json!({ "error": "forbidden", "detail": detail }).to_string();
         self.raw_response(req, 403, "application/json", body.into_bytes())
+    }
+
+    /// Authorize browser mutations before they can acquire a dispatch permit or
+    /// open the mailbox. Authentication has already run in `handle_inner`.
+    async fn check_mail_write_access_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+        path: &str,
+    ) -> Option<Http1Response> {
+        if !matches!(req.method, Http1Method::Post) {
+            return None;
+        }
+        // Keep the existing CSRF rejection ahead of role checks, including
+        // when RBAC or authentication is disabled for a local deployment.
+        if let Some(rejection) = self.mail_csrf_rejection(req) {
+            return Some(rejection);
+        }
+        if !self.config.http_rbac_enabled || self.allow_local_unauthenticated(req) {
+            return None;
+        }
+        let (roles, _) = match self.resolve_rbac_identity_with_cx(cx, req, true).await {
+            Ok(identity) => identity,
+            Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
+        };
+        if roles
+            .iter()
+            .any(|role| self.config.http_rbac_writer_roles.contains(role))
+        {
+            return None;
+        }
+
+        tracing::warn!(
+            event = "http_rbac_denied",
+            path,
+            roles = %roles.join(","),
+            required = "writer",
+            "RBAC denied mail mutation"
+        );
+        Some(self.json_response(
+            req,
+            403,
+            &serde_json::json!({
+                "error": "forbidden",
+                "detail": "Mail mutations require a configured writer role.",
+                "required_role": "writer",
+            }),
+        ))
     }
 
     fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
@@ -12913,15 +12967,15 @@ to skip auth for local requests.</p>
             .await
     }
 
-    async fn check_rbac_and_rate_limit_with_cx(
+    async fn resolve_rbac_identity_with_cx(
         &self,
         cx: &Cx,
         req: &Http1Request,
-        json_rpc: &JsonRpcRequest,
-    ) -> Option<Http1Response> {
-        let (kind, tool_name) = classify_request(json_rpc);
+        allow_browser_query_token: bool,
+    ) -> Result<(Vec<String>, Option<String>), ()> {
         let is_local_ok = self.allow_local_unauthenticated(req);
-        let has_static_bearer = self.has_expected_bearer_header(req);
+        let has_static_bearer = self.has_expected_bearer_header(req)
+            || (allow_browser_query_token && self.has_expected_query_token(req));
         let local_bypass_jwt_sub = if self.config.http_rate_limit_enabled
             && is_local_ok
             && self.config.http_jwt_enabled
@@ -12948,15 +13002,30 @@ to skip auth for local requests.</p>
             if has_static_bearer {
                 (self.static_bearer_rbac_roles(), None)
             } else {
-                match self.decode_jwt_with_cx(cx, req).await {
-                    Ok(ctx) => (ctx.roles, ctx.sub),
-                    Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
-                }
+                let ctx = self.decode_jwt_with_cx(cx, req).await?;
+                (ctx.roles, ctx.sub)
             }
         } else if has_static_bearer {
             (self.static_bearer_rbac_roles(), None)
         } else {
             (self.unauthenticated_default_rbac_roles(req), None)
+        };
+        Ok((roles, jwt_sub))
+    }
+
+    async fn check_rbac_and_rate_limit_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+        json_rpc: &JsonRpcRequest,
+    ) -> Option<Http1Response> {
+        let (kind, tool_name) = classify_request(json_rpc);
+        let is_local_ok = self.allow_local_unauthenticated(req);
+        // Query-token authentication is deliberately limited to browser
+        // routes; it must not grant MCP calls a static token's writer role.
+        let (roles, jwt_sub) = match self.resolve_rbac_identity_with_cx(cx, req, false).await {
+            Ok(identity) => identity,
+            Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
         };
 
         // RBAC (mirrors legacy python behavior)
@@ -24699,6 +24768,400 @@ first body
             resp.status, 401,
             "missing bearer auth must 401 before overseer JSON parsing"
         );
+    }
+
+    fn mail_rbac_test_config() -> mcp_agent_mail_core::Config {
+        mcp_agent_mail_core::Config {
+            http_host: "127.0.0.1".to_string(),
+            http_bearer_token: Some("mail-rbac-static".to_string()),
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("mail-rbac-jwt".to_string()),
+            http_jwt_jwks_url: None,
+            http_jwt_issuer: None,
+            http_jwt_audience: None,
+            http_jwt_algorithms: vec!["HS256".to_string()],
+            http_jwt_role_claim: "role".to_string(),
+            http_rbac_enabled: true,
+            http_rbac_default_role: "reader".to_string(),
+            http_rbac_reader_roles: vec!["reader".to_string()],
+            // A configured role, not a hard-coded spelling of "writer".
+            http_rbac_writer_roles: vec!["mail-operator".to_string()],
+            http_allow_localhost_unauthenticated: false,
+            http_rate_limit_enabled: false,
+            http_cors_origins: Vec::new(),
+            ..mcp_agent_mail_core::Config::from_env()
+        }
+    }
+
+    fn mail_rbac_post(uri: &str, authorization: Option<&str>, body: &str) -> Http1Request {
+        let mut headers = vec![("Content-Type", "application/json")];
+        if let Some(authorization) = authorization {
+            headers.push(("Authorization", authorization));
+        }
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            uri,
+            &headers,
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = body.as_bytes().to_vec();
+        req
+    }
+
+    #[test]
+    fn mail_post_rbac_rejects_before_cold_mailbox_admission() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let database_path = resolve_server_database_url_sqlite_path(&config.database_url)
+                .expect("fixture database path");
+            let storage_root = config.storage_root.clone();
+            let state = build_state(config);
+            assert!(!database_path.exists());
+            assert!(mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none());
+
+            for role in ["reader", "unknown", "writer"] {
+                let token = hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": role}));
+                let auth = format!("Bearer {token}");
+                for (uri, body) in [
+                    ("/mail/p/inbox/BlueLake/mark-read", r#"{"message_ids":[1]}"#),
+                    ("/mail/p/inbox/BlueLake/mark-all-read", "{}"),
+                    (
+                        "/mail/p/overseer/send",
+                        r#"{"intent":"human_overseer_send","recipients":["BlueLake"],"subject":"RBAC","body_md":"Test","reason":"Regression"}"#,
+                    ),
+                    ("/mail/api/projects/1/siblings/2", r#"{"action":"confirm"}"#),
+                ] {
+                    let resp = block_on(state.handle(mail_rbac_post(uri, Some(&auth), body)));
+                    assert_eq!(resp.status, 403, "role={role}, route={uri}");
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&resp.body).expect("structured mail refusal");
+                    assert_eq!(payload["required_role"], "writer");
+                    assert_eq!(payload["error"], "forbidden");
+                    assert!(
+                        !database_path.exists(),
+                        "a refused {uri} must not create the mailbox"
+                    );
+                    assert!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none(),
+                        "a refused {uri} must not admit a database pool"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root)
+                            .expect("archive directory")
+                            .count(),
+                        0,
+                        "a refused {uri} must not create archive or lease artifacts"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn mail_post_rbac_preserves_rows_and_accepts_configured_writers() {
+        async fn snapshot(
+            cx: &Cx,
+            pool: &mcp_agent_mail_db::DbPool,
+        ) -> (i64, i64, i64, i64, String) {
+            let conn = pool
+                .acquire(cx)
+                .await
+                .into_result()
+                .expect("snapshot checkout");
+            let rows = conn
+                .query_sync(
+                    "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+                     (SELECT COUNT(*) FROM agents) AS agents, \
+                     (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL) AS reads, \
+                     (SELECT COUNT(*) FROM message_recipients) AS recipients, \
+                     (SELECT status FROM project_sibling_suggestions WHERE id = 1) AS sibling",
+                    &[],
+                )
+                .expect("read mutation witnesses");
+            let row = rows.first().expect("snapshot row");
+            (
+                row.get_named("messages").expect("message count"),
+                row.get_named("agents").expect("agent count"),
+                row.get_named("reads").expect("read receipt count"),
+                row.get_named("recipients").expect("recipient count"),
+                row.get_named("sibling").expect("sibling state"),
+            )
+        }
+
+        with_serialized_tool_dispatch_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            |_| {
+                let config = mail_rbac_test_config();
+                let storage_root = config.storage_root.clone();
+                let state = build_state(config);
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("fixture runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                        .expect("real mailbox pool");
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed checkout");
+                    for sql in [
+                        "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                         (1, 'p', '/synthetic/mail-rbac', 1), (2, 'q', '/synthetic/mail-rbac-other', 1)",
+                        "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                         VALUES (1, 1, 'RedFox', 'test', 'test', 1, 1), (2, 1, 'BlueLake', 'test', 'test', 1, 1)",
+                        "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES (1, 1, 1, 'First', 'Body', 1), (2, 1, 1, 'Second', 'Body', 2), \
+                         (3, 1, 1, 'Third', 'Body', 3)",
+                        "INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 2), (2, 2), (3, 2)",
+                        "INSERT INTO project_sibling_suggestions \
+                         (id, project_a_id, project_b_id, score, created_ts, evaluated_ts) \
+                         VALUES (1, 1, 2, 0.9, 1, 1)",
+                    ] {
+                        conn.execute_sync(sql, &[]).expect("seed real mailbox rows");
+                    }
+                    drop(conn);
+                    let before = snapshot(&cx, &pool).await;
+                    assert_eq!(before, (3, 2, 0, 3, "suggested".to_string()));
+                    let archive_entries_before = std::fs::read_dir(&storage_root)
+                        .expect("seeded archive directory")
+                        .count();
+                    let reader = format!(
+                        "Bearer {}",
+                        hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+                    );
+                    let writer = format!(
+                        "Bearer {}",
+                        hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "mail-operator"}))
+                    );
+                    let overseer_body = r#"{"intent":"human_overseer_send","recipients":["BlueLake"],"subject":"RBAC","body_md":"Test","reason":"Regression"}"#;
+                    for (uri, body) in [
+                        ("/mail/p/inbox/BlueLake/mark-read", r#"{"message_ids":[1]}"#),
+                        ("/mail/p/inbox/BlueLake/mark-all-read", "{}"),
+                        ("/mail/p/overseer/send", overseer_body),
+                        ("/mail/api/projects/1/siblings/2", r#"{"action":"confirm"}"#),
+                    ] {
+                        let resp = state.handle(mail_rbac_post(uri, Some(&reader), body)).await;
+                        assert_eq!(resp.status, 403, "reader must not mutate {uri}");
+                        assert_eq!(snapshot(&cx, &pool).await, before, "denied route {uri}");
+                    }
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root).expect("archive directory").count(),
+                        archive_entries_before,
+                        "denied requests must not create archive artifacts"
+                    );
+
+                    let get = make_request_with_peer_addr(
+                        Http1Method::Get,
+                        "/mail/api/unified-inbox",
+                        &[("Authorization", reader.as_str())],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    );
+                    assert_eq!(state.handle(get).await.status, 200, "reader GET stays available");
+                    assert_eq!(snapshot(&cx, &pool).await, before);
+
+                    // Exercise the actual write handler for all three accepted
+                    // credentials, including browser-only query authentication.
+                    for (uri, auth, id) in [
+                        ("/mail/p/inbox/BlueLake/mark-read", Some(writer.as_str()), 1),
+                        ("/mail/p/inbox/BlueLake/mark-read", Some("Bearer mail-rbac-static"), 2),
+                        ("/mail/p/inbox/BlueLake/mark-read?token=mail-rbac-static", None, 3),
+                    ] {
+                        let body = format!(r#"{{"message_ids":[{id}]}}"#);
+                        let resp = state.handle(mail_rbac_post(uri, auth, &body)).await;
+                        assert_eq!(resp.status, 200, "authorized route {uri}: {:?}", resp.body);
+                        assert_eq!(snapshot(&cx, &pool).await.2, id);
+                    }
+                    let sent = state.handle(mail_rbac_post(
+                        "/mail/p/overseer/send?token=mail-rbac-static",
+                        Some(&reader),
+                        overseer_body,
+                    )).await;
+                    assert_eq!(sent.status, 200, "browser static token retains writer authority");
+                    assert_eq!(snapshot(&cx, &pool).await, (4, 3, 3, 4, "suggested".to_string()));
+                    let sibling = state.handle(mail_rbac_post(
+                        "/mail/api/projects/1/siblings/2",
+                        Some("Bearer mail-rbac-static"),
+                        r#"{"action":"confirm"}"#,
+                    )).await;
+                    assert_eq!(sibling.status, 200);
+                    let all_read = state.handle(mail_rbac_post(
+                        "/mail/p/inbox/BlueLake/mark-all-read",
+                        Some(&writer),
+                        "{}",
+                    )).await;
+                    assert_eq!(all_read.status, 200);
+                    assert_eq!(snapshot(&cx, &pool).await, (4, 3, 4, 4, "confirmed".to_string()));
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn mail_post_rbac_preserves_auth_csrf_and_local_policy() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let state = build_state(config.clone());
+            let uri = "/mail/p/overseer/send";
+            let reader = format!(
+                "Bearer {}",
+                hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+            );
+            let writer = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"mail-rbac-jwt",
+                    &serde_json::json!({"role": "mail-operator"})
+                )
+            );
+            let expired = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"mail-rbac-jwt",
+                    &serde_json::json!({"role": "mail-operator", "exp": 1})
+                )
+            );
+            let wrong_secret = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"other-secret",
+                    &serde_json::json!({"role": "mail-operator"})
+                )
+            );
+
+            for auth in [
+                None,
+                Some("Bearer malformed"),
+                Some(expired.as_str()),
+                Some(wrong_secret.as_str()),
+            ] {
+                let mut req = mail_rbac_post(uri, auth, "not json");
+                req.headers.retain(|(name, _)| name != "Content-Type");
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 401, "authentication precedes CSRF and roles");
+            }
+            let invalid_query = block_on(state.handle(mail_rbac_post(
+                "/mail/p/overseer/send?token=wrong-token",
+                None,
+                "not json",
+            )));
+            assert_eq!(invalid_query.status, 401);
+
+            let mut non_json = mail_rbac_post(uri, Some(&reader), "not json");
+            non_json.headers.retain(|(name, _)| name != "Content-Type");
+            let resp = block_on(state.handle(non_json));
+            assert_eq!(resp.status, 403);
+            let payload: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(
+                payload["detail"],
+                "mutating mail requests require Content-Type: application/json"
+            );
+            assert!(
+                payload.get("required_role").is_none(),
+                "CSRF refusal stays first"
+            );
+            let mut cross_origin = mail_rbac_post(uri, Some(&writer), "not json");
+            cross_origin.headers.extend([
+                ("Host".to_string(), "mail.example.test".to_string()),
+                (
+                    "Origin".to_string(),
+                    "https://other.example.test".to_string(),
+                ),
+            ]);
+            let resp = block_on(state.handle(cross_origin));
+            assert_eq!(resp.status, 403);
+            let payload: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(payload["detail"], "cross-origin request rejected");
+
+            // Query tokens authenticate the browser only. A valid reader JWT
+            // must not gain writer privileges by adding the same token to MCP.
+            let mut mcp = mail_rbac_post("/api?token=mail-rbac-static", Some(&reader), "");
+            mcp.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({"name": "send_message", "arguments": {}})),
+                1_i64,
+            ))
+            .unwrap();
+            assert_eq!(block_on(state.handle(mcp)).status, 403);
+            assert_eq!(
+                block_on(state.handle(mail_rbac_post(
+                    "/api?token=mail-rbac-static",
+                    None,
+                    "not json",
+                )))
+                .status,
+                401
+            );
+
+            // These permitted requests reach the real handler's JSON parser;
+            // the deliberately invalid body keeps the policy controls read-only.
+            let disabled = build_state(mcp_agent_mail_core::Config {
+                http_rbac_enabled: false,
+                ..config.clone()
+            });
+            assert_eq!(
+                block_on(disabled.handle(mail_rbac_post(uri, Some(&reader), "not json"))).status,
+                400
+            );
+            assert_eq!(
+                block_on(disabled.handle(mail_rbac_post(uri, Some(&expired), "not json"))).status,
+                401
+            );
+
+            let static_only = build_state(mcp_agent_mail_core::Config {
+                http_jwt_enabled: false,
+                ..config.clone()
+            });
+            for (path, auth) in [
+                (uri, Some("Bearer mail-rbac-static")),
+                ("/mail/p/overseer/send?token=mail-rbac-static", None),
+            ] {
+                assert_eq!(
+                    block_on(static_only.handle(mail_rbac_post(path, auth, "not json"))).status,
+                    400,
+                    "static credentials retain writer roles with JWT disabled"
+                );
+            }
+
+            let local = build_state(mcp_agent_mail_core::Config {
+                http_allow_localhost_unauthenticated: true,
+                ..config.clone()
+            });
+            for auth in [None, Some("Bearer malformed")] {
+                let mut req = mail_rbac_post(uri, auth, "not json");
+                req.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+                assert_eq!(
+                    block_on(local.handle(req)).status,
+                    400,
+                    "explicit local bypass remains complete"
+                );
+            }
+            let mut forwarded = mail_rbac_post(uri, Some(&reader), "not json");
+            forwarded.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+            forwarded
+                .headers
+                .push(("X-Forwarded-For".to_string(), "10.0.0.1".to_string()));
+            assert_eq!(
+                block_on(local.handle(forwarded)).status,
+                403,
+                "forwarding disables local bypass"
+            );
+
+            let no_auth = build_state(mcp_agent_mail_core::Config {
+                http_bearer_token: None,
+                http_jwt_enabled: false,
+                ..config
+            });
+            let mut loopback = mail_rbac_post(uri, None, "not json");
+            loopback.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+            assert_eq!(
+                block_on(no_auth.handle(loopback)).status,
+                400,
+                "direct no-auth loopback keeps writer access"
+            );
+            assert_eq!(
+                block_on(no_auth.handle(mail_rbac_post(uri, None, "not json"))).status,
+                403,
+                "remote no-auth clients keep the default reader role"
+            );
+        });
     }
 
     #[test]
