@@ -1546,7 +1546,7 @@ mod tests {
         });
         let (waiter_tx, waiter_rx) = mpsc::channel();
         let waiter_slot = Arc::clone(&slot);
-        let mut waiter_build = build.clone();
+        let mut waiter_build = build;
         waiter_build.deadline = waiter_build
             .deadline
             .min(Instant::now() + Duration::from_secs(5));

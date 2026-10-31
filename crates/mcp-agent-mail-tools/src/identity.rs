@@ -2790,7 +2790,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         }),
         lexical_backfill: pool
             .as_ref()
-            .map(|pool| mcp_agent_mail_db::search_service::lexical_backfill_health(pool)),
+            .map(mcp_agent_mail_db::search_service::lexical_backfill_health),
         circuit_breakers: Some(mcp_agent_mail_db::db_health_status()),
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),

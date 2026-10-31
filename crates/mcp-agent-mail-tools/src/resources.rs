@@ -3986,9 +3986,9 @@ async fn load_outbox_messages(
     let capped_rows: Vec<_> = rows.into_iter().take(200).collect();
     let message_ids: Vec<i64> = capped_rows
         .iter()
-        .map(|row| row.get_as(0))
+        .map(|row| row.get_as(0).map_err(|error| error.to_string()))
         .collect::<Result<_, _>>()
-        .map_err(|error| resource_sync_db_error_to_mcp_error(error.to_string()))?;
+        .map_err(resource_sync_db_error_to_mcp_error)?;
     let mut project_recipients =
         mcp_agent_mail_db::project_mailbox::project_mailbox_recipients_from_conn(
             &*conn,
@@ -6726,7 +6726,7 @@ mod resource_shape_tests {
                         .await
                         .expect("mounted agent roster with one connection");
                     let roster_response = serde_json::to_value(roster_response).unwrap();
-                    let roster =
+                    let agent_roster =
                         parse_json(roster_response["contents"][0]["text"].as_str().unwrap());
                     for (name, unread) in [
                         ("BlueLake", 0),
@@ -6734,7 +6734,7 @@ mod resource_shape_tests {
                         ("GreenCastle", 3),
                         ("DarkRose", 3),
                     ] {
-                        let entry = roster["agents"]
+                        let entry = agent_roster["agents"]
                             .as_array()
                             .unwrap()
                             .iter()

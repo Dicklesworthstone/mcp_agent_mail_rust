@@ -24312,7 +24312,7 @@ mod tests {
                 "root" => config.storage_root.push("other"),
                 "author" => config.git_author_name.push_str(" other"),
                 "email" => config.git_author_email.push_str(".other"),
-                "other-op" => batch[1].op = Box::new(wbq_test_clear_signal_op("bounded")),
+                "other-op" => *batch[1].op = wbq_test_clear_signal_op("bounded"),
                 _ => unreachable!(),
             }
             assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 1, "{boundary}");
