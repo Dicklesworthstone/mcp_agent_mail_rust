@@ -28,6 +28,7 @@ use super::agent_reconcile::{committed_artifact, head_tree, read_artifact};
 use retry::RetryQueue;
 
 const IDS_PER_PASS: i64 = 32;
+const DISCOVERY_ROWS_PER_PASS: usize = 128;
 const WRITES_PER_PASS: usize = 4;
 const SOURCE_BYTES: i64 = 32 * 1024;
 const ARTIFACT_BYTES: usize = 128 * 1024;
@@ -223,6 +224,9 @@ pub struct ActiveReservationReport {
     pub deferred: usize,
     pub deferred_transient: usize,
     pub retry_len: usize,
+    /// The finite metadata scan advanced, even when no eligible lease needed
+    /// a payload read. This is not a repair or permission to skip a candidate.
+    pub discovery_advanced: bool,
     /// Discovery has more candidates, or retained retry debt still exists.
     /// Cooling retries remain debt even when this pass scans no payloads.
     pub more: bool,
@@ -724,14 +728,23 @@ fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
     Ok(())
 }
 
+struct ActiveSelection {
+    ids: Vec<i64>,
+    started_after: i64,
+    ineligible_prefix: i64,
+    examined_through: i64,
+    more: bool,
+}
+
 // The caller owns database admission throughout source binding and selection.
-// Keep the existing finite ID window and all active/grace/release predicates.
+// Bound the primary-key page before applying eligibility: a LIMIT on matching
+// leases alone can scan an entire released history while holding admission.
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
     cursor: &mut ActiveReservationCursor,
-) -> Result<Vec<i64>, String> {
+) -> Result<ActiveSelection, String> {
     validate_source(cx, pool, config)?;
     let identity = pool.sqlite_identity_key();
     if cursor.identity != identity {
@@ -741,30 +754,68 @@ fn select_ids(
         };
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    if cursor.ceiling.is_none() {
+    let (after, ceiling) = if let Some(ceiling) = cursor.ceiling {
+        (cursor.after, ceiling)
+    } else {
         let rows = conn
             .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
             .map_err(source_error)?;
-        cursor.ceiling = Some(
+        (
+            0,
             rows.first()
                 .ok_or("reservation ID aggregate missing")?
                 .get_as::<i64>(0)
                 .map_err(source_error)?,
-        );
-        cursor.after = 0;
-    }
+        )
+    };
+    let now = mcp_agent_mail_db::now_micros();
     let rows = conn.query_sync(
-        "SELECT id FROM file_reservations WHERE id > ? AND id <= ? AND expires_ts > ? \
-         AND created_ts <= ? AND (released_ts IS NULL OR released_ts <= 0) \
+        "SELECT id, CASE WHEN expires_ts > ?3 AND created_ts <= ?4 \
+         AND (released_ts IS NULL OR released_ts <= 0) \
          AND NOT EXISTS (SELECT 1 FROM file_reservation_releases rr WHERE rr.reservation_id = file_reservations.id) \
-         ORDER BY id LIMIT ?",
-        &[cursor.after.into(), cursor.ceiling.unwrap_or(0).into(),
-          mcp_agent_mail_db::now_micros().into(),
-          mcp_agent_mail_db::now_micros().saturating_sub(GRANT_GRACE_US).into(), IDS_PER_PASS.into()],
+         THEN 1 ELSE 0 END AS eligible \
+         FROM file_reservations WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT ?5",
+        &[after.into(), ceiling.into(), now.into(),
+          now.saturating_sub(GRANT_GRACE_US).into(),
+          i64::try_from(DISCOVERY_ROWS_PER_PASS).expect("small discovery bound").into()],
     ).map_err(source_error)?;
-    rows.iter()
-        .map(|row| row.get_named::<i64>("id").map_err(source_error))
-        .collect()
+    let mut ids = Vec::new();
+    let mut last = after;
+    let mut ineligible_prefix = after;
+    let mut examined_through = after;
+    let mut truncated = false;
+    for row in &rows {
+        let id = row.get_named::<i64>("id").map_err(source_error)?;
+        let eligible = row.get_named::<i64>("eligible").map_err(source_error)?;
+        if id <= last || id > ceiling || !matches!(eligible, 0 | 1) {
+            return Err("active reservation page contains invalid selection evidence".into());
+        }
+        last = id;
+        if truncated {
+            continue;
+        }
+        if eligible == 1 {
+            if ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound") {
+                truncated = true;
+                continue;
+            }
+            ids.push(id);
+        } else if ids.is_empty() {
+            ineligible_prefix = id;
+        }
+        examined_through = id;
+    }
+    // Publish a new round only after the complete metadata page decoded. Its
+    // eligible IDs remain unconsumed until the ordinary source/publication loop.
+    cursor.after = after;
+    cursor.ceiling = Some(ceiling);
+    Ok(ActiveSelection {
+        ids,
+        started_after: after,
+        ineligible_prefix,
+        examined_through,
+        more: truncated || (rows.len() == DISCOVERY_ROWS_PER_PASS && last < ceiling),
+    })
 }
 
 /// Repair missing generation-stamped stable artifacts for settled active leases.
@@ -795,15 +846,23 @@ pub fn reconcile_active_reservations(
     if corruption_circuit_breaker().is_tripped() {
         return Err("active reservation repair refused: corruption breaker open".into());
     }
-    let ids = {
+    let selected = {
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or(
             "active reservation repair deferred: recovery promotion or admission contention",
         )?;
         select_ids(cx, pool, config, cursor)?
     };
+    if checkpoint(cx, stop).is_err() {
+        report.interrupted = true;
+        report.retry_len = cursor.retries.len();
+        report.more = true;
+        return Ok(report);
+    }
     let selected_identity = cursor.identity.clone();
-    let mut scan_more = ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound");
-    let mut scan = ids.into_iter().peekable();
+    let mut scan_more = selected.more;
+    let last_selected = selected.ids.last().copied();
+    cursor.after = selected.ineligible_prefix;
+    let mut scan = selected.ids.into_iter().peekable();
     let mut retries = cursor.retries.due(Instant::now()).into_iter();
     let mut seen = HashSet::new();
     loop {
@@ -908,6 +967,13 @@ pub fn reconcile_active_reservations(
             cursor.after = id;
         }
     }
+    // Only a fully consumed eligible prefix permits skipping its following
+    // ineligible metadata. A write/payload limit must retain every unvisited
+    // eligible ID, including one already taken from the iterator before yield.
+    if !report.interrupted && last_selected.is_none_or(|id| cursor.after >= id) {
+        cursor.after = selected.examined_through;
+    }
+    report.discovery_advanced = cursor.after > selected.started_after;
     // Discovery wraps independently of retry debt. A cooling retry must not
     // pin a completed round or restart it early while there are unvisited IDs.
     if !scan_more && !report.interrupted {
@@ -1396,6 +1462,134 @@ mod tests {
             let report = pass(cx, pool, config);
             assert_eq!((report.repaired, report.deferred), (0, 1));
             assert_eq!(fs::read(path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn sparse_active_discovery_bounds_history_and_retains_unpublished_eligible_ids() {
+        fixture(|cx, pool, config| {
+            let future = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE file_reservations SET expires_ts=9000000 WHERE id=401")
+                .unwrap();
+            for id in 402..=610 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT {id}, project_id, agent_id, 'src/{id}.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401")).unwrap();
+            }
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET expires_ts={future}, released_ts=5000000 WHERE id=500"
+            ))
+            .unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET expires_ts={future} WHERE id=501 OR id BETWEEN 600 AND 605"
+            ))
+            .unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(501, 5000000)").unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET created_ts={future}, expires_ts={} WHERE id=502",
+                future + 3_600_000_000,
+            ))
+            .unwrap();
+            let before = conn
+                .query_sync("SELECT id, created_ts, expires_ts, released_ts FROM file_reservations WHERE id <= 610 ORDER BY id", &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| (
+                    row.get_named::<i64>("id").unwrap(),
+                    row.get_named::<i64>("created_ts").unwrap(),
+                    row.get_named::<i64>("expires_ts").unwrap(),
+                    row.get_named::<Option<i64>>("released_ts").unwrap(),
+                ))
+                .collect::<Vec<_>>();
+            drop(conn);
+            let stop = AtomicBool::new(false);
+            let mut cursor = ActiveReservationCursor::default();
+            let first =
+                reconcile_active_reservations(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((first.scanned, first.attempted, first.repaired), (0, 0, 0));
+            assert_eq!(
+                cursor.after, 528,
+                "discovery must stop after 128 metadata rows"
+            );
+            assert_eq!(cursor.ceiling, Some(610));
+            assert!(first.discovery_advanced && first.more);
+
+            // New arrivals cannot expand the captured round. This lease must
+            // remain untouched while the old sparse history catches up.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT 900, project_id, agent_id, 'new.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=600").unwrap();
+            drop(conn);
+            let second =
+                reconcile_active_reservations(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (second.scanned, second.attempted, second.repaired),
+                (4, 4, 4)
+            );
+            assert_eq!(
+                cursor.after, 603,
+                "a metadata page cannot consume an unpublished lease"
+            );
+            assert!(second.discovery_advanced && second.more);
+            let third =
+                reconcile_active_reservations(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((third.scanned, third.attempted, third.repaired), (2, 2, 2));
+            assert_eq!(cursor.after, 610);
+            assert!(cursor.ceiling.is_none());
+            assert!(third.discovery_advanced && !third.more);
+            for id in 600..=605 {
+                assert_committed(cx, pool, config, id);
+            }
+            for id in [401, 500, 501, 502, 900] {
+                assert!(
+                    !config
+                        .storage_root
+                        .join(format!(
+                            "projects/project/file_reservations/id-{id}-gaabb.json"
+                        ))
+                        .exists()
+                );
+            }
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let after = conn
+                .query_sync("SELECT id, created_ts, expires_ts, released_ts FROM file_reservations WHERE id <= 610 ORDER BY id", &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| (
+                    row.get_named::<i64>("id").unwrap(),
+                    row.get_named::<i64>("created_ts").unwrap(),
+                    row.get_named::<i64>("expires_ts").unwrap(),
+                    row.get_named::<Option<i64>>("released_ts").unwrap(),
+                ))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                after, before,
+                "discovery and repair must not mutate source rows"
+            );
+        });
+    }
+
+    #[test]
+    fn active_discovery_caps_candidates_without_consuming_the_metadata_page_tail() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..=440 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT {id}, project_id, agent_id, 'src/{id}.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401")).unwrap();
+            }
+            drop(conn);
+            let mut cursor = ActiveReservationCursor::default();
+            let first = select_ids(cx, pool, config, &mut cursor).unwrap();
+            assert_eq!(first.ids, (401..=432).collect::<Vec<_>>());
+            assert_eq!(first.ineligible_prefix, 0);
+            assert_eq!(first.examined_through, 432);
+            assert!(first.more);
+            assert_eq!(
+                cursor.after, 0,
+                "selection alone cannot consume eligible IDs"
+            );
+            cursor.after = first.examined_through;
+            let rest = select_ids(cx, pool, config, &mut cursor).unwrap();
+            assert_eq!(rest.ids, (433..=440).collect::<Vec<_>>());
+            assert_eq!(rest.examined_through, 440);
+            assert!(!rest.more);
         });
     }
 

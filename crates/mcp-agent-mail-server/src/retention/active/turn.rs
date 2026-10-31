@@ -128,7 +128,8 @@ fn run_with(
             return Ok(stopped());
         }
         let delay = next_delay(&report);
-        let progressed = report.repaired > 0 || (report.unchanged > 0 && report.deferred == 0);
+        let progressed = report.repaired > 0
+            || ((report.unchanged > 0 || report.discovery_advanced) && report.deferred == 0);
         if delay != CATCH_UP_INTERVAL
             || !report.more
             || !progressed
@@ -308,6 +309,59 @@ mod tests {
                 idle: false,
             }
         );
+    }
+
+    #[test]
+    fn metadata_only_pages_catch_up_without_payloads_or_unbounded_turns() {
+        let metadata_page = || ActiveReservationReport {
+            discovery_advanced: true,
+            more: true,
+            ..Default::default()
+        };
+        let mut reports = VecDeque::from([
+            metadata_page(),
+            metadata_page(),
+            busy(),
+            ActiveReservationReport::default(),
+        ]);
+        let mut observed = Vec::new();
+        let turn = run_with(
+            || {
+                Ok(reports
+                    .pop_front()
+                    .expect("completed discovery must return to idle"))
+            },
+            |report| observed.push((report.scanned, report.repaired, report.discovery_advanced)),
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap();
+        assert!(reports.is_empty());
+        assert_eq!(
+            observed,
+            [(0, 0, true), (0, 0, true), (4, 4, false), (0, 0, false)]
+        );
+        assert_eq!(
+            turn,
+            Turn {
+                delay: POLL_INTERVAL,
+                idle: true
+            }
+        );
+
+        let mut calls = 0;
+        let turn = run_with(
+            || {
+                calls += 1;
+                Ok(metadata_page())
+            },
+            |_| {},
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(calls, MAX_BATCHES_PER_TURN);
+        assert_eq!(turn, pending());
     }
 
     #[test]
