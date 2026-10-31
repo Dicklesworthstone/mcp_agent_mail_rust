@@ -1291,6 +1291,15 @@ fn dispatch_release_archive_write(
     );
 }
 
+// Cancelling an optional replay does not invalidate already accepted work.
+// Keep this separate from foreground admission: cancellation must never be a
+// reason to enqueue a new release intent.
+fn release_intent_replay_error(error: McpError) -> (String, bool) {
+    let retryable =
+        error.code == McpErrorCode::RequestCancelled || mcp_error_supports_release_intent(&error);
+    (error.to_string(), retryable)
+}
+
 async fn replay_single_release_intent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -1299,12 +1308,14 @@ async fn replay_single_release_intent(
 ) -> Result<usize, (String, bool)> {
     // Shared recovery admits only full-hash-verified release records and
     // validates the bounded journal snapshot before replay mutates the database.
+    ensure_request_live(ctx).map_err(release_intent_replay_error)?;
     let project = resolve_project(ctx, pool, &intent.project_key)
         .await
-        .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
+        .map_err(release_intent_replay_error)?;
+    ensure_request_live(ctx).map_err(release_intent_replay_error)?;
     let project_id = project.id.unwrap_or(0);
     let normalized_paths = normalize_filter_paths(&project.human_key, intent.paths.clone())
-        .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
+        .map_err(release_intent_replay_error)?;
     let agent = resolve_agent(
         ctx,
         pool,
@@ -1314,7 +1325,8 @@ async fn replay_single_release_intent(
         &project.human_key,
     )
     .await
-    .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
+    .map_err(release_intent_replay_error)?;
+    ensure_request_live(ctx).map_err(release_intent_replay_error)?;
     let agent_id = agent.id.unwrap_or(0);
     let ids_to_release = if normalized_paths.is_some() || intent.file_reservation_ids.is_some() {
         let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
@@ -1351,6 +1363,7 @@ async fn replay_single_release_intent(
     } else {
         None
     };
+    ensure_request_live(ctx).map_err(release_intent_replay_error)?;
 
     // A durable release expresses the leases held when it was queued, not a
     // standing instruction to release this agent's future work. Enforce its
@@ -1379,6 +1392,7 @@ async fn replay_single_release_intent(
             return Err((format!("panicked: {}", panic.message()), true));
         }
     };
+    ensure_request_live(ctx).map_err(release_intent_replay_error)?;
     let db_generation = fetch_db_generation(ctx, pool).await;
     dispatch_release_archive_write(
         ctx,
@@ -1396,6 +1410,9 @@ async fn replay_queued_release_intents(
     pool: &mcp_agent_mail_db::DbPool,
     config: &Config,
 ) {
+    if ensure_request_live(ctx).is_err() {
+        return;
+    }
     let intents = match read_queued_release_intents(config) {
         Ok(intents) => intents,
         Err(error) => {
@@ -1404,7 +1421,19 @@ async fn replay_queued_release_intents(
         }
     };
     for intent in intents {
-        match replay_single_release_intent(ctx, pool, config, &intent).await {
+        if ensure_request_live(ctx).is_err() {
+            break;
+        }
+        let outcome = replay_single_release_intent(ctx, pool, config, &intent).await;
+        // The foreground release may already have committed before this
+        // optional drain is cancelled. Leave accepted work pending instead of
+        // publishing terminal receipts from a cancelled request. If a replay
+        // write raced cancellation, the release ledger remains authoritative
+        // and the normal archive recovery path still completes publication.
+        if ensure_request_live(ctx).is_err() {
+            break;
+        }
+        match outcome {
             Ok(released) => {
                 append_release_replay_record(
                     config,
@@ -8007,6 +8036,258 @@ mod tests {
                 1
             );
         });
+    }
+
+    #[test]
+    fn release_replay_cancellation_does_not_change_foreground_queue_policy() {
+        let cancelled = McpError::request_cancelled();
+        assert!(!mcp_error_supports_release_intent(&cancelled));
+        assert!(release_intent_replay_error(cancelled).1);
+        let missing = db_error_to_mcp_error(DbError::not_found("Agent", "missing"));
+        assert!(!release_intent_replay_error(missing).1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cancelled_release_replay_preserves_intents_before_and_during_lookup() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use std::time::Duration;
+
+        for stage in [
+            "before_replay",
+            "project_lookup",
+            "agent_lookup",
+            "reservation_lookup",
+        ] {
+            for request_token in [false, true] {
+                crate::test_support::with_isolated_mailbox(
+                    &RESERVATION_TEST_LOCK,
+                    "release-replay-cancellation",
+                    &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+                    |_| {
+                        run_async(|cx| async move {
+                            let pool = get_db_pool().expect("real mailbox pool");
+                            let project =
+                                ensure_project(&cx, &pool, "/tmp/release-replay-cancellation")
+                                    .await;
+                            let project_id = project.id.unwrap();
+                            let holder = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                            let healthy = McpContext::new(cx.clone(), 1);
+                            let grants = keyed_reservation_response(
+                                &healthy,
+                                &project.human_key,
+                                &holder.name,
+                                &["src/path.rs", "src/id.rs"],
+                                None,
+                            )
+                            .await;
+                            let ids: Vec<i64> = grants["granted"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|grant| grant["id"].as_i64().unwrap())
+                                .collect();
+                            assert_eq!(ids.len(), 2);
+                            let before = queries::get_reservations_by_ids(&cx, &pool, &ids)
+                                .await
+                                .into_result()
+                                .expect("original leases");
+                            let selected_id = before
+                                .iter()
+                                .find(|row| row.path_pattern == "src/id.rs")
+                                .expect("explicit ID release target")
+                                .id
+                                .unwrap();
+                            let config = Config::get();
+                            for (paths, selected_ids) in [
+                                (Some(vec!["src/path.rs".to_string()]), None),
+                                (None, Some(vec![selected_id])),
+                            ] {
+                                append_release_intent(
+                                    &config,
+                                    &project.human_key,
+                                    &holder.name,
+                                    paths,
+                                    selected_ids,
+                                    "release_reservations",
+                                    "accepted before the replay request",
+                                )
+                                .expect("persist real durable release intent");
+                            }
+                            let pending = read_queued_release_intents(&config).unwrap();
+                            assert_eq!(pending.len(), 2);
+                            let log = release_intent_log_path(&config);
+                            let journal_before = std::fs::read(&log).unwrap();
+                            mcp_agent_mail_storage::wbq_flush();
+                            mcp_agent_mail_storage::flush_async_commits();
+                            let directory = config
+                                .storage_root
+                                .join("projects")
+                                .join(&project.slug)
+                                .join("file_reservations");
+                            let artifacts: Vec<_> = ids.iter().map(|id| {
+                                let path = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                                    &directory, *id,
+                                ).expect("active lease artifact");
+                                let bytes = std::fs::read(&path).unwrap();
+                                (path, bytes)
+                            }).collect();
+
+                            // Force the selected real await by clearing only
+                            // this mailbox's cache and priming earlier lookups.
+                            let cache = mcp_agent_mail_db::cache::read_cache();
+                            let scope = pool.sqlite_identity_key();
+                            cache.invalidate_scope(&scope);
+                            let project_cached =
+                                matches!(stage, "agent_lookup" | "reservation_lookup");
+                            if project_cached {
+                                queries::get_project_by_slug(&cx, &pool, &project.slug)
+                                    .await
+                                    .into_result()
+                                    .expect("prime project lookup");
+                            }
+                            assert_eq!(
+                                cache.get_project_scoped(&scope, &project.slug).is_some(),
+                                project_cached,
+                            );
+                            if stage == "reservation_lookup" {
+                                queries::get_agent(&cx, &pool, project_id, &holder.name)
+                                    .await
+                                    .into_result()
+                                    .expect("prime agent lookup");
+                            }
+                            assert_eq!(
+                                cache
+                                    .get_agent_scoped(&scope, project_id, &holder.name)
+                                    .is_some(),
+                                stage == "reservation_lookup",
+                            );
+
+                            let request_cx = Cx::for_testing();
+                            let ctx = McpContext::new(request_cx.clone(), 2);
+                            let cancel = || {
+                                if request_token {
+                                    assert!(ctx.request_cancellation().cancel());
+                                } else {
+                                    request_cx.set_cancel_requested(true);
+                                }
+                            };
+                            if stage == "before_replay" {
+                                cancel();
+                                let error = release_file_reservations(
+                                    &ctx,
+                                    project.human_key.clone(),
+                                    holder.name.clone(),
+                                    None,
+                                    Some(vec![ids[0]]),
+                                )
+                                .await
+                                .expect_err("cancelled foreground release cannot enqueue");
+                                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                                replay_queued_release_intents(&ctx, &pool, &config).await;
+                            } else {
+                                let held = pool
+                                    .acquire(&cx)
+                                    .await
+                                    .into_result()
+                                    .expect("hold sole checkout before selected lookup");
+                                let mut waiting = std::pin::pin!(replay_queued_release_intents(
+                                    &ctx, &pool, &config,
+                                ));
+                                {
+                                    let mut context = Context::from_waker(Waker::noop());
+                                    assert!(
+                                        matches!(
+                                            waiting.as_mut().poll(&mut context),
+                                            Poll::Pending
+                                        ),
+                                        "actual {stage} must wait for the occupied checkout"
+                                    );
+                                }
+                                cancel();
+                                drop(held);
+                                asupersync::time::timeout(
+                                    cx.now(),
+                                    Duration::from_secs(5),
+                                    waiting,
+                                )
+                                .await
+                                .expect("cancelled replay leaves the wait promptly");
+                            }
+
+                            assert_eq!(
+                                std::fs::read(&log).unwrap(),
+                                journal_before,
+                                "{stage}, request_token={request_token}: cancellation publishes no replay marker"
+                            );
+                            assert_eq!(read_queued_release_intents(&config).unwrap(), pending);
+                            assert!(
+                                !cx.is_cancel_requested(),
+                                "cancellation stays request-scoped"
+                            );
+                            let unchanged = queries::get_reservations_by_ids(&cx, &pool, &ids)
+                                .await
+                                .into_result()
+                                .expect("authoritative leases after cancellation");
+                            assert_eq!(
+                                serde_json::to_value(unchanged).unwrap(),
+                                serde_json::to_value(&before).unwrap()
+                            );
+                            let conn = pool
+                                .acquire(&cx)
+                                .await
+                                .into_result()
+                                .expect("inspect ledger");
+                            let ledger = conn
+                                .query_sync(
+                                    "SELECT reservation_id FROM file_reservation_releases",
+                                    &[],
+                                )
+                                .expect("no cancelled release commits");
+                            assert!(ledger.is_empty());
+                            drop(conn);
+                            for (path, bytes) in &artifacts {
+                                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                            }
+
+                            replay_queued_release_intents(&healthy, &pool, &config).await;
+                            assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                            let released = queries::get_reservations_by_ids(&cx, &pool, &ids)
+                                .await
+                                .into_result()
+                                .expect("healthy replay releases accepted work");
+                            assert_eq!(released.len(), 2);
+                            assert!(released.iter().all(|row| row.released_ts.is_some()));
+                            let conn = pool.acquire(&cx).await.into_result().unwrap();
+                            let ledger = conn.query_sync(
+                                "SELECT reservation_id FROM file_reservation_releases ORDER BY reservation_id", &[],
+                            ).expect("durable release ledger");
+                            let mut expected_ids = ids.clone();
+                            expected_ids.sort_unstable();
+                            assert_eq!(
+                                ledger
+                                    .iter()
+                                    .map(|row| row.get_named::<i64>("reservation_id").unwrap())
+                                    .collect::<Vec<_>>(),
+                                expected_ids,
+                            );
+                            drop(conn);
+                            mcp_agent_mail_storage::wbq_flush();
+                            mcp_agent_mail_storage::flush_async_commits();
+                            for (path, _) in &artifacts {
+                                let terminal: Value =
+                                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                                assert!(terminal["released_ts"].as_str().is_some());
+                            }
+                            let completed = std::fs::read(&log).unwrap();
+                            replay_queued_release_intents(&healthy, &pool, &config).await;
+                            assert_eq!(std::fs::read(log).unwrap(), completed);
+                        });
+                    },
+                );
+            }
+        }
     }
 
     #[test]
