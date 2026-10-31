@@ -7909,10 +7909,9 @@ mod tests {
                         Some("SESSION_IDENTITY_MISMATCH")
                     );
                     let config = Config::get();
-                    assert!(
-                        crate::degraded_intents::read_queued_ack_intents(&config)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                        [] as [crate::degraded_intents::QueuedAckIntent; 0]
                     );
 
                     // Both supported ACK modes must survive contention. The
@@ -8010,10 +8009,9 @@ mod tests {
                         .expect("release competing writer");
                     drop(blocker);
                     replay_queued_ack_intents(&other_ctx, &pool, &config).await;
-                    assert!(
-                        crate::degraded_intents::read_queued_ack_intents(&config)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                        [] as [crate::degraded_intents::QueuedAckIntent; 0]
                     );
                     let completed = read_markers();
                     assert_eq!(completed.len(), 8);
@@ -8253,10 +8251,9 @@ mod tests {
 
                             let healthy = McpContext::new(cx.clone(), 2);
                             replay_queued_ack_intents(&healthy, &pool, &config).await;
-                            assert!(
-                                crate::degraded_intents::read_queued_ack_intents(&config)
-                                    .unwrap()
-                                    .is_empty()
+                            assert_eq!(
+                                crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                                [] as [crate::degraded_intents::QueuedAckIntent; 0]
                             );
                             let inbox = queries::fetch_inbox(
                                 &cx, &pool, project_id, recipient_id, false, None, 10,
