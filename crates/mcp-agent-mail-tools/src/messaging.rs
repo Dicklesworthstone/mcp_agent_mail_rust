@@ -6011,6 +6011,15 @@ fn queued_ack_intent_response(
     .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+/// Identity lookup cancellation is not evidence that an accepted intent is
+/// permanently invalid. Keep this replay policy separate from foreground
+/// admission: a cancelled request must never enqueue a new acknowledgement.
+fn ack_intent_replay_error(error: McpError) -> (String, bool) {
+    let retryable =
+        error.code == McpErrorCode::RequestCancelled || mcp_error_supports_ack_intent(&error);
+    (error.to_string(), retryable)
+}
+
 /// Replay a single queued ack intent against the now-reachable DB.
 ///
 /// Returns `Err((detail, retryable))` where `retryable == false` marks the
@@ -6021,9 +6030,11 @@ async fn replay_single_ack_intent(
     pool: &mcp_agent_mail_db::DbPool,
     intent: &crate::degraded_intents::QueuedAckIntent,
 ) -> Result<(), (String, bool)> {
+    ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
     let project = resolve_project(ctx, pool, &intent.project_key)
         .await
-        .map_err(|error| (error.to_string(), mcp_error_supports_ack_intent(&error)))?;
+        .map_err(ack_intent_replay_error)?;
+    ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
     let project_id = project.id.unwrap_or(0);
     let agent = resolve_agent(
         ctx,
@@ -6034,7 +6045,8 @@ async fn replay_single_ack_intent(
         &project.human_key,
     )
     .await
-    .map_err(|error| (error.to_string(), mcp_error_supports_ack_intent(&error)))?;
+    .map_err(ack_intent_replay_error)?;
+    ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
     let agent_id = agent.id.unwrap_or(0);
     if let Some(idempotency) = &intent.idempotency {
         let claim = mcp_agent_mail_db::IdempotencyClaim {
@@ -6092,6 +6104,9 @@ async fn replay_queued_ack_intents(
     pool: &mcp_agent_mail_db::DbPool,
     config: &Config,
 ) {
+    if ensure_request_live(ctx).is_err() {
+        return;
+    }
     let intents = match crate::degraded_intents::read_queued_ack_intents(config) {
         Ok(intents) => intents,
         Err(error) => {
@@ -6100,7 +6115,18 @@ async fn replay_queued_ack_intents(
         }
     };
     for intent in intents {
-        match replay_single_ack_intent(ctx, pool, &intent).await {
+        if ensure_request_live(ctx).is_err() {
+            break;
+        }
+        let outcome = replay_single_ack_intent(ctx, pool, &intent).await;
+        // The original foreground ACK may already have committed when its
+        // request expires. Do not turn cancellation of this optional drain
+        // into terminal receipts for other agents' durable work. An ACK that
+        // raced cancellation remains safely replayable even if SQL committed.
+        if ensure_request_live(ctx).is_err() {
+            break;
+        }
+        match outcome {
             Ok(()) => {
                 crate::degraded_intents::append_ack_replay_record(
                     config,
@@ -8067,6 +8093,211 @@ mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn ack_replay_cancellation_does_not_change_foreground_queue_policy() {
+        let cancelled = McpError::request_cancelled();
+        assert!(!mcp_error_supports_ack_intent(&cancelled));
+        assert!(ack_intent_replay_error(cancelled).1);
+        let missing = db_error_to_mcp_error(DbError::not_found("Agent", "missing"));
+        assert!(!ack_intent_replay_error(missing).1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cancelled_ack_replay_preserves_intents_before_and_during_identity_lookup() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use std::time::Duration;
+
+        for stage in ["before_replay", "project_lookup", "agent_lookup"] {
+            for request_token in [false, true] {
+                with_messaging_mailbox(
+                    &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+                    |_| {
+                        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                        runtime.block_on(async {
+                            let cx = Cx::current().expect("fixture runtime context");
+                            let pool = get_db_pool().expect("real mailbox pool");
+                            let project =
+                                ensure_project_row(&cx, &pool, "/ack-replay-cancellation").await;
+                            let project_id = project.id.unwrap();
+                            let sender =
+                                register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                            let recipient =
+                                register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                            let recipient_id = recipient.id.unwrap();
+                            let plain_id = create_ack_test_message(
+                                &cx,
+                                &pool,
+                                project_id,
+                                sender.id.unwrap(),
+                                &[(recipient_id, "to")],
+                            )
+                            .await;
+                            let keyed_id = create_ack_test_message(
+                                &cx,
+                                &pool,
+                                project_id,
+                                sender.id.unwrap(),
+                                &[(recipient_id, "to")],
+                            )
+                            .await;
+                            let claim = ack_retry_claim(&recipient.name, keyed_id, "cancelled-replay");
+                            let config = Config::get();
+                            for (message_id, idempotency) in
+                                [(plain_id, None), (keyed_id, Some(&claim))]
+                            {
+                                crate::degraded_intents::append_ack_intent(
+                                    &config,
+                                    &project.human_key,
+                                    &recipient.name,
+                                    message_id,
+                                    "acknowledge_message",
+                                    "accepted before the replay request",
+                                    idempotency,
+                                )
+                                .expect("persist real durable ACK intent");
+                            }
+                            let pending =
+                                crate::degraded_intents::read_queued_ack_intents(&config).unwrap();
+                            assert_eq!(pending.len(), 2);
+                            let log = crate::degraded_intents::log_path(
+                                &config,
+                                crate::degraded_intents::ACK_INTENT_LOG_FILE,
+                            );
+                            let journal_before = std::fs::read(&log).unwrap();
+
+                            // Remove only this mailbox's identity cache entries
+                            // so the next await is the chosen real lookup. No
+                            // injected error or substitute database is involved.
+                            let cache = mcp_agent_mail_db::cache::read_cache();
+                            let scope = pool.sqlite_identity_key();
+                            cache.invalidate_scope(&scope);
+                            if stage == "agent_lookup" {
+                                queries::get_project_by_slug(&cx, &pool, &project.slug)
+                                    .await
+                                    .into_result()
+                                    .expect("prime only the project identity");
+                                assert!(cache.get_project_scoped(&scope, &project.slug).is_some());
+                            } else {
+                                assert!(cache.get_project_scoped(&scope, &project.slug).is_none());
+                            }
+                            assert!(
+                                cache
+                                    .get_agent_scoped(&scope, project_id, &recipient.name)
+                                    .is_none()
+                            );
+
+                            let request_cx = Cx::for_testing();
+                            let ctx = McpContext::new(request_cx.clone(), 1);
+                            let cancel = || {
+                                if request_token {
+                                    assert!(ctx.request_cancellation().cancel());
+                                } else {
+                                    request_cx.set_cancel_requested(true);
+                                }
+                            };
+                            if stage == "before_replay" {
+                                cancel();
+                                replay_queued_ack_intents(&ctx, &pool, &config).await;
+                            } else {
+                                let held = pool
+                                    .acquire(&cx)
+                                    .await
+                                    .into_result()
+                                    .expect("hold the sole checkout before identity resolution");
+                                let mut waiting = std::pin::pin!(replay_queued_ack_intents(
+                                    &ctx, &pool, &config,
+                                ));
+                                {
+                                    let mut context = Context::from_waker(Waker::noop());
+                                    assert!(
+                                        matches!(waiting.as_mut().poll(&mut context), Poll::Pending),
+                                        "actual {stage} must wait for the occupied checkout"
+                                    );
+                                }
+                                cancel();
+                                drop(held);
+                                asupersync::time::timeout(cx.now(), Duration::from_secs(5), waiting)
+                                    .await
+                                    .expect("cancelled replay must leave the pool wait promptly");
+                            }
+
+                            assert_eq!(
+                                std::fs::read(&log).unwrap(),
+                                journal_before,
+                                "{stage}, request_token={request_token}: cancellation publishes no replay marker"
+                            );
+                            assert_eq!(
+                                crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                                pending,
+                                "cancellation cannot abandon accepted keyed or unkeyed work"
+                            );
+                            assert!(!cx.is_cancel_requested(), "cancellation is request-scoped");
+                            let conn = pool.acquire(&cx).await.into_result().expect("read state");
+                            let receipts = conn
+                                .query_sync(
+                                    "SELECT COUNT(*) AS n FROM message_recipients \
+                                     WHERE read_ts IS NOT NULL OR ack_ts IS NOT NULL",
+                                    &[],
+                                )
+                                .expect("inspect actual receipt rows");
+                            assert_eq!(receipts[0].get_named::<i64>("n").unwrap(), 0);
+                            let keys = conn
+                                .query_sync("SELECT COUNT(*) AS n FROM idempotency_keys", &[])
+                                .expect("inspect committed retry claims");
+                            assert_eq!(keys[0].get_named::<i64>("n").unwrap(), 0);
+                            drop(conn);
+
+                            let healthy = McpContext::new(cx.clone(), 2);
+                            replay_queued_ack_intents(&healthy, &pool, &config).await;
+                            assert!(
+                                crate::degraded_intents::read_queued_ack_intents(&config)
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                            let inbox = queries::fetch_inbox(
+                                &cx, &pool, project_id, recipient_id, false, None, 10,
+                            )
+                            .await
+                            .into_result()
+                            .expect("later healthy replay applies accepted work");
+                            assert_eq!(inbox.len(), 2);
+                            assert!(inbox.iter().all(|row| {
+                                row.ack_ts.is_some_and(|timestamp| timestamp > 0)
+                                    && row.read_ts == row.ack_ts
+                            }));
+                            let keyed = inbox
+                                .iter()
+                                .find(|row| row.message.id == Some(keyed_id))
+                                .unwrap();
+                            let stored = queries::lookup_idempotency_result::<(i64, i64)>(
+                                &cx,
+                                &pool,
+                                mcp_agent_mail_db::IdempotencyClaim {
+                                    project_id,
+                                    tool: "acknowledge_message",
+                                    key: &claim.key,
+                                    fingerprint: &claim.fingerprint,
+                                },
+                            )
+                            .await
+                            .into_result()
+                            .expect("original retry claim survives cancellation");
+                            assert_eq!(
+                                stored,
+                                Some(Ok((keyed.read_ts.unwrap(), keyed.ack_ts.unwrap())))
+                            );
+                            let completed = std::fs::read(&log).unwrap();
+                            replay_queued_ack_intents(&healthy, &pool, &config).await;
+                            assert_eq!(std::fs::read(log).unwrap(), completed);
+                        });
+                    },
+                );
+            }
+        }
     }
 
     #[test]
