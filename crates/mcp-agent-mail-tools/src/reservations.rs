@@ -8484,7 +8484,10 @@ mod tests {
                         .find(|record| record["intent_id"] == pending[0].intent_id)
                         .expect("the queued intent is in the durable log");
                     // The tool lists first, and that read is where the held writer stops it.
-                    assert_eq!(queued["failure"]["stage"], "list_unreleased_file_reservations");
+                    assert_eq!(
+                        queued["failure"]["stage"],
+                        "list_unreleased_file_reservations"
+                    );
                     assert!(
                         queued["failure"]["error_detail"]
                             .as_str()
