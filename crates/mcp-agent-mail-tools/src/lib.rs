@@ -1484,9 +1484,11 @@ pub mod tool_util {
         let _current = Cx::set_current(Some(cx.clone()));
         let outcome = poll_bootstrap_checkout(
             std::time::Duration::from_millis(cfg.acquire_timeout_ms),
-            || match ctx {
-                Some(ctx) => ensure_request_live(ctx),
-                None => cx.checkpoint().map_err(|_| McpError::request_cancelled()),
+            || {
+                ctx.map_or_else(
+                    || cx.checkpoint().map_err(|_| McpError::request_cancelled()),
+                    ensure_request_live,
+                )
             },
             || {
                 db_error_to_mcp_error(DbError::ResourceBusy(

@@ -1587,15 +1587,15 @@ mod tests {
             Some((Some(ready_path), expected_token)),
             "retirement must release the slot without replacing a newer build owner"
         );
-        let published = matches!(case, RetirementCase::Replacement);
+        let build_succeeded = matches!(case, RetirementCase::Replacement);
         assert_eq!(
             completion_before_cleanup.as_ref().map(Result::is_ok),
-            Some(published),
+            Some(build_succeeded),
             "build completion must precede snapshot cleanup"
         );
         assert_eq!(
             waiter_before_cleanup.as_ref().ok().map(Result::is_ok),
-            Some(published),
+            Some(build_succeeded),
             "a real build waiter must finish while cleanup remains blocked"
         );
         assert!(newer_completion_untouched);
