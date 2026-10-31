@@ -38,7 +38,7 @@ use crate::tool_util::get_db_pool;
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, ensure_request_live,
     get_authoritative_live_db_pool, get_db_pool_for_request, legacy_tool_error, resolve_agent,
-    resolve_project,
+    resolve_existing_project, resolve_project, tool_error_code,
 };
 
 const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -96,6 +96,17 @@ pub struct ReservationResponse {
     /// Current conflict snapshot, including when `granted` replays a previous
     /// keyed request. A replay never grants paths that became free afterward.
     pub conflicts: Vec<ReservationConflict>,
+}
+
+#[derive(Clone)]
+struct ReservationAcquireRequest {
+    project_key: String,
+    agent_name: String,
+    paths: Vec<String>,
+    ttl: i64,
+    is_exclusive: bool,
+    reason_str: String,
+    idempotency_key: Option<String>,
 }
 
 /// Result of an authoritative, side-effect-free reservation conflict check.
@@ -1980,8 +1991,74 @@ pub async fn file_reservation_paths(
     let is_exclusive = exclusive.unwrap_or(true);
     let reason_str = reason.unwrap_or_default();
 
-    let pool = get_db_pool_for_request(ctx)?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Bound the request before retaining a copy for the read-only replay probe.
+    const MAX_PATHS_PER_CALL: usize = 200;
+    if paths.len() > MAX_PATHS_PER_CALL {
+        return Err(legacy_tool_error(
+            "TOO_MANY_PATHS",
+            &format!(
+                "Maximum {MAX_PATHS_PER_CALL} paths per reservation call, got {}",
+                paths.len()
+            ),
+            true,
+            json!({ "count": paths.len(), "max": MAX_PATHS_PER_CALL }),
+        ));
+    }
+
+    let request = ReservationAcquireRequest {
+        project_key,
+        agent_name,
+        paths,
+        ttl,
+        is_exclusive,
+        reason_str,
+        idempotency_key,
+    };
+    if request.idempotency_key.is_some()
+        && let Some(pool) = crate::idempotency::replay_read_pool(ctx).await?
+        && let Some(response) =
+            file_reservation_paths_with_pool(ctx, pool, request.clone(), true).await?
+    {
+        return Ok(response);
+    }
+
+    // A miss is only an observation. Acquire normal write authority and resolve
+    // the project, actor and claim again: recovery may have replaced the source
+    // while this request waited for admission.
+    let write_pool = get_db_pool_for_request(ctx)?;
+    file_reservation_paths_with_pool(ctx, (*write_pool).clone(), request, false)
+        .await?
+        .ok_or_else(|| McpError::internal_error("reservation write attempt returned no result"))
+}
+
+/// A replay probe exits on a missing claim before any touch, archive healing or
+/// grant. A committed replay keeps the ordinary current-conflict and guard
+/// coverage checks; reading an old receipt must never certify an unsafe lease.
+#[allow(clippy::too_many_lines)]
+async fn file_reservation_paths_with_pool(
+    ctx: &McpContext,
+    pool: mcp_agent_mail_db::DbPool,
+    request: ReservationAcquireRequest,
+    replay_only: bool,
+) -> McpResult<Option<String>> {
+    let ReservationAcquireRequest {
+        project_key,
+        agent_name,
+        paths,
+        ttl,
+        is_exclusive,
+        reason_str,
+        idempotency_key,
+    } = request;
+    let project = if replay_only {
+        match resolve_existing_project(ctx, &pool, &project_key).await {
+            Ok(project) => project,
+            Err(error) if tool_error_code(&error) == Some("NOT_FOUND") => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    } else {
+        resolve_project(ctx, &pool, &project_key).await?
+    };
     // An orphaned-project placeholder names data whose project row is gone;
     // it is readable but cannot authorize a new reservation.
     if mcp_agent_mail_db::queries::is_orphan_project_placeholder(&project) {
@@ -1997,20 +2074,6 @@ pub async fn file_reservation_paths(
         ));
     }
     let project_id = project.id.unwrap_or(0);
-
-    // Limit: max 200 patterns per call, preventing resource exhaustion.
-    const MAX_PATHS_PER_CALL: usize = 200;
-    if paths.len() > MAX_PATHS_PER_CALL {
-        return Err(legacy_tool_error(
-            "TOO_MANY_PATHS",
-            &format!(
-                "Maximum {MAX_PATHS_PER_CALL} paths per reservation call, got {}",
-                paths.len()
-            ),
-            true,
-            json!({ "count": paths.len(), "max": MAX_PATHS_PER_CALL }),
-        ));
-    }
 
     // Reject suspicious patterns that are too broad or malformed.
     // Previously these were warn-only, but overly-broad patterns like
@@ -2073,7 +2136,6 @@ pub async fn file_reservation_paths(
     .await?;
     crate::session_identity::authorize_actor(ctx, &agent, false, "reserve files")?;
     let agent_id = agent.id.unwrap_or(0);
-    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     // Fingerprint the actual normalized path set, not its input spelling or
     // duplicate/order artifacts. JSON preserves list boundaries even when a
@@ -2122,6 +2184,13 @@ pub async fn file_reservation_paths(
     } else {
         None
     };
+
+    if replay_only && replayed_rows.is_none() {
+        return Ok(None);
+    }
+    if replayed_rows.is_none() {
+        crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
+    }
 
     // Check for conflicts with existing active reservations. F5: if this read
     // fails (DB/index corrupt, busy/unavailable), surface a fail-closed
@@ -2659,7 +2728,7 @@ pub async fn file_reservation_paths(
     );
 
     serde_json::to_string(&response)
-        .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
+        .map(|json| Some(crate::idempotency::with_replay_marker(json, idempotent_replay)))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -3740,6 +3809,62 @@ mod tests {
         }
     }
 
+    fn while_reservation_recovery_blocks_writers<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce(McpContext) -> Fut + Send,
+        Fut: std::future::Future<Output = T>,
+        T: Send,
+    {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, current_thread_holds_promotion_barrier,
+            try_acquire_promotion_barrier_if_idle,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let owner = try_acquire_promotion_barrier_if_idle().expect("hold real recovery promotion");
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = mpsc::channel();
+            // Promotion ownership is reentrant on its own thread. A separate
+            // runtime thread proves the tool does not borrow that authority.
+            let reader = scope.spawn(move || {
+                let result = run_async(|cx| async move { f(McpContext::new(cx, 2)).await });
+                assert!(done_tx.send(result).is_ok(), "return reservation retry result");
+            });
+            let result = done_rx.recv_timeout(Duration::from_secs(5));
+            let held = current_thread_holds_promotion_barrier();
+            let writers = active_writer_count();
+            // The old implementation parks behind recovery. Always release
+            // and join before asserting, including timeout and panic paths.
+            drop(owner);
+            reader.join().expect("reservation retry worker exits");
+            assert!(held, "replay must preserve recovery ownership");
+            assert_eq!(writers, 0, "replay must not acquire a writer lease");
+            result.expect("committed reservation retry must finish during recovery")
+        })
+    }
+
+    async fn reservation_replay_activity(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+    ) -> Vec<(i64, i64)> {
+        let conn = pool.acquire(cx).await.into_result().expect("activity reader");
+        conn.query_sync(
+            "SELECT id, last_active_ts FROM agents WHERE project_id = ? ORDER BY id",
+            &[project_id.into()],
+        )
+        .expect("fresh agent activity")
+        .iter()
+        .map(|row| {
+            (
+                row.get_as::<i64>(0).expect("agent ID"),
+                row.get_as::<i64>(1).expect("agent activity"),
+            )
+        })
+        .collect()
+    }
+
     fn unique_suffix() -> u64 {
         let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4620,7 +4745,11 @@ mod tests {
     fn reservation_key_replays_released_grants_without_touching_current_holder() {
         with_serialized_reservations(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let writer = get_db_pool().expect("db pool");
+                let pool = (*writer).clone();
+                // Keep the initialized mailbox alive without retaining write
+                // admission while the separate recovery owner closes it.
+                drop(writer);
                 let project_key = format!("/tmp/reservation-key-released-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.expect("project id");
@@ -4637,17 +4766,69 @@ mod tests {
                 )
                 .await;
                 assert_eq!(first["granted"].as_array().expect("grants").len(), 2);
+                mcp_agent_mail_storage::wbq_flush();
 
-                let normalized_retry = keyed_reservation_response(
-                    &ctx,
-                    &project_key,
-                    &original.name,
-                    &["src/main.rs", "./src/lib.rs", "src/lib.rs"],
-                    Some("lost-reply"),
-                )
-                .await;
+                let reservation_dir = Config::get()
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                let snapshot_artifacts = || {
+                    std::fs::read_dir(&reservation_dir)
+                        .expect("reservation archive")
+                        .filter_map(|entry| {
+                            let entry = entry.expect("archive entry");
+                            if !entry.file_type().expect("archive entry type").is_file() {
+                                return None;
+                            }
+                            let path = entry.path();
+                            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                                return None;
+                            }
+                            let bytes = std::fs::read(&path).expect("artifact bytes");
+                            Some((path, bytes))
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                };
+                let active_artifacts = snapshot_artifacts();
+                let active_activity = reservation_replay_activity(&cx, &pool, project_id).await;
+                let retry_project = &project_key;
+                let retry_agent = &original.name;
+                let normalized_retry =
+                    while_reservation_recovery_blocks_writers(|retry_ctx| async move {
+                        keyed_reservation_response(
+                            &retry_ctx,
+                            retry_project,
+                            retry_agent,
+                            &["src/main.rs", "./src/lib.rs", "src/lib.rs"],
+                            Some("lost-reply"),
+                        )
+                        .await
+                    });
                 assert_eq!(normalized_retry["idempotent_replay"], true);
                 assert_eq!(normalized_retry["granted"], first["granted"]);
+                mcp_agent_mail_storage::wbq_flush();
+                assert_eq!(snapshot_artifacts(), active_artifacts);
+                assert_eq!(
+                    reservation_replay_activity(&cx, &pool, project_id).await,
+                    active_activity,
+                    "active replay must not touch either agent",
+                );
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("active original rows");
+                assert_eq!(active.len(), 2);
+                assert!(
+                    active.iter().all(|row| {
+                        Some(row.agent_id) == original.id
+                            && first["granted"].as_array().unwrap().iter().any(|grant| {
+                                grant["id"].as_i64() == row.id
+                                    && grant["expires_ts"] == micros_to_iso(row.expires_ts)
+                            })
+                    }),
+                    "active replay must preserve the original IDs and expiry",
+                );
 
                 release_file_reservations(
                     &ctx,
@@ -4660,37 +4841,36 @@ mod tests {
                 .expect("release original grants");
                 let peer_response =
                     keyed_reservation_response(&ctx, &project_key, &peer.name, &paths, None).await;
+                mcp_agent_mail_storage::wbq_flush();
+                let artifacts_before = snapshot_artifacts();
+                let activity_before = reservation_replay_activity(&cx, &pool, project_id).await;
 
-                let reservation_dir = Config::get()
-                    .storage_root
-                    .join("projects")
-                    .join(&project.slug)
-                    .join("file_reservations");
-                let mut artifacts_before = Vec::new();
-                for grant in first["granted"]
-                    .as_array()
-                    .expect("original grants")
-                    .iter()
-                    .chain(peer_response["granted"].as_array().expect("peer grants"))
-                {
-                    let path =
-                        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
-                            &reservation_dir,
-                            grant["id"].as_i64().expect("grant id"),
+                let retry_project = &project_key;
+                let retry_agent = &original.name;
+                let (replay, changed) =
+                    while_reservation_recovery_blocks_writers(|retry_ctx| async move {
+                        let replay = keyed_reservation_response(
+                            &retry_ctx,
+                            retry_project,
+                            retry_agent,
+                            &paths,
+                            Some("lost-reply"),
                         )
-                        .expect("reservation artifact");
-                    let bytes = std::fs::read(&path).expect("artifact bytes");
-                    artifacts_before.push((path, bytes));
-                }
-
-                let replay = keyed_reservation_response(
-                    &ctx,
-                    &project_key,
-                    &original.name,
-                    &paths,
-                    Some("lost-reply"),
-                )
-                .await;
+                        .await;
+                        let changed = file_reservation_paths(
+                            &retry_ctx,
+                            retry_project.to_string(),
+                            retry_agent.to_string(),
+                            paths.iter().map(|path| (*path).to_string()).collect(),
+                            Some(7200),
+                            None,
+                            None,
+                            Some("lost-reply".to_string()),
+                        )
+                        .await
+                        .expect_err("changed TTL must conflict even when every path is held");
+                        (replay, changed)
+                    });
                 assert_eq!(replay["idempotent_replay"], true);
                 assert_eq!(replay["granted"], first["granted"]);
                 let conflicts = replay["conflicts"].as_array().expect("current conflicts");
@@ -4702,19 +4882,6 @@ mod tests {
                         .iter()
                         .all(|holder| holder["agent"] == peer.name)
                 }));
-
-                let changed = file_reservation_paths(
-                    &ctx,
-                    project_key.clone(),
-                    original.name,
-                    paths.iter().map(|path| (*path).to_string()).collect(),
-                    Some(7200),
-                    None,
-                    None,
-                    Some("lost-reply".to_string()),
-                )
-                .await
-                .expect_err("changed TTL must conflict even when every path is held");
                 assert_eq!(
                     changed.data.expect("typed key conflict")["error"]["type"],
                     "IDEMPOTENCY_KEY_CONFLICT"
@@ -4724,10 +4891,142 @@ mod tests {
                     .into_result()
                     .expect("active rows");
                 assert_eq!(active.len(), 2);
-                assert!(active.iter().all(|row| Some(row.agent_id) == peer.id));
-                for (path, bytes) in artifacts_before {
-                    assert_eq!(std::fs::read(path).expect("artifact after retries"), bytes);
-                }
+                assert!(
+                    active.iter().all(|row| {
+                        Some(row.agent_id) == peer.id
+                            && peer_response["granted"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|grant| {
+                                    grant["id"].as_i64() == row.id
+                                        && grant["expires_ts"] == micros_to_iso(row.expires_ts)
+                                })
+                    }),
+                    "released replay must preserve the current holder's IDs and expiry",
+                );
+                mcp_agent_mail_storage::wbq_flush();
+                assert_eq!(snapshot_artifacts(), artifacts_before);
+                assert_eq!(
+                    reservation_replay_activity(&cx, &pool, project_id).await,
+                    activity_before,
+                    "released replay and key conflict must not touch either agent",
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn reservation_replay_during_recovery_refuses_missing_active_coverage_without_healing() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let writer = get_db_pool().expect("db pool");
+                let pool = (*writer).clone();
+                drop(writer);
+                let project_key = format!("/tmp/reservation-replay-coverage-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let first = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &agent.name,
+                    &["src/lib.rs"],
+                    Some("missing-coverage"),
+                )
+                .await;
+                let id = first["granted"][0]["id"].as_i64().expect("original ID");
+                mcp_agent_mail_storage::wbq_flush();
+                let reservation_dir = Config::get()
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                let artifact_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        id,
+                    )
+                    .expect("published original grant");
+                let bytes = std::fs::read(&artifact_path).expect("original artifact");
+                let retained = Config::get().storage_root.join("retained-reservation.json");
+                std::fs::rename(&artifact_path, &retained).expect("preserve missing artifact");
+                let activity_before = reservation_replay_activity(&cx, &pool, project_id).await;
+
+                let retry_project = &project_key;
+                let retry_agent = &agent.name;
+                let error = while_reservation_recovery_blocks_writers(|retry_ctx| async move {
+                    let read_pool = crate::idempotency::replay_read_pool(&retry_ctx)
+                        .await
+                        .expect("read existing receipts")
+                        .expect("initialized mailbox");
+                    let missing = file_reservation_paths_with_pool(
+                        &retry_ctx,
+                        read_pool,
+                        ReservationAcquireRequest {
+                            project_key: retry_project.to_string(),
+                            agent_name: retry_agent.to_string(),
+                            paths: vec!["src/probe-miss.rs".to_string()],
+                            ttl: 3600,
+                            is_exclusive: true,
+                            reason_str: String::new(),
+                            idempotency_key: Some("unseen-read-probe".to_string()),
+                        },
+                        true,
+                    )
+                    .await
+                    .expect("a read-probe miss must not enter mutation or archive healing");
+                    assert!(missing.is_none(), "a missing key needs normal write admission");
+
+                    file_reservation_paths(
+                        &retry_ctx,
+                        retry_project.to_string(),
+                        retry_agent.to_string(),
+                        vec!["src/lib.rs".to_string()],
+                        None,
+                        None,
+                        None,
+                        Some("missing-coverage".to_string()),
+                    )
+                    .await
+                    .expect_err("an old receipt cannot certify missing current coverage")
+                });
+                let failure = archive_failure_data(error);
+                assert_eq!(failure["cause"], "archive_coverage_unconfirmed");
+                assert_eq!(failure["idempotent_replay"], true);
+                assert_eq!(failure["committed_reservation_ids"], json!([id]));
+                assert_eq!(failure["current_reservation_ids"], json!([id]));
+                mcp_agent_mail_storage::wbq_flush();
+                assert!(
+                    !artifact_path.exists(),
+                    "replay must not heal an active artifact",
+                );
+                assert!(
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        id,
+                    )
+                    .is_none(),
+                    "replay must not publish a replacement generation artifact",
+                );
+                assert_eq!(std::fs::read(retained).expect("preserved artifact"), bytes);
+                assert_eq!(
+                    reservation_replay_activity(&cx, &pool, project_id).await,
+                    activity_before,
+                    "coverage refusal must not touch the caller",
+                );
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("original active row");
+                assert_eq!(active.len(), 1);
+                assert_eq!(active[0].id, Some(id));
+                assert_eq!(Some(active[0].agent_id), agent.id);
+                assert_eq!(
+                    micros_to_iso(active[0].expires_ts),
+                    first["granted"][0]["expires_ts"].as_str().unwrap(),
+                );
             });
         });
     }
