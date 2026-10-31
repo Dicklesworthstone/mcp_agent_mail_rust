@@ -2000,25 +2000,14 @@ async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome
 
 /// Begin a transaction that guarantees a fresh WAL snapshot for a read.
 ///
-/// Writable pools keep Bug #85's `BEGIN IMMEDIATE`, which both re-pins the
-/// snapshot and serializes against an in-flight release. Query-only pools —
-/// every GH#198 read surface — cannot take a write lock ("attempt to write a
-/// readonly database" turned the file_reservations resource into a hard error,
-/// br-lwwq5), so fall back to an explicit deferred `BEGIN`: starting any new
-/// transaction re-pins the connection to the newest committed frame, which is
-/// all the freshness contract needs on a pool that can never write.
+/// An explicit deferred transaction re-pins a pooled connection to committed
+/// state while keeping every observation in that transaction on one snapshot.
+/// `BEGIN IMMEDIATE` is unnecessary for these pure readers: it takes the writer
+/// lock, blocks observations behind unrelated writes, and fails on query-only
+/// pools. Actual mutations acquire their own write transaction and revalidate
+/// their authority there. End these read transactions with [`commit_read_tx`].
 async fn begin_fresh_snapshot_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
-    match begin_immediate_tx(cx, tracked).await {
-        Outcome::Err(error)
-            if {
-                let message = error.to_string().to_ascii_lowercase();
-                message.contains("readonly database") || message.contains("query_only")
-            } =>
-        {
-            map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await).map(|_| ())
-        }
-        out => out,
-    }
+    map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await).map(|_| ())
 }
 
 /// Finish transaction cleanup even when its request has been cancelled.
@@ -14726,10 +14715,8 @@ pub async fn get_reservation_conflict_snapshot(
         };
         let tracked = tracked(&*conn);
 
-        // BEGIN IMMEDIATE is the established fresh-snapshot path for reservation
-        // reads (GH#85/#86). The transaction performs no table writes and ends
-        // through commit_read_tx, which deliberately skips the write-path WAL
-        // checkpoint. On query-only pools this degrades to a deferred BEGIN.
+        // One fresh committed snapshot covers identity, candidates and ledger
+        // without acquiring the writer lock or publishing/checkpointing WAL.
         try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
         let captured_ts = now_micros();
 
@@ -15321,8 +15308,8 @@ async fn create_file_reservations_impl(
 
 /// Get active file reservations for a project.
 ///
-/// Uses `BEGIN IMMEDIATE` to acquire a fresh WAL snapshot, ensuring the
-/// caller always sees the latest committed reservation state.  Without an
+/// Uses an explicit deferred transaction to acquire a fresh committed WAL
+/// snapshot without competing for the writer lock. Without an
 /// explicit transaction the pooled connection may re-use a stale read
 /// snapshot which causes phantom conflicts after release (Bug #85) and
 /// missed conflicts before insert (Bug #86).
@@ -15354,8 +15341,7 @@ async fn get_active_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot so we never read stale reservation state.
-    // On query-only pools this degrades to a deferred BEGIN.
+    // Observe candidates and the release ledger in one fresh committed snapshot.
     try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     // GH#180: fetch candidate active rows with the cheap `released_ts` predicate
@@ -15429,8 +15415,7 @@ async fn get_active_reservations_once(
 
     candidates.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
 
-    // Commit the read-only IMMEDIATE tx to release the write lock promptly.
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
     Outcome::Ok(candidates)
 }
 
@@ -15473,8 +15458,7 @@ async fn list_released_unexpired_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot so we never read stale reservation state.
-    // On query-only pools this degrades to a deferred BEGIN.
+    // Observe candidates and the release ledger in one fresh committed snapshot.
     try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     let candidate_sql = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, \
@@ -15551,8 +15535,7 @@ async fn list_released_unexpired_reservations_once(
         }
     };
 
-    // Commit the read-only IMMEDIATE tx to release the write lock promptly.
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
 
     for row in &mut candidates {
         if row.released_ts.is_none_or(|ts| ts <= 0)
@@ -16847,10 +16830,8 @@ async fn list_file_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot for active-only reads to avoid stale
-    // reservation state after a release (Bug #85) or concurrent grant.
-    // Falls back to a deferred BEGIN on query-only pools (GH#198 read
-    // surfaces), where BEGIN IMMEDIATE is a readonly-database error.
+    // Pin active rows and the release ledger to one fresh committed snapshot
+    // after a release (Bug #85) or concurrent grant, on either pool mode.
     if active_only {
         try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
     }
@@ -17073,7 +17054,7 @@ async fn list_file_reservations_once(
             };
             rows.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
         }
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
     }
     result
 }
@@ -17107,8 +17088,7 @@ async fn list_unreleased_file_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot (same rationale as get_active_reservations).
-    // On query-only pools this degrades to a deferred BEGIN.
+    // Refresh pooled observations without waiting for an unrelated writer.
     try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     let sql = format!(
@@ -17222,7 +17202,7 @@ async fn list_unreleased_file_reservations_once(
         }
     };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
     result
 }
 
@@ -31018,6 +30998,318 @@ mod tests {
             .expect("read released_ts");
             assert_eq!(rows.len(), 1);
             assert!(rows[0].get(0).and_then(value_as_i64).is_some());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reservation_read_snapshots_remain_available_and_fresh_while_a_writer_is_active() {
+        const CHILD: &str = "AM_TEST_RESERVATION_READ_SNAPSHOT_CHILD";
+        type LeaseState = std::collections::BTreeMap<i64, i64>;
+        struct ExpectedReads {
+            active: LeaseState,
+            unreleased: LeaseState,
+            released: LeaseState,
+            last_mail: i64,
+        }
+
+        fn lease_state(rows: &[FileReservationRow]) -> LeaseState {
+            rows.iter()
+                .map(|row| (row.id.expect("reservation id"), row.expires_ts))
+                .collect()
+        }
+
+        // SHM contains legitimate reader coordination state; the primary and
+        // WAL are the durable bytes that an observation must not publish.
+        fn durable_family(path: &std::path::Path) -> [Option<Vec<u8>>; 2] {
+            ["", "-wal"].map(|suffix| {
+                let mut member = path.as_os_str().to_os_string();
+                member.push(suffix);
+                match std::fs::read(std::path::PathBuf::from(member)) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("read durable SQLite family: {error}"),
+                }
+            })
+        }
+
+        async fn assert_reads(
+            cx: &Cx,
+            pool: &DbPool,
+            project_id: i64,
+            agent_id: i64,
+            expected: &ExpectedReads,
+        ) {
+            let active = get_active_reservations(cx, pool, project_id)
+                .await
+                .into_result()
+                .expect("active view must not acquire the writer lock");
+            assert_eq!(lease_state(&active), expected.active);
+            let unreleased = list_unreleased_file_reservations(cx, pool, project_id)
+                .await
+                .into_result()
+                .expect("cleanup listing must not acquire the writer lock");
+            assert_eq!(lease_state(&unreleased), expected.unreleased);
+            let released = list_released_unexpired_reservations(cx, pool, project_id)
+                .await
+                .into_result()
+                .expect("release archive view must not acquire the writer lock");
+            assert_eq!(lease_state(&released), expected.released);
+            assert!(released.iter().all(|row| row.released_ts.is_some()));
+            let listed = list_file_reservations(cx, pool, project_id, true)
+                .await
+                .into_result()
+                .expect("active resource listing");
+            assert_eq!(lease_state(&listed), expected.active);
+
+            // Exercise pagination's SQL-level ledger subtraction separately
+            // from the unpaginated candidate/ledger merge.
+            let mut pages = Vec::new();
+            for offset in 0..expected.active.len() {
+                let page = list_file_reservations_page(cx, pool, project_id, true, 1, offset)
+                    .await
+                    .into_result()
+                    .expect("active resource page");
+                assert_eq!(page.len(), 1);
+                pages.extend(page);
+            }
+            assert_eq!(pages.len(), expected.active.len());
+            assert_eq!(lease_state(&pages), expected.active);
+            let snapshot = get_reservation_conflict_snapshot(
+                cx,
+                pool,
+                "/reservation-read-snapshot",
+                "BlueLake",
+                100,
+            )
+            .await
+            .into_result()
+            .expect("authoritative guard snapshot");
+            assert_eq!(snapshot.project.id, Some(project_id));
+            assert_eq!(snapshot.caller_agent_id, agent_id);
+            assert!(!snapshot.overflow);
+            assert_eq!(
+                snapshot
+                    .reservations
+                    .iter()
+                    .map(|row| (row.id, row.expires_ts))
+                    .collect::<LeaseState>(),
+                expected.active,
+            );
+            assert_eq!(
+                get_agent_last_mail_activity(cx, pool, agent_id, project_id)
+                    .await
+                    .into_result()
+                    .expect("mail activity observation"),
+                Some(expected.last_mail),
+            );
+        }
+
+        // The retry budget is a process-wide LazyLock. Keep the negative
+        // control bounded without changing any other test's retry policy.
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .env("FSQLITE_CONCURRENT_RETRIES", "0")
+                .env("FSQLITE_CONCURRENT_MODE", "false")
+                .output()
+                .expect("run isolated reservation snapshot regression");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "reservation snapshot regression failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let (_cx, pool, dir) = setup_test_pool("reservation-read-snapshot.db");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/reservation-read-snapshot")
+                .await
+                .into_result()
+                .expect("project")
+                .id
+                .unwrap();
+            let agent_id = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("holder")
+            .id
+            .unwrap();
+            let leases = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/closed.rs", "src/released.rs", "src/renewed.rs", "src/expired.rs"],
+                3600,
+                true,
+                "snapshot fixture",
+            )
+            .await
+            .into_result()
+            .expect("initial leases");
+            let lease = |path| {
+                leases
+                    .iter()
+                    .find(|row| row.path_pattern == path)
+                    .expect("named lease")
+            };
+            let closed = lease("src/closed.rs");
+            let released = lease("src/released.rs");
+            let renewed = lease("src/renewed.rs");
+            let expired = lease("src/expired.rs");
+            release_reservations_by_ids(&cx, &pool, &[closed.id.unwrap()])
+                .await
+                .into_result()
+                .expect("pre-existing release");
+
+            let db_path = dir.path().join("reservation-read-snapshot.db");
+            let writer = crate::DbConn::open_file(db_path.to_str().unwrap())
+                .expect("independent native writer");
+            writer
+                .execute_raw("PRAGMA wal_autocheckpoint = 0")
+                .expect("retain committed WAL for the publication control");
+            writer
+                .execute_raw("PRAGMA busy_timeout = 0")
+                .expect("bounded writer admission");
+            writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+            writer
+                .execute_sync(
+                    "UPDATE file_reservations SET expires_ts = 1 WHERE id = ?",
+                    &[Value::BigInt(expired.id.unwrap())],
+                )
+                .expect("expired but unreleased fixture");
+            writer
+                .execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (1, ?, ?, 'Before', 'Committed activity', 100)",
+                    &[Value::BigInt(project_id), Value::BigInt(agent_id)],
+                )
+                .expect("committed mail activity");
+            writer.execute_raw("COMMIT").unwrap();
+
+            let read_pool = DbPool::new_query_only(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("query-only reader pool");
+            let before = ExpectedReads {
+                active: [
+                    (released.id.unwrap(), released.expires_ts),
+                    (renewed.id.unwrap(), renewed.expires_ts),
+                ]
+                .into(),
+                unreleased: [
+                    (released.id.unwrap(), released.expires_ts),
+                    (renewed.id.unwrap(), renewed.expires_ts),
+                    (expired.id.unwrap(), 1),
+                ]
+                .into(),
+                released: [(closed.id.unwrap(), closed.expires_ts)].into(),
+                last_mail: 100,
+            };
+            for reader in [&pool, &read_pool] {
+                assert_reads(&cx, reader, project_id, agent_id, &before).await;
+                let conn = reader.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync("PRAGMA busy_timeout = 0", &[])
+                    .expect("fail promptly if a reader attempts writer admission");
+            }
+
+            let new_id = leases.iter().filter_map(|row| row.id).max().unwrap() + 1;
+            let new_expiry = renewed.expires_ts + 120_000_000;
+            let release_ts = now_micros();
+            writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+            // A ledger-only release must disappear from every active view and
+            // appear in the released view only after this writer commits.
+            writer
+                .execute_sync(
+                    "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)",
+                    &[Value::BigInt(released.id.unwrap()), Value::BigInt(release_ts)],
+                )
+                .expect("uncommitted release");
+            writer
+                .execute_sync(
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &[Value::BigInt(new_expiry), Value::BigInt(renewed.id.unwrap())],
+                )
+                .expect("uncommitted renewal");
+            writer
+                .execute_sync(
+                    "INSERT INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     VALUES (?, ?, ?, 'src/new.rs', 1, 'Concurrent grant', ?, ?)",
+                    &[
+                        Value::BigInt(new_id),
+                        Value::BigInt(project_id),
+                        Value::BigInt(agent_id),
+                        Value::BigInt(release_ts),
+                        Value::BigInt(new_expiry),
+                    ],
+                )
+                .expect("uncommitted grant");
+            writer
+                .execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (2, ?, ?, 'After', 'Uncommitted activity', 200)",
+                    &[Value::BigInt(project_id), Value::BigInt(agent_id)],
+                )
+                .expect("uncommitted mail activity");
+            let held_family = durable_family(&db_path);
+            for reader in [&pool, &read_pool] {
+                assert_reads(&cx, reader, project_id, agent_id, &before).await;
+                assert_eq!(
+                    durable_family(&db_path),
+                    held_family,
+                    "reads must not publish the held writer's changes"
+                );
+            }
+
+            writer.execute_raw("COMMIT").expect("commit independent writer");
+            let committed_family = durable_family(&db_path);
+            assert!(
+                committed_family[1].as_ref().is_some_and(|wal| wal.len() > 32),
+                "the no-checkpoint control must retain actual committed WAL frames"
+            );
+            let after = ExpectedReads {
+                active: [(renewed.id.unwrap(), new_expiry), (new_id, new_expiry)].into(),
+                unreleased: [
+                    (renewed.id.unwrap(), new_expiry),
+                    (expired.id.unwrap(), 1),
+                    (new_id, new_expiry),
+                ]
+                .into(),
+                released: [
+                    (closed.id.unwrap(), closed.expires_ts),
+                    (released.id.unwrap(), released.expires_ts),
+                ]
+                .into(),
+                last_mail: 200,
+            };
+            for reader in [&pool, &read_pool] {
+                assert_reads(&cx, reader, project_id, agent_id, &after).await;
+                assert_eq!(
+                    durable_family(&db_path),
+                    committed_family,
+                    "fresh pooled reads must not checkpoint or rewrite committed WAL"
+                );
+            }
         });
     }
 

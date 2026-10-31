@@ -8483,11 +8483,9 @@ mod tests {
                         .map(|line| serde_json::from_str::<Value>(line).unwrap())
                         .find(|record| record["intent_id"] == pending[0].intent_id)
                         .expect("the queued intent is in the durable log");
-                    // The tool lists first, and that read is where the held writer stops it.
-                    assert_eq!(
-                        queued["failure"]["stage"],
-                        "list_unreleased_file_reservations"
-                    );
+                    // The listing observes committed state while the writer is
+                    // held; only the actual release needs writer admission.
+                    assert_eq!(queued["failure"]["stage"], "release_reservations");
                     assert!(
                         queued["failure"]["error_detail"]
                             .as_str()
