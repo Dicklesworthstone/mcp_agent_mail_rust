@@ -6160,6 +6160,93 @@ async fn replay_queued_ack_intents(
     }
 }
 
+fn ack_status_response(
+    message_id: i64,
+    read_ts: i64,
+    ack_ts: i64,
+    idempotent_replay: bool,
+) -> McpResult<String> {
+    let response = AckStatusResponse {
+        message_id,
+        acknowledged: true,
+        acknowledged_at: Some(micros_to_iso(ack_ts)),
+        read_at: Some(micros_to_iso(read_ts)),
+    };
+    serde_json::to_string(&response)
+        .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// A committed ACK is a read, even while recovery owns write admission. Only
+/// conclusive receipts, conflicts and actor authorization refusals return here.
+/// An unavailable read must preserve the admitted path's durable outage queue;
+/// it does not establish that the key is absent. That path rechecks the claim
+/// atomically with the acknowledgement before accepting any fresh mutation.
+async fn try_replay_ack(
+    ctx: &McpContext,
+    project_key: &str,
+    agent_name: &str,
+    message_id: i64,
+    idempotency: &crate::degraded_intents::AckIntentIdempotency,
+    authorization: &crate::session_identity::ActorAuthorizationSnapshot,
+) -> McpResult<Option<String>> {
+    let resolved: McpResult<_> = async {
+        let Some(pool) = crate::idempotency::replay_read_pool(ctx).await? else {
+            return Ok(None);
+        };
+        let project = resolve_existing_project(ctx, &pool, project_key).await?;
+        let project_id = project.id.unwrap_or(0);
+        let agent = resolve_agent(
+            ctx,
+            &pool,
+            project_id,
+            agent_name,
+            &project.slug,
+            &project.human_key,
+        )
+        .await?;
+        Ok(Some((pool, project_id, agent)))
+    }
+    .await;
+    let (pool, project_id, agent) = match resolved {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Ok(None),
+        Err(error) if error.code == McpErrorCode::RequestCancelled => return Err(error),
+        Err(_) => {
+            ensure_request_live(ctx)?;
+            return Ok(None);
+        }
+    };
+    // Resolve and authorize the current actor before disclosing either a
+    // receipt or a conflicting claim from this project's shared key namespace.
+    authorization.authorize(ctx, &agent, "acknowledge mail")?;
+    let outcome = mcp_agent_mail_db::queries::lookup_idempotency_result::<(i64, i64)>(
+        ctx.cx(),
+        &pool,
+        mcp_agent_mail_db::IdempotencyClaim {
+            project_id,
+            tool: "acknowledge_message",
+            key: &idempotency.key,
+            fingerprint: &idempotency.fingerprint,
+        },
+    )
+    .await;
+    ensure_request_live(ctx)?;
+    let receipt = match outcome {
+        // A read failure is not an authoritative miss. The write path retains
+        // its existing retry classification and fail-soft queue behavior.
+        Outcome::Err(_) => return Ok(None),
+        other => db_outcome_to_mcp_result(other)?,
+    };
+    match receipt {
+        Some(Ok((read_ts, ack_ts))) => {
+            ack_status_response(message_id, read_ts, ack_ts, true).map(Some)
+        }
+        Some(Err(conflict)) => Err(crate::idempotency::idempotency_conflict_error(&conflict)),
+        None => Ok(None),
+    }
+}
+
 /// Acknowledge a message (also marks as read).
 ///
 /// # Parameters
@@ -6200,6 +6287,20 @@ pub async fn acknowledge_message(
             ],
         ),
     });
+
+    if let Some(idempotency) = &idempotency
+        && let Some(response) = try_replay_ack(
+            ctx,
+            &project_key,
+            &agent_name,
+            message_id,
+            idempotency,
+            &authorization,
+        )
+        .await?
+    {
+        return Ok(response);
+    }
 
     // A durable intent is an accepted future mutation. If this session has a
     // binding that could constrain an unresolved actor, preserve the original
@@ -6356,13 +6457,6 @@ pub async fn acknowledge_message(
     // intents so degraded-mode acknowledgements land once the mailbox recovers.
     replay_queued_ack_intents(ctx, &pool, &config).await;
 
-    let response = AckStatusResponse {
-        message_id,
-        acknowledged: true,
-        acknowledged_at: Some(micros_to_iso(ack_ts)),
-        read_at: Some(micros_to_iso(read_ts)),
-    };
-
     tracing::debug!(
         "Acknowledged message {} for {} in project {}",
         message_id,
@@ -6370,9 +6464,7 @@ pub async fn acknowledge_message(
         project_key
     );
 
-    serde_json::to_string(&response)
-        .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+    ack_status_response(message_id, read_ts, ack_ts, idempotent_replay)
 }
 
 #[cfg(test)]
@@ -7767,6 +7859,439 @@ mod tests {
         .expect("create acknowledgement test message")
         .id
         .expect("message ID")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn committed_ack_retries_remain_read_only_while_recovery_holds_admission() {
+        // The promotion barrier is process-wide. A private process also lets
+        // the cold-pool case prove that receipt reads never bootstrap writers.
+        const CHILD: &str = "AM_TEST_ACK_RECEIPT_ADMISSION_CHILD";
+        const PROJECT: &str = "/ack-receipt-admission";
+        const KEY: &str = "committed-ack-receipt";
+        const EXPIRED_KEY: &str = "expired-ack-receipt";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated acknowledgement receipt test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated acknowledgement receipt test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        for warm in [false, true] {
+            with_messaging_mailbox(&[("MESSAGING_SESSION_IDENTITY", "true")], |mailbox| {
+                use crate::tool_util::DB_POOL_BOOTSTRAP_PROMOTIONS;
+                use mcp_agent_mail_db::write_barrier::{
+                    active_writer_count, current_thread_holds_promotion_barrier,
+                    try_acquire_promotion_barrier_if_idle,
+                };
+                use std::sync::{Arc, Barrier, atomic::Ordering, mpsc};
+                use std::time::{Duration, Instant};
+
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                let (project_id, recipient_id, peer_id, messages, timestamps) =
+                    runtime.block_on(async {
+                        let cx = Cx::current().expect("fixture context");
+                        let pool = DbPool::new(&DbPoolConfig::from_env()).expect("seed pool");
+                        let project = ensure_project_row(&cx, &pool, PROJECT).await;
+                        let project_id = project.id.unwrap();
+                        let recipient =
+                            register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                        let peer = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                        let recipient_id = recipient.id.unwrap();
+                        let peer_id = peer.id.unwrap();
+                        let mut messages = [0; 4];
+                        for message in &mut messages {
+                            *message = create_ack_test_message(
+                                &cx,
+                                &pool,
+                                project_id,
+                                peer_id,
+                                &[(recipient_id, "to"), (peer_id, "cc")],
+                            )
+                            .await;
+                        }
+                        let conn = pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("seed read times");
+                        conn.execute_raw(&format!(
+                            "UPDATE message_recipients SET read_ts = 123 \
+                             WHERE agent_id = {recipient_id} AND message_id IN ({}, {})",
+                            messages[0], messages[2],
+                        ))
+                        .expect("read predates the acknowledgement");
+                        drop(conn);
+                        let mut timestamps = [(0, 0); 2];
+                        for (index, (message_id, key)) in
+                            [(messages[0], KEY), (messages[2], EXPIRED_KEY)]
+                                .into_iter()
+                                .enumerate()
+                        {
+                            let claim = ack_retry_claim(&recipient.name, message_id, key);
+                            timestamps[index] = match queries::acknowledge_message_idempotent(
+                                &cx,
+                                &pool,
+                                recipient_id,
+                                message_id,
+                                mcp_agent_mail_db::IdempotencyClaim {
+                                    project_id,
+                                    tool: "acknowledge_message",
+                                    key,
+                                    fingerprint: &claim.fingerprint,
+                                },
+                            )
+                            .await
+                            .into_result()
+                            .expect("commit original acknowledgement")
+                            {
+                                mcp_agent_mail_db::IdempotentOutcome::Fresh(value) => value,
+                                other => panic!("expected fresh receipt: {other:?}"),
+                            };
+                        }
+                        let conn = pool.acquire(&cx).await.into_result().expect("seed expiry");
+                        conn.execute_raw(&format!(
+                            "UPDATE idempotency_keys SET expires_ts = 1 \
+                             WHERE idempotency_key = '{EXPIRED_KEY}'"
+                        ))
+                        .expect("expire the second claim");
+                        conn.execute_raw("UPDATE agents SET last_active_ts = 1")
+                            .expect("make any activity write observable");
+                        (project_id, recipient_id, peer_id, messages, timestamps)
+                    });
+                let cfg = DbPoolConfig::from_env();
+                assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+                // The registry is weak. Retain the actual pool without the
+                // wrapper's writer guard so recovery can still take admission.
+                let warm_pool =
+                    warm.then(|| (*get_db_pool().expect("warm authoritative pool")).clone());
+                let config = Config::get();
+                queued_ack_intent_response(
+                    &config,
+                    PROJECT,
+                    "BlueLake",
+                    messages[1],
+                    "fixture",
+                    "previous database outage",
+                    None,
+                )
+                .expect("accepted unrelated acknowledgement intent");
+                let journal = crate::degraded_intents::log_path(
+                    &config,
+                    crate::degraded_intents::ACK_INTENT_LOG_FILE,
+                );
+                let journal_before = std::fs::read(&journal).expect("durable intent journal");
+                let snapshot = || {
+                    let conn = mcp_agent_mail_db::DbConn::open_file(
+                        mailbox.database_path.to_str().unwrap(),
+                    )
+                    .expect("independent persisted-state reader");
+                    let activity = conn
+                        .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("n")
+                        .unwrap();
+                    let receipts = conn
+                        .query_sync(
+                            "SELECT message_id, agent_id, read_ts, ack_ts FROM message_recipients \
+                             ORDER BY message_id, agent_id",
+                            &[],
+                        )
+                        .unwrap()
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.get_named::<i64>("message_id").unwrap(),
+                                row.get_named::<i64>("agent_id").unwrap(),
+                                row.get_named::<Option<i64>>("read_ts").unwrap(),
+                                row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let keys = conn
+                        .query_sync(
+                            "SELECT idempotency_key, result_json, expires_ts FROM idempotency_keys \
+                             ORDER BY idempotency_key",
+                            &[],
+                        )
+                        .unwrap()
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.get_named::<String>("idempotency_key").unwrap(),
+                                row.get_named::<String>("result_json").unwrap(),
+                                row.get_named::<i64>("expires_ts").unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (activity, receipts, keys)
+                };
+                let state_before = snapshot();
+                let bootstraps_before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+                let owner = try_acquire_promotion_barrier_if_idle().expect("hold actual recovery");
+                let start = Arc::new(Barrier::new(7));
+                let (done_tx, done_rx) = mpsc::channel();
+                let mut requests = Vec::new();
+                let mut admission_controls = Vec::new();
+                for case in 0..6 {
+                    let start = Arc::clone(&start);
+                    let done_tx = done_tx.clone();
+                    let ctx = McpContext::with_state(
+                        Cx::for_testing(),
+                        case + 1,
+                        fastmcp_core::SessionState::new(),
+                    );
+                    let (actor_id, actor_name) = if case == 2 {
+                        (peer_id, "GreenStone")
+                    } else {
+                        (recipient_id, "BlueLake")
+                    };
+                    crate::session_identity::bind(&ctx, project_id, actor_id, actor_name);
+                    if case >= 4 {
+                        admission_controls.push(ctx.clone());
+                    }
+                    requests.push(std::thread::spawn(move || {
+                        let runtime = RuntimeBuilder::current_thread()
+                            .build()
+                            .expect("request runtime");
+                        let (agent, message, key) = match case {
+                            0 => (" bluelake ", messages[0], format!("  {KEY}  ")),
+                            1 => ("BlueLake", messages[1], KEY.to_string()),
+                            2 | 3 => ("GreenStone", messages[0], KEY.to_string()),
+                            4 => ("BlueLake", messages[3], "fresh-ack-receipt".to_string()),
+                            _ => ("BlueLake", messages[2], EXPIRED_KEY.to_string()),
+                        };
+                        start.wait();
+                        let result = runtime.block_on(acknowledge_message(
+                            &ctx,
+                            PROJECT.to_string(),
+                            agent.to_string(),
+                            message,
+                            Some(key),
+                        ));
+                        done_tx.send((case, result)).unwrap();
+                    }));
+                }
+                drop(done_tx);
+                start.wait();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut completed = Vec::new();
+                while completed.len() < 4 {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match done_rx.recv_timeout(remaining) {
+                        Ok(result) => completed.push(result),
+                        Err(_) => break,
+                    }
+                }
+                if let Ok(result) = done_rx.recv_timeout(Duration::from_millis(100)) {
+                    completed.push(result);
+                }
+                let mut early_cases = completed.iter().map(|(case, _)| *case).collect::<Vec<_>>();
+                early_cases.sort_unstable();
+                // Both misses must remain behind recovery. Cancel these probes
+                // while it still owns admission, then retry them sequentially
+                // below: concurrent cold bootstraps may legitimately contend.
+                for ctx in &admission_controls {
+                    ctx.request_cancellation().cancel();
+                }
+                let cancellation_deadline = Instant::now() + Duration::from_secs(2);
+                while completed.len() < 6 {
+                    let remaining = cancellation_deadline.saturating_duration_since(Instant::now());
+                    match done_rx.recv_timeout(remaining) {
+                        Ok(result) => completed.push(result),
+                        Err(_) => break,
+                    }
+                }
+                let finished_while_recovery_owned = completed.len();
+                let state_during_recovery = snapshot();
+                let journal_during_recovery = std::fs::read(&journal).unwrap();
+                let held = current_thread_holds_promotion_barrier();
+                let writers = active_writer_count();
+                let bootstraps_during_recovery =
+                    DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+                let cached_writer_during_recovery =
+                    mcp_agent_mail_db::get_cached_pool(&cfg).is_some();
+                // Release and join even on the pre-fix timeout; a failing
+                // assertion must never strand a writer behind this owner.
+                drop(owner);
+                for request in requests {
+                    request.join().expect("acknowledgement request exits");
+                }
+                completed.extend(done_rx.try_iter());
+                completed.sort_by_key(|(case, _)| *case);
+                assert_eq!(early_cases, vec![0, 1, 2, 3], "warm={warm}");
+                assert!(held);
+                assert_eq!(writers, 0);
+                assert_eq!(bootstraps_during_recovery, bootstraps_before);
+                assert_eq!(cached_writer_during_recovery, warm);
+                assert_eq!(state_during_recovery, state_before);
+                assert_eq!(journal_during_recovery, journal_before);
+                assert_eq!(completed.len(), 6);
+                assert_eq!(finished_while_recovery_owned, 6);
+                let replay: Value = serde_json::from_str(completed[0].1.as_ref().unwrap()).unwrap();
+                assert_eq!(replay["message_id"], messages[0]);
+                assert_eq!(replay["idempotent_replay"], true);
+                assert_eq!(replay["read_at"], micros_to_iso(timestamps[0].0));
+                assert_eq!(replay["acknowledged_at"], micros_to_iso(timestamps[0].1));
+                for (_, result) in &completed[1..3] {
+                    assert_eq!(
+                        crate::tool_error_code(result.as_ref().unwrap_err()),
+                        Some("IDEMPOTENCY_KEY_CONFLICT")
+                    );
+                }
+                assert_eq!(
+                    crate::tool_error_code(completed[3].1.as_ref().unwrap_err()),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                for (_, result) in &completed[4..] {
+                    assert_eq!(
+                        result.as_ref().unwrap_err().code,
+                        McpErrorCode::RequestCancelled
+                    );
+                }
+
+                let ctx =
+                    McpContext::with_state(Cx::for_testing(), 7, fastmcp_core::SessionState::new());
+                crate::session_identity::bind(&ctx, project_id, recipient_id, "BlueLake");
+                for (message, key) in [
+                    (messages[3], "fresh-ack-receipt"),
+                    (messages[2], EXPIRED_KEY),
+                ] {
+                    let fresh: Value = serde_json::from_str(
+                        &runtime
+                            .block_on(acknowledge_message(
+                                &ctx,
+                                PROJECT.to_string(),
+                                "BlueLake".to_string(),
+                                message,
+                                Some(key.to_string()),
+                            ))
+                            .expect(
+                                "fresh and expired keys proceed once recovery releases admission",
+                            ),
+                    )
+                    .unwrap();
+                    assert_eq!(fresh["acknowledged"], true);
+                    assert!(fresh.get("idempotent_replay").is_none());
+                    if key == EXPIRED_KEY {
+                        assert_eq!(fresh["read_at"], micros_to_iso(timestamps[1].0));
+                        assert_eq!(fresh["acknowledged_at"], micros_to_iso(timestamps[1].1));
+                    }
+                }
+                assert!(
+                    crate::degraded_intents::read_queued_ack_intents(&config)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(active_writer_count(), 0);
+                drop(warm_pool);
+            });
+        }
+    }
+
+    #[test]
+    fn ack_receipt_read_outage_preserves_durable_queue_and_retry_claim() {
+        with_messaging_mailbox(
+            &[
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("DATABASE_POOL_TIMEOUT", "1"),
+            ],
+            |_| {
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = get_db_pool().expect("authoritative mailbox pool");
+                    let project = ensure_project_row(&cx, &pool, "/ack-receipt-read-outage").await;
+                    let project_id = project.id.unwrap();
+                    let recipient = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                    let recipient_id = recipient.id.unwrap();
+                    let message_id = create_ack_test_message(
+                        &cx,
+                        &pool,
+                        project_id,
+                        recipient_id,
+                        &[(recipient_id, "to")],
+                    )
+                    .await;
+                    let read_pool = get_coalescer_bypass_read_db_pool().expect("receipt read pool");
+                    let occupied_read = read_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("occupy reader");
+                    let occupied_write = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("occupy writer");
+                    let key = "private-receipt-read-outage-key";
+                    let response = acknowledge_message(
+                        &ctx,
+                        project.human_key.clone(),
+                        recipient.name.clone(),
+                        message_id,
+                        Some(format!("  {key}  ")),
+                    )
+                    .await
+                    .expect("an unavailable receipt probe must retain the ordinary outage queue");
+                    let queued: Value = serde_json::from_str(&response).unwrap();
+                    assert_eq!(queued["queued"], true);
+                    assert_eq!(queued["acknowledged"], false);
+                    assert!(!response.contains(key));
+                    let config = Config::get();
+                    let intents =
+                        crate::degraded_intents::read_queued_ack_intents(&config).unwrap();
+                    assert_eq!(intents.len(), 1);
+                    assert_eq!(
+                        intents[0].idempotency,
+                        Some(ack_retry_claim(&recipient.name, message_id, key))
+                    );
+                    let changed = occupied_write
+                        .query_sync(
+                            "SELECT COUNT(*) AS n FROM message_recipients \
+                             WHERE read_ts IS NOT NULL OR ack_ts IS NOT NULL",
+                            &[],
+                        )
+                        .unwrap();
+                    assert_eq!(changed[0].get_named::<i64>("n").unwrap(), 0);
+                    drop(occupied_write);
+                    drop(occupied_read);
+                    replay_queued_ack_intents(&ctx, &pool, &config).await;
+                    assert!(
+                        crate::degraded_intents::read_queued_ack_intents(&config)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let replay: Value = serde_json::from_str(
+                        &acknowledge_message(
+                            &ctx,
+                            project.human_key,
+                            recipient.name,
+                            message_id,
+                            Some(key.to_string()),
+                        )
+                        .await
+                        .expect("the queued original claim is now committed and replayable"),
+                    )
+                    .unwrap();
+                    assert_eq!(replay["idempotent_replay"], true);
+                    assert_eq!(replay["acknowledged"], true);
+                });
+            },
+        );
     }
 
     #[test]
