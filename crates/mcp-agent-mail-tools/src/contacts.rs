@@ -713,6 +713,60 @@ pub async fn respond_contact(
     accept: bool,
     ttl_seconds: Option<i64>,
 ) -> McpResult<String> {
+    respond_contact_with_mode(
+        ctx,
+        project_key,
+        to_agent,
+        from_agent,
+        from_project,
+        ContactResponseMode::Explicit { accept },
+        ttl_seconds,
+    )
+    .await
+}
+
+/// The handshake has already requested contact, but only the recipient's
+/// explicit decision may lift a block committed before automatic approval.
+pub(crate) async fn approve_contact_unless_blocked(
+    ctx: &McpContext,
+    project_key: String,
+    to_agent: String,
+    from_agent: String,
+    from_project: Option<String>,
+    ttl_seconds: Option<i64>,
+) -> McpResult<String> {
+    respond_contact_with_mode(
+        ctx,
+        project_key,
+        to_agent,
+        from_agent,
+        from_project,
+        ContactResponseMode::Automatic,
+        ttl_seconds,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ContactResponseMode {
+    Explicit { accept: bool },
+    Automatic,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn respond_contact_with_mode(
+    ctx: &McpContext,
+    project_key: String,
+    to_agent: String,
+    from_agent: String,
+    from_project: Option<String>,
+    mode: ContactResponseMode,
+    ttl_seconds: Option<i64>,
+) -> McpResult<String> {
+    let accept = match mode {
+        ContactResponseMode::Explicit { accept } => accept,
+        ContactResponseMode::Automatic => true,
+    };
     // Normalize names
     let to_agent = mcp_agent_mail_core::models::normalize_agent_name(&to_agent).unwrap_or(to_agent);
     let from_agent =
@@ -768,17 +822,33 @@ pub async fn respond_contact(
         }
         _ => 2_592_000, // 30 days default
     };
-    let respond_out = mcp_agent_mail_db::queries::respond_contact(
-        ctx.cx(),
-        &pool,
-        source_project_id,
-        from_row.id.unwrap_or(0),
-        project_id,
-        to_row.id.unwrap_or(0),
-        accept,
-        ttl,
-    )
-    .await;
+    let respond_out = match mode {
+        ContactResponseMode::Explicit { accept } => {
+            mcp_agent_mail_db::queries::respond_contact(
+                ctx.cx(),
+                &pool,
+                source_project_id,
+                from_row.id.unwrap_or(0),
+                project_id,
+                to_row.id.unwrap_or(0),
+                accept,
+                ttl,
+            )
+            .await
+        }
+        ContactResponseMode::Automatic => {
+            mcp_agent_mail_db::queries::approve_contact_unless_blocked(
+                ctx.cx(),
+                &pool,
+                source_project_id,
+                from_row.id.unwrap_or(0),
+                project_id,
+                to_row.id.unwrap_or(0),
+                ttl,
+            )
+            .await
+        }
+    };
     if let Outcome::Err(ref err) = respond_out {
         tracing::error!(
             from_agent = %from_agent,
@@ -817,7 +887,7 @@ pub async fn respond_contact(
     let response = RespondContactResponse {
         from: from_agent,
         to: to_agent,
-        approved: accept,
+        approved: link_row.status.eq_ignore_ascii_case("approved"),
         expires_ts: link_row.expires_ts.map(micros_to_iso),
         updated,
     };

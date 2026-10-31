@@ -17323,6 +17323,65 @@ pub async fn respond_contact(
     accept: bool,
     ttl_seconds: i64,
 ) -> Outcome<(usize, AgentLinkRow), DbError> {
+    respond_contact_with_mode(
+        cx,
+        pool,
+        from_project_id,
+        from_agent_id,
+        to_project_id,
+        to_agent_id,
+        accept,
+        ttl_seconds,
+        ContactResponseMode::Explicit,
+    )
+    .await
+}
+
+/// Automatically approve an existing request without lifting a recipient's
+/// block. The returned row is authoritative: a preserved block has zero
+/// updated rows and retains all of its original metadata.
+#[allow(clippy::too_many_arguments)]
+pub async fn approve_contact_unless_blocked(
+    cx: &Cx,
+    pool: &DbPool,
+    from_project_id: i64,
+    from_agent_id: i64,
+    to_project_id: i64,
+    to_agent_id: i64,
+    ttl_seconds: i64,
+) -> Outcome<(usize, AgentLinkRow), DbError> {
+    respond_contact_with_mode(
+        cx,
+        pool,
+        from_project_id,
+        from_agent_id,
+        to_project_id,
+        to_agent_id,
+        true,
+        ttl_seconds,
+        ContactResponseMode::Automatic,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ContactResponseMode {
+    Explicit,
+    Automatic,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn respond_contact_with_mode(
+    cx: &Cx,
+    pool: &DbPool,
+    from_project_id: i64,
+    from_agent_id: i64,
+    to_project_id: i64,
+    to_agent_id: i64,
+    accept: bool,
+    ttl_seconds: i64,
+    mode: ContactResponseMode,
+) -> Outcome<(usize, AgentLinkRow), DbError> {
     let now = now_micros();
     let status = if accept { "approved" } else { "blocked" };
     let expires = if ttl_seconds > 0 && accept {
@@ -17383,10 +17442,6 @@ pub async fn respond_contact(
                 return Outcome::Err(e);
             }
         };
-        row.status = status.to_string();
-        row.updated_ts = now;
-        row.expires_ts = expires;
-
         let Some(link_id) = row.id else {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::invalid(
@@ -17394,6 +17449,20 @@ pub async fn respond_contact(
                 "existing agent_link row has NULL id",
             ));
         };
+        // The macro's earlier request result cannot authorize this update:
+        // the recipient may have blocked the link while approval was queued.
+        // Recheck inside every transaction attempt, after endpoint validation.
+        // An explicit recipient decision retains its ability to lift a block.
+        if matches!(mode, ContactResponseMode::Automatic)
+            && row.status.eq_ignore_ascii_case("blocked")
+        {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok((0, row));
+        }
+        row.status = status.to_string();
+        row.updated_ts = now;
+        row.expires_ts = expires;
+
         let update_sql =
             "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? WHERE id = ?";
         let update_params = [
@@ -35730,6 +35799,14 @@ mod tests {
                                     if field == expected_field
                             ));
                         }
+                        assert!(matches!(
+                            approve_contact_unless_blocked(
+                                &cx, &pool, from_project_id, from_agent_id,
+                                to_project_id, to_agent_id, 7200,
+                            ).await,
+                            Outcome::Err(DbError::InvalidArgument { field, .. })
+                                if field == expected_field
+                        ));
 
                         // Refused mutations must leave all link fields unchanged,
                         // and retirement must not hide historical contact metadata.
@@ -35775,6 +35852,129 @@ mod tests {
                     });
                 }
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_contact_approval_preserves_a_block_committed_while_waiting() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for cross_project in [false, true] {
+            let (_cx, pool, _dir) =
+                setup_test_pool(&format!("contact-auto-block-{cross_project}.db"));
+            let recipient_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("independent recipient pool");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let from_project_id = ensure_project(&cx, &pool, "/tmp/contact-auto-source")
+                    .await
+                    .into_result()
+                    .expect("source project")
+                    .id
+                    .unwrap();
+                let to_project_id = if cross_project {
+                    ensure_project(&cx, &pool, "/tmp/contact-auto-target")
+                        .await
+                        .into_result()
+                        .expect("target project")
+                        .id
+                        .unwrap()
+                } else {
+                    from_project_id
+                };
+                let from_agent_id = register_agent(
+                    &cx, &pool, from_project_id, "BlueLake", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("requester")
+                .id
+                .unwrap();
+                let to_agent_id = register_agent(
+                    &cx, &pool, to_project_id, "GreenStone", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("recipient")
+                .id
+                .unwrap();
+                let requested = request_contact(
+                    &cx, &pool, from_project_id, from_agent_id, to_project_id, to_agent_id,
+                    "request observed before the block", 3600,
+                )
+                .await
+                .into_result()
+                .expect("pending request");
+                assert_eq!(requested.status, "pending");
+                let reverse = request_contact(
+                    &cx, &pool, to_project_id, to_agent_id, from_project_id, from_agent_id,
+                    "independent reverse request", 1800,
+                )
+                .await
+                .into_result()
+                .expect("reverse link");
+                drop(recipient_pool.acquire(&cx).await.into_result().expect("warm recipient"));
+                let held = pool.acquire(&cx).await.into_result().expect("hold sole checkout");
+                let mut waiting = std::pin::pin!(approve_contact_unless_blocked(
+                    &cx, &pool, from_project_id, from_agent_id, to_project_id, to_agent_id, 7200,
+                ));
+                {
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                }
+                let (_, blocked) = respond_contact(
+                    &cx, &recipient_pool, from_project_id, from_agent_id,
+                    to_project_id, to_agent_id, false, 7200,
+                )
+                .await
+                .into_result()
+                .expect("recipient blocks after the request snapshot");
+                assert_eq!(blocked.status, "blocked");
+                drop(held);
+                let (updated, observed) = asupersync::time::timeout(
+                    cx.now(), std::time::Duration::from_secs(5), waiting,
+                )
+                .await
+                .expect("automatic approval watchdog")
+                .into_result()
+                .expect("automatic approval returns the preserved block");
+                assert_eq!(updated, 0);
+                assert_eq!(
+                    serde_json::to_value(&observed).unwrap(),
+                    serde_json::to_value(&blocked).unwrap(),
+                    "automatic approval must not refresh any blocked row field"
+                );
+                let history = list_contacts(&cx, &pool, from_project_id, from_agent_id)
+                    .await
+                    .into_result()
+                    .expect("preserved directed history");
+                assert_eq!(serde_json::to_value(history.0).unwrap(), serde_json::json!([blocked]));
+                assert_eq!(serde_json::to_value(history.1).unwrap(), serde_json::json!([reverse]));
+
+                let (updated, approved) = respond_contact(
+                    &cx, &pool, from_project_id, from_agent_id,
+                    to_project_id, to_agent_id, true, 3600,
+                )
+                .await
+                .into_result()
+                .expect("explicit recipient approval still lifts the block");
+                assert_eq!(updated, 1);
+                assert_eq!(approved.status, "approved");
+                assert_eq!(approved.id, requested.id);
+            });
         }
     }
 

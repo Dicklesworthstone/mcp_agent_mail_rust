@@ -854,17 +854,19 @@ pub async fn macro_contact_handshake(
     )
     .await?;
     let request_val: Value = parse_json(request_json, "request")?;
+    #[cfg(test)]
+    contact_handshake_tests::pause_after_request(&source_project_key);
     // `request_contact` leaves a blocked link blocked. auto_accept approves a
     // request on the target's behalf; it must not turn the target's explicit
     // block back into an approval (that would let the blocked requester
     // deliver into the target's project, GH#335 review).
-    let link_blocked = request_val
+    let mut link_blocked = request_val
         .get("status")
         .and_then(Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("blocked"));
 
     let response_val = if should_auto_accept && !link_blocked {
-        let respond_json = crate::contacts::respond_contact(
+        let respond_json = crate::contacts::approve_contact_unless_blocked(
             ctx,
             target_project_key.clone(),
             target_agent_name.clone(),
@@ -874,20 +876,26 @@ pub async fn macro_contact_handshake(
             } else {
                 None
             },
-            true,
             Some(ttl),
         )
         .await?;
         let response_val: Value = parse_json(respond_json, "response")?;
-        crate::contacts::send_contact_approved_notice(
-            ctx,
-            &source_project_key,
-            &from_agent,
-            &target_project_key,
-            &target_agent_name,
-        )
-        .await?;
-        Some(response_val)
+        if response_val.get("approved").and_then(Value::as_bool) == Some(true) {
+            crate::contacts::send_contact_approved_notice(
+                ctx,
+                &source_project_key,
+                &from_agent,
+                &target_project_key,
+                &target_agent_name,
+            )
+            .await?;
+            Some(response_val)
+        } else {
+            // The recipient's block won after the request snapshot. Preserve
+            // the same silent blocked outcome as a block observed up front.
+            link_blocked = true;
+            None
+        }
     } else {
         None
     };
@@ -997,6 +1005,9 @@ pub async fn macro_contact_handshake(
 }
 
 // removed generate_slug (unused; slug derivation handled by ensure_project)
+
+#[cfg(test)]
+mod contact_handshake_tests;
 
 #[cfg(test)]
 mod tests {
