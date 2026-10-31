@@ -351,7 +351,11 @@ pub(super) fn rename_reclaim_entry(
 fn validate_source_entry(parent: &File, name: &OsStr, expected: &Stat) -> io::Result<()> {
     let current =
         rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
-    if !same_object(&current, expected) || current.st_size != expected.st_size {
+    // A directory's size is no part of its identity: xfs keeps the parent's
+    // inode number inside a small directory, in 4 or 8 bytes, so a rename
+    // between parents on either side of 2^32 resizes it.
+    let directory = FileType::from_raw_mode(expected.st_mode) == FileType::Directory;
+    if !same_object(&current, expected) || (!directory && current.st_size != expected.st_size) {
         return Err(invalid(
             "reclaim source identity or size changed before publication",
         ));
@@ -2229,5 +2233,30 @@ mapping.close()
             "/proc/7/fd/3: Permission denied (os error 13)"
         );
         assert!(!is_proc_task_gone(&error));
+    }
+
+    #[test]
+    fn source_entry_identifies_a_directory_without_its_size() {
+        let root = fixture();
+        std::fs::create_dir(root.join("bundle")).unwrap();
+        std::fs::create_dir(root.join("replacement")).unwrap();
+        std::fs::write(root.join("artifact"), b"payload").unwrap();
+        let parent = open_directory(&root, false).unwrap();
+        let stat =
+            |name: &str| rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+
+        // What xfs does to a small directory on a rename across 2^32.
+        let mut resized = stat("bundle");
+        resized.st_size += 8;
+        validate_source_entry(&parent, OsStr::new("bundle"), &resized).unwrap();
+
+        // Device and inode still decide: a replacement directory is refused.
+        let replacement = stat("replacement");
+        validate_source_entry(&parent, OsStr::new("bundle"), &replacement).unwrap_err();
+
+        // Anything else keeps its size check.
+        let mut shrunk = stat("artifact");
+        shrunk.st_size -= 1;
+        validate_source_entry(&parent, OsStr::new("artifact"), &shrunk).unwrap_err();
     }
 }
