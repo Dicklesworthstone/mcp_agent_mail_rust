@@ -162,7 +162,7 @@ fn with_queued_archive_lag(config: &Config, age: Duration, test: impl FnOnce()) 
                 enqueued_at: Instant::now().checked_sub(age).unwrap(),
                 op: Box::new(op),
             }),
-            Some(&wbq.lifecycle),
+            Some(wbq),
         )
         .is_ok()
     );

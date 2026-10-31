@@ -2836,10 +2836,7 @@ pub(crate) fn sync_activated_recovery_database(db_path: &Path) -> Result<(), Sql
 
 /// Refuse startup/recovery if a prior promotion was not durably receipted, or
 /// if any finalized receipt's self-hash/chain link is invalid.
-pub(crate) fn verify_recovery_receipt_state(
-    storage_root: &Path,
-    db_path: &Path,
-) -> Result<(), SqlError> {
+pub fn verify_recovery_receipt_state(storage_root: &Path, db_path: &Path) -> Result<(), SqlError> {
     let receipts_dir = recovery_receipts_dir(storage_root, db_path)?;
     let pending = pending_recovery_receipt_paths(&receipts_dir)?;
     if !pending.is_empty() {

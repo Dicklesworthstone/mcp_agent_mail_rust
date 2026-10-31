@@ -29903,8 +29903,8 @@ mod tests {
             let first = newest.parent(0).expect("second group follows first");
             assert_eq!(newest.parent_count(), 1);
             assert_eq!(first.parent_count(), 0, "exactly two Git commits");
-            assert_eq!(newest.author().name(), Some("Test"));
-            assert_eq!(first.author().email(), Some("test@example.com"));
+            assert_eq!(newest.author().name(), Ok("Test"));
+            assert_eq!(first.author().email(), Ok("test@example.com"));
             let first_tree = first.tree().unwrap();
             let final_tree = newest.tree().unwrap();
             for (index, request) in requests.iter().enumerate() {
@@ -29965,7 +29965,10 @@ mod tests {
             assert!(outcome.failed_requests.is_empty());
             let mut commit = repo.head().unwrap().peel_to_commit().unwrap();
             for index in (0..4).rev() {
-                assert_eq!(commit.summary(), Some(format!("request {index}").as_str()));
+                assert_eq!(
+                    commit.summary(),
+                    Ok(Some(format!("request {index}").as_str()))
+                );
                 let tree = commit.tree().unwrap();
                 for message in 0..4 {
                     assert_eq!(
@@ -30078,12 +30081,12 @@ mod tests {
             assert_eq!(outcome.committed_commits, 3);
             assert!(outcome.failed_requests.is_empty());
             let newest = repo.head().unwrap().peel_to_commit().unwrap();
-            assert_eq!(newest.author().name(), Some("Other"));
-            assert_eq!(newest.author().email(), Some("other@example.com"));
+            assert_eq!(newest.author().name(), Ok("Other"));
+            assert_eq!(newest.author().email(), Ok("other@example.com"));
             let middle = newest.parent(0).unwrap();
             let first = middle.parent(0).unwrap();
-            assert_eq!(middle.author().name(), Some("Test"));
-            assert_eq!(first.author().name(), Some("Test"));
+            assert_eq!(middle.author().name(), Ok("Test"));
+            assert_eq!(first.author().name(), Ok("Test"));
             assert_eq!(first.parent_count(), 0);
             assert!(
                 first
