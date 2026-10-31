@@ -48,14 +48,14 @@ const MAX_RETRIES_PER_PASS: usize = 16;
 const MAX_IDS_PER_PASS: usize = 32;
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DeferredRetry {
     id: i64,
     attempts: u32,
     ready_at: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StartupTail {
     after: i64,
     ceiling: i64,
@@ -139,7 +139,7 @@ impl From<crate::StorageError> for ReconcileFailure {
 /// Cursors are only hints: restarting or wrapping always safely checks again.
 /// The startup-aware worker cursor checkpoints its hints; `Default` remains
 /// in-memory for independent one-shot scans and callers without a startup anchor.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ReconcileCursor {
     source_identity: String,
     tail_after: Option<i64>,
@@ -490,21 +490,44 @@ fn select_ids(
             ..Default::default()
         };
     }
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
+    // Discovery precedes every per-message retry. Returning its failed pager
+    // to the one-slot maintenance pool can strand the entire retry queue.
+    // Use the same quarantine/panic boundary as payload reads, and publish
+    // scheduling changes only after the complete bounded selection succeeds.
+    let mut pending = cursor.clone();
+    let selected = source::with_source_connection(cx, pool, |conn| {
+        select_ids_from_connection(conn, &mut pending, cutoff)
+    })
+    .map_err(|error| error.detail)?;
+    *cursor = pending;
+    Ok(selected)
+}
+
+fn select_ids_from_connection(
+    conn: &mcp_agent_mail_db::DbConn,
+    cursor: &mut ReconcileCursor,
+    cutoff: i64,
+) -> Result<SelectedIds, ReconcileFailure> {
+    let query = |sql: &str, params: &[mcp_agent_mail_db::sqlmodel_core::Value]| {
+        #[cfg(test)]
+        tests::discovery_read_fault(conn)?;
+        conn.query_sync(sql, params)
+            .map_err(ReconcileFailure::source_unavailable)
+    };
+    let mode = query("PRAGMA query_only", &[])?;
     let query_only = mode
         .first()
         .ok_or_else(|| "source query-only mode was not reported".to_string())?
         .get_as::<i64>(0)
         .map_err(source_error)?;
     if query_only != 0 {
-        return Err("query-only snapshots cannot authorize message archive repair".to_string());
+        return Err(
+            "query-only snapshots cannot authorize message archive repair"
+                .to_string()
+                .into(),
+        );
     }
-    let rows = conn
-        .query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
-        .map_err(source_error)?;
+    let rows = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])?;
     let max_id = rows
         .first()
         .ok_or_else(|| "message ID aggregate returned no row".to_string())?
@@ -523,12 +546,10 @@ fn select_ids(
             && cursor.settled_before_us > 0
             && let Some(after) = cursor.tail_after
         {
-            let rows = conn
-                .query_sync(
-                    "SELECT id FROM messages WHERE id > ? AND created_ts <= ? ORDER BY id DESC LIMIT 1",
-                    &[after.into(), cursor.settled_before_us.into()],
-                )
-                .map_err(source_error)?;
+            let rows = query(
+                "SELECT id FROM messages WHERE id > ? AND created_ts <= ? ORDER BY id DESC LIMIT 1",
+                &[after.into(), cursor.settled_before_us.into()],
+            )?;
             cursor.startup_tail = rows
                 .first()
                 .map(|row| row.get_named::<i64>("id").map_err(source_error))
@@ -546,12 +567,10 @@ fn select_ids(
         // this lane even after its grace expires. Read one bounded ID page
         // and stop at the first unsettled row instead. History and due retries
         // still make independent progress beyond that scheduling barrier.
-        let rows = conn
-            .query_sync(
-                "SELECT id, created_ts FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?",
-                &[after.into(), (IDS_PER_LANE + 1).into()],
-            )
-            .map_err(source_error)?;
+        let rows = query(
+            "SELECT id, created_ts FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?",
+            &[after.into(), (IDS_PER_LANE + 1).into()],
+        )?;
         let mut tail = Vec::with_capacity(rows.len());
         for row in rows {
             if row.get_named::<i64>("created_ts").map_err(source_error)? > cutoff {
@@ -574,21 +593,17 @@ fn select_ids(
         // both reads to the already observed maximum: an older request that
         // commits after the barrier read must remain future forward work, not
         // let this newest page jump over an intervening younger commit.
-        let first_unsettled = conn
-            .query_sync(
+        let first_unsettled = query(
                 "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts > ? ORDER BY id ASC LIMIT 1",
                 &[max_id.into(), cutoff.into()],
-            )
-            .map_err(source_error)?
+            )?
             .first()
             .map(|row| row.get_named::<i64>("id").map_err(source_error))
             .transpose()?;
-        let mut tail = conn
-            .query_sync(
+        let mut tail = query(
                 "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
                 &[max_id.into(), cutoff.into(), IDS_PER_LANE.into()],
-            )
-            .map_err(source_error)?
+            )?
             .into_iter()
             .map(|row| row.get_named::<i64>("id").map_err(source_error))
             .collect::<Result<Vec<_>, _>>()?;
@@ -601,16 +616,14 @@ fn select_ids(
         (tail, None)
     };
     tail.sort_unstable();
-    let history = conn
-        .query_sync(
+    let history = query(
             "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
             &[
                 cursor.backfill_ceiling.unwrap_or(max_id).into(),
                 cutoff.into(),
                 IDS_PER_LANE.into(),
             ],
-        )
-        .map_err(source_error)?
+        )?
         .into_iter()
         .map(|row| row.get_named::<i64>("id").map_err(source_error))
         .collect::<Result<Vec<_>, _>>()?;
@@ -621,7 +634,7 @@ fn select_ids(
         cursor.startup_backfill_complete = true;
     }
     let startup = if let Some(range) = &cursor.startup_tail {
-        conn.query_sync(
+        query(
             "SELECT id FROM messages WHERE id > ? AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
             &[
                 range.after.into(),
@@ -629,8 +642,7 @@ fn select_ids(
                 cursor.settled_before_us.into(),
                 IDS_PER_LANE.into(),
             ],
-        )
-        .map_err(source_error)?
+        )?
         .into_iter()
         .map(|row| row.get_named::<i64>("id").map_err(source_error))
         .collect::<Result<Vec<_>, _>>()?
@@ -1757,6 +1769,39 @@ pub fn prune_archived_message_batch(
 mod tests {
     use super::*;
 
+    std::thread_local! {
+        static DISCOVERY_READ_FAULT: std::cell::Cell<Option<(usize, bool)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    // Fail one chosen SQL boundary on the owning test thread. Real queries,
+    // source rows and archive publication remain on the production path.
+    pub(super) fn discovery_read_fault(
+        conn: &mcp_agent_mail_db::DbConn,
+    ) -> Result<(), ReconcileFailure> {
+        let fault = DISCOVERY_READ_FAULT.with(|slot| {
+            let (remaining, panic) = slot.get()?;
+            slot.set((remaining > 1).then_some((remaining.saturating_sub(1), panic)));
+            (remaining == 1).then_some(panic)
+        });
+        let Some(panic) = fault else {
+            return Ok(());
+        };
+        // This connection-local mark proves that the failed handle is retired,
+        // instead of the next pass borrowing that same handle again.
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert!(!panic, "private-discovery-source-panic-payload");
+        conn.query_sync("SELECT * FROM missing_message_discovery_probe", &[])
+            .map(|_| ())
+            .map_err(ReconcileFailure::source_unavailable)
+    }
+
     fn prepared() -> PreparedMessage {
         let message = json!({
             "id": 9, "from": "BlueLake", "to": ["GreenStone"], "cc": [], "bcc": ["RedFox"],
@@ -2703,6 +2748,110 @@ mod tests {
                     ..Config::default()
                 },
             );
+        });
+    }
+
+    fn exercise_failed_discovery(panic: bool) {
+        for failing_query in 1..=6 {
+            retention_fixture(2, |cx, pool, config| {
+                let before = admission_tests::database_evidence(cx, pool);
+                let mut cursor = ReconcileCursor {
+                    source_identity: pool.sqlite_identity_key(),
+                    tail_after: Some(900),
+                    // An empty history lane changes its wrap state before the
+                    // final startup query. A late failure must not publish that
+                    // incomplete selection or forget retained retry debt.
+                    backfill_ceiling: Some(899),
+                    settled_before_us: mcp_agent_mail_db::now_micros(),
+                    persist_progress: true,
+                    ..Default::default()
+                };
+                cursor.defer_transient(901, Instant::now());
+                let saved = format!("{cursor:?}");
+                DISCOVERY_READ_FAULT.with(|slot| slot.set(Some((failing_query, panic))));
+                let error = select_ids(cx, pool, &mut cursor, i64::MAX)
+                    .err()
+                    .expect("the selected discovery read must fail");
+                assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
+                assert_eq!(format!("{cursor:?}"), saved);
+                if panic {
+                    assert!(error.contains("panicked"), "{error}");
+                    assert!(!error.contains("private-discovery-source-panic-payload"));
+                }
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert_eq!(
+                    conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0)
+                        .unwrap(),
+                    0,
+                    "failed discovery reader was returned to the one-slot pool"
+                );
+                drop(conn);
+                assert_eq!(admission_tests::database_evidence(cx, pool), before);
+
+                let repaired =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(repaired.repaired, 2, "{repaired:?}");
+                assert_eq!(repaired.files_created, 8, "{repaired:?}");
+                assert_eq!(repaired.deferred, 0, "{repaired:?}");
+                assert_eq!(repaired.retry_len, 0, "{repaired:?}");
+                let archive = crate::open_archive(config, "project").unwrap().unwrap();
+                for id in [901, 902] {
+                    let prepared = prepare_message(cx, pool, id).unwrap();
+                    assert_eq!(prepared.message["reply_to"], 700);
+                    assert!(
+                        verify_retention_archive(&archive, &prepared, &mut 0)
+                            .unwrap()
+                            .is_some(),
+                        "every canonical, outbox and BCC-safe inbox copy must match Git"
+                    );
+                }
+                assert_eq!(admission_tests::database_evidence(cx, pool), before);
+            });
+        }
+    }
+
+    #[test]
+    fn failed_discovery_queries_retire_readers_preserve_cursors_and_resume_archive_repair() {
+        exercise_failed_discovery(false);
+    }
+
+    #[test]
+    fn discovery_panics_retire_readers_preserve_cursors_and_resume_archive_repair() {
+        exercise_failed_discovery(true);
+    }
+
+    #[test]
+    fn discovery_query_only_refusal_keeps_the_healthy_reader_and_cursor() {
+        retention_fixture(2, |cx, pool, config| {
+            let before = admission_tests::database_evidence(cx, pool);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                ..Default::default()
+            };
+            let saved = format!("{cursor:?}");
+            let error = select_ids(cx, pool, &mut cursor, i64::MAX)
+                .err()
+                .expect("a read-only source cannot authorize repair");
+            assert!(error.contains("query-only"), "{error}");
+            assert_eq!(format!("{cursor:?}"), saved);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1,
+                "a valid refusal must not retire a healthy connection"
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            drop(conn);
+            assert!(crate::open_archive(config, "project").unwrap().is_none());
+            assert_eq!(admission_tests::database_evidence(cx, pool), before);
         });
     }
 

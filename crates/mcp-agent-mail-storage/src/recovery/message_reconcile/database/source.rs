@@ -88,7 +88,7 @@ pub(super) fn prepare_message_classified(
 /// can turn the bounded retry lane into repeated reads of the same bad handle.
 /// Retire only failed source reads, not valid reads that expose conflicting
 /// durable metadata. Neither path mutates mailbox rows or relaxes validation.
-fn with_source_connection<T>(
+pub(super) fn with_source_connection<T>(
     cx: &Cx,
     pool: &DbPool,
     read: impl FnOnce(&DbConn) -> Result<T, ReconcileFailure>,
