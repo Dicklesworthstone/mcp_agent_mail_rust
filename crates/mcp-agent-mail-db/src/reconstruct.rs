@@ -9017,7 +9017,7 @@ mod tests {
                 );
             }
         }
-        assert!(stats.warnings.is_empty());
+        assert_eq!(stats.warnings, Vec::<String>::new());
     }
 
     #[test]

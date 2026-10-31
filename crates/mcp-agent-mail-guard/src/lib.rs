@@ -2227,10 +2227,14 @@ if __name__ == "__main__":
     // The loaded Python program carries its own policy identity. Re-reading
     // its path during a concurrent hook reinstall could certify old checks
     // under the replacement program's digest.
-    let admission_policy = Sha256::digest(template.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let admission_policy = Sha256::digest(template.as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        },
+    );
 
     template
         .replace("__HOOK_NAME_TEXT__", hook_name)
