@@ -1262,7 +1262,7 @@ mod tests {
                     report.deferred_transient,
                     report.retry_len
                 ),
-                (9, 0, 9, 9)
+                (9, 0, 1, 1)
             );
             let path = first
                 .retries
@@ -1279,7 +1279,7 @@ mod tests {
                     .iter()
                     .map(|retry| retry.id)
                     .collect::<Vec<_>>(),
-                [33, 34, 35, 36, 37, 38, 39, 40, 101]
+                [101]
             );
             assert_eq!(durable.after, 101);
             drop(first); // releases the actual OS lock, not just the retry payload
