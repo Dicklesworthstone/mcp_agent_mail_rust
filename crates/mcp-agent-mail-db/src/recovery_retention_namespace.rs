@@ -605,14 +605,14 @@ fn ensure_no_file_readers(
             {
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(proc_entry_error(&entry.path().join("fd"), &error)),
         };
         for descriptor in descriptors {
             charge()?;
             let descriptor = match descriptor {
                 Ok(descriptor) => descriptor,
                 Err(error) if is_proc_task_gone(&error) => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(proc_entry_error(&entry.path().join("fd"), &error)),
             };
             if pid == own_pid
                 && excluded_descriptor.is_some_and(|excluded| {
@@ -653,7 +653,7 @@ fn ensure_no_file_readers(
                     {
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
                 }
             };
             if same_inode {
@@ -699,7 +699,7 @@ fn ensure_no_mapped_file_readers(
         {
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(proc_entry_error(&process.join("maps"), &error)),
     };
     let mut maps = Vec::with_capacity(64 * 1024);
     match maps_file
@@ -714,7 +714,7 @@ fn ensure_no_mapped_file_readers(
         {
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(proc_entry_error(&process.join("maps"), &error)),
     }
     if u64::try_from(maps.len()).unwrap_or(u64::MAX) > MAX_PROCESS_MAP_BYTES {
         return Err(invalid("open-reader mappings exceeded their bounded scan"));
@@ -975,7 +975,7 @@ fn reader_inventory_denial_is_foreign(
             // A process that exited between the denial and status inspection no
             // longer retains a descriptor. Other unavailable evidence refuses.
             Err(error) if is_proc_task_gone(&error) => return Ok(true),
-            Err(error) => return Err(error),
+            Err(error) => return Err(proc_entry_error(&process.join("status"), &error)),
         }
     }
     Ok(false)
@@ -1809,6 +1809,17 @@ mapping.close()
         let error = result.unwrap_err();
         if descriptors_hidden {
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            // The refused process can be another protected one, so this reads
+            // the pid back from the message rather than expecting the child's.
+            let message = error.to_string();
+            let refused_pid = message
+                .strip_prefix("/proc/")
+                .and_then(|rest| rest.split_once("/fd"))
+                .map(|(pid, _)| pid);
+            assert!(
+                refused_pid.is_some_and(|pid| pid.parse::<u32>().is_ok()),
+                "{message}"
+            );
         } else {
             // A fully privileged observer can inspect the child, in which
             // case the actual reader (or another protected process) refuses.
@@ -2233,6 +2244,27 @@ mapping.close()
             "/proc/7/fd/3: Permission denied (os error 13)"
         );
         assert!(!is_proc_task_gone(&error));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_reader_scan_failures_name_the_process_and_entry() {
+        let root = fixture();
+        let retained = std::fs::metadata(&root).unwrap();
+        let self_status = read_process_status_summary(Path::new("/proc/self")).unwrap();
+        // A directory opens and then fails to read. A self-link fails to open.
+        let unreadable = root.join("4242");
+        std::fs::create_dir_all(unreadable.join("maps")).unwrap();
+        let unopenable = root.join("4243");
+        std::fs::create_dir(&unopenable).unwrap();
+        std::os::unix::fs::symlink("maps", unopenable.join("maps")).unwrap();
+        for process in [unreadable, unopenable] {
+            let error =
+                ensure_no_mapped_file_readers(&process, 0, &self_status, &retained, || Ok(()))
+                    .unwrap_err();
+            let expected = format!("{}: ", process.join("maps").display());
+            assert!(error.to_string().starts_with(&expected), "{error}");
+        }
     }
 
     #[test]

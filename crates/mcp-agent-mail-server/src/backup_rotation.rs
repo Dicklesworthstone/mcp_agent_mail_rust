@@ -99,6 +99,9 @@ pub struct RotateReport {
     /// The pass reached its wall-clock budget. What it did not reach stays on
     /// disk, counted as kept, for a later pass.
     pub deadline_reached: bool,
+    /// Periodic images removed from inside the newest-image window, because
+    /// the publication budget was still exhausted when the pass reached them.
+    pub window_images_deleted: usize,
     pub failures: Vec<RotationFailure>,
     pub per_kind: BTreeMap<&'static str, RotateKindSummary>,
 }
@@ -895,6 +898,9 @@ fn reclaim_pending(
             summary.bytes_kept = summary.bytes_kept.saturating_add(entry.metadata.len());
             continue;
         }
+        let removed_before = summary
+            .deleted
+            .saturating_add(summary.unconfirmed_deletions);
         if reclaim_periodic_file(
             primary,
             (&entry.path, &entry.metadata),
@@ -910,6 +916,14 @@ fn reclaim_pending(
             // cursor through smaller files behind it. It needs to be first
             // on the next pass to use the oversized-file allowance.
             stopped = true;
+        }
+        if entry.within_window
+            && summary
+                .deleted
+                .saturating_add(summary.unconfirmed_deletions)
+                > removed_before
+        {
+            report.window_images_deleted = report.window_images_deleted.saturating_add(1);
         }
         stopped |= report.admission_refused;
     }
@@ -2422,6 +2436,61 @@ mod tests {
         assert!(!valid.exists());
         drop(guard);
         assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newest_images_removed_for_an_exhausted_budget_are_counted() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let older = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        let middle = tmp.path().join("storage.sqlite3.bak.20000102_000000");
+        let newest = tmp.path().join("storage.sqlite3.bak.20000103_000000");
+        fs::write(&older, b"incomplete export evidence").unwrap();
+        fs::copy(&primary, &middle).unwrap();
+        fs::copy(&primary, &newest).unwrap();
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let pass = |byte_limit, publication| {
+            let pending = [(&older, false), (&middle, false), (&newest, true)]
+                .into_iter()
+                .map(|(path, within_window)| PendingReclaim {
+                    path: path.clone(),
+                    metadata: fs::metadata(path).unwrap(),
+                    historical: false,
+                    within_window,
+                })
+                .collect();
+            let mut budget = ReclaimBudget {
+                attempted: 0,
+                bytes: 0,
+                byte_limit,
+                publication,
+                deadline: None,
+                deadline_reached: false,
+            };
+            let mut report = RotateReport::default();
+            reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+            report
+        };
+        // Only the refused oldest file is attempted, and the cursor stops on it.
+        let refused = pass(0, None);
+        assert_eq!(refused.failures.len(), 1);
+        assert_eq!(refused.window_images_deleted, 0);
+        // A later pass starts after that cursor, so it reaches the window
+        // before retrying the oldest file, and refuses nothing itself.
+        fs::copy(&primary, &older).unwrap();
+        let exhausted = PeriodicPublicationBudget {
+            count: 9,
+            bytes: 0,
+            projected: 0,
+            count_limit: 6,
+            byte_limit: u64::MAX,
+        };
+        let report = pass(u64::MAX, Some(exhausted));
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.deleted, 3);
+        assert_eq!(report.window_images_deleted, 1);
+        assert!(!newest.exists());
     }
 
     #[cfg(unix)]

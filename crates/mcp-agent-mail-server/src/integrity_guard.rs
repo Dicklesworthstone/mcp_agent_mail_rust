@@ -829,6 +829,13 @@ fn rotate_after_backup_attempt_with(
 }
 
 pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, phase: &'static str) {
+    if report.window_images_deleted > 0 {
+        tracing::warn!(
+            phase,
+            window_images_deleted = report.window_images_deleted,
+            "backup retention removed newest images because the publication budget stayed exhausted"
+        );
+    }
     if !report.failures.is_empty()
         || report.admission_refused
         || report.inventory_incomplete
@@ -2020,6 +2027,122 @@ mod tests {
         })
         .expect("create real backup pool");
         (primary, pool)
+    }
+
+    /// Records the fields of every event at `warn` or louder, the levels a
+    /// default-configured server prints.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct WarnFields(String);
+
+    impl tracing::field::Visit for WarnFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+
+            write!(self.0, "{}={value:?} ", field.name()).unwrap();
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = WarnFields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn newest_images_removed_by_retention_are_reported_as_a_warning() {
+        let quiet = crate::backup_rotation::RotateReport {
+            deleted: 2,
+            ..Default::default()
+        };
+        let shortened = crate::backup_rotation::RotateReport {
+            deleted: 2,
+            window_images_deleted: 2,
+            ..Default::default()
+        };
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            report_backup_rotation(&quiet, "ordinary pass");
+            report_backup_rotation(&shortened, "shortened pass");
+        });
+        let warnings = capture.0.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("window_images_deleted=2"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("shortened pass"), "{warnings:?}");
+    }
+
+    /// Removing the newest images is only defensible while it keeps backups
+    /// moving, so a new one has to follow whether or not the refusals clear.
+    #[cfg(unix)]
+    #[test]
+    fn publication_follows_a_pass_that_removed_the_newest_images() {
+        use mcp_agent_mail_db::snapshot::{
+            latest_verified_snapshot, record_snapshot_metadata, snapshot_bak_path,
+        };
+
+        if !isolated_default_retention_child() || !owner_processes_fully_observable() {
+            return;
+        }
+        for refusals_clear in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let (primary, pool) = retention_mailbox(&root);
+            std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+            let published = record_snapshot_metadata(&primary, 1_700_000_000_000_000).unwrap();
+            let image = |day: u32| root.join(format!("mail.sqlite3.bak.2000010{day}_000000"));
+            let refused = [1, 2, 3, 4, 5, 6].map(image);
+            for path in &refused {
+                std::fs::write(path, b"interrupted export").unwrap();
+            }
+            let newest = [8, 9].map(image);
+            for path in &newest {
+                std::fs::copy(&primary, path).unwrap();
+            }
+
+            let report =
+                crate::backup_rotation::rotate_storage_backups(&root, &primary, 3).unwrap();
+            assert_eq!(report.window_images_deleted, 2, "{report:?}");
+            assert!(newest.iter().all(|path| !path.exists()));
+            assert!(
+                crate::backup_rotation::admit_periodic_publication(&root, &primary, 3).is_err(),
+                "the refused images keep the budget exhausted"
+            );
+
+            if refusals_clear {
+                for path in &refused {
+                    std::fs::copy(&primary, path).unwrap();
+                }
+            }
+            let mut schedule = AutomaticBackupSchedule::default();
+            assert!(run_automatic_backup(&pool, &root, &mut schedule));
+            assert_eq!(schedule.consecutive_failures(), 0);
+            let next = latest_verified_snapshot(&primary).expect("a verified snapshot remains");
+            assert!(
+                next.created_us > published.created_us,
+                "refusals_clear={refusals_clear}: no new image followed the pass"
+            );
+        }
     }
 
     #[cfg(unix)]
