@@ -3488,7 +3488,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         &config,
         &probe_target.database_url,
         &probe_target.storage_root,
-    ) {
+    )? {
         Ok(crate::DoctorDatabaseFixStrategy::None(
             "Database passed live server health_check probes".to_string(),
         ))

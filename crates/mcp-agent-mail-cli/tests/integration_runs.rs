@@ -8630,6 +8630,123 @@ fn serve_http_updates_client_configs_only_with_explicit_setup() {
     check_serve_http_client_config_setup(true);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn robot_health_preserves_real_daemon_memory_pressure() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let log_path = env.tmp.path().join("health-pressure-server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = OwnedServer(
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_ATC_ENABLED", "false")
+            .env("HTTP_PORT", port.to_string())
+            // Exercise the real serving process's RSS sampler without putting
+            // the host under pressure. The CLI keeps its ordinary thresholds.
+            .env("MEMORY_WARNING_MB", "1")
+            .env("MEMORY_CRITICAL_MB", "2")
+            .env("MEMORY_FATAL_MB", "0")
+            .current_dir(env.hostile_repo())
+            .args([
+                "serve-http",
+                "--no-tui",
+                "--no-auth",
+                "--port",
+                &port.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("start real health server"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline && server.0.try_wait().unwrap().is_none(),
+            "health server failed to start: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
+        .current_dir(env.hostile_repo())
+        .args(["robot", "health", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nserver:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&log_path).unwrap()
+    );
+    let health: Value = serde_json::from_slice(&output.stdout).expect("robot health JSON");
+    assert_eq!(health["overall"], "unhealthy", "{health}");
+    assert_eq!(health["health_level"], "red", "{health}");
+    assert_eq!(health["capacity_health_level"], "red", "{health}");
+    let probes = health["probes"].as_array().unwrap();
+    let server_probe = probes
+        .iter()
+        .find(|probe| probe["name"] == "server_health")
+        .unwrap();
+    assert_eq!(server_probe["status"], "fail", "{server_probe}");
+    assert!(
+        server_probe["detail"]
+            .as_str()
+            .unwrap()
+            .contains("pressure=red")
+    );
+    let pressure = probes
+        .iter()
+        .find(|probe| probe["name"] == "backpressure")
+        .unwrap();
+    assert_eq!(pressure["status"], "red", "{pressure}");
+    assert!(
+        pressure["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("live server:")
+    );
+    assert!(pressure["detail"].as_str().unwrap().contains("memory"));
+    let circuits = probes
+        .iter()
+        .find(|probe| probe["name"] == "circuit_breakers")
+        .unwrap();
+    assert!(
+        circuits["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("live server:")
+    );
+    assert!(
+        health["_alerts"].as_array().unwrap().iter().any(|alert| {
+            alert["severity"] == "error"
+                && alert["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("pressure=red"))
+        }),
+        "{health}"
+    );
+}
+
 fn check_serve_http_client_config_setup(setup: bool) {
     let env = TestEnv::new();
     let project = env.hostile_repo();

@@ -1569,6 +1569,13 @@ pub struct HealthCheckResponse {
     pub retention: Option<RetentionHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<IntegrityHealthResponse>,
+    /// Read-only lexical index evidence from this daemon's admitted mailbox.
+    /// Diagnostic clients must not open another pool to reconstruct this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_backfill: Option<mcp_agent_mail_db::search_service::LexicalBackfillHealth>,
+    /// Circuit state belongs to the serving process, not its diagnostic client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breakers: Option<mcp_agent_mail_db::DbHealthStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_indexing: Option<mcp_agent_mail_db::search_service::SemanticIndexingHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2551,6 +2558,10 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             checks_total: integrity_metrics.checks_total,
             failures_total: integrity_metrics.failures_total,
         }),
+        lexical_backfill: pool
+            .as_ref()
+            .map(|pool| mcp_agent_mail_db::search_service::lexical_backfill_health(pool)),
+        circuit_breakers: Some(mcp_agent_mail_db::db_health_status()),
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
         recovery,
@@ -5419,6 +5430,8 @@ mod tests {
             disk: None,
             retention: None,
             integrity: None,
+            lexical_backfill: None,
+            circuit_breakers: None,
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
@@ -5973,6 +5986,8 @@ mod tests {
             disk: None,
             retention: None,
             integrity: None,
+            lexical_backfill: None,
+            circuit_breakers: None,
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
@@ -5992,6 +6007,8 @@ mod tests {
             "disk",
             "retention",
             "integrity",
+            "lexical_backfill",
+            "circuit_breakers",
             "semantic_indexing",
             "two_tier_indexing",
             "recovery",
@@ -6324,6 +6341,24 @@ body
                 let value: serde_json::Value =
                     serde_json::from_str(&response).expect("parse health_check json");
                 assert_eq!(value["semantic_readiness"]["status"], "ok");
+                let lexical: mcp_agent_mail_db::search_service::LexicalBackfillHealth =
+                    serde_json::from_value(value["lexical_backfill"].clone())
+                        .expect("health exposes the admitted daemon's lexical index evidence");
+                assert_eq!(
+                    lexical,
+                    mcp_agent_mail_db::search_service::lexical_backfill_health(
+                        &get_authoritative_live_db_pool().expect("existing health pool")
+                    )
+                );
+                let circuits: mcp_agent_mail_db::DbHealthStatus =
+                    serde_json::from_value(value["circuit_breakers"].clone())
+                        .expect("health exposes the serving process's circuit state");
+                assert!(
+                    circuits
+                        .circuits
+                        .iter()
+                        .any(|circuit| circuit.subsystem == "db")
+                );
                 assert!(
                     value["semantic_readiness"]["detail"]
                         .as_str()

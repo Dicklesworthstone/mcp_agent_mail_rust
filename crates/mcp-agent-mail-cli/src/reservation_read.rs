@@ -69,7 +69,14 @@ impl ServerResourceSession {
     }
 
     pub(crate) async fn read(&self, uri: &str) -> CliResult<Value> {
-        read_resource_json(&self.client, &self.server_url, self.bearer.as_deref(), uri).await
+        read_resource_json(
+            &self.client,
+            &self.server_url,
+            self.bearer.as_deref(),
+            uri,
+            RESOURCE_TIMEOUT_SECONDS,
+        )
+        .await
     }
 
     /// Select the daemon only when its authenticated configuration names the
@@ -123,7 +130,14 @@ impl ServerResourceSession {
     }
 
     pub(crate) async fn verify_local_mailbox(&self, config: &Config) -> CliResult<()> {
-        let payload = self.read(MAILBOX_CONFIG_RESOURCE).await?;
+        let payload = read_resource_json(
+            &self.client,
+            &self.server_url,
+            self.bearer.as_deref(),
+            MAILBOX_CONFIG_RESOURCE,
+            MAILBOX_PROBE_TIMEOUT_SECONDS,
+        )
+        .await?;
         if !mailbox_config_matches(&payload, config)?
             || (self.ancestor_resolution && !supports_ancestor_resolution(&payload)?)
             || (self.inbox_priority_snapshot && !supports_inbox_priority_snapshot(&payload)?)
@@ -139,6 +153,16 @@ impl ServerResourceSession {
     /// identity checks. Never follow a redirect or reinterpret a rejection as
     /// permission to read a local mailbox.
     pub(crate) async fn call_tool(&self, tool: &str, arguments: Value) -> CliResult<Value> {
+        self.call_tool_with_timeout(tool, arguments, RESOURCE_TIMEOUT_SECONDS)
+            .await
+    }
+
+    pub(crate) async fn call_tool_with_timeout(
+        &self,
+        tool: &str,
+        arguments: Value,
+        timeout_seconds: u64,
+    ) -> CliResult<Value> {
         let id = format!("cli-read-{tool}");
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -150,7 +174,7 @@ impl ServerResourceSession {
             &self.server_url,
             self.bearer.as_deref(),
             &request,
-            RESOURCE_TIMEOUT_SECONDS,
+            timeout_seconds,
             &self.client,
         )
         .await
@@ -232,7 +256,7 @@ fn is_local_mailbox_endpoint(endpoint: &str) -> CliResult<bool> {
             .is_ok_and(|address| address.is_loopback()))
 }
 
-fn mailbox_config_matches(value: &Value, config: &Config) -> CliResult<bool> {
+pub(crate) fn mailbox_config_matches(value: &Value, config: &Config) -> CliResult<bool> {
     let database_url = nonempty_text(value, "database_url")?;
     // Older servers do not expose the archive root. They cannot authorize an
     // automatic switch from the selected local mailbox to this endpoint.
@@ -427,6 +451,7 @@ async fn read_resource_json(
     server_url: &str,
     bearer: Option<&str>,
     uri: &str,
+    timeout_seconds: u64,
 ) -> CliResult<Value> {
     let id = format!("cli-resource-read-{uri}");
     let request = serde_json::json!({
@@ -439,7 +464,7 @@ async fn read_resource_json(
         server_url,
         bearer,
         &request,
-        RESOURCE_TIMEOUT_SECONDS,
+        timeout_seconds,
         client,
     )
     .await
@@ -1013,6 +1038,130 @@ pub(crate) mod tests {
             );
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn health_probe_pins_the_mailbox_without_opening_local_storage() {
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Tool(mailbox_payload(config)),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            crate::probe_local_jsonrpc_health_with_latency,
+        );
+        let (payload, latency) = result.unwrap().expect("verified daemon health");
+        assert!(payload["database_url"].is_string());
+        assert!(latency >= 0.0);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["params"]["uri"], MAILBOX_CONFIG_RESOURCE);
+        assert_eq!(requests[1]["params"]["name"], "health_check");
+        assert_eq!(requests[2]["params"]["uri"], MAILBOX_CONFIG_RESOURCE);
+
+        // Doctor explicitly adopts the daemon's advertised mailbox when its
+        // default XDG mailbox differs. The health probe must use that target.
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Tool(mailbox_payload(config)),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            |config| {
+                let mut cli_config = config.clone();
+                cli_config.database_url = "sqlite:////different/xdg/default.db".into();
+                cli_config.storage_root = "/different/xdg/archive".into();
+                crate::robot::live_server_proves_mailbox_healthy(
+                    &cli_config,
+                    &config.database_url,
+                    &config.storage_root,
+                )
+            },
+        );
+        // Minimal peer data proves routing, never a healthy database verdict
+        // or permission to silently fall back after a malformed health reply.
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete health evidence")
+        );
+        assert_eq!(requests.len(), 3, "doctor must probe its selected mailbox");
+    }
+
+    #[test]
+    fn health_probe_refuses_rejections_malformed_replies_and_identity_drift() {
+        for status in [401, 403, 307] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    vec![TestReply::Raw(
+                        status,
+                        serde_json::json!({"error":"private-token"}),
+                    )]
+                },
+                crate::probe_local_jsonrpc_health_with_latency,
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("private-token"));
+            assert_eq!(requests.len(), 1);
+        }
+        for response in [
+            serde_json::json!({"jsonrpc":"2.0","id":"wrong-request","result":{}}),
+            serde_json::json!({"jsonrpc":"1.0","result":{}}),
+            serde_json::json!({"jsonrpc":"2.0","error":{"code":-32603,"message":"private-token"}}),
+            serde_json::json!({"jsonrpc":"2.0","result":{"isError":true,"content":[{"type":"text","text":"{}"}]}}),
+            serde_json::json!({"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{}"}],"structuredContent":{"different":true}}}),
+            serde_json::json!({"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1)}]}}),
+        ] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    vec![
+                        TestReply::Resource(mailbox_payload(config)),
+                        TestReply::Raw(200, response),
+                    ]
+                },
+                crate::probe_local_jsonrpc_health_with_latency,
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("private-token"));
+            assert_eq!(requests.len(), 2);
+        }
+        for drift_in_health in [true, false] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut other = mailbox_payload(config);
+                    other["database_url"] = "sqlite:////another/mailbox.db".into();
+                    let mut replies = vec![TestReply::Resource(mailbox_payload(config))];
+                    if drift_in_health {
+                        replies.push(TestReply::Tool(other));
+                    } else {
+                        replies.push(TestReply::Tool(mailbox_payload(config)));
+                        replies.push(TestReply::Resource(other));
+                    }
+                    replies
+                },
+                crate::probe_local_jsonrpc_health_with_latency,
+            );
+            assert!(result.is_err(), "changed mailbox must not permit fallback");
+            assert_eq!(requests.len(), if drift_in_health { 2 } else { 3 });
+        }
+
+        let (result, requests) = with_test_server(
+            |config| {
+                let mut other = mailbox_payload(config);
+                other["storage_root"] = "/other/mailbox".into();
+                vec![TestReply::Resource(other)]
+            },
+            crate::probe_local_jsonrpc_health_with_latency,
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "unselected daemon permits local reads"
+        );
+        assert_eq!(requests.len(), 1);
     }
 
     #[test]

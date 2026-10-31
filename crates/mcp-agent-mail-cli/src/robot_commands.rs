@@ -9119,6 +9119,162 @@ fn parse_health_check_response(
     serde_json::from_value(normalized).ok()
 }
 
+#[derive(Debug)]
+struct LiveServerHealthAssessment {
+    probe: HealthProbe,
+    level: mcp_agent_mail_core::HealthLevel,
+    pressure: Option<(mcp_agent_mail_core::HealthLevel, String)>,
+    circuits: Option<mcp_agent_mail_db::DbHealthStatus>,
+}
+
+/// Preserve the serving process's verdict even when a local read succeeds.
+/// A fresh CLI's empty counters cannot disprove daemon memory pressure, a
+/// stalled archive drain, or an open write circuit.
+fn assess_live_server_health(
+    config: &mcp_agent_mail_core::Config,
+    payload: &serde_json::Value,
+    latency_ms: f64,
+) -> Result<Option<LiveServerHealthAssessment>, CliError> {
+    use mcp_agent_mail_core::HealthLevel;
+
+    if !crate::reservation_read::mailbox_config_matches(payload, config)? {
+        return Ok(None);
+    }
+    let typed = parse_health_check_response(payload).ok_or_else(|| {
+        CliError::Other(
+            "invalid server health response; refusing incomplete health evidence".into(),
+        )
+    })?;
+    let parse_level = |value: &str| match value {
+        "green" => Ok(HealthLevel::Green),
+        "yellow" => Ok(HealthLevel::Yellow),
+        "red" => Ok(HealthLevel::Red),
+        _ => Err(CliError::Other(
+            "invalid server health level; refusing unverified health evidence".into(),
+        )),
+    };
+    let mut level = parse_level(&typed.health_level)?;
+    let mut details = Vec::new();
+    match typed.status.as_str() {
+        "ok" => {}
+        "error" => {
+            level = HealthLevel::Red;
+            details.push("server reports an error".to_string());
+        }
+        _ => {
+            return Err(CliError::Other(
+                "invalid server health status; refusing unverified health evidence".into(),
+            ));
+        }
+    }
+    for (name, verdict) in [
+        ("transport_health", &typed.verdicts.transport_health),
+        ("db_health", &typed.verdicts.db_health),
+        ("write_health", &typed.verdicts.write_health),
+        ("semantic_readiness", &typed.verdicts.semantic_readiness),
+        ("archive_db_parity", &typed.verdicts.archive_db_parity),
+        ("doctor_readiness", &typed.verdicts.doctor_readiness),
+        ("integrity_check", &typed.verdicts.integrity_check),
+    ] {
+        let verdict_level = parse_level(&verdict.status)?;
+        if verdict_level != HealthLevel::Green {
+            level = level.max(if verdict.critical {
+                verdict_level
+            } else {
+                HealthLevel::Yellow
+            });
+            details.push(format!("{name}={}: {}", verdict.status, verdict.detail));
+        }
+    }
+    match typed.semantic_readiness.status.as_str() {
+        "ok" => {}
+        "warn" => {
+            level = level.max(HealthLevel::Yellow);
+            details.push(typed.semantic_readiness.detail.clone());
+        }
+        "fail" => {
+            level = HealthLevel::Red;
+            details.push(typed.semantic_readiness.detail.clone());
+        }
+        _ => {
+            return Err(CliError::Other(
+                "invalid server semantic readiness; refusing unverified health evidence".into(),
+            ));
+        }
+    }
+    let mut pressure: Option<(HealthLevel, String)> = None;
+    for contributor in &typed.health_level_contributors {
+        let contributor_level = parse_level(&contributor.level)?;
+        level = level.max(contributor_level);
+        if contributor.name == "pressure"
+            && pressure
+                .as_ref()
+                .is_none_or(|(current, _)| contributor_level >= *current)
+        {
+            pressure = Some((contributor_level, contributor.detail.clone()));
+        }
+        if contributor_level != HealthLevel::Green {
+            details.push(format!(
+                "{}={}: {}",
+                contributor.name, contributor.level, contributor.detail
+            ));
+        }
+    }
+    if let Some(recovery) = &typed.recovery
+        && recovery.mode != "healthy"
+    {
+        level = level.max(HealthLevel::Yellow);
+        details.push(format!("mailbox recovery mode: {}", recovery.mode));
+    }
+    if let Some(circuits) = &typed.circuit_breakers {
+        let valid_state = |state: &str| matches!(state, "closed" | "open" | "half_open");
+        if !valid_state(&circuits.circuit_state)
+            || circuits
+                .circuits
+                .iter()
+                .any(|circuit| circuit.subsystem.trim().is_empty() || !valid_state(&circuit.state))
+        {
+            return Err(CliError::Other(
+                "invalid server circuit state; refusing unverified health evidence".into(),
+            ));
+        }
+        if circuits.circuit_state != "closed" {
+            level = level.max(HealthLevel::Yellow);
+            details.push(format!("db circuit={}", circuits.circuit_state));
+        }
+        for circuit in &circuits.circuits {
+            if circuit.state != "closed" {
+                level = level.max(HealthLevel::Yellow);
+                details.push(format!(
+                    "{} circuit={} ({} failures)",
+                    circuit.subsystem, circuit.state, circuit.failures
+                ));
+            }
+        }
+    }
+    let detail = if details.is_empty() {
+        format!("live server health_level={level}")
+    } else {
+        format!("live server health_level={level}; {}", details.join("; "))
+    };
+    Ok(Some(LiveServerHealthAssessment {
+        probe: HealthProbe {
+            name: "server_health".into(),
+            status: match level {
+                HealthLevel::Green => "ok",
+                HealthLevel::Yellow => "degraded",
+                HealthLevel::Red => "fail",
+            }
+            .into(),
+            latency_ms: (latency_ms * 100.0).round() / 100.0,
+            detail,
+        },
+        level,
+        pressure,
+        circuits: typed.circuit_breakers,
+    }))
+}
+
 fn synthesize_robot_health_probes_from_server(
     config: &mcp_agent_mail_core::Config,
     server_health: &serde_json::Value,
@@ -9162,9 +9318,9 @@ fn synthesize_robot_health_probes_from_server(
 
     let archive_db_parity =
         live_server_archive_parity_probe_from_health(&config.storage_root, &typed);
-    let search_index_snapshot = server_health
-        .get("lexical_backfill")
-        .and_then(|value| serde_json::from_value::<LexicalBackfillHealth>(value.clone()).ok())
+    let search_index_snapshot = typed
+        .lexical_backfill
+        .clone()
         .or_else(|| robot_search_index_health_from_config(config).ok())?;
     let search_status = search_index_probe_status(&search_index_snapshot);
     let search_index_probe = HealthProbe {
@@ -9298,16 +9454,25 @@ pub(crate) fn live_server_proves_mailbox_healthy(
     config: &mcp_agent_mail_core::Config,
     target_database_url: &str,
     target_storage_root: &Path,
-) -> bool {
-    let Some((server_health, _latency_ms)) = crate::probe_local_jsonrpc_health_with_latency(config)
+) -> Result<bool, CliError> {
+    // Doctor may already have selected the daemon's advertised mailbox instead
+    // of the CLI's XDG default. Pin the health read to that selected pair while
+    // retaining the configured endpoint and credential.
+    let mut target_config = config.clone();
+    target_config.database_url = target_database_url.to_string();
+    target_config.storage_root = target_storage_root.to_path_buf();
+    let Some((server_health, latency_ms)) =
+        crate::probe_local_jsonrpc_health_with_latency(&target_config)?
     else {
-        return false;
+        return Ok(false);
     };
-    live_server_health_payload_proves_mailbox_healthy(
+    assess_live_server_health(&target_config, &server_health, latency_ms)?
+        .ok_or_else(|| CliError::Other("server health mailbox identity changed".into()))?;
+    Ok(live_server_health_payload_proves_mailbox_healthy(
         target_database_url,
         target_storage_root,
         &server_health,
-    )
+    ))
 }
 
 // ── Reservations command implementation ─────────────────────────────────────
@@ -16919,7 +17084,28 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // E4 (br-bvq1x.5.4): on a DB failure, classify it (A2) and attach the
             // safe-remediation contract so an agent knows what is safe to do.
             let mut db_error_message: Option<String> = None;
-            let live_server_health = crate::probe_local_jsonrpc_health_with_latency(&config);
+            let live_server_health = crate::probe_local_jsonrpc_health_with_latency(&config)?;
+            let server_assessment = live_server_health
+                .as_ref()
+                .map(|(payload, latency)| assess_live_server_health(&config, payload, *latency))
+                .transpose()?
+                .flatten();
+            let (server_unhealthy, server_degraded, server_pressure, server_circuits, server_alert) =
+                if let Some(assessment) = server_assessment {
+                    let unhealthy = assessment.level == mcp_agent_mail_core::HealthLevel::Red;
+                    let degraded = assessment.level != mcp_agent_mail_core::HealthLevel::Green;
+                    let alert = degraded.then(|| assessment.probe.detail.clone());
+                    probes.push(assessment.probe);
+                    (
+                        unhealthy,
+                        degraded,
+                        assessment.pressure,
+                        assessment.circuits,
+                        alert,
+                    )
+                } else {
+                    (false, false, None, None, None)
+                };
             let mut integrity_override: Option<mcp_agent_mail_db::IntegrityMetrics> = None;
 
             let (
@@ -17062,16 +17248,26 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             };
 
             // 2. Circuit breaker status
-            let db_health = mcp_agent_mail_db::db_health_status();
+            let circuit_source = if server_circuits.is_some() {
+                "live server"
+            } else {
+                "local process (daemon circuit state unavailable)"
+            };
+            let db_health = server_circuits.unwrap_or_else(mcp_agent_mail_db::db_health_status);
             let open_circuits: Vec<String> = db_health
                 .circuits
                 .iter()
                 .filter(|c| c.state != "closed")
                 .map(|c| format!("{}={} ({} failures)", c.subsystem, c.state, c.failures))
                 .collect();
-            let circuits_ok = open_circuits.is_empty();
+            let circuits_ok = open_circuits.is_empty() && db_health.circuit_state == "closed";
             let circuit_detail = if circuits_ok {
                 "All circuits closed".to_string()
+            } else if open_circuits.is_empty() {
+                format!(
+                    "Active circuit faults: db={} ({} failures)",
+                    db_health.circuit_state, db_health.circuit_failures
+                )
             } else {
                 format!("Active circuit faults: {}", open_circuits.join(", "))
             };
@@ -17079,7 +17275,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 name: "circuit_breakers".into(),
                 status: if circuits_ok { "ok" } else { "degraded" }.into(),
                 latency_ms: 0.0,
-                detail: circuit_detail,
+                detail: format!("{circuit_source}: {circuit_detail}"),
             });
 
             // Per-subsystem circuit details
@@ -17098,7 +17294,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 mcp_agent_mail_core::backpressure::compute_capacity_governor_decision(
                     "search_messages",
                 );
-            let health_str = capacity_decision.health_level.to_string();
+            let health_str = server_pressure
+                .as_ref()
+                .map_or(capacity_decision.health_level, |(level, _)| *level)
+                .to_string();
             let signals = &capacity_decision.signals;
             let backpressure_degraded = health_str != "green";
             let backpressure_unhealthy = health_str == "red";
@@ -17116,21 +17315,26 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 name: "backpressure".into(),
                 status: health_str.clone(),
                 latency_ms: 0.0,
-                detail: format!(
-                    "decision={} enforced={} shedable={} pool={}% wbq={}% commit={}% \
-                     wbq_wait_p95_us={} commit_wait_p95_us={} disk={}{} memory={}{}",
-                    capacity_decision.action,
-                    capacity_decision.enforced,
-                    capacity_decision.tool_is_shedable,
-                    signals.pool_utilization_pct,
-                    signals.wbq_depth_pct,
-                    signals.commit_depth_pct,
-                    signals.wbq_queue_p95_us,
-                    signals.commit_queue_p95_us,
-                    signals.disk_pressure_level,
-                    disk_stale,
-                    signals.memory_pressure_level,
-                    memory_stale,
+                detail: server_pressure.map_or_else(
+                    || {
+                        format!(
+                            "local process: decision={} enforced={} shedable={} pool={}% wbq={}% commit={}% \
+                             wbq_wait_p95_us={} commit_wait_p95_us={} disk={}{} memory={}{}",
+                            capacity_decision.action,
+                            capacity_decision.enforced,
+                            capacity_decision.tool_is_shedable,
+                            signals.pool_utilization_pct,
+                            signals.wbq_depth_pct,
+                            signals.commit_depth_pct,
+                            signals.wbq_queue_p95_us,
+                            signals.commit_queue_p95_us,
+                            signals.disk_pressure_level,
+                            disk_stale,
+                            signals.memory_pressure_level,
+                            memory_stale,
+                        )
+                    },
+                    |(_, detail)| format!("live server: {detail}"),
                 ),
             });
 
@@ -17332,6 +17536,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || search_index_unhealthy
                 || backpressure_unhealthy
                 || descriptors_unhealthy
+                || server_unhealthy
             {
                 "unhealthy"
             } else if db_file_sanity_degraded
@@ -17346,6 +17551,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || process_owner_degraded
                 || descriptors_degraded
                 || write_mode_degraded
+                || server_degraded
             {
                 "degraded"
             } else {
@@ -17490,6 +17696,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             // Alerts
+            if let Some(detail) = server_alert {
+                env = env.with_alert(
+                    if server_unhealthy { "error" } else { "warn" },
+                    detail,
+                    Some("am doctor check --json".to_string()),
+                );
+            }
             if !db_ok {
                 // E4 (br-bvq1x.5.4): attach the safe-remediation contract derived
                 // from the classified DB failure (A2) and point the alert action at
@@ -29114,6 +29327,94 @@ mod tests {
             &storage_root,
             &healthy_payload
         ));
+        let assessment = assess_live_server_health(&config, &healthy_payload, 2.345)
+            .unwrap()
+            .expect("matching live mailbox");
+        assert_eq!(assessment.level, mcp_agent_mail_core::HealthLevel::Green);
+        assert_eq!(assessment.probe.status, "ok");
+
+        // Each of these faults lives in the daemon, not in the CLI's fresh
+        // process-global counters. A successful local DB probe must not make
+        // the robot report greener than the daemon's current observation.
+        for (contributor, reported, expected) in [
+            ("pressure", "red", mcp_agent_mail_core::HealthLevel::Red),
+            ("archive_lag", "red", mcp_agent_mail_core::HealthLevel::Red),
+            (
+                "coalescer_latency",
+                "yellow",
+                mcp_agent_mail_core::HealthLevel::Yellow,
+            ),
+            (
+                "retention",
+                "yellow",
+                mcp_agent_mail_core::HealthLevel::Yellow,
+            ),
+        ] {
+            let mut payload = healthy_payload.clone();
+            // A stale top-level green cannot erase a stronger named finding.
+            payload["health_level_contributors"] = serde_json::json!([
+                {"name":contributor, "level":reported, "detail":"serving process fault"}
+            ]);
+            assert!(
+                synthesize_robot_health_probes_from_server(&config, &payload, 0.5).is_some(),
+                "the real local DB remains healthy in this control"
+            );
+            let assessed = assess_live_server_health(&config, &payload, 0.5)
+                .unwrap()
+                .unwrap();
+            assert_eq!(assessed.level, expected, "{contributor}");
+            assert!(assessed.probe.detail.contains(contributor));
+            if contributor == "pressure" {
+                assert_eq!(assessed.pressure.unwrap().0, expected);
+            }
+        }
+        let mut write_failure = healthy_payload.clone();
+        write_failure["verdicts"]["write_health"]["status"] = "red".into();
+        write_failure["verdicts"]["write_health"]["detail"] =
+            "write circuit is open; reads still succeed".into();
+        assert!(synthesize_robot_health_probes_from_server(&config, &write_failure, 0.5).is_none());
+        assert_eq!(
+            assess_live_server_health(&config, &write_failure, 0.5)
+                .unwrap()
+                .unwrap()
+                .level,
+            mcp_agent_mail_core::HealthLevel::Red,
+            "a local fallback cannot clear the daemon's write failure"
+        );
+        let mut circuit_failure = healthy_payload.clone();
+        circuit_failure["circuit_breakers"] = serde_json::json!({
+            "circuit_state":"closed", "circuit_failures":0,
+            "circuits":[{
+                "subsystem":"git", "state":"open", "failures":9,
+                "threshold":5, "reset_secs":30, "half_open_successes":0,
+                "recommendation":"inspect the archive writer"
+            }]
+        });
+        let assessed = assess_live_server_health(&config, &circuit_failure, 0.5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assessed.level, mcp_agent_mail_core::HealthLevel::Yellow);
+        assert!(
+            assessed
+                .probe
+                .detail
+                .contains("git circuit=open (9 failures)")
+        );
+        let circuits = assessed.circuits.expect("daemon circuits retained");
+        assert_eq!(circuits.circuits[0].state, "open");
+        assert_eq!(circuits.circuits[0].failures, 9);
+        circuit_failure["circuit_breakers"]["circuits"][0]["state"] = "unknown".into();
+        assert!(assess_live_server_health(&config, &circuit_failure, 0.5).is_err());
+        for field in ["status", "health_level"] {
+            let mut invalid = healthy_payload.clone();
+            invalid[field] = "unknown".into();
+            assert!(assess_live_server_health(&config, &invalid, 1.0).is_err());
+        }
+        let mut invalid = healthy_payload.clone();
+        invalid["health_level_contributors"] = serde_json::json!([
+            {"name":"pressure", "level":"unknown", "detail":"not a verdict"}
+        ]);
+        assert!(assess_live_server_health(&config, &invalid, 1.0).is_err());
 
         // Different mailbox on the server must fall back to local probes.
         let other_db = temp_dir.path().join("other.sqlite3");
@@ -29127,6 +29428,11 @@ mod tests {
             "full integrity_check passed",
         );
         assert!(synthesize_robot_health_probes_from_server(&config, &other_payload, 1.0).is_none());
+        assert!(
+            assess_live_server_health(&config, &other_payload, 1.0)
+                .unwrap()
+                .is_none()
+        );
         assert!(!live_server_health_payload_proves_mailbox_healthy(
             &db_url,
             &storage_root,

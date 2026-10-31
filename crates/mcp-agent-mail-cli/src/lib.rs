@@ -32475,45 +32475,31 @@ fn probe_local_jsonrpc_health(
 
 pub(crate) fn probe_local_jsonrpc_health_with_latency(
     config: &Config,
-) -> Option<(serde_json::Value, f64)> {
-    let urls = check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path);
-    if urls.is_empty() {
-        return None;
-    }
-    let bearer = local_server_bearer_token(config);
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": "doctor-health-check",
-        "method": "tools/call",
-        "params": {
-            "name": "health_check",
-            "arguments": {},
-        }
-    });
-
+) -> CliResult<Option<(serde_json::Value, f64)>> {
     context::run_async(async {
-        for url in &urls {
-            let start = std::time::Instant::now();
-            let response = post_jsonrpc_request(
-                url,
-                bearer.as_deref(),
-                &request,
+        let Some(session) =
+            reservation_read::ServerResourceSession::for_local_mailbox(config).await?
+        else {
+            return Ok(None);
+        };
+        let start = std::time::Instant::now();
+        let payload = session
+            .call_tool_with_timeout(
+                "health_check",
+                serde_json::json!({}),
                 DOCTOR_RUNTIME_JSONRPC_TIMEOUT_SECS,
             )
-            .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            if let Ok(payload) = response
-                && parse_jsonrpc_error(&payload).is_none()
-                && let Some(result_payload) = payload.get("result").cloned()
-                && let Some(parsed) = coerce_tool_result_json(result_payload)
-            {
-                return Ok(Some((parsed, elapsed_ms)));
-            }
+            .await?;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if !reservation_read::mailbox_config_matches(&payload, config)? {
+            return Err(CliError::Other(
+                "server health response names a different mailbox; refusing unverified health"
+                    .to_string(),
+            ));
         }
-        Ok(None)
+        session.verify_local_mailbox(config).await?;
+        Ok(Some((payload, elapsed_ms)))
     })
-    .ok()
-    .flatten()
 }
 
 fn sample_agent_mail_process_cpu(pids: &[u32]) -> (Vec<DoctorProcessSample>, Option<String>) {

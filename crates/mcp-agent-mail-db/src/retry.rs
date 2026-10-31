@@ -849,7 +849,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Per-subsystem circuit breaker status snapshot.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubsystemCircuitStatus {
     /// Subsystem name (e.g. "db", "git", "signal", "llm").
     pub subsystem: String,
@@ -869,7 +869,7 @@ pub struct SubsystemCircuitStatus {
 }
 
 /// Database health status snapshot (matches legacy `get_db_health_status()`).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DbHealthStatus {
     /// Current circuit state: `"closed"`, `"open"`, or `"half_open"`.
     pub circuit_state: String,
