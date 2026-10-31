@@ -501,12 +501,21 @@ mod tests {
                     "v2/v3 ranges and v4 owned fallback must use their proven layouts"
                 );
             }
-            for prefix in ["A", "alpha", "folder/", "merged/conflict", "missing"] {
+            for prefix in ["A", "alpha", "folder/", "merged/", "missing"] {
                 assert_eq!(
                     observed.find_prefix(prefix).unwrap(),
                     native.find_prefix(prefix).ok()
                 );
             }
+            // On an exact name with stages libgit2 stops wherever its binary
+            // search lands, so only the path compares, and that is all
+            // reject_ancestor_entries reads. The decoded view stays on stage 1.
+            let first_stage = observed.find_prefix("merged/conflict").unwrap().unwrap();
+            assert_eq!(first_stage, native.len() - 3);
+            let found = observed.get(first_stage).unwrap();
+            let found_path: &[u8] = found.path.as_ref();
+            let any_stage = native.find_prefix("merged/conflict").unwrap();
+            assert_eq!(found_path, native.get(any_stage).unwrap().path.as_slice());
             let warm = open_with_cache(
                 &repo,
                 bytes.clone(),

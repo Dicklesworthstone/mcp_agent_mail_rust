@@ -44,7 +44,7 @@ fn reject_ancestor_entries(
             let entry = index
                 .get(position)
                 .ok_or_else(|| invalid("staged canonical ancestor lost its index entry"))?;
-            // Prefix lookup returns the first stage of an exact name before
+            // Prefix lookup lands on some stage of an exact name before
             // any descendants. Compare raw bytes so sparse trailing slashes
             // are not normalized away by platform Path conversion.
             if &entry.path[..] == name.as_bytes() {
