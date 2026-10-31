@@ -298,6 +298,30 @@ fn unique_tmp_lease_path(path: &Path) -> PathBuf {
 }
 
 fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> {
+    // Production callers hold the slot lock. A preferred or legacy filename
+    // is not ownership evidence, including for an expired or released lease.
+    // Refuse before staging so a failed acquisition preserves the incumbent.
+    match mcp_agent_mail_core::disk::open_regular_file_no_follow(path) {
+        Ok(mut file) => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut file, &mut text)?;
+            let existing: BuildSlotLease = serde_json::from_str(&text).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid build slot lease {}: {error}", path.display()),
+                )
+            })?;
+            if !lease_matches_holder(&existing, &lease.agent, lease.branch.as_deref()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("build slot lease {} belongs to another holder", path.display()),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1219,6 +1243,116 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn acquisition_preserves_foreign_owners_at_preferred_and_legacy_paths() {
+        for legacy in [false, true] {
+            for state in ["active", "expired", "released"] {
+                let dir = tempfile::tempdir().unwrap();
+                let occupied = if legacy {
+                    legacy_lease_path_for_holder(dir.path(), "BlueLake", Some("main"))
+                } else {
+                    lease_path_for_holder(dir.path(), "BlueLake", Some("main"))
+                };
+                let mut incumbent = make_lease("GreenPeak", Some("main"), true);
+                if state == "expired" {
+                    incumbent.expires_ts =
+                        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+                } else if state == "released" {
+                    incumbent.released_ts = Some(chrono::Utc::now().to_rfc3339());
+                }
+                let original = serde_json::to_vec(&incumbent).unwrap();
+                std::fs::write(&occupied, &original).unwrap();
+
+                let error = acquire_slot_lease(
+                    dir.path(),
+                    "slot-a",
+                    "BlueLake",
+                    Some("main".to_string()),
+                    3600,
+                    true,
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(std::fs::read(&occupied).unwrap(), original);
+                assert_eq!(
+                    std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                        })
+                        .count(),
+                    1,
+                    "failed acquisition must not publish another lease"
+                );
+                let lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+                drop(lock);
+
+                // Ordinary acquisition still succeeds and sees the preserved
+                // incumbent whenever it remains active and unreleased.
+                let next =
+                    acquire_slot_lease(dir.path(), "slot-a", "RedStone", None, 3600, true)
+                        .unwrap();
+                if state == "active" {
+                    assert_eq!(next.conflicts.len(), 1);
+                    assert_eq!(next.conflicts[0].agent, "GreenPeak");
+                } else {
+                    assert!(next.conflicts.is_empty());
+                }
+                assert_eq!(std::fs::read(&occupied).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_can_replace_its_own_released_lease_after_a_branch_change() {
+        let dir = tempfile::tempdir().unwrap();
+        acquire_slot_lease(
+            dir.path(),
+            "slot-a",
+            "BlueLake",
+            Some("main".to_string()),
+            3600,
+            true,
+        )
+        .unwrap();
+        assert!(release_slot_lease(dir.path(), "BlueLake", None).unwrap().released);
+        let result = acquire_slot_lease(
+            dir.path(),
+            "slot-a",
+            "BlueLake",
+            Some("feature".to_string()),
+            7200,
+            false,
+        )
+        .unwrap();
+        assert!(result.conflicts.is_empty());
+        let stored = stored_lease(&lease_path_for_holder(dir.path(), "BlueLake", None));
+        assert_eq!(stored.agent, "BlueLake");
+        assert_eq!(stored.branch.as_deref(), Some("feature"));
+        assert_eq!(stored.expires_ts, result.granted.expires_ts);
+        assert!(stored.released_ts.is_none());
+        assert!(!stored.exclusive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquisition_preserves_a_linked_destination_and_its_foreign_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir(&slot).unwrap();
+        let target = dir.path().join("foreign.json");
+        let original = serde_json::to_vec(&make_lease("GreenPeak", None, true)).unwrap();
+        std::fs::write(&target, &original).unwrap();
+        let linked = lease_path_for_holder(&slot, "BlueLake", None);
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+
+        assert!(acquire_slot_lease(&slot, "slot-a", "BlueLake", None, 3600, true).is_err());
+        assert_eq!(std::fs::read_link(&linked).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        let _lock = try_lock_slot(&slot, false).unwrap().unwrap();
     }
 
     #[test]
