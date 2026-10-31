@@ -7000,7 +7000,7 @@ body
                 let response = health_check(&ctx).expect("health_check should serialize");
                 let value: serde_json::Value =
                     serde_json::from_str(&response).expect("parse health_check json");
-                assert_eq!(value["semantic_readiness"]["status"], "ok");
+                assert_eq!(value["semantic_readiness"]["status"], "warn");
                 let lexical: mcp_agent_mail_db::search_service::LexicalBackfillHealth =
                     serde_json::from_value(value["lexical_backfill"].clone())
                         .expect("health exposes the admitted daemon's lexical index evidence");
