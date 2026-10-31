@@ -210,6 +210,7 @@ fn recipient_block_between_request_and_auto_approval_is_preserved() {
                 ("STORAGE_ROOT", storage_root.to_str().unwrap()),
                 ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
                 ("CONTACT_ENFORCEMENT_ENABLED", "1"),
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
             ],
             || {
                 Config::reset_cached();
