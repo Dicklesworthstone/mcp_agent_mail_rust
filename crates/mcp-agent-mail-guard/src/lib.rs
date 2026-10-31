@@ -459,6 +459,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
 // One template per hook is more readable than a dozen concatenated fragments.
 #[allow(clippy::too_many_lines)]
 fn render_guard_plugin_script(project: &str, hook_name: &str) -> String {
+    use sha2::{Digest, Sha256};
     // Real guard plugin: checks active file reservations against staged changes (pre-commit)
     // or pushed commits (pre-push).
     let project_json = serde_json::to_string(project).unwrap_or_else(|_| "\"\"".to_string());
@@ -470,9 +471,13 @@ fn render_guard_plugin_script(project: &str, hook_name: &str) -> String {
 
 import datetime
 import hashlib
+import hmac
 import json
+import math
 import os
 import re
+import secrets
+import stat
 import subprocess
 import sys
 
@@ -527,6 +532,15 @@ def _is_segfault_rc(rc):
     shell wrapper, 0xC0000005 on Windows."""
     return rc in (-11, -7, 139, 135, 0xC0000005)
 
+def _guard_git_env(env=None):
+    # A receipt is evidence about the stored commit, never a replacement or
+    # grafted graph supplied by the caller. --no-replace-objects alone does
+    # NOT disable info/grafts.
+    env = dict(os.environ if env is None else env)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_GRAFT_FILE"] = os.devnull
+    return env
+
 def _run_git_with_retry(args, **kwargs):
     """subprocess.run wrapper that retries on SIGSEGV (git 2.51.0).
 
@@ -541,6 +555,7 @@ def _run_git_with_retry(args, **kwargs):
     and bypass the retry entirely.
     """
     args = _git_argv(args)
+    kwargs["env"] = _guard_git_env(kwargs.get("env"))
 
     check_requested = kwargs.pop("check", False)
 
@@ -703,9 +718,10 @@ class _NameStatusStream:
     time no matter how many commits feed the stream.
     """
 
-    def __init__(self, files, max_records):
+    def __init__(self, files, max_records, strict=False):
         self.files = files
         self.max_records = max_records
+        self.strict = strict
         self.records = 0
         self.capped = False
         self._tail = b""
@@ -719,7 +735,7 @@ class _NameStatusStream:
         self._tail = parts.pop()
         for token in parts:
             if self._paths_left == 0:
-                status = token.decode("utf-8", "ignore").strip()
+                status = token.decode("utf-8", "strict" if self.strict else "ignore").strip()
                 if not status:
                     continue
                 if self.max_records is not None and self.records >= self.max_records:
@@ -728,7 +744,7 @@ class _NameStatusStream:
                 self.records += 1
                 self._paths_left = 2 if status.startswith(("R", "C")) else 1
                 continue
-            path = token.decode("utf-8", "ignore")
+            path = token.decode("utf-8", "strict" if self.strict else "ignore")
             if path:
                 self.files.add(path)
             self._paths_left -= 1
@@ -740,7 +756,7 @@ def _kill_quietly(proc):
     except OSError:
         pass
 
-def _scan_push_commits(rev_list_args, files, max_paths, deadline):
+def _scan_push_commits(rev_list_args, files, max_paths, deadline, admissions=None, strict=False):
     """Stream `git rev-list ... | git diff-tree --stdin` into `files`.
 
     Returns (records, capped, timed_out). Both git processes are killed the
@@ -758,29 +774,62 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
     # identical to the concatenation of the per-commit outputs.
     diff_tree_args = _git_argv(
         ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
-         "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "--cc", "--stdin"]
+         "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z",
+         "-m" if strict else "--cc", "--stdin"]
     )
     rev_list_args = _git_argv(rev_list_args)
+    scan_env = _guard_git_env()
+    if strict:
+        # Read the immutable object's real parents even if a concurrent fetch
+        # changes the repository's shallow boundary. Missing parent objects
+        # must fail inspection rather than masquerade as a root commit.
+        scan_env["GIT_SHALLOW_FILE"] = os.devnull
     delays = (0.1, 0.4, 1.6)
     for attempt in range(len(delays) + 1):
         left = _seconds_left(deadline)
         if left is not None and left <= 0:
             return 0, False, True
         scratch = set()
-        parser = _NameStatusStream(scratch, max_paths)
+        parser = _NameStatusStream(scratch, max_paths, strict)
         rev_list = subprocess.Popen(
-            rev_list_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            rev_list_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=scan_env,
         )
         try:
             diff_tree = subprocess.Popen(
-                diff_tree_args, stdin=rev_list.stdout,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                diff_tree_args, stdin=subprocess.PIPE if admissions else rev_list.stdout,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=scan_env,
             )
         except Exception:
             _kill_quietly(rev_list)
             rev_list.wait()
             raise
-        rev_list.stdout.close()  # diff-tree owns the read end now
+        filter_errors = []
+        filter_thread = None
+        if admissions:
+            def _forward_unadmitted():
+                try:
+                    for line in rev_list.stdout:
+                        oid = line.strip().decode("ascii")
+                        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+                            raise ValueError("invalid commit object ID")
+                        if not admissions.admitted(oid):
+                            diff_tree.stdin.write(line)
+                    diff_tree.stdin.close()
+                except BaseException as exc:
+                    filter_errors.append(str(exc))
+                    _kill_quietly(diff_tree)
+                    _kill_quietly(rev_list)
+                finally:
+                    rev_list.stdout.close()
+                    try:
+                        diff_tree.stdin.close()
+                    except OSError:
+                        pass
+            filter_thread = _threading.Thread(target=_forward_unadmitted, daemon=True)
+            filter_thread.start()
+        else:
+            rev_list.stdout.close()  # diff-tree owns the read end now
         expired = _threading.Event()
 
         def _expire():
@@ -802,6 +851,12 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
                     _kill_quietly(diff_tree)
                     _kill_quietly(rev_list)
                     break
+        except BaseException:
+            _kill_quietly(diff_tree)
+            _kill_quietly(rev_list)
+            diff_tree.wait()
+            rev_list.wait()
+            raise
         finally:
             if timer is not None:
                 timer.cancel()
@@ -810,11 +865,19 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
         rev_list_err = rev_list.stderr.read().decode("utf-8", "ignore").strip()
         diff_tree_rc = diff_tree.wait()
         rev_list_rc = rev_list.wait()
+        if filter_thread is not None:
+            filter_thread.join(timeout=1)
+            if filter_thread.is_alive():
+                fail_closed("mcp-agent-mail: commit admission inspection did not finish")
 
         if parser.capped:
             files.update(scratch)
             return parser.records, True, False
         if diff_tree_rc == 0 and rev_list_rc == 0:
+            if filter_errors:
+                fail_closed("mcp-agent-mail: commit admission filtering failed")
+            if strict and (parser._tail or parser._paths_left):
+                raise ValueError("incomplete committed-path record")
             files.update(scratch)
             return parser.records, False, False
         if expired.is_set():
@@ -839,7 +902,7 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
         )
     return 0, False, False  # unreachable: the loop returns or exits
 
-def get_push_files():
+def get_push_files(admissions=None):
     """Get (paths, unchecked) for the push (for pre-push).
 
     `unchecked` describes, for the operator, every part of the push the
@@ -909,7 +972,8 @@ def get_push_files():
             # Bounds 2 and 3: one streamed pipeline, capped on records read and
             # on the shared deadline.
             records, capped, timed_out = _scan_push_commits(
-                ["git", "rev-list", "-n", str(inspect)] + rev_args, files, max_paths, deadline
+                ["git", "rev-list", "-n", str(inspect)] + rev_args, files, max_paths, deadline,
+                admissions=admissions,
             )
             if capped:
                 unchecked.append(
@@ -932,6 +996,303 @@ def get_push_files():
     except Exception as exc:
         fail_closed("mcp-agent-mail: guard failed to inspect push files: " + str(exc))
     return sorted(files), unchecked
+
+# Commit admission is optional evidence, never authority to skip an ancestor.
+# Its private key and signed records live outside the worktree. Platforms
+# without directory-relative no-follow I/O retain the ordinary push check.
+ADMISSION_DIRECTORY = "agent-mail-guard-admissions-v1"
+ADMISSION_MAX_BYTES = 8192
+ADMISSION_POLICY = "__ADMISSION_POLICY_SHA256__"
+
+def _json_bytes(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+def _file_identity(metadata):
+    return (metadata.st_dev, metadata.st_ino)
+
+def _read_regular(path, limit, directory=None, private=False):
+    # A substituted FIFO must refuse, not block before fstat can inspect it.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags, dir_fd=directory)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("admission evidence is not one regular file")
+        if private and (metadata.st_uid != os.getuid() or metadata.st_mode & 0o077):
+            raise ValueError("admission evidence is not private to this user")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("admission evidence exceeds its byte limit")
+        if _file_identity(os.stat(path, dir_fd=directory, follow_symlinks=False)) != _file_identity(metadata):
+            raise ValueError("admission evidence changed while being read")
+        return data
+    finally:
+        os.close(fd)
+
+def _open_directory_chain(path):
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or os.open not in os.supports_dir_fd or os.link not in os.supports_dir_fd):
+        raise ValueError("no-follow directory-relative admission I/O is unavailable")
+    path = os.path.abspath(path)
+    fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in path.split(os.path.sep):
+            if component:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def _admission_binding(common, archive_root):
+    repo = os.path.realpath(get_repo_root())
+    project = os.path.realpath(project_root_for(archive_root, repo))
+    # An error-free absence can later become this repo's local archive. It
+    # cannot admit a later external matching archive: that changes this path.
+    archive = os.path.realpath(archive_root) if archive_root else repo
+    return {
+        "version": 1, "policy": ADMISSION_POLICY,
+        "repository": repo, "git_common_dir": common,
+        "repository_identity": list(_file_identity(os.stat(repo))),
+        "git_identity": list(_file_identity(os.stat(common))),
+        "project": project, "project_argument": PROJECT,
+        "project_identity": list(_file_identity(os.stat(project))),
+        "archive": archive,
+        "archive_identity": list(_file_identity(os.stat(archive))),
+        "storage_root": os.path.realpath(default_storage_root()),
+        "ignorecase": CASE_INSENSITIVE_REPO,
+    }
+
+class _AdmissionStore:
+    def __init__(self, create=False, archive_root=None, checked_binding=None):
+        self.common_fd = self.fd = None
+        self.authority_fds = {}
+        graph = _run_git_with_retry(
+            ["git", "rev-parse", "--is-shallow-repository"], capture_output=True,
+            text=True, check=True, timeout=10,
+        )
+        if graph.stdout.strip() != "false":
+            # A shallow boundary can turn a deletion into an apparent root
+            # commit, hiding the removed name from diff-tree. Such a graph
+            # cannot create or reuse complete-commit evidence.
+            raise ValueError("shallow history cannot establish complete commit admission")
+        result = _run_git_with_retry(
+            ["git", "rev-parse", "--git-common-dir"], capture_output=True,
+            text=True, check=True, timeout=10,
+        )
+        self.common = os.path.realpath(result.stdout.strip())
+        try:
+            self.common_fd = _open_directory_chain(self.common)
+            if create:
+                try:
+                    os.mkdir(ADMISSION_DIRECTORY, 0o700, dir_fd=self.common_fd)
+                except FileExistsError:
+                    pass
+            self.fd = os.open(ADMISSION_DIRECTORY,
+                              os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=self.common_fd)
+            metadata = os.fstat(self.fd)
+            if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                raise ValueError("commit admission directory is not private to this user")
+            self.binding = _admission_binding(self.common, archive_root)
+            if checked_binding is not None and self.binding != checked_binding:
+                raise ValueError("project/archive authority changed after commit inspection")
+            # Retained handles prevent inode reuse from disguising replacement.
+            # Repeated receipt checks walk only these few directories, never
+            # the archive's reservation population once per pushed commit.
+            for path_key, identity_key in (
+                    ("repository", "repository_identity"),
+                    ("project", "project_identity"),
+                    ("archive", "archive_identity")):
+                path = self.binding[path_key]
+                if path not in self.authority_fds:
+                    self.authority_fds[path] = _open_directory_chain(path)
+                if list(_file_identity(os.fstat(self.authority_fds[path]))) != self.binding[identity_key]:
+                    raise ValueError("commit admission authority changed while opening it")
+            self.prefix = hashlib.sha256(_json_bytes(self.binding)).hexdigest()
+            self._check_namespace()
+            if create:
+                # Atomic no-replace publication: a losing creator MUST read
+                # the winner's key, never sign with its discarded proposal.
+                self._write_once("key", secrets.token_bytes(32))
+            self.key = _read_regular("key", 32, self.fd, private=True)
+            if len(self.key) != 32:
+                raise ValueError("invalid commit admission key")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for fd in self.authority_fds.values():
+            os.close(fd)
+        self.authority_fds.clear()
+        for name in ("fd", "common_fd"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+    def _check_namespace(self):
+        # Walk without following a substituted ancestor or leaf symlink.
+        # A retired archive/project cannot authorize its replacement.
+        for path, retained in [(self.common, self.common_fd), *self.authority_fds.items()]:
+            current = _open_directory_chain(path)
+            try:
+                if _file_identity(os.fstat(current)) != _file_identity(os.fstat(retained)):
+                    raise ValueError("commit admission project/archive authority changed")
+            finally:
+                os.close(current)
+        namespace = os.stat(ADMISSION_DIRECTORY, dir_fd=self.common_fd, follow_symlinks=False)
+        if (not stat.S_ISDIR(namespace.st_mode)
+                or _file_identity(namespace) != _file_identity(os.fstat(self.fd))):
+            raise ValueError("commit admission directory authority changed")
+
+    def _write_once(self, name, data):
+        self._check_namespace()
+        temporary = ".staged-" + secrets.token_hex(16)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=self.fd)
+        try:
+            with os.fdopen(fd, "wb", closefd=False) as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(fd)
+            self._check_namespace()
+            try:
+                os.link(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd,
+                        follow_symlinks=False)
+            except FileExistsError:
+                pass
+            os.unlink(temporary, dir_fd=self.fd)
+            os.fsync(self.fd)
+            self._check_namespace()
+        finally:
+            os.close(fd)
+            try:
+                os.unlink(temporary, dir_fd=self.fd)
+            except FileNotFoundError:
+                pass
+
+    def _name(self, oid):
+        return self.prefix + "-" + oid + ".json"
+
+    def admitted(self, oid):
+        try:
+            self._check_namespace()
+            raw = _read_regular(self._name(oid), ADMISSION_MAX_BYTES, self.fd, private=True)
+            record = json.loads(raw)
+            payload = record["payload"]
+            valid = (payload["commit"] == oid and payload["binding"] == self.binding
+                     and payload["complete"] is True and payload["mode"] == "block"
+                     and hmac.compare_digest(record["mac"], hmac.new(
+                         self.key, _json_bytes(payload), hashlib.sha256).hexdigest()))
+            self._check_namespace()
+            return valid
+        except Exception:
+            # Unavailable or substituted evidence never exempts the commit.
+            return False
+
+    def record(self, oid, agent_name, archive_root):
+        payload = {"binding": self.binding, "commit": oid, "complete": True,
+                   "mode": "block", "agent": agent_name,
+                   "archive_observation": "present" if archive_root else "absent"}
+        record = {"payload": payload, "mac": hmac.new(
+            self.key, _json_bytes(payload), hashlib.sha256).hexdigest()}
+        data = _json_bytes(record)
+        if len(data) > ADMISSION_MAX_BYTES:
+            raise ValueError("commit admission exceeds its byte limit")
+        self._write_once(self._name(oid), data)
+
+class _PushAdmissions:
+    def __init__(self):
+        self.initialized = False
+        self.store = None
+        self.excluded = False
+
+    def admitted(self, oid):
+        if not self.initialized:
+            self.initialized = True
+            try:
+                # Ambiguous current archive authority cannot reuse evidence.
+                _, archive = get_active_reservations(strict=True)
+                self.store = _AdmissionStore(archive_root=archive)
+            except (Exception, SystemExit):
+                self.store = None
+        admitted = self.store is not None and self.store.admitted(oid)
+        self.excluded = self.excluded or admitted
+        return admitted
+
+    def verify_exclusions(self):
+        if not self.excluded:
+            return
+        try:
+            # Resolve again once after the bounded scan. Intact directories
+            # do not rule out a newly matching external archive. Later leases
+            # within the same authority deliberately preserve prior admission.
+            _, archive = get_active_reservations(strict=True)
+            self.store._check_namespace()
+            if _admission_binding(self.store.common, archive) != self.store.binding:
+                raise ValueError("the resolved project/archive authority changed")
+            self.store._check_namespace()
+        except (Exception, SystemExit) as exc:
+            # Excluded objects lack an ordinary path check in this invocation.
+            fail_closed("mcp-agent-mail: commit admission authority changed during the push; "
+                        "the excluded commits require a fresh reservation check: " + str(exc))
+
+    def close(self):
+        if self.store is not None:
+            self.store.close()
+
+def admit_committed_head():
+    """Post-commit is an independent strict inspection, never a commit veto."""
+    store = None
+    try:
+        result = _run_git_with_retry(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        oid = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+            raise ValueError("HEAD is not an immutable commit object ID")
+        timeout = push_scan_bound(PUSH_TIMEOUT_ENV, PUSH_TIMEOUT_SECS_DEFAULT)
+        deadline = None if timeout is None else _time.monotonic() + timeout
+        files = set()
+        _, capped, expired = _scan_push_commits(
+            ["git", "rev-list", "--no-walk", oid], files,
+            push_scan_bound(PUSH_MAX_PATHS_ENV, PUSH_MAX_PATHS_DEFAULT), deadline,
+            strict=True,
+        )
+        if capped or expired:
+            raise ValueError("the complete commit inspection exceeded its scan bound")
+        reservations, archive = get_active_reservations(strict=True)
+        repo = get_repo_root()
+        common = _run_git_with_retry(
+            ["git", "rev-parse", "--git-common-dir"], capture_output=True,
+            text=True, check=True, timeout=10,
+        ).stdout.strip()
+        checked_binding = _admission_binding(os.path.realpath(common), archive)
+        paths = project_relative_paths(sorted(files), checked_binding["project"],
+                                       repo, CASE_INSENSITIVE_REPO)
+        agent = AGENT_NAME or resolve_identity_agent_name() or ""
+        if reservations and paths and not agent:
+            raise ValueError("no agent identity is available for committed-path inspection")
+        if check_conflicts(paths, reservations, agent):
+            raise ValueError("the committed snapshot conflicts with an active reservation")
+        current_reservations, current_archive = get_active_reservations(strict=True)
+        if reservations != current_reservations or archive != current_archive:
+            raise ValueError("reservation authority changed during commit inspection")
+        store = _AdmissionStore(create=True, archive_root=archive,
+                                checked_binding=checked_binding)
+        store.record(oid, agent, archive)
+    except (Exception, SystemExit) as exc:
+        print("WARNING: mcp-agent-mail: commit remains unadmitted; pre-push will check it normally: "
+              + str(exc), file=sys.stderr)
+    finally:
+        if store is not None:
+            store.close()
 
 def is_real_directory(path):
     try:
@@ -1118,7 +1479,7 @@ def project_metadata_matches(
     canonical_human_key = canonical_text(human_key)
     return bool(canonical_human_key and canonical_human_key in {canonical_project, canonical_repo})
 
-def probe_real_directory(path):
+def probe_real_directory(path, strict=False):
     """(is_dir, error) -- inspection errors are distinct from a missing path.
 
     `os.path.isdir` coerces permission errors into False, which upstream made
@@ -1129,18 +1490,19 @@ def probe_real_directory(path):
     """
     try:
         if os.path.islink(path):
-            return False, None
+            return False, ("linked archive directory: " + path) if strict else None
         os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
         return False, None
     except OSError as exc:
         return False, "%s: %s" % (path, exc)
     try:
-        return os.path.isdir(path), None
+        is_directory = os.path.isdir(path)
+        return is_directory, ("archive path is not a directory: " + path) if strict and not is_directory else None
     except OSError as exc:
         return False, "%s: %s" % (path, exc)
 
-def resolve_archive_root():
+def resolve_archive_root(strict=False):
     """Locate this project's archive root.
 
     Returns (archive_root, suspicious_entry, errors):
@@ -1158,7 +1520,7 @@ def resolve_archive_root():
     repo_root = get_repo_root()
     if repo_root:
         local_reservations, err = probe_real_directory(
-            os.path.join(repo_root, "file_reservations")
+            os.path.join(repo_root, "file_reservations"), strict
         )
         if local_reservations:
             return repo_root, None, errors
@@ -1167,7 +1529,7 @@ def resolve_archive_root():
 
     storage_root = default_storage_root()
     projects_dir = os.path.join(storage_root, "projects")
-    projects_dir_ok, err = probe_real_directory(projects_dir)
+    projects_dir_ok, err = probe_real_directory(projects_dir, strict)
     if err:
         errors.append(err)
         return None, None, errors
@@ -1198,7 +1560,7 @@ def resolve_archive_root():
     for name in explicit_names:
         candidate = os.path.join(projects_dir, name)
         reservations_ok, err = probe_real_directory(
-            os.path.join(candidate, "file_reservations")
+            os.path.join(candidate, "file_reservations"), strict
         )
         if reservations_ok:
             return candidate, None, errors
@@ -1222,6 +1584,9 @@ def resolve_archive_root():
     suspicious = None
     for entry in entries:
         try:
+            if strict and entry.is_symlink():
+                errors.append("linked project archive: " + entry.path)
+                continue
             if not entry.is_dir(follow_symlinks=False):
                 continue
         except OSError as exc:
@@ -1230,7 +1595,7 @@ def resolve_archive_root():
 
         candidate = entry.path
         reservations_ok, err = probe_real_directory(
-            os.path.join(candidate, "file_reservations")
+            os.path.join(candidate, "file_reservations"), strict
         )
         if err:
             errors.append(err)
@@ -1242,6 +1607,9 @@ def resolve_archive_root():
 
         metadata_path = os.path.join(candidate, "project.json")
         if not is_real_file(metadata_path):
+            if strict and os.path.lexists(metadata_path):
+                errors.append("project metadata is not a regular file: " + metadata_path)
+                continue
             # This project's slug with no metadata saying otherwise: only a
             # parsed project.json naming another project proves a collision,
             # so enforce these reservations rather than allow (fail closed).
@@ -1249,14 +1617,20 @@ def resolve_archive_root():
                 return candidate, None, errors
             continue
         try:
-            with open(metadata_path, "r", encoding="utf-8") as handle:
-                metadata = json.load(handle)
+            if strict:
+                metadata = _strict_archive_json(metadata_path)
+            else:
+                with open(metadata_path, "r", encoding="utf-8") as handle:
+                    metadata = json.load(handle)
         except OSError as exc:
             # Cannot rule this candidate out as ours: unreadable metadata is
             # an errored outcome, not proof of no-match (GH#228).
             errors.append("%s: %s" % (metadata_path, exc))
             continue
         except Exception:
+            if strict:
+                errors.append("project metadata is malformed: " + metadata_path)
+                continue
             # Truncated or corrupt metadata proves nothing either (see above).
             if entry.name in slug_candidates:
                 return candidate, None, errors
@@ -1317,13 +1691,46 @@ def is_expired(value, now):
             return False
     return False
 
-def get_active_reservations():
+def _strict_archive_json(path):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate archive metadata key")
+            result[key] = value
+        return result
+    record = json.loads(_read_regular(path, 1024 * 1024), object_pairs_hook=unique_object)
+    if not isinstance(record, dict):
+        raise ValueError("archive metadata is not an object")
+    return record
+
+def _validate_lease_timestamp(value, released=False):
+    if released and (value is None or value in ("", "0", "null", "none")):
+        return
+    if isinstance(value, bool):
+        raise ValueError("invalid reservation timestamp")
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValueError("invalid reservation timestamp")
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("missing reservation timestamp")
+    text = value.strip()
+    if all(ch.isdigit() or ch in ".+-" for ch in text):
+        if not math.isfinite(float(text)):
+            raise ValueError("invalid reservation timestamp")
+        return
+    datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+def get_active_reservations(strict=False):
     """Read active file reservations directly from the archive.
 
     Returns (reservations, archive_root); archive_root is None when no
     archive was found.
     """
-    archive_root, suspicious, errors = resolve_archive_root()
+    archive_root, suspicious, errors = resolve_archive_root(strict)
+    if strict and (errors or suspicious):
+        raise ValueError("archive authority is ambiguous; no commit admission recorded")
     if not archive_root:
         if errors:
             # Resolution ERRORED -- "no matching project" is unprovable
@@ -1360,6 +1767,10 @@ def get_active_reservations():
         return [], None
 
     reservations_dir = os.path.join(archive_root, "file_reservations")
+    if strict:
+        metadata_path = os.path.join(archive_root, "project.json")
+        if os.path.lexists(metadata_path):
+            _strict_archive_json(metadata_path)
     if not is_real_directory(reservations_dir):
         return [], archive_root
 
@@ -1381,27 +1792,47 @@ def get_active_reservations():
     for entry in entries:
         try:
             if not entry.is_file(follow_symlinks=False):
+                if strict and entry.name.endswith(".json"):
+                    raise ValueError("reservation artifact is not a regular file")
                 continue
         except OSError:
+            if strict:
+                raise
             continue
         if not entry.name.endswith(".json"):
             continue
         if entry.is_symlink():
             continue
         try:
-            with open(entry.path, "r", encoding="utf-8") as handle:
-                record = json.load(handle)
+            if strict:
+                record = _strict_archive_json(entry.path)
+            else:
+                with open(entry.path, "r", encoding="utf-8") as handle:
+                    record = json.load(handle)
         except Exception:
+            if strict:
+                raise
             continue
         if not isinstance(record, dict):
             continue
+        if strict:
+            _validate_lease_timestamp(record.get("released_ts"), released=True)
         if released_ts_marks_released(record.get("released_ts")):
             continue
+        if strict:
+            _validate_lease_timestamp(record.get("expires_ts"))
         if is_expired(record.get("expires_ts"), now):
             continue
 
+        if strict and not isinstance(record.get("exclusive"), bool):
+            raise ValueError("reservation exclusivity is ambiguous")
         pattern = str(record.get("path_pattern") or record.get("path") or "").strip()
         holder = str(record.get("agent_name") or record.get("agent") or "").strip()
+        if strict and record.get("exclusive") is True and (
+                not pattern or not holder
+                or not isinstance(record.get("path_pattern") or record.get("path"), str)
+                or not isinstance(record.get("agent_name") or record.get("agent"), str)):
+            raise ValueError("exclusive reservation identity is ambiguous")
         if not pattern or not holder or record.get("exclusive") is not True:
             continue
 
@@ -1705,9 +2136,19 @@ def main():
     if enforcement_enabled is not None and enforcement_enabled.strip().lower() in ("0", "false", "f", "no", "n"):
         sys.exit(0)
 
+    if HOOK_NAME == "post-commit":
+        if GUARD_MODE == "block":
+            admit_committed_head()
+        return
+
     unchecked = []
     if HOOK_NAME == "pre-push":
-        files_to_check, unchecked = get_push_files()
+        admissions = _PushAdmissions()
+        try:
+            files_to_check, unchecked = get_push_files(admissions)
+            admissions.verify_exclusions()
+        finally:
+            admissions.close()
     else:
         files_to_check = get_staged_files()
 
@@ -1783,6 +2224,13 @@ if __name__ == "__main__":
         .unwrap_or_default();
     let storage_root_json =
         serde_json::to_string(&installed_storage_root).unwrap_or_else(|_| "\"\"".to_string());
+    // The loaded Python program carries its own policy identity. Re-reading
+    // its path during a concurrent hook reinstall could certify old checks
+    // under the replacement program's digest.
+    let admission_policy = Sha256::digest(template.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
 
     template
         .replace("__HOOK_NAME_TEXT__", hook_name)
@@ -1790,6 +2238,7 @@ if __name__ == "__main__":
         .replace("__PROJECT_JSON__", &project_json)
         .replace("__HOOK_NAME_JSON__", &hook_name_json)
         .replace("__STORAGE_ROOT_JSON__", &storage_root_json)
+        .replace("__ADMISSION_POLICY_SHA256__", &admission_policy)
 }
 
 fn render_cmd_shim(hook_name: &str) -> String {
@@ -1904,6 +2353,10 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
     install_hook("pre-commit")?;
 
     if install_prepush {
+        // Post-commit independently checks the immutable object before it
+        // records admission. It does not infer success from pre-commit, and
+        // Git ignores its exit status, so failure retains the push backstop.
+        install_hook("post-commit")?;
         install_hook("pre-push")?;
     }
 
@@ -1934,7 +2387,7 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
     }
 
     // Remove our hooks.d plugins if present.
-    for sub in ["pre-commit", "pre-push"] {
+    for sub in ["pre-commit", "post-commit", "pre-push"] {
         let plugin = hooks_dir.join("hooks.d").join(sub).join(PLUGIN_FILE_NAME);
         if plugin.exists() {
             let _ = std::fs::remove_file(plugin);
@@ -1943,7 +2396,7 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
 
     // Legacy top-level single-file uninstall (pre-chain-runner installs)
     // Only remove chain-runner if no other plugins depend on it.
-    for hook_name in ["pre-commit", "pre-push"] {
+    for hook_name in ["pre-commit", "post-commit", "pre-push"] {
         let hook_path = hooks_dir.join(hook_name);
         if !hook_path.exists() {
             continue;
@@ -5989,6 +6442,95 @@ mod tests {
         None
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn guard_commit_admission_runs_native_rendered_programs_against_real_git() {
+        let python = python_executable().expect("Python is required to execute installed guards");
+        let templates = tempfile::tempdir().expect("template directory");
+        for hook in ["pre-commit", "post-commit", "pre-push"] {
+            std::fs::write(
+                templates.path().join(hook),
+                render_guard_plugin_script("__ADMISSION_TEST_PROJECT__", hook),
+            )
+            .expect("write actual renderer output");
+        }
+        let output = Command::new(python)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/commit_admission.py"))
+            .arg("--templates")
+            .arg(templates.path())
+            .output()
+            .expect("execute real Git admission regressions");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_install_reinstall_and_uninstall_preserve_user_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(td.path());
+        let hooks = repo.join(".git/hooks");
+        run_git(
+            &repo,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+        let original = "#!/bin/sh\nprintf 'user post-commit\\n' >> user-post-commit.log\n";
+        std::fs::write(hooks.join("post-commit"), original).expect("user hook");
+        std::fs::set_permissions(
+            hooks.join("post-commit"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("executable user hook");
+        let user_shim = "@echo user-owned post-commit\r\n";
+        std::fs::write(hooks.join("post-commit.cmd"), user_shim).expect("user shim");
+        for _ in 0..2 {
+            install_guard(&repo.to_string_lossy(), &repo, true).expect("install composed hooks");
+        }
+        assert_eq!(
+            std::fs::read_to_string(hooks.join("post-commit.orig")).unwrap(),
+            original
+        );
+        let plugin = hooks.join("hooks.d/post-commit").join(PLUGIN_FILE_NAME);
+        assert!(plugin.is_file());
+        assert!(
+            std::fs::read_to_string(&plugin)
+                .unwrap()
+                .contains("admit_committed_head")
+        );
+        let python = python_executable().expect("Python is required to execute installed guards");
+        let output = Command::new(python)
+            .arg(hooks.join("post-commit"))
+            .current_dir(&repo)
+            .env("AGENT_MAIL_BYPASS", "1")
+            .output()
+            .expect("run composed post-commit hook");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("user-post-commit.log")).unwrap(),
+            "user post-commit\n"
+        );
+        uninstall_guard(&repo).expect("uninstall our plugins");
+        assert_eq!(
+            std::fs::read_to_string(hooks.join("post-commit")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(hooks.join("post-commit.cmd")).unwrap(),
+            user_shim
+        );
+        assert!(!plugin.exists());
+    }
+
     #[test]
     fn guard_plugin_script_contains_project() {
         let script = render_guard_plugin_script("/my/project", "pre-commit");
@@ -7718,8 +8260,8 @@ refs/heads/topic dddddddddddddddddddddddddddddddddddddddd\n";
     fn rendered_pre_push_hook_is_batched_and_bounded() {
         let script = render_guard_plugin_script("/abs/project", "pre-push");
         assert!(
-            script.contains("\"-z\", \"--cc\", \"--stdin\"]"),
-            "diff-tree must take its commit list on stdin"
+            script.contains("\"-m\" if strict else \"--cc\", \"--stdin\"]"),
+            "push scans retain combined merge diffs; strict commit admission checks every parent, both on stdin"
         );
         assert!(
             !script.contains("for sha in commits:"),

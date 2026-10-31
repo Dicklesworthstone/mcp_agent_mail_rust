@@ -1011,6 +1011,30 @@ another agent holds an active lease, the hook fails closed (exit 2) naming what
 was skipped and which variable to raise, the same way every other unfinished
 inspection does. `AGENT_MAIL_GUARD_MODE=warn` turns that into a warning.
 
+Installing with `am guard install <project> <repo> --prepush` also installs a
+composed post-commit hook. It independently checks the exact committed snapshot
+against active reservations, including both rename endpoints and every merge
+parent. A complete check in block mode records a private, signed admission in
+the repository's Git metadata. A later editing lease can then protect the next
+editor's work without vetoing publication of that already admitted commit.
+The pre-commit guard still checks staged changes; publishing never modifies
+the index or working tree.
+
+Pre-push skips only individually admitted commit objects. It still checks
+unadmitted ancestors and commits created without a successful admission, using
+the same scan bounds. Commit timestamps, branch names, replacement refs and
+grafts do not establish admission. Receipts are bound to the canonical
+repository, project and archive authority and the generated guard policy;
+copying receipts to another repository or changing that authority cannot reuse
+them. A failed or incomplete post-commit check leaves the commit unadmitted
+and prints a warning, since Git cannot veto a commit from that hook.
+Explicit bypass, disabled enforcement and warn mode never record admission.
+Ambiguous or malformed reservation evidence cannot record it either. Existing
+user hooks remain composed and are restored when the guard is uninstalled.
+Reinstall with `--prepush` to enable admission in repositories with older hooks.
+Shallow repositories, and platforms without directory-relative no-follow file
+operations, retain the ordinary pre-push reservation check without admission.
+
 | Area | Reserve glob |
 |------|-------------|
 | Core types/config | `crates/mcp-agent-mail-core/src/**` |
