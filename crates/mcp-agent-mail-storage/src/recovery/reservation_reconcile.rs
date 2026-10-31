@@ -257,6 +257,47 @@ fn validate_source(pool: &DbPool, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Admission, checkpoint binding and discovery all gate release retries. A
+/// failed reader at any of those gates must leave the pool before the next
+/// pass; successful reads of conflicting metadata remain ordinary refusals.
+/// Keep this boundary around source reads only, never checkpoint or archive I/O.
+fn read_discovery<T>(
+    cx: &Cx,
+    pool: &DbPool,
+    read: impl FnOnce(&DbConn) -> Result<T, ReleaseFailure>,
+) -> Result<T, String> {
+    let conn = outcome(block_on(pool.acquire(cx)))?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&conn)))
+        .unwrap_or_else(|_| {
+            Err(ReleaseFailure::source_unavailable(
+                "reservation archive discovery read panicked",
+            ))
+        });
+    if result.as_ref().is_err_and(|error| error.transient) {
+        mcp_agent_mail_db::close_db_conn(conn.detach(), "failed reservation discovery read");
+    }
+    result.map_err(|error| error.detail)
+}
+
+fn discovery_query(
+    conn: &DbConn,
+    sql: &str,
+    params: &[mcp_agent_mail_db::sqlmodel_core::Value],
+) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, ReleaseFailure> {
+    #[cfg(test)]
+    tests::discovery_read_fault(conn)?;
+    conn.query_sync(sql, params)
+        .map_err(ReleaseFailure::source_unavailable)
+}
+
+fn require_writable(conn: &DbConn) -> Result<(), ReleaseFailure> {
+    let mode = discovery_query(conn, "PRAGMA query_only", &[])?;
+    if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
+        return Err("query-only snapshots cannot authorize reservation archive repair".into());
+    }
+    Ok(())
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -264,50 +305,54 @@ fn select_ids(
     limit: i64,
     unexpired_only: bool,
 ) -> Result<Vec<i64>, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
-    if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-        return Err("query-only snapshots cannot authorize reservation archive repair".into());
-    }
-    if cursor.ceiling.is_none() {
-        let rows = conn
-            .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
-            .map_err(source_error)?;
-        cursor.ceiling = Some(
-            rows.first()
-                .ok_or("reservation ID aggregate is missing")?
-                .get_as::<i64>(0)
-                .map_err(source_error)?,
-        );
-        cursor.after = 0;
-    }
-    // History walks a bounded primary-key window, including active rows as
-    // unchanged, so a sparse release history cannot force a full table scan.
-    // Priority filters for still-unexpired terminal rows to reach guard-blocking
-    // releases promptly; its LIMIT bounds selected IDs, not SQL rows examined.
-    let rows = conn
-        .query_sync(
+    // Do not consume a new round until every query and ID decode succeeds.
+    // The retry queue and its independent checkpoint owner are never copied.
+    let mut selected = ScanPosition {
+        after: cursor.after,
+        ceiling: cursor.ceiling,
+    };
+    let ids = read_discovery(cx, pool, |conn| {
+        require_writable(conn)?;
+        if selected.ceiling.is_none() {
+            let rows = discovery_query(
+                conn,
+                "SELECT COALESCE(MAX(id), 0) FROM file_reservations",
+                &[],
+            )?;
+            selected.ceiling = Some(
+                rows.first()
+                    .ok_or("reservation ID aggregate is missing")?
+                    .get_as::<i64>(0)
+                    .map_err(source_error)?,
+            );
+            selected.after = 0;
+        }
+        // History walks a bounded primary-key window, including active rows as
+        // unchanged, so a sparse release history cannot force a full table scan.
+        let rows = discovery_query(
+            conn,
             "SELECT fr.id FROM file_reservations fr WHERE fr.id > ? AND fr.id <= ? \
          AND (? = 0 OR (fr.expires_ts > ? AND (fr.released_ts IS NOT NULL OR EXISTS \
              (SELECT 1 FROM file_reservation_releases rr WHERE rr.reservation_id = fr.id)))) \
          ORDER BY fr.id LIMIT ?",
             &[
-                cursor.after.into(),
-                cursor.ceiling.unwrap_or(0).into(),
+                selected.after.into(),
+                selected.ceiling.unwrap_or(0).into(),
                 i64::from(unexpired_only).into(),
                 mcp_agent_mail_db::now_micros().into(),
                 limit.into(),
             ],
-        )
-        .map_err(source_error)?;
-    if rows.is_empty() {
-        cursor.ceiling = None;
-    }
-    rows.iter()
-        .map(|row| row.get_named("id").map_err(source_error))
-        .collect()
+        )?;
+        if rows.is_empty() {
+            selected.ceiling = None;
+        }
+        Ok(rows
+            .iter()
+            .map(|row| row.get_named("id").map_err(source_error))
+            .collect::<Result<Vec<_>, _>>()?)
+    })?;
+    *cursor = selected;
+    Ok(ids)
 }
 
 fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<ReleaseSource>, ReleaseFailure> {
@@ -877,6 +922,55 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         static SOURCE_READ_PANIC: std::cell::Cell<Option<(i64, bool, usize)>> =
             const { std::cell::Cell::new(None) };
+        static DISCOVERY_READ_FAULT: std::cell::Cell<Option<(usize, bool)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) struct DiscoveryReadFault;
+
+    impl DiscoveryReadFault {
+        pub(super) fn new(query: usize, panic: bool) -> Self {
+            assert!(query > 0);
+            DISCOVERY_READ_FAULT.with(|slot| {
+                assert!(slot.get().is_none());
+                slot.set(Some((query, panic)));
+            });
+            Self
+        }
+
+        pub(super) fn assert_triggered(&self) {
+            assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
+        }
+    }
+
+    impl Drop for DiscoveryReadFault {
+        fn drop(&mut self) {
+            DISCOVERY_READ_FAULT.with(|slot| slot.set(None));
+        }
+    }
+
+    pub(super) fn discovery_read_fault(conn: &DbConn) -> Result<(), ReleaseFailure> {
+        let fault = DISCOVERY_READ_FAULT.with(|slot| {
+            let (remaining, panic) = slot.get()?;
+            slot.set((remaining > 1).then_some((remaining.saturating_sub(1), panic)));
+            (remaining == 1).then_some(panic)
+        });
+        let Some(panic) = fault else {
+            return Ok(());
+        };
+        // Connection-local state proves the one-slot pool discards this reader;
+        // no DB row, source result, archive operation or Git result is mocked.
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert!(!panic, "private-reservation-discovery-panic-payload");
+        conn.query_sync("SELECT * FROM missing_reservation_discovery_probe", &[])
+            .map(|_| ())
+            .map_err(ReleaseFailure::source_unavailable)
     }
 
     // An owned, one-shot unwind at a real read boundary; no source result or
@@ -1845,7 +1939,7 @@ mod tests {
         });
     }
 
-    fn isolated_admission_test() -> bool {
+    pub(super) fn isolated_admission_test() -> bool {
         const CHILD: &str = "AM_TEST_RESERVATION_ADMISSION_CHILD";
         let thread = std::thread::current();
         let name = thread.name().expect("named libtest thread");

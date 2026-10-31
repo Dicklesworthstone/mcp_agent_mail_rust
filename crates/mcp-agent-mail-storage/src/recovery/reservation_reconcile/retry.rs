@@ -177,70 +177,73 @@ fn select_ids(
         .ok()
         .filter(|limit| *limit > 0 && *limit <= PRIORITY_ROWS_PER_PAGE)
         .ok_or("invalid reservation priority candidate budget")?;
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
-    if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-        return Err("query-only snapshots cannot authorize reservation archive repair".into());
-    }
-    if position.ceiling.is_none() {
-        let rows = conn
-            .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
-            .map_err(source_error)?;
-        let ceiling = rows
-            .first()
-            .ok_or("reservation ID aggregate is missing")?
-            .get_as::<i64>(0)
-            .map_err(source_error)?;
-        position.ceiling = Some(ceiling);
-        position.after = 0;
-    }
-    let ceiling = position.ceiling.unwrap_or(0);
-    // Eligibility is a projection, not a WHERE predicate. One SQL snapshot
-    // supplies the bounded IDs and both hot-row/ledger release evidence.
-    // No unbounded path/reason strings are materialized during discovery.
-    let sql = format!(
-        "SELECT fr.id, CASE WHEN fr.expires_ts > ?3 AND \
+    let mut selected = ScanPosition {
+        after: position.after,
+        ceiling: position.ceiling,
+    };
+    let ids = read_discovery(cx, pool, |conn| {
+        require_writable(conn)?;
+        if selected.ceiling.is_none() {
+            let rows = discovery_query(
+                conn,
+                "SELECT COALESCE(MAX(id), 0) FROM file_reservations",
+                &[],
+            )?;
+            selected.ceiling = Some(
+                rows.first()
+                    .ok_or("reservation ID aggregate is missing")?
+                    .get_as::<i64>(0)
+                    .map_err(source_error)?,
+            );
+            selected.after = 0;
+        }
+        let ceiling = selected.ceiling.unwrap_or(0);
+        // Eligibility is a projection, not a WHERE predicate. One SQL snapshot
+        // supplies the bounded IDs and both hot-row/ledger release evidence.
+        // No unbounded path/reason strings are materialized during discovery.
+        let sql = format!(
+            "SELECT fr.id, CASE WHEN fr.expires_ts > ?3 AND \
          (fr.released_ts IS NOT NULL OR EXISTS \
           (SELECT 1 FROM file_reservation_releases rr WHERE rr.reservation_id = fr.id)) \
          THEN 1 ELSE 0 END AS eligible \
          FROM file_reservations fr WHERE fr.id > ?1 AND fr.id <= ?2 \
          ORDER BY fr.id LIMIT {PRIORITY_ROWS_PER_PAGE}"
-    );
-    let rows = conn
-        .query_sync(
+        );
+        let rows = discovery_query(
+            conn,
             &sql,
             &[
-                position.after.into(),
+                selected.after.into(),
                 ceiling.into(),
                 mcp_agent_mail_db::now_micros().into(),
             ],
-        )
-        .map_err(source_error)?;
-    if rows.is_empty() {
-        position.ceiling = None;
-        return Ok(Vec::new());
-    }
-    let mut ids = Vec::new();
-    let mut last = position.after;
-    for row in &rows {
-        let id = row.get_named::<i64>("id").map_err(source_error)?;
-        let eligible = row.get_named::<i64>("eligible").map_err(source_error)?;
-        if id <= last || id > ceiling || !matches!(eligible, 0 | 1) {
-            return Err("reservation priority page contains invalid selection evidence".into());
+        )?;
+        if rows.is_empty() {
+            selected.ceiling = None;
+            return Ok(Vec::new());
         }
-        last = id;
-        if eligible == 1 && ids.len() < limit {
-            ids.push(id);
+        let mut ids = Vec::new();
+        let mut last = selected.after;
+        for row in &rows {
+            let id = row.get_named::<i64>("id").map_err(source_error)?;
+            let eligible = row.get_named::<i64>("eligible").map_err(source_error)?;
+            if id <= last || id > ceiling || !matches!(eligible, 0 | 1) {
+                return Err("reservation priority page contains invalid selection evidence".into());
+            }
+            last = id;
+            if eligible == 1 && ids.len() < limit {
+                ids.push(id);
+            }
         }
-    }
-    // An entirely nonmatching page has no publication/retry debt to retain.
-    // Otherwise leave advancement to the existing per-ID execution loop:
-    // even a two-write budget break cannot consume the unprocessed page tail.
-    if ids.is_empty() && !cx.checkpoint().is_err() {
-        advance(position, last);
-    }
+        // An entirely nonmatching page has no publication/retry debt to retain.
+        // Otherwise leave advancement to the existing per-ID execution loop:
+        // even a two-write budget break cannot consume the unprocessed page tail.
+        if ids.is_empty() && !cx.checkpoint().is_err() {
+            advance(&mut selected, last);
+        }
+        Ok(ids)
+    })?;
+    *position = selected;
     Ok(ids)
 }
 
@@ -362,13 +365,7 @@ pub(super) fn run(
     // the same writable-source admission before touching any archive path.
     {
         let _admission = admit_source(pool, config, None)?;
-        let conn = outcome(block_on(pool.acquire(cx)))?;
-        let mode = conn
-            .query_sync("PRAGMA query_only", &[])
-            .map_err(source_error)?;
-        if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-            return Err("query-only snapshots cannot authorize reservation archive repair".into());
-        }
+        read_discovery(cx, pool, require_writable)?;
         let identity = pool.sqlite_identity_key();
         if identity != cursor.source_identity {
             let checkpoint_enabled = cursor.retries.checkpoint.enabled;

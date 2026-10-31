@@ -17,9 +17,11 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AtomicBool, Config, Cx, DbPool, DeferredRelease, MAX_BACKOFF, MAX_RETRY_IDS,
-    ReservationReconcileCursor, ReservationReconcileReport, ScanPosition, block_on,
-    corruption_circuit_breaker, outcome, source_error,
+    ReservationReconcileCursor, ReservationReconcileReport, ScanPosition,
+    corruption_circuit_breaker, discovery_query, read_discovery, source_error,
 };
+#[cfg(test)]
+use super::{block_on, outcome};
 
 const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 128 * 1024;
@@ -70,31 +72,30 @@ struct Binding {
 
 impl Binding {
     fn capture(cx: &Cx, pool: &DbPool, config: &Config) -> Result<Self, String> {
-        let conn = outcome(block_on(pool.acquire(cx)))?;
-        // Bound the projection before materializing an untrusted generation.
-        let rows = conn
-            .query_sync(
+        let generation = read_discovery(cx, pool, |conn| {
+            // Bound the projection before materializing an untrusted generation.
+            let rows = discovery_query(
+                conn,
                 "SELECT CASE WHEN length(CAST(generation_id AS BLOB)) BETWEEN 1 AND 128 \
                  THEN generation_id ELSE NULL END AS generation_id \
                  FROM db_identity WHERE singleton = 0",
                 &[],
-            )
-            .map_err(source_error)?;
-        let generation = match rows.as_slice() {
-            [] => None,
-            [row] => Some(
-                row.get_named::<Option<String>>("generation_id")
-                    .map_err(source_error)?
-                    .filter(|value| {
-                        !value.is_empty()
-                            && value.len() <= 128
-                            && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
-                    .ok_or("reservation checkpoint source generation is invalid")?,
-            ),
-            _ => return Err("reservation checkpoint source generation is ambiguous".into()),
-        };
-        drop(conn);
+            )?;
+            match rows.as_slice() {
+                [] => Ok(None),
+                [row] => Ok(Some(
+                    row.get_named::<Option<String>>("generation_id")
+                        .map_err(source_error)?
+                        .filter(|value| {
+                            !value.is_empty()
+                                && value.len() <= 128
+                                && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                        .ok_or("reservation checkpoint source generation is invalid")?,
+                )),
+                _ => Err("reservation checkpoint source generation is ambiguous".into()),
+            }
+        })?;
         Self::at(
             Path::new(pool.sqlite_path()),
             &config.storage_root,
@@ -652,6 +653,7 @@ fn save_current(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::tests as release_tests;
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,6 +777,241 @@ mod tests {
         );
         cursor.retries.checkpoint = state;
         result
+    }
+
+    #[test]
+    fn discovery_failures_preserve_checkpoint_debt_and_eventually_publish_fresh_release() {
+        if release_tests::isolated_admission_test() {
+            return;
+        }
+        // Real checkpointed entrypoints: writable admission, binding capture,
+        // priority page after its aggregate, and history page after its aggregate.
+        for failing_query in [1, 2, 5, 8] {
+            for panic in [false, true] {
+                release_tests::fixture(|cx, pool, config| {
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+                    conn.execute_raw(&format!(
+                        "UPDATE file_reservations SET expires_ts = {expires} WHERE id = 401"
+                    ))
+                    .unwrap();
+                    drop(conn);
+                    let source = super::super::super::read_source(cx, pool, 401)
+                        .unwrap()
+                        .unwrap();
+                    let (path, original) =
+                        release_tests::seed_artifact(config, &source, "aabb", false);
+                    let (mut cursor, binding, _) = persisted_retry(cx, pool, config);
+                    cursor.priority = ScanPosition {
+                        after: 17,
+                        ceiling: None,
+                    };
+                    cursor.history = ScanPosition {
+                        after: 23,
+                        ceiling: None,
+                    };
+                    cursor.retries.pending[0].ready_at = Instant::now() + MAX_BACKOFF;
+                    let stop = AtomicBool::new(false);
+                    save_pending(cx, pool, config, &mut cursor, &stop).unwrap();
+                    let previous = std::fs::read(binding.path().unwrap()).unwrap();
+                    let debt = (
+                        cursor.retries.pending[0].id,
+                        cursor.retries.pending[0].attempts,
+                        cursor.retries.pending[0].ready_at,
+                    );
+
+                    let fault = release_tests::DiscoveryReadFault::new(failing_query, panic);
+                    let error = cursor
+                        .reconcile_checkpointed(cx, pool, config, &stop)
+                        .unwrap_err();
+                    fault.assert_triggered();
+                    drop(fault);
+                    assert!(!error.contains("private-reservation-discovery-panic-payload"));
+                    assert!(error.contains(if panic {
+                        "panicked"
+                    } else {
+                        "source query failed"
+                    }));
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                    assert_eq!(cursor.retries.pending.len(), 1);
+                    assert_eq!(
+                        (
+                            cursor.retries.pending[0].id,
+                            cursor.retries.pending[0].attempts,
+                            cursor.retries.pending[0].ready_at,
+                        ),
+                        debt,
+                    );
+                    // A failed selection keeps its old hints. An earlier
+                    // completed priority page is still legitimate progress.
+                    assert_eq!(
+                        (cursor.priority.after, cursor.priority.ceiling),
+                        (if failing_query == 8 { 401 } else { 17 }, None),
+                    );
+                    assert_eq!((cursor.history.after, cursor.history.ceiling), (23, None));
+                    assert!(Store::open(binding.clone()).is_err_and(|error| contended(&error)));
+                    let saved = std::fs::read(binding.path().unwrap()).unwrap();
+                    if failing_query <= 2 {
+                        assert_eq!(saved, previous);
+                    }
+                    let snapshot: Snapshot = serde_json::from_slice(&saved).unwrap();
+                    snapshot.validate(&binding).unwrap();
+                    assert_eq!(snapshot.retries.len(), 1);
+                    assert_eq!(snapshot.retries[0].id, 401);
+                    assert_eq!(snapshot.history.after, 23);
+                    assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    assert_eq!(
+                        conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                            .get_as::<i64>(0)
+                            .unwrap(),
+                        0,
+                        "the sole failed reader was returned to the pool",
+                    );
+                    let rows = conn
+                        .query_sync(
+                            "SELECT fr.released_ts, rr.released_ts FROM file_reservations fr \
+                         JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+                         WHERE fr.id = 401",
+                            &[],
+                        )
+                        .unwrap();
+                    assert_eq!(rows[0].get_as::<Option<i64>>(0).unwrap(), None);
+                    assert_eq!(rows[0].get_as::<i64>(1).unwrap(), 5_000_000);
+                    conn.execute_raw(
+                        "UPDATE file_reservations SET reason = 'fresh source after failure' WHERE id = 401"
+                    ).unwrap();
+                    conn.execute_raw(
+                        "UPDATE file_reservation_releases SET released_ts = 6000000 WHERE reservation_id = 401"
+                    ).unwrap();
+                    drop(conn);
+                    cursor.retries.pending[0].ready_at = Instant::now();
+                    let report = cursor
+                        .reconcile_checkpointed(cx, pool, config, &stop)
+                        .unwrap();
+                    assert_eq!((report.repaired, report.retry_len), (1, 0), "{report:?}");
+                    let bytes = std::fs::read(&path).unwrap();
+                    let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        super::super::super::timestamp(&artifact["released_ts"]),
+                        Some(6_000_000),
+                    );
+                    assert_eq!(artifact["reason"], "fresh source after failure");
+                    assert_eq!(artifact["operator_note"], "preserve this note");
+                    assert_eq!(artifact["db_generation"], "aabb");
+                    let repo = git2::Repository::open(&config.storage_root).unwrap();
+                    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                    let entry = tree
+                        .get_path(Path::new(
+                            "projects/project/file_reservations/id-401-gaabb.json",
+                        ))
+                        .unwrap();
+                    assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+                    assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_save_source_failures_preserve_owned_snapshot_until_retry() {
+        if release_tests::isolated_admission_test() {
+            return;
+        }
+        for panic in [false, true] {
+            release_tests::fixture(|cx, pool, config| {
+                let (mut cursor, binding, previous) = persisted_retry(cx, pool, config);
+                cursor.retries.pending[0].attempts = 2;
+                cursor.retries.pending[0].ready_at = Instant::now() + MAX_BACKOFF;
+                let stop = AtomicBool::new(false);
+                let fault = release_tests::DiscoveryReadFault::new(1, panic);
+                let error = save_pending(cx, pool, config, &mut cursor, &stop).unwrap_err();
+                fault.assert_triggered();
+                drop(fault);
+                assert!(
+                    !error
+                        .to_string()
+                        .contains("private-reservation-discovery-panic-payload")
+                );
+                assert_eq!(std::fs::read(binding.path().unwrap()).unwrap(), previous);
+                assert_eq!(cursor.retries.pending.len(), 1);
+                assert_eq!(cursor.retries.pending[0].attempts, 2);
+                assert!(Store::open(binding.clone()).is_err_and(|error| contended(&error)));
+                assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert_eq!(
+                    conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0)
+                        .unwrap(),
+                    0,
+                );
+                drop(conn);
+                save_pending(cx, pool, config, &mut cursor, &stop).unwrap();
+                let snapshot: Snapshot =
+                    serde_json::from_slice(&std::fs::read(binding.path().unwrap()).unwrap())
+                        .unwrap();
+                snapshot.validate(&binding).unwrap();
+                assert_eq!(snapshot.retries[0].attempts, 2);
+                cursor.retries.pending[0].ready_at = Instant::now();
+                let report = cursor
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap();
+                assert_eq!((report.repaired, report.retry_len), (1, 0));
+            });
+        }
+    }
+
+    #[test]
+    fn metadata_refusals_keep_healthy_readers_and_release_debt() {
+        release_tests::fixture(|cx, pool, config| {
+            let (mut cursor, binding, previous) = persisted_retry(cx, pool, config);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let stop = AtomicBool::new(false);
+            let error = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap_err();
+            assert!(error.contains("query-only snapshots"));
+            assert_eq!(std::fs::read(binding.path().unwrap()).unwrap(), previous);
+            assert_eq!(cursor.retries.pending.len(), 1);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            conn.execute_raw(
+                "UPDATE db_identity SET generation_id = 'not-hex' WHERE singleton = 0",
+            )
+            .unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            // A successful metadata read of an invalid generation is also a
+            // refusal, without retiring an otherwise healthy source reader.
+            let error = Binding::capture(cx, pool, config).unwrap_err();
+            assert!(error.contains("generation is invalid"));
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            conn.execute_raw("UPDATE db_identity SET generation_id = 'aabb' WHERE singleton = 0")
+                .unwrap();
+            drop(conn);
+            assert!(Store::open(binding).is_err_and(|error| contended(&error)));
+            let report = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!((report.repaired, report.retry_len), (1, 0));
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
     }
 
     #[test]
