@@ -263,7 +263,8 @@ pub use mailbox_verdict::{
     DURABILITY_TRANSITIONS, DurabilityState, DurabilityTransition, MailboxArchiveDriftState,
     MailboxArchiveDriftVerdict, MailboxHealthVerdict, MailboxSqlitePathVerdict, MailboxState,
     ProbeResult, ProbeSeverity, VerdictOptions, compute_mailbox_verdict,
-    validate_durability_transition, verdict_prefers_archive_snapshot_reads,
+    inspect_mailbox_archive_drift, validate_durability_transition,
+    verdict_prefers_archive_snapshot_reads,
     verdict_prefers_archive_snapshot_reads_for_primary_read_surface,
 };
 pub use migrate::{

@@ -949,7 +949,7 @@ pub fn compute_mailbox_verdict(
     let archive_drift = if options.skip_archive_count {
         MailboxArchiveDriftVerdict::skipped("Archive drift inspection disabled by options")
     } else {
-        inspect_archive_drift(&db_path, archive_root)
+        inspect_mailbox_archive_drift(&db_path, archive_root)
     };
     let archive_presence = if options.skip_archive_count {
         inspect_archive_state_presence(archive_root)
@@ -1209,7 +1209,18 @@ fn probe_integrity(integrity: &MailboxIntegrityVerdict) -> ProbeResult {
     }
 }
 
-fn inspect_archive_drift(db_path: &Path, archive_root: &Path) -> MailboxArchiveDriftVerdict {
+/// Compare SQLite and canonical archive inventories through the guarded
+/// read-only database lane.
+///
+/// This returns only archive drift evidence. It does not repeat integrity or
+/// ownership probes, test archive writability, or perform recovery. Callers
+/// that require those checks must perform them independently before deciding
+/// how to act on an archive-ahead result.
+#[must_use]
+pub fn inspect_mailbox_archive_drift(
+    db_path: &Path,
+    archive_root: &Path,
+) -> MailboxArchiveDriftVerdict {
     if db_path.as_os_str() == ":memory:" {
         return MailboxArchiveDriftVerdict::skipped(
             "Archive drift inspection skipped for in-memory database",
@@ -2358,6 +2369,66 @@ mod tests {
     }
 
     #[test]
+    fn focused_archive_drift_reports_inventory_without_unrelated_probes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("archive root");
+        let probe_path = storage_root.join(".write_probe");
+        let original = b"archive inventory probes must leave this untouched";
+        std::fs::write(&probe_path, original).expect("archive sentinel");
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("mailbox schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (1, 'project', '/project', 0)",
+        )
+        .expect("live project");
+        drop(conn);
+
+        let db_ahead = inspect_mailbox_archive_drift(&db_path, &storage_root);
+        assert_eq!(db_ahead.state, MailboxArchiveDriftState::DbAhead);
+        assert_eq!((db_ahead.db_projects, db_ahead.archive_projects), (1, 0));
+
+        let project = storage_root.join("projects").join("project");
+        let messages = project.join("messages").join("2026").join("10");
+        std::fs::create_dir_all(&messages).expect("canonical message directory");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"project","human_key":"/project","created_at":0}"#,
+        )
+        .expect("archive project");
+        let aligned = inspect_mailbox_archive_drift(&db_path, &storage_root);
+        assert_eq!(aligned.state, MailboxArchiveDriftState::Aligned);
+        assert_eq!((aligned.db_projects, aligned.archive_projects), (1, 1));
+
+        std::fs::write(
+            messages.join("2026-10-30T00-00-00Z__archive-only__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Archive only\",\"importance\":\"normal\",\"created_ts\":\"2026-10-30T00:00:00Z\"}\n---\n\nbody\n",
+        )
+        .expect("canonical archive message");
+        let archive_ahead = inspect_mailbox_archive_drift(&db_path, &storage_root);
+        assert_eq!(archive_ahead.state, MailboxArchiveDriftState::ArchiveAhead);
+        assert_eq!(archive_ahead.archive_messages, 1);
+        assert_eq!(archive_ahead.archive_latest_message_id, Some(7));
+        assert_eq!(archive_ahead.db_messages, 0);
+
+        let missing = dir.path().join("missing.sqlite3");
+        let unavailable = inspect_mailbox_archive_drift(&missing, &storage_root);
+        assert_eq!(unavailable.state, MailboxArchiveDriftState::Unknown);
+        assert_eq!(unavailable.archive_messages, 1);
+        assert!(
+            !missing.exists(),
+            "a diagnostic must not initialize the database"
+        );
+        assert_eq!(
+            std::fs::read(&probe_path).expect("archive sentinel must remain"),
+            original,
+        );
+    }
+
+    #[test]
     fn inspect_archive_drift_prefers_db_ahead_when_archive_only_has_metadata_advantage() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
@@ -2446,7 +2517,7 @@ mod tests {
         )
         .expect("write archive-only agent metadata");
 
-        let drift = inspect_archive_drift(&db_path, &storage_root);
+        let drift = inspect_mailbox_archive_drift(&db_path, &storage_root);
         assert_eq!(drift.state, MailboxArchiveDriftState::DbAhead);
         assert!(
             drift.detail.contains("DB is ahead of archive"),

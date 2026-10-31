@@ -2549,19 +2549,19 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
         Ok(_) => {
             #[cfg(test)]
             record_startup_work(1);
-            let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
-                &config.database_url,
-                &config.storage_root,
-                &mcp_agent_mail_db::VerdictOptions {
-                    skip_integrity_check: true,
-                    ..mcp_agent_mail_db::VerdictOptions::default()
-                },
-            );
-            if verdict.archive_drift.state
-                == mcp_agent_mail_db::MailboxArchiveDriftState::ArchiveAhead
+            // The admitted integrity check above has already proved the
+            // database. Only archive drift is needed here: the full mailbox
+            // verdict repeats size-proportional database sanity probes,
+            // discovers owners and writes an archive writability probe whose
+            // results this recovery decision never consumes.
+            let archive_drift = resolved_db_path.as_deref().map(|db_path| {
+                mcp_agent_mail_db::inspect_mailbox_archive_drift(db_path, &config.storage_root)
+            });
+            if let Some(drift) = archive_drift
+                && drift.state == mcp_agent_mail_db::MailboxArchiveDriftState::ArchiveAhead
             {
                 tracing::warn!(
-                    detail = %verdict.archive_drift.detail,
+                    detail = %drift.detail,
                     "startup integrity probe found archive-backed state ahead of healthy sqlite; attempting archive reconciliation (not confirmed corruption)"
                 );
                 return attempt_probe_recovery(config);
@@ -5109,6 +5109,40 @@ mod tests {
         assert!(
             matches!(result, ProbeResult::Ok { .. }),
             "healthy DB should pass probe_integrity; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_integrity_preserves_archive_writability_probe_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("archive root");
+        let probe_path = storage_root.join(".write_probe");
+        let original = b"pre-existing archive artifact: do not overwrite or remove";
+        std::fs::write(&probe_path, original).expect("preserve archive sentinel");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize real mailbox schema");
+        drop(conn);
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        let _ = take_startup_work_counts();
+
+        let result = probe_integrity(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }), "{result:?}");
+        assert_eq!(
+            take_startup_work_counts(),
+            [1, 1, 1, 0],
+            "integrity, archive drift and ID-floor checks must still run"
+        );
+        assert_eq!(
+            std::fs::read(&probe_path).expect("archive artifact must survive startup"),
+            original,
+            "post-integrity inventory checking must not run unrelated writability probes"
         );
     }
 
