@@ -1897,7 +1897,7 @@ mod tests {
                     .display()
                     .to_string()
             })
-            .filter(|name| !name.ends_with(".lock"))
+            .filter(|name| Path::new(name).extension().is_none_or(|ext| ext != "lock"))
             .collect();
         names.sort();
         names
