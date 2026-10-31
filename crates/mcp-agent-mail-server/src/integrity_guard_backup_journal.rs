@@ -299,6 +299,11 @@ impl AutomaticBackupLease {
         self.kind
     }
 
+    /// The one over-budget export is gone until ordinary admission fits again.
+    pub(super) const fn retention_repair_spent(&self) -> bool {
+        self.state.retention_repair_reserved
+    }
+
     /// Request a verified repair without yet spending its export allowance.
     /// Snapshot contention or live verification can still defer before any
     /// staging begins; those non-export attempts need no additional disk slot.

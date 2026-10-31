@@ -418,6 +418,17 @@ impl PeriodicPublicationBudget {
         )
     }
 
+    /// Whether publication would stay refused with these images gone too.
+    const fn exhausted_without(&self, images: usize, bytes: u64) -> bool {
+        periodic_limit_reached(
+            self.count.saturating_sub(images),
+            self.bytes.saturating_sub(bytes),
+            self.projected,
+            self.count_limit,
+            self.byte_limit,
+        )
+    }
+
     fn admit(&self) -> std::io::Result<()> {
         if self.exhausted() {
             return Err(std::io::Error::other(PeriodicBudgetExceeded(format!(
@@ -840,8 +851,9 @@ struct PendingReclaim {
     metadata: fs::Metadata,
     historical: bool,
     /// Shorten the normal resident window only while the complete footprint
-    /// still prevents publication. The exact slot and verified pin never enter
-    /// this queue, and failed deletions never satisfy this condition.
+    /// still prevents publication and removing the rest of the window would
+    /// end that. The exact slot and verified pin never enter this queue, and
+    /// failed deletions never satisfy this condition.
     within_window: bool,
 }
 
@@ -883,17 +895,38 @@ fn reclaim_pending(
         let start = pending.partition_point(|entry| key(entry) <= cursor);
         pending.rotate_left(start);
     }
+    // Stable, so older entries keep the cursor's fair turn, and each has had its
+    // try before the first window image is considered. The window needs no fair
+    // turn: a refusal doesn't stop this loop, so its oldest image always goes
+    // first and the next still gets its try in the same pass.
+    pending.sort_by_key(|entry| entry.within_window);
+    let window_start = pending.partition_point(|entry| !entry.within_window);
+    pending[window_start..].sort_by_key(&key);
+    let (mut window_images, mut window_bytes) = pending
+        .iter()
+        .filter(|entry| entry.within_window)
+        .fold((0_usize, 0_u64), |(images, bytes), entry| {
+            (
+                images.saturating_add(1),
+                bytes.saturating_add(entry.metadata.len()),
+            )
+        });
     let mut summary = RotateKindSummary::default();
     let mut last_attempted = None;
     let mut stopped = report.admission_refused;
     for entry in pending {
-        if stopped
-            || (entry.within_window
-                && budget
-                    .publication
-                    .as_ref()
-                    .is_none_or(|publication| !publication.exhausted()))
-        {
+        // The budget has only this pass's confirmed deletions in it, so what a
+        // refusal left behind still counts against the rest of the window.
+        let keep_window = entry.within_window
+            && budget.publication.as_ref().is_none_or(|publication| {
+                !publication.exhausted()
+                    || publication.exhausted_without(window_images, window_bytes)
+            });
+        if entry.within_window {
+            window_images = window_images.saturating_sub(1);
+            window_bytes = window_bytes.saturating_sub(entry.metadata.len());
+        }
+        if stopped || keep_window {
             summary.kept = summary.kept.saturating_add(1);
             summary.bytes_kept = summary.bytes_kept.saturating_add(entry.metadata.len());
             continue;
@@ -2438,22 +2471,84 @@ mod tests {
         assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
     }
 
+    /// An older file refused on an earlier pass sits behind the cursor, and it
+    /// still goes before the window. The window then goes only if that ends
+    /// the refusal: the limit here is 6, and two older images go first.
     #[cfg(unix)]
     #[test]
-    fn newest_images_removed_for_an_exhausted_budget_are_counted() {
+    fn window_images_go_last_and_only_to_reopen_publication() {
+        for (count, window_deleted) in [(7, 0), (8, 1), (9, 0)] {
+            let tmp = TempDir::new().unwrap();
+            let primary = verified_mailbox(tmp.path());
+            let older = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+            let middle = tmp.path().join("storage.sqlite3.bak.20000102_000000");
+            let newest = tmp.path().join("storage.sqlite3.bak.20000103_000000");
+            fs::write(&older, b"incomplete export evidence").unwrap();
+            fs::copy(&primary, &middle).unwrap();
+            fs::copy(&primary, &newest).unwrap();
+            let guard =
+                mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+            let pass = |byte_limit, publication| {
+                let pending = [(&older, false), (&middle, false), (&newest, true)]
+                    .into_iter()
+                    .map(|(path, within_window)| PendingReclaim {
+                        path: path.clone(),
+                        metadata: fs::metadata(path).unwrap(),
+                        historical: false,
+                        within_window,
+                    })
+                    .collect();
+                let mut budget = ReclaimBudget {
+                    attempted: 0,
+                    bytes: 0,
+                    byte_limit,
+                    publication,
+                    deadline: None,
+                    deadline_reached: false,
+                };
+                let mut report = RotateReport::default();
+                reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+                report
+            };
+            // Only the refused oldest file is attempted, and the cursor stops on it.
+            let refused = pass(0, None);
+            assert_eq!(refused.failures.len(), 1);
+            assert_eq!(refused.window_images_deleted, 0);
+            fs::copy(&primary, &older).unwrap();
+            let exhausted = PeriodicPublicationBudget {
+                count,
+                bytes: 0,
+                projected: 0,
+                count_limit: 6,
+                byte_limit: u64::MAX,
+            };
+            let report = pass(u64::MAX, Some(exhausted));
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(report.deleted, 2 + window_deleted, "count={count}");
+            assert_eq!(
+                report.window_images_deleted, window_deleted,
+                "count={count}"
+            );
+            assert_eq!(newest.exists(), window_deleted == 0, "count={count}");
+        }
+    }
+
+    /// With the cursor on the older window image, its rotation puts the newest
+    /// first, and here one deletion is all it takes to reopen publication.
+    #[cfg(unix)]
+    #[test]
+    fn older_window_image_goes_first_whatever_the_cursor() {
         let tmp = TempDir::new().unwrap();
         let primary = verified_mailbox(tmp.path());
         let older = tmp.path().join("storage.sqlite3.bak.20000101_000000");
-        let middle = tmp.path().join("storage.sqlite3.bak.20000102_000000");
-        let newest = tmp.path().join("storage.sqlite3.bak.20000103_000000");
+        let newest = tmp.path().join("storage.sqlite3.bak.20000102_000000");
         fs::write(&older, b"incomplete export evidence").unwrap();
-        fs::copy(&primary, &middle).unwrap();
         fs::copy(&primary, &newest).unwrap();
         let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
-        let pass = |byte_limit, publication| {
-            let pending = [(&older, false), (&middle, false), (&newest, true)]
+        let pass = |within_window, byte_limit, publication| {
+            let pending = [&older, &newest]
                 .into_iter()
-                .map(|(path, within_window)| PendingReclaim {
+                .map(|path| PendingReclaim {
                     path: path.clone(),
                     metadata: fs::metadata(path).unwrap(),
                     historical: false,
@@ -2472,25 +2567,23 @@ mod tests {
             reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
             report
         };
-        // Only the refused oldest file is attempted, and the cursor stops on it.
-        let refused = pass(0, None);
+        // Only the refused older image is attempted, and the cursor stops on it.
+        let refused = pass(false, 0, None);
         assert_eq!(refused.failures.len(), 1);
-        assert_eq!(refused.window_images_deleted, 0);
-        // A later pass starts after that cursor, so it reaches the window
-        // before retrying the oldest file, and refuses nothing itself.
+        assert!(older.exists() && newest.exists());
         fs::copy(&primary, &older).unwrap();
-        let exhausted = PeriodicPublicationBudget {
-            count: 9,
+        let one_over = PeriodicPublicationBudget {
+            count: 6,
             bytes: 0,
             projected: 0,
             count_limit: 6,
             byte_limit: u64::MAX,
         };
-        let report = pass(u64::MAX, Some(exhausted));
+        let report = pass(true, u64::MAX, Some(one_over));
         assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.deleted, 3);
         assert_eq!(report.window_images_deleted, 1);
-        assert!(!newest.exists());
+        assert!(!older.exists(), "the older image goes first");
+        assert!(newest.exists(), "and that was enough to keep the newest");
     }
 
     #[cfg(unix)]

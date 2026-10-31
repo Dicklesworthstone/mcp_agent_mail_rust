@@ -1013,6 +1013,13 @@ where
                 if crate::backup_rotation::periodic_reclamation_enabled()
                     && crate::backup_rotation::periodic_publication_budget_exhausted(&error) =>
             {
+                if lease.retention_repair_spent() {
+                    tracing::warn!(
+                        path = %primary.display(),
+                        %error,
+                        "automatic backups have stopped: retention cannot delete enough old backups to make room, so no new backup is taken until it can; existing backups are kept"
+                    );
+                }
                 lease
                     .prepare_retention_repair()
                     .map_err(|error| error.to_string())?;
@@ -2093,11 +2100,11 @@ mod tests {
         assert!(warnings[0].contains("shortened pass"), "{warnings:?}");
     }
 
-    /// Removing the newest images is only defensible while it keeps backups
-    /// moving, so a new one has to follow whether or not the refusals clear.
+    /// A pass with refusals must keep backups moving, and it may spend the
+    /// newest images on that only where removing them reopens publication.
     #[cfg(unix)]
     #[test]
-    fn publication_follows_a_pass_that_removed_the_newest_images() {
+    fn publication_follows_a_pass_with_refusals() {
         use mcp_agent_mail_db::snapshot::{
             latest_verified_snapshot, record_snapshot_metadata, snapshot_bak_path,
         };
@@ -2119,14 +2126,14 @@ mod tests {
             eprintln!("not asserting publication: a process of this user hides its open files");
             return;
         }
-        for refusals_clear in [false, true] {
+        for (stuck, refusals_clear) in [(6_u32, false), (6, true), (4, false)] {
             let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
             let (primary, pool) = retention_mailbox(&root);
             let slot = snapshot_bak_path(&primary);
             std::fs::copy(&primary, &slot).unwrap();
             let published = record_snapshot_metadata(&primary, 1_700_000_000_000_000).unwrap();
             let image = |day: u32| root.join(format!("mail.sqlite3.bak.2000010{day}_000000"));
-            let refused = [1, 2, 3, 4, 5, 6].map(image);
+            let refused: Vec<PathBuf> = (1..=stuck).map(image).collect();
             for path in &refused {
                 std::fs::write(path, b"interrupted export").unwrap();
             }
@@ -2135,13 +2142,21 @@ mod tests {
                 std::fs::copy(&primary, path).unwrap();
             }
 
+            // The count limit is 6: the slot, the refused images and the two
+            // newest. Removing those two only helps while 5 or fewer remain.
+            let reopens = stuck < 5;
             let report =
                 crate::backup_rotation::rotate_storage_backups(&root, &primary, 3).unwrap();
-            assert_eq!(report.window_images_deleted, 2, "{report:?}");
-            assert!(newest.iter().all(|path| !path.exists()));
-            assert!(
-                crate::backup_rotation::admit_periodic_publication(&root, &primary, 3).is_err(),
-                "the refused images keep the budget exhausted"
+            assert_eq!(
+                report.window_images_deleted,
+                if reopens { 2 } else { 0 },
+                "{report:?}"
+            );
+            assert_eq!(newest.iter().all(|path| !path.exists()), reopens);
+            assert_eq!(
+                crate::backup_rotation::admit_periodic_publication(&root, &primary, 3).is_ok(),
+                reopens,
+                "stuck={stuck}"
             );
 
             if refusals_clear {
@@ -2156,17 +2171,90 @@ mod tests {
             assert_ne!(
                 std::fs::metadata(&slot).unwrap().ino(),
                 slot_before,
-                "refusals_clear={refusals_clear}: no new image followed the pass"
+                "stuck={stuck} refusals_clear={refusals_clear}: no new image followed the pass"
             );
-            // Cleared refusals return to ordinary admission, whose first hour
-            // is a proactive refresh. Only the over-budget repair is verified.
+            // Ordinary admission's first hour is a proactive refresh. Only the
+            // over-budget repair is verified.
             let next = latest_verified_snapshot(&primary).expect("a verified snapshot remains");
             assert_eq!(
                 next.created_us > published.created_us,
-                !refusals_clear,
-                "refusals_clear={refusals_clear}"
+                !reopens && !refusals_clear,
+                "stuck={stuck} refusals_clear={refusals_clear}"
             );
         }
+    }
+
+    /// Backups stopping is the worse failure, so it has its own default-level
+    /// line once the one repair export is spent.
+    #[cfg(unix)]
+    #[test]
+    fn stopped_backups_are_reported_as_a_warning() {
+        use mcp_agent_mail_db::snapshot::{record_snapshot_metadata, snapshot_bak_path};
+
+        if !isolated_default_retention_child() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let (primary, pool) = retention_mailbox(&root);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        record_snapshot_metadata(&primary, 1_700_000_000_000_000).unwrap();
+        for day in 1..=6 {
+            std::fs::write(
+                root.join(format!("mail.sqlite3.bak.2000010{day}_000000")),
+                b"interrupted export",
+            )
+            .unwrap();
+        }
+        let policy = PeriodicBackupPolicy {
+            storage_root: &root,
+            keep: 3,
+        };
+        let start = Instant::now();
+        let wall_start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut schedule = AutomaticBackupSchedule::default();
+        let capture = WarnCapture::default();
+        let mut stopped_lines = Vec::new();
+        tracing::subscriber::with_default(capture.clone(), || {
+            for hour in 0..3_u64 {
+                let now = start + Duration::from_secs(hour * 3600);
+                let requested = schedule.next_attempt(now).expect("this attempt is due");
+                backup_budget::with_admission(&primary, || {
+                    let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                        &primary,
+                        requested,
+                        wall_start + hour * 3600,
+                    )
+                    .unwrap()
+                    .expect("no other exporter");
+                    run_with_backup_lease(
+                        &primary,
+                        &mut schedule,
+                        || now,
+                        Some(policy),
+                        lease,
+                        |kind, before_export| {
+                            publish_automatic_backup(&pool, policy, kind, before_export)
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+                stopped_lines.push(
+                    capture
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|line| line.contains("automatic backups have stopped"))
+                        .count(),
+                );
+            }
+        });
+        // The repair export takes hour 0. Each hour after it says so again.
+        assert_eq!(stopped_lines, [0, 1, 2], "{:?}", capture.0.lock().unwrap());
     }
 
     #[cfg(unix)]
