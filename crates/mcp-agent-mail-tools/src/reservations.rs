@@ -8476,11 +8476,18 @@ mod tests {
                     assert_eq!(response["released"], 0);
                     let pending = read_queued_release_intents(&config).unwrap();
                     assert_eq!(pending.len(), 1);
-                    assert_eq!(pending[0].failure.stage, "release_reservations");
+                    // The read-only view leaves `failure` out; the hashed record carries it.
+                    let queued = std::fs::read_to_string(release_intent_log_path(&config))
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .find(|record| record["intent_id"] == pending[0].intent_id)
+                        .expect("the queued intent is in the durable log");
+                    assert_eq!(queued["failure"]["stage"], "release_reservations");
                     assert!(
-                        pending[0]
-                            .failure
-                            .error_detail
+                        queued["failure"]["error_detail"]
+                            .as_str()
+                            .unwrap()
                             .contains("retry budget exhausted")
                     );
                     replay_queued_release_intents(&holder_ctx, &pool, &config).await;

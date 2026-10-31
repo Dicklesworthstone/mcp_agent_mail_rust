@@ -58,7 +58,11 @@ pub(crate) async fn replay_read_pool(
     }
 
     let pool = get_coalescer_bypass_read_db_pool()?;
-    let conn = db_outcome_to_mcp_result(pool.acquire(ctx.cx()).await)?;
+    let conn = db_outcome_to_mcp_result(
+        pool.acquire(ctx.cx())
+            .await
+            .map_err(|error| mcp_agent_mail_db::DbError::Sqlite(error.to_string())),
+    )?;
     let schema = conn
         .query_sync("SELECT name FROM sqlite_master LIMIT 1", &[])
         .map_err(|error| {
