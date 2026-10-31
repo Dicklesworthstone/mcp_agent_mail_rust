@@ -901,7 +901,7 @@ const fn archive_writes_pending(lag: &mcp_agent_mail_storage::ArchiveLagSnapshot
 
 const MAX_ARCHIVE_GAP_OBSERVATIONS: usize = 64;
 const MAX_ARCHIVE_GAP_GENERATION_BYTES: usize = 256;
-const ARCHIVE_GAP_CRITICAL_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const ARCHIVE_GAP_CRITICAL_AGE: std::time::Duration = std::time::Duration::from_mins(30);
 
 #[derive(Debug, PartialEq, Eq)]
 struct ArchiveGapMailbox {
@@ -1506,14 +1506,18 @@ fn health_check_semantic_readiness(
     // Legacy/unreadable identity remains unknown and never seeds a token.
     let observed_at = std::time::Instant::now();
     let inventory = if cfg!(unix) && present.contains("db_identity") {
-        conn.query_sync(
+        let with_generation = conn.query_sync(
             &format!(
                 "{inventory_sql}, \
                  (SELECT generation_id FROM db_identity WHERE singleton = 0) AS generation_id"
             ),
             &[],
-        )
-        .or_else(|_| conn.query_sync(inventory_sql, &[]))
+        );
+        if with_generation.is_ok() {
+            with_generation
+        } else {
+            conn.query_sync(inventory_sql, &[])
+        }
     } else {
         conn.query_sync(inventory_sql, &[])
     };
@@ -4960,7 +4964,7 @@ mod tests {
                 false,
                 start + ARCHIVE_GAP_CRITICAL_AGE,
             ),
-            Some(std::time::Duration::from_secs(1200)),
+            Some(std::time::Duration::from_mins(20)),
         );
     }
 
@@ -5133,7 +5137,7 @@ mod tests {
             (None, "warn", "yellow"),
             (Some(std::time::Duration::ZERO), "warn", "yellow"),
             (
-                Some(ARCHIVE_GAP_CRITICAL_AGE - std::time::Duration::from_millis(1)),
+                ARCHIVE_GAP_CRITICAL_AGE.checked_sub(std::time::Duration::from_millis(1)),
                 "warn",
                 "yellow",
             ),
