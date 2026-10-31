@@ -106,10 +106,10 @@ impl<'a> CleanupArchiveScope<'a> {
     fn begin_for_generation(
         cx: &Cx,
         pool: &'a DbPool,
-        expected: &Option<String>,
+        expected: Option<&str>,
     ) -> Result<Self, String> {
         let scope = Self::begin(cx, pool)?;
-        if &scope.generation != expected {
+        if scope.generation.as_deref() != expected {
             return Err("cleanup source generation changed; refusing stale observations".into());
         }
         Ok(scope)
@@ -453,7 +453,7 @@ fn run_cleanup_cycle_with_cache(
             Outcome::Ok(ids) => ids,
             other => return Err(format!("failed to list projects: {other:?}")),
         };
-        (scope.generation.clone(), project_ids)
+        (scope.generation, project_ids)
     };
 
     let mut total_released = 0usize;
@@ -463,7 +463,8 @@ fn run_cleanup_cycle_with_cache(
         // Phase 1: release expired and capture its terminal artifacts under
         // the same short generation lease, before probing the workspace.
         {
-            let scope = CleanupArchiveScope::begin_for_generation(&cx, pool, &generation)?;
+            let scope =
+                CleanupArchiveScope::begin_for_generation(&cx, pool, generation.as_deref())?;
             let expired_ids = match block_on(release_expired_reservations(&cx, pool, *pid)) {
                 Outcome::Ok(ids) => ids,
                 Outcome::Err(err) => {
@@ -521,7 +522,7 @@ fn run_cleanup_cycle_with_cache(
         if scan.candidates.is_empty() {
             continue;
         }
-        let scope = CleanupArchiveScope::begin_for_generation(&cx, pool, &generation)?;
+        let scope = CleanupArchiveScope::begin_for_generation(&cx, pool, generation.as_deref())?;
         let stale_ids = match scan.release(&cx, &scope, *pid) {
             Ok(ids) => ids,
             Err(err) => {
@@ -555,7 +556,7 @@ fn run_cleanup_cycle_with_cache(
     // horizon. The git archive retains the audit history, so this is
     // non-destructive. `0` days disables the prune (historical behavior).
     if config.file_reservations_retention_days > 0 {
-        let _scope = CleanupArchiveScope::begin_for_generation(&cx, pool, &generation)?;
+        let _scope = CleanupArchiveScope::begin_for_generation(&cx, pool, generation.as_deref())?;
         let retention_us = i64::try_from(config.file_reservations_retention_days)
             .unwrap_or(30)
             .saturating_mul(86_400)
@@ -607,9 +608,9 @@ fn detect_and_release_stale(
     project_id: i64,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<Vec<i64>, String> {
-    let generation = CleanupArchiveScope::begin(cx, pool)?.generation.clone();
+    let generation = CleanupArchiveScope::begin(cx, pool)?.generation;
     let scan = collect_stale_reservations(config, pool, cx, project_id, probe_cache)?;
-    let scope = CleanupArchiveScope::begin_for_generation(cx, pool, &generation)?;
+    let scope = CleanupArchiveScope::begin_for_generation(cx, pool, generation.as_deref())?;
     scan.release(cx, &scope, project_id)
 }
 
@@ -895,20 +896,17 @@ fn path_has_recent_activity_cached(
     };
 
     if entry.git_head_oid.as_deref() != Some(current_head) {
-        match git_latest_commit_us(workspace, &normalized_pattern, current_head) {
-            Ok(latest_commit) => {
-                entry.git_head_oid = Some(current_head.to_string());
-                entry.git_latest_commit_us = latest_commit;
-            }
-            Err(_) => {
-                // A timed-out/failed history probe is not evidence of no
-                // activity, and must not become a negative result cached for
-                // the lifetime of this HEAD. Preserve the claim and retry.
-                entry.git_head_oid = None;
-                entry.git_latest_commit_us = None;
-                return true;
-            }
-        }
+        let Ok(latest_commit) = git_latest_commit_us(workspace, &normalized_pattern, current_head)
+        else {
+            // A timed-out/failed history probe is not evidence of no
+            // activity, and must not become a negative result cached for
+            // the lifetime of this HEAD. Preserve the claim and retry.
+            entry.git_head_oid = None;
+            entry.git_latest_commit_us = None;
+            return true;
+        };
+        entry.git_head_oid = Some(current_head.to_string());
+        entry.git_latest_commit_us = latest_commit;
     }
     entry
         .git_latest_commit_us
@@ -2624,8 +2622,9 @@ mod tests {
                 }
                 _ => {}
             }
-            let scope = CleanupArchiveScope::begin_for_generation(&cx, &pool, &generation)
-                .expect("readmit the observed generation");
+            let scope =
+                CleanupArchiveScope::begin_for_generation(&cx, &pool, generation.as_deref())
+                    .expect("readmit the observed generation");
             let released = scan
                 .release(&cx, &scope, project_id)
                 .expect("guarded release");
@@ -2661,10 +2660,7 @@ mod tests {
             block_on(queries::db_generation_id(&cx, &pool)),
             Outcome::Ok(Some(_))
         ));
-        let generation = CleanupArchiveScope::begin(&cx, &pool)
-            .unwrap()
-            .generation
-            .clone();
+        let generation = CleanupArchiveScope::begin(&cx, &pool).unwrap().generation;
         let mut cache = CleanupProbeCache::default();
         let config = stale_cleanup_test_config(&tmp);
         let scan = collect_stale_reservations(&config, &pool, &cx, project_id, &mut cache).unwrap();
@@ -2674,9 +2670,10 @@ mod tests {
             &cx,
             "UPDATE db_identity SET generation_id = '11223344' WHERE singleton = 0",
         );
-        let error = match CleanupArchiveScope::begin_for_generation(&cx, &pool, &generation) {
-            Err(error) => error,
-            Ok(_) => panic!("a new generation cannot inherit stale workspace observations"),
+        let Err(error) =
+            CleanupArchiveScope::begin_for_generation(&cx, &pool, generation.as_deref())
+        else {
+            panic!("a new generation cannot inherit stale workspace observations");
         };
         assert!(error.contains("generation changed"));
         assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);

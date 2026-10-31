@@ -54,11 +54,13 @@ pub struct AtcPopulationHydrationStats {
     pub last_scope_actions_withheld: usize,
 }
 
-/// A nonblocking observation of population hydration work. `complete` means
-/// this queue and its final yield are finished, not that every row was admitted
-/// by the engine or that overall ATC coverage and execution are healthy. Engine
-/// capacity and other safety gates remain independent. Missing progress is
-/// unknown, never a fabricated empty or completed population.
+/// A nonblocking observation of population hydration work.
+///
+/// `complete` means this queue and its final yield are finished, not that every
+/// row was admitted by the engine or that overall ATC coverage and execution
+/// are healthy. Engine capacity and other safety gates remain independent.
+/// Missing progress is unknown, never a fabricated empty or completed
+/// population.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct AtcPopulationHealthSnapshot {
     pub status: &'static str,

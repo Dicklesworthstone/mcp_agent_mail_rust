@@ -7064,16 +7064,21 @@ mod engine_tests {
             for agent in ["BlueFox", "RedOwl"] {
                 match kind {
                     ReservationEventKind::Granted => {
-                        engine.note_reservation_granted(agent, &paths, true, "resolved-project", 2)
+                        engine.note_reservation_granted(agent, &paths, true, "resolved-project", 2);
                     }
                     ReservationEventKind::Renewed => {
-                        engine.note_reservation_renewed(agent, &paths, "resolved-project", 2)
+                        engine.note_reservation_renewed(agent, &paths, "resolved-project", 2);
                     }
                     ReservationEventKind::Released => {
-                        engine.note_reservation_released(agent, &paths, "resolved-project", 2)
+                        engine.note_reservation_released(agent, &paths, "resolved-project", 2);
                     }
                     ReservationEventKind::ForceReleased => {
-                        engine.note_reservation_force_released(agent, &paths, "resolved-project", 2)
+                        engine.note_reservation_force_released(
+                            agent,
+                            &paths,
+                            "resolved-project",
+                            2,
+                        );
                     }
                     ReservationEventKind::Conflicted => unreachable!("resolution paths only"),
                 }
