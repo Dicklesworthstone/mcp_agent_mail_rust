@@ -113,6 +113,12 @@ fn validate_source(pool: &DbPool, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+struct AgentSelection {
+    candidates: Vec<Candidate>,
+    after: i64,
+    ceiling: Option<i64>,
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -126,9 +132,37 @@ fn select_ids(
         };
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
+    // Discovery gates both the roster and retries. Quarantine a failed reader
+    // without catching publication or replacing the retry queue's lifetime lock.
+    // Its scan hints remain local until every query and decode has succeeded.
+    let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        select_ids_from_connection(&conn, cursor)
+    }))
+    .unwrap_or_else(|_| {
+        Err(Failure::source_unavailable(
+            "agent archive discovery read panicked",
+        ))
+    });
+    if selected.as_ref().is_err_and(|error| error.transient) {
+        mcp_agent_mail_db::close_db_conn(conn.detach(), "failed agent archive discovery read");
+    }
+    let selected = selected.map_err(|error| error.detail)?;
+    cursor.after = selected.after;
+    cursor.ceiling = selected.ceiling;
+    Ok(selected.candidates)
+}
+
+fn select_ids_from_connection(
+    conn: &DbConn,
+    cursor: &AgentReconcileCursor,
+) -> Result<AgentSelection, Failure> {
+    let query = |sql: &str, params: &[mcp_agent_mail_db::sqlmodel_core::Value]| {
+        #[cfg(test)]
+        tests::discovery_read_fault(conn)?;
+        conn.query_sync(sql, params)
+            .map_err(Failure::source_unavailable)
+    };
+    let mode = query("PRAGMA query_only", &[])?;
     if mode
         .first()
         .ok_or("source query-only mode was not reported")?
@@ -138,40 +172,38 @@ fn select_ids(
     {
         return Err("query-only snapshots cannot authorize agent archive repair".into());
     }
-    if cursor.ceiling.is_none() {
-        let rows = conn
-            .query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM agents", &[])
-            .map_err(source_error)?;
-        cursor.ceiling = Some(
+    let mut after = cursor.after;
+    let mut ceiling = cursor.ceiling;
+    if ceiling.is_none() {
+        let rows = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM agents", &[])?;
+        ceiling = Some(
             rows.first()
                 .ok_or("agent ID aggregate returned no row")?
                 .get_named::<i64>("max_id")
                 .map_err(source_error)?,
         );
-        cursor.after = 0;
+        after = 0;
     }
     // Snapshot the ready lane once. A first deferral in this batch cannot be
     // attempted again until the next call, and selection never removes debt.
     let retries = cursor.retries.ready_ids(Instant::now());
     let scan_limit = IDS_PER_BATCH - i64::try_from(retries.len()).expect("bounded retry count");
-    let rows = conn
-        .query_sync(
-            "SELECT id FROM agents WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
-            &[
-                cursor.after.into(),
-                cursor.ceiling.unwrap_or(0).into(),
-                scan_limit.into(),
-            ],
-        )
-        .map_err(source_error)?;
+    let rows = query(
+        "SELECT id FROM agents WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
+        &[after.into(), ceiling.unwrap_or(0).into(), scan_limit.into()],
+    )?;
     if rows.is_empty() {
-        cursor.ceiling = None;
+        ceiling = None;
     }
     let scan = rows
         .into_iter()
         .map(|row| row.get_named::<i64>("id").map_err(source_error))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(retry::interleave(scan, retries, cursor.next_lane_is_retry))
+    Ok(AgentSelection {
+        candidates: retry::interleave(scan, retries, cursor.next_lane_is_retry),
+        after,
+        ceiling,
+    })
 }
 
 fn timestamp(value: i64) -> Result<String, String> {
@@ -803,6 +835,8 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         static SOURCE_READ_PANIC: std::cell::Cell<Option<(i64, bool, usize)>> =
             const { std::cell::Cell::new(None) };
+        static DISCOVERY_READ_FAULT: std::cell::Cell<Option<(usize, bool)>> =
+            const { std::cell::Cell::new(None) };
         static PROFILE_OBSERVATION_AFTER_PREPARE: std::cell::RefCell<Option<ProfileObservationHook>> =
             const { std::cell::RefCell::new(None) };
     }
@@ -812,6 +846,30 @@ mod tests {
         if let Some(hook) = hook {
             hook(conn);
         }
+    }
+
+    pub(super) fn discovery_read_fault(conn: &DbConn) -> Result<(), Failure> {
+        let fault = DISCOVERY_READ_FAULT.with(|slot| {
+            let (remaining, panic) = slot.get()?;
+            slot.set((remaining > 1).then_some((remaining.saturating_sub(1), panic)));
+            (remaining == 1).then_some(panic)
+        });
+        let Some(panic) = fault else {
+            return Ok(());
+        };
+        // A connection-local witness distinguishes reader retirement from a
+        // fresh selection accidentally reusing the same failed one-slot reader.
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert!(!panic, "private-agent-discovery-panic-payload");
+        conn.query_sync("SELECT * FROM missing_agent_discovery_probe", &[])
+            .map(|_| ())
+            .map_err(Failure::source_unavailable)
     }
 
     // Inject an unwind only at a real source-read boundary. The query and
@@ -957,6 +1015,190 @@ mod tests {
             .unwrap();
         assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
         value
+    }
+
+    fn exercise_failed_discovery(panic: bool) {
+        if isolate_admission_test() {
+            return;
+        }
+        // New-round mode/MAX/page reads, an ongoing round, and a round whose
+        // remaining IDs disappeared all preserve their hints on read failure.
+        for (after, ceiling, failing_query) in [
+            (999, None, 1),
+            (999, None, 2),
+            (999, None, 3),
+            (101, Some(102), 2),
+            (98, Some(99), 2),
+        ] {
+            for prefer_retry in [false, true] {
+                with_mailbox(|cx, pool, config, _| {
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+                        VALUES(102, 101, 'GreenStone', 'test', 'test', 'unaffected', 1000000, 2000000)").unwrap();
+                    drop(conn);
+                    let before = [
+                        read_source(cx, pool, 101).unwrap(),
+                        read_source(cx, pool, 102).unwrap(),
+                    ];
+                    let mut cursor = AgentReconcileCursor {
+                        source_identity: pool.sqlite_identity_key(),
+                        after,
+                        ceiling,
+                        next_lane_is_retry: prefer_retry,
+                        ..Default::default()
+                    };
+                    // Retain a previously backed-off, now-ready obligation.
+                    let ready_since = Instant::now() - std::time::Duration::from_secs(2);
+                    cursor.retries.defer(101, ready_since);
+                    cursor.retries.defer(101, ready_since);
+                    let saved = format!("{cursor:?}");
+                    DISCOVERY_READ_FAULT.with(|slot| slot.set(Some((failing_query, panic))));
+                    let error = select_ids(cx, pool, &mut cursor)
+                        .err()
+                        .expect("the selected discovery read must fail");
+                    assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
+                    assert_eq!(format!("{cursor:?}"), saved);
+                    if panic {
+                        assert!(error.contains("panicked"), "{error}");
+                        assert!(!error.contains("private-agent-discovery-panic-payload"));
+                    } else {
+                        assert!(error.contains("source query failed"), "{error}");
+                    }
+                    let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                    assert_eq!(
+                        conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                            .get_as::<i64>(0)
+                            .unwrap(),
+                        0,
+                        "failed discovery reader was returned to the one-slot pool"
+                    );
+                    drop(conn);
+                    assert!(crate::open_archive(config, "project").unwrap().is_none());
+                    for source in &before {
+                        assert_eq!(&read_source(cx, pool, source.id).unwrap(), source);
+                    }
+
+                    let stop = AtomicBool::new(false);
+                    let mut repaired = 0;
+                    for _ in 0..2 {
+                        let report =
+                            reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                        assert!(!report.interrupted, "{report:?}");
+                        assert_eq!(report.deferred, 0, "{report:?}");
+                        repaired += report.repaired;
+                    }
+                    assert_eq!(repaired, 2);
+                    assert_eq!(cursor.retries.len(), 0);
+                    assert_profile_committed(config);
+                    let relative = Path::new("projects/project/agents/GreenStone/profile.json");
+                    let bytes = fs::read(config.storage_root.join(relative)).unwrap();
+                    let repo = Repository::open(&config.storage_root).unwrap();
+                    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                    let entry = tree.get_path(relative).unwrap();
+                    assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+                    for source in &before {
+                        assert_eq!(&read_source(cx, pool, source.id).unwrap(), source);
+                    }
+                    assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn failed_discovery_queries_retire_readers_preserve_cursors_and_resume_profile_repair() {
+        exercise_failed_discovery(false);
+    }
+
+    #[test]
+    fn discovery_panics_retire_readers_preserve_cursors_and_resume_profile_repair() {
+        exercise_failed_discovery(true);
+    }
+
+    #[test]
+    fn discovery_query_only_refusal_keeps_the_healthy_reader_and_cursor() {
+        with_mailbox(|cx, pool, config, _| {
+            let mut cursor = AgentReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                after: 999,
+                next_lane_is_retry: true,
+                ..Default::default()
+            };
+            cursor.retries.defer(101, Instant::now());
+            let saved = format!("{cursor:?}");
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let error = select_ids(cx, pool, &mut cursor)
+                .err()
+                .expect("a query-only source cannot authorize repair");
+            assert!(error.contains("query-only"), "{error}");
+            assert_eq!(format!("{cursor:?}"), saved);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1,
+                "a valid refusal must not retire a healthy connection"
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            drop(conn);
+            assert!(crate::open_archive(config, "project").unwrap().is_none());
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn discovery_failure_preserves_checkpoint_ownership_and_retry_progress() {
+        with_mailbox(|cx, pool, config, _| {
+            let stop = AtomicBool::new(false);
+            let mut cursor = AgentReconcileCursor::default();
+            assert_eq!(
+                cursor
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap()
+                    .repaired,
+                1
+            );
+            let previous = fs::read(profile_path(config)).unwrap();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = 123456789 WHERE id = 101")
+                .unwrap();
+            drop(conn);
+            cursor.after = 999;
+            cursor.ceiling = None;
+            cursor.next_lane_is_retry = true;
+            cursor.retries.defer(101, Instant::now());
+            let saved = format!("{cursor:?}");
+            DISCOVERY_READ_FAULT.with(|slot| slot.set(Some((3, false))));
+            assert!(select_ids(cx, pool, &mut cursor).is_err());
+            assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
+            assert_eq!(format!("{cursor:?}"), saved);
+            assert_eq!(fs::read(profile_path(config)).unwrap(), previous);
+
+            let mut competitor = AgentReconcileCursor::default();
+            let error = competitor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap_err();
+            assert!(
+                error.contains("checkpoint is owned by another worker"),
+                "{error}"
+            );
+            assert_eq!(format!("{cursor:?}"), saved);
+            let report = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!(
+                (report.repaired, report.deferred, report.retry_len),
+                (1, 0, 0)
+            );
+            assert_eq!(
+                assert_profile_committed(config)["retired_at"],
+                timestamp(123_456_789).unwrap()
+            );
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
     }
 
     #[test]
