@@ -9107,6 +9107,79 @@ fn cli_discovers_nondefault_mailbox_daemon_port() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
 }
 
+/// br-eos8u: a client that sees a live server own a non-default mailbox, but
+/// cannot tie a listener to it, stops with an error. Its own TMPDIR hides the
+/// daemon's listener hints, so the only endpoint left is the default one, which
+/// could belong to another mailbox's server.
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_refuses_a_mailbox_server_it_cannot_confirm() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let env = TestEnv::new();
+    let project = env.hostile_repo.to_str().unwrap();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("unconfirmed-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let client_tmp = env.tmp.path().join("client-tmp");
+    std::fs::create_dir_all(&client_tmp).unwrap();
+    let command = |tmpdir: &std::path::Path| {
+        let mut cmd = Command::new(am_bin());
+        cmd.env_clear()
+            .envs(env.isolated_env())
+            .env_remove("HTTP_HOST")
+            .env_remove("HTTP_PORT")
+            .env("TMPDIR", tmpdir)
+            .env("HTTP_BEARER_TOKEN", "unconfirmed-server-token")
+            .env("AM_ATC_ENABLED", "false")
+            .current_dir(&env.hostile_repo);
+        cmd
+    };
+    let mut server_command = command(env.tmp.path());
+    server_command
+        .args([
+            "serve-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--no-tui",
+            "--no-auth",
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut server = OwnedServer(server_command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let agents_list = ["agents", "list", "--project", project, "--json"];
+    let out = command(&client_tmp).args(agents_list).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("could not be confirmed"), "{stderr}");
+    assert!(stderr.contains("nothing was sent to"), "{stderr}");
+    // The daemon's own TMPDIR reaches the same listener, so only the guess was
+    // refused. The daemon has no such project, and the refusal is its answer.
+    let out = command(env.tmp.path()).args(agents_list).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("list_agents via server failed"), "{stderr}");
+    assert!(stderr.contains("NOT_FOUND"), "{stderr}");
+    assert!(!stderr.contains("could not be confirmed"), "{stderr}");
+}
+
 #[test]
 fn serve_http_help_exits_zero() {
     let env = TestEnv::new();

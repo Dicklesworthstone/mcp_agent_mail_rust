@@ -6289,10 +6289,12 @@ fn build_robot_inbox_server_request(
     }))
 }
 
+/// No candidates when this mailbox's server cannot be confirmed: the caller
+/// labels its local fallback rather than guessing an endpoint.
 fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> {
-    crate::check_inbox_server_urls_for_agent_mail_url(
-        &crate::local_server_url(config),
-        &config.http_path,
+    crate::local_server_url(config).map_or_else(
+        |_| Vec::new(),
+        |url| crate::check_inbox_server_urls_for_agent_mail_url(&url, &config.http_path),
     )
 }
 

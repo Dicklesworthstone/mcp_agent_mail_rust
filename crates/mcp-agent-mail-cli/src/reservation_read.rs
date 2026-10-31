@@ -42,7 +42,7 @@ pub(crate) struct ServerResourceSession {
 
 impl ServerResourceSession {
     pub(crate) fn new(config: &Config) -> CliResult<Self> {
-        let server_url = crate::local_server_url(config);
+        let server_url = crate::local_server_url(config)?;
         let bearer = mcp_agent_mail_core::config::env_value("AGENT_MAIL_TOKEN")
             .filter(|token| !token.trim().is_empty())
             .or_else(|| crate::local_server_bearer_token(config))

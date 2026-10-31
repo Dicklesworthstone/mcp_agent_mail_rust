@@ -10618,23 +10618,50 @@ fn local_server_url_from_parts(host: &str, port: u16, http_path: &str) -> String
 /// Resolve the CLI endpoint, discovering this mailbox's owner if unconfigured.
 ///
 /// Never infer authority from argv text.
-pub(crate) fn local_server_url(config: &Config) -> String {
+pub(crate) fn local_server_url(config: &Config) -> CliResult<String> {
     use mcp_agent_mail_core::config::env_value;
 
     if let Some(url) = env_value("AGENT_MAIL_URL").filter(|url| !url.trim().is_empty()) {
-        return normalize_agent_mail_url(&url, &config.http_path);
+        return Ok(normalize_agent_mail_url(&url, &config.http_path));
     }
-    let (host, port) = local_server_host_port(config);
-    local_server_url_from_parts(&host, port, &config.http_path)
+    let (host, port) = local_server_host_port(config)?;
+    Ok(local_server_url_from_parts(&host, port, &config.http_path))
+}
+
+/// The port of an endpoint nothing can answer. A mailbox with no server to
+/// call gets it, so the caller's connection fails before any request or token
+/// leaves the process and the caller takes its local path (br-eos8u).
+const NO_SERVER_PORT: u16 = 0;
+
+/// The waits before each further look for a live server's listener.
+const OWNER_LISTENER_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+];
+
+/// What discovery learned about the server that owns this mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerDiscovery {
+    /// The owner's own listener, confirmed by the operating system.
+    Listener(String, u16),
+    /// No server owns the mailbox.
+    Unowned,
+    /// A server owns the mailbox, but no listener could be tied to it. `pid`
+    /// is set when ownership names exactly one process.
+    Unresolved { pid: Option<u32>, detail: String },
 }
 
 /// The daemon's host and port, ignoring `AGENT_MAIL_URL`: the configured
 /// `HTTP_HOST`/`HTTP_PORT` (process env or user config), or this mailbox's
 /// verified owner listener when neither is configured.
-pub(crate) fn local_server_host_port(config: &Config) -> (String, u16) {
+///
+/// With neither, see [`endpoint_without_owner`]. The default endpoint can
+/// belong to another mailbox's server, so it is not a safe guess for every
+/// mailbox (br-eos8u).
+pub(crate) fn local_server_host_port(config: &Config) -> CliResult<(String, u16)> {
     use mcp_agent_mail_core::config::env_value;
 
-    let configured = || (config.http_host.clone(), config.http_port);
+    let configured = (config.http_host.clone(), config.http_port);
     if ["HTTP_HOST", "HTTP_PORT"]
         .iter()
         .any(|key| env_value(key).is_some())
@@ -10642,39 +10669,155 @@ pub(crate) fn local_server_host_port(config: &Config) -> (String, u16) {
         || config.http_port != Config::default().http_port
         || mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
     {
-        return configured();
+        return Ok(configured);
     }
+    let default_root = is_default_mailbox_root(&config.storage_root);
     let Ok(sqlite_path) = resolve_mailbox_activity_sqlite_path(&config.database_url) else {
-        return configured();
+        return endpoint_without_owner(&OwnerDiscovery::Unowned, default_root, configured, &[]);
     };
-    let ownership =
-        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_path, &config.storage_root);
+    let mut discovery = discover_mailbox_owner(config, &sqlite_path);
+    if !default_root {
+        for delay in OWNER_LISTENER_RETRY_DELAYS {
+            if !matches!(discovery, OwnerDiscovery::Unresolved { .. }) {
+                break;
+            }
+            std::thread::sleep(delay);
+            discovery = discover_mailbox_owner(config, &sqlite_path);
+        }
+    }
+    let holders = match &discovery {
+        OwnerDiscovery::Unresolved { pid: Some(_), .. } => {
+            mcp_agent_mail_server::startup_checks::listener_port_holder_pids_with_hint(
+                &configured.0,
+                configured.1,
+            )
+        }
+        _ => Vec::new(),
+    };
+    endpoint_without_owner(&discovery, default_root, configured, &holders)
+}
+
+/// The endpoint for a mailbox once discovery has finished.
+///
+/// The default mailbox keeps the default endpoint unless that endpoint is
+/// visibly held by something other than the mailbox's owner. Any other mailbox
+/// never guesses: with no server it gets [`NO_SERVER_PORT`] and the local path,
+/// and with a live server it cannot find, an error.
+fn endpoint_without_owner(
+    discovery: &OwnerDiscovery,
+    default_root: bool,
+    configured: (String, u16),
+    configured_holders: &[u32],
+) -> CliResult<(String, u16)> {
+    let unresolved = |detail: &str| {
+        CliError::Other(format!(
+            "this mailbox's server could not be confirmed, so nothing was sent to \
+             {}:{}: {detail}. Set AGENT_MAIL_URL or HTTP_PORT to reach it",
+            configured.0, configured.1
+        ))
+    };
+    match discovery {
+        OwnerDiscovery::Listener(host, port) => Ok((host.clone(), *port)),
+        OwnerDiscovery::Unresolved {
+            pid: Some(pid),
+            detail,
+        } if default_root
+            && !configured_holders.is_empty()
+            && !configured_holders.contains(pid) =>
+        {
+            Err(unresolved(detail))
+        }
+        OwnerDiscovery::Unowned | OwnerDiscovery::Unresolved { .. } if default_root => {
+            Ok(configured)
+        }
+        OwnerDiscovery::Unowned => Ok((configured.0, NO_SERVER_PORT)),
+        OwnerDiscovery::Unresolved { detail, .. } => Err(unresolved(detail)),
+    }
+}
+
+/// One look at who owns this mailbox and where that owner listens.
+fn discover_mailbox_owner(config: &Config, sqlite_path: &Path) -> OwnerDiscovery {
+    use mcp_agent_mail_db::pool::inspect_mailbox_ownership;
+    use mcp_agent_mail_server::startup_checks::{
+        listener_port_holder_pids_with_hint, verified_listener_for_pid,
+    };
+
+    let ownership = inspect_mailbox_ownership(sqlite_path, &config.storage_root);
+    if !mailbox_owner_may_serve(&ownership) {
+        return OwnerDiscovery::Unowned;
+    }
     let Some(pid) = sole_proxy_mailbox_owner(&ownership) else {
-        return configured();
+        return OwnerDiscovery::Unresolved {
+            pid: None,
+            detail: ownership.detail,
+        };
     };
-    let Some((host, port)) = mcp_agent_mail_server::startup_checks::verified_listener_for_pid(pid)
-    else {
-        return configured();
+    // A client whose TMPDIR differs from the daemon's cannot see its listener
+    // hints, but the configured port still shows who holds it.
+    let listener = verified_listener_for_pid(pid).or_else(|| {
+        (listener_port_holder_pids_with_hint(&config.http_host, config.http_port) == [pid])
+            .then(|| (config.http_host.clone(), config.http_port))
+    });
+    let Some((host, port)) = listener else {
+        return OwnerDiscovery::Unresolved {
+            pid: Some(pid),
+            detail: ownership.detail,
+        };
     };
     // Recheck mailbox ownership after listener discovery, before using the URL.
-    let current =
-        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_path, &config.storage_root);
+    let current = inspect_mailbox_ownership(sqlite_path, &config.storage_root);
     if sole_proxy_mailbox_owner(&current) != Some(pid) {
-        return configured();
+        return OwnerDiscovery::Unresolved {
+            pid: None,
+            detail: current.detail,
+        };
     }
-    (host, port)
+    OwnerDiscovery::Listener(host, port)
+}
+
+/// Whether a competing owner could be a server a client should call, rather
+/// than another CLI holding the mailbox for a moment. An unreadable command
+/// line counts as a server.
+fn mailbox_owner_may_serve(ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState) -> bool {
+    ownership
+        .processes
+        .iter()
+        .filter(|process| ownership.competing_pids.contains(&process.pid))
+        .any(|process| {
+            process.command.as_deref().is_none_or(|command| {
+                command.split_whitespace().any(|arg| arg == "serve-http")
+                    || mcp_agent_mail_db::pool::command_is_python_agent_mail_shadow(command)
+            })
+        })
+}
+
+/// Whether `storage_root` is the mailbox a default install uses, under any
+/// spelling of its path.
+fn is_default_mailbox_root(storage_root: &Path) -> bool {
+    use mcp_agent_mail_core::config::{default_storage_root_path, is_default_storage_root};
+
+    is_default_storage_root(storage_root)
+        || matches!(
+            (
+                std::fs::canonicalize(storage_root),
+                std::fs::canonicalize(default_storage_root_path()),
+            ),
+            (Ok(root), Ok(default)) if root == default
+        )
 }
 
 /// The host and port the inbox hook commands (`check-inbox`, `mark-all-read`,
 /// `inbox-events`) probe and call: explicit `--host`/`--port` win, otherwise
-/// the same endpoint `am mail` resolves.
+/// the same endpoint `am mail` resolves. These commands never interrupt agent
+/// work, so an unconfirmed server becomes no server rather than an error.
 fn hook_server_host_port(
     config: &Config,
     host: Option<String>,
     port: Option<u16>,
 ) -> (String, u16) {
     if host.is_none() && port.is_none() {
-        return local_server_host_port(config);
+        return local_server_host_port(config)
+            .unwrap_or_else(|_| (config.http_host.clone(), NO_SERVER_PORT));
     }
     (
         host.unwrap_or_else(|| config.http_host.clone()),
@@ -20555,7 +20698,7 @@ fn try_proxy_file_reservations_mutation(
 ) -> CliResult<Option<serde_json::Value>> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     let Some((tool_name, command_label, arguments)) = file_reservations_proxy_request(action)
@@ -21777,7 +21920,7 @@ fn handle_contacts_with_conn(
 fn try_proxy_contacts_mutation(action: &ContactsCommand) -> CliResult<bool> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     let (tool_name, command_label, arguments) = match action {
@@ -22041,7 +22184,7 @@ async fn try_proxy_contact_handshake(
 ) -> CliResult<Option<serde_json::Value>> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     let mut arguments = serde_json::Map::new();
@@ -39923,7 +40066,7 @@ fn write_pending_send_receipt(
 async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     match action {
@@ -40652,7 +40795,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             // its worst-case fallback) snapshot + migrate + rebuild a fresh
             // Tantivy index for a single query, which scales with mailbox
             // size, not answer size.
-            let server_url = local_server_url(&server_config);
+            let server_url = local_server_url(&server_config)?;
             let bearer = local_server_bearer_token(&server_config);
             match try_call_server_tool(
                 &server_url,
@@ -41256,7 +41399,7 @@ fn handle_agents(action: AgentsCommand) -> CliResult<()> {
 
 async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
@@ -42491,7 +42634,7 @@ fn handle_macros(action: MacroCommand) -> CliResult<()> {
 #[allow(clippy::too_many_lines)]
 async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
@@ -48607,6 +48750,126 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             hook_server_host_port(&config, None, None),
             ("10.1.2.3".to_string(), 9000)
         );
+    }
+
+    fn endpoint_for(
+        discovery: &OwnerDiscovery,
+        default_root: bool,
+        holders: &[u32],
+    ) -> CliResult<(String, u16)> {
+        endpoint_without_owner(
+            discovery,
+            default_root,
+            ("127.0.0.1".to_string(), 8765),
+            holders,
+        )
+    }
+
+    fn unresolved_owner(pid: Option<u32>) -> OwnerDiscovery {
+        OwnerDiscovery::Unresolved {
+            pid,
+            detail: "another Agent Mail process already owns the mailbox".to_string(),
+        }
+    }
+
+    #[test]
+    fn default_mailbox_keeps_the_default_endpoint_unless_another_process_holds_it() {
+        let default_endpoint = ("127.0.0.1".to_string(), 8765);
+        for (discovery, holders) in [
+            (OwnerDiscovery::Unowned, &[][..]),
+            (OwnerDiscovery::Unowned, &[9][..]),
+            (unresolved_owner(None), &[][..]),
+            (unresolved_owner(None), &[9][..]),
+            (unresolved_owner(Some(7)), &[][..]),
+            (unresolved_owner(Some(7)), &[7][..]),
+            (unresolved_owner(Some(7)), &[7, 9][..]),
+        ] {
+            assert_eq!(
+                endpoint_for(&discovery, true, holders).unwrap(),
+                default_endpoint,
+                "{discovery:?} with holders {holders:?}"
+            );
+        }
+        let refused = endpoint_for(&unresolved_owner(Some(7)), true, &[9]).unwrap_err();
+        assert!(refused.to_string().contains("could not be confirmed"));
+    }
+
+    #[test]
+    fn other_mailboxes_never_guess_the_default_endpoint() {
+        assert_eq!(
+            endpoint_for(&OwnerDiscovery::Unowned, false, &[9]).unwrap(),
+            ("127.0.0.1".to_string(), NO_SERVER_PORT)
+        );
+        for discovery in [unresolved_owner(None), unresolved_owner(Some(7))] {
+            for holders in [&[][..], &[7][..], &[9][..]] {
+                let refused = endpoint_for(&discovery, false, holders).unwrap_err();
+                assert!(
+                    refused.to_string().contains("nothing was sent to"),
+                    "{refused}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_confirmed_listener_wins_for_every_mailbox() {
+        let listener = OwnerDiscovery::Listener("127.0.0.1".to_string(), 9100);
+        for default_root in [true, false] {
+            assert_eq!(
+                endpoint_for(&listener, default_root, &[9]).unwrap(),
+                ("127.0.0.1".to_string(), 9100)
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_possible_server_counts_as_a_mailbox_owner_to_call() {
+        use mcp_agent_mail_db::pool::{
+            MailboxOwnershipDisposition, MailboxOwnershipProcess, MailboxOwnershipState,
+        };
+        let ownership = |command: Option<&str>, competing: bool| MailboxOwnershipState {
+            disposition: MailboxOwnershipDisposition::ActiveOtherOwner,
+            storage_lock_path: String::new(),
+            sqlite_lock_path: String::new(),
+            processes: vec![MailboxOwnershipProcess {
+                pid: 7,
+                command: command.map(str::to_string),
+                executable_path: None,
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: true,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            }],
+            competing_pids: if competing { vec![7] } else { Vec::new() },
+            readers: Vec::new(),
+            supervised_restart_required: false,
+            detail: String::new(),
+        };
+        assert!(mailbox_owner_may_serve(&ownership(
+            Some("/usr/local/bin/am serve-http --no-tui"),
+            true
+        )));
+        assert!(
+            mailbox_owner_may_serve(&ownership(None, true)),
+            "an unreadable command line must count as a server"
+        );
+        assert!(!mailbox_owner_may_serve(&ownership(
+            Some("/usr/local/bin/am mail send"),
+            true
+        )));
+        assert!(!mailbox_owner_may_serve(&ownership(
+            Some("/usr/local/bin/am serve-http"),
+            false
+        )));
+    }
+
+    #[test]
+    fn default_mailbox_root_is_recognised_under_another_spelling() {
+        let default = mcp_agent_mail_core::config::default_storage_root_path();
+        assert!(is_default_mailbox_root(&default));
+        let scratch = tempfile::tempdir().unwrap();
+        assert!(!is_default_mailbox_root(scratch.path()));
     }
 
     #[test]
@@ -86008,7 +86271,7 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
         return Ok(());
     }
 
-    let server_url = local_server_url(&config);
+    let server_url = local_server_url(&config)?;
     let bearer = local_server_bearer_token(&config);
     handle_am_run_with(
         &config,
@@ -86031,7 +86294,7 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
 
 fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url = local_server_url(&config);
+    let server_url = local_server_url(&config)?;
     // The same token `am mail` sends, including the managed-service fallback.
     let bearer = local_server_bearer_token(&config);
     handle_am_run_with(&config, Some(server_url.as_str()), bearer.as_deref(), args)
@@ -97952,7 +98215,7 @@ fn handle_products(action: ProductsCommand) -> CliResult<()> {
 
 async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url = local_server_url(&config);
+    let server_url = local_server_url(&config)?;
     let bearer_token = local_server_bearer_token(&config);
     let bearer = bearer_token.as_deref();
 
