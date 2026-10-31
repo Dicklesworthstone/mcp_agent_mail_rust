@@ -855,7 +855,10 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             first_failure = ?report.failures.first(),
             "backup retention completed with refusals or uncertain operations; retained bytes remain on disk"
         );
-    } else if report.evicted() > 0 || report.empty_directories_deleted > 0 {
+    } else if report.evicted() > 0
+        || report.empty_directories_deleted > 0
+        || report.deadline_reached
+    {
         tracing::info!(
             phase,
             empty_directories_deleted = report.empty_directories_deleted,
@@ -866,6 +869,7 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
             bytes_retained = report.bytes_retained(),
+            deadline_reached = report.deadline_reached,
             "backup retention completed"
         );
     }

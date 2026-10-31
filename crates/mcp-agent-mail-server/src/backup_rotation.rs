@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, info, warn};
 
@@ -41,6 +41,12 @@ const PERIODIC_BYTES_FLOOR: u64 = 512 * 1024 * 1024;
 const MAX_RECLAIM_FILES_PER_PASS: usize = 128;
 #[cfg(unix)]
 const MAX_RECLAIM_DIRECTORIES_PER_PASS: usize = 128;
+/// Wall-clock limit on the rotation pass a cold start waits for.
+///
+/// That pass runs before the listener binds, and every reclaimed entry costs a
+/// scan of `/proc`. Past this budget the pass stops reclaiming and the
+/// background loop takes the rest.
+pub const COLD_START_ROTATION_BUDGET: Duration = Duration::from_secs(1);
 const MAX_INVENTORY_ENTRIES: usize = 16_384;
 #[cfg(any(not(unix), test))]
 const MAX_QUARANTINE_LEAF_ATTEMPTS: u32 = 128;
@@ -90,6 +96,9 @@ pub struct RotateReport {
     /// Namespace, inventory, or snapshot admission was unavailable. A quota
     /// refusal following this pass must not authorize a repair export.
     pub admission_refused: bool,
+    /// The pass reached its wall-clock budget. What it did not reach stays on
+    /// disk, counted as kept, for a later pass.
+    pub deadline_reached: bool,
     pub failures: Vec<RotationFailure>,
     pub per_kind: BTreeMap<&'static str, RotateKindSummary>,
 }
@@ -571,6 +580,7 @@ fn inspect_historical_backups(storage_root: &Path, primary: &Path) -> Historical
 fn reclaim_empty_rotation_directories(
     storage_root: &Path,
     remaining: &mut usize,
+    deadline: Option<Instant>,
     report: &mut RotateReport,
     mut admit: impl FnMut() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -599,6 +609,10 @@ fn reclaim_empty_rotation_directories(
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_dir() || fs::read_dir(&path)?.next().transpose()?.is_some() {
             continue;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            report.deadline_reached = true;
+            break;
         }
         admit()?;
         *remaining -= 1;
@@ -748,11 +762,20 @@ struct ReclaimBudget {
     bytes: u64,
     byte_limit: u64,
     publication: Option<PeriodicPublicationBudget>,
+    deadline: Option<Instant>,
+    deadline_reached: bool,
 }
 
 #[cfg(unix)]
 impl ReclaimBudget {
     fn admit(&mut self, bytes: u64) -> bool {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.deadline_reached = true;
+            return false;
+        }
         // Admit one oversized image so a large mailbox can still make progress.
         if self.attempted >= MAX_RECLAIM_FILES_PER_PASS
             || (self.attempted > 0 && self.bytes.saturating_add(bytes) > self.byte_limit)
@@ -1096,6 +1119,27 @@ pub fn rotate_storage_backups(
     )
 }
 
+/// A pass for a caller that cannot wait for a backlog.
+///
+/// At `budget` it stops reclaiming and leaves the rest to a later pass, with
+/// nothing refused. One entry already under way finishes, so the bound is not
+/// exact.
+pub fn rotate_storage_backups_within(
+    storage_root: &Path,
+    database_path: &Path,
+    keep_per_kind: usize,
+    budget: Duration,
+) -> std::io::Result<RotateReport> {
+    rotate_storage_backups_impl(
+        storage_root,
+        database_path,
+        keep_per_kind,
+        stage_backup_noreplace,
+        false,
+        Instant::now().checked_add(budget),
+    )
+}
+
 /// The automatic producer already owns the database-parent exporter lease.
 /// Reacquiring a second flock would refuse our own admission. Use this entry
 /// only inside that existing admitted producer/cleanup closure.
@@ -1110,6 +1154,7 @@ pub(crate) fn rotate_storage_backups_with_exporter_lease(
         keep_per_kind,
         stage_backup_noreplace,
         true,
+        None,
     )
 }
 
@@ -1122,7 +1167,14 @@ fn rotate_storage_backups_with<F>(
 where
     F: FnMut(&Path, &RotationQuarantine, &fs::Metadata) -> std::io::Result<PathBuf>,
 {
-    rotate_storage_backups_impl(storage_root, database_path, keep_per_kind, stage, false)
+    rotate_storage_backups_impl(
+        storage_root,
+        database_path,
+        keep_per_kind,
+        stage,
+        false,
+        None,
+    )
 }
 
 fn rotate_storage_backups_impl<F>(
@@ -1131,6 +1183,7 @@ fn rotate_storage_backups_impl<F>(
     keep_per_kind: usize,
     mut stage: F,
     caller_holds_parent_lease: bool,
+    deadline: Option<Instant>,
 ) -> std::io::Result<RotateReport>
 where
     F: FnMut(&Path, &RotationQuarantine, &fs::Metadata) -> std::io::Result<PathBuf>,
@@ -1171,7 +1224,7 @@ where
     // cannot make byte accounting or source witnesses stale between the scan
     // and admission. On refusal, still collect the observable retained bytes.
     #[cfg(not(unix))]
-    let _ = caller_holds_parent_lease;
+    let _ = (caller_holds_parent_lease, deadline);
     #[cfg(unix)]
     let parent_admission = if caller_holds_parent_lease {
         Ok(None)
@@ -1189,6 +1242,7 @@ where
         && let Err(error) = reclaim_empty_rotation_directories(
             &storage_root,
             &mut empty_directory_budget,
+            deadline,
             &mut report,
             || {
                 if early_snapshot_guard.is_none() {
@@ -1454,6 +1508,8 @@ where
             .unwrap_or(0)
             .max(PERIODIC_BYTES_FLOOR),
         publication: publication_budget,
+        deadline,
+        deadline_reached: false,
     };
     // Incident verification has its own bounded work allowance. Repeatedly
     // refused incident evidence must not starve the periodic backup queue.
@@ -1463,6 +1519,8 @@ where
         bytes: 0,
         byte_limit: reclaim_budget.byte_limit,
         publication: None,
+        deadline,
+        deadline_reached: false,
     };
     #[cfg(unix)]
     let mut pending_reclaims = Vec::new();
@@ -1740,11 +1798,17 @@ where
         &mut report,
     );
     #[cfg(unix)]
+    {
+        report.deadline_reached |=
+            reclaim_budget.deadline_reached || incident_reclaim_budget.deadline_reached;
+    }
+    #[cfg(unix)]
     if !report.admission_refused
         && periodic_reclamation_enabled()
         && let Err(error) = reclaim_empty_rotation_directories(
             &storage_root,
             &mut empty_directory_budget,
+            deadline,
             &mut report,
             || snapshot_guard.revalidate(),
         )
@@ -1768,6 +1832,7 @@ where
     if report.evicted() > 0
         || report.empty_directories_deleted > 0
         || report.unconfirmed_moves > 0
+        || report.deadline_reached
         || !report.failures.is_empty()
     {
         info!(
@@ -1781,6 +1846,7 @@ where
             bytes_retained = report.bytes_retained(),
             inventory_incomplete = report.inventory_incomplete,
             admission_refused = report.admission_refused,
+            deadline_reached = report.deadline_reached,
             failures = report.failures.len(),
             unconfirmed_deletions = report.unconfirmed_deletions,
             bytes_unconfirmed_deletions = report.bytes_unconfirmed_deletions,
@@ -1815,6 +1881,117 @@ mod tests {
         mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 2_000_000_000_000_000)
             .unwrap();
         primary
+    }
+
+    #[cfg(unix)]
+    fn names_on_disk(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = walkdir::WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            })
+            .filter(|name| !name.ends_with(".lock"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    fn mailbox_with_backlog(root: &Path) -> PathBuf {
+        let primary = verified_mailbox(root);
+        for day in 1..=9 {
+            fs::copy(
+                &primary,
+                root.join(format!("storage.sqlite3.bak.2000010{day}_000000")),
+            )
+            .unwrap();
+        }
+        primary
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_budget_leaves_the_backlog_for_the_next_pass() {
+        let control = TempDir::new().unwrap();
+        let control_primary = mailbox_with_backlog(control.path());
+        let unbudgeted = rotate_storage_backups(control.path(), &control_primary, 3).unwrap();
+        assert!(unbudgeted.deleted > 0);
+
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let before = names_on_disk(tmp.path());
+        let spent = rotate_storage_backups_within(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
+        assert!(spent.deadline_reached);
+        assert_eq!(spent.deleted, 0);
+        assert!(spent.failures.is_empty(), "{:?}", spent.failures);
+        assert!(!spent.admission_refused);
+        assert_eq!(
+            spent.kept,
+            unbudgeted.kept + unbudgeted.deleted,
+            "a spent budget counts what it left as kept"
+        );
+        assert_eq!(names_on_disk(tmp.path()), before);
+
+        // The background pass has no budget: same evictions, same kept set.
+        let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(!next.deadline_reached);
+        assert_eq!(next.deleted, unbudgeted.deleted);
+        assert_eq!(next.kept, unbudgeted.kept);
+        assert_eq!(
+            names_on_disk(tmp.path()),
+            names_on_disk(control.path()),
+            "the kept set must not depend on which pass reclaimed the backlog"
+        );
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn budget_not_reached_changes_nothing() {
+        let control = TempDir::new().unwrap();
+        let control_primary = mailbox_with_backlog(control.path());
+        let unbudgeted = rotate_storage_backups(control.path(), &control_primary, 3).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let ample = Duration::from_secs(3600);
+        let report = rotate_storage_backups_within(tmp.path(), &primary, 3, ample).unwrap();
+        assert!(!report.deadline_reached);
+        assert_eq!(report.deleted, unbudgeted.deleted);
+        assert_eq!(report.kept, unbudgeted.kept);
+        assert_eq!(names_on_disk(tmp.path()), names_on_disk(control.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_budget_leaves_empty_rotation_directories_for_the_next_pass() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let empties = [1, 2, 3].map(|n| {
+            let directory = tmp
+                .path()
+                .join(format!("doctor/reclaimable/rotation-1999122{n}T235959Z"));
+            fs::create_dir_all(&directory).unwrap();
+            directory
+        });
+
+        let spent = rotate_storage_backups_within(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
+        assert!(spent.deadline_reached);
+        assert_eq!(spent.empty_directories_deleted, 0);
+        assert!(spent.failures.is_empty(), "{:?}", spent.failures);
+        assert!(empties.iter().all(|directory| directory.is_dir()));
+
+        let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(!next.deadline_reached);
+        assert_eq!(next.empty_directories_deleted, 3);
+        assert!(empties.iter().all(|directory| !directory.exists()));
     }
 
     #[cfg(unix)]
@@ -2224,6 +2401,8 @@ mod tests {
                 bytes: 0,
                 byte_limit: 0,
                 publication: None,
+                deadline: None,
+                deadline_reached: false,
             };
             let mut report = RotateReport::default();
             reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
@@ -2273,6 +2452,8 @@ mod tests {
                 bytes: 0,
                 byte_limit: 2,
                 publication: None,
+                deadline: None,
+                deadline_reached: false,
             };
             let mut report = RotateReport::default();
             reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);

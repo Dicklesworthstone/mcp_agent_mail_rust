@@ -3256,7 +3256,8 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 
 /// Best-effort rotation of old backup detritus in `storage_root`. Errors are
 /// logged at warn level and otherwise ignored — rotation failures must never
-/// prevent the server from starting.
+/// prevent the server from starting. The listener waits for this pass, so a
+/// backlog beyond the budget is left for the background loop.
 fn rotate_backups_best_effort(config: &Config) {
     #[cfg(test)]
     record_startup_work(3);
@@ -3264,8 +3265,12 @@ fn rotate_backups_best_effort(config: &Config) {
         return;
     };
     let keep = crate::backup_rotation::resolved_keep_per_kind();
-    match crate::backup_rotation::rotate_storage_backups(&config.storage_root, &database_path, keep)
-    {
+    match crate::backup_rotation::rotate_storage_backups_within(
+        &config.storage_root,
+        &database_path,
+        keep,
+        crate::backup_rotation::COLD_START_ROTATION_BUDGET,
+    ) {
         Ok(report) => crate::integrity_guard::report_backup_rotation(&report, "startup"),
         Err(err) => {
             tracing::warn!(
