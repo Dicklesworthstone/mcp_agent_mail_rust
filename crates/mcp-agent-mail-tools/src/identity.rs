@@ -899,6 +899,179 @@ const fn archive_writes_pending(lag: &mcp_agent_mail_storage::ArchiveLagSnapshot
         || lag.oldest_unmaterialized_us > 0
 }
 
+const MAX_ARCHIVE_GAP_OBSERVATIONS: usize = 64;
+const MAX_ARCHIVE_GAP_GENERATION_BYTES: usize = 256;
+const ARCHIVE_GAP_CRITICAL_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchiveGapMailbox {
+    database_url: String,
+    storage_root: PathBuf,
+}
+
+impl ArchiveGapMailbox {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            database_url: config.database_url.clone(),
+            storage_root: config.storage_root.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveGapGeneration {
+    token: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct ArchiveGapProbe {
+    generation: ArchiveGapGeneration,
+    observed_at: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct ArchiveGapObservation {
+    mailbox: ArchiveGapMailbox,
+    generation: ArchiveGapGeneration,
+    gap: u64,
+    since: std::time::Instant,
+    last_observed: std::time::Instant,
+}
+
+/// Bounded observational state only: eviction forgets an age, never mailbox
+/// data or a recovery authority. A generation token must come from the same
+/// read-only statement that supplied the inventory, and is never seeded here.
+#[derive(Debug, Default)]
+struct ArchiveGapTracker {
+    observations: std::collections::VecDeque<ArchiveGapObservation>,
+}
+
+impl ArchiveGapTracker {
+    fn observe(
+        &mut self,
+        mailbox: ArchiveGapMailbox,
+        generation: Option<&ArchiveGapGeneration>,
+        gap: Option<u64>,
+        archive_pending: bool,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let previous = self
+            .observations
+            .iter()
+            .position(|observation| observation.mailbox == mailbox)
+            .and_then(|index| self.observations.remove(index));
+        let generation = generation.filter(|generation| {
+            !generation.token.trim().is_empty()
+                && generation.token.len() <= MAX_ARCHIVE_GAP_GENERATION_BYTES
+        })?;
+        let gap = gap.filter(|gap| *gap > 0)?;
+        if archive_pending {
+            return None;
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|previous| now < previous.last_observed)
+        {
+            // A slower, older probe must not restart the clock in the past:
+            // that would manufacture a critical age on the next fresh probe.
+            return None;
+        }
+        let since = previous
+            .filter(|previous| previous.generation == *generation && gap >= previous.gap)
+            .map_or(now, |previous| previous.since);
+        let age = now.saturating_duration_since(since);
+        if self.observations.len() >= MAX_ARCHIVE_GAP_OBSERVATIONS {
+            let _ = self.observations.pop_front();
+        }
+        self.observations.push_back(ArchiveGapObservation {
+            mailbox,
+            generation: generation.clone(),
+            gap,
+            since,
+            last_observed: now,
+        });
+        Some(age)
+    }
+}
+
+fn observe_idle_archive_gap(
+    config: &Config,
+    probe: Option<&ArchiveGapProbe>,
+    semantic: &SemanticReadinessResponse,
+    archive_pending: bool,
+) -> Option<std::time::Duration> {
+    static TRACKER: std::sync::OnceLock<std::sync::Mutex<ArchiveGapTracker>> =
+        std::sync::OnceLock::new();
+    let tracker = TRACKER.get_or_init(|| std::sync::Mutex::new(ArchiveGapTracker::default()));
+    let mut observations = tracker.lock().unwrap_or_else(|poisoned| {
+        let mut observations = poisoned.into_inner();
+        // A partially updated observation must never supply a critical age.
+        observations.observations.clear();
+        tracker.clear_poison();
+        observations
+    });
+    observations.observe(
+        ArchiveGapMailbox::from_config(config),
+        probe.map(|probe| &probe.generation),
+        semantic.archive_message_gap,
+        archive_pending,
+        probe.map_or_else(std::time::Instant::now, |probe| probe.observed_at),
+    )
+}
+
+fn apply_idle_archive_gap_health(
+    semantic: &mut SemanticReadinessResponse,
+    verdicts: &mut HealthVerdicts,
+    archive_pending: bool,
+    idle_gap_age: Option<std::time::Duration>,
+) {
+    use mcp_agent_mail_core::HealthLevel::{Red, Yellow};
+
+    if archive_pending || semantic.archive_message_gap.is_none_or(|gap| gap == 0) {
+        return;
+    }
+    let persistent = idle_gap_age.is_some_and(|age| age >= ARCHIVE_GAP_CRITICAL_AGE);
+    let level = if persistent || verdicts.archive_db_parity.level() == Red {
+        Red
+    } else {
+        Yellow
+    };
+    let observation = idle_gap_age.map_or_else(
+        || "idle gap age is unavailable without a verified database generation".to_string(),
+        |age| {
+            format!(
+                "idle inventory gap has not decreased across observations for {} ms{}",
+                age.as_millis(),
+                if persistent {
+                    "; persistent archive convergence failure (30-minute bound)"
+                } else {
+                    ""
+                }
+            )
+        },
+    );
+    let detail = format!("{}; {observation}", verdicts.archive_db_parity.detail);
+    verdicts.archive_db_parity = HealthVerdict::new(level, true, detail.clone());
+    // Apply after decomposition: an archive gap must not be misclassified as
+    // a database connectivity failure merely because readiness is degraded.
+    // Preserve an existing stronger failure and its diagnostic. If the gap
+    // escalates a prior warning, retain that warning's reason as well.
+    if verdicts.semantic_readiness.level() < level {
+        let detail = if semantic.status == "ok" {
+            detail
+        } else {
+            format!("{}; {detail}", semantic.detail)
+        };
+        verdicts.semantic_readiness = HealthVerdict::new(level, false, detail.clone());
+        semantic.status = if level == Red { "fail" } else { "warn" }.to_string();
+        semantic.detail = detail;
+    }
+}
+
 fn archive_parity_health_verdict(
     semantic: &SemanticReadinessResponse,
     kind: SemanticVerdictKind,
@@ -927,8 +1100,8 @@ fn archive_parity_health_verdict(
     {
         // Inventory and queue observations are not atomic: a writer can finish
         // between the probes. Report unverified convergence, not corruption.
-        // A later aligned inventory clears this observation without retaining
-        // a process-local failure that could outlive the actual repair.
+        // A later aligned inventory clears the observation. The generation-
+        // scoped tracker separately escalates a persistent nonshrinking gap.
         HealthVerdict::new(
             Yellow,
             true,
@@ -1224,7 +1397,11 @@ fn semantic_readiness_response(
     }
 }
 
-fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse {
+fn health_check_semantic_readiness(
+    config: &Config,
+    observed_generation: &mut Option<ArchiveGapProbe>,
+) -> SemanticReadinessResponse {
+    *observed_generation = None;
     let sqlite_path = match resolve_health_check_sqlite_path(&config.database_url) {
         Ok(path) => path,
         Err(error) => return semantic_readiness_response("fail", error),
@@ -1261,6 +1438,8 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
+    #[cfg(unix)]
+    let source_identity_before = std::fs::metadata(&sqlite_path).ok();
     let conn = match open_health_check_sync_db_connection(&sqlite_path) {
         Ok(conn) => conn,
         Err(error) => {
@@ -1317,14 +1496,28 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
     }
 
     let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
-    let rows = match conn.query_sync(
-        "SELECT \
+    let inventory_sql = "SELECT \
             (SELECT COUNT(*) FROM projects) AS project_count, \
             (SELECT COUNT(*) FROM agents) AS agent_count, \
             (SELECT COUNT(*) FROM messages) AS message_count, \
-            COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id",
-        &[],
-    ) {
+            COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id";
+    // Counts and generation must share one statement snapshot: a later
+    // autocommit identity read could attach an older gap to a recovered DB.
+    // Legacy/unreadable identity remains unknown and never seeds a token.
+    let observed_at = std::time::Instant::now();
+    let inventory = if cfg!(unix) && present.contains("db_identity") {
+        conn.query_sync(
+            &format!(
+                "{inventory_sql}, \
+                 (SELECT generation_id FROM db_identity WHERE singleton = 0) AS generation_id"
+            ),
+            &[],
+        )
+        .or_else(|_| conn.query_sync(inventory_sql, &[]))
+    } else {
+        conn.query_sync(inventory_sql, &[])
+    };
+    let rows = match inventory {
         Ok(rows) => rows,
         Err(error) => {
             return semantic_readiness_response(
@@ -1436,6 +1629,29 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         ),
     );
     readiness.archive_message_gap = Some(db_ahead_by);
+    // Metadata-only checks discard ages across a restored inode even when a
+    // backup retains the same logical token. No additional live DB is opened.
+    #[cfg(unix)]
+    if let Ok(token) = row.get_named::<String>("generation_id") {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Some(before), Ok(after)) = (source_identity_before, std::fs::metadata(&sqlite_path))
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+        {
+            *observed_generation = Some(ArchiveGapProbe {
+                generation: ArchiveGapGeneration {
+                    token,
+                    device: after.dev(),
+                    inode: after.ino(),
+                },
+                observed_at,
+            });
+        }
+    }
+    // Other platforms keep the immediate warning without inventing a
+    // persistence age until a source-bound physical identity is available.
+    #[cfg(not(unix))]
+    let _ = observed_at;
     readiness
 }
 
@@ -2213,7 +2429,8 @@ pub struct CommitInfo {
 #[allow(clippy::too_many_lines)]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let config = &Config::get();
-    let mut semantic_readiness = health_check_semantic_readiness(config);
+    let mut observed_generation = None;
+    let mut semantic_readiness = health_check_semantic_readiness(config, &mut observed_generation);
     let pool = if semantic_readiness.status == "fail" {
         None
     } else {
@@ -2284,13 +2501,26 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
-    let verdicts = compute_health_verdicts(
+    let archive_pending = archive_writes_pending(&archive_lag);
+    let idle_gap_age = observe_idle_archive_gap(
+        config,
+        observed_generation.as_ref(),
+        &semantic_readiness,
+        archive_pending,
+    );
+    let mut verdicts = compute_health_verdicts(
         config,
         pool.is_some(),
         &semantic_readiness,
         &integrity_metrics,
         archive_drain_stall.as_deref(),
-        archive_writes_pending(&archive_lag),
+        archive_pending,
+    );
+    apply_idle_archive_gap_health(
+        &mut semantic_readiness,
+        &mut verdicts,
+        archive_pending,
+        idle_gap_age,
     );
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
@@ -4611,6 +4841,408 @@ mod tests {
         assert_eq!(unsafe_index.detail, ahead.detail);
     }
 
+    fn gap_mailbox(database: &str, archive: &str) -> ArchiveGapMailbox {
+        ArchiveGapMailbox {
+            database_url: database.to_string(),
+            storage_root: PathBuf::from(archive),
+        }
+    }
+
+    fn gap_generation(token: &str) -> ArchiveGapGeneration {
+        ArchiveGapGeneration {
+            token: token.to_string(),
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 1,
+        }
+    }
+
+    #[test]
+    fn archive_gap_age_resets_on_progress_and_convergence() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for (elapsed, gap, age) in [(0, 20, 0), (300, 21, 300), (600, 19, 0), (900, 19, 300)] {
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    Some(&generation),
+                    Some(gap),
+                    false,
+                    start + std::time::Duration::from_secs(elapsed),
+                ),
+                Some(std::time::Duration::from_secs(age)),
+            );
+        }
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(0),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            None,
+        );
+        assert!(tracker.observations.is_empty());
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(19),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn archive_gap_age_is_scoped_to_database_archive_and_generation() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for (database, archive, elapsed) in [
+            ("database-a", "archive-a", 0),
+            ("database-b", "archive-a", 600),
+            ("database-a", "archive-b", 1200),
+        ] {
+            let _ = tracker.observe(
+                gap_mailbox(database, archive),
+                Some(&generation),
+                Some(3),
+                false,
+                start + std::time::Duration::from_secs(elapsed),
+            );
+        }
+        for (database, archive, age) in [
+            ("database-a", "archive-a", 1800),
+            ("database-b", "archive-a", 1200),
+            ("database-a", "archive-b", 600),
+        ] {
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox(database, archive),
+                    Some(&generation),
+                    Some(3),
+                    false,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                Some(std::time::Duration::from_secs(age)),
+            );
+        }
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-a", "archive-a"),
+                Some(&gap_generation("generation-b")),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-a", "archive-a"),
+                None,
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            None,
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-b", "archive-a"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::from_secs(1200)),
+        );
+    }
+
+    #[test]
+    fn archive_gap_age_forgets_pending_unavailable_and_invalid_observations() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let blank = gap_generation(" \t");
+        let oversized = gap_generation(&"x".repeat(MAX_ARCHIVE_GAP_GENERATION_BYTES + 1));
+        for (identity, gap, pending) in [
+            (Some(&generation), Some(3), true),
+            (None, Some(3), false),
+            (Some(&generation), None, false),
+            (Some(&blank), Some(3), false),
+            (Some(&oversized), Some(3), false),
+        ] {
+            let mut tracker = ArchiveGapTracker::default();
+            let _ = tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            );
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    identity,
+                    gap,
+                    pending,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                None,
+            );
+            assert!(tracker.observations.is_empty());
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    Some(&generation),
+                    Some(3),
+                    false,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                Some(std::time::Duration::ZERO),
+            );
+        }
+    }
+
+    #[test]
+    fn archive_gap_tracking_is_bounded_and_retains_recent_observations() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for index in 0..MAX_ARCHIVE_GAP_OBSERVATIONS {
+            let _ = tracker.observe(
+                gap_mailbox(&format!("database-{index}"), "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            );
+        }
+        let _ = tracker.observe(
+            gap_mailbox("database-0", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + std::time::Duration::from_secs(1),
+        );
+        let _ = tracker.observe(
+            gap_mailbox("database-extra", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(tracker.observations.len(), MAX_ARCHIVE_GAP_OBSERVATIONS);
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-1", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+            "eviction must forget an age instead of manufacturing persistence",
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-0", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(ARCHIVE_GAP_CRITICAL_AGE),
+        );
+        assert_eq!(tracker.observations.len(), MAX_ARCHIVE_GAP_OBSERVATIONS);
+    }
+
+    #[test]
+    fn archive_gap_age_forgets_out_of_order_observation() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        let _ = tracker.observe(
+            gap_mailbox("database", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + ARCHIVE_GAP_CRITICAL_AGE,
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            ),
+            None,
+        );
+        assert!(tracker.observations.is_empty());
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE + std::time::Duration::from_secs(1),
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_gap_age_restarts_when_restored_inode_keeps_generation_token() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("preserved-generation");
+        let mut tracker = ArchiveGapTracker::default();
+        let _ = tracker.observe(
+            gap_mailbox("database", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start,
+        );
+        let restored = ArchiveGapGeneration {
+            inode: 2,
+            ..generation
+        };
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&restored),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn idle_archive_gap_health_escalates_at_the_exact_persistence_boundary() {
+        let config = Config::default();
+        for (age, readiness, color) in [
+            (None, "warn", "yellow"),
+            (Some(std::time::Duration::ZERO), "warn", "yellow"),
+            (
+                Some(ARCHIVE_GAP_CRITICAL_AGE - std::time::Duration::from_millis(1)),
+                "warn",
+                "yellow",
+            ),
+            (Some(ARCHIVE_GAP_CRITICAL_AGE), "fail", "red"),
+            (
+                Some(ARCHIVE_GAP_CRITICAL_AGE + std::time::Duration::from_millis(1)),
+                "fail",
+                "red",
+            ),
+        ] {
+            let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+            observation.archive_message_gap = Some(2);
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                false,
+            );
+            apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, age);
+            assert_eq!(observation.status, readiness);
+            assert_eq!(verdicts.semantic_readiness.status, color);
+            assert_eq!(verdicts.archive_db_parity.status, color);
+            assert!(verdicts.archive_db_parity.critical);
+            assert_eq!(verdicts.db_health.status, "green");
+            assert_eq!(verdicts.write_health.status, "green");
+            assert_eq!(verdicts.rollup_level(), verdicts.archive_db_parity.level());
+            if age.is_none() {
+                assert!(observation.detail.contains("age is unavailable"));
+            } else if color == "red" {
+                assert!(observation.detail.contains("30-minute bound"));
+            }
+        }
+    }
+
+    #[test]
+    fn idle_archive_gap_health_ignores_active_converged_and_skipped_inventory() {
+        let config = Config::default();
+        for (gap, pending) in [(Some(2), true), (Some(0), false), (None, false)] {
+            let mut observation = semantic("ok", "inventory observation");
+            observation.archive_message_gap = gap;
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                pending,
+            );
+            apply_idle_archive_gap_health(
+                &mut observation,
+                &mut verdicts,
+                pending,
+                Some(ARCHIVE_GAP_CRITICAL_AGE),
+            );
+            assert_eq!(observation.status, "ok");
+            assert_eq!(observation.detail, "inventory observation");
+            assert_eq!(verdicts.semantic_readiness.status, "green");
+            assert_eq!(verdicts.archive_db_parity.status, "green");
+        }
+    }
+
+    #[test]
+    fn idle_archive_gap_health_preserves_existing_failures() {
+        let config = Config::default();
+        for age in [None, Some(ARCHIVE_GAP_CRITICAL_AGE)] {
+            let mut observation = semantic(
+                "fail",
+                "sqlite schema missing required health_check tables: messages",
+            );
+            observation.archive_message_gap = Some(2);
+            let prior_detail = observation.detail.clone();
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                false,
+            );
+            apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, age);
+            assert_eq!(observation.status, "fail");
+            assert_eq!(observation.detail, prior_detail);
+            assert_eq!(verdicts.semantic_readiness.status, "red");
+            assert_eq!(verdicts.semantic_readiness.detail, prior_detail);
+            assert_eq!(verdicts.db_health.status, "green");
+            assert_eq!(verdicts.write_health.status, "red");
+        }
+
+        let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+        observation.archive_message_gap = Some(2);
+        let mut verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &observation,
+            &healthy_integrity_metrics(),
+            Some("no completed op for 900000 ms"),
+            false,
+        );
+        apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, None);
+        assert_eq!(verdicts.archive_db_parity.status, "red");
+        assert_eq!(verdicts.semantic_readiness.status, "red");
+        assert_eq!(observation.status, "fail");
+        assert!(observation.detail.contains("drain stalled"));
+        assert_eq!(verdicts.db_health.status, "green");
+        assert_eq!(verdicts.write_health.status, "green");
+    }
+
     #[test]
     fn semantic_archive_gap_wire_format_preserves_skipped_and_legacy_responses() {
         let legacy = json!({"status": "ok", "detail": "parity skipped"});
@@ -6124,9 +6756,14 @@ mod tests {
         ).expect("persist a message before its archive copy");
         drop(conn);
 
-        let before = health_check_semantic_readiness(&config);
+        let mut observed_generation = None;
+        let before = health_check_semantic_readiness(&config, &mut observed_generation);
         assert_eq!(before.status, "ok", "{}", before.detail);
         assert_eq!(before.archive_message_gap, Some(1));
+        assert!(
+            observed_generation.is_none(),
+            "health probes must not seed an empty database identity"
+        );
         let verdicts = compute_health_verdicts(
             &config,
             true,
@@ -6149,8 +6786,27 @@ mod tests {
             messages.join("2026-10-01T00-00-00Z__persisted__1.md"),
             "---json\n{\"id\":1,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Persisted\",\"importance\":\"normal\",\"created_ts\":\"2026-10-01T00:00:00Z\"}\n---\n\nbody\n",
         ).expect("materialize canonical message");
-        let after = health_check_semantic_readiness(&config);
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+        conn.execute_raw(
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, 'health-gap-generation')",
+        )
+        .expect("seed the existing database identity independently of health");
+        drop(conn);
+        let after = health_check_semantic_readiness(&config, &mut observed_generation);
         assert_eq!(after.archive_message_gap, Some(0), "{}", after.detail);
+        #[cfg(unix)]
+        assert_eq!(
+            observed_generation
+                .as_ref()
+                .map(|probe| probe.generation.token.as_str()),
+            Some("health-gap-generation"),
+            "inventory counts and the existing generation must be read together"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            observed_generation.is_none(),
+            "unknown physical file identity must not supply a persistence age"
+        );
         let repaired = compute_health_verdicts(
             &config,
             true,
