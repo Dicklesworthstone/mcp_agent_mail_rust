@@ -554,6 +554,13 @@ fn is_proc_task_gone(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
 }
 
+/// A failure here is about another process, not the candidate under inspection,
+/// so name the entry. The kind survives for callers that read it.
+#[cfg(target_os = "linux")]
+fn proc_entry_error(entry: &Path, error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", entry.display()))
+}
+
 #[cfg(target_os = "linux")]
 fn ensure_no_file_readers(
     source: &Path,
@@ -623,7 +630,7 @@ fn ensure_no_file_readers(
                 {
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
             };
             // Non-filesystem descriptors (`socket:[...]`, `pipe:[...]`,
             // `anon_inode:[...]`) never reference a regular file inode on disk.
@@ -2209,5 +2216,18 @@ mapping.close()
         assert!(is_proc_task_gone(&io::Error::from_raw_os_error(3)));
         assert!(!is_proc_task_gone(&io::Error::from_raw_os_error(13)));
         assert!(!is_proc_task_gone(&io::Error::from_raw_os_error(5)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_entry_error_names_the_entry_and_keeps_the_kind() {
+        let denied = io::Error::from_raw_os_error(13);
+        let error = proc_entry_error(Path::new("/proc/7/fd/3"), &denied);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "/proc/7/fd/3: Permission denied (os error 13)"
+        );
+        assert!(!is_proc_task_gone(&error));
     }
 }
