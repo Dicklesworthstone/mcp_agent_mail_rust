@@ -234,6 +234,7 @@ pub fn has_project_mailbox_deliveries(
 }
 
 /// Unread messages for every agent in a project, including eligible shared mail.
+///
 /// Direct and shared receipts are observed together; a direct delivery takes
 /// precedence even when its own receipt is already read. Shared history is
 /// visited in bounded delivery pages instead of rescanned for every agent.
