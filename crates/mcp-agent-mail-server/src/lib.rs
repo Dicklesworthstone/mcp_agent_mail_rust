@@ -12219,9 +12219,8 @@ impl HttpState {
         if !self.config.http_rbac_enabled || self.allow_local_unauthenticated(req) {
             return None;
         }
-        let (roles, _) = match self.resolve_rbac_identity_with_cx(cx, req, true).await {
-            Ok(identity) => identity,
-            Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
+        let Ok((roles, _)) = self.resolve_rbac_identity_with_cx(cx, req, true).await else {
+            return Some(self.error_response(req, 401, "Unauthorized"));
         };
         if roles
             .iter()
@@ -13023,9 +13022,8 @@ to skip auth for local requests.</p>
         let is_local_ok = self.allow_local_unauthenticated(req);
         // Query-token authentication is deliberately limited to browser
         // routes; it must not grant MCP calls a static token's writer role.
-        let (roles, jwt_sub) = match self.resolve_rbac_identity_with_cx(cx, req, false).await {
-            Ok(identity) => identity,
-            Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
+        let Ok((roles, jwt_sub)) = self.resolve_rbac_identity_with_cx(cx, req, false).await else {
+            return Some(self.error_response(req, 401, "Unauthorized"));
         };
 
         // RBAC (mirrors legacy python behavior)
