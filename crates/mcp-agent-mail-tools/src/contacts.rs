@@ -91,12 +91,27 @@ pub struct RespondContactResponse {
 /// Valid contact policy values.
 pub const VALID_CONTACT_POLICIES: &[&str] = &["open", "auto", "contacts_only", "block_all"];
 
-/// Contact links are authorization state. Retired identities must not create,
-/// approve, block, or refresh that state until they are explicitly unretired.
+/// Contact links are authorization state. Inactive identities must not create,
+/// approve, block, or refresh that state.
 fn require_active_contact_participant(
     agent: &mcp_agent_mail_db::AgentRow,
     role: &'static str,
 ) -> McpResult<()> {
+    // Imported Python tombstones need not also carry retired_at. Transaction
+    // admission separately checks the authoritative deregistration ledger.
+    if mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
+        &agent.task_description,
+    ) {
+        return Err(legacy_tool_error(
+            "AGENT_DEREGISTERED",
+            format!(
+                "{role} agent {} is deregistered and cannot change contact authorization",
+                agent.name
+            ),
+            false,
+            serde_json::json!({ "agent": agent.name, "role": role }),
+        ));
+    }
     if let Some(retired_at) = agent.retired_at {
         return Err(legacy_tool_error(
             "AGENT_RETIRED",
@@ -1003,6 +1018,33 @@ pub async fn set_contact_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contact_lifecycle_rejects_retirement_and_imported_deregistration() {
+        let mut agent = mcp_agent_mail_db::AgentRow {
+            id: Some(81),
+            project_id: 71,
+            name: "BlueLake".into(),
+            ..Default::default()
+        };
+        for role in ["requester", "target", "recipient"] {
+            require_active_contact_participant(&agent, role).unwrap();
+        }
+        agent.retired_at = Some(5_000_000);
+        for role in ["requester", "target", "recipient"] {
+            let error = require_active_contact_participant(&agent, role).unwrap_err();
+            assert_eq!(tool_error_code(&error), Some("AGENT_RETIRED"));
+        }
+        for retired_at in [None, Some(5_000_000)] {
+            agent.retired_at = retired_at;
+            agent.task_description =
+                "[DEREGISTERED at 2026-10-01 00:00:00] imported identity".into();
+            for role in ["requester", "target", "recipient"] {
+                let error = require_active_contact_participant(&agent, role).unwrap_err();
+                assert_eq!(tool_error_code(&error), Some("AGENT_DEREGISTERED"));
+            }
+        }
+    }
 
     // ── normalize_contact_policy ──
 

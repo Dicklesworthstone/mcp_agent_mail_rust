@@ -9210,8 +9210,8 @@ async fn ensure_message_participants_active_in_tx(
 }
 
 /// Revalidate distinct agent identities at the same transaction boundary as
-/// the new work they authorize. Reservations additionally require the owner to
-/// belong to their project; cached tool-layer identity checks are insufficient.
+/// the new work they authorize. Reservations and contacts additionally require
+/// participants to belong to their project; cached tool-layer checks are insufficient.
 async fn ensure_agents_active_in_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
@@ -17190,6 +17190,16 @@ pub async fn request_contact(
 
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[from_agent_id], Some(from_project_id)).await
+        );
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[to_agent_id], Some(to_project_id)).await
+        );
 
         // FrankenConnection does not consistently support `ON CONFLICT ... DO UPDATE`.
         // Keep this path portable by doing insert-then-refresh on uniqueness conflict
@@ -17331,6 +17341,16 @@ pub async fn respond_contact(
 
         let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[from_agent_id], Some(from_project_id)).await
+        );
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[to_agent_id], Some(to_project_id)).await
+        );
 
         let existing_sql = format!(
             "{AGENT_LINK_SELECT_COLUMNS_SQL} \
@@ -35585,6 +35605,305 @@ mod tests {
                 .expect("request against a blocked link");
             assert_eq!(still_blocked.status, "blocked");
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn contact_mutations_require_active_endpoints_and_preserve_history() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for permanent in [false, true] {
+            for inactive_sender in [false, true] {
+                for initial_status in ["pending", "approved", "blocked"] {
+                    let (_cx, pool, _dir) = setup_test_pool(&format!(
+                        "contact-lifecycle-{permanent}-{inactive_sender}-{initial_status}.db"
+                    ));
+                    rt.block_on(async {
+                        let cx = Cx::current().expect("runtime context");
+                        let from_project_id = ensure_project(&cx, &pool, "/tmp/contact-source")
+                            .await
+                            .into_result()
+                            .expect("source project")
+                            .id
+                            .unwrap();
+                        let to_project_id = ensure_project(&cx, &pool, "/tmp/contact-target")
+                            .await
+                            .into_result()
+                            .expect("target project")
+                            .id
+                            .unwrap();
+                        let from_agent_id = register_agent(
+                            &cx, &pool, from_project_id, "BlueLake", "test", "test",
+                            None, None, None,
+                        )
+                        .await
+                        .into_result()
+                        .expect("requester")
+                        .id
+                        .unwrap();
+                        let to_agent_id = register_agent(
+                            &cx, &pool, to_project_id, "GreenStone", "test", "test",
+                            None, None, None,
+                        )
+                        .await
+                        .into_result()
+                        .expect("recipient")
+                        .id
+                        .unwrap();
+                        let mut original = request_contact(
+                            &cx, &pool, from_project_id, from_agent_id,
+                            to_project_id, to_agent_id, "original", 3600,
+                        )
+                        .await
+                        .into_result()
+                        .expect("active cross-project request");
+                        if initial_status != "pending" {
+                            original = respond_contact(
+                                &cx, &pool, from_project_id, from_agent_id,
+                                to_project_id, to_agent_id, initial_status == "approved", 3600,
+                            )
+                            .await
+                            .into_result()
+                            .expect("active cross-project response")
+                            .1;
+                        }
+
+                        // Each identity must belong to its stated endpoint project.
+                        for (wrong_from, wrong_to) in [
+                            (to_project_id, to_project_id),
+                            (from_project_id, from_project_id),
+                        ] {
+                            assert!(matches!(
+                                request_contact(
+                                    &cx, &pool, wrong_from, from_agent_id,
+                                    wrong_to, to_agent_id, "wrong project", 7200,
+                                ).await,
+                                Outcome::Err(DbError::NotFound { entity: "Agent", .. })
+                            ));
+                            assert!(matches!(
+                                respond_contact(
+                                    &cx, &pool, wrong_from, from_agent_id,
+                                    wrong_to, to_agent_id, true, 7200,
+                                ).await,
+                                Outcome::Err(DbError::NotFound { entity: "Agent", .. })
+                            ));
+                        }
+                        let inactive_id = if inactive_sender { from_agent_id } else { to_agent_id };
+                        let expected_field = if permanent {
+                            let deregistered = deregister_agent(&cx, &pool, inactive_id, now_micros())
+                                .await
+                                .into_result()
+                                .expect("deregister participant");
+                            assert!(deregistered.retired_at.is_none(), "ledger-only lifecycle state");
+                            "agent_deregistered"
+                        } else {
+                            set_agent_retired_at(&cx, &pool, inactive_id, Some(now_micros()))
+                                .await
+                                .into_result()
+                                .expect("retire participant");
+                            "agent_retired"
+                        };
+
+                        // Refuse both refresh of the existing direction and creation
+                        // of the previously absent reverse direction.
+                        for (a_project, a_agent, b_project, b_agent) in [
+                            (from_project_id, from_agent_id, to_project_id, to_agent_id),
+                            (to_project_id, to_agent_id, from_project_id, from_agent_id),
+                        ] {
+                            assert!(matches!(
+                                request_contact(
+                                    &cx, &pool, a_project, a_agent, b_project, b_agent,
+                                    "changed authorization", 7200,
+                                ).await,
+                                Outcome::Err(DbError::InvalidArgument { field, .. })
+                                    if field == expected_field
+                            ));
+                        }
+                        for accept in [false, true] {
+                            assert!(matches!(
+                                respond_contact(
+                                    &cx, &pool, from_project_id, from_agent_id,
+                                    to_project_id, to_agent_id, accept, 7200,
+                                ).await,
+                                Outcome::Err(DbError::InvalidArgument { field, .. })
+                                    if field == expected_field
+                            ));
+                        }
+
+                        // Refused mutations must leave all link fields unchanged,
+                        // and retirement must not hide historical contact metadata.
+                        let source_history = list_contacts(&cx, &pool, from_project_id, from_agent_id)
+                            .await
+                            .into_result()
+                            .expect("requester history");
+                        let target_history = list_contacts(&cx, &pool, to_project_id, to_agent_id)
+                            .await
+                            .into_result()
+                            .expect("recipient history");
+                        assert!(source_history.1.is_empty());
+                        assert!(target_history.0.is_empty());
+                        assert_eq!(
+                            serde_json::to_value(&source_history.0).unwrap(),
+                            serde_json::json!([&original])
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&target_history.1).unwrap(),
+                            serde_json::json!([&original])
+                        );
+
+                        if !permanent {
+                            set_agent_retired_at(&cx, &pool, inactive_id, None)
+                                .await
+                                .into_result()
+                                .expect("explicitly unretire");
+                            request_contact(
+                                &cx, &pool, from_project_id, from_agent_id,
+                                to_project_id, to_agent_id, "resumed", 3600,
+                            )
+                            .await
+                            .into_result()
+                            .expect("unretired participant can request");
+                            respond_contact(
+                                &cx, &pool, from_project_id, from_agent_id,
+                                to_project_id, to_agent_id, true, 3600,
+                            )
+                            .await
+                            .into_result()
+                            .expect("unretired participant can respond");
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn contact_lifecycle_is_rechecked_after_waiting_for_pool_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for responding in [false, true] {
+            for inactive_sender in [false, true] {
+                let (_cx, pool, _dir) = setup_test_pool(&format!(
+                    "contact-retirement-wait-{responding}-{inactive_sender}.db"
+                ));
+                let lifecycle_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                    database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                    storage_root: Some(pool.storage_root().to_path_buf()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("independent lifecycle pool");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let project_id = ensure_project(&cx, &pool, "/tmp/contact-retirement-wait")
+                        .await
+                        .into_result()
+                        .expect("project")
+                        .id
+                        .unwrap();
+                    let from_agent_id = register_agent(
+                        &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .expect("requester")
+                    .id
+                    .unwrap();
+                    let to_agent_id = register_agent(
+                        &cx, &pool, project_id, "GreenStone", "test", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .expect("recipient")
+                    .id
+                    .unwrap();
+                    let original = request_contact(
+                        &cx, &pool, project_id, from_agent_id, project_id, to_agent_id,
+                        "original", 3600,
+                    )
+                    .await
+                    .into_result()
+                    .expect("original request");
+                    let (inactive_id, inactive_name) = if inactive_sender {
+                        (from_agent_id, "BlueLake")
+                    } else {
+                        (to_agent_id, "GreenStone")
+                    };
+                    let resolved = get_agent(&cx, &pool, project_id, inactive_name)
+                        .await
+                        .into_result()
+                        .expect("tool-level lookup");
+                    assert!(resolved.retired_at.is_none());
+                    drop(
+                        lifecycle_pool.acquire(&cx).await.into_result()
+                            .expect("initialize lifecycle pool"),
+                    );
+                    let held = pool.acquire(&cx).await.into_result().expect("hold sole checkout");
+                    let mut waiting = std::pin::pin!(async {
+                        if responding {
+                            respond_contact(
+                                &cx, &pool, project_id, from_agent_id, project_id, to_agent_id,
+                                true, 7200,
+                            )
+                            .await
+                            .into_result()
+                            .map(|(_, row)| row)
+                        } else {
+                            request_contact(
+                                &cx, &pool, project_id, from_agent_id, project_id, to_agent_id,
+                                "queued refresh", 7200,
+                            )
+                            .await
+                            .into_result()
+                        }
+                    });
+                    {
+                        let mut context = Context::from_waker(Waker::noop());
+                        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                    }
+                    // Retire through a separate real pool after identity lookup
+                    // and while the contact mutation is waiting for admission.
+                    set_agent_retired_at(&cx, &lifecycle_pool, inactive_id, Some(now_micros()))
+                        .await
+                        .into_result()
+                        .expect("retire while contact mutation waits");
+                    drop(held);
+                    let error = asupersync::time::timeout(
+                        cx.now(), std::time::Duration::from_secs(5), waiting,
+                    )
+                    .await
+                    .expect("contact admission watchdog")
+                    .expect_err("retirement wins before contact admission");
+                    assert!(matches!(
+                        error,
+                        asupersync::OutcomeError::Err(DbError::InvalidArgument {
+                            field: "agent_retired",
+                            ..
+                        })
+                    ));
+                    let (outgoing, incoming) = list_contacts(
+                        &cx, &pool, project_id, from_agent_id,
+                    )
+                    .await
+                    .into_result()
+                    .expect("unchanged contact history");
+                    assert!(incoming.is_empty());
+                    assert_eq!(
+                        serde_json::to_value(outgoing).unwrap(),
+                        serde_json::json!([original])
+                    );
+                });
+            }
+        }
     }
 
     #[test]
