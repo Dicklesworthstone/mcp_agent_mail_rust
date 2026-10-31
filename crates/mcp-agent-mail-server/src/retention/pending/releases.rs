@@ -392,7 +392,7 @@ async fn apply_release(
         Vec::new()
     } else {
         db_value(
-            queries::release_reservations_with_created_cutoff(
+            queries::release_reservations_with_replay_cutoffs(
                 ctx.cx(),
                 pool,
                 project_id,
@@ -400,6 +400,8 @@ async fn apply_release(
                 None,
                 Some(&ids),
                 Some(intent.created_ts),
+                (intent.paths.is_none() && intent.file_reservation_ids.is_none())
+                    .then_some(intent.created_ts),
             )
             .await,
         )?

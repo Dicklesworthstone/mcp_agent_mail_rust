@@ -15589,6 +15589,7 @@ struct ReleaseReservationScope {
     project_id: i64,
     agent_id: i64,
     created_at_or_before: Option<i64>,
+    agent_last_active_at_or_before: Option<i64>,
 }
 
 /// Database evidence captured before a stale-reservation filesystem/git probe.
@@ -15736,8 +15737,7 @@ pub fn release_reservations<'a>(
 ///
 /// The final write transaction rechecks the owner and cutoff: candidate IDs
 /// selected before a concurrent replacement are never sufficient authority.
-/// `None` retains the ordinary direct-release behavior.
-#[allow(clippy::too_many_lines, clippy::must_use_candidate)]
+#[allow(clippy::must_use_candidate)]
 pub fn release_reservations_with_created_cutoff<'a>(
     cx: &'a Cx,
     pool: &'a DbPool,
@@ -15746,6 +15746,41 @@ pub fn release_reservations_with_created_cutoff<'a>(
     paths: Option<&'a [&'a str]>,
     reservation_ids: Option<&'a [i64]>,
     created_at_or_before: Option<i64>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
+> {
+    release_reservations_with_replay_cutoffs(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        paths,
+        reservation_ids,
+        created_at_or_before,
+        None,
+    )
+}
+
+/// Release reservations with creation and optional holder-activity cutoffs.
+///
+/// Broad durable intents carry an activity cutoff: a revived holder may have
+/// renewed old leases in place, without changing their creation times. Both
+/// cutoffs are rechecked inside the final write transaction on every retry.
+/// Direct and explicitly scoped releases pass no activity cutoff.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::must_use_candidate
+)]
+pub fn release_reservations_with_replay_cutoffs<'a>(
+    cx: &'a Cx,
+    pool: &'a DbPool,
+    project_id: i64,
+    agent_id: i64,
+    paths: Option<&'a [&'a str]>,
+    reservation_ids: Option<&'a [i64]>,
+    created_at_or_before: Option<i64>,
+    agent_last_active_at_or_before: Option<i64>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
 > {
@@ -15762,7 +15797,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                 ReleaseReservationChunkTarget::ReservationIds => {
                     if let Some(ids) = reservation_ids {
                         for chunk in ids.chunks(chunk_size) {
-                            let rows = match release_reservations_with_created_cutoff(
+                            let rows = match release_reservations_with_replay_cutoffs(
                                 cx,
                                 pool,
                                 project_id,
@@ -15770,6 +15805,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                                 paths,
                                 Some(chunk),
                                 created_at_or_before,
+                                agent_last_active_at_or_before,
                             )
                             .await
                             {
@@ -15785,7 +15821,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                 ReleaseReservationChunkTarget::Paths => {
                     if let Some(pats) = paths {
                         for chunk in pats.chunks(chunk_size) {
-                            let rows = match release_reservations_with_created_cutoff(
+                            let rows = match release_reservations_with_replay_cutoffs(
                                 cx,
                                 pool,
                                 project_id,
@@ -15793,6 +15829,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                                 Some(chunk),
                                 reservation_ids,
                                 created_at_or_before,
+                                agent_last_active_at_or_before,
                             )
                             .await
                             {
@@ -15909,6 +15946,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
             project_id,
             agent_id,
             created_at_or_before,
+            agent_last_active_at_or_before,
         };
         let released_markers = match release_reservations_by_ids_with_constraints(
             cx,
@@ -15973,6 +16011,37 @@ async fn release_reservations_by_ids_with_constraints(
         // v14), and every active-reservation read already depends on it, so
         // the release transaction runs no DDL of its own.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        if let Some(scope) = scope
+            && let Some(cutoff) = scope.agent_last_active_at_or_before
+        {
+            // A broad degraded closeout belongs to the session that queued it.
+            // Recheck durable activity after checkout and on every retry, in
+            // the same writer transaction as the release ledger updates. The
+            // tool/worker's earlier agent row cannot authorize later revocation.
+            let holder = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_query(
+                        cx,
+                        &tracked,
+                        "SELECT 1 FROM agents WHERE id = ? AND project_id = ? \
+                         AND last_active_ts <= ? LIMIT 1",
+                        &[
+                            Value::BigInt(scope.agent_id),
+                            Value::BigInt(scope.project_id),
+                            Value::BigInt(cutoff),
+                        ],
+                    )
+                    .await,
+                )
+            );
+            if holder.is_empty() {
+                try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+                return Outcome::Ok(Vec::new());
+            }
+        }
 
         let mut release_marker = now_micros();
         let mut released = Vec::with_capacity(ids.len());
@@ -30326,6 +30395,7 @@ mod tests {
                     project_id,
                     agent_id: holder_id,
                     created_at_or_before: Some(cutoff),
+                    agent_last_active_at_or_before: None,
                 }),
                 None,
             )
@@ -30367,6 +30437,173 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn broad_release_rechecks_revival_after_waiting_for_final_write_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for revived in [false, true] {
+            let (_cx, pool, _dir) = setup_test_pool(&format!("broad-release-revival-{revived}.db"));
+            let revival_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("independent revival pool");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project_id = ensure_project(&cx, &pool, "/tmp/broad-release-revival")
+                    .await
+                    .into_result()
+                    .expect("project")
+                    .id
+                    .unwrap();
+                let holder = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("holder");
+                let agent_id = holder.id.unwrap();
+                let original = create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/renewed.rs"],
+                    3600,
+                    true,
+                    "original session",
+                )
+                .await
+                .into_result()
+                .expect("original lease");
+                let ids = [original[0].id.unwrap()];
+                let cutoff = now_micros();
+                assert!(holder.last_active_ts <= cutoff);
+                assert!(original[0].created_ts <= cutoff);
+                drop(
+                    revival_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("initialize independent pool"),
+                );
+
+                // Candidate selection has already happened. Hold the only
+                // checkout so a durable heartbeat and renewal can commit
+                // after that observation but before the release transaction.
+                let held = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("sole checkout");
+                let mut waiting = std::pin::pin!(release_reservations_by_ids_with_constraints(
+                    &cx,
+                    &pool,
+                    &ids,
+                    ReleaseReservationExpiryConstraint::Any,
+                    Some(ReleaseReservationScope {
+                        project_id,
+                        agent_id,
+                        created_at_or_before: Some(cutoff),
+                        agent_last_active_at_or_before: Some(cutoff),
+                    }),
+                    None,
+                ));
+                {
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                }
+                let renewed = if revived {
+                    assert!(
+                        touch_agent(&cx, &revival_pool, agent_id)
+                            .await
+                            .into_result()
+                            .expect("durable revival heartbeat")
+                    );
+                    let renewed = renew_reservations(
+                        &cx,
+                        &revival_pool,
+                        project_id,
+                        agent_id,
+                        600,
+                        None,
+                        Some(&ids),
+                    )
+                    .await
+                    .into_result()
+                    .expect("renew older lease while release waits");
+                    assert_eq!(renewed.len(), 1);
+                    assert_eq!(renewed[0].created_ts, original[0].created_ts);
+                    assert!(renewed[0].expires_ts > original[0].expires_ts);
+                    let conn = revival_pool.acquire(&cx).await.into_result().unwrap();
+                    let activity = conn
+                        .query_sync(
+                            "SELECT last_active_ts FROM agents WHERE id = ?",
+                            &[Value::BigInt(agent_id)],
+                        )
+                        .expect("persisted revival");
+                    assert!(activity[0].get_named::<i64>("last_active_ts").unwrap() > cutoff);
+                    renewed
+                } else {
+                    original.clone()
+                };
+                drop(held);
+                let released =
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), waiting)
+                        .await
+                        .expect("release admission watchdog")
+                        .into_result()
+                        .expect("broad release replay");
+                assert_eq!(released.len(), usize::from(!revived));
+
+                let retained = get_reservations_by_ids(&cx, &pool, &ids)
+                    .await
+                    .into_result()
+                    .expect("read lease after release decision");
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let ledger = conn
+                    .query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+                    .expect("release ledger");
+                assert_eq!(ledger.len(), usize::from(!revived));
+                drop(conn);
+                if revived {
+                    assert_eq!(
+                        serde_json::to_value(&retained).unwrap(),
+                        serde_json::to_value(&renewed).unwrap(),
+                        "refused broad replay leaves the renewed lease unchanged"
+                    );
+                    let narrow = release_reservations_with_created_cutoff(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_id,
+                        None,
+                        Some(&ids),
+                        Some(cutoff),
+                    )
+                    .await
+                    .into_result()
+                    .expect("explicit older intent still owns its exact lease scope");
+                    assert_eq!(narrow.len(), 1);
+                    assert_eq!(narrow[0].id, Some(ids[0]));
+                } else {
+                    assert_eq!(released[0].id, ids[0]);
+                    assert!(retained[0].released_ts.is_some());
+                }
+            });
+        }
     }
 
     #[test]
@@ -35703,8 +35940,15 @@ mod tests {
                             .id
                             .unwrap();
                         let from_agent_id = register_agent(
-                            &cx, &pool, from_project_id, "BlueLake", "test", "test",
-                            None, None, None,
+                            &cx,
+                            &pool,
+                            from_project_id,
+                            "BlueLake",
+                            "test",
+                            "test",
+                            None,
+                            None,
+                            None,
                         )
                         .await
                         .into_result()
@@ -35712,8 +35956,15 @@ mod tests {
                         .id
                         .unwrap();
                         let to_agent_id = register_agent(
-                            &cx, &pool, to_project_id, "GreenStone", "test", "test",
-                            None, None, None,
+                            &cx,
+                            &pool,
+                            to_project_id,
+                            "GreenStone",
+                            "test",
+                            "test",
+                            None,
+                            None,
+                            None,
                         )
                         .await
                         .into_result()
@@ -35721,16 +35972,28 @@ mod tests {
                         .id
                         .unwrap();
                         let mut original = request_contact(
-                            &cx, &pool, from_project_id, from_agent_id,
-                            to_project_id, to_agent_id, "original", 3600,
+                            &cx,
+                            &pool,
+                            from_project_id,
+                            from_agent_id,
+                            to_project_id,
+                            to_agent_id,
+                            "original",
+                            3600,
                         )
                         .await
                         .into_result()
                         .expect("active cross-project request");
                         if initial_status != "pending" {
                             original = respond_contact(
-                                &cx, &pool, from_project_id, from_agent_id,
-                                to_project_id, to_agent_id, initial_status == "approved", 3600,
+                                &cx,
+                                &pool,
+                                from_project_id,
+                                from_agent_id,
+                                to_project_id,
+                                to_agent_id,
+                                initial_status == "approved",
+                                3600,
                             )
                             .await
                             .into_result()
@@ -35745,26 +36008,54 @@ mod tests {
                         ] {
                             assert!(matches!(
                                 request_contact(
-                                    &cx, &pool, wrong_from, from_agent_id,
-                                    wrong_to, to_agent_id, "wrong project", 7200,
-                                ).await,
-                                Outcome::Err(DbError::NotFound { entity: "Agent", .. })
+                                    &cx,
+                                    &pool,
+                                    wrong_from,
+                                    from_agent_id,
+                                    wrong_to,
+                                    to_agent_id,
+                                    "wrong project",
+                                    7200,
+                                )
+                                .await,
+                                Outcome::Err(DbError::NotFound {
+                                    entity: "Agent",
+                                    ..
+                                })
                             ));
                             assert!(matches!(
                                 respond_contact(
-                                    &cx, &pool, wrong_from, from_agent_id,
-                                    wrong_to, to_agent_id, true, 7200,
-                                ).await,
-                                Outcome::Err(DbError::NotFound { entity: "Agent", .. })
+                                    &cx,
+                                    &pool,
+                                    wrong_from,
+                                    from_agent_id,
+                                    wrong_to,
+                                    to_agent_id,
+                                    true,
+                                    7200,
+                                )
+                                .await,
+                                Outcome::Err(DbError::NotFound {
+                                    entity: "Agent",
+                                    ..
+                                })
                             ));
                         }
-                        let inactive_id = if inactive_sender { from_agent_id } else { to_agent_id };
+                        let inactive_id = if inactive_sender {
+                            from_agent_id
+                        } else {
+                            to_agent_id
+                        };
                         let expected_field = if permanent {
-                            let deregistered = deregister_agent(&cx, &pool, inactive_id, now_micros())
-                                .await
-                                .into_result()
-                                .expect("deregister participant");
-                            assert!(deregistered.retired_at.is_none(), "ledger-only lifecycle state");
+                            let deregistered =
+                                deregister_agent(&cx, &pool, inactive_id, now_micros())
+                                    .await
+                                    .into_result()
+                                    .expect("deregister participant");
+                            assert!(
+                                deregistered.retired_at.is_none(),
+                                "ledger-only lifecycle state"
+                            );
                             "agent_deregistered"
                         } else {
                             set_agent_retired_at(&cx, &pool, inactive_id, Some(now_micros()))
@@ -35810,10 +36101,11 @@ mod tests {
 
                         // Refused mutations must leave all link fields unchanged,
                         // and retirement must not hide historical contact metadata.
-                        let source_history = list_contacts(&cx, &pool, from_project_id, from_agent_id)
-                            .await
-                            .into_result()
-                            .expect("requester history");
+                        let source_history =
+                            list_contacts(&cx, &pool, from_project_id, from_agent_id)
+                                .await
+                                .into_result()
+                                .expect("requester history");
                         let target_history = list_contacts(&cx, &pool, to_project_id, to_agent_id)
                             .await
                             .into_result()
@@ -35835,15 +36127,27 @@ mod tests {
                                 .into_result()
                                 .expect("explicitly unretire");
                             request_contact(
-                                &cx, &pool, from_project_id, from_agent_id,
-                                to_project_id, to_agent_id, "resumed", 3600,
+                                &cx,
+                                &pool,
+                                from_project_id,
+                                from_agent_id,
+                                to_project_id,
+                                to_agent_id,
+                                "resumed",
+                                3600,
                             )
                             .await
                             .into_result()
                             .expect("unretired participant can request");
                             respond_contact(
-                                &cx, &pool, from_project_id, from_agent_id,
-                                to_project_id, to_agent_id, true, 3600,
+                                &cx,
+                                &pool,
+                                from_project_id,
+                                from_agent_id,
+                                to_project_id,
+                                to_agent_id,
+                                true,
+                                3600,
                             )
                             .await
                             .into_result()
@@ -35896,7 +36200,15 @@ mod tests {
                     from_project_id
                 };
                 let from_agent_id = register_agent(
-                    &cx, &pool, from_project_id, "BlueLake", "test", "test", None, None, None,
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    "BlueLake",
+                    "test",
+                    "test",
+                    None,
+                    None,
+                    None,
                 )
                 .await
                 .into_result()
@@ -35904,7 +36216,15 @@ mod tests {
                 .id
                 .unwrap();
                 let to_agent_id = register_agent(
-                    &cx, &pool, to_project_id, "GreenStone", "test", "test", None, None, None,
+                    &cx,
+                    &pool,
+                    to_project_id,
+                    "GreenStone",
+                    "test",
+                    "test",
+                    None,
+                    None,
+                    None,
                 )
                 .await
                 .into_result()
@@ -35912,45 +36232,78 @@ mod tests {
                 .id
                 .unwrap();
                 let requested = request_contact(
-                    &cx, &pool, from_project_id, from_agent_id, to_project_id, to_agent_id,
-                    "request observed before the block", 3600,
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    "request observed before the block",
+                    3600,
                 )
                 .await
                 .into_result()
                 .expect("pending request");
                 assert_eq!(requested.status, "pending");
                 let reverse = request_contact(
-                    &cx, &pool, to_project_id, to_agent_id, from_project_id, from_agent_id,
-                    "independent reverse request", 1800,
+                    &cx,
+                    &pool,
+                    to_project_id,
+                    to_agent_id,
+                    from_project_id,
+                    from_agent_id,
+                    "independent reverse request",
+                    1800,
                 )
                 .await
                 .into_result()
                 .expect("reverse link");
-                drop(recipient_pool.acquire(&cx).await.into_result().expect("warm recipient"));
-                let held = pool.acquire(&cx).await.into_result().expect("hold sole checkout");
+                drop(
+                    recipient_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("warm recipient"),
+                );
+                let held = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("hold sole checkout");
                 let mut waiting = std::pin::pin!(approve_contact_unless_blocked(
-                    &cx, &pool, from_project_id, from_agent_id, to_project_id, to_agent_id, 7200,
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    7200,
                 ));
                 {
                     let mut context = Context::from_waker(Waker::noop());
                     assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
                 }
                 let (_, blocked) = respond_contact(
-                    &cx, &recipient_pool, from_project_id, from_agent_id,
-                    to_project_id, to_agent_id, false, 7200,
+                    &cx,
+                    &recipient_pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    false,
+                    7200,
                 )
                 .await
                 .into_result()
                 .expect("recipient blocks after the request snapshot");
                 assert_eq!(blocked.status, "blocked");
                 drop(held);
-                let (updated, observed) = asupersync::time::timeout(
-                    cx.now(), std::time::Duration::from_secs(5), waiting,
-                )
-                .await
-                .expect("automatic approval watchdog")
-                .into_result()
-                .expect("automatic approval returns the preserved block");
+                let (updated, observed) =
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), waiting)
+                        .await
+                        .expect("automatic approval watchdog")
+                        .into_result()
+                        .expect("automatic approval returns the preserved block");
                 assert_eq!(updated, 0);
                 assert_eq!(
                     serde_json::to_value(&observed).unwrap(),
@@ -35961,12 +36314,24 @@ mod tests {
                     .await
                     .into_result()
                     .expect("preserved directed history");
-                assert_eq!(serde_json::to_value(history.0).unwrap(), serde_json::json!([blocked]));
-                assert_eq!(serde_json::to_value(history.1).unwrap(), serde_json::json!([reverse]));
+                assert_eq!(
+                    serde_json::to_value(history.0).unwrap(),
+                    serde_json::json!([blocked])
+                );
+                assert_eq!(
+                    serde_json::to_value(history.1).unwrap(),
+                    serde_json::json!([reverse])
+                );
 
                 let (updated, approved) = respond_contact(
-                    &cx, &pool, from_project_id, from_agent_id,
-                    to_project_id, to_agent_id, true, 3600,
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    true,
+                    3600,
                 )
                 .await
                 .into_result()
@@ -36019,7 +36384,15 @@ mod tests {
                     .id
                     .unwrap();
                     let to_agent_id = register_agent(
-                        &cx, &pool, project_id, "GreenStone", "test", "test", None, None, None,
+                        &cx,
+                        &pool,
+                        project_id,
+                        "GreenStone",
+                        "test",
+                        "test",
+                        None,
+                        None,
+                        None,
                     )
                     .await
                     .into_result()
@@ -36027,8 +36400,14 @@ mod tests {
                     .id
                     .unwrap();
                     let original = request_contact(
-                        &cx, &pool, project_id, from_agent_id, project_id, to_agent_id,
-                        "original", 3600,
+                        &cx,
+                        &pool,
+                        project_id,
+                        from_agent_id,
+                        project_id,
+                        to_agent_id,
+                        "original",
+                        3600,
                     )
                     .await
                     .into_result()
@@ -36044,23 +36423,42 @@ mod tests {
                         .expect("tool-level lookup");
                     assert!(resolved.retired_at.is_none());
                     drop(
-                        lifecycle_pool.acquire(&cx).await.into_result()
+                        lifecycle_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
                             .expect("initialize lifecycle pool"),
                     );
-                    let held = pool.acquire(&cx).await.into_result().expect("hold sole checkout");
+                    let held = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("hold sole checkout");
                     let mut waiting = std::pin::pin!(async {
                         if responding {
                             respond_contact(
-                                &cx, &pool, project_id, from_agent_id, project_id, to_agent_id,
-                                true, 7200,
+                                &cx,
+                                &pool,
+                                project_id,
+                                from_agent_id,
+                                project_id,
+                                to_agent_id,
+                                true,
+                                7200,
                             )
                             .await
                             .into_result()
                             .map(|(_, row)| row)
                         } else {
                             request_contact(
-                                &cx, &pool, project_id, from_agent_id, project_id, to_agent_id,
-                                "queued refresh", 7200,
+                                &cx,
+                                &pool,
+                                project_id,
+                                from_agent_id,
+                                project_id,
+                                to_agent_id,
+                                "queued refresh",
+                                7200,
                             )
                             .await
                             .into_result()
@@ -36078,7 +36476,9 @@ mod tests {
                         .expect("retire while contact mutation waits");
                     drop(held);
                     let error = asupersync::time::timeout(
-                        cx.now(), std::time::Duration::from_secs(5), waiting,
+                        cx.now(),
+                        std::time::Duration::from_secs(5),
+                        waiting,
                     )
                     .await
                     .expect("contact admission watchdog")
@@ -36090,12 +36490,10 @@ mod tests {
                             ..
                         })
                     ));
-                    let (outgoing, incoming) = list_contacts(
-                        &cx, &pool, project_id, from_agent_id,
-                    )
-                    .await
-                    .into_result()
-                    .expect("unchanged contact history");
+                    let (outgoing, incoming) = list_contacts(&cx, &pool, project_id, from_agent_id)
+                        .await
+                        .into_result()
+                        .expect("unchanged contact history");
                     assert!(incoming.is_empty());
                     assert_eq!(
                         serde_json::to_value(outgoing).unwrap(),

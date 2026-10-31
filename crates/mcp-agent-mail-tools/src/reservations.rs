@@ -1229,7 +1229,10 @@ fn queued_release_intent_response(
     .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
-const fn db_error_supports_release_intent(error: &DbError) -> bool {
+fn db_error_supports_release_intent(error: &DbError) -> bool {
+    if let DbError::RetryBudgetExhausted { inner, .. } = error {
+        return db_error_supports_release_intent(inner);
+    }
     matches!(
         error,
         DbError::Pool(_)
@@ -1352,7 +1355,7 @@ async fn replay_single_release_intent(
     // A durable release expresses the leases held when it was queued, not a
     // standing instruction to release this agent's future work. Enforce its
     // timestamp in the DB write transaction as well as the current filters.
-    let released_rows = match mcp_agent_mail_db::queries::release_reservations_with_created_cutoff(
+    let released_rows = match mcp_agent_mail_db::queries::release_reservations_with_replay_cutoffs(
         ctx.cx(),
         pool,
         project_id,
@@ -1360,6 +1363,8 @@ async fn replay_single_release_intent(
         None,
         ids_to_release.as_deref(),
         Some(intent.created_ts),
+        (intent.paths.is_none() && intent.file_reservation_ids.is_none())
+            .then_some(intent.created_ts),
     )
     .await
     {
@@ -2728,7 +2733,12 @@ async fn file_reservation_paths_with_pool(
     );
 
     serde_json::to_string(&response)
-        .map(|json| Some(crate::idempotency::with_replay_marker(json, idempotent_replay)))
+        .map(|json| {
+            Some(crate::idempotency::with_replay_marker(
+                json,
+                idempotent_replay,
+            ))
+        })
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -3829,7 +3839,10 @@ mod tests {
             // runtime thread proves the tool does not borrow that authority.
             let reader = scope.spawn(move || {
                 let result = run_async(|cx| async move { f(McpContext::new(cx, 2)).await });
-                assert!(done_tx.send(result).is_ok(), "return reservation retry result");
+                assert!(
+                    done_tx.send(result).is_ok(),
+                    "return reservation retry result"
+                );
             });
             let result = done_rx.recv_timeout(Duration::from_secs(5));
             let held = current_thread_holds_promotion_barrier();
@@ -3849,7 +3862,11 @@ mod tests {
         pool: &DbPool,
         project_id: i64,
     ) -> Vec<(i64, i64)> {
-        let conn = pool.acquire(cx).await.into_result().expect("activity reader");
+        let conn = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("activity reader");
         conn.query_sync(
             "SELECT id, last_active_ts FROM agents WHERE project_id = ? ORDER BY id",
             &[project_id.into()],
@@ -4977,7 +4994,10 @@ mod tests {
                     )
                     .await
                     .expect("a read-probe miss must not enter mutation or archive healing");
-                    assert!(missing.is_none(), "a missing key needs normal write admission");
+                    assert!(
+                        missing.is_none(),
+                        "a missing key needs normal write admission"
+                    );
 
                     file_reservation_paths(
                         &retry_ctx,
@@ -7246,6 +7266,20 @@ mod tests {
                         .all(|row| row.created_ts > intent.created_ts),
                     "new grants must follow the durable intent, without clock sleeps"
                 );
+                if filter == "all" {
+                    // Isolate the creation boundary from session revival. The
+                    // separate foreground regression below exercises a real
+                    // re-registration and renewal after a broad intent.
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    conn.execute_sync(
+                        "UPDATE agents SET last_active_ts = ? WHERE id = ?",
+                        &[
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(intent.created_ts),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id),
+                        ],
+                    )
+                    .expect("creation-cutoff fixture keeps its original session");
+                }
 
                 mcp_agent_mail_storage::wbq_flush();
                 mcp_agent_mail_storage::flush_async_commits();
@@ -7336,6 +7370,165 @@ mod tests {
     #[test]
     fn replay_release_intent_preserves_later_same_agent_leases_id_filtered() {
         assert_release_replay_preserves_later_same_agent_leases("ids");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn foreground_release_replay_preserves_a_revived_holders_renewed_lease() {
+        for revived in [false, true] {
+            with_serialized_reservations(|| {
+                run_async(|cx| async move {
+                    let config = Config::get();
+                    let pool = get_db_pool().expect("mailbox pool");
+                    let project_key = format!("/tmp/release-revival-{revived}-{}", unique_suffix());
+                    let project = ensure_project(&cx, &pool, &project_key).await;
+                    let project_id = project.id.unwrap();
+                    let holder = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let trigger = register_agent(&cx, &pool, project_id, "GreenStone").await;
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let granted = keyed_reservation_response(
+                        &ctx,
+                        &project_key,
+                        &holder.name,
+                        &["src/held.rs"],
+                        None,
+                    )
+                    .await;
+                    let id = granted["granted"][0]["id"].as_i64().unwrap();
+                    let original = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                        .await
+                        .into_result()
+                        .expect("original lease");
+                    append_release_intent(
+                        &config,
+                        &project_key,
+                        &holder.name,
+                        None,
+                        None,
+                        "release_reservations",
+                        "database is locked",
+                    )
+                    .expect("queue original session's broad closeout");
+                    let intent = read_queued_release_intents(&config).unwrap().remove(0);
+                    assert!(original[0].created_ts <= intent.created_ts);
+                    if revived {
+                        // Registration persists a new session heartbeat even
+                        // when the normal tool-touch throttle is still warm.
+                        let returning = register_agent(&cx, &pool, project_id, &holder.name).await;
+                        assert_eq!(returning.id, holder.id);
+                        assert!(returning.last_active_ts > intent.created_ts);
+                        let renewal = renew_file_reservations(
+                            &ctx,
+                            project_key.clone(),
+                            holder.name.clone(),
+                            Some(600),
+                            None,
+                            Some(vec![id]),
+                        )
+                        .await
+                        .expect("real tool renews older lease after revival");
+                        let renewal: Value = serde_json::from_str(&renewal).unwrap();
+                        assert_eq!(renewal["renewed"], 1);
+                    }
+                    let before = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                        .await
+                        .into_result()
+                        .expect("lease before foreground replay");
+                    assert_eq!(before[0].created_ts, original[0].created_ts);
+                    if revived {
+                        assert!(before[0].expires_ts > original[0].expires_ts);
+                    }
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let directory = config
+                        .storage_root
+                        .join("projects")
+                        .join(&project.slug)
+                        .join("file_reservations");
+                    let artifact =
+                        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                            &directory, id,
+                        )
+                        .expect("live lease artifact");
+                    let active_bytes = std::fs::read(&artifact).unwrap();
+
+                    // Another actor's valid empty release triggers the actual
+                    // foreground replay path without touching this holder.
+                    let response = release_file_reservations(
+                        &ctx,
+                        project_key.clone(),
+                        trigger.name.clone(),
+                        None,
+                        Some(vec![]),
+                    )
+                    .await
+                    .expect("foreground replay trigger");
+                    let response: Value = serde_json::from_str(&response).unwrap();
+                    assert_eq!(response["released"], 0);
+                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let after = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                        .await
+                        .into_result()
+                        .expect("authoritative lease after replay");
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    let ledger = conn
+                        .query_sync(
+                            "SELECT reservation_id FROM file_reservation_releases \
+                             WHERE reservation_id = ?",
+                            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(id)],
+                        )
+                        .expect("release ledger");
+                    assert_eq!(ledger.len(), usize::from(!revived));
+                    drop(conn);
+                    if revived {
+                        assert_eq!(
+                            serde_json::to_value(after).unwrap(),
+                            serde_json::to_value(before).unwrap(),
+                            "an older broad closeout cannot revoke renewed work"
+                        );
+                        assert_eq!(std::fs::read(&artifact).unwrap(), active_bytes);
+                        // A later explicitly scoped durable release still has
+                        // authority over this exact older lease.
+                        append_release_intent(
+                            &config,
+                            &project_key,
+                            &holder.name,
+                            None,
+                            Some(vec![id]),
+                            "release_reservations",
+                            "database is locked",
+                        )
+                        .expect("queue narrow closeout after revival");
+                        release_file_reservations(
+                            &ctx,
+                            project_key.clone(),
+                            trigger.name.clone(),
+                            None,
+                            Some(vec![]),
+                        )
+                        .await
+                        .expect("narrow intent remains replayable");
+                        assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    } else {
+                        assert!(after[0].released_ts.is_some());
+                    }
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let released: Value =
+                        serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+                    assert!(released["released_ts"].as_str().is_some());
+                    assert!(
+                        queries::get_active_reservations(&cx, &pool, project_id)
+                            .await
+                            .into_result()
+                            .unwrap()
+                            .is_empty()
+                    );
+                });
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7814,6 +8007,283 @@ mod tests {
                 1
             );
         });
+    }
+
+    #[test]
+    fn release_retry_exhaustion_preserves_the_inner_error_policy() {
+        let wrap = |inner| DbError::RetryBudgetExhausted {
+            operation: "release_reservations_select",
+            attempts: 1,
+            budget: 1,
+            elapsed_ms: 0,
+            inner: Box::new(inner),
+        };
+        assert!(db_error_supports_release_intent(&wrap(wrap(
+            DbError::ResourceBusy("database is locked".to_string())
+        ))));
+        for error in [
+            DbError::not_found("Agent", "missing"),
+            DbError::invalid("paths", "invalid release scope"),
+            DbError::Internal("unclassified failure".to_string()),
+        ] {
+            assert!(!db_error_supports_release_intent(&wrap(wrap(error))));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn release_retry_exhaustion_keeps_intents_until_database_recovers() {
+        // Retry settings are process-wide LazyLocks. Use a private process to
+        // exercise actual native writer contention with a single attempt.
+        const CHILD: &str = "AM_TEST_RELEASE_RETRY_EXHAUSTION_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .env("FSQLITE_CONCURRENT_RETRIES", "0")
+                .env("FSQLITE_CONCURRENT_MODE", "false")
+                .output()
+                .expect("run isolated release contention test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated release contention test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        crate::test_support::with_isolated_mailbox(
+            &RESERVATION_TEST_LOCK,
+            "release-retry-exhaustion",
+            &[
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("FSQLITE_CONCURRENT_RETRIES", "0"),
+                ("FSQLITE_CONCURRENT_MODE", "false"),
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+            ],
+            |mailbox| {
+                run_async(|cx| async move {
+                    let config = Config::get();
+                    let pool = get_db_pool().expect("real mailbox pool");
+                    let project = ensure_project(&cx, &pool, "/tmp/release-retry-exhaustion").await;
+                    let project_id = project.id.unwrap();
+                    let holder = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let peer = register_agent(&cx, &pool, project_id, "GreenStone").await;
+                    let holder_ctx =
+                        McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+                    let peer_ctx =
+                        McpContext::with_state(cx.clone(), 2, fastmcp_core::SessionState::new());
+                    crate::session_identity::bind(
+                        &holder_ctx,
+                        project_id,
+                        holder.id.unwrap(),
+                        &holder.name,
+                    );
+                    crate::session_identity::bind(
+                        &peer_ctx,
+                        project_id,
+                        peer.id.unwrap(),
+                        &peer.name,
+                    );
+                    let grant = keyed_reservation_response(
+                        &holder_ctx,
+                        &project.human_key,
+                        &holder.name,
+                        &["src/owned.rs"],
+                        None,
+                    )
+                    .await;
+                    let id = grant["granted"][0]["id"].as_i64().unwrap();
+                    let peer_grant = keyed_reservation_response(
+                        &peer_ctx,
+                        &project.human_key,
+                        &peer.name,
+                        &["src/peer.rs"],
+                        None,
+                    )
+                    .await;
+                    let peer_id = peer_grant["granted"][0]["id"].as_i64().unwrap();
+                    let before = queries::get_reservations_by_ids(&cx, &pool, &[id, peer_id])
+                        .await
+                        .into_result()
+                        .expect("original leases");
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let directory = config
+                        .storage_root
+                        .join("projects")
+                        .join(&project.slug)
+                        .join("file_reservations");
+                    let artifacts: Vec<_> = [id, peer_id].into_iter().map(|id| {
+                        let path = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                            &directory, id,
+                        ).expect("active lease artifact");
+                        let bytes = std::fs::read(&path).unwrap();
+                        (path, bytes)
+                    }).collect();
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("warm sole checkout");
+                    conn.execute_sync("PRAGMA busy_timeout = 0", &[])
+                        .expect("bounded native lock failure");
+                    drop(conn);
+                    let blocker = mcp_agent_mail_db::DbConn::open_file(
+                        mailbox.database_path.to_str().unwrap(),
+                    )
+                    .expect("independent native writer");
+                    blocker
+                        .execute_raw("BEGIN IMMEDIATE")
+                        .expect("hold writer lock");
+
+                    let error = match queries::release_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        holder.id.unwrap(),
+                        None,
+                        Some(&[id]),
+                    )
+                    .await
+                    {
+                        Outcome::Err(error) => error,
+                        other => panic!("competing writer must exhaust the release: {other:?}"),
+                    };
+                    assert!(
+                        matches!(
+                            &error,
+                            DbError::RetryBudgetExhausted {
+                                operation: "release_reservations_select",
+                                attempts: 1,
+                                budget: 1,
+                                ..
+                            }
+                        ),
+                        "expected real native retry exhaustion, got {error:?}"
+                    );
+                    let unauthorized = release_file_reservations(
+                        &holder_ctx,
+                        project.human_key.clone(),
+                        peer.name.clone(),
+                        None,
+                        Some(vec![peer_id]),
+                    )
+                    .await
+                    .expect_err("contention cannot authorize another holder's release");
+                    assert_eq!(
+                        crate::tool_error_code(&unauthorized),
+                        Some("SESSION_IDENTITY_MISMATCH")
+                    );
+                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    let response = release_file_reservations(
+                        &holder_ctx,
+                        project.human_key.clone(),
+                        holder.name.clone(),
+                        None,
+                        Some(vec![id]),
+                    )
+                    .await
+                    .expect("actual exhausted release must queue durably");
+                    let response: Value = serde_json::from_str(&response).unwrap();
+                    assert_eq!(response["queued"], true);
+                    assert_eq!(response["released"], 0);
+                    let pending = read_queued_release_intents(&config).unwrap();
+                    assert_eq!(pending.len(), 1);
+                    assert_eq!(pending[0].failure.stage, "release_reservations");
+                    assert!(
+                        pending[0]
+                            .failure
+                            .error_detail
+                            .contains("retry budget exhausted")
+                    );
+                    replay_queued_release_intents(&holder_ctx, &pool, &config).await;
+                    assert_eq!(read_queued_release_intents(&config).unwrap(), pending);
+                    let log = release_intent_log_path(&config);
+                    let read_markers = || {
+                        std::fs::read_to_string(&log)
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                            .filter(|record| record["kind"] == RELEASE_INTENT_REPLAY_KIND)
+                            .collect::<Vec<_>>()
+                    };
+                    let failed = read_markers();
+                    assert_eq!(failed.len(), 1);
+                    assert_eq!(failed[0]["status"], "failed");
+                    assert!(
+                        failed[0]["error_detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("retry budget exhausted")
+                    );
+                    let unchanged = queries::get_reservations_by_ids(&cx, &pool, &[id, peer_id])
+                        .await
+                        .into_result()
+                        .expect("read while writer is held");
+                    assert_eq!(
+                        serde_json::to_value(&unchanged).unwrap(),
+                        serde_json::to_value(&before).unwrap()
+                    );
+                    for (path, bytes) in &artifacts {
+                        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                    }
+
+                    blocker
+                        .execute_raw("ROLLBACK")
+                        .expect("release native writer lock");
+                    drop(blocker);
+                    release_file_reservations(
+                        &peer_ctx,
+                        project.human_key.clone(),
+                        peer.name.clone(),
+                        None,
+                        Some(vec![]),
+                    )
+                    .await
+                    .expect("successful tool call replays the accepted closeout");
+                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    let completed = read_markers();
+                    assert_eq!(completed.len(), 2);
+                    assert_eq!(completed[1]["status"], "replayed");
+                    assert_eq!(completed[1]["released"], 1);
+                    assert_eq!(completed[1]["intent_id"], pending[0].intent_id);
+                    assert_eq!(
+                        completed[1]["intent_content_sha256"],
+                        pending[0].content_sha256
+                    );
+                    let after = queries::get_reservations_by_ids(&cx, &pool, &[id, peer_id])
+                        .await
+                        .into_result()
+                        .expect("recovered authoritative leases");
+                    let released = after.iter().find(|row| row.id == Some(id)).unwrap();
+                    assert!(released.released_ts.is_some());
+                    let retained = after.iter().find(|row| row.id == Some(peer_id)).unwrap();
+                    let original_peer = before.iter().find(|row| row.id == Some(peer_id)).unwrap();
+                    assert_eq!(
+                        serde_json::to_value(retained).unwrap(),
+                        serde_json::to_value(original_peer).unwrap()
+                    );
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let archived: Value =
+                        serde_json::from_slice(&std::fs::read(&artifacts[0].0).unwrap()).unwrap();
+                    assert!(archived["released_ts"].as_str().is_some());
+                    assert_eq!(std::fs::read(&artifacts[1].0).unwrap(), artifacts[1].1);
+                    replay_queued_release_intents(&holder_ctx, &pool, &config).await;
+                    assert_eq!(
+                        read_markers(),
+                        completed,
+                        "completed release is not retried"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
