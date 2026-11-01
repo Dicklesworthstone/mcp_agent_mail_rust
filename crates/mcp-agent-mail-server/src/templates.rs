@@ -302,6 +302,262 @@ mod tests {
         assert!(html.contains("Agent &lt;agent@example.com&gt;"));
     }
 
+    fn conversation_template_context() -> serde_json::Value {
+        serde_json::json!({
+            "project": {"id": 1, "slug": "alpha", "human_key": "Workspace Alpha"},
+            "threads_url": "/mail/alpha/threads",
+            "threads": [],
+            "has_more_threads": false,
+            "previous_page_url": "",
+            "next_page_url": "",
+            "page_size": 50,
+            "agents": [],
+            "retired_agents": [],
+            "results": [],
+            "recipes": [],
+            "messages": [],
+            "items": [],
+            "q": "",
+            "scope": "",
+            "field_scope": "",
+            "order": "relevance",
+            "boost": false,
+            "importance": [],
+            "ack": "any",
+            "agent": "BlueLake",
+            "thread": "",
+            "direction": "",
+            "from_date": "",
+            "to_date": "",
+            "static_export": false
+        })
+    }
+
+    fn has_template_href(html: &str, href: &str) -> bool {
+        let attribute = format!("href=\"{}\"", href.replace('&', "&amp;"));
+        html.contains(&attribute) || html.contains(&attribute.replace('/', "&#x2f;"))
+    }
+
+    /// Inspect rendered content before scripts, including the inbox's Alpine
+    /// template. Nested anchors change the browser's DOM and break card links.
+    fn assert_independent_content_anchors(html: &str) {
+        let content = html
+            .split_once("<main ")
+            .expect("rendered base has main content")
+            .1
+            .split("</main>")
+            .next()
+            .expect("main content")
+            .split("<script")
+            .next()
+            .expect("content before scripts");
+        let mut anchor_open = false;
+        for tag in content.split('<').skip(1) {
+            if tag.starts_with("a ") {
+                assert!(!anchor_open, "nested anchor in rendered content: {tag}");
+                anchor_open = true;
+            } else if tag.starts_with("/a>") {
+                assert!(anchor_open, "closing anchor has no opening anchor");
+                anchor_open = false;
+            }
+        }
+        assert!(!anchor_open, "unclosed anchor in rendered content");
+    }
+
+    #[test]
+    fn conversation_project_preview_renders_metadata_and_escaped_links() {
+        let mut ctx = conversation_template_context();
+        ctx["has_more_threads"] = serde_json::json!(true);
+        ctx["threads"] = serde_json::json!([{
+            "thread_id": "release <tag> ?#&",
+            "subject": "<script>alert(1)</script>",
+            "message_count": 3,
+            "first_activity": "2026-01-01T00:00:00Z",
+            "last_activity": "2026-01-02T00:00:00Z",
+            "last_activity_relative": "2 minutes ago",
+            "thread_url": "/mail/alpha/thread/release%20%3Ctag%3E%20%3F%23%26"
+        }]);
+        let html = render_template("mail_project.html", &ctx).expect("project renders");
+        assert!(html.contains("Active Conversations"));
+        assert!(html.contains("Browse all threads"));
+        assert!(html.contains("3 messages"));
+        assert!(html.contains("2 minutes ago"));
+        assert!(html.contains("datetime=\"2026-01-02T00:00:00Z\""));
+        assert!(html.contains("release &lt;tag&gt; ?#&amp;"));
+        assert!(html.contains("&lt;script&gt;alert(1)"));
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(has_template_href(&html, "/mail/alpha/threads"));
+        assert!(has_template_href(
+            &html,
+            "/mail/alpha/thread/release%20%3Ctag%3E%20%3F%23%26"
+        ));
+        assert_independent_content_anchors(&html);
+    }
+
+    #[test]
+    fn conversation_empty_project_does_not_claim_an_unsent_search_failed() {
+        let ctx = conversation_template_context();
+        let html = render_template("mail_project.html", &ctx).expect("empty project renders");
+        assert!(html.contains("No conversations yet"));
+        assert!(!html.contains("No matching messages"));
+        assert!(has_template_href(&html, "/mail/alpha/threads"));
+
+        let mut searched = ctx;
+        searched["q"] = serde_json::json!("missing");
+        let html = render_template("mail_project.html", &searched).expect("search renders");
+        assert!(html.contains("No matching messages"));
+    }
+
+    #[test]
+    fn conversation_browser_preserves_cursor_links_and_canonical_identifiers() {
+        let mut ctx = conversation_template_context();
+        let previous = "/mail/alpha/threads?before=cursor%2Bvalue&limit=2";
+        let next = "/mail/alpha/threads?after=cursor%2Bvalue&limit=2";
+        ctx["previous_page_url"] = serde_json::json!(previous);
+        ctx["next_page_url"] = serde_json::json!(next);
+        ctx["page_size"] = serde_json::json!(2);
+        ctx["threads"] = serde_json::json!([
+            {
+                "thread_id": "..", "subject": "", "message_count": 1,
+                "first_activity": "2026-01-01T00:00:00Z",
+                "last_activity": "2026-01-01T00:00:00Z",
+                "last_activity_relative": "1 hour ago",
+                "thread_url": "/mail/alpha/thread?thread_id=.."
+            },
+            {
+                "thread_id": "0042", "subject": "Numeric key", "message_count": 4,
+                "first_activity": "2025-12-01T00:00:00Z",
+                "last_activity": "2025-12-31T00:00:00Z",
+                "last_activity_relative": "1 day ago",
+                "thread_url": "/mail/alpha/thread/0042"
+            }
+        ]);
+        let html = render_template("mail_threads.html", &ctx).expect("thread browser renders");
+        assert!(html.contains("Project Threads"));
+        assert!(html.contains("(No subject)"));
+        assert!(html.contains("1 message"));
+        assert!(html.contains("4 messages"));
+        assert!(html.contains("Started:"));
+        assert!(html.contains("datetime=\"2025-12-01T00:00:00Z\""));
+        assert!(html.contains("Up to 2 conversations per page"));
+        for href in [
+            previous,
+            next,
+            "/mail/alpha/thread?thread_id=..",
+            "/mail/alpha/thread/0042",
+        ] {
+            assert!(has_template_href(&html, href), "missing {href}");
+        }
+        assert!(html.contains("rel=\"prev\""));
+        assert!(html.contains("rel=\"next\""));
+        assert_independent_content_anchors(&html);
+    }
+
+    #[test]
+    fn conversation_browser_empty_and_exhausted_pages_keep_navigation() {
+        let mut ctx = conversation_template_context();
+        let html = render_template("mail_threads.html", &ctx).expect("empty browser renders");
+        assert!(html.contains("No conversations yet"));
+        assert!(!html.contains("aria-label=\"Thread pagination\""));
+        assert!(has_template_href(&html, "/mail/alpha"));
+
+        ctx["previous_page_url"] = serde_json::json!("/mail/alpha/threads?before=earlier&limit=50");
+        let html = render_template("mail_threads.html", &ctx).expect("exhausted page renders");
+        assert!(html.contains("No more conversations"));
+        assert!(html.contains("rel=\"prev\""));
+        assert!(!html.contains("rel=\"next\""));
+    }
+
+    #[test]
+    fn conversation_search_results_have_independent_message_and_thread_links() {
+        for template in ["mail_project.html", "mail_search.html"] {
+            let mut ctx = conversation_template_context();
+            ctx["q"] = serde_json::json!("needle");
+            ctx["results"] = serde_json::json!([
+                {
+                    "id": 42, "subject": "", "sender": "RemoteSender", "from": "RemoteSender",
+                    "created": "2026-01-01T00:00:00Z", "created_relative": "1 hour ago",
+                    "thread_id": "42", "thread_url": "/mail/alpha/thread/42", "snippet": ""
+                },
+                {
+                    "id": 43, "subject": "Escaped <subject>", "sender": "RemoteSender", "from": "RemoteSender",
+                    "created": "2026-01-01T00:00:00Z", "created_relative": "1 hour ago",
+                    "thread_id": "literal%2F\" <thread>",
+                    "thread_url": "/mail/alpha/thread/literal%252F%22%20%3Cthread%3E", "snippet": ""
+                }
+            ]);
+            let html = render_template(template, &ctx).expect("search template renders");
+            assert!(html.contains("(No subject)"), "{template}");
+            assert!(html.contains("Escaped &lt;subject&gt;"), "{template}");
+            assert!(!html.contains("<thread>"), "{template}");
+            for href in [
+                "/mail/alpha/threads",
+                "/mail/alpha/message/42",
+                "/mail/alpha/thread/42",
+                "/mail/alpha/message/43",
+                "/mail/alpha/thread/literal%252F%22%20%3Cthread%3E",
+            ] {
+                assert!(has_template_href(&html, href), "{template}: missing {href}");
+            }
+            assert_independent_content_anchors(&html);
+        }
+    }
+
+    #[test]
+    fn conversation_message_and_inbox_keep_independent_thread_navigation() {
+        let mut ctx = conversation_template_context();
+        ctx["message"] = serde_json::json!({
+            "id": 42, "subject": "Standalone starter", "sender": "BlueLake",
+            "created": "2026-01-01T00:00:00Z", "thread_id": "42",
+            "thread_url": "/mail/alpha/thread/42"
+        });
+        let html = render_template("mail_message.html", &ctx).expect("message renders");
+        assert!(html.contains("View Thread"));
+        assert!(has_template_href(&html, "/mail/alpha/thread/42"));
+        assert!(has_template_href(&html, "/mail/alpha/threads"));
+        assert_independent_content_anchors(&html);
+
+        let html = render_template("mail_inbox.html", &ctx).expect("inbox renders");
+        assert!(has_template_href(&html, "/mail/alpha/threads"));
+        assert!(html.contains("window.agentMailAppendAuth(item.thread_url)"));
+        assert_independent_content_anchors(&html);
+    }
+
+    #[test]
+    fn conversation_static_exports_do_not_offer_unexported_thread_browsers() {
+        let mut ctx = conversation_template_context();
+        ctx["static_export"] = serde_json::json!(true);
+        ctx["message"] = serde_json::json!({"id": 42, "subject": "Exported message"});
+        for template in [
+            "mail_project.html",
+            "mail_search.html",
+            "mail_message.html",
+            "mail_thread.html",
+            "mail_inbox.html",
+        ] {
+            let html = render_template(template, &ctx).expect("static template renders");
+            assert!(
+                !has_template_href(&html, "/mail/alpha/threads"),
+                "{template} links to a dynamic-only browser"
+            );
+            assert!(!html.contains("Active Conversations"), "{template}");
+        }
+    }
+
+    #[test]
+    fn conversation_thread_view_links_back_to_its_project_browser() {
+        let mut ctx = conversation_template_context();
+        ctx["thread_id"] = serde_json::json!("0042");
+        ctx["thread_subject"] = serde_json::json!("Named numeric conversation");
+        ctx["message_count"] = serde_json::json!(0);
+        let html = render_template("mail_thread.html", &ctx).expect("thread renders");
+        assert!(has_template_href(&html, "/mail/alpha/threads"));
+        assert!(has_template_href(&html, "/mail/alpha"));
+        assert!(html.contains("Browse Threads"));
+        assert!(html.contains("Back to Threads"));
+        assert_independent_content_anchors(&html);
+    }
+
     // --- ENV initialization ---
 
     #[test]

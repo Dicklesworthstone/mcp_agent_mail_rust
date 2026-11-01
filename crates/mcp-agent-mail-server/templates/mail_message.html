@@ -18,6 +18,14 @@
 
 {% block header_actions %}
 <div class="flex items-center gap-2">
+  {% if not static_export %}
+  <a href="/mail/{{ project.slug }}/threads"
+     class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm transition-colors"
+     aria-label="Browse project threads">
+    <i data-lucide="messages-square" class="w-4 h-4"></i>
+    <span class="text-sm">Threads</span>
+  </a>
+  {% endif %}
   <button disabled
           class="px-4 py-2 text-sm font-medium text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 rounded-lg flex items-center gap-2 opacity-60 cursor-not-allowed relative"
           data-tippy-content="Coming soon - Reply to this message"
@@ -76,7 +84,7 @@
           <i data-lucide="calendar" class="w-4 h-4"></i>
           <span>{{ message.created }}</span>
         </div>
-        {% if message.thread_id %}
+        {% if message.thread_url %}
           <a href="{{ message.thread_url }}"
              class="inline-flex items-center gap-2 px-3 py-1.5 bg-primary-100 dark:bg-primary-900/30 hover:bg-primary-200 dark:hover:bg-primary-800/40 text-primary-700 dark:text-primary-300 rounded-lg transition-all duration-200 font-medium">
             <i data-lucide="messages-square" class="w-4 h-4"></i>

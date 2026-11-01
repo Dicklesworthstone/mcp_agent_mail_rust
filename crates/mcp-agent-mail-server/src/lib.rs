@@ -24807,6 +24807,304 @@ first body
     }
 
     #[test]
+    fn mail_conversations_reject_invalid_auth_before_mailbox_admission() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let database_path = resolve_server_database_url_sqlite_path(&config.database_url)
+                .expect("fixture database path");
+            let storage_root = config.storage_root.clone();
+            let state = build_state(config);
+            let forged_jwt = format!(
+                "Bearer {}",
+                hs256_token(b"wrong-secret", &serde_json::json!({"role": "reader"}))
+            );
+            for uri in [
+                "/mail/2/threads",
+                "/mail/2/thread?thread_id=shared",
+                "/mail/2/thread/shared",
+                "/mail/2/threads?token=wrong-token",
+                "/mail/2/thread?thread_id=shared&token=wrong-token",
+            ] {
+                for authorization in [None, Some("Bearer wrong-token"), Some(forged_jwt.as_str())] {
+                    let headers: Vec<_> = authorization
+                        .map(|value| ("Authorization", value))
+                        .into_iter()
+                        .collect();
+                    let req = make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &headers,
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    );
+                    let resp = block_on(state.handle(req));
+                    assert_eq!(resp.status, 401, "unauthenticated conversation route {uri}");
+                    assert_eq!(
+                        response_header(&resp, "content-type"),
+                        Some("text/html; charset=utf-8")
+                    );
+                    assert!(
+                        !database_path.exists(),
+                        "refused {uri} must not create the mailbox"
+                    );
+                    assert!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none(),
+                        "refused {uri} must not admit a database pool"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root)
+                            .expect("archive directory")
+                            .count(),
+                        0,
+                        "refused {uri} must not create archive artifacts"
+                    );
+                }
+            }
+        });
+    }
+
+    fn with_mail_conversation_http_fixture<F, Fut>(f: F)
+    where
+        F: FnOnce(Arc<HttpState>, mcp_agent_mail_db::DbPool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        with_serialized_tool_dispatch_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            |_| {
+                let state = Arc::new(build_state(mail_rbac_test_config()));
+                // Exercise the real bounded HTTP dispatch worker, as serve-http does.
+                let _ = state.self_ref.set(Arc::downgrade(&state));
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("fixture runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                        .expect("real mailbox pool");
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed checkout");
+                    for sql in [
+                        // A numeric slug must not be interpreted as another project's row ID.
+                        "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                         (1, '2', '/synthetic/conversations-numeric-slug', 1), \
+                         (2, 'other-project', '/synthetic/conversations-other', 1), \
+                         (3, 'empty-project', '/synthetic/conversations-empty', 1)",
+                        "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                         VALUES (1, 1, 'RedFox', 'test', 'test', 1, 1), \
+                         (2, 2, 'BlueLake', 'test', 'test', 1, 1), \
+                         (3, 1, 'GreenLake', 'test', 'test', 1, 1)",
+                        "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, created_ts) VALUES \
+                         (1, 1, 1, 'shared', 'Numeric slug conversation', 'PRIVATE_NUMERIC_PROJECT_BODY', 1), \
+                         (2, 1, 1, 'shared', 'Numeric slug reply', 'PRIVATE_NUMERIC_REPLY_BODY', 2), \
+                         (3, 2, 2, 'shared', 'Other project conversation', 'PRIVATE_OTHER_PROJECT_BODY', 3), \
+                         (4, 1, 1, '2', 'Literal numeric conversation', 'LITERAL_NUMERIC_THREAD_BODY', 4), \
+                         (5, 1, 1, NULL, 'Standalone conversation', 'STANDALONE_THREAD_BODY', 5), \
+                         (6, 1, 1, 'topic/a+b?c#%2F', 'Encoded identifier conversation', 'ENCODED_THREAD_BODY', 6), \
+                         (7, 1, 1, '.', 'Dot identifier conversation', 'DOT_THREAD_BODY', 7), \
+                         (8, 1, 1, '..', 'Double dot conversation', 'DOUBLE_DOT_THREAD_BODY', 8)",
+                        "INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 3)",
+                    ] {
+                        conn.execute_sync(sql, &[]).expect("seed conversation fixture");
+                    }
+                    drop(conn);
+                    f(state, pool).await;
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn mail_conversations_allow_authenticated_readers_and_isolate_projects() {
+        with_mail_conversation_http_fixture(|state, pool| async move {
+            let reader = format!(
+                "Bearer {}",
+                hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+            );
+            for (uri, authorization, present, absent) in [
+                (
+                    "/mail/2/threads",
+                    Some(reader.as_str()),
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/2/threads",
+                    Some("Bearer mail-rbac-static"),
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/2/threads?token=mail-rbac-static",
+                    None,
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/other-project/threads",
+                    Some(reader.as_str()),
+                    "Other project conversation",
+                    "Numeric slug reply",
+                ),
+                (
+                    "/mail/2/thread?thread_id=shared",
+                    Some(reader.as_str()),
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                    "PRIVATE_OTHER_PROJECT_BODY",
+                ),
+                (
+                    "/mail/other-project/thread/shared?token=mail-rbac-static",
+                    None,
+                    "PRIVATE_OTHER_PROJECT_BODY",
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                ),
+            ] {
+                let headers: Vec<_> = authorization
+                    .map(|value| ("Authorization", value))
+                    .into_iter()
+                    .collect();
+                let req = make_request_with_peer_addr(
+                    Http1Method::Get,
+                    uri,
+                    &headers,
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let resp = state.handle(req).await;
+                assert_eq!(
+                    resp.status, 200,
+                    "authorized conversation route {uri}: {:?}",
+                    resp.body
+                );
+                assert_eq!(
+                    response_header(&resp, "content-type"),
+                    Some("text/html; charset=utf-8")
+                );
+                let html = std::str::from_utf8(&resp.body).expect("rendered conversation HTML");
+                assert!(html.contains(present), "{uri} must contain {present}");
+                assert!(!html.contains(absent), "{uri} must not leak {absent}");
+                if uri.contains("/threads") {
+                    assert!(html.contains("Project Threads"));
+                    assert!(
+                        !html.contains("PRIVATE_"),
+                        "thread summaries must not load message bodies"
+                    );
+                }
+            }
+            let cx = Cx::current().expect("fixture context");
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("verification checkout");
+            let rows = conn
+                .query_sync(
+                    "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+                 (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL) AS reads",
+                    &[],
+                )
+                .expect("verify read-only browsing");
+            assert_eq!(
+                rows[0].get_named::<i64>("messages").expect("message count"),
+                8
+            );
+            assert_eq!(rows[0].get_named::<i64>("reads").expect("read count"), 0);
+        });
+    }
+
+    #[test]
+    fn mail_conversations_http_keeps_canonical_keys_and_read_only_routes() {
+        with_mail_conversation_http_fixture(|state, _pool| async move {
+            for (uri, present, absent) in [
+                (
+                    "/mail/2/thread/2",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=2",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                    "PRIVATE_NUMERIC_REPLY_BODY",
+                ),
+                (
+                    "/mail/2/thread/5",
+                    "STANDALONE_THREAD_BODY",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=topic%2Fa%2Bb%3Fc%23%252F",
+                    "ENCODED_THREAD_BODY",
+                    "STANDALONE_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread/topic%2Fa%2Bb%3Fc%23%252F",
+                    "ENCODED_THREAD_BODY",
+                    "STANDALONE_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=.",
+                    "DOT_THREAD_BODY",
+                    "DOUBLE_DOT_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=..",
+                    "DOUBLE_DOT_THREAD_BODY",
+                    "Encoded identifier conversation",
+                ),
+            ] {
+                let resp = state
+                    .handle(make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &[("Authorization", "Bearer mail-rbac-static")],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    ))
+                    .await;
+                assert_eq!(
+                    resp.status, 200,
+                    "canonical thread route {uri}: {:?}",
+                    resp.body
+                );
+                let html = std::str::from_utf8(&resp.body).expect("thread HTML");
+                assert!(html.contains(present), "{uri} must resolve {present}");
+                assert!(!html.contains(absent), "{uri} must not merge {absent}");
+            }
+            for (uri, status) in [
+                ("/mail/empty-project/threads", 200),
+                ("/mail/missing-project/threads", 404),
+                ("/mail/other-project/thread/2", 404),
+                ("/mail/2/thread/missing-thread", 404),
+                ("/mail/2/thread?thread_id=missing-thread", 404),
+                ("/mail/2/thread", 400),
+                ("/mail/2/thread?thread_id=", 400),
+            ] {
+                let resp = state
+                    .handle(make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &[("Authorization", "Bearer mail-rbac-static")],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    ))
+                    .await;
+                assert_eq!(
+                    resp.status, status,
+                    "conversation route {uri}: {:?}",
+                    resp.body
+                );
+            }
+            for uri in [
+                "/mail/2/threads",
+                "/mail/2/thread?thread_id=shared",
+                "/mail/2/thread/shared",
+            ] {
+                let resp = state
+                    .handle(mail_rbac_post(uri, Some("Bearer mail-rbac-static"), "{}"))
+                    .await;
+                assert_eq!(
+                    resp.status, 405,
+                    "conversation browsing must be GET-only: {uri}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn mail_post_rbac_rejects_before_cold_mailbox_admission() {
         with_serialized_tool_dispatch_env(&[], |_| {
             let config = mail_rbac_test_config();

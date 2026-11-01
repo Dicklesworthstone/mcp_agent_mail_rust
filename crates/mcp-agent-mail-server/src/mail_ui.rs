@@ -1285,7 +1285,7 @@ first body
             &[(sender.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, root.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, root.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(html.contains("GreenCastle"));
@@ -1350,7 +1350,7 @@ first body
             &[(sender.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, root_id)
+        let html = render_message(&cx, &pool, &project.slug, root_id, false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
@@ -1485,7 +1485,7 @@ first body
             &[(recipient.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(!html.contains("marked.parse(markdownContent)"), "{html}");
@@ -1547,7 +1547,7 @@ first body
         )
         .expect("delete sender row");
 
-        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
@@ -1634,9 +1634,7 @@ first body
             "{html}"
         );
         assert!(
-            html.contains(
-                "window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`)"
-            ),
+            html.contains("window.agentMailAppendAuth(selectedMessage.thread_url)"),
             "{html}"
         );
         assert!(
@@ -1946,10 +1944,26 @@ fn percent_encode_path_segment(input: &str) -> String {
 }
 
 pub fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
+    // Browsers normalize dot path segments even when their dots are encoded.
+    // Keep those legitimate conversation keys in a query parameter instead.
+    if matches!(thread_id, "." | "..") {
+        return format!(
+            "/mail/{project_slug}/thread?thread_id={}",
+            percent_encode_path_segment(thread_id)
+        );
+    }
     format!(
         "/mail/{project_slug}/thread/{}",
         percent_encode_path_segment(thread_id)
     )
+}
+
+fn mail_thread_href_for_mode(project_slug: &str, thread_id: &str, static_export: bool) -> String {
+    if static_export {
+        crate::static_export::export_thread_route(project_slug, thread_id)
+    } else {
+        mail_thread_href(project_slug, thread_id)
+    }
 }
 
 #[cfg(test)]
@@ -3306,6 +3320,7 @@ struct UnifiedMessage {
     created_relative: String,
     importance: String,
     thread_id: String,
+    thread_url: String,
     project_slug: String,
     project_name: String,
     sender: String,
@@ -3333,12 +3348,7 @@ struct UnifiedMessageAggregate {
 }
 
 impl UnifiedMessageAggregate {
-    fn from_inbox_row(
-        project: &ProjectRow,
-        recipient_name: &str,
-        row: &queries::InboxRow,
-        root_ids_with_replies: &HashSet<i64>,
-    ) -> Self {
+    fn from_inbox_row(project: &ProjectRow, recipient_name: &str, row: &queries::InboxRow) -> Self {
         let message = &row.message;
         let mut recipients = std::collections::BTreeSet::new();
         recipients.insert(recipient_name.to_string());
@@ -3350,10 +3360,9 @@ impl UnifiedMessageAggregate {
             body_md: message.body_md.clone(),
             created_ts: message.created_ts,
             importance: message.importance.clone(),
-            thread_id: display_thread_ref_for_message(
+            thread_id: queries::canonical_thread_id(
                 message.id.unwrap_or(0),
                 message.thread_id.as_deref(),
-                root_ids_with_replies,
             ),
             project_slug: project.slug.clone(),
             project_name: project.human_key.clone(),
@@ -3386,6 +3395,7 @@ impl UnifiedMessageAggregate {
             created_relative: ts_display_relative(self.created_ts),
             created,
             importance: self.importance,
+            thread_url: mail_thread_href(&self.project_slug, &self.thread_id),
             thread_id: self.thread_id,
             project_slug: self.project_slug,
             project_name: self.project_name,
@@ -3396,41 +3406,6 @@ impl UnifiedMessageAggregate {
             read: self.all_read,
         }
     }
-}
-
-fn explicit_thread_ref(thread_id: Option<&str>) -> Option<String> {
-    thread_id
-        .map(str::trim)
-        .filter(|thread_id| !thread_id.is_empty())
-        .map(str::to_string)
-}
-
-fn root_ids_with_replies(
-    cx: &Cx,
-    pool: &DbPool,
-    project_id: i64,
-    root_message_ids: &[i64],
-) -> Result<HashSet<i64>, (u16, String)> {
-    Ok(block_on_outcome(
-        cx,
-        queries::list_numeric_thread_roots_with_replies(cx, pool, project_id, root_message_ids),
-    )?
-    .into_iter()
-    .collect())
-}
-
-fn display_thread_ref_for_message(
-    message_id: i64,
-    thread_id: Option<&str>,
-    root_ids_with_replies: &HashSet<i64>,
-) -> String {
-    if let Some(thread_ref) = explicit_thread_ref(thread_id) {
-        return thread_ref;
-    }
-    if message_id > 0 && root_ids_with_replies.contains(&message_id) {
-        return message_id.to_string();
-    }
-    String::new()
 }
 
 fn collect_unified_message_aggregates(
@@ -3466,7 +3441,6 @@ fn reference_collect_unified_message_aggregates(
         let pid = project.id.unwrap_or(0);
         let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
         let mut project_inbox_rows = Vec::new();
-        let mut candidate_root_ids = Vec::new();
         for agent in &agents_rows {
             let aid = agent.id.unwrap_or(0);
             let inbox = block_on_outcome(
@@ -3478,17 +3452,10 @@ fn reference_collect_unified_message_aggregates(
                 if !matches_importance_filter(&message.importance, filter_importance) {
                     continue;
                 }
-                if explicit_thread_ref(message.thread_id.as_deref()).is_none()
-                    && let Some(message_id) = message.id
-                    && message_id > 0
-                {
-                    candidate_root_ids.push(message_id);
-                }
                 project_inbox_rows.push((agent.name.clone(), row));
             }
         }
 
-        let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
         for (agent_name, row) in project_inbox_rows {
             let message = &row.message;
             let Some(message_id) = message.id else {
@@ -3499,12 +3466,7 @@ fn reference_collect_unified_message_aggregates(
                 continue;
             }
 
-            let aggregate = UnifiedMessageAggregate::from_inbox_row(
-                project,
-                &agent_name,
-                &row,
-                &reply_root_ids,
-            );
+            let aggregate = UnifiedMessageAggregate::from_inbox_row(project, &agent_name, &row);
             messages.insert(message_id, aggregate);
         }
     }
@@ -3566,6 +3528,11 @@ fn render_unified_inbox(
     )?
     .into_iter()
     .map(UnifiedMessageAggregate::into_view)
+    .map(|mut message| {
+        message.thread_url =
+            mail_thread_href_for_mode(&message.project_slug, &message.thread_id, static_export);
+        message
+    })
     .collect::<Vec<_>>();
 
     let total_messages = messages.len();
@@ -3601,6 +3568,7 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
         "created_relative": message.created_relative,
         "importance": message.importance,
         "thread_id": message.thread_id,
+        "thread_url": message.thread_url,
         "sender": message.sender,
         "recipients": message.recipients,
         "recipient_names": message.recipient_names,
@@ -3623,7 +3591,37 @@ struct ProjectCtx {
     /// Retired agents, listed apart from the active ones. Deregistered agents
     /// appear in neither list (GH#358).
     retired_agents: Vec<AgentView>,
+    threads: Vec<ConversationView>,
+    threads_url: String,
+    has_more_threads: bool,
     static_export: bool,
+}
+
+const RECENT_CONVERSATIONS: usize = 6;
+const DEFAULT_CONVERSATIONS_PAGE_SIZE: usize = 50;
+const MAX_CONVERSATIONS_PAGE_SIZE: usize = 200;
+
+#[derive(Serialize)]
+struct ConversationView {
+    thread_id: String,
+    subject: String,
+    message_count: i64,
+    first_activity: String,
+    last_activity: String,
+    last_activity_relative: String,
+    thread_url: String,
+}
+
+fn conversation_view(project_slug: &str, row: queries::ProjectThreadSummary) -> ConversationView {
+    ConversationView {
+        thread_url: mail_thread_href(project_slug, &row.thread_id),
+        thread_id: row.thread_id,
+        subject: row.subject,
+        message_count: row.message_count,
+        first_activity: ts_display(row.first_created_ts),
+        last_activity: ts_display(row.last_created_ts),
+        last_activity_relative: ts_display_relative(row.last_created_ts),
+    }
 }
 
 #[derive(Serialize)]
@@ -3704,15 +3702,394 @@ fn render_project(
     let roster = block_on_outcome(cx, queries::list_agent_roster(cx, pool, p.id.unwrap_or(0)))?;
     let (retired, active): (Vec<_>, Vec<_>) =
         roster.iter().partition(|agent| agent.retired_at.is_some());
+    // Static snapshots do not export the dynamic conversation browser.
+    let (threads, has_more_threads) = if static_export {
+        (Vec::new(), false)
+    } else {
+        let page = block_on_outcome(
+            cx,
+            queries::list_project_threads(cx, pool, p.id.unwrap_or(0), RECENT_CONVERSATIONS, None),
+        )?;
+        let has_more = page.next_cursor.is_some();
+        (
+            page.threads
+                .into_iter()
+                .map(|row| conversation_view(&p.slug, row))
+                .collect(),
+            has_more,
+        )
+    };
     render(
         "mail_project.html",
         ProjectCtx {
             project: project_view(&p),
             agents: active.into_iter().map(agent_view).collect(),
             retired_agents: retired.into_iter().map(agent_view).collect(),
+            threads,
+            threads_url: format!("/mail/{}/threads", p.slug),
+            has_more_threads,
             static_export,
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /mail/{project}/threads — canonical project conversations
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ThreadsCtx {
+    project: ProjectView,
+    threads: Vec<ConversationView>,
+    threads_url: String,
+    next_page_url: String,
+    previous_page_url: String,
+    page_size: usize,
+    static_export: bool,
+}
+
+/// Bind navigation state to its project and page size. The snapshot watermark
+/// keeps newly arriving messages from moving conversations between pages.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationCursor {
+    version: u8,
+    project_id: i64,
+    page_size: usize,
+    position: queries::ProjectThreadCursor,
+}
+
+fn conversations_page_size(query: &str) -> Result<usize, (u16, String)> {
+    let Some(raw) = extract_query_str(query, "limit") else {
+        return Ok(DEFAULT_CONVERSATIONS_PAGE_SIZE);
+    };
+    let size = raw
+        .parse::<usize>()
+        .map_err(|_| (400, "Invalid conversation page size".to_string()))?;
+    Ok(size.clamp(1, MAX_CONVERSATIONS_PAGE_SIZE))
+}
+
+fn decode_conversation_cursor(
+    raw: &str,
+    project_id: i64,
+    page_size: usize,
+) -> Result<queries::ProjectThreadCursor, (u16, String)> {
+    use base64::Engine as _;
+
+    let invalid = || (400, "Invalid conversation cursor".to_string());
+    if raw.len() > 1024 {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| invalid())?;
+    let cursor: ConversationCursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if cursor.version != 1
+        || cursor.project_id != project_id
+        || cursor.page_size != page_size
+        || cursor.position.anchor_message_id <= 0
+        || cursor.position.snapshot_id < cursor.position.anchor_message_id
+    {
+        return Err(invalid());
+    }
+    Ok(cursor.position)
+}
+
+fn conversation_page_url(
+    project: &ProjectRow,
+    page_size: usize,
+    position: Option<queries::ProjectThreadCursor>,
+    static_export: bool,
+) -> Result<String, (u16, String)> {
+    use base64::Engine as _;
+
+    let Some(position) = position else {
+        return Ok(String::new());
+    };
+    let bytes = serde_json::to_vec(&ConversationCursor {
+        version: 1,
+        project_id: project.id.unwrap_or(0),
+        page_size,
+        position,
+    })
+    .map_err(|err| (500, format!("Could not encode conversation cursor: {err}")))?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let suffix = if static_export {
+        "&__static_export=1"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "/mail/{}/threads?limit={page_size}&cursor={encoded}{suffix}",
+        project.slug
+    ))
+}
+
+fn render_project_threads(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+    query: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let page_size = conversations_page_size(query)?;
+    let project = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let project_id = project.id.unwrap_or(0);
+    let cursor = extract_query_str(query, "cursor")
+        .map(|raw| decode_conversation_cursor(&raw, project_id, page_size))
+        .transpose()?;
+    let page = block_on_outcome(
+        cx,
+        queries::list_project_threads(cx, pool, project_id, page_size, cursor.as_ref()),
+    )?;
+    let static_export = is_static_export_request(query);
+    render(
+        "mail_threads.html",
+        ThreadsCtx {
+            project: project_view(&project),
+            threads: page
+                .threads
+                .into_iter()
+                .map(|row| conversation_view(&project.slug, row))
+                .collect(),
+            threads_url: format!("/mail/{}/threads", project.slug),
+            next_page_url: conversation_page_url(
+                &project,
+                page_size,
+                page.next_cursor,
+                static_export,
+            )?,
+            previous_page_url: conversation_page_url(
+                &project,
+                page_size,
+                page.previous_cursor,
+                static_export,
+            )?,
+            page_size,
+            static_export,
+        },
+    )
+}
+
+#[cfg(test)]
+mod conversation_ui_tests {
+    use super::*;
+
+    fn page_link(html: &str, relation: &str) -> Option<String> {
+        let relation_start = html.find(&format!("rel=\"{relation}\""))?;
+        let tag_start = html[..relation_start].rfind("<a ")?;
+        let tag = &html[tag_start..relation_start];
+        let href_start = tag.find("href=\"")? + "href=\"".len();
+        let href = tag[href_start..].split('"').next()?;
+        Some(href.replace("&#x2f;", "/").replace("&amp;", "&"))
+    }
+
+    fn follow_link(cx: &Cx, pool: &DbPool, link: &str) -> String {
+        let (path, query) = link.split_once('?').unwrap_or((link, ""));
+        dispatch_project_route(
+            path.strip_prefix("/mail").expect("mail URL"),
+            "GET",
+            "",
+            cx,
+            pool,
+            pool,
+            query,
+        )
+        .expect("conversation link succeeds")
+        .expect("conversation HTML")
+    }
+
+    #[test]
+    fn project_conversations_follow_stable_rendered_pagination_links() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(60));
+        let pool = initialized_test_pool("project-conversations-ui");
+        let project = block_on_outcome(
+            &cx,
+            queries::ensure_project(&cx, &pool, "/conversation-browser-ui"),
+        )
+        .expect("project");
+        let pid = project.id.unwrap();
+        let sender = block_on_outcome(
+            &cx,
+            queries::register_agent(
+                &cx, &pool, pid, "BlueLake", "test", "test", None, None, None,
+            ),
+        )
+        .expect("sender");
+        let send = |thread: &str, subject: &str| {
+            block_on_outcome(
+                &cx,
+                queries::create_message(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender.id.unwrap(),
+                    subject,
+                    "Private body must not be in conversation summaries",
+                    Some(thread),
+                    "normal",
+                    false,
+                    "[]",
+                ),
+            )
+            .expect("message")
+        };
+        for index in 0..9 {
+            send(&format!("topic-{index}"), &format!("Conversation {index}"));
+        }
+
+        let preview = render_project(&cx, &pool, &project.slug, false)
+            .unwrap()
+            .unwrap();
+        assert!(preview.contains("Active Conversations"));
+        for index in 3..9 {
+            assert!(preview.contains(&format!("Conversation {index}")));
+            assert!(html_contains_url(
+                &preview,
+                &mail_thread_href(&project.slug, &format!("topic-{index}")),
+            ));
+        }
+        assert!(!preview.contains("Conversation 2"));
+        assert!(!preview.contains("Private body"));
+
+        let first_url = format!("/mail/{}/threads?limit=3", project.slug);
+        let first = follow_link(&cx, &pool, &first_url);
+        assert!(first.contains("Conversation 8"));
+        assert!(first.contains("Conversation 6"));
+        assert!(!first.contains("Conversation 5"));
+        assert!(page_link(&first, "prev").is_none());
+        let older = page_link(&first, "next").expect("older page link");
+
+        // Both a new conversation and a reply to an unseen conversation arrive
+        // after page one. Following its links must retain the original window.
+        send("new-topic", "Arrived after browsing began");
+        send("topic-0", "New activity on the oldest conversation");
+        let second = follow_link(&cx, &pool, &older);
+        for index in 3..6 {
+            assert!(second.contains(&format!("Conversation {index}")));
+        }
+        assert!(!second.contains("Conversation 6"));
+        assert!(!second.contains("Arrived after browsing began"));
+        assert!(!second.contains("New activity on the oldest conversation"));
+        let newer = page_link(&second, "prev").expect("newer page link");
+        let back = follow_link(&cx, &pool, &newer);
+        assert!(back.contains("Conversation 8"));
+        assert!(back.contains("Conversation 6"));
+        assert!(!back.contains("Conversation 5"));
+        assert!(page_link(&back, "prev").is_none());
+        let last = follow_link(
+            &cx,
+            &pool,
+            &page_link(&second, "next").expect("last page link"),
+        );
+        for index in 0..3 {
+            assert!(last.contains(&format!("Conversation {index}")));
+        }
+        assert!(page_link(&last, "next").is_none());
+        assert!(!last.contains("New activity on the oldest conversation"));
+
+        let fresh = follow_link(&cx, &pool, &first_url);
+        assert!(fresh.contains("Arrived after browsing began"));
+        assert!(fresh.contains("New activity on the oldest conversation"));
+    }
+
+    #[test]
+    fn project_conversations_validate_bounded_project_specific_cursors() {
+        let project = ProjectRow {
+            id: Some(7),
+            slug: "demo".to_string(),
+            human_key: "/demo".to_string(),
+            created_at: 0,
+        };
+        let cursor = queries::ProjectThreadCursor {
+            snapshot_id: 30,
+            anchor_created_ts: 50,
+            anchor_message_id: 15,
+            newer: false,
+        };
+        let url = conversation_page_url(&project, 10, Some(cursor), false).unwrap();
+        let query = url.split_once('?').unwrap().1;
+        let encoded = extract_query_str(query, "cursor").unwrap();
+        assert!(decode_conversation_cursor(&encoded, 7, 10).is_ok());
+        assert_eq!(
+            decode_conversation_cursor(&encoded, 8, 10).unwrap_err().0,
+            400
+        );
+        assert_eq!(
+            decode_conversation_cursor(&encoded, 7, 20).unwrap_err().0,
+            400
+        );
+        for bad in ["not_base64!", "e30", &"A".repeat(1025)] {
+            assert_eq!(decode_conversation_cursor(bad, 7, 10).unwrap_err().0, 400);
+        }
+        assert_eq!(conversations_page_size("").unwrap(), 50);
+        assert_eq!(conversations_page_size("limit=0").unwrap(), 1);
+        assert_eq!(conversations_page_size("limit=9999").unwrap(), 200);
+        for query in ["limit=-1", "limit=wrong", "limit=999999999999999999999999"] {
+            assert_eq!(conversations_page_size(query).unwrap_err().0, 400);
+        }
+    }
+
+    #[test]
+    fn project_conversations_search_links_open_canonical_roots_and_exact_keys() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(60));
+        let pool = initialized_test_pool("project-conversations-search");
+        let project = block_on_outcome(
+            &cx,
+            queries::ensure_project(&cx, &pool, "/conversation-browser-search"),
+        )
+        .expect("project");
+        let pid = project.id.unwrap();
+        let sender = block_on_outcome(
+            &cx,
+            queries::register_agent(
+                &cx, &pool, pid, "BlueLake", "test", "test", None, None, None,
+            ),
+        )
+        .expect("sender");
+        let mut expected = Vec::new();
+        for (thread, subject) in [
+            (None, "Standalone search result"),
+            (Some(" padded/key+%2F "), "Exact key search result"),
+            (Some(".."), "Dot key search result"),
+        ] {
+            let message = block_on_outcome(
+                &cx,
+                queries::create_message(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender.id.unwrap(),
+                    subject,
+                    "Search conversation body",
+                    thread,
+                    "normal",
+                    false,
+                    "[]",
+                ),
+            )
+            .expect("message");
+            let key = thread.map_or_else(|| message.id.unwrap().to_string(), str::to_string);
+            expected.push((key, subject));
+        }
+
+        // Facet-only search exercises the real DB result projection, including
+        // a null thread_id. Saved recipes are unrelated to this isolated pool.
+        let html = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", "unsupported://conversation-ui-search")],
+            || render_search(&cx, &pool, &project.slug, "imp=normal"),
+        )
+        .expect("project search")
+        .expect("search HTML");
+        for (key, subject) in expected {
+            let link = mail_thread_href(&project.slug, &key);
+            assert!(html.contains(subject), "search includes {subject}");
+            assert!(html_contains_url(&html, &link), "search links to {key}");
+            let conversation = follow_link(&cx, &pool, &link);
+            assert!(conversation.contains(subject));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3779,26 +4156,10 @@ fn render_inbox(
     )?;
     let total = inbox.len();
     let page_rows: Vec<_> = inbox.iter().skip(offset).take(limit).collect();
-    let candidate_root_ids: Vec<i64> = page_rows
-        .iter()
-        .filter_map(|row| {
-            if explicit_thread_ref(row.message.thread_id.as_deref()).is_none() {
-                row.message.id.filter(|message_id| *message_id > 0)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
-
     let mut items = Vec::new();
     for row in page_rows {
         let m = &row.message;
-        let thread_id = display_thread_ref_for_message(
-            m.id.unwrap_or(0),
-            m.thread_id.as_deref(),
-            &reply_root_ids,
-        );
+        let thread_id = queries::canonical_thread_id(m.id.unwrap_or(0), m.thread_id.as_deref());
         items.push(InboxMessage {
             id: m.id.unwrap_or(0),
             subject: m.subject.clone(),
@@ -3806,11 +4167,7 @@ fn render_inbox(
             sender: row.sender_name.clone(),
             importance: m.importance.clone(),
             thread_id: thread_id.clone(),
-            thread_url: if thread_id.is_empty() {
-                String::new()
-            } else {
-                mail_thread_href(&p.slug, &thread_id)
-            },
+            thread_url: mail_thread_href_for_mode(&p.slug, &thread_id, static_export),
             created: ts_display(m.created_ts),
             ack_required: m.ack_required_bool(),
             acked: row.ack_ts.is_some(),
@@ -3854,6 +4211,7 @@ struct MessageCtx {
     other_thread_items: Vec<MessageThreadPreview>,
     extra_thread_count: usize,
     commit_sha: Option<String>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -3888,6 +4246,7 @@ fn render_message(
     pool: &DbPool,
     project_slug: &str,
     message_id: i64,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
@@ -3903,37 +4262,24 @@ fn render_message(
         cx,
         queries::list_message_recipients_by_message(cx, pool, pid, message_id),
     )?;
-    let stored_thread_ref = explicit_thread_ref(m.thread_id.as_deref());
-    let candidate_thread_ref = stored_thread_ref
-        .clone()
-        .or_else(|| (current_message_id > 0).then(|| current_message_id.to_string()));
-    let thread_items = if let Some(thread_id) = candidate_thread_ref.as_deref() {
-        block_on_outcome(
-            cx,
-            queries::list_thread_messages(cx, pool, pid, thread_id, None),
-        )?
-        .into_iter()
-        .map(|item| MessageThreadPreview {
-            id: item.id,
-            from: item.from,
-            subject: item.subject,
-        })
-        .collect()
-    } else {
-        Vec::new()
-    };
+    let thread_ref = queries::canonical_thread_id(current_message_id, m.thread_id.as_deref());
+    let thread_items = block_on_outcome(
+        cx,
+        queries::list_canonical_thread_messages(cx, pool, pid, &thread_ref, None),
+    )?
+    .into_iter()
+    .map(|item| MessageThreadPreview {
+        id: item.id,
+        from: item.from,
+        subject: item.subject,
+    })
+    .collect::<Vec<_>>();
     let other_thread_items = thread_items
         .iter()
         .filter(|item| item.id != current_message_id)
         .cloned()
         .collect::<Vec<_>>();
     let extra_thread_count = other_thread_items.len().saturating_sub(5);
-    let thread_ref = if stored_thread_ref.is_some() || thread_items.len() > 1 {
-        candidate_thread_ref.unwrap_or_default()
-    } else {
-        String::new()
-    };
-
     render(
         "mail_message.html",
         MessageCtx {
@@ -3944,7 +4290,7 @@ fn render_message(
                 body_md: m.body_md.clone(),
                 body_html: markdown::render_markdown_to_safe_html(&m.body_md),
                 importance: m.importance.clone(),
-                thread_url: mail_thread_href(&p.slug, &thread_ref),
+                thread_url: mail_thread_href_for_mode(&p.slug, &thread_ref, static_export),
                 thread_id: thread_ref,
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
@@ -3961,6 +4307,7 @@ fn render_message(
             other_thread_items,
             extra_thread_count,
             commit_sha: None,
+            static_export,
         },
     )
 }
@@ -4062,6 +4409,7 @@ struct ThreadCtx {
     thread_subject: String,
     message_count: usize,
     messages: Vec<ThreadMessage>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -4080,13 +4428,17 @@ fn render_thread(
     pool: &DbPool,
     project_slug: &str,
     thread_id: &str,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
     let thread_msgs = block_on_outcome(
         cx,
-        queries::list_thread_messages(cx, pool, pid, thread_id, None),
+        queries::list_canonical_thread_messages(cx, pool, pid, thread_id, None),
     )?;
+    if thread_msgs.is_empty() {
+        return Err((404, "Thread not found".to_string()));
+    }
 
     let messages: Vec<ThreadMessage> = thread_msgs
         .iter()
@@ -4114,6 +4466,7 @@ fn render_thread(
             thread_subject,
             message_count,
             messages,
+            static_export,
         },
     )
 }
@@ -4527,23 +4880,21 @@ fn render_search(
         let web_results: Vec<WebSearchResult> = resp
             .results
             .iter()
-            .map(|r| WebSearchResult {
-                id: r.id,
-                subject: r.title.clone(),
-                snippet: highlight_snippet(&r.body, &q, 250),
-                from_name: r.from_agent.clone().unwrap_or_default(),
-                created: r.created_ts.map_or_else(String::new, ts_display),
-                created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
-                importance: r.importance.clone().unwrap_or_default(),
-                thread_url: r
-                    .thread_id
-                    .as_deref()
-                    .map_or_else(String::new, |thread_id| {
-                        mail_thread_href(project_slug, thread_id)
-                    }),
-                thread_id: r.thread_id.clone().unwrap_or_default(),
-                ack_required: r.ack_required.unwrap_or(false),
-                score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
+            .map(|r| {
+                let thread_id = queries::canonical_thread_id(r.id, r.thread_id.as_deref());
+                WebSearchResult {
+                    id: r.id,
+                    subject: r.title.clone(),
+                    snippet: highlight_snippet(&r.body, &q, 250),
+                    from_name: r.from_agent.clone().unwrap_or_default(),
+                    created: r.created_ts.map_or_else(String::new, ts_display),
+                    created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
+                    importance: r.importance.clone().unwrap_or_default(),
+                    thread_url: mail_thread_href_for_mode(&p.slug, &thread_id, static_export),
+                    thread_id,
+                    ack_required: r.ack_required.unwrap_or(false),
+                    score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
+                }
             })
             .collect();
 
@@ -5008,6 +5359,19 @@ fn dispatch_project_route(
 
     match rest {
         "" => render_project(cx, read_pool, project_slug, is_static_export_request(query)),
+        "threads" if method == "GET" => render_project_threads(cx, read_pool, project_slug, query),
+        "thread" if method == "GET" => {
+            let thread_id = extract_query_str(query, "thread_id")
+                .ok_or_else(|| (400, "Missing thread ID".to_string()))?;
+            render_thread(
+                cx,
+                read_pool,
+                project_slug,
+                &thread_id,
+                is_static_export_request(query),
+            )
+        }
+        "threads" | "thread" => Err((405, "Method Not Allowed".to_string())),
         "search" => render_search(cx, read_pool, project_slug, query),
         "file_reservations" => render_file_reservations(cx, read_pool, project_slug),
         "attachments" => render_attachments(cx, read_pool, project_slug),
@@ -5057,15 +5421,30 @@ fn dispatch_project_route(
             let mid: i64 = mid_str
                 .parse()
                 .map_err(|_| (400, format!("Invalid message ID: {mid_str}")))?;
-            render_message(cx, read_pool, project_slug, mid)
+            render_message(
+                cx,
+                read_pool,
+                project_slug,
+                mid,
+                is_static_export_request(query),
+            )
         }
         _ if rest.starts_with("thread/") => {
+            if method != "GET" {
+                return Err((405, "Method Not Allowed".to_string()));
+            }
             let encoded_thread_id = rest.strip_prefix("thread/").unwrap_or("");
             let thread_id = percent_decode_path_segment(encoded_thread_id);
             if thread_id.is_empty() {
                 return Err((400, "Missing thread ID".to_string()));
             }
-            render_thread(cx, read_pool, project_slug, &thread_id)
+            render_thread(
+                cx,
+                read_pool,
+                project_slug,
+                &thread_id,
+                is_static_export_request(query),
+            )
         }
         _ => Ok(None),
     }

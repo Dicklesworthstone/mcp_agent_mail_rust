@@ -516,8 +516,8 @@
                   <i data-lucide="external-link" class="w-4 h-4"></i>
                   Open in Project
                 </a>
-                <template x-if="selectedMessage.thread_id">
-                  <a :href="window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`)"
+                <template x-if="selectedMessage.thread_url">
+                  <a :href="window.agentMailAppendAuth(selectedMessage.thread_url)"
                      class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                     <i data-lucide="git-branch" class="w-4 h-4"></i>
                     View Thread

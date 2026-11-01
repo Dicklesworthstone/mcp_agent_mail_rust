@@ -16,9 +16,7 @@ use mcp_agent_mail_db::pool::{DbPool, SyncQuery};
 use mcp_agent_mail_db::queries::{self, InboxRow, UNKNOWN_SENDER_DISPLAY};
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 
-use super::{
-    UnifiedMessageAggregate, block_on_outcome, explicit_thread_ref, matches_importance_filter,
-};
+use super::{UnifiedMessageAggregate, block_on_outcome, matches_importance_filter};
 
 const PAGE_SIZE: usize = 256;
 const SAVEPOINT: &str = "SAVEPOINT am_unified_inbox_read";
@@ -202,29 +200,8 @@ pub(super) fn collect(
         .iter()
         .map(|project| (project.id.unwrap_or(0), project))
         .collect();
-    // Keep the established numeric-thread convention. These existing bounded
-    // root probes run after releasing the checkout (also safe in a size-1 pool).
-    // A newly arrived reply may add a link, but cannot change page membership,
-    // recipients, read status or body from the completed message snapshot.
-    let mut root_ids: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
-    for selected in &selected {
-        if explicit_thread_ref(selected.inbox.message.thread_id.as_deref()).is_none()
-            && let Some(id) = selected.inbox.message.id.filter(|id| *id > 0)
-        {
-            root_ids
-                .entry(selected.inbox.message.project_id)
-                .or_default()
-                .push(id);
-        }
-    }
-    let mut roots = HashMap::new();
-    for (project, ids) in root_ids {
-        roots.insert(
-            project,
-            super::root_ids_with_replies(cx, pool, project, &ids)?,
-        );
-    }
-    let empty_roots = std::collections::HashSet::new();
+    // Canonical conversation keys come from the selected message itself,
+    // including standalone roots. No post-snapshot reply probes are needed.
     let mut out = Vec::with_capacity(selected.len());
     for mut selected in selected {
         let project = projects
@@ -235,9 +212,6 @@ pub(super) fn collect(
                     "Unified inbox returned an unselected project".to_string(),
                 )
             })?;
-        let reply_roots = roots
-            .get(&selected.inbox.message.project_id)
-            .unwrap_or(&empty_roots);
         let mut aggregate = None;
         for receipt in selected.recipients {
             selected.inbox.kind = receipt.kind;
@@ -250,7 +224,6 @@ pub(super) fn collect(
                     project,
                     &receipt.name,
                     &selected.inbox,
-                    reply_roots,
                 ));
             }
         }

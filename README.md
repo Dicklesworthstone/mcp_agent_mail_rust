@@ -1255,10 +1255,12 @@ for the shipped replay boundary and the still-deferred live parity contract.
 |-------|-------------|
 | `/mail/` and `/mail/unified-inbox` | Unified inbox across all projects with importance filtering and related-project context |
 | `/mail/projects` | Project inventory page for browsing into one mailbox at a time |
-| `/mail/{project}` | Project overview with search entry point, agent roster, and quick links |
+| `/mail/{project}` | Project overview with the six most recently active conversations, search, agent roster, and quick links |
+| `/mail/{project}/threads` | All project conversations, with subjects, canonical IDs, message counts, timestamps, and older/newer navigation |
 | `/mail/{project}/inbox/{agent}` | Reverse-chronological inbox for one agent with pagination and mark-read actions |
 | `/mail/{project}/message/{id}` | Full message detail with metadata, recipients, thread preview, and attachments |
 | `/mail/{project}/thread/{thread_id}` | Full thread rendering with chronological conversation context |
+| `/mail/{project}/thread?thread_id=...` | Query-form conversation link, including dot-only identifiers that browsers normalize in URL paths |
 | `/mail/{project}/search?q=...` | Search V3-powered query route with field filters (`subject:foo`, `body:"multi word"`) |
 | `/mail/{project}/file_reservations` | Active and historical file reservations |
 | `/mail/{project}/attachments` | Messages with attachments and provenance |
@@ -1274,6 +1276,25 @@ server beyond loopback. With auth configured,
 `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` explicitly permits the guarded local
 bypass; it is not needed for no-token operation. These transport controls do not
 isolate hostile clients sharing the same OS account or bearer credential.
+
+### Browsing conversations
+
+Open **Threads** or **Browse all threads** from a project to browse its conversations
+without searching first. The browser defaults to 50 conversations per page;
+`?limit=...` accepts up to 200. Conversations are ordered by their latest message's
+timestamp and message ID. Older/newer links retain a message watermark, so new
+messages do not move conversations between pages during a browsing session. Use
+**Latest conversations** to refresh that view.
+
+Each nonblank explicit thread ID is preserved exactly. A message with no thread
+ID uses its decimal message ID as its conversation key, joining replies with that
+same key. Numeric keys never expand into an unrelated named conversation; `42`
+and `0042` stay distinct. Thread links in search, message details, and inboxes use
+the same identity rules and remain scoped to the message's project.
+
+The conversation list reads indexed message metadata and hydrates only the selected
+subjects. It does not load message bodies or change read/acknowledgement receipts.
+The dynamic browser is omitted from static-export project pages.
 
 ### Human Overseer
 

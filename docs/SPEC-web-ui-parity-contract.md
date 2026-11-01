@@ -136,7 +136,24 @@ CI parses the JSON block below and fails if any row:
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_project)",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_search)"
       ],
-      "notes": "Route exists. Rust uses a dedicated /mail/{project}/search?q= route instead of inline ?q= on the project view. This is an intentional improvement: cleaner URL structure, dedicated search UX. The /search route provides equivalent functionality."
+      "notes": "Six recently active canonical conversations include subjects, counts, activity timestamps and direct links (GH#370). Rust uses a dedicated /mail/{project}/search?q= route instead of inline ?q= on the project view. The /search route provides equivalent search functionality."
+    },
+    {
+      "id": "mail_project_threads_html_get",
+      "category": "route_html",
+      "method": "GET",
+      "python_path": "/mail/{project}/threads",
+      "rust_path": "/mail/{project}/threads",
+      "policy": "must_match",
+      "status": "implemented",
+      "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.8"],
+      "evidence": [
+        "crates/mcp-agent-mail-db/src/queries.rs (list_project_threads and canonical_thread_id)",
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (conversation_ui_tests)",
+        "crates/mcp-agent-mail-server/src/lib.rs (mail_conversations_* tests)",
+        "crates/mcp-agent-mail-server/src/templates.rs (conversation_* tests)"
+      ],
+      "notes": "GH#370: project-scoped canonical conversations, exact numeric/whitespace keys, latest subject and complete message counts. Defaults to 50 rows, capped at 200; cursor-based older/newer links preserve a message-ID watermark and timestamp/ID tie ordering. Covers project metadata through a composite index and hydrates only selected subjects, without reading bodies or changing receipts. Uses the existing HTTP authorization gate."
     },
     {
       "id": "mail_projects_siblings_post",
@@ -244,7 +261,7 @@ CI parses the JSON block below and fails if any row:
         "crates/mcp-agent-mail-server/templates/mail_thread.html",
         "crates/mcp-agent-mail-server/tests/ui_markdown_templates.rs"
       ],
-      "notes": "Markdown rendering at parity: same comrak+ammonia pipeline as message detail. Thread view renders all messages with body_html|safe."
+      "notes": "Markdown rendering at parity: same comrak+ammonia pipeline as message detail. Thread view renders all messages with body_html|safe. Canonical key lookup does not expand a numeric key into another named thread. The query-form /mail/{project}/thread?thread_id=... preserves dot-only identifiers; missing conversations return 404."
     },
     {
       "id": "mail_search_html_get",

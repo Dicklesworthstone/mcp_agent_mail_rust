@@ -13,6 +13,10 @@
     {{ project.human_key }}
   </a>
   <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
+  {% if not static_export %}
+  <a href="/mail/{{ project.slug }}/threads" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">Threads</a>
+  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
+  {% endif %}
   <span class="text-slate-900 dark:text-white font-medium">Thread Conversation</span>
 </nav>
 {% endblock %}
@@ -43,7 +47,14 @@
       </div>
 
       <!-- Actions -->
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
+        {% if not static_export %}
+        <a href="/mail/{{ project.slug }}/threads"
+           class="px-3 py-2 bg-primary-100 dark:bg-primary-900/30 hover:bg-primary-200 dark:hover:bg-primary-800/40 text-primary-700 dark:text-primary-300 rounded-lg transition-all duration-200 flex items-center gap-2 text-sm font-medium">
+          <i data-lucide="messages-square" class="w-4 h-4"></i>
+          Browse Threads
+        </a>
+        {% endif %}
         <a href="/mail/{{ project.slug }}"
            class="px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 flex items-center gap-2 text-sm font-medium">
           <i data-lucide="arrow-left" class="w-4 h-4"></i>
@@ -172,11 +183,19 @@
         <p class="text-xs">{{ message_count }} message{{ 's' if message_count != 1 else '' }} in this thread</p>
       </div>
 
+      {% if not static_export %}
+      <a href="/mail/{{ project.slug }}/threads"
+         class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg shadow-sm hover:shadow-md transition-all duration-200 font-medium">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i>
+        Back to Threads
+      </a>
+      {% else %}
       <a href="/mail/{{ project.slug }}"
          class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg shadow-sm hover:shadow-md transition-all duration-200 font-medium">
         <i data-lucide="arrow-left" class="w-4 h-4"></i>
         Back to Project
       </a>
+      {% endif %}
     </div>
   </div>
 </div>

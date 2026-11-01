@@ -428,9 +428,9 @@ fn open_static_export_read_pool() -> Result<Option<crate::ObservabilityDbPool>, 
 }
 
 /// Block on an async outcome, converting errors to String.
-fn bo<T>(
+fn bo<T, E: std::fmt::Display>(
     _cx: &Cx,
-    f: impl std::future::Future<Output = asupersync::Outcome<T, mcp_agent_mail_db::DbError>>,
+    f: impl std::future::Future<Output = asupersync::Outcome<T, E>>,
 ) -> Result<T, String> {
     match block_on(f) {
         asupersync::Outcome::Ok(v) => Ok(v),
@@ -455,15 +455,52 @@ fn route_html_output_path(route: &str) -> String {
 }
 
 fn export_thread_ref(message_id: i64, thread_id: Option<&str>) -> Option<String> {
-    match thread_id.map(str::trim).filter(|thread| !thread.is_empty()) {
-        Some(thread_id) => Some(thread_id.to_string()),
-        None if message_id > 0 => Some(message_id.to_string()),
-        None => None,
+    if message_id <= 0 && thread_id.is_none_or(|thread| thread.trim_matches(' ').is_empty()) {
+        None
+    } else {
+        Some(queries::canonical_thread_id(message_id, thread_id))
     }
 }
 
-fn export_thread_route(project_slug: &str, thread_id: &str) -> String {
-    crate::mail_ui::mail_thread_href(project_slug, thread_id)
+pub(crate) fn export_thread_route(project_slug: &str, thread_id: &str) -> String {
+    // A static host decodes URL paths before looking up files. Hex paths keep
+    // encoded slashes, whitespace and dot segments from changing the filename
+    // or colliding with another conversation. The separate route prefix also
+    // cannot collide with a literal named thread such as "2e" or "thread-key".
+    if matches!(thread_id, "." | "..")
+        || !thread_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
+        format!(
+            "/mail/{project_slug}/thread-key/{}",
+            hex_encode(thread_id.as_bytes())
+        )
+    } else {
+        crate::mail_ui::mail_thread_href(project_slug, thread_id)
+    }
+}
+
+fn emit_thread_route(
+    project_slug: &str,
+    thread_id: &str,
+    output_dir: &Path,
+    files: &mut BTreeMap<String, ManifestEntry>,
+) -> Result<(), String> {
+    let live_url = crate::mail_ui::mail_thread_href(project_slug, thread_id);
+    let (path, thread_query) = live_url.split_once('?').unwrap_or((&live_url, ""));
+    let query = if thread_query.is_empty() {
+        "__static_export=1".to_string()
+    } else {
+        format!("{thread_query}&__static_export=1")
+    };
+    let static_url = export_thread_route(project_slug, thread_id);
+    let file_path = route_html_output_path(&static_url);
+    emit_route(path, &query, &file_path, output_dir, files)?;
+    if let Some(entry) = files.get_mut(&file_path) {
+        entry.route = static_url;
+    }
+    Ok(())
 }
 
 const fn export_inbox_scan_is_truncated(row_count: usize) -> bool {
@@ -623,14 +660,48 @@ fn emit_project_routes(
         }
     }
 
+    // Thread pages contain the complete canonical conversation, including
+    // messages without a surviving recipient. Enumerate metadata once so all
+    // linked message details and standalone roots have an exported page. The
+    // inbox scan above retains its existing truncation check for inbox pages.
+    {
+        let conn = bo(cx, pool.acquire(cx))?;
+        let rows = conn
+            .query_sync(
+                "SELECT id, thread_id FROM messages \
+                 INDEXED BY idx_messages_project_thread_activity WHERE project_id = ?",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(pid)],
+            )
+            .map_err(|error| format!("enumerate project conversation pages: {error}"))?;
+        for row in rows {
+            let id = row
+                .get_as::<i64>(0)
+                .map_err(|error| format!("decode exported message id: {error}"))?;
+            let thread_id = row
+                .get_as::<Option<String>>(1)
+                .map_err(|error| format!("decode exported conversation key: {error}"))?;
+            if id > 0 {
+                seen_messages.insert(id);
+            }
+            if let Some(thread_id) = export_thread_ref(id, thread_id.as_deref()) {
+                seen_threads.insert(thread_id);
+            }
+        }
+    }
+
     // Render thread pages.
     for tid in &seen_threads {
-        emit_html_route(&export_thread_route(slug, tid), "", output_dir, files)?;
+        emit_thread_route(slug, tid, output_dir, files)?;
     }
 
     // Render message detail pages.
     for mid in &seen_messages {
-        emit_html_route(&format!("{prefix}/message/{mid}"), "", output_dir, files)?;
+        emit_html_route(
+            &format!("{prefix}/message/{mid}"),
+            "__static_export=1",
+            output_dir,
+            files,
+        )?;
     }
 
     Ok(())
@@ -669,6 +740,7 @@ struct SearchIndexEntry {
     body_text: String,
     from_agent: String,
     thread_id: String,
+    thread_url: String,
     importance: String,
     created_ts: String,
 }
@@ -704,6 +776,8 @@ fn emit_search_index(
                 let (safe_body_text, _) = scan_for_secrets(&msg.body_md);
                 let excerpt = truncate(&msg.body_md, 300);
                 let (safe_excerpt, _) = scan_for_secrets(&excerpt);
+                let thread_id =
+                    export_thread_ref(mid, msg.thread_id.as_deref()).unwrap_or_default();
                 entries.push(SearchIndexEntry {
                     id: mid,
                     project: slug.clone(),
@@ -711,7 +785,8 @@ fn emit_search_index(
                     body_excerpt: safe_excerpt,
                     body_text: safe_body_text,
                     from_agent: row.sender_name.clone(),
-                    thread_id: export_thread_ref(mid, msg.thread_id.as_deref()).unwrap_or_default(),
+                    thread_url: export_thread_route(slug, &thread_id),
+                    thread_id,
                     importance: msg.importance.clone(),
                     created_ts: mcp_agent_mail_db::timestamps::micros_to_iso(msg.created_ts),
                 });
@@ -1198,15 +1273,45 @@ first body
     fn export_thread_ref_uses_message_id_for_root_messages() {
         assert_eq!(export_thread_ref(42, None), Some("42".to_string()));
         assert_eq!(export_thread_ref(42, Some("")), Some("42".to_string()));
+        assert_eq!(export_thread_ref(42, Some("   ")), Some("42".to_string()));
+        for key in [" padded ", "\t", "\u{a0}", "0042", "+42", ".", ".."] {
+            assert_eq!(export_thread_ref(42, Some(key)), Some(key.to_string()));
+        }
     }
 
     #[test]
-    fn export_thread_route_encodes_path_special_thread_ids() {
+    fn export_thread_route_uses_lossless_static_paths_for_special_ids() {
         let route = export_thread_route("demo", "topic/with space+plus");
-        assert_eq!(route, "/mail/demo/thread/topic%2Fwith%20space%2Bplus");
+        assert_eq!(
+            route,
+            "/mail/demo/thread-key/746f7069632f776974682073706163652b706c7573"
+        );
         assert_eq!(
             route_html_output_path(&route),
-            "mail/demo/thread/topic%2Fwith%20space%2Bplus/index.html"
+            "mail/demo/thread-key/746f7069632f776974682073706163652b706c7573/index.html"
+        );
+        assert_eq!(export_thread_route("demo", "."), "/mail/demo/thread-key/2e");
+        assert_eq!(
+            export_thread_route("demo", ".."),
+            "/mail/demo/thread-key/2e2e"
+        );
+        assert_eq!(export_thread_route("demo", "2e"), "/mail/demo/thread/2e");
+        assert_eq!(
+            export_thread_route("demo", "%2F"),
+            "/mail/demo/thread-key/253246"
+        );
+        assert_eq!(export_thread_route("demo", "/"), "/mail/demo/thread-key/2f");
+        assert_eq!(
+            export_thread_route("demo", "\t"),
+            "/mail/demo/thread-key/09"
+        );
+        assert_eq!(
+            export_thread_route("demo", "\u{a0}"),
+            "/mail/demo/thread-key/c2a0"
+        );
+        assert_eq!(
+            export_thread_route("demo", "topic-1"),
+            "/mail/demo/thread/topic-1"
         );
     }
 
@@ -1385,6 +1490,140 @@ first body
             search_index.contains("\"from_agent\": \"Alice\""),
             "{search_index}"
         );
+    }
+
+    fn seed_export_conversation_fixture(database_path: &Path) {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            database_path.to_str().expect("fixture database path"),
+        )
+        .expect("seed canonical mailbox file");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("seed mailbox schema");
+        for sql in [
+            "INSERT INTO projects(id, slug, human_key, created_at) VALUES \
+             (1, 'export-demo', '/export-demo', 1), (2, 'export-other', '/export-other', 1)",
+            "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+             (1, 1, 'RedFox', 'test', 'test', 1, 1), (2, 1, 'BlueLake', 'test', 'test', 1, 1), \
+             (3, 2, 'GreenLake', 'test', 'test', 1, 1)",
+            "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+             VALUES (99, 2, 3, '2', 'Foreign conversation', 'FOREIGN_EXPORT_BODY', 99)",
+        ] {
+            conn.execute_raw(sql).expect("seed export identities");
+        }
+        for (id, key) in [
+            (1, None),
+            (2, Some("named")),
+            (3, Some("2")),
+            (4, Some(".")),
+            (5, Some("..")),
+            (6, Some(" padded ")),
+            (7, Some("padded")),
+            (8, Some("\t")),
+            (9, Some("\u{a0}")),
+            (10, Some("topic/a%2Fb")),
+            (11, Some("2e")),
+            (12, None),
+            (13, Some(".")),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+                 VALUES (?, 1, 1, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    key.map_or(Value::Null, |key| Value::Text(key.into())),
+                    Value::Text(format!("Export subject {id}")),
+                    Value::Text(format!("EXPORT_BODY_{id}_END")),
+                    Value::BigInt(id),
+                ],
+            )
+            .expect("seed export message");
+            if id != 13 {
+                conn.execute_sync(
+                    "INSERT INTO message_recipients(message_id, agent_id) VALUES (?, 2)",
+                    &[Value::BigInt(id)],
+                )
+                .expect("seed export delivery");
+            }
+        }
+    }
+
+    #[test]
+    fn export_static_site_preserves_canonical_thread_identity_and_offline_navigation() {
+        let dir = tempfile::tempdir().expect("private export fixture");
+        let storage_root = dir.path().join("archive");
+        fs::create_dir(&storage_root).expect("archive directory");
+        let database_path = dir.path().join("mailbox.sqlite3");
+        seed_export_conversation_fixture(&database_path);
+        let output_dir = dir.path().join("export");
+        let manifest = with_static_export_env(&storage_root, &database_path, &[], || {
+            export_static_site(&ExportConfig {
+                output_dir: output_dir.clone(),
+                projects: vec!["export-demo".to_string()],
+                include_archive: false,
+                include_search_index: true,
+            })
+            .expect("export canonical conversations")
+        });
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(output_dir.join("search-index.json")).expect("search index file"),
+        )
+        .expect("search index JSON");
+        assert_eq!(entries.len(), 12);
+        for entry in &entries {
+            let id = entry["id"].as_i64().expect("message id");
+            let key = entry["thread_id"].as_str().expect("canonical key");
+            let url = entry["thread_url"].as_str().expect("static thread URL");
+            let file_path = route_html_output_path(url);
+            assert!(
+                manifest.files.contains_key(&file_path),
+                "missing page for {url}"
+            );
+            let html = fs::read_to_string(output_dir.join(&file_path)).expect("thread page");
+            assert!(
+                html.contains(&format!("EXPORT_BODY_{id}_END")),
+                "thread {key:?}"
+            );
+            assert!(!html.contains("FOREIGN_EXPORT_BODY"));
+            assert!(!html.contains("href=\"/mail/export-demo/threads\""));
+            let message_html = fs::read_to_string(
+                output_dir.join(format!("mail/export-demo/message/{id}/index.html")),
+            )
+            .expect("message page");
+            assert!(
+                message_html.contains(url) || message_html.contains(&url.replace('/', "&#x2f;")),
+                "message {id} must link to its exported canonical conversation"
+            );
+            assert!(!message_html.contains("href=\"/mail/export-demo/threads\""));
+        }
+        let numeric = fs::read_to_string(output_dir.join("mail/export-demo/thread/2/index.html"))
+            .expect("literal numeric thread page");
+        assert!(numeric.contains("EXPORT_BODY_3_END"));
+        assert!(!numeric.contains("EXPORT_BODY_2_END"));
+        let orphaned_reply =
+            fs::read_to_string(output_dir.join("mail/export-demo/message/13/index.html"))
+                .expect("the dot thread's undelivered reply also has a detail page");
+        assert!(orphaned_reply.contains("EXPORT_BODY_13_END"));
+        for (id, key, url) in [
+            (1, "1", "/mail/export-demo/thread/1"),
+            (4, ".", "/mail/export-demo/thread-key/2e"),
+            (5, "..", "/mail/export-demo/thread-key/2e2e"),
+            (
+                6,
+                " padded ",
+                "/mail/export-demo/thread-key/2070616464656420",
+            ),
+            (11, "2e", "/mail/export-demo/thread/2e"),
+            (12, "12", "/mail/export-demo/thread/12"),
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .expect("indexed message");
+            assert_eq!(entry["thread_id"], key);
+            assert_eq!(entry["thread_url"], url);
+        }
     }
 
     #[test]

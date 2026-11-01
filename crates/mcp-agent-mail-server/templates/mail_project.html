@@ -30,6 +30,15 @@
 
   <!-- Secondary Actions -->
   <div class="flex items-center gap-2">
+    {% if not static_export %}
+    <a href="{{ threads_url }}"
+       class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm hover:shadow-md transition-all duration-200"
+       aria-label="Browse project threads">
+      <i data-lucide="messages-square" class="w-4 h-4"></i>
+      <span class="text-sm">Threads</span>
+    </a>
+    {% endif %}
+
     <!-- File Reservations -->
     <a href="/mail/{{ project.slug }}/file_reservations"
        class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm hover:shadow-md transition-all duration-200"
@@ -84,6 +93,49 @@
     <!-- Subtle accent -->
     <div class="absolute top-0 right-0 w-64 h-64 bg-gradient-to-br from-primary-500/5 to-purple-500/5 rounded-full blur-3xl pointer-events-none"></div>
   </div>
+
+  {% if not static_export %}
+  <section aria-labelledby="active-conversations-heading" class="bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border border-slate-200 dark:border-slate-700">
+    <div class="flex flex-wrap items-center justify-between gap-4 mb-5">
+      <div>
+        <h2 id="active-conversations-heading" class="text-2xl font-bold text-slate-900 dark:text-white">Active Conversations</h2>
+        <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">Recently active threads in this project.</p>
+      </div>
+      <a href="{{ threads_url }}"
+         class="inline-flex items-center gap-2 text-sm font-semibold text-primary-600 dark:text-primary-400 hover:underline focus-visible:ring-2 focus-visible:ring-primary-500 rounded"
+         aria-label="Browse all threads in this project">
+        Browse all threads
+        <i data-lucide="arrow-right" class="w-4 h-4"></i>
+      </a>
+    </div>
+    {% if threads %}
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {% for thread in threads %}
+      <a href="{{ thread.thread_url }}"
+         class="block min-w-0 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-4 hover:border-primary-400 dark:hover:border-primary-500 hover:shadow-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
+        <h3 class="font-semibold text-slate-900 dark:text-white break-words">{{ thread.subject or '(No subject)' }}</h3>
+        <p class="mt-1 text-sm text-primary-600 dark:text-primary-400 break-all">
+          <span class="text-slate-500 dark:text-slate-400">Thread</span>
+          <span class="font-mono">{{ thread.thread_id }}</span>
+        </p>
+        <div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600 dark:text-slate-400">
+          <span>{{ thread.message_count }} message{{ 's' if thread.message_count != 1 else '' }}</span>
+          <span>Latest activity: <time datetime="{{ thread.last_activity }}" title="{{ thread.last_activity }}">{{ thread.last_activity_relative or thread.last_activity }}</time></span>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+    {% if has_more_threads %}
+    <p class="mt-4 text-sm text-slate-500 dark:text-slate-400">Showing the most recently active conversations. Browse all threads for earlier activity.</p>
+    {% endif %}
+    {% else %}
+    <div class="rounded-xl border border-dashed border-slate-300 dark:border-slate-600 p-8 text-center">
+      <h3 class="text-lg font-semibold text-slate-900 dark:text-white">No conversations yet</h3>
+      <p class="mt-2 text-sm text-slate-600 dark:text-slate-400">Conversations appear here when messages are sent in this project.</p>
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
 
   <!-- Enhanced Search Section -->
   <div class="bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border border-slate-200 dark:border-slate-700"
@@ -257,12 +309,12 @@
 
         <div class="space-y-3">
           {% for r in results %}
-            <a href="/mail/{{ project.slug }}/message/{{ r.id }}"
-               class="block group bg-slate-50 dark:bg-slate-900 hover:bg-white dark:hover:bg-slate-800 rounded-xl p-5 border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 shadow-sm hover:shadow-md stagger-item"
+            <article class="relative block group bg-slate-50 dark:bg-slate-900 hover:bg-white dark:hover:bg-slate-800 rounded-xl p-5 border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 shadow-sm hover:shadow-md stagger-item"
                style="animation-delay: {{ [loop.index0 * 0.05, 1.0]|min }}s;">
               <div class="flex items-start justify-between mb-3">
                 <h4 class="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors line-clamp-1">
-                  {{ r.subject }}
+                  <a href="/mail/{{ project.slug }}/message/{{ r.id }}"
+                     class="after:absolute after:inset-0 focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-primary-500 focus-visible:after:rounded-xl">{{ r.subject or '(No subject)' }}</a>
                 </h4>
                 {% if r.hits %}
                   <span class="px-3 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-bold rounded-full whitespace-nowrap ml-4">
@@ -271,7 +323,7 @@
                 {% endif %}
               </div>
 
-              <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400 mb-3">
+              <div class="flex flex-wrap items-center gap-4 text-sm text-slate-600 dark:text-slate-400 mb-3">
                 <div class="flex items-center gap-1.5">
                   <i data-lucide="user" class="w-4 h-4"></i>
                   <span class="font-medium">{{ r.sender }}</span>
@@ -281,12 +333,14 @@
                   <i data-lucide="calendar" class="w-4 h-4"></i>
                   <span>{{ r.created }}</span>
                 </div>
-                {% if r.thread_id %}
+                {% if r.thread_url %}
                   <span class="text-slate-300 dark:text-slate-600">•</span>
-                  <div class="flex items-center gap-1.5" data-tippy-content="Canonical thread identifier shared across agents" title="Canonical thread identifier shared across agents">
-                    <i data-lucide="message-circle" class="w-4 h-4"></i>
+                  <div class="flex items-center gap-1.5 min-w-0" data-tippy-content="Canonical thread identifier shared across agents" title="Canonical thread identifier shared across agents">
+                    <i data-lucide="message-circle" class="w-4 h-4 flex-shrink-0"></i>
                     <span class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-500">Thread</span>
-                    <span class="font-mono text-xs">{{ r.thread_id }}</span>
+                    <a href="{{ r.thread_url }}"
+                       class="relative z-10 font-mono text-xs break-all text-primary-600 dark:text-primary-400 hover:underline focus-visible:ring-2 focus-visible:ring-primary-500 rounded"
+                       aria-label="Open thread {{ r.thread_id }}">{{ r.thread_id }}</a>
                   </div>
                 {% endif %}
               </div>
@@ -296,11 +350,11 @@
                   {{ r.snippet | safe }}
                 </div>
               {% endif %}
-            </a>
+            </article>
           {% endfor %}
         </div>
       </div>
-    {% elif results is defined %}
+    {% elif results is defined and q and q|trim %}
       <div class="mt-8 text-center py-12 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-700">
         <div class="w-16 h-16 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4">
           <i data-lucide="search-x" class="w-8 h-8 text-slate-400"></i>
