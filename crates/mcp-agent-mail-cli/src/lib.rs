@@ -10673,65 +10673,44 @@ pub(crate) fn local_server_host_port(config: &Config) -> CliResult<(String, u16)
     }
     let default_root = is_default_mailbox_root(&config.storage_root);
     let Ok(sqlite_path) = resolve_mailbox_activity_sqlite_path(&config.database_url) else {
-        return endpoint_without_owner(&OwnerDiscovery::Unowned, default_root, configured, &[]);
+        return endpoint_without_owner(&OwnerDiscovery::Unowned, default_root, configured);
     };
     let mut discovery = discover_mailbox_owner(config, &sqlite_path);
-    if !default_root {
-        for delay in OWNER_LISTENER_RETRY_DELAYS {
-            if !matches!(discovery, OwnerDiscovery::Unresolved { .. }) {
-                break;
-            }
-            std::thread::sleep(delay);
-            discovery = discover_mailbox_owner(config, &sqlite_path);
+    for delay in OWNER_LISTENER_RETRY_DELAYS {
+        if !matches!(discovery, OwnerDiscovery::Unresolved { .. }) {
+            break;
         }
+        std::thread::sleep(delay);
+        discovery = discover_mailbox_owner(config, &sqlite_path);
     }
-    let holders = match &discovery {
-        OwnerDiscovery::Unresolved { pid: Some(_), .. } => {
-            mcp_agent_mail_server::startup_checks::listener_port_holder_pids_with_hint(
-                &configured.0,
-                configured.1,
-            )
-        }
-        _ => Vec::new(),
-    };
-    endpoint_without_owner(&discovery, default_root, configured, &holders)
+    endpoint_without_owner(&discovery, default_root, configured)
 }
 
 /// The endpoint for a mailbox once discovery has finished.
 ///
-/// The default mailbox keeps the default endpoint unless that endpoint is
-/// visibly held by something other than the mailbox's owner. Any other mailbox
-/// never guesses: with no server it gets [`NO_SERVER_PORT`] and the local path,
-/// and with a live server it cannot find, an error.
+/// Only an unowned default mailbox keeps the default endpoint. Other unowned
+/// mailboxes get [`NO_SERVER_PORT`] and the local path. An unresolved owner
+/// always prevents routing, including when its command or listener is unreadable.
 fn endpoint_without_owner(
     discovery: &OwnerDiscovery,
     default_root: bool,
     configured: (String, u16),
-    configured_holders: &[u32],
 ) -> CliResult<(String, u16)> {
-    let unresolved = |detail: &str| {
-        CliError::Other(format!(
-            "this mailbox's server could not be confirmed, so nothing was sent to \
-             {}:{}: {detail}. Set AGENT_MAIL_URL or HTTP_PORT to reach it",
-            configured.0, configured.1
-        ))
-    };
     match discovery {
         OwnerDiscovery::Listener(host, port) => Ok((host.clone(), *port)),
-        OwnerDiscovery::Unresolved {
-            pid: Some(pid),
-            detail,
-        } if default_root
-            && !configured_holders.is_empty()
-            && !configured_holders.contains(pid) =>
-        {
-            Err(unresolved(detail))
-        }
-        OwnerDiscovery::Unowned | OwnerDiscovery::Unresolved { .. } if default_root => {
-            Ok(configured)
-        }
+        OwnerDiscovery::Unowned if default_root => Ok(configured),
         OwnerDiscovery::Unowned => Ok((configured.0, NO_SERVER_PORT)),
-        OwnerDiscovery::Unresolved { detail, .. } => Err(unresolved(detail)),
+        OwnerDiscovery::Unresolved { pid, detail } => {
+            let owner = pid.map_or_else(
+                || "owner PID is not uniquely confirmed".to_string(),
+                |pid| format!("owner PID {pid}"),
+            );
+            Err(CliError::Other(format!(
+                "this mailbox's server could not be confirmed ({owner}), so nothing was sent to \
+                 {}:{}: {detail}. Set AGENT_MAIL_URL or HTTP_PORT to reach it",
+                configured.0, configured.1
+            )))
+        }
     }
 }
 
@@ -10742,53 +10721,58 @@ fn discover_mailbox_owner(config: &Config, sqlite_path: &Path) -> OwnerDiscovery
         listener_port_holder_pids_with_hint, verified_listener_for_pid,
     };
 
-    let ownership = inspect_mailbox_ownership(sqlite_path, &config.storage_root);
-    if !mailbox_owner_may_serve(&ownership) {
-        return OwnerDiscovery::Unowned;
-    }
-    let Some(pid) = sole_proxy_mailbox_owner(&ownership) else {
-        return OwnerDiscovery::Unresolved {
-            pid: None,
-            detail: ownership.detail,
-        };
-    };
-    // A client whose TMPDIR differs from the daemon's cannot see its listener
-    // hints, but the configured port still shows who holds it.
-    let listener = verified_listener_for_pid(pid).or_else(|| {
-        (listener_port_holder_pids_with_hint(&config.http_host, config.http_port) == [pid])
-            .then(|| (config.http_host.clone(), config.http_port))
-    });
-    let Some((host, port)) = listener else {
-        return OwnerDiscovery::Unresolved {
-            pid: Some(pid),
-            detail: ownership.detail,
-        };
-    };
-    // Recheck mailbox ownership after listener discovery, before using the URL.
-    let current = inspect_mailbox_ownership(sqlite_path, &config.storage_root);
-    if sole_proxy_mailbox_owner(&current) != Some(pid) {
-        return OwnerDiscovery::Unresolved {
-            pid: None,
-            detail: current.detail,
-        };
-    }
-    OwnerDiscovery::Listener(host, port)
+    discover_mailbox_owner_with_probes(
+        &inspect_mailbox_ownership(sqlite_path, &config.storage_root),
+        |pid| {
+            // A different TMPDIR can hide the daemon's listener hint. The
+            // configured port is usable only when its actual holder is this PID.
+            verified_listener_for_pid(pid).or_else(|| {
+                (listener_port_holder_pids_with_hint(&config.http_host, config.http_port) == [pid])
+                    .then(|| (config.http_host.clone(), config.http_port))
+            })
+        },
+        || inspect_mailbox_ownership(sqlite_path, &config.storage_root),
+    )
 }
 
-/// Whether a competing owner could be a server a client should call, rather
-/// than another CLI holding the mailbox for a moment. An unreadable command
-/// line counts as a server.
-fn mailbox_owner_may_serve(ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState) -> bool {
-    ownership
-        .processes
-        .iter()
-        .filter(|process| ownership.competing_pids.contains(&process.pid))
-        .any(|process| {
-            process.command.as_deref().is_none_or(|command| {
-                command.split_whitespace().any(|arg| arg == "serve-http")
-                    || mcp_agent_mail_db::pool::command_is_python_agent_mail_shadow(command)
-            })
-        })
+fn unresolved_mailbox_owner(
+    ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
+    reason: &str,
+) -> OwnerDiscovery {
+    OwnerDiscovery::Unresolved {
+        pid: match ownership.competing_pids.as_slice() {
+            [pid] => Some(*pid),
+            _ => None,
+        },
+        // Ownership detail contains process argv. Do not echo credentials that
+        // an owner may have received on its command line into a client error.
+        detail: format!(
+            "{reason}; ownership {:?}, owner PIDs {:?}",
+            ownership.disposition, ownership.competing_pids
+        ),
+    }
+}
+
+fn discover_mailbox_owner_with_probes(
+    ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
+    listener_for_pid: impl FnOnce(u32) -> Option<(String, u16)>,
+    inspect_again: impl FnOnce() -> mcp_agent_mail_db::pool::MailboxOwnershipState,
+) -> OwnerDiscovery {
+    if !ownership.blocks_mutation() {
+        return OwnerDiscovery::Unowned;
+    }
+    let Some(pid) = sole_proxy_mailbox_owner(ownership) else {
+        return unresolved_mailbox_owner(ownership, "no single fully locked owner was confirmed");
+    };
+    let Some((host, port)) = listener_for_pid(pid) else {
+        return unresolved_mailbox_owner(ownership, "the owner's listener was not confirmed");
+    };
+    // Recheck mailbox ownership after listener discovery, before using the URL.
+    let current = inspect_again();
+    if sole_proxy_mailbox_owner(&current) != Some(pid) {
+        return unresolved_mailbox_owner(&current, "mailbox ownership changed during discovery");
+    }
+    OwnerDiscovery::Listener(host, port)
 }
 
 /// Whether `storage_root` is the mailbox a default install uses, under any
@@ -48752,17 +48736,8 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         );
     }
 
-    fn endpoint_for(
-        discovery: &OwnerDiscovery,
-        default_root: bool,
-        holders: &[u32],
-    ) -> CliResult<(String, u16)> {
-        endpoint_without_owner(
-            discovery,
-            default_root,
-            ("127.0.0.1".to_string(), 8765),
-            holders,
-        )
+    fn endpoint_for(discovery: &OwnerDiscovery, default_root: bool) -> CliResult<(String, u16)> {
+        endpoint_without_owner(discovery, default_root, ("127.0.0.1".to_string(), 8765))
     }
 
     fn unresolved_owner(pid: Option<u32>) -> OwnerDiscovery {
@@ -48773,41 +48748,31 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
     }
 
     #[test]
-    fn default_mailbox_keeps_the_default_endpoint_unless_another_process_holds_it() {
-        let default_endpoint = ("127.0.0.1".to_string(), 8765);
-        for (discovery, holders) in [
-            (OwnerDiscovery::Unowned, &[][..]),
-            (OwnerDiscovery::Unowned, &[9][..]),
-            (unresolved_owner(None), &[][..]),
-            (unresolved_owner(None), &[9][..]),
-            (unresolved_owner(Some(7)), &[][..]),
-            (unresolved_owner(Some(7)), &[7][..]),
-            (unresolved_owner(Some(7)), &[7, 9][..]),
-        ] {
-            assert_eq!(
-                endpoint_for(&discovery, true, holders).unwrap(),
-                default_endpoint,
-                "{discovery:?} with holders {holders:?}"
-            );
+    fn default_mailbox_keeps_the_default_endpoint_only_when_unowned() {
+        assert_eq!(
+            endpoint_for(&OwnerDiscovery::Unowned, true).unwrap(),
+            ("127.0.0.1".to_string(), 8765)
+        );
+        for discovery in [unresolved_owner(None), unresolved_owner(Some(7))] {
+            let refused = endpoint_for(&discovery, true).unwrap_err().to_string();
+            assert!(refused.contains("could not be confirmed"), "{refused}");
+            assert!(refused.contains("HTTP_PORT"), "{refused}");
+            assert!(refused.contains("owner PID"), "{refused}");
         }
-        let refused = endpoint_for(&unresolved_owner(Some(7)), true, &[9]).unwrap_err();
-        assert!(refused.to_string().contains("could not be confirmed"));
     }
 
     #[test]
     fn other_mailboxes_never_guess_the_default_endpoint() {
         assert_eq!(
-            endpoint_for(&OwnerDiscovery::Unowned, false, &[9]).unwrap(),
+            endpoint_for(&OwnerDiscovery::Unowned, false).unwrap(),
             ("127.0.0.1".to_string(), NO_SERVER_PORT)
         );
         for discovery in [unresolved_owner(None), unresolved_owner(Some(7))] {
-            for holders in [&[][..], &[7][..], &[9][..]] {
-                let refused = endpoint_for(&discovery, false, holders).unwrap_err();
-                assert!(
-                    refused.to_string().contains("nothing was sent to"),
-                    "{refused}"
-                );
-            }
+            let refused = endpoint_for(&discovery, false).unwrap_err();
+            assert!(
+                refused.to_string().contains("nothing was sent to"),
+                "{refused}"
+            );
         }
     }
 
@@ -48816,23 +48781,25 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         let listener = OwnerDiscovery::Listener("127.0.0.1".to_string(), 9100);
         for default_root in [true, false] {
             assert_eq!(
-                endpoint_for(&listener, default_root, &[9]).unwrap(),
+                endpoint_for(&listener, default_root).unwrap(),
                 ("127.0.0.1".to_string(), 9100)
             );
         }
     }
 
-    #[test]
-    fn only_a_possible_server_counts_as_a_mailbox_owner_to_call() {
+    fn proxy_mailbox_owner(
+        pid: u32,
+        command: Option<&str>,
+    ) -> mcp_agent_mail_db::pool::MailboxOwnershipState {
         use mcp_agent_mail_db::pool::{
             MailboxOwnershipDisposition, MailboxOwnershipProcess, MailboxOwnershipState,
         };
-        let ownership = |command: Option<&str>, competing: bool| MailboxOwnershipState {
+        MailboxOwnershipState {
             disposition: MailboxOwnershipDisposition::ActiveOtherOwner,
             storage_lock_path: String::new(),
             sqlite_lock_path: String::new(),
             processes: vec![MailboxOwnershipProcess {
-                pid: 7,
+                pid,
                 command: command.map(str::to_string),
                 executable_path: None,
                 executable_deleted: false,
@@ -48841,27 +48808,213 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
                 holds_exclusive_lock: true,
                 holds_database_file: true,
             }],
-            competing_pids: if competing { vec![7] } else { Vec::new() },
+            competing_pids: vec![pid],
             readers: Vec::new(),
             supervised_restart_required: false,
-            detail: String::new(),
-        };
-        assert!(mailbox_owner_may_serve(&ownership(
+            detail: "owner command contains secret-from-owner-argv".to_string(),
+        }
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_never_discards_an_owner_based_on_argv() {
+        for command in [
             Some("/usr/local/bin/am serve-http --no-tui"),
-            true
-        )));
-        assert!(
-            mailbox_owner_may_serve(&ownership(None, true)),
-            "an unreadable command line must count as a server"
-        );
-        assert!(!mailbox_owner_may_serve(&ownership(
+            Some("/usr/local/bin/mcp-agent-mail serve"),
             Some("/usr/local/bin/am mail send"),
-            true
-        )));
-        assert!(!mailbox_owner_may_serve(&ownership(
-            Some("/usr/local/bin/am serve-http"),
-            false
-        )));
+            None,
+        ] {
+            let discovery = discover_mailbox_owner_with_probes(
+                &proxy_mailbox_owner(7, command),
+                |pid| {
+                    assert_eq!(pid, 7);
+                    None
+                },
+                || panic!("no listener to recheck"),
+            );
+            assert!(matches!(
+                discovery,
+                OwnerDiscovery::Unresolved { pid: Some(7), .. }
+            ));
+            for default_root in [true, false] {
+                let error = endpoint_for(&discovery, default_root)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("owner PID 7"), "{error}");
+                assert!(!error.contains("secret-from-owner-argv"), "{error}");
+                if let Some(command) = command {
+                    assert!(!error.contains(command), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_requires_stable_owner_after_listener_lookup() {
+        let listener = ("127.0.0.1".to_string(), 9100);
+        assert_eq!(
+            discover_mailbox_owner_with_probes(
+                &proxy_mailbox_owner(7, None),
+                |pid| {
+                    assert_eq!(pid, 7);
+                    Some(listener.clone())
+                },
+                || proxy_mailbox_owner(7, None),
+            ),
+            OwnerDiscovery::Listener(listener.0.clone(), listener.1)
+        );
+        let changed = discover_mailbox_owner_with_probes(
+            &proxy_mailbox_owner(7, None),
+            |_| Some(listener.clone()),
+            || proxy_mailbox_owner(8, None),
+        );
+        assert!(matches!(
+            changed,
+            OwnerDiscovery::Unresolved { pid: Some(8), .. }
+        ));
+        let mut unowned = proxy_mailbox_owner(7, None);
+        unowned.disposition = mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned;
+        unowned.competing_pids.clear();
+        unowned.processes.clear();
+        let disappeared = discover_mailbox_owner_with_probes(
+            &proxy_mailbox_owner(7, None),
+            |_| Some(listener),
+            || unowned.clone(),
+        );
+        assert!(matches!(
+            disappeared,
+            OwnerDiscovery::Unresolved { pid: None, .. }
+        ));
+        assert_eq!(
+            discover_mailbox_owner_with_probes(
+                &unowned,
+                |_| panic!("unowned mailbox has no listener to discover"),
+                || panic!("unowned mailbox needs no recheck"),
+            ),
+            OwnerDiscovery::Unowned
+        );
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_refuses_ambiguous_or_incomplete_ownership() {
+        use mcp_agent_mail_db::pool::MailboxOwnershipDisposition;
+        let mut split = proxy_mailbox_owner(7, None);
+        split.disposition = MailboxOwnershipDisposition::SplitBrain;
+        split.competing_pids.push(8);
+        let mut missing_storage_lock = proxy_mailbox_owner(7, None);
+        missing_storage_lock.processes[0].holds_storage_root_lock = false;
+        let mut missing_sqlite_lock = proxy_mailbox_owner(7, None);
+        missing_sqlite_lock.processes[0].holds_sqlite_lock = false;
+        let mut no_exclusive_lock = proxy_mailbox_owner(7, None);
+        no_exclusive_lock.processes[0].holds_exclusive_lock = false;
+        let mut unknown_pid = proxy_mailbox_owner(7, None);
+        unknown_pid.competing_pids.clear();
+        for ownership in [
+            split,
+            missing_storage_lock,
+            missing_sqlite_lock,
+            no_exclusive_lock,
+            unknown_pid,
+        ] {
+            let discovery = discover_mailbox_owner_with_probes(
+                &ownership,
+                |_| panic!("ambiguous ownership cannot authorize listener discovery"),
+                || panic!("unconfirmed ownership has no verified listener"),
+            );
+            assert!(matches!(discovery, OwnerDiscovery::Unresolved { .. }));
+            assert!(endpoint_for(&discovery, true).is_err());
+            assert!(endpoint_for(&discovery, false).is_err());
+        }
+    }
+
+    #[test]
+    fn unresolved_mailbox_owner_sends_no_request_or_bearer_to_recording_endpoint() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let payload = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let payload_len = serde_json::to_vec(&payload).unwrap().len();
+        for (discovery, default_root, should_send) in [
+            (OwnerDiscovery::Unowned, true, true),
+            (unresolved_owner(None), true, false),
+            (unresolved_owner(Some(7)), true, false),
+            (unresolved_owner(None), false, false),
+            (unresolved_owner(Some(7)), false, false),
+        ] {
+            // Model the configured default using an ephemeral endpoint. Never
+            // bind or contact the actual shared mailbox's default port.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let finished = AtomicBool::new(false);
+            let (result, recorded) = std::thread::scope(|scope| {
+                let recorder = scope.spawn(|| {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                                stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                                let mut request = Vec::new();
+                                let mut buffer = [0_u8; 1024];
+                                loop {
+                                    let n = stream.read(&mut buffer).unwrap();
+                                    assert_ne!(n, 0, "client must send a complete request");
+                                    request.extend_from_slice(&buffer[..n]);
+                                    if find_http_header_end(&request)
+                                        .is_some_and(|end| request.len() >= end + payload_len)
+                                    {
+                                        break;
+                                    }
+                                }
+                                let body = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+                                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                                stream.write_all(body).unwrap();
+                                return Some(String::from_utf8(request).unwrap());
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if finished.load(Ordering::Acquire) {
+                                    return None;
+                                }
+                                assert!(Instant::now() < deadline, "client did not finish");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("recording listener failed: {error}"),
+                        }
+                    }
+                });
+                let result = endpoint_without_owner(
+                    &discovery,
+                    default_root,
+                    (addr.ip().to_string(), addr.port()),
+                )
+                .and_then(|(host, port)| {
+                    post_jsonrpc_request_blocking_http(
+                        &format!("http://{host}:{port}/mcp/"),
+                        Some("routing-regression-secret"),
+                        &payload,
+                        2,
+                    )
+                });
+                finished.store(true, Ordering::Release);
+                (result, recorder.join().unwrap())
+            });
+            if should_send {
+                assert_eq!(result.unwrap().unwrap().status, 200);
+                let request = recorded.expect("positive control must capture an actual request");
+                assert!(request.contains("POST /mcp/ HTTP/1.1"));
+                assert!(request.contains("Authorization: Bearer routing-regression-secret"));
+                assert!(request.contains("tools/list"));
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("nothing was sent to"), "{error}");
+                assert!(
+                    recorded.is_none(),
+                    "stray request leaked to default endpoint: {recorded:?}"
+                );
+            }
+        }
     }
 
     #[test]

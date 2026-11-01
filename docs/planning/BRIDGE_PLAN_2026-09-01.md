@@ -1,5 +1,55 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 1 mailbox-routing repair (br-eos8u)
+
+- [x] Refresh authoritative ready work and preserve the clean tracked checkout.
+  Governing project docs match the fully reviewed snapshot. The TUI contact
+  query already landed; its remaining Mac production check is not a new fix.
+- [x] Claim `br-eos8u` and reserve the CLI implementation, existing integration
+  tests and this plan. The partial repair still guesses for unresolved default
+  mailbox owners and skips their bounded discovery retry. Its argv filter can
+  also discard a live exclusive owner the database probe already identified.
+- [x] Remove the default-root exception while retaining genuine unowned/default,
+  unowned/private and explicit-endpoint behavior. Keep the existing retry budget.
+- [x] Treat every reported competing owner as requiring listener verification;
+  retain both-lock/exclusive/single-PID authority and the ownership recheck.
+  Show owner PIDs and remediation without echoing owner command-line secrets.
+- [ ] Add recording-endpoint regressions on ephemeral ports only, with a real
+  authenticated HTTP positive control and zero requests for unresolved owners.
+  Cover missing/ambiguous owner, disappeared/changed ownership, actual dedicated
+  server-style command lines, known CLI holders and unreadable command lines.
+- [ ] Execute the real nondefault-daemon CLI registration/send/inbox round trip
+  and the real owned/unresolved refusal test. Distinguish injected probe tests
+  from these real lock/listener/transport paths; never touch the live default port.
+- [ ] Run exact-source focused native tests plus all-target, separate production,
+  strict Clippy, formatting and scanner checks through strict RCH.
+- [ ] Fresh solo acceptance against the original Bead; retain failures and
+  original broader holds, then close only on populated evidence. Flush Beads,
+  check graph preservation/cycles, commit/push without force and release leases.
+
+Implementation and regression code are written; runtime acceptance is pending.
+Evidence is retained in `/data/tmp/am-eos8u-20261101T2014/`. Initial worker
+admission refusals are exit 103, not test failures or passes. The receipt-enabled
+workspace attempt also failed before Cargo: RCH's contained-source policy rejects
+sibling paths in excluded fuzz/browser manifests. The unchanged Cargo workspace
+check is being retried through strict remote execution with a separate live-source
+observation. The native test job was admitted with a source-content receipt.
+Its source matches the frozen manifest except six historical perf JSON files
+already excluded by `.rchignore`; those exclusions are not new and are not test
+inputs for this routing slice. They remain explicit exclusions, not exact-tree
+equality. No compiler or runtime success is claimed yet.
+
+Scanner result: the initial UBS run timed out at 300 seconds (exit 2, no files
+scanned). Doctor found the scanner healthy. The identical two-file/rule scan
+completed in 763 seconds with a 1,200-second scanner budget: exit 0, zero
+critical findings, 11,724 warnings and 5,364 informational findings across the
+full monolithic files. All 62 findings on changed lines were reviewed: test
+assertions/panics, known-nonempty fixture indexing, bounded read-buffer slicing,
+strict UTF-8 on the test client's own request, loopback HTTP, cloning and slash
+strings misidentified as division. Production changes have one informational
+clone finding and no new warning or critical finding. No suppression, category
+exclusion, product-test timeout change or whole-project scanner claim follows.
+
 ## November 1 execution queue (publication verified)
 
 Beads remains the complete dependency-aware work list. This queue records the

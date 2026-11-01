@@ -9171,6 +9171,12 @@ fn cli_refuses_a_mailbox_server_it_cannot_confirm() {
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("could not be confirmed"), "{stderr}");
     assert!(stderr.contains("nothing was sent to"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("owner PID {}", server.0.id())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("HTTP_PORT"), "{stderr}");
+    assert!(!stderr.contains("unconfirmed-server-token"), "{stderr}");
     // The daemon's own TMPDIR reaches the same listener, so only the guess was
     // refused. The daemon has no such project, and the refusal is its answer.
     let out = command(env.tmp.path()).args(agents_list).output().unwrap();
