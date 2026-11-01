@@ -8589,10 +8589,12 @@ Options:
   --preview          Alias for --dry-run
 
 Environment:
-  TMPDIR                Staging and default installer lock directory (default: /tmp)
-  AM_INSTALL_LOCK_FILE  Override the lock base path (the lock directory adds .d)
+  TMPDIR                Staging and initial installer lock directory (default: /tmp)
+  AM_INSTALL_LOCK_FILE  Override the initial lock base path (directory adds .d)
   LOG_FILE              Installer diagnostic log path
   AM_LINK_DIR           Convenience symlink directory (default: ~/.local/bin)
+
+The install destination is also locked, including across different TMPDIR values.
 EOFU
 }
 
@@ -9041,6 +9043,9 @@ cleanup() {
   if [ -n "${TMP:-}" ]; then
     remove_installer_tmp_dir "$TMP" || true
   fi
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    remove_installer_lock_dir "${DESTINATION_LOCK_DIR:-}" "$$" || true
+  fi
   if [ "${LOCKED:-0}" -eq 1 ]; then
     remove_installer_lock_dir "${LOCK_DIR:-}" "$$" || true
   fi
@@ -9055,6 +9060,8 @@ cleanup() {
 # lock this invocation actually owns.
 LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
+DESTINATION_LOCK_DIR=""
+DESTINATION_LOCKED=0
 TMP=""
 trap cleanup EXIT
 trap 'handle_binary_transaction_signal HUP 129' HUP
@@ -9063,53 +9070,69 @@ trap 'handle_binary_transaction_signal QUIT 131' QUIT
 trap 'handle_binary_transaction_signal TERM 143' TERM
 
 publish_installer_lock_pid() {
-  chmod 700 "$LOCK_DIR" || return 1
-  (umask 077; printf '%s\n' "$$" >"$LOCK_DIR/pid")
+  local lock_dir="$1"
+  case "$2" in
+    initial) LOCKED=1 ;;
+    destination) DESTINATION_LOCKED=1 ;;
+    *) return 1 ;;
+  esac
+  chmod 700 "$lock_dir" || return 1
+  (umask 077; printf '%s\n' "$$" >"$lock_dir/pid")
 }
 
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-  LOCKED=1
-  if ! publish_installer_lock_pid; then
-    err "Could not publish installer lock ownership at $LOCK_DIR"
-    exit 1
-  fi
-else
-  lock_owner=""
-  current_uid=$(id -u 2>/dev/null || printf '')
-  if [ ! -L "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
-    lock_owner=$(installer_path_owner_uid "$LOCK_DIR" 2>/dev/null || printf '')
-  fi
-  if [ -n "$current_uid" ] && [ "$lock_owner" = "$current_uid" ] && \
-     [ -f "$LOCK_DIR/pid" ] && [ ! -L "$LOCK_DIR/pid" ]; then
-    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || printf '')
-    case "$OLD_PID" in
-      ''|0|*[!0-9]*) ;;
-      *)
-        if ! kill -0 "$OLD_PID" 2>/dev/null; then
-          if remove_installer_lock_dir "$LOCK_DIR" "$OLD_PID" && mkdir "$LOCK_DIR" 2>/dev/null; then
-            LOCKED=1
-            if ! publish_installer_lock_pid; then
-              err "Could not publish installer lock ownership at $LOCK_DIR"
-              exit 1
+acquire_installer_lock() {
+  local lock_dir="$1"
+  local lock_kind="$2"
+  local lock_owner="" current_uid="" old_pid="" acquired=0
+  if mkdir "$lock_dir" 2>/dev/null; then
+    acquired=1
+  else
+    current_uid=$(id -u 2>/dev/null || printf '')
+    if [ ! -L "$lock_dir" ] && [ -d "$lock_dir" ]; then
+      lock_owner=$(installer_path_owner_uid "$lock_dir" 2>/dev/null || printf '')
+    fi
+    if [ -n "$current_uid" ] && [ "$lock_owner" = "$current_uid" ] && \
+       [ -f "$lock_dir/pid" ] && [ ! -L "$lock_dir/pid" ]; then
+      old_pid=$(cat "$lock_dir/pid" 2>/dev/null || printf '')
+      case "$old_pid" in
+        ''|0|*[!0-9]*) ;;
+        *)
+          if ! kill -0 "$old_pid" 2>/dev/null; then
+            if remove_installer_lock_dir "$lock_dir" "$old_pid" && mkdir "$lock_dir" 2>/dev/null; then
+              acquired=1
             fi
           fi
-        fi
-        ;;
-    esac
+          ;;
+      esac
+    fi
   fi
-  if [ "$LOCKED" -eq 0 ]; then
-    err "Another installer is running or the lock authority is unsafe (lock $LOCK_DIR)"
+  if [ "$acquired" -eq 0 ]; then
+    err "Another installer is running or the lock authority is unsafe (lock $lock_dir)"
     err "Wait for the other install to finish, or inspect the stale lock without following symlinks."
-    err "Check lock owner with: ls -ld \"$LOCK_DIR\" \"$LOCK_DIR/pid\""
-    exit 1
+    err "Check lock owner with: ls -ld \"$lock_dir\" \"$lock_dir/pid\""
+    return 1
   fi
-fi
+  if ! publish_installer_lock_pid "$lock_dir" "$lock_kind"; then
+    err "Could not publish installer lock ownership at $lock_dir"
+    return 1
+  fi
+}
+
+acquire_installer_lock "$LOCK_DIR" initial || exit 1
 
 # Persistent install-state writes begin only after dry-run/confirmation and
 # while the installer lock is held.
 if ! ensure_real_directory_tree "$DEST" "install destination"; then
   err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
   exit 1
+fi
+# Temporary roots and explicit lock overrides can differ between invocations.
+# Fence the shared destination before inspecting or recovering its transaction.
+DESTINATION_LOCK_DIR="$DEST/.mcp-agent-mail-install.lock.d"
+if [ ! -L "$DESTINATION_LOCK_DIR" ] && [ "$LOCK_DIR" -ef "$DESTINATION_LOCK_DIR" ]; then
+  DESTINATION_LOCK_DIR=""
+else
+  acquire_installer_lock "$DESTINATION_LOCK_DIR" destination || exit 1
 fi
 # Only the fixed active path is authoritative. A crash before its no-replace
 # publication can leave `.preparing.*` evidence, but those unique directories

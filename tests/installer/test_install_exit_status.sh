@@ -287,7 +287,128 @@ done
 done
 done
 
-printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$failures"
+# Run two complete installers with distinct temporary roots. The first pauses
+# at the download boundary while holding its real locks. Network substitution
+# controls that interleaving only; the signed installations below remain the
+# real dependency positives. A shared destination must refuse the contender
+# before recovery, while unrelated destinations can make progress.
+destination_cases=0
+for delivery in file stdin; do
+for sharing in same different alias; do
+    if ! python3 - "$INSTALL_SH" "$scratch/destination-$delivery-$sharing" \
+        "$ARTIFACT_DIR" "$BASH" "$VERSION" "$delivery" "$sharing" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+source, case_root, artifacts, bash, version, delivery, sharing = sys.argv[1:]
+root = Path(case_root)
+assert not root.exists(), "concurrency cases need independent temporary roots"
+for name in ("bin", "home", "tmp-first", "tmp-second", "destination"):
+    (root / name).mkdir(parents=True, exist_ok=True)
+curl = root / "bin/curl"
+curl.write_text("""#!/bin/bash
+for argument; do
+  [ "$argument" = -fsSI ] && exit 22
+done
+printf '%s\\n' "$$" > "$PROBE_ENTRY"
+if [ "$PROBE_FIRST" = 1 ]; then
+  attempt=0
+  while [ "$attempt" -lt 1500 ]; do
+    [ -e "$PROBE_RELEASE" ] && exit 22
+    attempt=$((attempt + 1))
+    sleep 0.02
+  done
+fi
+exit 22
+""")
+curl.chmod(0o755)
+prefix = "destination-" + delivery + "-" + sharing
+
+def launch(role, destination):
+    env = {
+        "HOME": str(root / "home"),
+        "PATH": str(root / "bin") + ":/usr/bin:/bin:/usr/sbin:/sbin",
+        "SHELL": "/bin/bash", "LC_ALL": "C", "TERM": "dumb",
+        "TMPDIR": str(root / ("tmp-" + role)),
+        "LOG_FILE": str(Path(artifacts) / (prefix + "-" + role + ".verbose.log")),
+        "PROBE_ENTRY": str(root / (role + ".curl")),
+        "PROBE_RELEASE": str(root / "release"),
+        "PROBE_FIRST": "1" if role == "first" else "0",
+    }
+    if role == "first" and sharing == "alias":
+        # Distinct spellings of one lock directory must not self-contend.
+        env["AM_INSTALL_LOCK_FILE"] = str(destination) + "/./.mcp-agent-mail-install.lock"
+    args = ["--version", version, "--dest", str(destination), "--yes",
+            "--no-gum", "--no-service", "--no-migrate"]
+    log = Path(artifacts) / (prefix + "-" + role + ".log")
+    with log.open("wb") as output:
+        if delivery == "file":
+            return subprocess.Popen([bash, source, *args], env=env, cwd=root,
+                                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+        with open(source, "rb") as stdin:
+            return subprocess.Popen([bash, "-s", "--", *args], env=env, cwd=root,
+                                    stdin=stdin, stdout=output, stderr=subprocess.STDOUT)
+
+first = launch("first", root / "destination")
+try:
+    deadline = time.monotonic() + 15
+    while not (root / "first.curl").exists() and first.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    first_log = Path(artifacts) / (prefix + "-first.log")
+    assert (root / "first.curl").exists(), first_log.read_text()
+    initial = root / ("destination/.mcp-agent-mail-install.lock.d" if sharing == "alias"
+                      else "tmp-first/mcp-agent-mail-install.lock.d")
+    assert (initial / "pid").read_text().strip() == str(first.pid)
+    destination_lock = root / "destination/.mcp-agent-mail-install.lock.d"
+    if destination_lock.exists():
+        assert (destination_lock / "pid").read_text().strip() == str(first.pid)
+    evidence = None
+    if delivery == "stdin" and sharing != "different":
+        journal = root / "destination/.mcp-agent-mail-install-transaction.active"
+        journal.mkdir(mode=0o700)
+        evidence = journal / "live-owner-evidence"
+        evidence.write_bytes(b"leave the active owner's journal unchanged\n")
+        before = (evidence.stat().st_ino, evidence.read_bytes())
+    second_dest = root / ("other-destination" if sharing == "different" else "destination")
+    second = launch("second", second_dest)
+    second_rc = second.wait(timeout=15)
+    second_log = (Path(artifacts) / (prefix + "-second.log")).read_text()
+    assert second_rc == 1, second_log
+    assert first.poll() is None, first_log.read_text()
+    assert (initial / "pid").read_text().strip() == str(first.pid)
+    if sharing == "different":
+        assert (root / "second.curl").exists(), second_log
+        assert "Another installer is running" not in second_log, second_log
+        assert not (second_dest / ".mcp-agent-mail-install.lock.d").exists()
+    else:
+        assert not (root / "second.curl").exists(), second_log
+        assert "Another installer is running" in second_log, second_log
+        assert "previous binary transaction is ambiguous" not in second_log, second_log
+        assert (destination_lock / "pid").read_text().strip() == str(first.pid)
+    assert not (root / "tmp-second/mcp-agent-mail-install.lock.d").exists()
+    if evidence is not None:
+        assert (evidence.stat().st_ino, evidence.read_bytes()) == before
+finally:
+    (root / "release").touch()
+    first_rc = first.wait(timeout=15)
+assert first_rc == 1, first_log.read_text()
+assert not initial.exists()
+assert not destination_lock.exists()
+if evidence is not None:
+    assert (evidence.stat().st_ino, evidence.read_bytes()) == before
+print("destination", delivery, sharing, "owner preserved; contender and cleanup verified")
+PY
+    then
+        failures=$((failures + 1))
+    fi
+    destination_cases=$((destination_cases + 1))
+done
+done
+
+printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
     [ "$failures" -eq 0 ]
     exit $?

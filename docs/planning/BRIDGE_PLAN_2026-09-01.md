@@ -1,6 +1,6 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
-## November 1 execution queue (16:56 UTC)
+## November 1 execution queue (18:17 UTC)
 
 Beads remains the complete dependency-aware work list. This queue records the
 current execution details in the existing plan because the earlier loose
@@ -15,7 +15,8 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
   build `30085930664591514` each report completed/exit 0. DB test counts and
   named cases cannot be recovered from the missing stdout. This is completion
   evidence on the older frozen source, not a current 0.3.40 runtime verdict.
-- [x] Recheck the live mailbox read-only: healthy, reservation parity285/285.
+- [x] Recheck the live mailbox read-only: healthy, reservation parity300/300
+  on the latest probe; the same live owner remains in place.
   Leave its installed binary, service, database and archive untouched.
 - [x] Import Beads after the incoming work. An overlapping read/import hit
   the sole-opener checkpoint guard; the sequential retry succeeds. No database
@@ -35,7 +36,8 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
 - [x] Run four actual authenticated0.3.40 installations, including default
   file/stdin delivery: all pass signature/checksum, exact installed versions,
   setup witnesses and exit0. All use private homes/destinations. `br-97lrm`
-  closes at this scope after fresh solo acceptance; no independent review.
+  initially closes at this scope after fresh solo acceptance; no independent
+  review. The final concurrency review below finds a regression and reopens it.
 - [x] Fix both installer-test subshells to abort if entering their private
   working directory fails. Final44+16 controls pass again. The Bash scan reports
   two pre-existing critical findings and zero warnings; it remains a red scan.
@@ -55,8 +57,9 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
   All three finish with exit0 (38m08s / 70m12s / 58m13s respectively). The
   upstream `proc-macro-error2` future-compatibility notice remains. Formatting
   and whitespace also pass. This is compiler qualification, not a runtime or
-  release certificate.
-- [ ] Run the original populated DB admission/initializer, storage
+  release certificate. These passes precede the later `.78` test-fixture edit;
+  that source has its own required gates pending below.
+- [x] Run the original populated DB admission/initializer, storage
   checkpoint/path/owner-lock/decoded-index and bundle publication controls on
   the final source when admitted. GNU compilation and native Windows execution
   remain distinct; `.76`, `.77`, `.49` and broader authority holds stay open.
@@ -71,9 +74,41 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
   `422c61c8`; all 3,782 actual input files match with no exclusions. Both outer
   timeout variables are14400; per-test deadlines remain unchanged. Debug info
   and incremental compilation are disabled to bound build resource use. No
-  native tests have reported results yet.
-- [ ] Keep `.75` open: the checksum-setting proposal failed its controlled
-  reproducer. Remove the ineffective setting without presenting this as a
+  The run finishes exit100:180 selected tests execute,179 pass and one fails;
+  5,187 tests outside the declared filter are skipped. DB49/49, share3/3 and
+  storage127/128 pass. Both new checkpoint cases execute and pass on the actual
+  current storage ELF `95bde54d`, rather than the older stale77 executable.
+  The failure is `test_file_lock_stale_cleanup_permission_denied_returns_false`:
+  its uid65534 child cannot execute through root-private `/data/tmp` ancestors,
+  so the original denial assertions have not run in that failing invocation.
+  A late runtime-source observer reaches the process after exit and sees no
+  process; it receives no runtime-source proof credit. The live compiler source
+  witness and the three observed executable hashes remain valid bounded evidence.
+- [x] Claim `.78`, reserve the existing storage source and reproduce the fourth
+  permission-probe launch defect. On the same exact original ELF, root-path
+  execution fails101/EACCES while a retained-descriptor invocation with real
+  uid/gid65534 and no supplementary groups passes1/1, executing the unchanged
+  denial, lock/metadata preservation and restored-writable positive assertions.
+  Reuse `.65`'s existing Linux descriptor technique in the fixture; no shared
+  path modes, child privileges, production behavior, assertion or deadline change.
+- [x] Complete `.78`'s unchanged180-control rerun:180/180 pass (DB49, storage128,
+  share3), with all11 declared filter families populated and5,187 outside-filter
+  cases skipped. The repaired storage ELF is `7a45bc8c`; DB `8938bf3e` and share
+  `7f1be08b` are unchanged. All-target checking passes39m10s and strict Clippy
+  passes31m23s; separate production checking is still running. These compiler
+  runs precede the later installer concurrency correction. The native,
+  all-target and separate-production processes each match all
+  3,782 files of repaired-source manifest `d405cd55`, with no exclusions or
+  mismatches. Do not promote original179 passes into a green suite or close the
+  platform/cache/engine/release requirements from this fixture maintenance.
+- [x] Scan the edited storage file: UBS exits1 with4 critical,4,399 warning and
+  1,154 informational findings. Three critical sites are pre-existing worker-
+  spawn panic paths; the fourth flags the cfg(test) command whose executable is
+  formed only from the retained current ELF descriptor. No user-controlled
+  executable selection, annotation or scanner-rule change is introduced. This
+  review does not make the overall scan green.
+- [x] Remove the ineffective checksum setting in `ad628c9c` after its real
+  controlled reproducer fails. `.75` stays open: this removal is not a
   normal-route cache fix. Preserve the stale77 correction below.
 - [ ] Keep `.63` and `br-5nr0m` open under their original workloads and reader
   protection. The incoming detailed reader-scan task covers the observed
@@ -92,10 +127,75 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
 - [x] Build the mandated ACFS checker remotely. Its local baseline checksum
   validation, installer listing and `check --dry-run --local` all pass using a
   private data directory. New installer pin validation follows publication.
-- [ ] Commit/push the owned installer/config/tracker changes in logical batches
-  without force; preserve both remote histories and verify main/mirror refs.
-  Verify the ACFS pin against the exact public installer after publication;
-  coordinate any required checksum update in ACFS. No new binary release,
+- [x] Commit/push the owned changes in logical batches: `ad628c9c` removes the
+  falsified cache setting; `0c350359` carries the installer repair and its
+  original acceptance; `003c7d79` records the current compiler gates and the
+  retention counterexample. Non-force atomic publication succeeds; both public
+  refs equal `003c7d790843c8d29fa4ea29e54ee48a9aa622ae` at17:01:57 UTC.
+- [x] Generate the canonical ACFS checksum candidate after publication. Its
+  Agent Mail pin is correct; four unrelated upstream installer changes are
+  held unchanged. ACFS's checksum monitor independently publishes `47eec968`
+  with only the Agent Mail pin, timestamp and two generated checksum consumers
+  changed. Review all three paths, fast-forward the clean ACFS checkout to that
+  immutable commit, and import its Beads sequentially without repair.
+- [x] Verify the public installer blob `be535232` and ACFS public file agree
+  on SHA256 `f8ca5d8173bb86ea599c7a84210869981c972380854b00982165685e2d4c1c07`.
+  Both ACFS public refs equal `47eec96814ce7aa4b9da7e6c638da75e4dc593b4`;
+  both generated consumers match the actual checksums.yaml hash `415ef8da`.
+  The mandated local checker again passes validation, installer listing and
+  `check --dry-run --local` after synchronization. No unrelated pin is updated.
+- [x] Re-read the four open release P0s against the current source. Public pin
+  parity settles this installer follow-through, not `br-quq4r`'s original
+  release-blocking acceptance. Canonical DSR policy, tag identity, advertised
+  artifact coverage and container provenance remain distinct open requirements;
+  no dormant workflow or post-publication poller is promoted into release proof.
+- [x] Reopen `br-97lrm` after the final concurrency review catches a regression
+  in the initial TMPDIR repair. In one private PID/network environment, original
+  `4a08f950` refuses a second same-destination installer, while published
+  `f8ca5d81` lets it reach download with a different TMPDIR. The first owner is
+  still running and its real PID lock remains owned. Distinct destinations do
+  advance as intended. The download substitute establishes admission behavior,
+  not authenticated installation or a claimed observed corruption.
+- [x] Add destination-bound exclusion before transaction recovery. Both locks
+  use the same atomic mkdir/owner/PID/stale-lock rules and reverse-order cleanup;
+  an initial override naming the destination lock itself does not self-contend.
+  No transaction, signing, owner-preservation or primary-lock condition is removed.
+- [x] Execute all44 original exit controls,16 initial-lock controls and6 new
+  two-installer controls:66/66 pass. Cover file/stdin delivery, same/distinct
+  destinations, alternate spellings of the same initial/destination lock, exact
+  live owner PID, unchanged active-journal inode/bytes and owned-lock cleanup.
+  The published TMPDIR-only source passes the original60 and the two distinct-
+  destination controls, but fails all four shared-destination controls. Retain
+  the initial pre-lock curl observer mistake and the missing-source mount error
+  as setup failures with no behavior credit.
+- [x] Repeat all four actual authenticated0.3.40 installations on corrected
+  installer SHA256 `2036b05888b613a05c74162364f8aceefd00a0fafa18123f8f3aae4c2e47a180`:
+  exact versions, minisign, manifest checksums, setup witnesses and exit0 all pass.
+- [x] Finish the earlier separate production check:0/51m59s. Qualify the
+  combined installer and fixture source, manifest `4c6a12fd`: all-target
+  checking0/4m44s on `hz4`, separate production0/3.34s on `vmi1153651`, and strict
+  Clippy0/7.90s on `hz4`. Formatting, Bash syntax and whitespace pass. Two core
+  tests embed install.sh, so this later qualification matters. Actual all-target
+  and production process namespaces match all3,782 files, with no exclusions.
+  The Clippy rerun has its frozen transfer/command receipt, not a separate live
+  source observer: the extra observer request refuses admission and receives no
+  additional proof credit. A first observer misses `cargo-rch-real` by matching
+  only the literal cargo executable name; the corrected all-target observer
+  matches the real process. All failed/refused observations remain retained.
+- [x] Cancel only the redundant owned all-target job after the equivalent final
+  gate passes. The legacy build-ID cancellation refuses an ownership mismatch;
+  its recommended exact-wrapper command cancels `rchw-8ef9fcc9` successfully.
+  The original wrapper exits143 and receives no pass credit. No process signal,
+  daemon restart, slot override or cleanup is applied to another agent's work.
+- [x] Close `.78` on its original Linux fixture criteria and cited terminal
+  evidence. Keep `.75/.76/.77/.49`, retention, engine, authority, large-archive
+  and release requirements open; the original failed whole-workspace run stays
+  red. UBS still reports2 Bash critical findings and4 in the edited Rust file.
+- [ ] Publish the corrected installer and update/verify its new ACFS pin; the
+  earlier public `f8ca5d81` pin is historical evidence, not this final digest.
+- [ ] Commit the remaining owned code/tracker/verification changes, finish
+  public read-back and close `.97` only after its new pin matches. Release only
+  owned reservations. No new binary release,
   version bump or live-server replacement is part of this repair.
 
 Current raw receipts are under `/data/tmp/am-agency-20261101/`. Neither missing
