@@ -10648,8 +10648,8 @@ enum OwnerDiscovery {
     Listener(String, u16),
     /// No server owns the mailbox.
     Unowned,
-    /// A server owns the mailbox, but no listener could be tied to it. `pid`
-    /// is set when ownership names exactly one process.
+    /// Mailbox ownership or its listener could not authorize an endpoint.
+    /// `pid` is set when ownership names exactly one process.
     Unresolved { pid: Option<u32>, detail: String },
 }
 
@@ -10675,7 +10675,15 @@ pub(crate) fn local_server_host_port(config: &Config) -> CliResult<(String, u16)
     }
     let default_root = is_default_mailbox_root(&config.storage_root);
     let Ok(sqlite_path) = resolve_mailbox_activity_sqlite_path(&config.database_url) else {
-        return endpoint_without_owner(&OwnerDiscovery::Unowned, default_root, configured);
+        return endpoint_without_owner(
+            &OwnerDiscovery::Unresolved {
+                pid: None,
+                detail: "the configured database path could not be resolved; check DATABASE_URL"
+                    .to_string(),
+            },
+            default_root,
+            configured,
+        );
     };
     let mut discovery = discover_mailbox_owner(config, &sqlite_path);
     for delay in OWNER_LISTENER_RETRY_DELAYS {
@@ -49165,6 +49173,73 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
                 }
             }
         }
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_rejects_unresolvable_database_path() {
+        const CHILD_FLAG: &str = "AM_TEST_UNRESOLVABLE_MAILBOX_PATH_CHILD";
+        if std::env::var(CHILD_FLAG).is_ok_and(|value| value == "1") {
+            let roots = [
+                mcp_agent_mail_core::config::default_storage_root_path(),
+                std::env::current_dir().unwrap().join("private-mailbox"),
+            ];
+            for storage_root in roots {
+                for database_url in [
+                    "sqlite:///",
+                    "sqlite:///?fixture-token=credential-must-not-appear",
+                ] {
+                    let config = Config {
+                        database_url: database_url.to_string(),
+                        storage_root: storage_root.clone(),
+                        ..Config::default()
+                    };
+                    let error = local_server_host_port(&config)
+                        .expect_err("an unknown mailbox path must never mean unowned");
+                    assert!(!server_tool_error_is_unavailable(&error));
+                    let message = error.to_string();
+                    assert!(message.contains("nothing was sent to"), "{message}");
+                    assert!(message.contains("DATABASE_URL"), "{message}");
+                    assert!(message.contains("HTTP_PORT"), "{message}");
+                    assert!(!message.contains("credential-must-not-appear"), "{message}");
+                }
+            }
+            let explicit = Config {
+                database_url: "sqlite:///".to_string(),
+                http_port: 1,
+                ..Config::default()
+            };
+            assert_eq!(
+                local_server_host_port(&explicit).unwrap(),
+                (explicit.http_host.clone(), 1)
+            );
+            return;
+        }
+        // Clear ambient endpoint settings in a child rather than mutating this
+        // process's environment. This calls only the resolver, never HTTP.
+        let scratch = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tests::mailbox_owner_discovery_rejects_unresolvable_database_path",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD_FLAG, "1")
+            .env("HOME", scratch.path())
+            .env("USERPROFILE", scratch.path())
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .current_dir(scratch.path());
+        for key in ["SYSTEMROOT", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                child.env(key, value);
+            }
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed;"), "{stdout}\n{stderr}");
     }
 
     #[test]
