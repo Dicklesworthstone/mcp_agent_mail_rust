@@ -36,8 +36,10 @@ fastmcp-protocol = "0.13.0"
 # br-5lgwn: the mailbox engine, SQLModel and FastMCP share Asupersync 0.5.
 # The embedded Beads library retains its older private runtime graph.
 asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
-fsqlite = "=0.4.10"
-fsqlite-types = "=0.4.10"
+# GH#372: 0.4.13 fixes descending-key index page amplification in persisted
+# tool metrics. Existing bloated mailboxes need an explicit offline VACUUM.
+fsqlite = "=0.4.13"
+fsqlite-types = "=0.4.13"
 
 sqlmodel = "=0.5.0"
 sqlmodel-core = "=0.5.0"
@@ -203,7 +205,7 @@ inherits = "release"     # Benchmarks use same optimizations as release
 [patch.crates-io]
 # beads_rust 0.6.0 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
-# The mailbox uses registry FrankenSQLite 0.4.10 (no patch).
+# The mailbox uses registry FrankenSQLite 0.4.13 (no patch).
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
@@ -225,12 +227,14 @@ fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 # The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# registry FrankenSQLite 0.4.10 and registry FastMCP 0.13.0.
+# registry FrankenSQLite 0.4.13 and registry FastMCP 0.13.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
 # Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus
 # the short-record decoder fix for rows made short by ADD COLUMN (br-2hpuk).
 # 0.4.10 adds the b-tree insert-in-transaction (bd-obwsy) and retried-fsync
 # (bd-alyrn) integrity fixes and max-rowid parity (br-9pnpe).
+# 0.4.13 adds balanced descending index splits, including promoted dividers
+# and minimum-size cells (FrankenSQLite GH#521; Agent Mail GH#372).
 # No mutable sibling checkout is required.
 #
 # beads_rust =0.6.0 is published and resolves from crates.io. Do not patch it

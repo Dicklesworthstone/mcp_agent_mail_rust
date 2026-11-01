@@ -103,7 +103,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 |-------|---------|
 | `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `fastmcp-rust` (`0.13.0`, crates.io; imported as `fastmcp`) | MCP protocol implementation; `Cargo.lock` selects the 0.13.0 registry family on Asupersync 0.5 |
-| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; registry FrankenSQLite `=0.4.10` is the runtime `DbConn`. The `[patch]` Git revision `2633b38a` in `Cargo.toml` applies only to embedded Beads' separate 0.3.18 engine |
+| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; registry FrankenSQLite `=0.4.13` is the runtime `DbConn`. The `[patch]` Git revision `2633b38a` in `Cargo.toml` applies only to embedded Beads' separate 0.3.18 engine |
 | `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.7.0`, FrankenTUI) | TUI rendering for operations console; facade defaults disabled, platform-specific backends selected by the server |
 | `frankensearch` (`0.6.1`, git revision `616c9a7a6bdada97d81f760808996911ba3be294`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Optional `hybrid` integration for semantic retrieval and reranking; portable lexical Search V3 uses the local `TantivyBridge`. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context, and its rustix 1.1.5 requirement agrees with FastMCP |
