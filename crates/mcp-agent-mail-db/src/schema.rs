@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS messages (
     archive_metadata_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
+CREATE INDEX IF NOT EXISTS idx_messages_project_thread_activity ON messages(project_id, thread_id, created_ts, id);
 CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic);
@@ -5219,6 +5220,103 @@ mod tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    async fn assert_project_thread_index_upgrade<C: Connection>(cx: &Cx, conn: &C) {
+        conn.execute(
+            cx,
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             thread_id TEXT, created_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        conn.execute(
+            cx,
+            "INSERT INTO messages VALUES (1, 1, NULL, 10), (2, 1, '1', 20), (3, 2, '1', 30)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        init_migrations_table(cx, conn).await.into_result().unwrap();
+        let migration = schema_migrations_base()
+            .into_iter()
+            .find(|migration| {
+                migration.id == "v1_create_index_idx_messages_project_thread_activity"
+            })
+            .expect("conversation index runs on the runtime migration lane");
+        for _ in 0..2 {
+            run_specific_migrations(cx, conn, vec![migration.clone()])
+                .await
+                .into_result()
+                .unwrap();
+        }
+        let rows = conn
+            .query(
+                cx,
+                "SELECT id, project_id, thread_id, created_ts FROM messages ORDER BY id",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        let retained = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_as::<i64>(0).unwrap(),
+                    row.get_as::<i64>(1).unwrap(),
+                    row.get_as::<Option<String>>(2).unwrap(),
+                    row.get_as::<i64>(3).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            [
+                (1, 1, None, 10),
+                (2, 1, Some("1".into()), 20),
+                (3, 2, Some("1".into()), 30)
+            ]
+        );
+        let columns = conn
+            .query(
+                cx,
+                "PRAGMA index_info(idx_messages_project_thread_activity)",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            columns
+                .iter()
+                .map(|row| row.get_as::<String>(2).unwrap())
+                .collect::<Vec<_>>(),
+            ["project_id", "thread_id", "created_ts", "id"]
+        );
+        let ledger = conn
+            .query(
+                cx,
+                &format!("SELECT COUNT(*) FROM {MIGRATIONS_TABLE_NAME} WHERE id = ?"),
+                &[Value::Text(migration.id)],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(ledger[0].get_as::<i64>(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn project_thread_index_upgrades_existing_mailboxes_idempotently_on_both_engines() {
+        block_on(|cx| async move {
+            let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+            assert_project_thread_index_upgrade(&cx, &canonical).await;
+            let runtime = DbConn::open_memory().unwrap();
+            assert_project_thread_index_upgrade(&cx, &runtime).await;
+        });
     }
 
     async fn seed_legacy_project_events<C: Connection>(cx: &Cx, conn: &C) -> Migration {

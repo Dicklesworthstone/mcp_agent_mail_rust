@@ -8141,6 +8141,52 @@ pub struct ThreadMessageRow {
     pub from: String,
 }
 
+/// The exact conversation key used by project browsing and its detail links.
+///
+/// Only absent, empty, or ASCII-space-only keys denote an unthreaded root.
+/// Preserve every other key verbatim, including leading zeroes, surrounding
+/// spaces and Unicode whitespace. This matches SQLite's one-argument `TRIM`.
+#[must_use]
+pub fn canonical_thread_id(message_id: i64, thread_id: Option<&str>) -> String {
+    thread_id
+        .filter(|key| !key.trim_matches(' ').is_empty())
+        .map_or_else(|| message_id.to_string(), str::to_string)
+}
+
+/// A stable position in the project's conversation list. Messages accepted
+/// after `snapshot_id` are hidden until the reader starts a fresh browse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectThreadCursor {
+    pub snapshot_id: i64,
+    pub anchor_created_ts: i64,
+    pub anchor_message_id: i64,
+    pub newer: bool,
+}
+
+/// Body-free metadata for one canonical project conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectThreadSummary {
+    pub thread_id: String,
+    /// Subject of the newest message by `(created_ts, id)`, not the largest id.
+    pub subject: String,
+    pub message_count: i64,
+    pub first_created_ts: i64,
+    pub last_created_ts: i64,
+    pub last_message_id: i64,
+}
+
+/// A bounded, bidirectionally navigable page ordered by most recent activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectThreadPage {
+    pub threads: Vec<ProjectThreadSummary>,
+    pub snapshot_id: i64,
+    pub next_cursor: Option<ProjectThreadCursor>,
+    pub previous_cursor: Option<ProjectThreadCursor>,
+}
+
+/// Shared upper bound for the web conversation browser and direct DB callers.
+pub const MAX_PROJECT_THREADS_PAGE_SIZE: usize = 200;
+
 /// Recipient details for a single message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecipientDetailRow {
@@ -10038,6 +10084,312 @@ pub async fn get_messages_details_by_ids(
         }
     }
     Outcome::Ok(out)
+}
+
+// No bodies, recipients, attachments or subjects enter the window sort. The
+// covering index keeps this an O(project metadata) pass, independent of body
+// size, and only the selected page's subjects are fetched afterward. A stored
+// summary table would require extra write/import/recovery invariants; an
+// expression index is not supported by the runtime schema reader.
+const PROJECT_THREAD_RANKED_SQL: &str = "WITH scoped AS (\
+    SELECT id, created_ts, \
+           CASE WHEN thread_id IS NOT NULL AND TRIM(thread_id) <> '' \
+                THEN thread_id ELSE CAST(id AS TEXT) END AS conversation_key \
+    FROM messages INDEXED BY idx_messages_project_thread_activity \
+    WHERE project_id = ? AND id <= ?\
+), ranked AS (\
+    SELECT id, created_ts, conversation_key, \
+           ROW_NUMBER() OVER (PARTITION BY conversation_key ORDER BY created_ts DESC, id DESC) AS position, \
+           COUNT(*) OVER (PARTITION BY conversation_key) AS message_count, \
+           MIN(created_ts) OVER (PARTITION BY conversation_key) AS first_created_ts \
+    FROM scoped\
+) \
+SELECT conversation_key, message_count, first_created_ts, created_ts, id \
+FROM ranked WHERE position = 1";
+
+fn project_thread_page_sql(cursor: Option<&ProjectThreadCursor>) -> String {
+    use std::fmt::Write as _;
+
+    let mut sql = PROJECT_THREAD_RANKED_SQL.to_string();
+    if let Some(cursor) = cursor {
+        let comparison = if cursor.newer { ">" } else { "<" };
+        let _ = write!(
+            sql,
+            " AND (created_ts {comparison} ? OR (created_ts = ? AND id {comparison} ?))"
+        );
+    }
+    if cursor.is_some_and(|cursor| cursor.newer) {
+        sql.push_str(" ORDER BY created_ts ASC, id ASC LIMIT ?");
+    } else {
+        sql.push_str(" ORDER BY created_ts DESC, id DESC LIMIT ?");
+    }
+    sql
+}
+
+fn decode_project_thread_summary(
+    row: &SqlRow,
+) -> std::result::Result<ProjectThreadSummary, DbError> {
+    Ok(ProjectThreadSummary {
+        thread_id: row.get_as(0).map_err(|error| map_sql_error(&error))?,
+        subject: String::new(),
+        message_count: row.get_as(1).map_err(|error| map_sql_error(&error))?,
+        first_created_ts: row.get_as(2).map_err(|error| map_sql_error(&error))?,
+        last_created_ts: row.get_as(3).map_err(|error| map_sql_error(&error))?,
+        last_message_id: row.get_as(4).map_err(|error| map_sql_error(&error))?,
+    })
+}
+
+/// Browse complete project conversations, including roots with no explicit key.
+///
+/// Groups before applying the page limit, so one busy conversation never
+/// crowds older conversations out of the browser. The `(created_ts, id)` pair
+/// breaks timestamp ties deterministically. The initial high-water message id
+/// is carried through both directions, preventing concurrent new messages or
+/// replies (including backdated inserts) from shifting later pages. Existing
+/// message edits/deletions are reflected; this is not a retained DB snapshot.
+#[allow(clippy::too_many_lines)]
+pub async fn list_project_threads(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    limit: usize,
+    cursor: Option<&ProjectThreadCursor>,
+) -> Outcome<ProjectThreadPage, DbError> {
+    if cursor.is_some_and(|cursor| {
+        cursor.snapshot_id < 0
+            || cursor.anchor_message_id <= 0
+            || cursor.anchor_message_id > cursor.snapshot_id
+    }) {
+        return Outcome::Err(DbError::invalid("cursor", "invalid conversation position"));
+    }
+    let limit = limit.clamp(1, MAX_PROJECT_THREADS_PAGE_SIZE);
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let snapshot_id = if let Some(cursor) = cursor {
+        cursor.snapshot_id
+    } else {
+        let rows = match map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT COALESCE(MAX(id), 0) FROM messages \
+                 INDEXED BY idx_messages_project_thread_activity WHERE project_id = ?",
+                &[Value::BigInt(project_id)],
+            )
+            .await,
+        ) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match rows.first().map(|row| row.get_as::<i64>(0)) {
+            Some(Ok(id)) => id,
+            Some(Err(error)) => return Outcome::Err(map_sql_error(&error)),
+            None => return Outcome::Err(DbError::Internal("missing message high water".into())),
+        }
+    };
+
+    let mut params = vec![Value::BigInt(project_id), Value::BigInt(snapshot_id)];
+    if let Some(cursor) = cursor {
+        params.extend([
+            Value::BigInt(cursor.anchor_created_ts),
+            Value::BigInt(cursor.anchor_created_ts),
+            Value::BigInt(cursor.anchor_message_id),
+        ]);
+    }
+    let Ok(fetch_limit) = i64::try_from(limit + 1) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+    params.push(Value::BigInt(fetch_limit));
+    let rows = match map_sql_outcome(
+        traw_query(cx, &tracked, &project_thread_page_sql(cursor), &params).await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut threads = match rows
+        .iter()
+        .map(decode_project_thread_summary)
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
+        Ok(threads) => threads,
+        Err(error) => return Outcome::Err(error),
+    };
+    let more_in_direction = threads.len() > limit;
+    threads.truncate(limit);
+    let newer = cursor.is_some_and(|cursor| cursor.newer);
+    if newer {
+        threads.reverse();
+    }
+
+    if !threads.is_empty() {
+        let sql = format!(
+            "SELECT id, subject FROM messages WHERE project_id = ? AND id IN ({})",
+            placeholders(threads.len())
+        );
+        let mut params = vec![Value::BigInt(project_id)];
+        params.extend(threads.iter().map(|row| Value::BigInt(row.last_message_id)));
+        let subjects = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let subjects = subjects
+            .iter()
+            .map(|row| Ok((row.get_as::<i64>(0)?, row.get_as::<String>(1)?)))
+            .collect::<std::result::Result<HashMap<_, _>, SqlError>>();
+        let mut subjects = match subjects {
+            Ok(subjects) => subjects,
+            Err(error) => return Outcome::Err(map_sql_error(&error)),
+        };
+        for thread in &mut threads {
+            thread.subject = subjects.remove(&thread.last_message_id).unwrap_or_default();
+        }
+    }
+
+    let make_cursor = |row: &ProjectThreadSummary, newer| ProjectThreadCursor {
+        snapshot_id,
+        anchor_created_ts: row.last_created_ts,
+        anchor_message_id: row.last_message_id,
+        newer,
+    };
+    let has_older = if newer {
+        cursor.is_some()
+    } else {
+        more_in_direction
+    };
+    let has_newer = if newer {
+        more_in_direction
+    } else {
+        cursor.is_some()
+    };
+    let next_cursor = threads
+        .last()
+        .filter(|_| has_older)
+        .map(|row| make_cursor(row, false));
+    let previous_cursor = threads
+        .first()
+        .filter(|_| has_newer)
+        .map(|row| make_cursor(row, true));
+    Outcome::Ok(ProjectThreadPage {
+        threads,
+        snapshot_id,
+        next_cursor,
+        previous_cursor,
+    })
+}
+
+/// Fetch one canonical conversation without the numeric-seed expansion of
+/// [`list_thread_messages`]. A numeric key only admits its root when that
+/// root's canonical key is exactly equal; `0042`, `+42` and a message numbered
+/// 42 that belongs to another named thread cannot collide with key `42`.
+#[allow(clippy::too_many_lines)]
+pub async fn list_canonical_thread_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    thread_id: &str,
+    limit: Option<usize>,
+) -> Outcome<Vec<ThreadMessageRow>, DbError> {
+    if thread_id.trim_matches(' ').is_empty() || limit == Some(0) {
+        return Outcome::Ok(Vec::new());
+    }
+    let mut ids = {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        let mut sql = "SELECT id, created_ts FROM messages \
+            WHERE project_id = ? AND thread_id = ? \
+            ORDER BY created_ts DESC, id DESC"
+            .to_string();
+        let mut params = vec![Value::BigInt(project_id), Value::Text(thread_id.into())];
+        if let Some(limit) = limit {
+            let Ok(limit) = i64::try_from(limit) else {
+                return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+            };
+            sql.push_str(" LIMIT ?");
+            params.push(Value::BigInt(limit));
+        }
+        let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let mut ids = match rows
+            .iter()
+            .map(|row| Ok((row.get_as::<i64>(0)?, row.get_as::<i64>(1)?)))
+            .collect::<std::result::Result<Vec<_>, SqlError>>()
+        {
+            Ok(ids) => ids,
+            Err(error) => return Outcome::Err(map_sql_error(&error)),
+        };
+        if let Ok(root_id) = thread_id.parse::<i64>()
+            && root_id.to_string() == thread_id
+            && !ids.iter().any(|(id, _)| *id == root_id)
+        {
+            let rows = match map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, created_ts, thread_id FROM messages WHERE id = ? AND project_id = ?",
+                    &[Value::BigInt(root_id), Value::BigInt(project_id)],
+                )
+                .await,
+            ) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+            if let Some(row) = rows.first() {
+                let key = match row.get_as::<Option<String>>(2) {
+                    Ok(key) => key,
+                    Err(error) => return Outcome::Err(map_sql_error(&error)),
+                };
+                if canonical_thread_id(root_id, key.as_deref()) == thread_id {
+                    let created_ts = match row.get_as::<i64>(1) {
+                        Ok(created_ts) => created_ts,
+                        Err(error) => return Outcome::Err(map_sql_error(&error)),
+                    };
+                    ids.push((root_id, created_ts));
+                }
+            }
+        }
+        ids
+    };
+    ids.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(right.0.cmp(&left.0)));
+    if let Some(limit) = limit {
+        ids.truncate(limit);
+    }
+    let ids = ids.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    match get_messages_details_by_ids(cx, pool, &ids, Some(project_id)).await {
+        Outcome::Ok(mut messages) => {
+            // Recheck the key after hydration: an intervening import/update
+            // must not turn a previously scoped id into a foreign thread.
+            messages.retain(|message| {
+                canonical_thread_id(message.id, message.thread_id.as_deref()) == thread_id
+            });
+            messages.sort_by_key(|message| (message.created_ts, message.id));
+            Outcome::Ok(messages)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
 }
 
 /// List messages for a thread.
@@ -29560,6 +29912,443 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].from, UNKNOWN_SENDER_DISPLAY);
             assert_eq!(rows[0].subject, "thread survives sender drift");
+        });
+    }
+
+    async fn seed_project_thread_fixture(cx: &Cx, pool: &DbPool) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("conversation fixture connection");
+        for sql in [
+            "INSERT INTO projects(id, slug, human_key, created_at) \
+             VALUES (1, 'threads-a', '/threads-a', 1), (2, 'threads-b', '/threads-b', 1)",
+            "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1), \
+                    (2, 1, 'RedStone', 'test', 'test', 1, 1), \
+                    (3, 2, 'GreenLake', 'test', 'test', 1, 1)",
+        ] {
+            conn.execute(cx, sql, &[])
+                .await
+                .into_result()
+                .expect("seed conversation identities");
+        }
+        let rows = [
+            (1, 1, None, "root", 10),
+            (2, 1, Some("1"), "root reply", 20),
+            (3, 1, Some("topic"), "topic first", 30),
+            (4, 1, Some("topic"), "topic latest", 50),
+            (5, 1, Some("topic"), "topic backdated", 40),
+            (6, 1, Some("6"), "self numeric", 15),
+            (7, 1, Some("0001"), "leading zeroes", 20),
+            (8, 1, Some("other"), "unrelated numeric seed", 60),
+            (9, 1, Some("8"), "numeric key", 61),
+            (10, 2, Some("topic"), "foreign topic", 100),
+            (11, 2, Some("1"), "foreign numeric key", 101),
+            (12, 1, Some(""), "empty root", 12),
+            (13, 1, Some("12"), "empty root reply", 13),
+            (14, 1, Some("   "), "space root", 14),
+            (15, 1, Some("14"), "space root reply", 15),
+            (16, 1, Some("\t"), "tab key", 16),
+            (17, 1, Some("\u{a0}"), "nbsp key", 17),
+            (18, 1, Some(" padded "), "padded key", 18),
+            (19, 1, Some("padded"), "unpadded key", 19),
+            (
+                20,
+                1,
+                Some("slash/plus+query?#%26'\"><"),
+                "reserved key",
+                20,
+            ),
+            (21, 1, Some("timestamp-tie"), "tied latest", 61),
+        ];
+        for (id, project_id, thread_id, subject, created_ts) in rows {
+            conn.execute(
+                cx,
+                "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(project_id),
+                    Value::BigInt(if project_id == 1 { 1 } else { 3 }),
+                    thread_id.map_or(Value::Null, |key| Value::Text(key.into())),
+                    Value::Text(subject.into()),
+                    Value::Text("large-body ".repeat(4096)),
+                    Value::BigInt(created_ts),
+                ],
+            )
+            .await
+            .into_result()
+            .expect("seed conversation message");
+        }
+        conn.execute(
+            cx,
+            "INSERT INTO message_recipients(message_id, agent_id, kind) \
+             VALUES (4, 1, 'to'), (4, 2, 'cc')",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("multiple deliveries must not multiply conversation counts");
+    }
+
+    #[test]
+    fn canonical_thread_id_preserves_exact_nonblank_identifiers() {
+        for blank in [None, Some(""), Some(" "), Some("    ")] {
+            assert_eq!(canonical_thread_id(42, blank), "42");
+        }
+        for key in [
+            "42", "0042", "+42", " topic ", "\t", "\u{a0}", "../x?y#z", "a%2Fb",
+        ] {
+            assert_eq!(canonical_thread_id(42, Some(key)), key);
+        }
+    }
+
+    async fn assert_project_thread_metadata_query<C: Connection>(cx: &Cx, conn: &C) {
+        conn.execute(
+            cx,
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             thread_id TEXT, created_ts INTEGER NOT NULL, subject TEXT, body_md TEXT)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let migration = crate::schema::schema_migrations()
+            .into_iter()
+            .find(|migration| {
+                migration.id == "v1_create_index_idx_messages_project_thread_activity"
+            })
+            .expect("covering index has an additive schema migration");
+        conn.execute(cx, &migration.up, &[])
+            .await
+            .into_result()
+            .unwrap();
+        conn.execute(
+            cx,
+            "INSERT INTO messages VALUES \
+             (1, 1, NULL, 9, 'root', 'body'), (2, 1, '1', 10, 'reply', 'body'), \
+             (3, 1, 'topic', 12, 'latest', 'body'), (4, 1, 'topic', 11, 'backdated', 'body'), \
+             (5, 2, 'topic', 99, 'foreign', 'body'), (6, 1, 'tie', 12, 'tie', 'body')",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let sql = project_thread_page_sql(None);
+        let params = [Value::BigInt(1), Value::BigInt(6), Value::BigInt(11)];
+        let rows = conn.query(cx, &sql, &params).await.into_result().unwrap();
+        let summaries = rows
+            .iter()
+            .map(decode_project_thread_summary)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|row| (
+                    row.thread_id.as_str(),
+                    row.last_message_id,
+                    row.message_count
+                ))
+                .collect::<Vec<_>>(),
+            [("tie", 6, 1), ("topic", 3, 2), ("1", 2, 2)]
+        );
+        // FrankenSQLite 0.4.10 reports only the outer `SCAN ranked` for
+        // this CTE's EXPLAIN. Inspect the exact production metadata scan
+        // separately; the complete query's real results are checked above.
+        let scoped_sql = PROJECT_THREAD_RANKED_SQL
+            .strip_prefix("WITH scoped AS (")
+            .unwrap()
+            .split_once("), ranked AS (")
+            .unwrap()
+            .0;
+        let plan = conn
+            .query(
+                cx,
+                &format!("EXPLAIN QUERY PLAN {scoped_sql}"),
+                &params[..2],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        let detail = plan
+            .iter()
+            .map(|row| row.get_as::<String>(3).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            detail.contains("idx_messages_project_thread_activity"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn project_thread_metadata_query_runs_on_both_engines_and_uses_covering_index() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = Cx::for_testing();
+            let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+            assert_project_thread_metadata_query(&cx, &canonical).await;
+            let runtime = crate::DbConn::open_memory().unwrap();
+            assert_project_thread_metadata_query(&cx, &runtime).await;
+        });
+    }
+
+    #[test]
+    fn project_threads_have_exact_counts_latest_subjects_and_project_scope() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("project-thread-summary.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let page = list_project_threads(&cx, &pool, 1, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(page.threads.len(), 14);
+            assert_eq!(page.snapshot_id, 21);
+            assert!(page.previous_cursor.is_none());
+            assert!(page.next_cursor.is_none());
+            assert_eq!(page.threads[0].thread_id, "timestamp-tie");
+            assert_eq!(page.threads[1].thread_id, "8");
+            let topic = page
+                .threads
+                .iter()
+                .find(|row| row.thread_id == "topic")
+                .unwrap();
+            assert_eq!(topic.subject, "topic latest");
+            assert_eq!(
+                topic.last_message_id, 4,
+                "a backdated insertion must not select the subject"
+            );
+            assert_eq!(
+                topic.message_count, 3,
+                "recipients must not multiply counts"
+            );
+            assert_eq!((topic.first_created_ts, topic.last_created_ts), (30, 50));
+            for (key, count) in [
+                ("1", 2),
+                ("12", 2),
+                ("14", 2),
+                ("0001", 1),
+                ("8", 1),
+                ("6", 1),
+            ] {
+                assert_eq!(
+                    page.threads
+                        .iter()
+                        .find(|row| row.thread_id == key)
+                        .unwrap()
+                        .message_count,
+                    count
+                );
+            }
+            for key in [
+                "\t",
+                "\u{a0}",
+                " padded ",
+                "padded",
+                "slash/plus+query?#%26'\"><",
+            ] {
+                assert!(page.threads.iter().any(|row| row.thread_id == key));
+            }
+            let foreign = list_project_threads(&cx, &pool, 2, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(foreign.threads.len(), 2);
+            assert!(
+                foreign
+                    .threads
+                    .iter()
+                    .all(|row| row.subject.starts_with("foreign"))
+            );
+            let empty = list_project_threads(&cx, &pool, 99, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(empty.threads.is_empty());
+            assert_eq!(empty.snapshot_id, 0);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn project_threads_cursor_pages_stay_stable_during_new_and_backdated_inserts() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("project-thread-pagination.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let baseline = list_project_threads(&cx, &pool, 1, 200, None)
+                .await.into_result().unwrap();
+            let first = list_project_threads(&cx, &pool, 1, 3, None)
+                .await.into_result().unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute(
+                &cx,
+                "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+                 VALUES (1000, 1, 1, 'topic', 'concurrent reply', 'body', 999), \
+                        (1001, 1, 1, 'new-backdated', 'concurrent backdated', 'body', -100)",
+                &[],
+            ).await.into_result().unwrap();
+            drop(conn);
+
+            let second = list_project_threads(&cx, &pool, 1, 3, first.next_cursor.as_ref())
+                .await.into_result().unwrap();
+            let previous = list_project_threads(&cx, &pool, 1, 3, second.previous_cursor.as_ref())
+                .await.into_result().unwrap();
+            assert_eq!(previous.threads, first.threads);
+            assert!(previous.previous_cursor.is_none());
+            let mut all = first.threads.clone();
+            let mut next = first.next_cursor;
+            while let Some(cursor) = next {
+                let page = list_project_threads(&cx, &pool, 1, 3, Some(&cursor))
+                    .await.into_result().unwrap();
+                assert_eq!(page.snapshot_id, 21);
+                assert!(page.previous_cursor.is_some());
+                all.extend(page.threads);
+                next = page.next_cursor;
+            }
+            assert_eq!(all, baseline.threads, "no duplicate, missing or newly accepted threads");
+            let refreshed = list_project_threads(&cx, &pool, 1, 200, None)
+                .await.into_result().unwrap();
+            assert_eq!(refreshed.threads.len(), 15);
+            assert_eq!(refreshed.threads[0].subject, "concurrent reply");
+            assert_eq!(refreshed.threads[0].message_count, 4);
+            assert_eq!(refreshed.threads.last().unwrap().thread_id, "new-backdated");
+        });
+    }
+
+    #[test]
+    fn project_threads_bounded_pages_do_not_let_one_busy_thread_hide_older_threads() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("project-thread-bounds.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            for id in 100..405 {
+                conn.execute(
+                    &cx,
+                    "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+                     VALUES (?, 1, 1, ?, 'bounded', 'body', ?)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(if id < 200 { "busy".into() } else { format!("thread-{id}") }),
+                        Value::BigInt(if id < 200 { 10_000 } else { id }),
+                    ],
+                ).await.into_result().unwrap();
+            }
+            drop(conn);
+            let page = list_project_threads(&cx, &pool, 1, usize::MAX, None)
+                .await.into_result().unwrap();
+            assert_eq!(page.threads.len(), MAX_PROJECT_THREADS_PAGE_SIZE);
+            assert_eq!(page.threads[0].thread_id, "busy");
+            assert_eq!(page.threads[0].message_count, 100);
+            assert_eq!(page.threads[1].thread_id, "thread-404");
+            assert!(page.next_cursor.is_some());
+            let tail = list_project_threads(&cx, &pool, 1, usize::MAX, page.next_cursor.as_ref())
+                .await.into_result().unwrap();
+            assert_eq!(page.threads.len() + tail.threads.len(), 220);
+            assert!(tail.next_cursor.is_none());
+            let one = list_project_threads(&cx, &pool, 1, 0, None)
+                .await.into_result().unwrap();
+            assert_eq!(one.threads.len(), 1);
+            for (snapshot_id, anchor_message_id) in [(-1, 1), (10, 0), (10, 11)] {
+                let cursor = ProjectThreadCursor {
+                    snapshot_id, anchor_message_id, anchor_created_ts: 0, newer: false,
+                };
+                assert!(matches!(list_project_threads(&cx, &pool, 1, 3, Some(&cursor)).await, Outcome::Err(_)));
+            }
+        });
+    }
+
+    #[test]
+    fn canonical_thread_messages_match_browser_keys_without_numeric_seed_collisions() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("canonical-thread-membership.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let page = list_project_threads(&cx, &pool, 1, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            for summary in page.threads {
+                let messages =
+                    list_canonical_thread_messages(&cx, &pool, 1, &summary.thread_id, None)
+                        .await
+                        .into_result()
+                        .unwrap();
+                assert_eq!(
+                    i64::try_from(messages.len()).unwrap(),
+                    summary.message_count,
+                    "{}",
+                    summary.thread_id
+                );
+                assert!(messages.iter().all(|message| message.project_id == 1));
+                assert_eq!(messages.last().unwrap().id, summary.last_message_id);
+            }
+            for (key, expected) in [
+                ("1", vec![1, 2]),
+                ("8", vec![9]),
+                ("0001", vec![7]),
+                ("12", vec![12, 13]),
+                ("14", vec![14, 15]),
+            ] {
+                let messages = list_canonical_thread_messages(&cx, &pool, 1, key, None)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(
+                    messages
+                        .iter()
+                        .map(|message| message.id)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+            let limited = list_canonical_thread_messages(&cx, &pool, 1, "topic", Some(2))
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                limited.iter().map(|message| message.id).collect::<Vec<_>>(),
+                [5, 4]
+            );
+            for key in ["", " ", "missing", "+1"] {
+                assert!(
+                    list_canonical_thread_messages(&cx, &pool, 1, key, None)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert!(
+                list_canonical_thread_messages(&cx, &pool, 2, "8", None)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_empty()
+            );
+            // The MCP/resource seed lookup has an intentionally different API.
+            let seeded = list_thread_messages(&cx, &pool, 1, "8", None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                seeded.iter().map(|message| message.id).collect::<Vec<_>>(),
+                [8, 9]
+            );
         });
     }
 
