@@ -2909,16 +2909,18 @@ pub enum DoctorCommand {
         json: bool,
     },
 
-    /// Reclaim orphaned pages INSIDE the live database (VACUUM + ANALYZE).
+    /// Compact the mailbox database offline (verified backup, VACUUM + ANALYZE).
     ///
     /// GH#289: an archive reconstruct can leave the promoted database with a
     /// large share of orphaned pages (`Page N: never used`, freelist_count=0)
     /// — pure space-accounting waste that keeps `am doctor health` degraded
     /// forever with no supported reclaim path. This verb runs the
-    /// drain/ownership protocol (same guard as `repair`), then VACUUMs and
+    /// drain/ownership protocol, retains a verified backup, then VACUUMs and
     /// ANALYZEs the mailbox in place and reports the before/after integrity
-    /// class and page counts. Default (no `--yes`) previews. Refuses while a
-    /// live owner holds the mailbox unless `--allow-live-owner`.
+    /// class and page counts. Also rebuilds the sparse metrics index left by
+    /// FrankenSQLite before 0.4.13 (GH#372), even if integrity_check is clean.
+    /// Stop the server first and keep it stopped until completion. Default
+    /// (no `--yes`) previews; applying holds exclusive mailbox locks.
     Vacuum {
         /// Preview: report page counts and integrity class, mutate nothing.
         #[arg(long)]
@@ -2929,10 +2931,10 @@ pub enum DoctorCommand {
         /// Output JSON (shorthand for machine-readable output).
         #[arg(long)]
         json: bool,
-        /// Proceed even if a live owner currently holds the mailbox (unsafe).
+        /// Unsupported for VACUUM: stop the server first (kept for a clear error).
         #[arg(long)]
         allow_live_owner: bool,
-        /// Supervised takeover of a provably dead owner before vacuuming.
+        /// Unsupported for VACUUM: stop all owners without replacing their locks.
         #[arg(long)]
         take_ownership: bool,
     },
@@ -11471,8 +11473,275 @@ fn doctor_vacuum_stats(db_path: &Path) -> CliResult<DoctorVacuumStats> {
     })
 }
 
-/// `am doctor vacuum` — in-place VACUUM + ANALYZE of the live mailbox, with
-/// the same supervised-owner protocol as `repair` (GH#289).
+/// The owner census is advisory: exclusive activity locks close the race with
+/// a server starting immediately after the census. Keep both locks until the
+/// backup, compaction and post-check have finished. A live-owner override is
+/// deliberately unavailable for this whole-file rewrite (GH#372).
+fn acquire_doctor_vacuum_locks(
+    database_url: &str,
+    storage_root: &Path,
+    allow_live_owner: bool,
+    take_ownership: bool,
+) -> CliResult<CliMailboxMutationLocks> {
+    if allow_live_owner || take_ownership {
+        return Err(CliError::Usage(
+            "doctor vacuum is offline-only; --allow-live-owner and --take-ownership cannot bypass this requirement. \
+             Stop every server using this mailbox, run `am doctor drain`, then retry \
+             `am doctor vacuum --yes` without ownership overrides."
+                .to_string(),
+        ));
+    }
+    enforce_supervised_owner_guard(database_url, storage_root, "vacuum", false, false, false)?;
+    acquire_cli_mailbox_mutation_locks(database_url, Some(storage_root))
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct DoctorVacuumTableWitness {
+    rows: u64,
+    sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct DoctorVacuumContentWitness {
+    user_version: i64,
+    application_id: i64,
+    schema_sha256: String,
+    tables: BTreeMap<String, DoctorVacuumTableWitness>,
+}
+
+/// Hash the complete contents of message and identity tables, including every
+/// stored column (bodies, attachments, tokens, read/ack times). Keyset pagination
+/// bounds each materialized batch to 32 rows and avoids loading a whole mailbox
+/// into memory or repeatedly scanning growing OFFSETs. The key names below are
+/// fixed schema identifiers, never operator input. Missing newer tables remain
+/// missing on older mailboxes: compaction must not run migrations.
+fn doctor_vacuum_content_witness(db_path: &Path) -> CliResult<DoctorVacuumContentWitness> {
+    use mcp_agent_mail_db::sqlmodel_core::Value;
+    use sha2::Digest as _;
+
+    const TABLES: &[(&str, &[&str])] = &[
+        ("projects", &["id"]),
+        ("agents", &["id"]),
+        ("messages", &["id"]),
+        ("message_recipients", &["message_id", "agent_id", "kind"]),
+        ("project_mailbox_deliveries", &["message_id"]),
+        ("project_mailbox_receipts", &["message_id", "agent_id"]),
+        // AUTOINCREMENT high-water marks can exceed every surviving row ID.
+        // Reconstructing them from MAX(id) would silently permit ID reuse.
+        ("sqlite_sequence", &["name"]),
+    ];
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+        db_path,
+        "doctor vacuum message-content verification",
+    )
+    .map_err(|error| CliError::Other(format!("cannot verify mailbox contents: {error}")))?;
+    let header_value = |sql: &str| -> CliResult<i64> {
+        let rows = conn
+            .query_sync(sql, &[])
+            .map_err(|error| CliError::Other(format!("cannot read {sql}: {error}")))?;
+        rows.first()
+            .and_then(|row| {
+                row.values().find_map(|value| match value {
+                    Value::BigInt(value) => Some(*value),
+                    Value::Int(value) => Some(i64::from(*value)),
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| CliError::Other(format!("{sql} returned no integer")))
+    };
+    let user_version = header_value("PRAGMA user_version")?;
+    let application_id = header_value("PRAGMA application_id")?;
+    // Root page numbers necessarily change during VACUUM. ANALYZE may create
+    // sqlite_stat* tables; every other table, index, view and trigger definition
+    // must remain exactly as stored, including extension schemas we do not own.
+    let schema = conn
+        .query_sync(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master \
+             WHERE name NOT LIKE 'sqlite_stat%' ORDER BY type, name",
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("cannot verify mailbox schema: {error}")))?;
+    let schema_json: Vec<_> = schema.iter().map(tooling_row_to_json).collect();
+    let schema_bytes = serde_json::to_vec(&schema_json)
+        .map_err(|error| CliError::Other(format!("cannot hash mailbox schema: {error}")))?;
+    let schema_sha256 = hex::encode(sha2::Sha256::digest(&schema_bytes));
+    let mut witness = BTreeMap::new();
+    for &(table, keys) in TABLES {
+        let present = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                &[Value::Text(table.to_string())],
+            )
+            .map_err(|error| CliError::Other(format!("cannot inspect {table}: {error}")))?;
+        if present.is_empty() {
+            continue;
+        }
+        let mut digest = sha2::Sha256::new();
+        let mut count = 0_u64;
+        let mut last_key: Option<Vec<Value>> = None;
+        loop {
+            let mut params = Vec::new();
+            let predicate = if let Some(last) = &last_key {
+                let mut alternatives = Vec::with_capacity(keys.len());
+                for (index, key) in keys.iter().enumerate() {
+                    let mut terms = Vec::with_capacity(index + 1);
+                    for (prefix, previous) in keys.iter().zip(last).take(index) {
+                        terms.push(format!("{prefix} = ?"));
+                        params.push(previous.clone());
+                    }
+                    terms.push(format!("{key} > ?"));
+                    params.push(last[index].clone());
+                    alternatives.push(format!("({})", terms.join(" AND ")));
+                }
+                format!("WHERE {}", alternatives.join(" OR "))
+            } else {
+                String::new()
+            };
+            let rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT * FROM {table} {predicate} ORDER BY {} LIMIT 32",
+                        keys.join(", ")
+                    ),
+                    &params,
+                )
+                .map_err(|error| CliError::Other(format!("cannot verify {table}: {error}")))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                // Preserve SQLite storage-class distinctions, including a BLOB
+                // versus TEXT with the same printable bytes. Integer widths
+                // are normalized by the existing SQL-to-JSON conversion.
+                let fields: Vec<_> = row
+                    .column_names()
+                    .zip(row.values())
+                    .map(|(name, value)| {
+                        let kind = match value {
+                            Value::Null => "null",
+                            Value::Bytes(_) => "blob",
+                            Value::Text(_) => "text",
+                            Value::Float(_) | Value::Double(_) => "real",
+                            _ => "scalar",
+                        };
+                        (name, kind, tooling_sql_value_to_json(value.clone()))
+                    })
+                    .collect();
+                let bytes = serde_json::to_vec(&fields)
+                    .map_err(|error| CliError::Other(format!("cannot hash {table}: {error}")))?;
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(bytes);
+                count += 1;
+            }
+            let last_row = &rows[rows.len() - 1];
+            let next_key = keys
+                .iter()
+                .map(|key| {
+                    last_row
+                        .column_names()
+                        .zip(last_row.values())
+                        .find_map(|(name, value)| (name == *key).then(|| value.clone()))
+                        .ok_or_else(|| {
+                            CliError::Other(format!("cannot find {table}.{key} for verification"))
+                        })
+                })
+                .collect::<CliResult<Vec<_>>>()?;
+            if last_key.as_ref() == Some(&next_key) {
+                return Err(CliError::Other(format!(
+                    "message-content verification made no progress in {table}"
+                )));
+            }
+            last_key = Some(next_key);
+        }
+        // Fail closed if an unexpected legacy key shape (NULL/duplicates) or
+        // engine scan bug skipped rows across a page boundary. A count alone
+        // cannot prove content preservation, but it proves this digest covered
+        // every row when combined with strict keyset progress.
+        let totals = conn
+            .query_sync(&format!("SELECT COUNT(*) AS total FROM {table}"), &[])
+            .map_err(|error| CliError::Other(format!("cannot count {table}: {error}")))?;
+        let total = totals
+            .first()
+            .ok_or_else(|| CliError::Other(format!("no count for {table}")))?
+            .get_named::<i64>("total")
+            .map_err(|error| CliError::Other(format!("invalid count for {table}: {error}")))?;
+        if u64::try_from(total).ok() != Some(count) {
+            return Err(CliError::Other(format!(
+                "content verification covered {count} of {total} rows in {table}; refusing compaction"
+            )));
+        }
+        witness.insert(
+            table.to_string(),
+            DoctorVacuumTableWitness {
+                rows: count,
+                sha256: hex::encode(digest.finalize()),
+            },
+        );
+    }
+    Ok(DoctorVacuumContentWitness {
+        user_version,
+        application_id,
+        schema_sha256,
+        tables: witness,
+    })
+}
+
+/// Retain an independently readable, full-schema backup before any in-place
+/// rewrite. Export includes committed WAL rows through the owning engine; a
+/// raw copy of the main file alone would silently omit them. A failed export,
+/// validation or durability barrier aborts before VACUUM touches the source.
+/// The private directory is intentionally retained on success AND failure.
+fn create_doctor_vacuum_backup(
+    db_path: &Path,
+    expected: &DoctorVacuumContentWitness,
+) -> CliResult<PathBuf> {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let backup_dir = tempfile::Builder::new()
+        .prefix("doctor-vacuum-backup-")
+        .tempdir_in(parent)?
+        .keep();
+    let backup_path = backup_dir.join("mailbox.sqlite3");
+    let backup = || -> CliResult<()> {
+        vacuum_live_franken_sqlite_into_snapshot(
+            db_path,
+            &backup_path,
+            "doctor vacuum pre-compaction backup",
+        )?;
+        let stats = doctor_vacuum_stats(&backup_path)?;
+        if stats.structural_errors != 0 || stats.leaked_pages != 0 {
+            return Err(CliError::Other(format!(
+                "backup integrity class is {}",
+                stats.integrity_class
+            )));
+        }
+        if &doctor_vacuum_content_witness(&backup_path)? != expected {
+            return Err(CliError::Other(
+                "backup changed message, recipient, identity, schema, or header metadata"
+                    .to_string(),
+            ));
+        }
+        // FlushFileBuffers (Windows' sync_all implementation) requires write
+        // access. This is only the new private backup, never the live inode.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backup_path)?
+            .sync_all()?;
+        sync_startup_artifact_parents(&backup_dir, &backup_path)?;
+        Ok(())
+    };
+    backup().map_err(|error| {
+        CliError::Other(format!(
+            "refusing in-place VACUUM because its backup could not be verified: {error}; \
+             source was not compacted; backup attempt retained at {}",
+            backup_dir.display()
+        ))
+    })?;
+    Ok(backup_path)
+}
+
+/// `am doctor vacuum` — explicit offline compaction, never a startup migration
+/// or an automatic repair. The operator stops the server before `--yes`.
 fn handle_doctor_vacuum(
     dry_run: bool,
     yes: bool,
@@ -11500,8 +11769,20 @@ fn handle_doctor_vacuum(
         )));
     }
 
-    let before = doctor_vacuum_stats(&db_path)?;
     let apply = yes && !dry_run;
+    // On apply, refuse a live mailbox before even the expensive integrity
+    // probe: opening a badly bloated file can itself consume substantial RSS.
+    let _mutation_locks = if apply {
+        Some(acquire_doctor_vacuum_locks(
+            &database_url,
+            &config.storage_root,
+            allow_live_owner,
+            take_ownership,
+        )?)
+    } else {
+        None
+    };
+    let before = doctor_vacuum_stats(&db_path)?;
 
     if !apply {
         if before.structural_errors > 0 {
@@ -11536,6 +11817,8 @@ fn handle_doctor_vacuum(
                     "mode": "plan",
                     "before": before,
                     "would_run": ["VACUUM", "ANALYZE"],
+                    "requires_server_stopped": true,
+                    "retains_verified_backup": true,
                     "apply_command": "am doctor vacuum --yes",
                 })
             );
@@ -11549,7 +11832,11 @@ fn handle_doctor_vacuum(
                 before.file_bytes
             );
             ftui_runtime::ftui_println!(
-                "would run VACUUM + ANALYZE in place; apply with: am doctor vacuum --yes"
+                "stop every server using this mailbox first, then run: am doctor vacuum --yes; \
+                 a verified backup is retained before VACUUM + ANALYZE"
+            );
+            ftui_runtime::ftui_println!(
+                "a clean integrity_check does not rule out sparse metrics-index pages (GH#372)"
             );
         }
         return Ok(());
@@ -11564,34 +11851,61 @@ fn handle_doctor_vacuum(
         )));
     }
 
-    enforce_supervised_owner_guard(
-        &database_url,
-        &config.storage_root,
-        "vacuum",
-        false,
-        allow_live_owner,
-        take_ownership,
-    )?;
+    let content_before = doctor_vacuum_content_witness(&db_path)?;
+    let backup_path = create_doctor_vacuum_backup(&db_path, &content_before)?;
+    ftui_runtime::ftui_eprintln!(
+        "Verified pre-vacuum backup retained at {}. Keep the server stopped until verification completes.",
+        backup_path.display()
+    );
 
-    {
+    let compact = || -> CliResult<()> {
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .map_err(|e| CliError::Other(format!("cannot open {}: {e}", db_path.display())))?;
-        conn.execute_raw("VACUUM")
-            .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
-        if let Err(e) = conn.execute_raw("ANALYZE") {
+        let vacuum = conn.execute_raw("VACUUM");
+        if vacuum.is_ok()
+            && let Err(e) = conn.execute_raw("ANALYZE")
+        {
             tracing::warn!(error = %e, "doctor vacuum: ANALYZE failed after successful VACUUM");
         }
-        mcp_agent_mail_db::close_db_conn(conn, "doctor vacuum");
-    }
+        let close = conn.close_sync();
+        vacuum.map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
+        close.map_err(|e| {
+            CliError::Other(format!("cannot flush and close compacted mailbox: {e}"))
+        })?;
+        Ok(())
+    };
+    compact().map_err(|error| {
+        CliError::Other(format!(
+            "{error}; keep the server stopped and inspect the mailbox; verified backup retained at {}",
+            backup_path.display()
+        ))
+    })?;
 
-    let after = doctor_vacuum_stats(&db_path)?;
+    let after = doctor_vacuum_stats(&db_path).map_err(|error| {
+        CliError::Other(format!(
+            "post-vacuum verification failed: {error}; keep the server stopped; verified backup retained at {}",
+            backup_path.display()
+        ))
+    })?;
+    let content_after = doctor_vacuum_content_witness(&db_path).map_err(|error| {
+        CliError::Other(format!(
+            "post-vacuum content verification failed: {error}; keep the server stopped; \
+             verified backup retained at {}",
+            backup_path.display()
+        ))
+    })?;
+    let content_preserved = content_before == content_after;
+    let healthy = after.leaked_pages == 0 && after.structural_errors == 0 && content_preserved;
     let reclaimed_pages = before.page_count.saturating_sub(after.page_count);
     if json_mode {
         ftui_runtime::ftui_println!(
             "{}",
             serde_json::json!({
-                "ok": true,
+                "ok": healthy,
                 "mode": "applied",
+                "backup_path": backup_path,
+                "message_content_preserved": content_preserved,
+                "message_content_witness": content_after,
                 "before": before,
                 "after": after,
                 "reclaimed_pages": reclaimed_pages,
@@ -11610,12 +11924,17 @@ fn handle_doctor_vacuum(
             before.file_bytes,
             after.file_bytes
         );
-    }
-    if after.leaked_pages > 0 || after.structural_errors > 0 {
         ftui_runtime::ftui_println!(
-            "warn: integrity class {} with {} leaked page(s) remain after VACUUM; next: am doctor health",
+            "message/recipient/identity contents preserved: {content_preserved}"
+        );
+    }
+    if !healthy {
+        ftui_runtime::ftui_eprintln!(
+            "warn: vacuum verification failed (integrity class {}, {} leaked page(s), contents preserved={content_preserved}); keep the server stopped; \
+             next: am doctor health; verified backup retained at {}",
             after.integrity_class,
-            after.leaked_pages
+            after.leaked_pages,
+            backup_path.display()
         );
         return Err(CliError::ExitCode(1));
     }
@@ -64311,6 +64630,243 @@ startup_timeout_sec = 42
         assert_eq!(stats.structural_errors, 0);
         assert_eq!(stats.integrity_class, "clean");
         assert!(stats.file_bytes > 0);
+    }
+
+    fn seed_doctor_vacuum_message_fixture(db_path: &Path) {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_str().unwrap())
+            .expect("create offline mailbox");
+        conn.execute_raw(
+            "PRAGMA user_version = 33; PRAGMA application_id = 1095585100; \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT, body_md TEXT, attachments TEXT, extension BLOB); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id, kind)); \
+             CREATE INDEX idx_messages_desc ON messages(subject, id DESC); \
+             CREATE TABLE custom_extension (key TEXT PRIMARY KEY, value TEXT); \
+             INSERT INTO custom_extension VALUES ('preserve', 'not rebuilt from archive'); \
+             BEGIN",
+        )
+        .expect("create fixture schema");
+        // Cross several keyset batches, with sparse IDs and multiple recipient
+        // kinds for one agent (the legacy three-column primary key).
+        for index in 0..70_i64 {
+            let id = 10 + index * 2;
+            conn.execute_sync(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(format!("message {index} — café")),
+                    Value::Text(format!("body {index}\nsecond line\n")),
+                    Value::Text("[{\"path\":\"attachment.bin\"}]".to_string()),
+                    Value::Bytes(vec![0, 1, 127, 255]),
+                ],
+            )
+            .expect("insert message");
+            for kind in ["to", "cc"] {
+                conn.execute_sync(
+                    "INSERT INTO message_recipients VALUES (?, 7, ?, ?, ?)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(kind.to_string()),
+                        Value::BigInt(1_700_000_000_000_000 + index),
+                        Value::Null,
+                    ],
+                )
+                .expect("insert delivery receipt");
+            }
+        }
+        conn.execute_raw(
+            "INSERT INTO messages (id, subject) VALUES (1000001, 'deleted high-water sentinel'); \
+             DELETE FROM messages WHERE id = 1000001; COMMIT",
+        )
+        .expect("retain autoincrement high-water mark above surviving rows");
+        mcp_agent_mail_db::close_db_conn(conn, "doctor vacuum fixture");
+    }
+
+    #[test]
+    fn doctor_vacuum_content_witness_detects_same_count_body_and_ack_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let before = doctor_vacuum_content_witness(&path).expect("source witness");
+        assert_eq!(before.tables["messages"].rows, 70);
+        assert_eq!(before.tables["message_recipients"].rows, 140);
+        assert_eq!(before.user_version, 33);
+        assert_eq!(before.application_id, 1_095_585_100);
+        assert_eq!(before.tables["sqlite_sequence"].rows, 1);
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(path.to_str().unwrap()).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET body_md = 'changed body' WHERE id = 148; \
+                 UPDATE message_recipients SET ack_ts = 1700000000009999 WHERE message_id = 10 AND kind = 'cc'",
+            )
+            .expect("change content without changing counts");
+            mcp_agent_mail_db::close_db_conn(conn, "doctor vacuum changed-content fixture");
+        }
+        let after = doctor_vacuum_content_witness(&path).expect("changed witness");
+        assert_eq!(
+            before.tables["messages"].rows,
+            after.tables["messages"].rows
+        );
+        assert_eq!(
+            before.tables["message_recipients"].rows,
+            after.tables["message_recipients"].rows
+        );
+        assert_ne!(
+            before.tables["messages"].sha256,
+            after.tables["messages"].sha256
+        );
+        assert_ne!(
+            before.tables["message_recipients"].sha256,
+            after.tables["message_recipients"].sha256
+        );
+    }
+
+    #[test]
+    fn doctor_vacuum_backup_verifies_content_and_preserves_source_on_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let mut witness = doctor_vacuum_content_witness(&path).expect("source witness");
+        let backup = create_doctor_vacuum_backup(&path, &witness).expect("verified backup");
+        assert_eq!(doctor_vacuum_content_witness(&backup).unwrap(), witness);
+        let before = std::fs::read(&path).expect("source bytes");
+        witness.tables.get_mut("messages").unwrap().sha256 =
+            "deliberately wrong digest".to_string();
+        let error = create_doctor_vacuum_backup(&path, &witness)
+            .expect_err("mismatched backup must refuse mutation");
+        assert!(error.to_string().contains("backup changed message"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            backup.exists(),
+            "an earlier verified backup remains available"
+        );
+    }
+
+    #[test]
+    fn doctor_vacuum_locks_refuse_live_owner_override_and_block_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let database_url = format!("sqlite://{}", path.display());
+        let live = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            &path,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("live owner lock");
+        assert!(acquire_doctor_vacuum_locks(&database_url, dir.path(), false, false).is_err());
+        assert!(matches!(
+            acquire_doctor_vacuum_locks(&database_url, dir.path(), true, false),
+            Err(CliError::Usage(message)) if message.contains("offline-only")
+        ));
+        assert!(matches!(
+            acquire_doctor_vacuum_locks(&database_url, dir.path(), false, true),
+            Err(CliError::Usage(message)) if message.contains("offline-only")
+        ));
+        drop(live);
+        let offline = acquire_doctor_vacuum_locks(&database_url, dir.path(), false, false)
+            .expect("offline ownership");
+        assert!(
+            mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+                &path,
+                mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+            )
+            .is_err(),
+            "a server cannot reopen the mailbox during compaction"
+        );
+        assert!(
+            mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+                dir.path(),
+                mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+            )
+            .is_err(),
+            "the storage-root lifetime lock also remains held"
+        );
+        drop(offline);
+    }
+
+    #[test]
+    fn doctor_vacuum_preview_is_read_only_and_apply_preserves_mailbox_and_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let database_url = format!("sqlite://{}", path.display());
+        let storage_root = dir.path().to_str().unwrap();
+        let before = std::fs::read(&path).expect("source bytes");
+        let contents = doctor_vacuum_content_witness(&path).expect("source witness");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", storage_root),
+            ],
+            || {
+                handle_doctor_vacuum(false, false, true, false, false).expect("default preview");
+                handle_doctor_vacuum(true, true, true, false, false).expect("explicit dry run");
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                let live = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+                    &path,
+                    mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+                )
+                .expect("live mailbox owner");
+                assert!(
+                    handle_doctor_vacuum(false, true, true, false, false).is_err(),
+                    "apply must refuse an actual live owner before backup or rewrite"
+                );
+                assert!(
+                    handle_doctor_vacuum(false, true, true, true, false).is_err(),
+                    "--allow-live-owner must not bypass offline admission"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                drop(live);
+                assert!(
+                    std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("doctor-vacuum-backup-")),
+                    "previews and live-owner refusals must not create backup artifacts"
+                );
+                handle_doctor_vacuum(false, true, true, false, false).expect("offline compaction");
+            },
+        );
+        assert_eq!(doctor_vacuum_content_witness(&path).unwrap(), contents);
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("doctor-vacuum-backup-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup_path = backups[0].join("mailbox.sqlite3");
+        assert_eq!(
+            doctor_vacuum_content_witness(&backup_path).unwrap(),
+            contents
+        );
+        let backup = mcp_agent_mail_db::CanonicalDbConn::open_file(backup_path.to_str().unwrap())
+            .expect("backup readable by canonical SQLite");
+        let rows = backup
+            .query_sync(
+                "SELECT value FROM custom_extension WHERE key = 'preserve'",
+                &[],
+            )
+            .expect("custom schema survived");
+        assert_eq!(
+            rows[0].get_named::<String>("value").unwrap(),
+            "not rebuilt from archive"
+        );
+        let sequence = backup
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .expect("read retained AUTOINCREMENT history");
+        assert_eq!(sequence[0].get_named::<i64>("seq").unwrap(), 1_000_001);
+        assert_eq!(doctor_vacuum_stats(&path).unwrap().integrity_class, "clean");
     }
 
     #[test]

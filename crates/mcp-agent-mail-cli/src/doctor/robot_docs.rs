@@ -138,16 +138,22 @@ Repair (mutating; preview first with `--dry-run`):
 | `am doctor repair` | Repair the SQLite index in place. Refuses (exit 3) while a live owner holds the mailbox. | 0 / 3 |
 | `am doctor reconstruct` | Rebuild the SQLite index from the Git archive. Same owner guard as `repair`. | 0 / 3 |
 | `am doctor restore <backup-path>` | Restore the database from a backup listed by `backups`. | see `--help` |
-| `am doctor vacuum` | VACUUM + ANALYZE the live database in place (orphaned pages). Same owner guard. | see `--help` |
+| `am doctor vacuum` | Preview offline mailbox compaction; `--yes` retains a verified backup, holds exclusive mailbox locks, then runs VACUUM + ANALYZE and verifies message contents. Stop the server first. | see `--help` |
 | `am doctor reclaim` | Consolidate stale recovery debris into one reversible directory. Previews without `--yes`. | 0 |
 | `am doctor archive-normalize` | Quarantine or annotate anomalous archive files. Never deletes. | see `--help` |
 | `am doctor fix-orphan-refs` | Report refs whose objects are missing; prunes (with backups) only with `--apply`. | see `--help` |
 | `am doctor pack-archive` | Git loose-object repack of the archive (`--plan` only inspects). | see `--help` |
 
 When a live owner blocks `repair` / `reconstruct` / `vacuum`, drain it
-through its supervisor and confirm with `am doctor drain`; pass
-`--take-ownership` only for an owner `am doctor locks` classifies as
-`reclaimable`. Doctor never kills `am`.
+through its supervisor and confirm with `am doctor drain`. For `repair` or
+`reconstruct`, pass `--take-ownership` only for an owner `am doctor locks`
+classifies as `reclaimable`. Doctor never kills `am`.
+`vacuum --yes` is always offline: it rejects both `--allow-live-owner` and
+`--take-ownership`. Keep the
+server stopped through backup and post-compaction verification; without
+`--yes` (or with `--dry-run`) it only previews. See `docs/RECOVERY_RUNBOOK.md`
+for the GH#372 metrics-index bloat procedure, including mailboxes whose
+`integrity_check` reports `ok`.
 
 ## Exit codes
 

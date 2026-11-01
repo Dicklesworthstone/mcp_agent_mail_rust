@@ -18,6 +18,29 @@
 - `integrity-check` (SQLite + archive)
 - `doctor repair` (wraps the above with backups)
 
+## Metrics-index growth and memory exhaustion (GH#372)
+
+Upgrade to an Agent Mail build using FrankenSQLite **0.4.13** before repairing
+a mailbox affected by [issue #372](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/372).
+The corrected B-tree insertion prevents new index bloat, but upgrading does
+not reclaim existing sparse pages. `PRAGMA integrity_check = ok` does not
+rule out this problem.
+
+**Stop every server using the mailbox first, and keep it stopped for the
+entire operation.** With the affected server's `DATABASE_URL` and
+`STORAGE_ROOT`, confirm `am doctor drain --json` reports
+`safe_to_mutate=true`, preview with `am doctor vacuum`, then apply with
+**`am doctor vacuum --yes`**. The default without `--yes` only previews.
+The command refuses ownership overrides, holds exclusive mailbox locks,
+retains a verified standalone backup including committed WAL rows, and checks
+message/recipient contents as well as integrity after compaction. It never
+automatically rebuilds an active mailbox or reconstructs messages from the
+archive. Keep the server stopped on any error.
+
+See the [complete offline procedure](docs/RECOVERY_RUNBOOK.md#metrics-index-growth-and-memory-exhaustion-gh372)
+for supervisor/container guidance, backup locations, disk-space requirements,
+verification, temporary metrics-disable mitigation, and failure handling.
+
 ## Keep pre-incident backups before restarting
 
 A cold start of the HTTP/TUI server (no Agent Mail server already answering on

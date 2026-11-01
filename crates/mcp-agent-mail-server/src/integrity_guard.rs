@@ -1262,8 +1262,9 @@ fn run_maintenance_op<F, E>(
 }
 
 /// Run any due background SQLite maintenance ops (bead K4): passive WAL
-/// checkpoint, `ANALYZE`, and `VACUUM`, each on its own configured cadence, plus
-/// re-applying the configured `journal_size_limit`.
+/// checkpoint, `ANALYZE`, and ATC-sidecar `VACUUM`, each on its own configured
+/// cadence, plus re-applying the configured `journal_size_limit`. The primary
+/// mailbox is compacted only by an explicit offline `am doctor vacuum --yes`.
 ///
 /// Runs on the integrity-guard worker thread against its own connection, so it
 /// never touches the request/dispatch hot path. Each op is bounded and
@@ -1284,7 +1285,7 @@ fn run_db_maintenance_cycle(
     if !config.db_maintenance_enabled {
         return;
     }
-    // #219: checkpoint/ANALYZE/VACUUM rewrite live-file state; hold the
+    // #219: checkpoint/ANALYZE rewrite live-file state; hold the
     // in-process write lease so a recovery promotion cannot rename the file
     // out from under them (a VACUUM racing a promotion would rebuild the
     // quarantined generation and recreate sidecars at the live paths).
@@ -1320,16 +1321,12 @@ fn run_db_maintenance_cycle(
     }
 
     if maintenance_task_due(config.db_vacuum_interval_secs, *last_vacuum, now) {
-        run_maintenance_op(
-            "vacuum",
-            || pool.vacuum(),
-            &db.maintenance_vacuum_runs_total,
-            &db.maintenance_last_vacuum_us,
-        );
-        // br-fv0s1: the main vacuum never touches the isolated ATC telemetry
-        // sidecar (atc.sqlite3), so pages freed by the experience-ceiling sweep
-        // (br-bvq1x.11.6) would accumulate. Vacuum it on the same cadence,
-        // reusing the vacuum metrics. No-op when the sidecar was never created.
+        // GH#372: never rebuild the primary mailbox under a running server.
+        // An engine upgrade fixes future insertions, but existing sparse index
+        // pages require explicit, backed-up offline compaction. A scheduled
+        // rewrite must not bypass the doctor's exclusive activity locks.
+        // br-fv0s1: retain compaction for the isolated ATC telemetry sidecar;
+        // it contains no mailbox messages. No-op if it was never created.
         run_maintenance_op(
             "vacuum_atc_sidecar",
             || pool.vacuum_atc_sidecar(),
@@ -4304,6 +4301,91 @@ mod tests {
             cp.is_none() && an.is_none() && va.is_none() && atc.is_none() && dr.is_none(),
             "disabled maintenance must not attempt or advance any task"
         );
+    }
+
+    #[test]
+    fn scheduled_maintenance_never_vacuums_the_live_mailbox() {
+        let directory = tempfile::tempdir().expect("maintenance fixture directory");
+        let path = directory.path().join("mailbox.sqlite3");
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().as_ref())
+                .expect("open runtime maintenance fixture"),
+            "close scheduled maintenance fixture",
+        );
+        conn.execute_raw(
+            "PRAGMA journal_mode = DELETE; \
+             PRAGMA autocommit_retain = OFF; \
+             CREATE TABLE mail(id INTEGER PRIMARY KEY, body TEXT NOT NULL); \
+             INSERT INTO mail VALUES (7, 'Preserve this message'); \
+             CREATE TABLE discarded(id INTEGER PRIMARY KEY, payload BLOB NOT NULL); \
+             WITH RECURSIVE seq(n) AS ( \
+                 SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 384 \
+             ) INSERT INTO discarded(payload) SELECT zeroblob(2048) FROM seq; \
+             DELETE FROM discarded;",
+        )
+        .expect("seed reclaimable pages without deleting mail");
+        let free_pages = || {
+            conn.query_sync("PRAGMA freelist_count", &[])
+                .expect("read freelist")[0]
+                .get_as::<i64>(0)
+                .expect("decode freelist")
+        };
+        let free_before = free_pages();
+        assert!(free_before > 0, "fixture must be compactable");
+        let bytes_before = std::fs::read(&path).expect("read original mailbox image");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&path),
+            storage_root: Some(directory.path().join("archive")),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create maintenance pool");
+        let config = Config {
+            db_maintenance_enabled: true,
+            db_checkpoint_interval_secs: 0,
+            db_analyze_interval_secs: 0,
+            db_vacuum_interval_secs: 1,
+            db_journal_size_limit_bytes: 0,
+            atc_experience_max_rows: 0,
+            doctor_retention_enabled: false,
+            ..Config::default()
+        };
+        let now = Instant::now();
+        let (mut checkpoint, mut analyze, mut vacuum, mut atc, mut doctor) =
+            (None, None, None, None, None);
+        run_db_maintenance_cycle(
+            &pool,
+            &config,
+            &path,
+            now,
+            &mut checkpoint,
+            &mut analyze,
+            &mut vacuum,
+            &mut atc,
+            &mut doctor,
+        );
+        assert_eq!(vacuum, Some(now), "the sidecar cadence was due");
+        assert_eq!(free_pages(), free_before, "no automatic mailbox compaction");
+        assert_eq!(
+            std::fs::read(&path).expect("read mailbox after scheduled maintenance"),
+            bytes_before,
+            "a due VACUUM interval must leave the mailbox byte-for-byte intact"
+        );
+        assert_eq!(
+            conn.query_sync("SELECT body FROM mail WHERE id = 7", &[])
+                .expect("read preserved message")[0]
+                .get_as::<String>(0)
+                .expect("decode preserved body"),
+            "Preserve this message"
+        );
+        // Positive control: the fixture really would change if the scheduled
+        // path accidentally called the primary-mailbox vacuum again.
+        pool.vacuum().expect("explicit fixture compaction");
+        assert_eq!(free_pages(), 0);
+        assert!(std::fs::metadata(&path).unwrap().len() < bytes_before.len() as u64);
     }
 
     #[test]

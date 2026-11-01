@@ -18,6 +18,108 @@
 - `integrity-check` (SQLite + archive)
 - `doctor repair` (wraps the above with backups)
 
+## Metrics-index growth and memory exhaustion (GH#372)
+
+FrankenSQLite 0.4.10 through 0.4.12 can leave very sparse B-tree pages when
+inserting descending index keys. Agent Mail's metrics history uses
+`idx_tool_metrics_snapshots_tool_ts(tool_name, collected_ts DESC)`: each new
+sample sorts before the older samples for that tool. With metrics persistence
+enabled, this can amplify both database size and the memory needed to open it.
+`PRAGMA integrity_check` can still report `ok`, and `freelist_count` can be
+small: these are allocated, sparsely populated index pages, not necessarily
+corruption or free pages. See [issue #372](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/372)
+and [upstream #521](https://github.com/Dicklesworthstone/frankensqlite/issues/521).
+
+**Upgrade first to a build using FrankenSQLite 0.4.13.** The dependency update
+fixes subsequent insertions without changing the mailbox schema or rebuilding
+existing files at startup. Existing oversized index pages need an explicit
+offline rebuild; upgrading alone does not reclaim them. If an upgrade cannot
+be deployed immediately, set `TOOL_METRICS_EMIT_ENABLED=false` in the server's
+environment and restart it gracefully to stop new metrics snapshots. This is
+a temporary growth mitigation, not a repair of the existing index.
+
+### Offline recovery
+
+Run every command with the same `DATABASE_URL` and `STORAGE_ROOT` as the
+affected server. For a container deployment, stop the serving container and
+run the upgraded `am` against the same persistent volume in an isolated
+maintenance container. Do not start a second server on that volume.
+
+1. Gracefully **stop all HTTP and stdio servers using the mailbox** and keep
+   them stopped, including any supervisor that would restart them. For a
+   systemd user service, for example:
+
+   ```bash
+   systemctl --user stop mcp-agent-mail
+   am doctor locks --json
+   am doctor drain --json
+   ```
+
+   `am doctor drain` only reports ownership; it does not stop anything. Require
+   `safe_to_mutate=true`. A restart command is not a substitute for stopping
+   the server throughout maintenance. Never remove activity locks to force
+   admission. VACUUM rejects both `--allow-live-owner` and `--take-ownership`:
+   replacing a wedged process's lock does not prove that the process stopped.
+
+2. Keep an independent pre-incident backup outside the storage root when one
+   is available, and ensure enough free space for a full backup and the
+   temporary VACUUM image. Preview the selected database and page counts:
+
+   ```bash
+   am doctor vacuum --json
+   ```
+
+   Without `--yes`, this is read-only. `--dry-run` remains read-only even
+   when combined with `--yes`. A clean integrity result does not rule out
+   this specific bloat, so it does not eliminate the need for compaction.
+
+3. Apply the offline rebuild:
+
+   ```bash
+   am doctor vacuum --yes --json
+   ```
+
+   The command holds the applicable mailbox activity locks exclusively from
+   admission through verification, including the database lock, preventing a cooperating server from
+   restarting in the middle. It first exports a full-schema, standalone
+   backup that includes committed WAL rows, verifies its integrity and message
+   contents, and flushes the backup to disk. The private
+   `doctor-vacuum-backup-*/mailbox.sqlite3` directory beside the database is
+   retained; the exact path is printed on stderr and returned as `backup_path`.
+   Backup failure aborts before in-place VACUUM. It never reconstructs messages
+   from the archive or drops metrics/history tables.
+
+   Success requires a clean post-compaction integrity check and matching
+   SHA-256 content witnesses for messages, recipient read/ack state, project
+   deliveries/receipts, agents and projects. The witnesses include every
+   stored column and are computed in bounded batches. The schema definitions,
+   `user_version`, `application_id` and AUTOINCREMENT high-water marks must also
+   survive unchanged. JSON reports
+   `message_content_preserved=true`, before/after page counts and file sizes,
+   and `reclaimed_pages`.
+
+4. Confirm the command exited successfully, inspect the before/after sizes,
+   and verify the mailbox before restarting the server:
+
+   ```bash
+   am doctor health
+   am doctor check --json
+   systemctl --user start mcp-agent-mail
+   ```
+
+   Use the applicable supervisor command for your deployment. After restart,
+   confirm existing conversations and acknowledgements are readable and monitor
+   memory/database growth with metrics enabled. The automatic maintenance
+   cadence may still compact the separate ATC telemetry sidecar; main-mailbox
+   compaction is reserved for this explicit offline command.
+
+If compaction or content verification fails, **keep the server stopped** and
+retain the reported backup and the original database family for diagnosis.
+The command does not automatically restore over the mailbox. Do not copy a
+backup over an active database or delete WAL/namespace sidecars by hand; use
+the supported `am doctor restore <backup-path>` recovery surface only after
+reviewing the failure and confirming offline ownership.
+
 ---
 
 ## Reconstruct/Promotion Refusal Loop (GH#208)

@@ -408,6 +408,8 @@ pub struct Config {
     pub db_maintenance_enabled: bool,
     pub db_checkpoint_interval_secs: u64,
     pub db_analyze_interval_secs: u64,
+    // Compacts only the isolated ATC telemetry sidecar. Main-mailbox VACUUM
+    // requires an explicit offline `am doctor vacuum --yes` (GH#372).
     pub db_vacuum_interval_secs: u64,
     pub db_journal_size_limit_bytes: u64,
 
@@ -1682,7 +1684,7 @@ impl Default for Config {
             db_maintenance_enabled: true,
             db_checkpoint_interval_secs: 300, // passive WAL checkpoint every 5 min
             db_analyze_interval_secs: 21_600, // refresh planner stats every 6 h
-            db_vacuum_interval_secs: 86_400,  // reclaim/defragment daily (0 disables)
+            db_vacuum_interval_secs: 86_400,  // ATC sidecar only, daily (0 disables)
             // 16 MiB WAL truncation cap: an automatic checkpoint over the cap is
             // promoted to TRUNCATE. Every fresh engine connection rescans the whole
             // WAL, so a smaller WAL is cheaper per send (br-v0ucm, br-yzk37).
