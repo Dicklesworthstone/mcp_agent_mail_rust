@@ -6,8 +6,8 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-Scope window: [v0.3.38 → v0.3.39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.38...v0.3.39)
-and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.39...main). Entries use git diffs, tag targets,
+Scope window: [v0.3.39 → v0.3.40](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.39...v0.3.40)
+and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.40...main). Entries use git diffs, tag targets,
 GitHub publication metadata, Beads records, and executed release receipts.
 Publication dates are UTC; post-tag installer changes are identified separately.
 
@@ -17,7 +17,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
-| [v0.3.40](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.40) | 2026-10-31 | **Release** | Reservation writes staged outside the archive fence with a bounded 5 s wait (GH#351, GH#362, br-9ott5); background archive repair that resumes after restarts and survives source failures; automatic deletion and a byte limit for superseded backups (GH#355, GH#359); CLI reads served by the running local server (GH#368); request cancellation in write admission (GH#353); Windows checkpoint fixes, not yet run on native Windows (GH#369); in-process `age` passphrase decryption; cold-start backup rotation bounded to 1 s; dependency security updates |
+| [v0.3.40](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.40) | 2026-11-01 | **Release** | Reservation writes staged outside the archive fence with a bounded 5 s wait (GH#351, GH#362, br-9ott5); background archive repair that resumes after restarts and survives source failures; automatic deletion and a byte limit for superseded backups (GH#355, GH#359); CLI reads served by the running local server (GH#368); request cancellation in write admission (GH#353); Windows checkpoint fixes, not yet run on native Windows (GH#369); in-process `age` passphrase decryption; cold-start backup rotation bounded to 1 s; dependency security updates |
 | [v0.3.39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.39) | 2026-10-13 | **Release** | Startup survives a small or full temp directory (GH#347); integrity guard accepts proven never-written orphan pages instead of staying red (GH#291); project-addressed shared mailboxes (GH#282, schema v33) and opt-in session-bound identity (GH#279); reservation writes staged outside the archive fence; FastMCP 0.13.0 from crates.io; share-export, pre-commit guard, search, CLI, web UI, TUI and installer fixes (GH#339, GH#346, GH#348) |
 | [v0.3.38](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.38) | 2026-10-08 | **Release** | Server descriptor-leak fix (GH #333): one shared, bounded live read pool; FrankenSQLite 0.4.10 data-integrity update; background closeout replay and archive repair; CLI/TUI/search correctness fixes |
 | [v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.37) | 2026-10-05 | **Release** | Safe mailbox upgrades after the v30 short-record incident (br-2hpuk); FrankenSQLite 0.4.9; Linux descriptor bound and descriptor-exhaustion reporting; stalled write-behind drain detection |
@@ -28,7 +28,51 @@ Recent releases; the earlier version history continues below.
 
 ---
 
-## v0.3.40 — 2026-10-31 [Release]
+## Unreleased
+
+Changes on `main` that are not in the [v0.3.40 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.40), so they are not in the v0.3.40
+binaries. They were committed to `main` while v0.3.40 was being released; `main` then merged the
+release commit in 3fdda50c.
+
+- **Reservation reads stay available while a writer holds the lock.** Reservation and mail-activity
+  reads take a fresh deferred snapshot and finish as read-only transactions, so listings no longer
+  ask for the writer lock or checkpoint (0a8b0633, "fix(db): keep reservation reads available
+  during writer contention").
+- **Replays of committed acknowledgements no longer need writer admission.** An authorized replay of
+  an ACK that is already committed is answered from the query-only pool with the original receipt
+  timestamps. If the receipt can't be read, the request falls through to the existing transaction
+  and durable outage queue (bee7e077, "feat(tools): replay committed acknowledgements without writer
+  admission").
+- **Lost reservation renewals are recovered without client traffic.** Bounded reservation
+  reconciliation now advances the archive artifact's expiry when a database renewal committed but
+  its archive publication was lost (6b2a0a9f, "feat(storage): recover lost reservation renewals
+  without client traffic").
+
+**Tests for these three commits.** Run on the tree of `main` at 7720c82a: 3fdda50c plus a test-only
+commit that finishes the `assert_eq!` conversion of two queued-ack checks. No full-suite run is
+recorded for this tree.
+
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`, with the repository's pinned
+  nightly toolchain: passed.
+- The 8 tests the three commits add: 8 passed (8 ran, 0 returned early). Four of them run their body
+  in a re-executed child, and the parent asserts that the child printed `1 passed; 0 failed`.
+  - db: `reservation_read_snapshots_remain_available_and_fresh_while_a_writer_is_active`.
+  - storage: `lost_renewals_share_the_four_write_budget_and_finish_the_round`,
+    `renewal_and_ordinary_terminal_writer_share_publication_ownership`,
+    `renewal_preserves_conflicting_intent_that_survives_only_in_head`,
+    `renewal_refuses_terminal_newer_foreign_or_conflicting_surviving_evidence`,
+    `staged_renewal_observes_independent_source_commits_and_preserves_archive_winners`.
+  - tools: `ack_receipt_read_outage_preserves_durable_queue_and_retry_claim`,
+    `committed_ack_retries_remain_read_only_while_recovery_holds_admission`.
+- An earlier run on the same tree passed 7 of the 8.
+  `renewal_refuses_terminal_newer_foreign_or_conflicting_surviving_evidence` hit the 60 s child
+  deadline in `isolated()` on a shared host at a load average of 52, and passed when the same binaries
+  were run again. Run on its own without the deadline, it took 16 s, 64 s and 97 s as the load rose, so
+  whether it fits the deadline depends on load (br-kw4yv).
+
+---
+
+## v0.3.40 — 2026-11-01 [Release]
 
 Changes after the [v0.3.39 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.39)
 (504 non-merge commits). Many of these commits were written where the Rust tests could not be run,
@@ -1128,6 +1172,24 @@ combined policy (a7e7e094).
     9da9da51, cca2efaf, 8820c3fb, 78326ac5, 19c3f21e, 5ec96724.
   - **Build configuration:** `.rchignore` (23fe3dce), Cargo checksum freshness (08df64b1) and Cargo.toml
     comments (71642ccf).
+
+**Test record for this release run (added 2026-11-01).** The v0.3.40 release notes give
+`cargo nextest run --workspace` at 5ec96724 as 20,677 run, 20,644 passed, 32 failed, 1 timed out,
+54 skipped. Some of the passing tests returned early without running their bodies. Counted that way:
+20,644 passed (≤20,633 ran; ≥10 returned early: 6 child entries, 2 opt-ins never set, 2
+host-condition skips). 1 more passed only in non-strict mode: `native_share_archive_transport_gate`,
+whose adapter failed because age was missing (`AM_E2E_SHARE_ARCHIVE_REQUIRE_PASS` unset).
+
+- The 2 opt-ins: `libgit2_index_race_immunity` (`AM_C8_RUN=1`) and `scenario_b_synthetic_racer`
+  (`AM_TEST_GIT_251=1`).
+- The 2 host-condition skips: `run_share_export_reports_encrypted_archive_as_final_output` (no `age`)
+  and `handle_bench_quick_mode_uses_default_warmup_runs_and_writes_report` (no `am` on the PATH).
+- Not proven either way: 3 llm tests (`choose_best_model_returns_string`,
+  `choose_best_model_passthrough_qualified_name`,
+  `complete_system_user_requests_the_configured_default_model`) return early only when every
+  candidate provider has an API key set, and the run didn't record whether that was the case.
+- br-qpacg tracks the test environment: `age` and `am` were missing, and the `AM_E2E_*_REQUIRE_PASS`
+  switches were not set.
 
 ## v0.3.39 — 2026-10-13 [Release]
 
