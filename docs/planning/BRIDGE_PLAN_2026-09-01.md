@@ -1,6 +1,6 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
-## November 1 execution queue (18:17 UTC)
+## November 1 execution queue (publication verified)
 
 Beads remains the complete dependency-aware work list. This queue records the
 current execution details in the existing plan because the earlier loose
@@ -191,12 +191,40 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
   evidence. Keep `.75/.76/.77/.49`, retention, engine, authority, large-archive
   and release requirements open; the original failed whole-workspace run stays
   red. UBS still reports2 Bash critical findings and4 in the edited Rust file.
-- [ ] Publish the corrected installer and update/verify its new ACFS pin; the
-  earlier public `f8ca5d81` pin is historical evidence, not this final digest.
-- [ ] Commit the remaining owned code/tracker/verification changes, finish
-  public read-back and close `.97` only after its new pin matches. Release only
-  owned reservations. No new binary release,
-  version bump or live-server replacement is part of this repair.
+- [x] Publish both owned source fixes: `a61642cc` retains permission-test ELF
+  authority; `1bd555e9` fences shared installer destinations. Non-force atomic
+  publication succeeds; both public MCP refs equal
+  `1bd555e92e840e1e0d34f3c07ff6261f7ffcd9cb` at18:20:14 UTC. Public installer
+  blob `f53c37dbbdc0868c334fd7cb0b080169a37af3ec` matches local source2036b058.
+  The earlier public `f8ca5d81` pin and its regression remain historical evidence.
+- [x] Read and preserve ACFS's incoming DSR-only policy commits through
+  `fd59ab47`, with clean fast-forward and sequential Beads import. Do not rely
+  on a GitHub Actions workflow for this update. The shared DSR registry has no
+  ACFS entry; a private, explicitly scoped job configuration runs the existing
+  canonical utilities and local checker without changing that shared registry.
+- [x] Independently observe all48 installer URLs:43 matches,5 mismatches,
+  zero errors and zero skipped entries. Canonical bound candidate construction
+  and validation pass2/2 through direct DSR, deferring exactly atuin/grok/omp/uv.
+  Only the header and Agent Mail pin change in checksums.yaml. Regenerate the
+  consumers; the internal ledger also updates the actual newly changed
+  `acfs/AGENTS.md` policy checksum to `eb5caa1e`.
+- [x] Retain the first DSR consumer run as an overall failure: its4 commands
+  exit0, but generation changes tracked source during that run. The subsequent
+  stable source passes all4 generator/local-checker commands, and both static
+  checks pass. The two generated consumer files scan with zero UBS findings.
+  This is scoped checksum maintenance, not a full ACFS installation or release.
+- [x] Publish ACFS `5c584b728384c4bb37b993ca54903c0dc3ff1087` with the exact
+  installer2036b058 pin. Independently read the public checksums.yaml back;
+  both public ACFS refs match at18:33:10 UTC. Its YAML hash `5de4a32a` matches
+  both generated consumers. Close `.97` only after this public verification.
+  Keep `br-quq4r` open: this post-publication installer repair does not prove
+  its original version/tag pre-publication or mutation-sensitive release gate.
+- [x] Preserve all2,846 tracker IDs and old comments, flush through br and
+  verify zero dependency cycles. Release completed source and ACFS reservations.
+  The documentation lease is retained only for the final evidence commit and
+  then released. The final read-only mailbox probe is healthy with the same
+  PID3047470 and reservation parity306/306. No version bump, binary release or
+  live-server replacement occurs.
 
 Current raw receipts are under `/data/tmp/am-agency-20261101/`. Neither missing
 old logs, the earlier 18-file UBS result (five critical findings), peer release
