@@ -75,7 +75,7 @@ MINISIGN_BIN=""
 RELEASE_TRUST_MODEL=""
 EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
+LOCK_FILE="${AM_INSTALL_LOCK_FILE:-${TMPDIR:-/tmp}/mcp-agent-mail-install.lock}"
 SYSTEM=0
 NO_GUM=0
 NO_VERIFY=0
@@ -8587,6 +8587,12 @@ Options:
   --purge            With --uninstall, also delete storage/database data
   --dry-run          Preview what the installer would do without making changes
   --preview          Alias for --dry-run
+
+Environment:
+  TMPDIR                Staging and default installer lock directory (default: /tmp)
+  AM_INSTALL_LOCK_FILE  Override the lock base path (the lock directory adds .d)
+  LOG_FILE              Installer diagnostic log path
+  AM_LINK_DIR           Convenience symlink directory (default: ~/.local/bin)
 EOFU
 }
 

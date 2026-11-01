@@ -1,5 +1,87 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 1 execution queue (15:54 UTC)
+
+Beads remains the complete dependency-aware work list. This queue records the
+current execution details in the existing plan because the earlier loose
+temporary logs and TODO are no longer present. Their absence is not a pass.
+
+- [x] Preserve the local corrections and incoming history. A concurrent worker
+  advanced `main` through the 89 upstream commits to `1c21a192`, then preserved
+  the preceding bridge entry in `333cb8c0`. Equivalent barrier/archive test lint
+  fixes are already upstream; do not duplicate them or replace peer changes.
+- [x] Recover original strict-remote completion records: DB build
+  `30085930664591513`, all-target build `30085930664591512`, and GNU production
+  build `30085930664591514` each report completed/exit 0. DB test counts and
+  named cases cannot be recovered from the missing stdout. This is completion
+  evidence on the older frozen source, not a current 0.3.40 runtime verdict.
+- [x] Recheck the live mailbox read-only: healthy, reservation parity285/285.
+  Leave its installed binary, service, database and archive untouched.
+- [x] Import Beads after the incoming work. An overlapping read/import hit
+  the sole-opener checkpoint guard; the sequential retry succeeds. No database
+  repair, force flag, row deletion or lost-issue reconstruction was used.
+- [x] Claim `br-97lrm` and reserve the installer and existing exit-status test.
+  Honor `TMPDIR` and `AM_INSTALL_LOCK_FILE`, documenting the environment in
+  `--help`; retain the atomic directory/PID/owner/stale-lock machinery.
+- [x] Run all44 existing exit controls and16 complete-installer lock controls:
+  no failures. Cover file/stdin delivery, free/busy locks, private and
+  trailing-slash temporary paths, explicit and empty overrides, and spaces.
+  Free-lock cases reach the intended destination refusal and clean up their
+  lock; busy-lock cases retain the original live owner's PID evidence.
+- [x] Complete the old/corrected installer comparison in the same private
+  mount/network environment: old source passes44 existing cases and fails all16
+  new cases; corrected source passes all60. The initial sandbox had unusable
+  `/dev/null`, failed52 cases and gets no behavior credit. Keep that failure.
+- [x] Run four actual authenticated0.3.40 installations, including default
+  file/stdin delivery: all pass signature/checksum, exact installed versions,
+  setup witnesses and exit0. All use private homes/destinations. `br-97lrm`
+  closes at this scope after fresh solo acceptance; no independent review.
+- [x] Fix both installer-test subshells to abort if entering their private
+  working directory fails. Final44+16 controls pass again. The Bash scan reports
+  two pre-existing critical findings and zero warnings; it remains a red scan.
+- [x] Installer/test Bash syntax, final Rust formatting, whitespace and the
+  existing three lastpipe controls pass. These are bounded checks, not an
+  authenticated installation or a release qualification.
+- [x] Finish the admitted older-source Clippy run on `vmi1152480`: exit101 on
+  three initializer visibility lints. Incoming0.3.40 already fixes all three;
+  no extra patch or suppression is added. Its live
+  compiler source matched all3779 files of manifest `92bae2ee…`, based on
+  `8820c3fb`; subsequent incoming 0.3.40 code still needs its own checks.
+- [ ] Finish the three current 0.3.40 gates: all-target checking on `vmi1152480`,
+  production lib/bins on `vmi1293453`, strict all-target Clippy on `vmi1153651`.
+  All three live compiler namespaces match all 3,782 dispatch-snapshot files,
+  manifest `bed7ccf6`, with no exclusions or mismatches. Subsequent plan/tracker
+  updates do not change the compiled Rust/Cargo inputs.
+- [ ] Run the original populated DB admission/initializer, storage
+  checkpoint/path/owner-lock/decoded-index and bundle publication controls on
+  the final source when admitted. GNU compilation and native Windows execution
+  remain distinct; `.76`, `.77`, `.49` and broader authority holds stay open.
+  Two ordinary native requests refuse exit 103 because the requested workers cannot
+  provide the original two test threads; zero tests run. Nextest archive/list
+  requests refuse RCH-E301 as unsupported. A normal one-job Cargo compile-only
+  request refuses exit 103 (pressure/project exclusion). No direct SSH compilation,
+  local compilation, job-mode compiler smuggling, fleet override or weakened
+  runner settings are used. Retry only after running gates release capacity.
+- [ ] Keep `.75` open: the checksum-setting proposal failed its controlled
+  reproducer. Remove the ineffective setting without presenting this as a
+  normal-route cache fix. Preserve the stale77 correction below.
+- [ ] Keep `.63` and `br-5nr0m` open under their original workloads and reader
+  protection. The incoming detailed reader-scan task covers the observed
+  per-candidate full process scan; do not create a duplicate performance lane.
+- [x] Complete the fresh written20-question solo acceptance review, flush
+  Beads, and verify zero cycles. Issues and base retain all old IDs/comments,
+  with no duplicate IDs; their2845 rows include the six earlier owned tasks.
+  Preserve all original engine/platform/cache/authority/release holds.
+- [ ] Commit/push the owned installer/config/tracker changes in logical batches
+  without force; preserve both remote histories and verify main/mirror refs.
+  Verify the ACFS pin against the exact public installer after publication;
+  coordinate any required checksum update in ACFS. No new binary release,
+  version bump or live-server replacement is part of this repair.
+
+Current raw receipts are under `/data/tmp/am-agency-20261101/`. Neither missing
+old logs, the earlier 18-file UBS result (five critical findings), peer release
+reports nor this solo review establishes a clean whole-workspace runtime gate.
+
 ## October 30 integrated-source verification (02:43 UTC)
 
 The checkpoint rerun described as pending below exposed a real verification

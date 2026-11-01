@@ -225,7 +225,69 @@ authority-error 1 0
 CASES
 done
 
-printf 'Unit exit regressions: %s cases, %s failure(s)\n' "$unit_cases" "$failures"
+# Exercise the complete installer up to its real lock/destination boundary.
+# A regular-file destination stops a successful acquisition before downloads;
+# a live owner must instead stop it at the lock without altering that evidence.
+lock_cases=0
+for delivery in file stdin; do
+for location in tmpdir trailing-slash explicit empty-override; do
+for ownership in free busy; do
+    case_root="$scratch/lock-$delivery-$location-$ownership"
+    mkdir -p "$case_root/home" "$case_root/work" "$case_root/tmp root" "$case_root/lock root"
+    printf 'destination sentinel\n' > "$case_root/destination"
+    tmp_parent="$case_root/tmp root"
+    [ "$location" != trailing-slash ] || tmp_parent="$tmp_parent/"
+    expected_lock="$tmp_parent/mcp-agent-mail-install.lock"
+    lock_env=("PATH=/usr/bin:/bin:/usr/sbin:/sbin" "HOME=$case_root/home"
+        "TMPDIR=$tmp_parent" "LOG_FILE=$case_root/installer.log" "LC_ALL=C" "TERM=dumb")
+    case "$location" in
+        explicit)
+            expected_lock="$case_root/lock root/selected.lock"
+            lock_env+=("AM_INSTALL_LOCK_FILE=$expected_lock")
+            ;;
+        empty-override) lock_env+=("AM_INSTALL_LOCK_FILE=") ;;
+    esac
+    if [ "$ownership" = busy ]; then
+        mkdir "${expected_lock}.d"
+        printf '%s\n' "$$" > "${expected_lock}.d/pid"
+    fi
+    installer_args=(--version "$VERSION" --yes --no-gum --no-easy --no-service
+        --offline --force --dest "$case_root/destination")
+    output="$ARTIFACT_DIR/lock-$delivery-$location-$ownership.log"
+    rc=0
+    (
+        cd "$case_root/work" || exit
+        if [ "$delivery" = file ]; then
+            env -i "${lock_env[@]}" "$BASH" -x "$INSTALL_SH" "${installer_args[@]}" < /dev/null
+        else
+            env -i "${lock_env[@]}" "$BASH" -x -s -- "${installer_args[@]}" < "$INSTALL_SH"
+        fi
+    ) > "$output" 2>&1 || rc=$?
+    case_failed=0
+    [ "$rc" -eq 1 ] || case_failed=1
+    grep -Fq "${expected_lock}.d" "$output" || case_failed=1
+    [ "$(cat "$case_root/destination")" = 'destination sentinel' ] || case_failed=1
+    if [ "$ownership" = busy ]; then
+        grep -Fq 'Another installer is running or the lock authority is unsafe' "$output" || case_failed=1
+        [ "$(cat "${expected_lock}.d/pid")" = "$$" ] || case_failed=1
+        if grep -Fq '+ LOCKED=1' "$output"; then case_failed=1; fi
+    else
+        grep -Fq '+ LOCKED=1' "$output" || case_failed=1
+        grep -Fq 'Install destination contains traversal, a symlink, or a non-directory component' "$output" || case_failed=1
+        [ ! -e "${expected_lock}.d" ] || case_failed=1
+    fi
+    if grep -Fq 'Downloading https://' "$output"; then case_failed=1; fi
+    lock_cases=$((lock_cases + 1))
+    printf 'lock %-5s %-14s %-4s exit=%s expected=1\n' "$delivery" "$location" "$ownership" "$rc"
+    if [ "$case_failed" -ne 0 ]; then
+        failures=$((failures + 1))
+        tail -n 60 "$output" >&2
+    fi
+done
+done
+done
+
+printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
     [ "$failures" -eq 0 ]
     exit $?
@@ -252,7 +314,7 @@ for mode in file stdin file-default stdin-default; do
     verbose_log="$ARTIFACT_DIR/$mode.verbose.log"
     rc=0
     (
-        cd "$case_root/work"
+        cd "$case_root/work" || exit
         # No caller credentials, XDG locations, shell startup hooks, or installer
         # skip overrides may leak into the clean-HOME reproduction.
         case "$mode" in
