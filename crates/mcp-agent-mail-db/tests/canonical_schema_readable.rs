@@ -11,11 +11,17 @@
 //! shape suite. Fixed upstream by `strip_leading_sql_comments` (fsqlite
 //! 5015af7f0); this test pins the fix at the CONSUMER boundary so a future
 //! fsqlite pin regression is caught in `mcp_agent_mail_rust`'s own suite.
+//!
+//! GH#372 also protects the reverse boundary: an existing canonical legacy
+//! mailbox must retain its complete payloads through native startup migrations
+//! and subsequent native writes when the database engine is upgraded.
 
 use crate::common;
 
 use asupersync::{Cx, Outcome};
+use mcp_agent_mail_db::pool::SyncQuery;
 use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
+use sqlmodel_core::Value;
 
 /// Build a fresh db file carrying the full (comment-prefixed) Agent Mail schema
 /// through fsqlite, exactly as runtime bootstrap does.
@@ -97,4 +103,269 @@ fn canonical_sqlite_reads_comment_prefixed_schema() {
         .query_sync("SELECT COUNT(*) FROM idempotency_keys", &[])
         .expect("fsqlite reads its own schema");
     mcp_agent_mail_db::close_db_conn(franken, "canonical_schema_readable fsqlite re-open");
+}
+
+// Python-era on-disk tables, deliberately without a Rust migration ledger or
+// the later messages.recipients_json/topic/archive_metadata_json columns.
+// Seed these with canonical SQLite, not the engine under test: a round trip
+// which creates and reads both sides with the new engine cannot protect the
+// existing-mailbox boundary when the pinned FrankenSQLite version changes.
+const LEGACY_MAILBOX_SCHEMA: &str = "
+    CREATE TABLE projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE,
+        human_key TEXT NOT NULL, created_at DATETIME NOT NULL
+    );
+    CREATE TABLE agents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL REFERENCES projects(id), name TEXT NOT NULL,
+        program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL,
+        inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL,
+        attachments_policy TEXT NOT NULL DEFAULT 'auto',
+        contact_policy TEXT NOT NULL DEFAULT 'auto',
+        reaper_exempt INTEGER NOT NULL DEFAULT 0, registration_token TEXT,
+        UNIQUE(project_id, name)
+    );
+    CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL REFERENCES projects(id),
+        sender_id INTEGER NOT NULL REFERENCES agents(id), thread_id TEXT,
+        subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL,
+        ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL,
+        attachments TEXT NOT NULL DEFAULT '[]'
+    );
+    CREATE TABLE message_recipients (
+        message_id INTEGER NOT NULL REFERENCES messages(id),
+        agent_id INTEGER NOT NULL REFERENCES agents(id), kind TEXT NOT NULL,
+        read_ts DATETIME, ack_ts DATETIME,
+        PRIMARY KEY(message_id, agent_id, kind)
+    );
+    CREATE TABLE file_reservations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL REFERENCES projects(id),
+        agent_id INTEGER NOT NULL REFERENCES agents(id), path_pattern TEXT NOT NULL,
+        exclusive INTEGER NOT NULL, reason TEXT, created_ts DATETIME NOT NULL,
+        expires_ts DATETIME NOT NULL, released_ts DATETIME
+    );
+";
+
+fn seed_canonical_legacy_mailbox(conn: &CanonicalDbConn) {
+    conn.execute_raw(LEGACY_MAILBOX_SCHEMA)
+        .expect("canonical legacy schema");
+    conn.execute_raw(
+        "INSERT INTO projects VALUES (7, 'kept', '/kept', '2026-02-24 15:30:00.123456');
+         INSERT INTO agents (id, project_id, name, program, model, task_description,
+                             inception_ts, last_active_ts)
+         VALUES (11, 7, 'BlueLake', 'legacy', 'model', 'sender',
+                 '2026-02-24 15:30:00.123456', '2026-02-24 15:30:00.123456'),
+                (19, 7, 'RedStone', 'legacy', 'model', 'recipient',
+                 '2026-02-24 15:30:00.123456', '2026-02-24 15:30:00.123456'),
+                (23, 7, 'GreenHill', 'legacy', 'model', 'copy',
+                 '2026-02-24 15:30:00.123456', '2026-02-24 15:30:00.123456');",
+    )
+    .expect("canonical project and agents");
+    // Overflow payload pages and non-ASCII text must survive, as must attachment
+    // metadata byte-for-byte. An empty body/attachment fixture would miss both.
+    let body = "# Retained mail\nCafé — 日本語 🦀; 'quoted' and \\path\n".repeat(256);
+    let attachments = r#"[{"type":"image","path":"attachments/kept.png","sha256":"deadbeef","width":32,"height":16}]"#;
+    conn.execute_sync(
+        "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md,
+                               importance, ack_required, created_ts, attachments)
+         VALUES (500, 7, 11, 'kept-thread', 'Retained subject', ?1, 'high', 1,
+                 '2026-02-24 15:30:00.123456', ?2)",
+        &[Value::Text(body), Value::Text(attachments.to_string())],
+    )
+    .expect("canonical message with overflow body and attachment");
+    conn.execute_raw(
+        "INSERT INTO messages VALUES
+            (900, 7, 19, NULL, 'Second retained message', '', 'normal', 0,
+             '2026-02-24 15:30:00.123456', '[]');
+         INSERT INTO message_recipients VALUES
+            (500, 19, 'to', '2026-02-24 15:32:00.123456', '2026-02-24 15:33:00.123456'),
+            (500, 23, 'cc', NULL, NULL), (900, 11, 'bcc', NULL, NULL);
+         INSERT INTO file_reservations VALUES
+            (77, 7, 11, 'src/**', 1, 'retained lease',
+             '2026-02-24 15:30:00.123456', '2026-02-24 16:30:00.123456', NULL);",
+    )
+    .expect("canonical recipients, second message and reservation");
+}
+
+fn query_values(conn: &impl SyncQuery, sql: &str) -> Vec<Vec<Value>> {
+    conn.query_sync(sql, &[])
+        .unwrap_or_else(|error| panic!("{sql}: {error}"))
+        .into_iter()
+        .map(|row| row.values().cloned().collect())
+        .collect()
+}
+
+/// Original payloads and relational keys, excluding timestamps that the
+/// documented v3 migration intentionally converts from TEXT to microseconds.
+fn retained_legacy_payloads(conn: &impl SyncQuery) -> Vec<Vec<Vec<Value>>> {
+    [
+        "SELECT id, slug, human_key FROM projects ORDER BY id",
+        "SELECT id, project_id, name, program, model, task_description,
+                attachments_policy, contact_policy FROM agents ORDER BY id",
+        "SELECT id, project_id, sender_id, thread_id, subject, body_md, importance,
+                ack_required, attachments FROM messages WHERE id <= 900 ORDER BY id",
+        "SELECT message_id, agent_id, kind FROM message_recipients
+         WHERE message_id <= 900 ORDER BY message_id, agent_id, kind",
+        "SELECT id, project_id, agent_id, path_pattern, exclusive, reason
+         FROM file_reservations ORDER BY id",
+    ]
+    .into_iter()
+    .map(|sql| query_values(conn, sql))
+    .collect()
+}
+
+fn assert_legacy_timestamps(conn: &impl SyncQuery) {
+    const CREATED: i64 = 1_771_947_000_123_456;
+    for (sql, expected) in [
+        (
+            "SELECT created_at FROM projects ORDER BY id",
+            vec![vec![Value::BigInt(CREATED)]],
+        ),
+        (
+            "SELECT inception_ts, last_active_ts FROM agents ORDER BY id",
+            vec![vec![Value::BigInt(CREATED), Value::BigInt(CREATED)]; 3],
+        ),
+        (
+            "SELECT created_ts FROM messages WHERE id <= 900 ORDER BY id",
+            vec![vec![Value::BigInt(CREATED)]; 2],
+        ),
+        (
+            "SELECT read_ts, ack_ts FROM message_recipients
+             WHERE message_id <= 900 ORDER BY message_id, agent_id, kind",
+            vec![
+                vec![
+                    Value::BigInt(CREATED + 120_000_000),
+                    Value::BigInt(CREATED + 180_000_000),
+                ],
+                vec![Value::Null, Value::Null],
+                vec![Value::Null, Value::Null],
+            ],
+        ),
+        (
+            "SELECT created_ts, expires_ts, released_ts FROM file_reservations ORDER BY id",
+            vec![vec![
+                Value::BigInt(CREATED),
+                Value::BigInt(CREATED + 3_600_000_000),
+                Value::Null,
+            ]],
+        ),
+    ] {
+        assert_eq!(query_values(conn, sql), expected, "{sql}");
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the sequential engine ownership phases visible together.
+fn canonical_legacy_mailbox_survives_native_upgrade_and_new_writes() {
+    let dir = tempfile::tempdir().expect("legacy mailbox directory");
+    let path = dir.path().join("legacy.sqlite3").display().to_string();
+    let canonical = CanonicalDbConn::open_file(&path).expect("canonical legacy writer");
+    seed_canonical_legacy_mailbox(&canonical);
+    let original = retained_legacy_payloads(&canonical);
+    drop(canonical);
+
+    // Match startup's native base pass followed by its deferred canonical
+    // migrations. Close each owner before the other engine opens the file.
+    let native = DbConn::open_file(&path).expect("new engine opens existing mailbox");
+    native
+        .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+        .expect("runtime migration PRAGMAs");
+    let applied = common::block_on({
+        let native = &native;
+        move |cx| async move {
+            mcp_agent_mail_db::schema::migrate_to_latest_base(&cx, native)
+                .await
+                .into_result()
+                .expect("native legacy base migration")
+        }
+    });
+    assert!(!applied.is_empty(), "fixture must exercise real migrations");
+    assert_eq!(retained_legacy_payloads(&native), original);
+    assert_legacy_timestamps(&native);
+    native.close_sync().expect("close native migration owner");
+
+    let canonical = CanonicalDbConn::open_file(&path).expect("canonical deferred migration owner");
+    canonical
+        .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+        .expect("canonical migration PRAGMAs");
+    let applied = common::block_on({
+        let canonical = &canonical;
+        move |cx| async move {
+            mcp_agent_mail_db::schema::migrate_to_latest(&cx, canonical)
+                .await
+                .into_result()
+                .expect("deferred legacy migrations")
+        }
+    });
+    assert!(
+        applied
+            .iter()
+            .any(|id| id == "v15_add_recipients_json_to_messages")
+    );
+    assert_eq!(retained_legacy_payloads(&canonical), original);
+    canonical
+        .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("publish canonical migrations before runtime reopen");
+    drop(canonical);
+
+    let native = DbConn::open_file(&path).expect("native upgraded mailbox writer");
+    assert_eq!(retained_legacy_payloads(&native), original);
+    assert_legacy_timestamps(&native);
+    native
+        .execute_raw(
+            "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md,
+                                   importance, ack_required, created_ts)
+             VALUES (7, 11, 'kept-thread', 'After upgrade', 'new body', 'normal', 0,
+                     1771947001000000);
+             INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (901, 19, 'to');",
+        )
+        .expect("new message and delivery after upgrade");
+    native
+        .close_sync()
+        .expect("close native upgraded mailbox writer");
+
+    let canonical = CanonicalDbConn::open_file(&path).expect("independent final verifier");
+    assert_eq!(retained_legacy_payloads(&canonical), original);
+    assert_legacy_timestamps(&canonical);
+    assert_eq!(
+        query_values(
+            &canonical,
+            "SELECT id, subject, body_md FROM messages WHERE id > 900"
+        ),
+        vec![vec![
+            Value::BigInt(901),
+            Value::Text("After upgrade".into()),
+            Value::Text("new body".into())
+        ]],
+        "a new write must preserve the existing message-ID floor"
+    );
+    assert_eq!(
+        query_values(
+            &canonical,
+            "SELECT recipients_json FROM messages WHERE id <= 900 ORDER BY id"
+        ),
+        vec![vec![Value::Text("{}".into())]; 2]
+    );
+    assert_eq!(
+        query_values(
+            &canonical,
+            "SELECT message_id, agent_id, kind, read_ts, ack_ts
+             FROM message_recipients WHERE message_id > 900"
+        ),
+        vec![vec![
+            Value::BigInt(901),
+            Value::BigInt(19),
+            Value::Text("to".into()),
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+    assert_eq!(
+        query_values(&canonical, "PRAGMA integrity_check"),
+        vec![vec![Value::Text("ok".into())]]
+    );
+    assert!(query_values(&canonical, "PRAGMA foreign_key_check").is_empty());
 }

@@ -34,6 +34,47 @@ Changes on `main` that are not in the [v0.3.40 tag](https://github.com/Dickleswo
 binaries. They were committed to `main` while v0.3.40 was being released; `main` then merged the
 release commit in 3fdda50c.
 
+### Persisted tool metrics: index growth and offline recovery (GH#372)
+
+- **The mailbox engine moves to registry FrankenSQLite 0.4.13.** Both direct
+  pins (`fsqlite` and `fsqlite-types`) and the runtime engine family in
+  `Cargo.lock` advance together. SQLModel 0.5.0 and Asupersync 0.5.0 remain
+  compatible; embedded Beads retains its independent patched 0.3.18 engine.
+  The published release contains the divider-aware B-tree sibling balancing
+  fixes for descending index insertions ([upstream #521](https://github.com/Dicklesworthstone/frankensqlite/issues/521)).
+  These prevent the sparse-leaf amplification of
+  `idx_tool_metrics_snapshots_tool_ts(tool_name, collected_ts DESC)` that
+  caused excessive database growth and memory pressure with metrics enabled.
+- **Existing sparse pages require an offline rebuild.** Upgrading prevents
+  the insertion defect but does not compact an already bloated mailbox.
+  `PRAGMA integrity_check` can report `ok` on such a file. **Stop every server
+  using the mailbox first**, using its supervisor, container manager, or
+  terminal; keep it stopped throughout recovery. In the same configured
+  `STORAGE_ROOT` and `DATABASE_URL`, run `am doctor drain`, then preview with
+  `am doctor vacuum`, and apply with **`am doctor vacuum --yes`**. Without
+  `--yes`, or with `--dry-run`, the command only previews. See the
+  [complete recovery procedure](docs/RECOVERY_RUNBOOK.md#metrics-index-growth-and-memory-exhaustion-gh372)
+  for backup, disk-space, verification, and restart steps.
+- **Compaction now holds exclusive mailbox locks and retains a verified
+  standalone backup.** Live-owner overrides and takeover cannot bypass the
+  offline requirement. Message, recipient, identity, schema, and header
+  witnesses are checked before and after the rewrite. A failed backup aborts
+  before compaction; a failed post-check reports the retained backup and
+  requires the server to stay stopped. Recovery never reconstructs messages
+  from an archive as part of this command.
+- **Background maintenance no longer VACUUMs the primary mailbox.**
+  `DB_VACUUM_INTERVAL_SECS` controls only the isolated ATC telemetry sidecar.
+  Main-mailbox compaction always requires the explicit offline command;
+  checkpointing and ANALYZE remain available.
+- **The same release includes bounded optional prepared-read hydration**
+  ([upstream #492](https://github.com/Dicklesworthstone/frankensqlite/issues/492),
+  `91df8b6b9`), including WAL-only growth. Its 8 MiB logical-image threshold
+  is an admission bound for that optimization, not an RSS limit for the server.
+  This upgrade does not by itself qualify the separate full swarm/RSS soak
+  tracked by `br-kp1in.46`.
+
+### Other changes on main
+
 - **Reservation reads stay available while a writer holds the lock.** Reservation and mail-activity
   reads take a fresh deferred snapshot and finish as read-only transactions, so listings no longer
   ask for the writer lock or checkpoint (0a8b0633, "fix(db): keep reservation reads available

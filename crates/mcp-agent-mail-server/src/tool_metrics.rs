@@ -1320,4 +1320,125 @@ mod tests {
         let count = persisted_metric_store_size(&database_url);
         assert!(count >= 1);
     }
+
+    /// GH#372: exercise the worker's real transaction and retention helpers for
+    /// eighty virtual days. Newer timestamps insert at the left edge of each
+    /// tool's DESC index range; a small round-trip test never splits that tree.
+    #[test]
+    fn sustained_metrics_persistence_bounds_growth_and_preserves_retention() {
+        const TICKS: i64 = 960;
+        const STEP_MICROS: i64 = 2 * 60 * 60 * 1_000_000;
+        const START_MICROS: i64 = 1_700_000_000_000_000;
+        let dir = tempfile::tempdir().expect("metrics soak directory");
+        let db_path = dir.path().join("sustained_metrics.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open metrics soak database");
+        conn.execute_raw("PRAGMA journal_mode = WAL")
+            .expect("match the live mailbox journal mode");
+        ensure_metrics_schema(&conn);
+        let mut snapshot: Vec<_> = [
+            "send_message",
+            "fetch_inbox",
+            "register_agent",
+            "health_check",
+            "file_reservation_paths",
+            "search_messages",
+            "reply_message",
+            "acknowledge_message",
+        ]
+        .into_iter()
+        .map(|name| MetricsSnapshotEntry {
+            name: name.to_string(),
+            calls: 0,
+            errors: 0,
+            rejections: 0,
+            cluster: "regression".to_string(),
+            capabilities: vec!["metrics".to_string()],
+            complexity: "simple".to_string(),
+            latency: None,
+        })
+        .collect();
+
+        for tick in 0..TICKS {
+            for (tool_index, entry) in snapshot.iter_mut().enumerate() {
+                entry.calls =
+                    u64::try_from((tick + 1) * 10).unwrap() + u64::try_from(tool_index).unwrap();
+                entry.errors = u64::try_from(tick / 20).unwrap();
+            }
+            let collected_ts = START_MICROS + tick * STEP_MICROS;
+            persist_snapshot_rows(&conn, collected_ts, &snapshot)
+                .unwrap_or_else(|error| panic!("metrics persistence at tick {tick}: {error}"));
+            if u64::try_from(tick)
+                .unwrap()
+                .is_multiple_of(PRUNE_INTERVAL_TICKS)
+            {
+                prune_old_snapshot_rows(&conn, collected_ts);
+            }
+            if tick % 120 == 119 {
+                let pages = conn.query_sync("PRAGMA page_count", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap();
+                let page_size = conn.query_sync("PRAGMA page_size", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap();
+                // Fewer than 3,400 retained rows of small metrics need well
+                // under 2 MiB, including both indexes and reusable free pages.
+                // The 0.4.10 one-cell-leaf defect exceeds this by many times.
+                assert!(
+                    pages * page_size <= 2 * 1024 * 1024,
+                    "metrics page growth at tick {tick}: {pages} pages of {page_size} bytes"
+                );
+            }
+        }
+
+        let latest_ts = START_MICROS + (TICKS - 1) * STEP_MICROS;
+        let cutoff = latest_ts - METRICS_RETENTION_DAYS * 86_400_000_000;
+        prune_old_snapshot_rows(&conn, latest_ts);
+        let retained_ticks = METRICS_RETENTION_DAYS * 86_400_000_000 / STEP_MICROS + 1;
+        let expected_rows = retained_ticks * i64::try_from(snapshot.len()).unwrap();
+        let totals = conn
+            .query_sync(
+                "SELECT COUNT(*) AS n, MIN(collected_ts) AS oldest, \
+                 MAX(collected_ts) AS newest FROM tool_metrics_snapshots",
+                &[],
+            )
+            .expect("retention totals");
+        assert_eq!(totals[0].get_named::<i64>("n").unwrap(), expected_rows);
+        assert_eq!(totals[0].get_named::<i64>("oldest").unwrap(), cutoff);
+        assert_eq!(totals[0].get_named::<i64>("newest").unwrap(), latest_ts);
+        conn.close_sync()
+            .expect("close and flush sustained metrics fixture");
+
+        // Public observer paths must recover the same latest sample after the
+        // writer closes, including the cumulative counters used by the TUI.
+        assert_eq!(
+            persisted_metric_store_size(&database_url),
+            u64::try_from(expected_rows).unwrap()
+        );
+        let latest = load_latest_persisted_metrics(&database_url, snapshot.len());
+        assert_eq!(latest.len(), snapshot.len());
+        for expected in &snapshot {
+            let actual = latest
+                .iter()
+                .find(|metric| metric.tool_name == expected.name)
+                .expect("every persisted tool has a latest sample");
+            assert_eq!(actual.collected_ts, latest_ts);
+            assert_eq!(actual.calls, expected.calls);
+            assert_eq!(actual.errors, expected.errors);
+        }
+
+        // The engine's own integrity check was green in the report. Use an
+        // independent reader as well as explicit growth and content checks.
+        let canonical = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            db_path.to_str().expect("UTF-8 metrics database path"),
+        )
+        .expect("open quiescent metrics database with canonical SQLite");
+        let integrity = canonical.query_sync("PRAGMA integrity_check", &[]).unwrap();
+        assert_eq!(integrity.len(), 1);
+        assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+        let rows = canonical
+            .query_sync("SELECT COUNT(*) FROM tool_metrics_snapshots", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), expected_rows);
+    }
 }

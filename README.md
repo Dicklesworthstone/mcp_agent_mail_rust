@@ -349,7 +349,7 @@ Requires Rust nightly (see `rust-toolchain.toml`). Current `main` records [Frank
 
 A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source.
 
-The mailbox uses registry FrankenSQLite `=0.4.10` through SQLModel 0.5.0 on Asupersync 0.5.0. `Cargo.lock` selects the FastMCP 0.13.0 family from crates.io, with `fastmcp-rust` imported as `fastmcp`. Registry `beads_rust =0.6.0` retains its separate FrankenSQLite 0.3.18 engine, patched to an immutable Git revision, with default features disabled. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results.
+The mailbox uses registry FrankenSQLite `=0.4.13` through SQLModel 0.5.0 on Asupersync 0.5.0. `Cargo.lock` selects the FastMCP 0.13.0 family from crates.io, with `fastmcp-rust` imported as `fastmcp`. Registry `beads_rust =0.6.0` retains its separate FrankenSQLite 0.3.18 engine, patched to an immutable Git revision, with default features disabled. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results. If persisted tool metrics have already bloated your mailbox, stop the server and follow the [offline recovery procedure](docs/RECOVERY_RUNBOOK.md) before running `am doctor vacuum --yes`; upgrading does not compact existing pages.
 
 ### Platforms
 
@@ -1353,7 +1353,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `DB_MAINTENANCE_ENABLED` | `true` | Enable checkpoint/ANALYZE/VACUUM/journal-size maintenance within the integrity guard; `false` leaves checks and backups enabled |
 | `DB_CHECKPOINT_INTERVAL_SECS` | `300` | Passive WAL checkpoint cadence (`0` disables that op) |
 | `DB_ANALYZE_INTERVAL_SECS` | `21600` | `ANALYZE` planner-stats refresh cadence (`0` disables) |
-| `DB_VACUUM_INTERVAL_SECS` | `86400` | `VACUUM` reclaim/defragment cadence (`0` disables) |
+| `DB_VACUUM_INTERVAL_SECS` | `86400` | Isolated ATC telemetry sidecar `VACUUM` cadence (`0` disables). Main-mailbox compaction requires a stopped server and explicit `am doctor vacuum --yes`. |
 | `DB_JOURNAL_SIZE_LIMIT_BYTES` | `16777216` | `journal_size_limit` WAL truncation cap (16 MiB); an automatic checkpoint over the cap truncates the WAL |
 | `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
 | `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |

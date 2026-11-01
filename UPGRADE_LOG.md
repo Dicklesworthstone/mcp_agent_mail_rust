@@ -1,5 +1,129 @@
 # Dependency Upgrade Log
 
+## November 1, 2026 — FrankenSQLite 0.4.13 (GH#372)
+
+The runtime mailbox engine uses the published `fsqlite =0.4.13` and
+`fsqlite-types =0.4.13` registry releases. SQLModel 0.5.0's `^0.4.0` engine
+requirements admit this release without an adapter or Asupersync upgrade.
+The immutable Git patch for embedded Beads' separate 0.3.18 family is unchanged.
+
+The inspected published archives identify source commit
+[`e4137af304002ac0b57a948c9e0005f9161475d7`](https://github.com/Dicklesworthstone/frankensqlite/commit/e4137af304002ac0b57a948c9e0005f9161475d7).
+Git ancestry and the published B-tree source confirm the release contains
+[`00e907b`](https://github.com/Dicklesworthstone/frankensqlite/commit/00e907b5214c8fb60906f9ebefa28b361afe9ae5),
+[`6fb125a`](https://github.com/Dicklesworthstone/frankensqlite/commit/6fb125a3d36ee086ee7886e09ae6a67fbc140786), and
+[`11c0185`](https://github.com/Dicklesworthstone/frankensqlite/commit/11c018555502719140eee1ddaa33b12619b9fbe5).
+They account for promoted divider bytes and minimum cell allocation while
+redistributing sibling index pages, preventing repeated descending inserts
+from stranding almost-empty leaves. The published source includes the upstream
+12,000-key regression; source inclusion is distinct from executing our
+consumer-boundary tests.
+
+The release also includes `91df8b6b9` (upstream #492), which limits optional
+whole-image prepared-read hydration to logical images no larger than 8 MiB,
+including pages still in WAL. That does not establish an overall RSS ceiling
+or close the separately specified `br-kp1in.46` swarm-soak acceptance gate.
+
+No mailbox schema migration or startup rebuild is introduced. Already bloated
+databases retain their sparse pages until the operator stops the server and
+runs `am doctor vacuum --yes`. Follow the
+[offline recovery runbook](docs/RECOVERY_RUNBOOK.md#metrics-index-growth-and-memory-exhaustion-gh372);
+the command retains a verified backup and refuses a live mailbox.
+
+### Executed qualification and remaining gates
+
+Cargo resolved the complete runtime family to 0.4.13: 20 package version
+changes, including `fsqlite-vfs` from 0.4.11. A parsed-lockfile comparison
+confirmed that every Git-sourced package entry, including Beads' independent
+0.3.18 family, remained unchanged.
+
+The official Linux x86_64 static-musl CLI releases were verified against
+GitHub asset digests, archive checksums, signed SHA256SUMS, and both Minisign
+signature components. The 0.4.13 binary's source revision matches the
+published crates. Archive SHA-256 values:
+
+- 0.4.10: `12b8ec599038c74609a3db2c6ed6fb15fd3e3258693ab7dc62830f5dd3d42fc0`.
+- 0.4.13: `c0be5ff014ba34e4173a69b315e5514d5935125bcd6e398d2fcf4d1830d22784`.
+
+Native CLI probes exercised the actual v9 table and both metrics indexes,
+a 61-character tool name, a pre-existing row, and 12,000 increasing timestamp
+inserts committed in batches of 100. Independent canonical SQLite forced an
+indexed descending scan and checked all 12,001 exact timestamp/counter pairs.
+
+| Page size | Engine | Database bytes | Index leaf pages | Single-cell leaves | Growth/density bounds |
+|---:|---|---:|---:|---:|---|
+| 4,096 | 0.4.10 | 26,501,120 | 5,919 | 5,916 | Both fail |
+| 4,096 | 0.4.13 | 3,096,576 | 411 | 0 | Both pass |
+| 512 | 0.4.10 | 5,503,488 | 5,994 | 5,991 | Both fail |
+| 512 | 0.4.13 | 3,475,456 | 2,998 | 0 | Both pass |
+
+Every file returned `integrity_check = ok`, including both defective
+controls. The unchanged regression limits are 4,739,072 bytes and fewer than
+10% single-cell index leaves. The ordered values have the same SHA-256 in
+all four runs:
+`8efa17af561f4a35beb1cc41cb56aee06a290591881ca785baeea41dd73a5f36`.
+
+A separate compatibility/recovery probe inserted Unicode messages, attachment
+JSON, BLOB values, recipient read/ack state, a custom database-only table,
+and a deleted high-ID AUTOINCREMENT sentinel using the old 0.4.10 binary.
+The 0.4.13 binary read the exact values without changing the main-file hash.
+Explicit offline 0.4.13 `VACUUM INTO`, followed by `VACUUM`, reduced that
+private database from 26,537,984 to 2,428,928 bytes. Backup and compacted-file
+witnesses preserved every table's rows, exact schema SQL, `user_version=33`,
+`application_id=1095585100`, and `sqlite_sequence`'s deleted-ID high-water
+mark of 1,000,001. Canonical integrity and foreign-key checks passed.
+
+These executable results qualify the upstream index fix and the engine's
+preservation behavior. They do not substitute for executing the changed
+Agent Mail command, its lock tests, or its sustained worker and memory tests.
+
+The simple cold-open, single-connection CLI `SELECT 1` probe did **not**
+reproduce the application's memory amplification. Linux `wait4` peak RSS
+was 16,948 KiB on 0.4.10 and 17,868 KiB on 0.4.13 before compaction, and
+18,076 KiB on 0.4.13 after compaction. These measurements establish neither
+a server RSS improvement nor the five-connection regression's 32 MiB bound.
+
+`cargo fmt --all -- --check` and `git diff --check` passed. The application
+check `cargo check --locked -p mcp-agent-mail-db --no-default-features --test it`
+stopped while compiling Asupersync because the shared 63 GiB filesystem
+reached zero free space (`No space left on device` writing its dependency
+file). UBS's static scan also failed to assemble its report under the same
+disk exhaustion; it did not report a completed clean scan. No workspace
+check, strict Clippy result, native Agent Mail test result, or full swarm-soak
+pass is claimed.
+
+The added regression gates remain required:
+
+- `startup_page_leak::descending_metrics_insertions_keep_index_pages_dense`:
+  real adapter inserts, physical page occupancy, exact indexed values, and
+  storage bounds at both page sizes.
+- `startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory`:
+  Linux fresh-process RSS, a mailbox larger than 16 MiB, one writer plus four
+  existing readers, a committed update, and parameterized point reads.
+- `canonical_schema_readable::canonical_legacy_mailbox_survives_native_upgrade_and_new_writes`:
+  legacy schema/data across actual migrations, native new writes, then
+  independent canonical verification.
+- `tool_metrics::tests::sustained_metrics_persistence_bounds_growth_and_preserves_retention`:
+  actual persist/prune/read helpers, eight tools, 960 ticks spanning 80 virtual
+  days, the real prune cadence, the inclusive 30-day boundary, and a 2 MiB
+  logical database ceiling.
+- `integrity_guard::tests::scheduled_maintenance_never_vacuums_the_live_mailbox`:
+  a due background interval leaves a genuinely compactable mailbox unchanged.
+- The CLI's `doctor_vacuum_` tests: unchanged-count content tampering, backup
+  refusal, live-owner refusal before side effects, lock lifetime, read-only
+  preview, retained backup, and exact message/metadata preservation.
+
+Run the focused database tests with `cargo test --locked -p mcp-agent-mail-db
+--no-default-features --test it <test-name> -- --exact --nocapture`. Run the
+server tests with `cargo test --locked -p mcp-agent-mail-server
+--no-default-features --features portable --lib <test-name> --
+--exact --nocapture`. Run the recovery group with `cargo test --locked
+-p mcp-agent-mail-cli --no-default-features --features portable --lib
+doctor_vacuum_ -- --nocapture`. Then run the repository-required workspace
+all-target and production-only checks, strict Clippy, and the broader
+compatibility/soak gates. Keep the issue and `br-kp1in.46` acceptance gate open
+until their remaining application-level evidence is available.
+
 ## October 2026 — FrankenSQLite 0.4.10, FastMCP 0.10.0, and v0.3.37–v0.3.39 release status
 
 This section supersedes the September status notes below:

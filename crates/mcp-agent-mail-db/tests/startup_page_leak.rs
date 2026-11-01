@@ -14,7 +14,7 @@ use crate::common;
 use asupersync::Cx;
 use mcp_agent_mail_db::sqlmodel_core::Error as SqlError;
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteErrorCode;
-use mcp_agent_mail_db::{CanonicalDbConn, DbPoolConfig, create_pool};
+use mcp_agent_mail_db::{CanonicalDbConn, DbConn, DbPoolConfig, create_pool};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -421,4 +421,319 @@ fn clean_compacted_mailbox_stays_clean_across_service_startup() {
     let after_restart = audit(&db_path);
     eprintln!("after second start: {after_restart:?}");
     assert_no_new_orphans("second start", &clean, &after_restart);
+}
+
+#[derive(Debug, Default)]
+struct MetricsIndexShape {
+    pages: usize,
+    leaves: usize,
+    single_cell_leaves: usize,
+    depth: usize,
+}
+
+/// Inspect only the affected index, without depending on SQLite's optional
+/// dbstat extension. Interior index cells start with a four-byte child page
+/// number; leaf headers carry their cell count. A visited set makes cycles a
+/// test failure rather than an unbounded walk.
+fn metrics_index_shape(path: &Path, root_page: usize) -> MetricsIndexShape {
+    let bytes = std::fs::read(path).expect("read checkpointed metrics database");
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    let page_size = match u16::from_be_bytes([bytes[16], bytes[17]]) {
+        1 => 65_536,
+        size => usize::from(size),
+    };
+    let mut pending = vec![(root_page, 1)];
+    let mut visited = std::collections::HashSet::new();
+    let mut shape = MetricsIndexShape::default();
+    while let Some((page_number, depth)) = pending.pop() {
+        assert!(
+            visited.insert(page_number),
+            "index page cycle at {page_number}"
+        );
+        assert!(page_number > 0 && page_number <= bytes.len() / page_size);
+        let page = &bytes[(page_number - 1) * page_size..page_number * page_size];
+        let header = usize::from(page_number == 1) * 100;
+        let cells = usize::from(u16::from_be_bytes([page[header + 3], page[header + 4]]));
+        shape.pages += 1;
+        shape.depth = shape.depth.max(depth);
+        match page[header] {
+            0x0a => {
+                shape.leaves += 1;
+                shape.single_cell_leaves += usize::from(cells == 1);
+            }
+            0x02 => {
+                let right_child =
+                    u32::from_be_bytes(page[header + 8..header + 12].try_into().unwrap());
+                pending.push((usize::try_from(right_child).unwrap(), depth + 1));
+                for cell in 0..cells {
+                    let pointer = header + 12 + cell * 2;
+                    let offset =
+                        usize::from(u16::from_be_bytes([page[pointer], page[pointer + 1]]));
+                    let child = u32::from_be_bytes(page[offset..offset + 4].try_into().unwrap());
+                    pending.push((usize::try_from(child).unwrap(), depth + 1));
+                }
+            }
+            other => panic!("index contains non-index page {page_number}: {other:#x}"),
+        }
+    }
+    shape
+}
+
+/// GH#372 / FrankenSQLite #521: run the persisted metrics migration's actual
+/// composite DESC index through repeated leaf and interior splits. The old
+/// engine passed integrity_check while allocating almost one leaf per two rows.
+#[test]
+fn descending_metrics_insertions_keep_index_pages_dense() {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    const ROWS: i64 = 12_000;
+    let dir = tempfile::tempdir().expect("descending metrics fixture directory");
+    for page_size in [512, 4096] {
+        let path = dir.path().join(format!("metrics-{page_size}.sqlite3"));
+        // Canonical SQLite supplies an existing file with the unchanged v9
+        // schema and one old sample. The upgraded runtime must append without
+        // rebuilding the schema or losing that pre-existing row.
+        let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+        seed.execute_raw(&format!("PRAGMA page_size = {page_size}"))
+            .unwrap();
+        let migrations: Vec<_> = mcp_agent_mail_db::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v9_"))
+            .collect();
+        assert_eq!(migrations.len(), 3, "exercise all three metrics migrations");
+        for migration in migrations {
+            seed.execute_raw(&migration.up).unwrap();
+        }
+        let tool = format!("send_message_{}", "x".repeat(48));
+        seed.execute_sync(
+            "INSERT INTO tool_metrics_snapshots (tool_name, collected_ts, calls) VALUES (?, 0, 7)",
+            &[Value::Text(tool.clone())],
+        )
+        .unwrap();
+        drop(seed);
+
+        let writer = DbConn::open_file(path.to_str().unwrap()).expect("open existing metrics file");
+        let actual_page_size = writer.query_sync("PRAGMA page_size", &[]).unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap();
+        assert_eq!(actual_page_size, page_size);
+        writer.execute_raw("BEGIN").unwrap();
+        for timestamp in 1..=ROWS {
+            writer
+                .execute_sync(
+                    "INSERT INTO tool_metrics_snapshots (tool_name, collected_ts, calls) \
+                     VALUES (?, ?, ?)",
+                    &[
+                        Value::Text(tool.clone()),
+                        Value::BigInt(timestamp),
+                        Value::BigInt(timestamp * 3),
+                    ],
+                )
+                .unwrap_or_else(|error| panic!("DESC insertion {timestamp}: {error}"));
+            if timestamp % 100 == 0 {
+                writer.execute_raw("COMMIT").unwrap();
+                if timestamp != ROWS {
+                    writer.execute_raw("BEGIN").unwrap();
+                }
+            }
+        }
+        writer
+            .close_sync()
+            .expect("close and flush descending metrics fixture");
+
+        let canonical = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+        canonical
+            .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let integrity = canonical.query_sync("PRAGMA integrity_check", &[]).unwrap();
+        assert_eq!(integrity.len(), 1);
+        assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+        let ordered = canonical
+            .query_sync(
+                "SELECT collected_ts, calls FROM tool_metrics_snapshots \
+                 INDEXED BY idx_tool_metrics_snapshots_tool_ts \
+                 WHERE tool_name = ? ORDER BY collected_ts DESC",
+                &[Value::Text(tool)],
+            )
+            .expect("canonical reader must traverse the persisted DESC index");
+        assert_eq!(ordered.len(), usize::try_from(ROWS + 1).unwrap());
+        for (position, row) in ordered.iter().enumerate() {
+            let timestamp = ROWS - i64::try_from(position).unwrap();
+            assert_eq!(row.get_as::<i64>(0).unwrap(), timestamp);
+            assert_eq!(
+                row.get_as::<i64>(1).unwrap(),
+                if timestamp == 0 { 7 } else { timestamp * 3 }
+            );
+        }
+        let root = canonical
+            .query_sync(
+                "SELECT rootpage FROM sqlite_master \
+                 WHERE name = 'idx_tool_metrics_snapshots_tool_ts'",
+                &[],
+            )
+            .unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap();
+        drop(canonical);
+
+        let shape = metrics_index_shape(&path, usize::try_from(root).unwrap());
+        let file_bytes = std::fs::metadata(&path).unwrap().len();
+        eprintln!("GH372 page_size={page_size} rows={ROWS} bytes={file_bytes} index={shape:?}");
+        assert!(
+            shape.depth >= 3,
+            "fixture must split interior index pages: {shape:?}"
+        );
+        assert!(shape.leaves > 10, "fixture must exercise many leaf splits");
+        assert!(
+            shape.single_cell_leaves * 10 < shape.leaves,
+            "DESC insertions left mostly one-cell leaves despite integrity_check=ok: {shape:?}"
+        );
+        assert!(
+            file_bytes <= u64::try_from(ROWS).unwrap() * 384 + 128 * 1024,
+            "metrics database amplified storage beyond 384 bytes/sample: {file_bytes}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_kib(field: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .expect("Linux memory accounting is required for the memory regression")
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(field)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or_else(|| panic!("missing {field} in /proc/self/status"))
+}
+
+/// GH#372 / br-kp1in.46: 0.4.10 multiplied each mailbox's logical image by
+/// its connection count, even for tiny reads. Use a fresh process so an earlier
+/// test's allocator high-water mark cannot hide another whole-image allocation.
+#[cfg(target_os = "linux")]
+#[test]
+fn existing_mailbox_reads_have_bounded_connection_memory() {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    const CHILD_ENV: &str = "AM_GH372_MEMORY_FIXTURE";
+    const CHILD_TEST: &str =
+        "startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory";
+    const ACK: &str = "gh372-memory-probe-complete";
+    const MESSAGE_COUNT: i64 = 4096;
+    if let Some(path) = std::env::var_os(CHILD_ENV) {
+        let path = PathBuf::from(path);
+        assert!(path.is_absolute());
+        assert_eq!(std::fs::canonicalize(&path).unwrap(), path);
+        assert!(
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("am-gh372-memory-"))
+        );
+        let baseline_kib = process_memory_kib("VmRSS:");
+        let writer = DbConn::open_file(path.to_str().unwrap()).expect("open existing mailbox");
+        let readers: Vec<_> = (0..4)
+            .map(|_| DbConn::open_file(path.to_str().unwrap()).expect("open runtime reader"))
+            .collect();
+        writer
+            .execute_raw("UPDATE messages SET subject = 'post-upgrade write' WHERE id = 1")
+            .expect("upgraded writer must preserve the existing mailbox format");
+        for reader in &readers {
+            assert_eq!(
+                reader.query_sync("SELECT 1", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            let row = reader
+                .query_sync(
+                    "SELECT subject, body_md FROM messages WHERE id = ?",
+                    &[Value::BigInt(1)],
+                )
+                .expect("read committed message through another connection");
+            assert_eq!(row[0].get_as::<String>(0).unwrap(), "post-upgrade write");
+            assert_eq!(
+                row[0].get_as::<String>(1).unwrap(),
+                "retained body ".repeat(320)
+            );
+        }
+        let peak_kib = process_memory_kib("VmHWM:");
+        let delta_kib = peak_kib.saturating_sub(baseline_kib);
+        eprintln!("GH372 baseline_kib={baseline_kib} peak_kib={peak_kib} delta_kib={delta_kib}");
+        // The file holds >16 MiB of message bodies. Five live connections may
+        // use bounded pager caches, but must not each hydrate the entire image.
+        assert!(
+            delta_kib <= 32 * 1024,
+            "small reads amplified mailbox RSS by {delta_kib} KiB"
+        );
+        drop(readers);
+        writer
+            .close_sync()
+            .expect("close and flush bounded-memory fixture");
+        eprintln!("{ACK}");
+        return;
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("am-gh372-memory-")
+        .tempdir()
+        .expect("private memory fixture directory");
+    let path = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("storage.sqlite3");
+    let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+    seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        .expect("seed the unchanged mailbox schema using canonical SQLite");
+    seed.execute_raw(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'gh372', '/gh372', 1); \
+         INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+         VALUES (1, 1, 'BlueLake', 'codex', 'test', 1, 1); BEGIN",
+    )
+    .unwrap();
+    let body = "retained body ".repeat(320);
+    for id in 1..=MESSAGE_COUNT {
+        seed.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (?, 1, 1, 'before upgrade', ?, ?)",
+            &[
+                Value::BigInt(id),
+                Value::Text(body.clone()),
+                Value::BigInt(id),
+            ],
+        )
+        .unwrap();
+    }
+    seed.execute_raw("COMMIT").unwrap();
+    drop(seed);
+    assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD_ENV, &path)
+        .output()
+        .expect("run isolated memory measurement");
+    std::io::stdout().write_all(&output.stdout).unwrap();
+    std::io::stderr().write_all(&output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "memory child failed: {}",
+        output.status
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| *line == ACK)
+            .count(),
+        1,
+        "a zero-test child filter is not a successful memory regression"
+    );
+    let canonical = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+    let rows = canonical
+        .query_sync("SELECT COUNT(*), SUM(length(body_md)) FROM messages", &[])
+        .unwrap();
+    assert_eq!(rows[0].get_as::<i64>(0).unwrap(), MESSAGE_COUNT);
+    assert_eq!(
+        rows[0].get_as::<i64>(1).unwrap(),
+        MESSAGE_COUNT * i64::try_from(body.len()).unwrap()
+    );
 }
