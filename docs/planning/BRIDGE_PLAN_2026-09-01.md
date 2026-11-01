@@ -1,6 +1,6 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
-## November 1 execution queue (15:54 UTC)
+## November 1 execution queue (16:56 UTC)
 
 Beads remains the complete dependency-aware work list. This queue records the
 current execution details in the existing plan because the earlier loose
@@ -47,11 +47,15 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
   no extra patch or suppression is added. Its live
   compiler source matched all3779 files of manifest `92bae2ee…`, based on
   `8820c3fb`; subsequent incoming 0.3.40 code still needs its own checks.
-- [ ] Finish the three current 0.3.40 gates: all-target checking on `vmi1152480`,
+- [x] Finish the three current 0.3.40 gates: all-target checking on `vmi1152480`,
   production lib/bins on `vmi1293453`, strict all-target Clippy on `vmi1153651`.
   All three live compiler namespaces match all 3,782 dispatch-snapshot files,
   manifest `bed7ccf6`, with no exclusions or mismatches. Subsequent plan/tracker
   updates do not change the compiled Rust/Cargo inputs.
+  All three finish with exit0 (38m08s / 70m12s / 58m13s respectively). The
+  upstream `proc-macro-error2` future-compatibility notice remains. Formatting
+  and whitespace also pass. This is compiler qualification, not a runtime or
+  release certificate.
 - [ ] Run the original populated DB admission/initializer, storage
   checkpoint/path/owner-lock/decoded-index and bundle publication controls on
   the final source when admitted. GNU compilation and native Windows execution
@@ -62,16 +66,32 @@ temporary logs and TODO are no longer present. Their absence is not a pass.
   request refuses exit 103 (pressure/project exclusion). No direct SSH compilation,
   local compilation, job-mode compiler smuggling, fleet override or weakened
   runner settings are used. Retry only after running gates release capacity.
+  After the all-target job finishes, the normal two-thread native request is
+  admitted on `vmi1152480`. It is compiling on source `0c350359`, manifest
+  `422c61c8`; all 3,782 actual input files match with no exclusions. Both outer
+  timeout variables are14400; per-test deadlines remain unchanged. Debug info
+  and incremental compilation are disabled to bound build resource use. No
+  native tests have reported results yet.
 - [ ] Keep `.75` open: the checksum-setting proposal failed its controlled
   reproducer. Remove the ineffective setting without presenting this as a
   normal-route cache fix. Preserve the stale77 correction below.
 - [ ] Keep `.63` and `br-5nr0m` open under their original workloads and reader
   protection. The incoming detailed reader-scan task covers the observed
   per-candidate full process scan; do not create a duplicate performance lane.
+  A private Linux notification probe rejects one shortcut: ordinary directory
+  opens emit `IN_OPEN`, while duplicated and `O_PATH` handles do not. All are
+  visible readers of the same inode to the existing inventory. A notification-
+  only replacement would weaken protection; no production change is made.
 - [x] Complete the fresh written20-question solo acceptance review, flush
   Beads, and verify zero cycles. Issues and base retain all old IDs/comments,
   with no duplicate IDs; their2845 rows include the six earlier owned tasks.
   Preserve all original engine/platform/cache/authority/release holds.
+- [x] Execute all22 existing real-Git commit-admission regressions: pass. This
+  is standalone production-template coverage, not a native Rust CLI-renderer
+  test, and closes no additional feature task.
+- [x] Build the mandated ACFS checker remotely. Its local baseline checksum
+  validation, installer listing and `check --dry-run --local` all pass using a
+  private data directory. New installer pin validation follows publication.
 - [ ] Commit/push the owned installer/config/tracker changes in logical batches
   without force; preserve both remote histories and verify main/mirror refs.
   Verify the ACFS pin against the exact public installer after publication;
