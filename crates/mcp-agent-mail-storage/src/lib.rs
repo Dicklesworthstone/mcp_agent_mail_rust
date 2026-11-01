@@ -21812,7 +21812,19 @@ mod tests {
                 std::env::var_os("AM_STORAGE_PERMISSION_TEST_CHILD").is_none(),
                 "permission child must actually drop root privileges"
             );
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            // Keep the exact ELF reachable after dropping privileges even when
+            // the build target has root-private ancestors. Linux resolves this
+            // retained descriptor before closing it on exec.
+            #[cfg(target_os = "linux")]
+            let executable = fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            #[cfg(target_os = "linux")]
+            let executable_path = {
+                use std::os::fd::AsRawFd as _;
+                format!("/proc/self/fd/{}", executable.as_raw_fd())
+            };
+            #[cfg(not(target_os = "linux"))]
+            let executable_path = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(executable_path)
                 .args([
                     "--exact",
                     "tests::test_file_lock_stale_cleanup_permission_denied_returns_false",
@@ -21825,6 +21837,8 @@ mod tests {
                 .current_dir("/tmp")
                 .output()
                 .expect("run stale-lock denial without root DAC bypass");
+            #[cfg(target_os = "linux")]
+            drop(executable);
             assert!(
                 output.status.success(),
                 "unprivileged permission test failed: {}\n{}",
