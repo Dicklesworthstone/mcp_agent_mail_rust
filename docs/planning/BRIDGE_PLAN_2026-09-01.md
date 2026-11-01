@@ -2,6 +2,43 @@
 
 ## November 1 mailbox-routing repair (br-eos8u)
 
+- [x] Resume after disk recovery: 22 GiB available; read-only mailbox health
+  passes again with the same owner PID, reservation parity 327/327. No repair,
+  reconstruction, service change or protected-home cache move was performed.
+- [x] Recover the original 0.4.13 all-target wrapper without replay: exit 0,
+  terminal acknowledged. This qualifies the older 96b25a56 source only.
+- [x] Inspect and fast-forward the four incoming commits through 7c9137da;
+  preserve existing plan/tracker changes and import Beads. Incoming offline
+  VACUUM and conversation browsing changes remain distinct from this repair.
+- [x] Apply the additional invalid-database-path guard as small manual hunks.
+  Unresolvable paths no longer mean unowned, error text does not echo URL
+  credentials, and explicit endpoint authority is retained. Add an isolated
+  child regression for default/private roots, both invalid URL spellings and
+  explicit-port behavior; require one actual child test to prevent zero-run green.
+- [x] Current formatting and whitespace checks pass. Freeze resumed manifest
+  c573e11e (3,770 tracked files except Beads/planning); CLI hash 162afec7,
+  lock d6918089. This is a new source epoch, not qualified by the older run.
+- [ ] Finish the already-running 96b25a56 native routing suite without cancelling
+  or replaying it. Record actual populated tests and any failures separately.
+- [ ] Run the complete declared routing suite including the added invalid-path
+  regression on resumed source. Require the real daemon registration/send/inbox
+  and real unresolved-owner refusal, retaining original assertions/deadlines.
+- [ ] Complete resumed-source all-target, separate production lib/bins and
+  strict Clippy checks through ordinary strict RCH admission. The all-target
+  job is running on vmi1149989; no local compilation or worker-policy override.
+- [ ] Finish the changed CLI scanner, review new changed-line findings, retain
+  original failed attempts and preserve the unchanged integration-file receipt.
+- [ ] Fresh original-acceptance check; update Beads with terminal evidence,
+  flush JSONL, check cycles and graph preservation, commit/publish without force,
+  then release only this task's three leases (renewed through 02:12 UTC).
+
+The full-disk failure and prepared recovery candidate are preserved in the NAS
+recovery copy. Capacity is now restored independently of the blocked cache move;
+the helper was not run by this agent. Native build 30090344884338721 still runs
+its original frozen source. Its result cannot qualify the additional guard or
+the incoming conversation/VACUUM work. New logs and scanner outputs remain under
+`/mnt/je_nas/am-eos8u-preserved-20261101-zpzkz13u/`.
+
 - [x] Refresh authoritative ready work and preserve the clean tracked checkout.
   Governing project docs match the fully reviewed snapshot. The TUI contact
   query already landed; its remaining Mac production check is not a new fix.
@@ -14,7 +51,7 @@
 - [x] Treat every reported competing owner as requiring listener verification;
   retain both-lock/exclusive/single-PID authority and the ownership recheck.
   Show owner PIDs and remediation without echoing owner command-line secrets.
-- [ ] Add recording-endpoint regressions on ephemeral ports only, with a real
+- [x] Add recording-endpoint regressions on ephemeral ports only, with a real
   authenticated HTTP positive control and zero requests for unresolved owners.
   Cover missing/ambiguous owner, disappeared/changed ownership, actual dedicated
   server-style command lines, known CLI holders and unreadable command lines.
@@ -49,6 +86,45 @@ strict UTF-8 on the test client's own request, loopback HTTP, cloning and slash
 strings misidentified as division. Production changes have one informational
 clone finding and no new warning or critical finding. No suppression, category
 exclusion, product-test timeout change or whole-project scanner claim follows.
+
+Source transition: another session committed the same pending routing patch in
+`03814432`, explicitly without acceptance or closure. The frozen CLI/test bytes
+are unchanged. Then upstream `96b25a56` upgraded the runtime engine to 0.4.13;
+its only changes are AGENTS, Cargo.toml and Cargo.lock (20 registry engine
+packages; the separate Beads engine is unchanged). The non-overlapping
+fast-forward and required Beads import succeeded. Current manifest
+`78b950f3` has lock hash `d6918089`; the old manifest `18881c42`/lock `4e6bb8d6`
+remains separately preserved. The old native build was cooperatively cancelled
+through its exact RCH wrapper and exited 143 before tests ran. It provides no
+runtime pass. The replacement uses the identical tests and watchdogs on the new
+graph, with one runner thread to fit normal fleet admission. The old all-target
+job may finish, but any result from it qualifies only the 0.4.10 graph. Current
+0.4.13 native, all-target, production and Clippy acceptance remain open.
+
+The 0.4.10 all-target job completed (build `30090344884338715`, exit 0,
+47m55s). All 3,769 frozen files still matched on the worker afterward.
+Cargo reported the existing `proc-macro-error2` future-compatibility warning;
+this is compiler evidence only, not a runtime or current-graph pass.
+
+The coordinator subsequently ran out of disk space. The first 0.4.13
+all-target caller aborted (134); recovery of its exact wrapper reports 143,
+not success. A queued native retry also aborted before admission. Only those
+owned wrappers were reconciled. Completed diagnostic trees were archived and
+byte/metadata-compared on the NAS, then moved to Linux RAM storage with links
+at their old paths. The archive preserves the non-UTF-8 negative-test filename
+that a loose NAS copy could not represent. This recovered limited working
+headroom without discarding the diagnostics; the coordinator remains short
+of disk space. Authoritative new logs/artifacts are under
+`/mnt/je_nas/am-eos8u-preserved-20261101-zpzkz13u/`.
+
+Current native build `30090344884338721` runs on `vmi1152480` with the same
+tests, features and watchdogs; its caller artifact directory is on the NAS
+while RCH retains normal worker-side target placement and admission. The
+current all-target run is on `vmi1149989`. Both compile the 0.4.13 graph.
+Live source checks match the current manifest (3,769 files for the workspace;
+3,763 plus the six pre-existing perf exclusions for native). Neither is a
+runtime pass yet. The live mailbox remains healthy with the same owner PID;
+only this task's three leases were renewed, through 00:12 UTC on November 2.
 
 ## November 1 execution queue (publication verified)
 
