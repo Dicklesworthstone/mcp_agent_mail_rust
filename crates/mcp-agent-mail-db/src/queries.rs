@@ -36263,7 +36263,7 @@ mod tests {
                         .expect("recipient")
                         .id
                         .unwrap();
-                        let mut original = request_contact(
+                        let requested = request_contact(
                             &cx,
                             &pool,
                             from_project_id,
@@ -36276,8 +36276,10 @@ mod tests {
                         .await
                         .into_result()
                         .expect("active cross-project request");
-                        if initial_status != "pending" {
-                            original = respond_contact(
+                        let original = if initial_status == "pending" {
+                            requested
+                        } else {
+                            respond_contact(
                                 &cx,
                                 &pool,
                                 from_project_id,
@@ -36290,8 +36292,8 @@ mod tests {
                             .await
                             .into_result()
                             .expect("active cross-project response")
-                            .1;
-                        }
+                            .1
+                        };
 
                         // Each identity must belong to its stated endpoint project.
                         for (wrong_from, wrong_to) in [

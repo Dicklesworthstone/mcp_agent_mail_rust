@@ -314,7 +314,10 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
             if !lease_matches_holder(&existing, &lease.agent, lease.branch.as_deref()) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("build slot lease {} belongs to another holder", path.display()),
+                    format!(
+                        "build slot lease {} belongs to another holder",
+                        path.display()
+                    ),
                 ));
             }
         }
@@ -1293,8 +1296,7 @@ mod tests {
                 // Ordinary acquisition still succeeds and sees the preserved
                 // incumbent whenever it remains active and unreleased.
                 let next =
-                    acquire_slot_lease(dir.path(), "slot-a", "RedStone", None, 3600, true)
-                        .unwrap();
+                    acquire_slot_lease(dir.path(), "slot-a", "RedStone", None, 3600, true).unwrap();
                 if state == "active" {
                     assert_eq!(next.conflicts.len(), 1);
                     assert_eq!(next.conflicts[0].agent, "GreenPeak");
@@ -1318,7 +1320,11 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(release_slot_lease(dir.path(), "BlueLake", None).unwrap().released);
+        assert!(
+            release_slot_lease(dir.path(), "BlueLake", None)
+                .unwrap()
+                .released
+        );
         let result = acquire_slot_lease(
             dir.path(),
             "slot-a",

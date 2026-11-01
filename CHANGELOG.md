@@ -17,6 +17,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
+| [v0.3.40](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.40) | 2026-10-31 | **Release** | Reservation writes staged outside the archive fence with a bounded 5 s wait (GH#351, GH#362, br-9ott5); background archive repair that resumes after restarts and survives source failures; automatic deletion and a byte limit for superseded backups (GH#355, GH#359); CLI reads served by the running local server (GH#368); request cancellation in write admission (GH#353); Windows checkpoint fixes, not yet run on native Windows (GH#369); in-process `age` passphrase decryption; cold-start backup rotation bounded to 1 s; dependency security updates |
 | [v0.3.39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.39) | 2026-10-13 | **Release** | Startup survives a small or full temp directory (GH#347); integrity guard accepts proven never-written orphan pages instead of staying red (GH#291); project-addressed shared mailboxes (GH#282, schema v33) and opt-in session-bound identity (GH#279); reservation writes staged outside the archive fence; FastMCP 0.13.0 from crates.io; share-export, pre-commit guard, search, CLI, web UI, TUI and installer fixes (GH#339, GH#346, GH#348) |
 | [v0.3.38](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.38) | 2026-10-08 | **Release** | Server descriptor-leak fix (GH #333): one shared, bounded live read pool; FrankenSQLite 0.4.10 data-integrity update; background closeout replay and archive repair; CLI/TUI/search correctness fixes |
 | [v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.37) | 2026-10-05 | **Release** | Safe mailbox upgrades after the v30 short-record incident (br-2hpuk); FrankenSQLite 0.4.9; Linux descriptor bound and descriptor-exhaustion reporting; stalled write-behind drain detection |
@@ -27,12 +28,11 @@ Recent releases; the earlier version history continues below.
 
 ---
 
-## Unreleased
+## v0.3.40 — 2026-10-31 [Release]
 
-Changes on `main` after the [v0.3.39 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.39)
-(about 325 non-merge commits, not yet released). Many of these commits were written where the Rust
-tests could not be run. Gate commits have since made the workspace compile and pass Clippy, but the
-workspace test suite is not green on `main` (see Known issues).
+Changes after the [v0.3.39 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.39)
+(504 non-merge commits). Many of these commits were written where the Rust tests could not be run,
+and the bullets say so where a commit does.
 
 ### Upgrade notes
 
@@ -161,6 +161,58 @@ workspace test suite is not green on `main` (see Known issues).
   - Findings of `fm-mcp-config-files-wrong-http-url-or-scheme` for entries under `projects.<path>`
     use an escaped JSON Pointer (`/projects/~1repo/mcpServers/agent-mail/url`) (c569fbd0).
 
+- **CLI reads go to the running local server when it serves the same mailbox.**
+  - **Which commands.** `am robot thread`, `am robot message`, `am robot search`, `am robot inbox`,
+    `am robot reservations` and `am file_reservations list|active|soon|conflicts`.
+  - **How the server is chosen.** The CLI first reads `resource://config/environment` from the
+    configured HTTP endpoint, with a 2 s timeout, and only on a loopback host. When the server's
+    `database_url` and `storage_root` both match the CLI's mailbox, the read goes through that server
+    with the configured bearer token.
+  - **Fallback.** An unreachable server still falls back to the local read. Authentication, protocol
+    and identity failures from a matching server are errors; the CLI does not quietly read the local
+    files instead.
+  - **Explicit `--server`.** It keeps its meaning (9c31bc19, 48026fe6, ec94cba9, 919dbcc3).
+- **New fields in health answers.**
+  - `health_check` adds `lexical_backfill` and `circuit_breakers` (8415d5f6).
+  - `/health` and `/health/readiness` add `atc_population_hydration` (546563be).
+  - `archive_db_parity` turns red, and `semantic_readiness` fails, once a gap where the database has
+    more messages than the archive stays the same size for 30 minutes while no archive write is pending
+    (dce91707).
+- **New error codes.**
+  - `request_contact` and `respond_contact` refuse a retired participant with `AGENT_RETIRED`, and a
+    deregistered one, including an imported Python tombstone, with `AGENT_DEREGISTERED` (3a753b5c,
+    548a0b89).
+  - A pool exhaustion that reached the wire as `DATABASE_ERROR` is now reported as
+    `DATABASE_POOL_EXHAUSTED` (fbaccb6a).
+- **Browser mail actions now need a writer role.** Before this change an authenticated reader could send
+  overseer mail, change inbox read receipts or confirm sibling relationships through the browser routes,
+  despite the MCP write restrictions. Mail POSTs are now authorized before dispatch and before any mailbox
+  is created. Configured writer tokens, explicit local bypass and deployments with RBAC disabled keep working
+  as before (28b81435).
+- **A client on another mailbox no longer guesses the default port.** Before this change a client that couldn't
+  confirm its mailbox's owner sent its request and bearer token to whatever held 8765. Now only the default
+  mailbox keeps the default endpoint, unless that port is visibly held by something else, which is an error. Any
+  other mailbox fails before a request or token leaves, and takes its local path if no server is running
+  (17788325, br-eos8u; see Known issues).
+- **`am share decrypt --passphrase` no longer runs the `age` CLI.**
+  - Decryption uses the `age` 0.11.3 library in process.
+  - A terminal prompt does not echo. Piped input is read as one line and keeps significant whitespace.
+  - An empty passphrase is refused.
+  - `--identity` decryption still runs the external `age` (c2833b43, merge 10f511c6).
+- **`am guard install ... --prepush` now also installs a post-commit hook.** Existing hooks get commit
+  admission only after a reinstall with `--prepush` (c937e0eb; see the guard bullet).
+- **ATC: `AM_ATC_POPULATION_LIMIT` now also caps liveness tracking.**
+  - The setting already existed (default 4,096, clamped to 1–65,536).
+  - Past the cap, new identities are refused.
+  - After the first refusal, coverage is marked incomplete and automatic reservation releases are
+    suppressed. This lasts until the ATC engine is reset, which a code comment says is "normally with a
+    larger population limit" (89a67bc0).
+- **Windows: reconcile checkpoints from earlier builds are rebuilt once.**
+  - Checkpoint bindings now include the volume serial number and file index.
+  - The commit says checkpoints with the older Windows binding are "conservatively" rescanned, so the
+    first start after the upgrade should rebuild them. That is read from the code and wasn't run
+    (52ea1edb).
+
 ### Known issues
 
 - **Reservations can be refused when the archive fence is held longer than 5 s.**
@@ -182,19 +234,72 @@ workspace test suite is not green on `main` (see Known issues).
     - On 98c7a0e4, with give-way, br-9ott5's own probe (one 60-agent arm, 2 s period) refused 5.4% and
       7.2% (p2probe2), and three more such runs 4.1–7.0% (df26's control arm).
     - With short direct holds (below), three such windows refused none of 7,899 grants, against 610
-      for the same base without them (sh27). br-9ott5's own closing probe on the landed build is
-      still to run.
+      for the same base without them (sh27). br-9ott5's closing probe passed on the release build of
+      b01df8d5: in two 60-agent runs at a 2 s period, 0 of 2,633 grants were refused in each, and
+      reservation p50/p99 was 0.23/1.36 s and 0.31/2.53 s at host load 2–10 (p2probe3). Later fence
+      changes (82e2a027, 6a8474ef, e778ae39, 8df5af58, fe8ed321, 3f714ab9) haven't been measured at
+      swarm scale.
   - **Not yet re-measured:** the heavily loaded host on the newer base.
-  - **Tracked in** br-9ott5 and br-kp1in.47.
+  - No open bead tracks the loaded-host re-measurement.
 - **Swarm load.** Archive convergence after load and write-behind progress are still open
   (br-9ott5, br-kp1in.13, br-kp1in.35). Several changes below shorten how long background work holds
-  the archive fence, but they cite no swarm-scale measurement.
-- **Open GitHub issues.** GH#343 (Linux lock loss), GH#353 (pool start-up), GH#354 (idle CPU in
-  `am serve-http`), GH#359 (backup growth) and the canonical-message scan of GH#362 stay open. The
-  commits below address parts of them.
-- **Test suite.** The workspace test suite has known failures on `main` (br-uwvwz, br-zhhq7). One of
-  them, `scoped_query_failure_is_an_error_not_an_empty_population`, covers a path where
-  `am robot overview` could report counts from an incomplete population instead of an error.
+  the archive fence, but they cite no swarm-scale measurement. Retained-mailbox probes still fail the
+  300-second quiet-convergence requirement (orphan 20195, eedae388), and sw27 on b01df8d5 left 2 crash
+  orphans unvisited (br-bx73n).
+- **Open GitHub issues.** GH#343 (Linux lock loss), GH#351, GH#353 (pool start-up), GH#354 (idle CPU
+  in `am serve-http`), GH#359 (backup growth), the canonical-message scan of GH#362, GH#364, GH#365,
+  GH#368 and GH#369 stay open. The commits below address parts of them, including GH#364 (c937e0eb),
+  GH#368 (b6c94d95, 282404e2) and GH#369 (Windows checkpoints, not run on native Windows).
+- **`full_archive_preserves_schema_authority_and_unknown_payloads` fails on FrankenSQLite 0.4.10.** The
+  full-archive copy has `user_version` 0 instead of 231. The bug is in the published 0.4.10 engine
+  (br-kp1in.52; merge 10f511c6).
+- **Engine read conflicts (FrankenSQLite #457).** Concurrent commits can make a read fail with `RESOURCE_BUSY`
+  ("snapshot conflict on pages: pager publication advanced between metadata bind and reload transaction").
+  No data is lost. In the smoke on b01df8d5 this happened 1–3 times per run on `send_message` and
+  `fetch_inbox`. The fix is FrankenSQLite 93dd2b5fe, which is in no published release.
+- **Whole-database reads after a commit (FrankenSQLite #492).** On FrankenSQLite 0.4.10 the first read after
+  any commit reads the whole database into memory, and every pooled connection of `am` can do this. The
+  upstream issue measured 200 ms at 82 MB, 1.65 s at 658 MB, and about 7.4 GB of RSS and 40 s at 3.2 GB. An
+  engine with the fix (FrankenSQLite 91df8b6b9) sat at 1,255 MiB RSS after 15 idle minutes against 2,096 MiB
+  (br-kp1in.44, br-kp1in.46). The fix is in no published release.
+- **Swarm send latency.** The rs27 smoke on b01df8d5 against v0.3.39, both orders, did not meet the release
+  trigger: `send_message` p99 was 6.18 s and 4.41 s against 3.72 s and 3.56 s, and "zero tool errors" failed.
+  sw27 attributes the p99 to closed-loop saturation, because this code acknowledges 34–39% more sends.
+  Reservation p99 went from 22–24 s to 1.2–1.5 s (br-bx73n).
+- **Daemon memory (br-kp1in.44, open).** A v0.3.38 daemon reached 8.8 GB on a 72 MB mailbox after 10 days, and
+  the cause is unattributed. This release bounds several retained structures but no soak has been run.
+- **Startup time grows with mailbox size (br-asldx, open).** About 1.07 ms per message: 8.3 s to readiness at
+  about 7k messages, with the same slope on v0.3.39. 63680407 removes one redundant probe, unmeasured.
+- **The start-up integrity check runs before `am` listens.** On a loaded host it took about 0.8 s at 60 MB and
+  5.8 s at 500 MB, and connections are refused during that time. v0.3.39 does the same check.
+- **A cold start can spend about 1 s on old backups before `am` listens.** The worst case is about 1 s plus one
+  backup's check, about 2.4 s at 500 MB, and connections are refused during that time. See
+  Automatic backups and retention for the cost against v0.3.39.
+- **Native Windows is unverified.** No GH#369 checkpoint fix and no share crypto publication change
+  (br-kp1in.49, blocked) has run on native Windows.
+- **Client token on the default port (br-eos8u).** On the default mailbox with no confirmed owner, the client
+  still sends to the default port with its token unless that port is visibly held by something else.
+- **Backup rotation inside a shared-pid sandbox.** Inside a sandbox that shares the host's process table, such
+  as `bwrap` without `--unshare-pid`, `am` can't inspect other processes and refuses to rotate backups. The
+  warning ends with `error: "/proc/<pid>/fd/<n>: Permission denied (os error 13)"`. Existing backups are kept,
+  but once the retention limit is reached `am` takes no new automatic backups until it runs outside that
+  sandbox. A sandbox with its own pid namespace avoids the refusal, though `am` then can't see readers
+  outside it.
+- **Automatic backups stop when retention can't make room (br-refused-pass-window-policy-q7mxt).** With 4 or more
+  backups that retention can't delete, such as ones left by an interrupted export, `am` stops taking new
+  automatic backups. Existing backups are kept, and backups resume on their own once enough of those files can
+  be deleted.
+  - With exactly 4, `am` takes one more verified backup and then stops at 6 images, so it ends up with one
+    newer image rather than two older ones.
+  - With 5 or more it repairs once at the first attempt, then stops at 8 images with 5, 9 with 6 and 12 with 9,
+    keeping the images it has, because removing them wouldn't make room.
+  - With 3 or fewer, backups continue: 3 shortens the window each hour and keeps 5 images, 1 keeps 4.
+  - A same-user `sftp-server` session that outlives about 4 hourly publications stops new backups until it
+    exits. Measured with one running for 9 hours: backups verified for hours 1 to 3, stopped from hour 4, and
+    resumed on their own at the first attempt after it exited, with nothing removed. An `sshfs` session should
+    behave the same, because it uses the same mechanism, but that wasn't run.
+  - A service logs a warning on each attempt: `automatic backups have stopped`. On a terminal with the TUI,
+    that line doesn't show.
 
 ### File reservations (GH#351, GH#362, br-9ott5)
 
@@ -275,6 +380,39 @@ workspace test suite is not green on `main` (see Known issues).
 - **Build slots.** Renew and release act on every lease file the agent holds in the slot. A stale
   hashed file no longer hides an active branch-keyed lease (21ad2c47).
 
+- **Reservation writes stop when the MCP request is cancelled.** This covers direct reservation writes
+  and the active/released reconcile-on-read paths.
+  - A prepared write checks for cancellation while it waits for the project lock and just before it
+    publishes staged artifacts.
+  - A database receipt that is already committed is kept.
+  - A cancellation that was actually observed is no longer counted as an archive I/O failure by the
+    circuit breaker.
+  - Recorded runs: 43 native tests (the admission module and FastMCP checks). Final native
+    storage/tools runs were blocked (3f714ab9).
+- **A queued broad release is dropped if its agent came back.**
+  - A degraded-mode "release all" intent with no paths and no ids is abandoned when the agent was
+    active again after the intent was queued. Otherwise it could release leases that the revived session
+    had renewed in place.
+  - Path- and id-scoped intents keep their behavior.
+  - No run recorded (3a7a5934).
+- **Build slots: another holder's lease file is never overwritten.**
+  - An acquisition reads the stored holder under the slot lock before it stages a replacement. Neither
+    the preferred nor the legacy filename lets it replace another holder's lease, even an expired or
+    released one.
+  - Non-regular and linked destinations are refused.
+  - The commit says its tests were not run (59773c92).
+- **A retried reservation request no longer waits for write admission.** A keyed retry reads its receipt
+  through the live read lane first, so during recovery it gets its original grant back, sees current
+  conflicts, keeps released leases, and fails closed if an active grant has lost its archive artifact. A
+  miss takes normal write authority and resolves the project, actor and claim again (a3abfbbf).
+- **A queued broad release can no longer revoke a holder that came back.** The intent's activity cutoff
+  now reaches the final per-ID transaction and every retry rechecks the holder, so a heartbeat and renewal
+  after selection keep the renewed leases. Accepted closeouts stay pending through exhausted retries until
+  the database recovers (a5470ae3).
+- **A cancelled request no longer abandons accepted releases.** Replay stops at its next boundary, leaves
+  the journal as it was, and resumes under a healthy request. A cancelled foreground request still can't
+  queue new work (5ac4dc24).
+
 ### Archive write-behind and the durability latch (br-9ott5, br-kp1in.13, br-6r7k2)
 
 - **A write-behind batch's archive files are synced together.**
@@ -306,6 +444,38 @@ workspace test suite is not green on `main` (see Known issues).
   JSON lacked `topic`, so the reconciler's copy differed and the queued write failed the canonical-id
   collision check. Commit figure: a paced 60-agent run lost 6,743 tool calls to "database is busy
   (recovery in progress)" (e65d3ad0).
+
+- **Bursts no longer form one huge publication group.**
+  - A message group is capped at 64 charged paths and 16 MiB of rendered copies, including recipient
+    fan-out. An oversized bundle stays whole, as a group of one.
+  - Between groups the drain honors the existing give-way to waiting direct writers.
+  - Recorded runs: 12 native planner tests, and the old planner fails the burst-bound control. The
+    storage build and the archive/Git regression did not run (8df5af58).
+- **One conflicting path no longer splits a whole commit batch.**
+  - The coalescer splits a repository batch into contiguous groups with disjoint paths and one author.
+    Before, one repeated path made it commit every request separately.
+  - Commit figure: a 32-request batch with sparse conflicts goes from 32 commits to two groups of 16.
+  - Recorded runs: 12 native std tests, and 54 tests in the release-smoke helper suite. The native Git
+    regressions did not run (fe8ed321).
+- **A shutdown or restart of the write-behind queue no longer blocks requests.**
+  - Request-path enqueue only tries to take lifecycle ownership; administrative callers still wait for
+    it (9e2e4154).
+  - A worker whose shutdown timed out stays registered, so a restart cannot replace its receiver or
+    reset its accounting. A producer still holding the retired sender is refused (33878023).
+  - No native run recorded for either.
+- **Retry-journal entries are owned until they are retired.**
+  - Recovery cannot queue a second copy of an operation whose publisher is still running.
+  - A completed write whose journal move failed retries only the move. It is never reapplied, and its
+    dead-letter record is never appended twice.
+  - Blocked retirements rotate behind healthy queued work (a40050d6).
+- **Recovered journals are read lazily.** Only the front entry of the ordered backlog is decoded.
+  Corrupt and unreadable journals are kept with bounded retry, and retirement uses atomic no-replace
+  moves (6c64b7df).
+- **The fallback journal is durable on Unix before it reports `Queued`.**
+  - The whole directory chain is synced after the rename.
+  - If that sync fails, the result is `QueuedEphemeral`, and the file stays tracked for replay
+    (a91eba17).
+- The journal commits above (a40050d6, 6c64b7df, a91eba17) record no test run.
 
 ### Background archive repair (br-kp1in.35, br-kp1in.19, GH#353, GH#354)
 
@@ -369,6 +539,63 @@ agent profiles from the database. None of these commits cites a swarm-scale conv
 
   (f07eb310, fac55324)
 
+- **Reservation repair keeps its progress after a source failure.** Failed SQL readers are quarantined and
+  read panics are contained in the checkpointed release maintenance path. Pending retries, cooldowns and
+  checkpoint ownership survive, so a later pass rereads current evidence and publishes the final artifact
+  (9d58c545).
+- **Restart catch-up reaches crash-window orphans sooner (br-kp1in.35).**
+  - A restored forward cursor that lags gets a bounded newest-first startup scan (e5a82248).
+  - Catch-up continues past a finished history round when the cursor still lags (789efef1).
+  - A young message no longer lets an older one with a higher id slip past the cursor (22c648f5).
+  - Pages that hold only cooling retries keep the fast cadence (e0fd03b6).
+  - No native run recorded for any of them. eedae388 records that retained-mailbox probes still fail
+    the 300-second quiet-convergence requirement (orphan 20195).
+- **A busy archive no longer fills the retry queue with healthy messages.**
+  - Only an explicit HEAD or epoch change counts as a retryable observation change, and it is rechecked
+    under the guarded path.
+  - Staged-index checks reuse one date-parent Git tree.
+  - Recorded runs: native storage library 925/925 with 2 skips, and a focused batch 7/7 (eedae388).
+- **Repair holds the publication fence less.**
+  - On a busy project it tries the project lock once and defers. Unrelated reservations then publish
+    (82e2a027; 115 affected native storage tests passed).
+  - Warm-archive metadata is read without a preliminary fence (6a8474ef).
+  - Profile entries that are already complete are confirmed without the fence (e778ae39).
+  - Recovery admission is released between reservation repairs (6dcb7a41).
+  - 6a8474ef, e778ae39 and 6dcb7a41 record no native run.
+- **Source read failures and panics no longer stall a lane.**
+  - A failed or panicking reader is retired and the record is retried.
+  - Cursors and scan hints are published only after the whole bounded selection succeeds, so a one-slot
+    maintenance pool recovers.
+  - No run recorded (77ef6614, 672dd764, 2fe4f3cb).
+- **A committed non-directory ancestor is a conflict, not an empty path.** Message repair refuses it and
+  leaves HEAD, the index and existing copies alone. No compilation or run recorded (972d6f08, formatted
+  in a7b92f27).
+- **Large Git indexes are cached compactly.**
+  - Path slices are reused after an exact match against libgit2's decoded names.
+  - Encoded indexes over 16 MiB are cached when the decoded form fits the unchanged 32 MiB bound.
+  - Recorded runs: four helper tests, including real Git indexes v2–v4 (0f0d62c8, 490de9b9).
+- **Active-reservation discovery stays bounded on long histories (br-kp1in.19).** Released and expired
+  history no longer widens a discovery page. No run recorded (2ebd1e42).
+- **Reservation cleanup (`FILE_RESERVATIONS_CLEANUP_ENABLED=true`) no longer holds database admission
+  across Git probes.**
+  - Workspace scans and Git commands, which have a 120 s default budget, run without a database lease.
+  - The original generation is rechecked before the atomic release.
+  - Lazy cleanup pools are initialized before counted write activity.
+  - No native run recorded (ed7ad0e8; the release build was fixed in 8fa6bea3).
+- **Windows checkpoints (GH#369).**
+  - v0.3.39 on Windows logged `message_archive_checkpoint_unavailable` with "Incorrect function. (os
+    error 1)" about once a minute, and kept no durable progress.
+  - Path validation now checks a drive prefix together with its root (e460081d).
+  - fs2's lock-contention error is recognized as contention (e795a951).
+  - Errors name the failing component, phase, error kind and OS code (1abf33ec, b12861ad).
+  - Checkpoints and locks are bound to opened file identities (52ea1edb). Hard-linked sidecars are
+    refused in every store (3b7933ca).
+  - `docs/OPERATOR_RUNBOOK.md` documents the new fields.
+  - Recorded runs:
+    - Linux component tests (74 checkpoint and 3 path in e795a951; 29 and 3 in b12861ad; 54 in 52ea1edb);
+    - a Wine reproduction of the old failure (e460081d).
+  - **Not verified on native Windows.** Each commit says so, and GH#369 is open.
+
 ### Automatic backups and retention (GH#355, GH#359, br-kp1in.36, br-cdsge)
 
 The operator cookbook section "Automatic backup retention and actual disk reclamation" describes the
@@ -421,6 +648,33 @@ combined policy (a7e7e094).
   a restart. It now retries with backoff from 1 to 60 s, and keeps its schedules when a recovery
   retires the pool (c7890ebe, 22ce92b9).
 
+- **The mapped-reader check reads complete identities.**
+  - Before deleting a backup, the check reads `fdinfo` in a fixed buffer and stops at the inode line.
+  - It no longer accepts an inode number cut off at the 4 KiB boundary.
+  - Recorded runs: 33 passed and 1 identical ENOSPC fixture failure, against 28/1 for the old code. The
+    16,641-directory retention gate remains unqualified (7f188230).
+- f2c2af9d only pre-sizes the procfs read buffers; its message records no measurement.
+- **Moving a small directory into reclaim no longer fails on xfs.** xfs stores the parent's inode number inside a small
+  directory in 4 or 8 bytes, so a rename between parents on either side of 2^32 changes the directory's size, and the
+  move was reported as "reclaim source identity or size changed before publication". Directories are now identified by
+  device and inode alone, and files keep the size check (9745aed2). On xfs the affected test failed 26 of 400 runs before
+  this change and 0 of 400 after it.
+- **A cold start spends a bounded time clearing old backups.** Rotation before the listener binds now stops at 1 s and
+  leaves the rest to the background loop, whose caps are unchanged (9c89fd22). The worst case is about 1 s plus one
+  backup's check, about 2.4 s at 500 MB. Before this change, 40 generations took 10.9 s and 128 generations 37 s.
+  - This is still a cost against v0.3.39, which has no such scan, wherever a backlog exists: 40 generations went from
+    142 ms to 1,218 ms, 128 generations from 193 ms to 1,230 ms, and 5 generations at 60 MB from 1,493 ms to 1,931 ms.
+  - It is one-time if the backlog clears. After a background pass, the next cold start at 40 generations took about 57 ms.
+    A server restarted before that pass pays again, about 1.45 s per start at 40 generations, clearing 3 each time.
+- **A backup pass with refusals keeps the newest backups unless removing them helps.** The two newest backups now go only
+  when that reopens publication, after every older file has had its try, and the older of the two goes first (7e9d2466).
+  Before this change a pass that couldn't delete older files could remove both newest backups and gain nothing, and a
+  one-second same-user `sftp-server` was enough to cause that, in 8 of 8 rounds. With it, the same row removes neither
+  in 8 of 8 rounds, and neither do the rows with no helper or a four-second one.
+- **A refused rotation names what refused it.** Reader-scan failures now name the `/proc` entry instead of reading
+  "Permission denied (os error 13)" with no process in them, and a pass that removes newest images logs a warning
+  with the number. What gets refused doesn't change (65221644, 807ce000).
+
 ### Health reporting (`am doctor health`, `health_check`, `whois`)
 
 - **Retained backup stages are reported.**
@@ -437,6 +691,20 @@ combined policy (a7e7e094).
   too (4fb1d577).
 - **`whois` history is bounded and says when it stopped.** It walks lazily from `HEAD` instead of
   sorting the whole history first (8c24c9f4).
+
+- **A long idle archive gap turns red.**
+  - The gap is a database ahead of the archive that does not shrink.
+  - Its age is bound to the mailbox, database generation and file identity, and resets on progress, on
+    pending writes or on an identity change.
+  - After 30 minutes it makes `archive_db_parity` red and `semantic_readiness` fail.
+  - No run recorded (dce91707, br-kp1in.35).
+- **Readiness shows ATC hydration progress.** `/health` and `/health/readiness` report
+  `atc_population_hydration`: status, backlog, age, progress and `inference_deferred_by_hydration`. The
+  probe does no database I/O and never starts ATC. Its five regressions were not executed (546563be,
+  br-hwney).
+- **`am robot health` keeps the server's verdict.** It pins the selected database and archive before
+  and after the call, and reports the server's worst verdict, pressure contributors and circuit failures
+  even when local reads succeed. No run recorded (8415d5f6).
 
 ### Inbox reads and project mail (GH#282 follow-ups, br-qctx4, br-kp1in.40, br-v0ucm)
 
@@ -471,6 +739,19 @@ combined policy (a7e7e094).
   (195e6394, 0c0d28f0, 86a73a31, 4fcfaf4b, 954e99d4, 9e614366, c7f67af9, 56daaa4f)
 - **Lost project-mailbox tables are an error, not an empty shared inbox** (see the upgrade notes)
   (b904f046, 97ec78f1).
+
+- **`am robot inbox` reads one consistent snapshot through the local server.**
+  - Priority top-N is selected across direct and shared mail in one read snapshot. Older urgent or
+    pending-ACK mail is no longer pushed out by a capped window of newer mail (3020f2e6).
+  - The server advertises `priority_v1` and serves it as `resource://inbox/<agent>?...&context=true`
+    (919dbcc3).
+  - Unsupported scopes and limits stay on the local path.
+  - Native runs blocked in both commits. 549f9aba later records 15/15 inbox/priority tests passing.
+- **Shared project mail counts in agent discovery and appears in outboxes.**
+  - `resource://agents/<project>` unread counts include eligible shared deliveries.
+  - `resource://outbox/<agent>` shows the project address of a project-only send.
+  - Recorded runs: 9 SQL checks on in-memory SQLite. FrankenSQLite and mounted-resource tests did not
+    run (7b16390a).
 
 ### Database start-up and locking (GH#343, GH#353, GH#357)
 
@@ -514,6 +795,45 @@ combined policy (a7e7e094).
 
   (94bdb7e6, 0d6b76e3, fee33a98)
 
+- **Request cancellation reaches write admission (GH#353).**
+  - The write barrier checks cancellation in 25 ms slices outside its mutex. Cancellation and panics
+    release only the caller's own lease (1ba77e8f, follow-up 5db10843).
+  - Every write tool path observes cancellation while waiting for admission: build slots, contacts,
+    identity, macros, messaging, products and reservations (9a4b5a77, bf7afb26, 8885664a, f41ffe86,
+    a1e9300f, d4052ded, 0d498343).
+  - A cold pool finishes a real checkout before a writer is handed over. Optional read-activity touches
+    no longer start a writer (6ddc8418, a6d04074, 043d9fd5).
+  - Lazy-initializer waiters return to the pool when cancelled (a08d631e, 2198a042, 21153bbc).
+  - Archive snapshot retirement happens outside the publication fence (85e98147).
+  - Recorded runs: component tests only. The admission module passed 32 baseline / 40 candidate tests,
+    the initializer gate 8, and the polling loop 6. In a held-owner check, the old gate stayed blocked
+    for 500 ms while the new one cancelled in about 25 ms (21153bbc).
+  - Not run: DbPool integration, the tools integration cases and any request-latency measurement.
+    GH#353 stays open.
+- **Initialization from an archive no longer fails with `Closed`.**
+  - A first acquire that rebuilds a missing mailbox from its archive root keeps its own pool through
+    promotion.
+  - A failed promotion restores the whole sidecar family.
+  - Recorded run: native 10/10 (f89fdbf5).
+- **Recovery promotion refuses unsafe moves.**
+  - It no longer falls back to a replacing rename when the no-replace operation is unsupported. No
+    runtime run recorded (967258d7).
+  - Windows also refuses a hard-linked primary. 2f22a9d3 records a note of 10/10 native Linux recovery
+    tests, and Linux does not run the Windows branch (addc201f).
+  - A parent replaced during the check, and an unreadable `search_index`, are refused. The commit says
+    these paths were not run (38835749).
+- **Reconstruction keeps more of the original mailbox.**
+  - Salvage restores the source delivery ledger with its sequence numbers and the shared-mail
+    visibility. Seven helper tests passed in a harness on canonical SQLite; the integration test was not
+    run (200c2c75).
+  - Retired and deregistered agents stay inactive when their marker is malformed. No run recorded
+    (7368e57c, br-sgaee).
+  - The candidate is vacuumed and checkpointed before promotion. A supplemental canonical-SQLite run
+    shrank a fragmented file from 2,445,312 to 315,392 bytes (b171d207).
+- **The v15 messages-table rebuild keeps the inbox-delivery cursor trigger.** It also refuses unknown or
+  generated columns before any destructive DDL. Recorded run: DB native lane 4,607 of 4,610, with the
+  three launch failures later passing after a fixture repair (066faf4e).
+
 ### Session-bound identity (GH#279, `MESSAGING_SESSION_IDENTITY=true`)
 
 - **An evicted binding keeps its project restricted.**
@@ -526,6 +846,15 @@ combined policy (a7e7e094).
 - **A binding matches only its own agent row** (project id, agent id and stored name) (160f32a5).
 - **`macro_contact_handshake` checks both actors before it writes anything** (GH#335, 7a9b099d).
 
+- **Every per-agent mail view applies the session restriction.**
+  - Covered: inbox, mailbox, mailbox-with-commits, outbox and the four `views/*` resources. A bound
+    session can no longer read another agent's mail through them.
+  - Native tests blocked (7ef0446e).
+- **Explicit registration no longer races.**
+  - When the name was absent at preflight, `register_agent` creates a fresh row.
+  - If another session created the name first, that row must authorize the caller before any update.
+  - No run recorded (5116125a).
+
 ### MCP tools
 
 - **`create_agent_identity` without `name_hint` redraws a taken name** instead of failing with
@@ -533,6 +862,26 @@ combined policy (a7e7e094).
 - **Replaying a reply needs the same options** (see the upgrade notes, df181a75).
 - **Fixture LLM text is labelled.** With `MCP_AGENT_MAIL_LLM_STUB` (test mode only), summaries carry
   `llm_stub: true` (8f92d30e).
+
+- **A committed send or reply can be retried during recovery.** Receipts are read through the live
+  query-only lane without taking a writer lease, with the sender proof, fingerprint, expiry, attachment and
+  duplicate-delivery checks unchanged (4c984bdf).
+- **Accepted acknowledgements survive exhausted retries and cancelled replay.** An exhausted attempt stays
+  queued instead of being abandoned, and a cancelled replay leaves its journal unchanged and resumes under a
+  healthy request. Permanent errors stay final (3e5f4f1c, f928ccce).
+- **An automatic handshake can no longer lift a recipient's block.** The current link is checked inside each
+  transaction attempt, so a block committed while the handshake waits wins, with no approval notice or welcome
+  delivery. An explicit approval from the recipient still lifts it (06482dbf).
+- **Contact authorization refuses inactive participants.**
+  - `request_contact` and `respond_contact` check both endpoints first in the tool, then again inside
+    the transaction. Refusals are `AGENT_RETIRED` or `AGENT_DEREGISTERED`.
+  - No run recorded (3a753b5c, 548a0b89).
+- **Cross-project replies keep `reply_to` in the archive envelope.**
+  - SQLite already stored the parent, but the Git copy omitted it.
+  - The commit itself records no native run. The br-kp1in.69 close records 17/17 integration tests and
+    46 of 46 HTTP/CLI/stdio probe checks passing (3f58bcb9).
+- **Pool exhaustion keeps its classification** (`DATABASE_POOL_EXHAUSTED`). Recorded run: tools suite
+  1,160/1,160 (fbaccb6a).
 
 ### Air Traffic Control (ATC)
 
@@ -544,6 +893,24 @@ combined policy (a7e7e094).
   (cb751de0, 4d2335c7, 04e41644, cadee9d9)
 - **Stale activity no longer revives a dead agent** (88071622), and a lock-order deadlock between
   outcome feedback and the tick is fixed (af78e951).
+
+- **Long-lived ATC state is bounded (br-kp1in.44).**
+  - Session detail: 1,024 agents and 4,096 threads, plus a bounded participation graph (260fd481; 25
+    harness tests).
+  - Operator cooldowns: 4,096. Executor registrations: 1,024 projects (80f896c2; 6 harness tests).
+  - Tracked identities follow `AM_ATC_POPULATION_LIMIT`, and reservation outcomes: 4,096 (89a67bc0; 8
+    native outcome tests).
+  - A project's conflict graph is retired once its last conflict resolves (2390e047). Four component
+    checks passed, and the old code kept 4,097 graphs for one active project.
+- **Learning writes are validated and atomic (br-kp1in.50).**
+  - Appends and outcome updates are size-checked before any durable write (2a318695).
+  - Server writes go through atomic validated APIs, and rejection logs no longer include row content
+    (a03883ff).
+  - ACK precedence is decided inside the transaction (7ba1964a).
+  - Those three commits ran no tests. The br-kp1in.50 close records native lifecycle and reopen tests
+    passing. 2516ebad fixes the tests' observers.
+- **Denied reservations feed deadlock detection, and outcomes are scoped by project and agent** (d06682b6;
+  no run recorded).
 
 ### `am robot`, `am doctor` and the pre-commit guard
 
@@ -563,6 +930,33 @@ combined policy (a7e7e094).
 - **`am doctor undo` no longer overwrites later edits after a crash.** It restores an interrupted
   action only when the live file matches the planned replacement, and keeps an existing empty file
   whose backup is missing (2eb5e527, 03b84ea8).
+
+- **Reading a message or thread through the server.**
+  - `am robot message`, `am robot thread` and `am thread` accept `--server`. The server answers with a
+    versioned context envelope from one read snapshot (`context=true`). It refuses more than 10,000
+    messages or receipts, 1,000 displayed messages or 4 MiB rather than truncating.
+  - `am robot search` adds `--limit` (1–1000, default 20) and `--cursor`.
+  - Recorded runs: harness tests on canonical SQLite only (161d6db1).
+- **Reservation reads from a running v0.3.39 server are complete (GH#368).**
+  - Against a v0.3.39 server, `--server` now reads one explicit 250-row page, and accepts only a short
+    page as complete (b6c94d95). Against a real v0.3.39 server, the old reader missed 27 of 249 leases;
+    the new path returned all of them.
+  - Client clock skew can no longer hide server-active leases (282404e2; no run recorded).
+  - GH#368 stays open.
+- **`am robot agents`: contact health evidence comes from one snapshot.** Two grouped queries replace a
+  per-delivery probe. A canonical-SQLite probe matched the old results 16/16 (c9f63d35, br-bdo5g).
+- **Pre-commit guard: an admitted commit can be pushed after a later lease (GH#364).**
+  - With `--prepush`, a post-commit hook fully checks the commit and records a signed admission.
+  - Pre-push then skips only admitted objects.
+  - Bypass, warn mode and incomplete scans never admit.
+  - No run recorded (c937e0eb). GH#364 stays open.
+- **`am doctor` compares bearer tokens in constant time.** Recorded run: 536/536 in the CLI doctor
+  batch (cbe99cad).
+- **`am doctor` version probes are bounded.** The `--version` probes share a deadline and a 1 MiB output
+  cap, and no reader threads are left behind (merge 10f511c6).
+- **`am legacy import` no longer echoes a rejected `DATABASE_URL`.** The error is a fixed sentence, so
+  passwords and tokens in the URL stay out of it. 2f22a9d3 records a note of 66/66 native legacy tests
+  (4c1e44b7).
 
 ### Search
 
@@ -584,6 +978,9 @@ combined policy (a7e7e094).
   137 ms against 1,912 ms at 16,000 rows (afaf2f96).
 - **Idle polling no longer re-reads the whole mailbox every cycle** when the mailbox has retired agents
   (GH#354, 32e91b5b).
+
+- **The Search screen's render cache is bounded.** The limits are 8 MiB in total, 2 MiB per entry and
+  512 entries. No test run recorded (754e5a82, br-kp1in.44).
 
 ### Web UI
 
@@ -612,6 +1009,22 @@ combined policy (a7e7e094).
   remains (11adc358).
 - **Blank and ambiguous `--project` values are errors** (see the upgrade notes, 5c43a291).
 
+- **Passphrase decryption works with official `age` (br-kp1in.48).**
+  - v0.3.39 ran `age -d -p` and piped the passphrase on stdin. That fails with the official `age` CLI,
+    which reads the passphrase from the terminal, so `am share decrypt --passphrase` could not decrypt.
+  - Decryption now runs in process (c2833b43, merge 10f511c6). `scripts/e2e_share.sh` covers it with the
+    real `age` (b71eb5cb).
+  - The br-kp1in.48 close records real `age` round trips passing.
+- **Crypto outputs are published without replacing a concurrent file (br-kp1in.49).**
+  - Encrypt, decrypt and sign use no-replace publication (629d9acf).
+  - On Linux, directories are synced through readable handles (8e1118ed). A native primitive probe
+    reproduced the old EBADF.
+  - br-kp1in.49 is blocked, waiting for a native Windows run.
+- **`am archive save` hands off its private snapshot safely.**
+  - It excludes the selected database's own coordination files.
+  - It survives a rebuilt snapshot whose inode changed.
+  - Recorded run: CLI batch 536/536 (7edb0da8).
+
 ### Server startup
 
 - **A missing mailbox directory no longer gets recovery advice.** A fresh install, a wrong
@@ -619,6 +1032,11 @@ combined policy (a7e7e094).
   (br-xvxwr, 36acde4b).
 - **Startup recovery artifacts never overwrite one another.** They are published with atomic
   no-replace moves (26eb803a).
+
+- **Startup skips a redundant full mailbox verdict.**
+  - After the admitted integrity check passes, startup checks archive drift directly.
+  - It no longer writes and removes an archive writability probe.
+  - No run recorded (63680407, br-asldx; see Known issues).
 
 ### Installer and self-update
 
@@ -634,12 +1052,82 @@ combined policy (a7e7e094).
   (GH#352, 0c747cd4), and corrects the registration-proof format, overseer storage, release-binary
   search tier and the `WORKTREES_ENABLED` row (br-4meup, f7b44878).
 
+### `am setup`
+
+- **OMP (Oh My Pi) setup sees every MCP provider.**
+  - Setup status and self-heal include providers from configured OMP extensions (2162c579) and from
+    installed user and project plugins (28a1665e).
+  - Recorded runs: 224 setup tests (2162c579), and 234 setup tests plus 8 new ones (28a1665e). The final
+    source's reruns are not recorded.
+  - br-17tyc stays in progress.
+- **TOML merge refusals no longer echo a bearer token.** They report a category and a byte span. The
+  new test was not run (de6c868b).
+
+### Long-running memory (br-kp1in.44)
+
+- **The global identifier interner is bounded.**
+  - Before, it kept every distinct lookup key, including misses, for the life of the daemon.
+  - It now holds at most 16,384 entries and 8 MiB, with a 16 KiB limit per value.
+  - Recorded run: native core interner suite 42/42, before the final lint edits (d304ddb4).
+- Related bounds: the ATC state and Search screen cache bullets above.
+- None of these commits measures daemon RSS. br-kp1in.44 stays open.
+
+### Dependencies
+
+- **Security updates.** `cargo audit` on the previous lockfile reported 19 vulnerabilities; this clears
+  15 (69fefaeb).
+  - **Lockfile bumps:** rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.11, ammonia 4.2.4,
+    pulldown-cmark 0.13.6, ctutils 0.4.7, libz-sys 1.1.31, zstd-sys 2.1.2 and franken-agent-detection
+    0.3.10.
+  - **zip 8.6.0 → 9.1.3.** zip 9 makes entry names fallible:
+    - `am archive` verification fails on an undecodable name;
+    - the Windows self-update extractor reports one as a zip entry error.
+  - **Still reported:** zstd 0.13, zstd-safe 7 and lru 0.16, which come in through tantivy.
+  - No test run recorded. The test build was fixed for zip 9 in aa4ac0d5.
+- **New crates:** `age` 0.11.3 (armor feature only), `rpassword` 7.4.0 and `zeroize` 1.9 (c2833b43,
+  merge 10f511c6).
+- **FrankenSQLite stays at 0.4.10.** The FrankenSQLite release that fixes #457 and #492 isn't published, so
+  neither fix is in this release (see Known issues).
+
 ### Source tree only (not in the `am` binary)
 
 - **`scripts/check_backup_health.py --database <path>`** reports backup readiness as one JSON object
   (`am.backup-health.v1`) without opening the database with SQLite (bd16d719).
 - `scripts/reclaim_backup_staging.py` runs on macOS (bfa280b1).
 - `scripts/idle_cpu_probe.py` and `docs/IDLE_CPU_REGRESSION.md` measure idle CPU (GH#354, 87bc112b).
+
+- **Release smoke.**
+  - Keeps error payloads and per-call timings (3eb42e2a).
+  - Judges quiet convergence from committed archive contents instead of message counts (a68a13f4,
+    3ffffa40). Recorded runs: suites of 40 and 50 tests. 3ffffa40 shows four false positives in the old
+    observer.
+  - Adds an optional three-project swarm (fe8ed321).
+- **CI.**
+  - `issue353-native.yml` and `scripts/ci/qualify_issue353.py` run an A/B for GH#353 natively (8c80b6f3,
+    1f15538f, 587306d4).
+  - `archive-fsync-matrix.yml` gains Windows checkpoint jobs (e460081d, 52ea1edb). 52ea1edb records that
+    repository Actions is disabled.
+- **Test fixtures and isolation.** 2516ebad, 08d4a9b2, d1c95470, 48440b09, 65852eb8 and bfcd0412, plus
+  fb5f4b3c, which gives the stdio e2e suite its own `STORAGE_ROOT` so it can no longer write to a live
+  mailbox.
+- **Evidence and planning docs.**
+  - `docs/evidence/gh353/*`: d2c0a914, 8f76f049, e0272f69, ed6759a2, 0199ffca, 6bbadb7a.
+  - `docs/evidence/gh369/*`: cc7468b2.
+  - `docs/planning/BRIDGE_PLAN_2026-09-01.md`: bf463b8a, 2b915f8a, 9ff9dc12, 2f22a9d3.
+  - 5c79606c is a preservation snapshot of a local draft. Its share, ATC and documentation code reached
+    `main` through merge 10f511c6.
+- **Build and lint.** These commits change no behavior.
+  - **Main-only breaks, fixed:**
+    - macOS darwin targets stopped compiling after c1f13e10, fixed in c4d46e5c, which records a passing
+      `cargo check` on macOS;
+    - release builds lacked `git2` after ed7ad0e8, fixed in 8fa6bea3;
+    - `am serve-http` panicked at startup on a resource-route collision from 48026fe6, fixed in 549f9aba,
+      which records HTTP and stdio startup with 45 tools and 25 templates.
+  - **Test-target compiles:** d2982cc5, aa4ac0d5.
+  - **Clippy, fmt and docs:** a7b92f27, 8acce6bc, ba8b20c2, 260ccc7a, cd8b4472, 3259c0ef, d3d00a2e,
+    9da9da51, cca2efaf, 8820c3fb, 78326ac5, 19c3f21e, 5ec96724.
+  - **Build configuration:** `.rchignore` (23fe3dce), Cargo checksum freshness (08df64b1) and Cargo.toml
+    comments (71642ccf).
 
 ## v0.3.39 — 2026-10-13 [Release]
 

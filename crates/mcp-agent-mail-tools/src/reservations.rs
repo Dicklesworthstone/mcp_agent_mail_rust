@@ -4905,8 +4905,8 @@ mod tests {
                         .await;
                         let changed = file_reservation_paths(
                             &retry_ctx,
-                            retry_project.to_string(),
-                            retry_agent.to_string(),
+                            retry_project.clone(),
+                            retry_agent.clone(),
                             paths.iter().map(|path| (*path).to_string()).collect(),
                             Some(7200),
                             None,
@@ -5011,8 +5011,8 @@ mod tests {
                         &retry_ctx,
                         read_pool,
                         ReservationAcquireRequest {
-                            project_key: retry_project.to_string(),
-                            agent_name: retry_agent.to_string(),
+                            project_key: retry_project.clone(),
+                            agent_name: retry_agent.clone(),
                             paths: vec!["src/probe-miss.rs".to_string()],
                             ttl: 3600,
                             is_exclusive: true,
@@ -5030,8 +5030,8 @@ mod tests {
 
                     file_reservation_paths(
                         &retry_ctx,
-                        retry_project.to_string(),
-                        retry_agent.to_string(),
+                        retry_project.clone(),
+                        retry_agent.clone(),
                         vec!["src/lib.rs".to_string()],
                         None,
                         None,
@@ -7494,7 +7494,10 @@ mod tests {
                     .expect("foreground replay trigger");
                     let response: Value = serde_json::from_str(&response).unwrap();
                     assert_eq!(response["released"], 0);
-                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    assert_eq!(
+                        read_queued_release_intents(&config).unwrap(),
+                        [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                    );
                     mcp_agent_mail_storage::wbq_flush();
                     mcp_agent_mail_storage::flush_async_commits();
                     let after = queries::get_reservations_by_ids(&cx, &pool, &[id])
@@ -7539,7 +7542,10 @@ mod tests {
                         )
                         .await
                         .expect("narrow intent remains replayable");
-                        assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                        assert_eq!(
+                            read_queued_release_intents(&config).unwrap(),
+                            [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                        );
                     } else {
                         assert!(after[0].released_ts.is_some());
                     }
@@ -8252,7 +8258,10 @@ mod tests {
                             }
 
                             replay_queued_release_intents(&healthy, &pool, &config).await;
-                            assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                            assert_eq!(
+                                read_queued_release_intents(&config).unwrap(),
+                                [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                            );
                             let released = queries::get_reservations_by_ids(&cx, &pool, &ids)
                                 .await
                                 .into_result()
@@ -8461,7 +8470,10 @@ mod tests {
                         crate::tool_error_code(&unauthorized),
                         Some("SESSION_IDENTITY_MISMATCH")
                     );
-                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    assert_eq!(
+                        read_queued_release_intents(&config).unwrap(),
+                        [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                    );
                     let response = release_file_reservations(
                         &holder_ctx,
                         project.human_key.clone(),
@@ -8537,7 +8549,10 @@ mod tests {
                     )
                     .await
                     .expect("successful tool call replays the accepted closeout");
-                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    assert_eq!(
+                        read_queued_release_intents(&config).unwrap(),
+                        [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                    );
                     let completed = read_markers();
                     assert_eq!(completed.len(), 2);
                     assert_eq!(completed[1]["status"], "replayed");

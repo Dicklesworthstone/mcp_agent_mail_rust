@@ -1054,8 +1054,7 @@ mod tests {
                     let saved = format!("{cursor:?}");
                     DISCOVERY_READ_FAULT.with(|slot| slot.set(Some((failing_query, panic))));
                     let error = select_ids(cx, pool, &mut cursor)
-                        .err()
-                        .expect("the selected discovery read must fail");
+                        .expect_err("the selected discovery read must fail");
                     assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
                     assert_eq!(format!("{cursor:?}"), saved);
                     if panic {
@@ -1130,8 +1129,7 @@ mod tests {
             conn.execute_raw("PRAGMA query_only = ON").unwrap();
             drop(conn);
             let error = select_ids(cx, pool, &mut cursor)
-                .err()
-                .expect("a query-only source cannot authorize repair");
+                .expect_err("a query-only source cannot authorize repair");
             assert!(error.contains("query-only"), "{error}");
             assert_eq!(format!("{cursor:?}"), saved);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();

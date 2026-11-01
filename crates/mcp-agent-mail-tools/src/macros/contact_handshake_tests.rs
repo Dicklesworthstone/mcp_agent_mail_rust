@@ -23,7 +23,9 @@ static REQUEST_PAUSE: Mutex<Option<RequestPause>> = Mutex::new(None);
 /// Compiled only into unit tests. Other requests never consume this gate.
 pub(super) fn pause_after_request(project: &str) {
     let pause = {
-        let mut slot = REQUEST_PAUSE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = REQUEST_PAUSE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|pause| pause.project == project) {
             slot.take()
         } else {
@@ -31,8 +33,14 @@ pub(super) fn pause_after_request(project: &str) {
         }
     };
     if let Some(pause) = pause {
-        pause.entered.send(()).expect("report real request completion");
-        pause.resume.recv_timeout(Duration::from_secs(10)).expect("resume handshake");
+        pause
+            .entered
+            .send(())
+            .expect("report real request completion");
+        pause
+            .resume
+            .recv_timeout(Duration::from_secs(10))
+            .expect("resume handshake");
     }
 }
 
@@ -54,8 +62,13 @@ impl PausedHandshake {
             worker: None,
         };
         {
-            let mut slot = REQUEST_PAUSE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(slot.is_none(), "another request already owns the pause gate");
+            let mut slot = REQUEST_PAUSE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                slot.is_none(),
+                "another request already owns the pause gate"
+            );
             *slot = Some(RequestPause {
                 project: source.clone(),
                 entered: entered_tx,
@@ -63,7 +76,9 @@ impl PausedHandshake {
             });
         }
         owner.worker = Some(std::thread::spawn(move || {
-            let runtime = RuntimeBuilder::current_thread().build().expect("handshake runtime");
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("handshake runtime");
             runtime.block_on(async {
                 let ctx = McpContext::new(Cx::current().expect("handshake context"), 2);
                 handshake(&ctx, &source, &target).await
@@ -73,12 +88,19 @@ impl PausedHandshake {
     }
 
     fn wait_for_request(&self) {
-        self.entered.recv_timeout(Duration::from_secs(10)).expect("macro read pending request");
+        self.entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("macro read pending request");
     }
 
     fn release(&mut self) {
-        let mut slot = REQUEST_PAUSE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.as_ref().is_some_and(|pause| pause.project == self.project) {
+        let mut slot = REQUEST_PAUSE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|pause| pause.project == self.project)
+        {
             slot.take();
         }
         drop(slot);
@@ -89,7 +111,11 @@ impl PausedHandshake {
 
     fn finish(mut self) -> McpResult<String> {
         self.release();
-        self.worker.take().unwrap().join().expect("handshake worker exits")
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("handshake worker exits")
     }
 }
 
@@ -129,12 +155,26 @@ async fn handshake(ctx: &McpContext, source: &str, target: &str) -> McpResult<St
 }
 
 async fn register_actor(ctx: &McpContext, project: &str, name: &str) -> String {
-    let project = crate::ensure_project(ctx, project.to_string(), None).await.expect("project");
+    let project = crate::ensure_project(ctx, project.to_string(), None)
+        .await
+        .expect("project");
     let project: Value = serde_json::from_str(&project).unwrap();
-    let key = project["human_key"].as_str().expect("canonical project key").to_string();
+    let key = project["human_key"]
+        .as_str()
+        .expect("canonical project key")
+        .to_string();
     crate::register_agent(
-        ctx, key.clone(), "test".to_string(), "test".to_string(), Some(name.to_string()),
-        None, None, None, None, None, None,
+        ctx,
+        key.clone(),
+        "test".to_string(),
+        "test".to_string(),
+        Some(name.to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("agent");
@@ -149,24 +189,32 @@ async fn state(ctx: &McpContext, source: &str) -> Value {
     let project = crate::tool_util::resolve_existing_project(ctx, &pool, source)
         .await
         .expect("existing source");
-    let sender = mcp_agent_mail_db::queries::get_agent(
-        ctx.cx(), &pool, project.id.unwrap(), "BlueLake",
-    )
-    .await
-    .into_result()
-    .expect("source agent");
+    let sender =
+        mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project.id.unwrap(), "BlueLake")
+            .await
+            .into_result()
+            .expect("source agent");
     let (outgoing, incoming) = mcp_agent_mail_db::queries::list_contacts(
-        ctx.cx(), &pool, project.id.unwrap(), sender.id.unwrap(),
+        ctx.cx(),
+        &pool,
+        project.id.unwrap(),
+        sender.id.unwrap(),
     )
     .await
     .into_result()
     .expect("both contact directions");
-    let conn = pool.acquire(ctx.cx()).await.into_result().expect("state checkout");
-    let rows = conn.query_sync(
-        "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+    let conn = pool
+        .acquire(ctx.cx())
+        .await
+        .into_result()
+        .expect("state checkout");
+    let rows = conn
+        .query_sync(
+            "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
          (SELECT COUNT(*) FROM message_recipients) AS recipients",
-        &[],
-    ).expect("delivery counts");
+            &[],
+        )
+        .expect("delivery counts");
     json!({
         "outgoing": outgoing,
         "incoming": incoming,
@@ -201,7 +249,11 @@ fn recipient_block_between_request_and_auto_approval_is_preserved() {
         let database_url = format!("sqlite://{}", dir.path().join("mail.sqlite3").display());
         let storage_root = dir.path().join("archive");
         let source = dir.path().join("source");
-        let target = if cross_project { dir.path().join("target") } else { source.clone() };
+        let target = if cross_project {
+            dir.path().join("target")
+        } else {
+            source.clone()
+        };
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         with_process_env_overrides_for_test(
@@ -214,15 +266,26 @@ fn recipient_block_between_request_and_auto_approval_is_preserved() {
             ],
             || {
                 Config::reset_cached();
-                let runtime = RuntimeBuilder::current_thread().build().expect("fixture runtime");
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("fixture runtime");
                 runtime.block_on(async {
                     let ctx = McpContext::new(Cx::current().expect("fixture context"), 1);
                     let source = register_actor(&ctx, source.to_str().unwrap(), "BlueLake").await;
-                    let target = register_actor(&ctx, target.to_str().unwrap(), "GreenCastle").await;
+                    let target =
+                        register_actor(&ctx, target.to_str().unwrap(), "GreenCastle").await;
                     crate::contacts::request_contact_with_intro(
-                        &ctx, target.clone(), "GreenCastle".to_string(), "BlueLake".to_string(),
-                        Some(source.clone()), Some("independent reverse link".to_string()),
-                        Some(1800), Some(false), None, None, None,
+                        &ctx,
+                        target.clone(),
+                        "GreenCastle".to_string(),
+                        "BlueLake".to_string(),
+                        Some(source.clone()),
+                        Some("independent reverse link".to_string()),
+                        Some(1800),
+                        Some(false),
+                        None,
+                        None,
+                        None,
                         crate::contacts::ContactIntro::Deferred,
                     )
                     .await
@@ -231,8 +294,13 @@ fn recipient_block_between_request_and_auto_approval_is_preserved() {
                     let pending = PausedHandshake::start(source.clone(), target.clone());
                     pending.wait_for_request();
                     crate::contacts::respond_contact(
-                        &ctx, target.clone(), "GreenCastle".to_string(), "BlueLake".to_string(),
-                        Some(source.clone()), false, None,
+                        &ctx,
+                        target.clone(),
+                        "GreenCastle".to_string(),
+                        "BlueLake".to_string(),
+                        Some(source.clone()),
+                        false,
+                        None,
                     )
                     .await
                     .expect("recipient blocks after macro read pending");
@@ -244,38 +312,75 @@ fn recipient_block_between_request_and_auto_approval_is_preserved() {
 
                     let response = pending.finish().expect("macro reports the winning block");
                     let response: Value = serde_json::from_str(&response).unwrap();
-                    assert_eq!(response["request"]["status"], "pending", "the raced snapshot");
+                    assert_eq!(
+                        response["request"]["status"], "pending",
+                        "the raced snapshot"
+                    );
                     assert!(response["response"].is_null());
                     assert!(response["welcome_message"].is_null());
-                    assert_eq!(response["welcome_skipped_reason"], super::WELCOME_SKIPPED_CONTACT_BLOCKED);
+                    assert_eq!(
+                        response["welcome_skipped_reason"],
+                        super::WELCOME_SKIPPED_CONTACT_BLOCKED
+                    );
                     mcp_agent_mail_storage::wbq_flush();
-                    assert_eq!(state(&ctx, &source).await, blocked, "all link metadata and deliveries");
-                    assert_eq!(archive_files(&storage_root), files, "no notice or welcome archive");
+                    assert_eq!(
+                        state(&ctx, &source).await,
+                        blocked,
+                        "all link metadata and deliveries"
+                    );
+                    assert_eq!(
+                        archive_files(&storage_root),
+                        files,
+                        "no notice or welcome archive"
+                    );
 
                     let retry: Value = serde_json::from_str(
-                        &handshake(&ctx, &source, &target).await.expect("already-blocked handshake"),
-                    ).unwrap();
+                        &handshake(&ctx, &source, &target)
+                            .await
+                            .expect("already-blocked handshake"),
+                    )
+                    .unwrap();
                     assert_eq!(retry["request"]["status"], "blocked");
                     assert!(retry["response"].is_null());
                     assert!(retry["welcome_message"].is_null());
                     assert_eq!(state(&ctx, &source).await, blocked);
 
                     let approved = crate::contacts::respond_contact(
-                        &ctx, target.clone(), "GreenCastle".to_string(), "BlueLake".to_string(),
-                        Some(source.clone()), true, None,
+                        &ctx,
+                        target.clone(),
+                        "GreenCastle".to_string(),
+                        "BlueLake".to_string(),
+                        Some(source.clone()),
+                        true,
+                        None,
                     )
                     .await
                     .expect("explicit recipient approval still unblocks");
-                    assert_eq!(serde_json::from_str::<Value>(&approved).unwrap()["approved"], true);
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&approved).unwrap()["approved"],
+                        true
+                    );
                     let accepted: Value = serde_json::from_str(
-                        &handshake(&ctx, &source, &target).await.expect("approved handshake"),
-                    ).unwrap();
+                        &handshake(&ctx, &source, &target)
+                            .await
+                            .expect("approved handshake"),
+                    )
+                    .unwrap();
                     assert_eq!(accepted["response"]["approved"], true);
                     assert!(!accepted["welcome_message"].is_null());
                     let after = state(&ctx, &source).await;
-                    assert_eq!(after["incoming"], blocked["incoming"], "reverse link is independent");
-                    assert_eq!(after["messages"].as_i64(), blocked["messages"].as_i64().map(|n| n + 2));
-                    assert_eq!(after["recipients"].as_i64(), blocked["recipients"].as_i64().map(|n| n + 2));
+                    assert_eq!(
+                        after["incoming"], blocked["incoming"],
+                        "reverse link is independent"
+                    );
+                    assert_eq!(
+                        after["messages"].as_i64(),
+                        blocked["messages"].as_i64().map(|n| n + 2)
+                    );
+                    assert_eq!(
+                        after["recipients"].as_i64(),
+                        blocked["recipients"].as_i64().map(|n| n + 2)
+                    );
                     mcp_agent_mail_storage::wbq_flush();
                 });
                 Config::reset_cached();

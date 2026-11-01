@@ -5556,7 +5556,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "asupersync 0.5.0",
  "clap",
@@ -5584,7 +5584,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "asupersync 0.5.0",
  "base64 0.23.1",
@@ -5639,7 +5639,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "asupersync 0.5.0",
  "chrono",
@@ -5666,7 +5666,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -5705,7 +5705,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "asupersync 0.5.0",
  "chrono",
@@ -5755,7 +5755,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "chrono",
  "git2",
@@ -5772,7 +5772,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "chrono",
  "criterion",
@@ -5802,7 +5802,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "ammonia",
  "asupersync 0.5.0",
@@ -5850,7 +5850,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "age",
  "base64 0.23.1",
@@ -5878,7 +5878,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "asupersync 0.5.0",
  "base64 0.23.1",
@@ -5907,7 +5907,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "git2",
  "tempfile",
@@ -5916,7 +5916,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arbitrary",
  "asupersync 0.5.0",
