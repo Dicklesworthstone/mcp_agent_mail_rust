@@ -1,5 +1,49 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## October 30 integrated-source verification (02:43 UTC)
+
+The checkpoint rerun described as pending below exposed a real verification
+defect. Its second **77/77** result executed the earlier executable even though
+the running Nextest process saw all current source bytes. Preserved source
+mtimes were older than that cached executable, and the two new checkpoint tests
+were absent. That result receives **no current-source validation credit**. The
+original executable hash and both receipts remain recorded in `.75` and the
+session TODO.
+
+The proposed nightly Cargo checksum setting failed the controlled real
+Cargo/RCH reproducer, including a newly primed checksum-mode control. Its
+ineffective configuration addition is being removed. RCH's existing source
+receipt mode rebuilds the small reproducer correctly, but refuses this project's
+parked manifests because sibling inputs are absent. No manifest, source ledger,
+assertion or dependency was removed to evade that refusal. `.75` remains open;
+an isolated checkout is bounded validation, not a normal-route cache repair.
+
+The latest integrated verification snapshot includes the incoming cancellable
+SQLite initializer and bounded ATC outcome modules. All 3,779 tracked non-Beads
+files are frozen under manifest `d0743e27…`. Actual native/all-target compiler
+namespaces match 3,773 inputs; exactly six historical performance receipts are
+absent, with no other missing or mismatched inputs. The GNU Windows production
+compiler namespace matches all 3,779. Separate production checking passes on
+this snapshot; its source witness was collected after completion, not during
+the compiler process. Integrated all-target checking and native database
+execution are still pending in this entry.
+
+Other reviewed repairs preserve the original controls: Windows recovery errors
+use the existing contextual error variant, file identity checks use comparable
+metadata, three locked-owner fixtures read through the still-owning descriptor,
+and both bundle rollback tests select the native platform's file-symlink API.
+No tests or permission failures are skipped. The Windows OS lock probe is
+contract evidence, and GNU checking is compiler evidence; neither executes the
+supported native Windows Rust tests. `.76` and `.77` remain unresolved.
+
+Two native attempts expired before running tests because the outer RCH timeout
+was configured incorrectly. The active retry uses `RCH_TEST_TIMEOUT_SEC=14400`;
+original per-test deadlines and populations are unchanged. An unnecessary
+all-target cancellation is also retained as an execution mistake. The older
+failed whole-workspace run and all engine, authority, header, retention,
+large-archive, native-platform and release holds below remain open. Neither
+peer-reported receipts nor this solo review establish independent certification.
+
 ## October 29 credential, transport and recovery follow-through (22:37 UTC)
 
 The useful changes through `addc201f` are preserved alongside the incoming
