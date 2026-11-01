@@ -8189,10 +8189,9 @@ mod tests {
                         assert_eq!(fresh["acknowledged_at"], micros_to_iso(timestamps[1].1));
                     }
                 }
-                assert!(
-                    crate::degraded_intents::read_queued_ack_intents(&config)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                    [] as [crate::degraded_intents::QueuedAckIntent; 0]
                 );
                 assert_eq!(active_writer_count(), 0);
                 drop(warm_pool);
@@ -8270,10 +8269,9 @@ mod tests {
                     drop(occupied_write);
                     drop(occupied_read);
                     replay_queued_ack_intents(&ctx, &pool, &config).await;
-                    assert!(
-                        crate::degraded_intents::read_queued_ack_intents(&config)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                        [] as [crate::degraded_intents::QueuedAckIntent; 0]
                     );
                     let replay: Value = serde_json::from_str(
                         &acknowledge_message(
