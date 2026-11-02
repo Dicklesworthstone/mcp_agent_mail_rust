@@ -18,19 +18,54 @@
 - [x] Current formatting and whitespace checks pass. Freeze resumed manifest
   c573e11e (3,770 tracked files except Beads/planning); CLI hash 162afec7,
   lock d6918089. This is a new source epoch, not qualified by the older run.
-- [ ] Finish the already-running 96b25a56 native routing suite without cancelling
-  or replaying it. Record actual populated tests and any failures separately.
+- [x] Finish the already-running 96b25a56 native routing suite without cancelling
+  or replaying it: 29 executed, 28 passed, one real round-trip failure at inbox
+  reading (HTTP 400), after registration and send succeeded. The real unresolved
+  owner refusal and every selected ownership/recording control pass. Preserve
+  native exit 100 and caller exit 1: RCH's comparison also rejected 42 deltas
+  after the local source advanced. Exact-wrapper recovery acknowledges exit 100;
+  no runtime acceptance or source-barrier waiver follows.
+- [x] Diagnose the HTTP 400 with the exact compiled binary (SHA c1d13b1e).
+  The first private probe stops at ownership before transport and is retained.
+  An explicit private endpoint isolates the transport: registration/send pass,
+  inbox fails, a 295-byte resource request ID gets HTTP 400, and the identical
+  resource URI with a short ID gets 200. Actual 256/257-byte boundary controls
+  return 200/400. All private children are stopped and reaped; no live mailbox
+  is used. Receipts: http400-private-diagnosis*.json under the existing NAS root.
+- [x] Replace all three URI-sized resource correlation IDs with one bounded
+  SHA-256-based ID, retaining exact resource URIs and response identity checks.
+  Add real FastMCP-decoder positive/old-ID-negative controls and make the existing
+  real round-trip fixture use a long project path. Keep every assertion and
+  original deadline. No protocol limit or transport gate is weakened.
 - [ ] Run the complete declared routing suite including the added invalid-path
   regression on resumed source. Require the real daemon registration/send/inbox
   and real unresolved-owner refusal, retaining original assertions/deadlines.
+  Include all reservation_read::tests because resource ID generation changed.
+  Keep this checkout's source payload frozen until the receipt job finishes.
+  First new-source request refused admission with exit 103/no free slots; no
+  tests ran. Retry only through normal admission after capacity changes.
 - [ ] Complete resumed-source all-target, separate production lib/bins and
   strict Clippy checks through ordinary strict RCH admission. The all-target
   job is running on vmi1149989; no local compilation or worker-policy override.
+  The first resumed Clippy run exits 101 on an incoming conversation-query
+  documentation paragraph. Split that paragraph without changing its words,
+  code or lint rules; the corrected source needs a fresh strict Clippy run.
 - [ ] Finish the changed CLI scanner, review new changed-line findings, retain
   original failed attempts and preserve the unchanged integration-file receipt.
 - [ ] Fresh original-acceptance check; update Beads with terminal evidence,
   flush JSONL, check cycles and graph preservation, commit/publish without force,
   then release only this task's three leases (renewed through 02:12 UTC).
+
+The fresh scanner on CLI hash 162afec7 completed in 740s, exit 0, one file,
+0 critical / 10,227 warnings / 4,986 informational findings. All 15 new changed-line
+findings were reviewed: 12 intentional fixture/assertion warnings and three
+test-only clone/Command/expect_err notes. Production guard lines have no finding.
+This predates the resource-ID fix, which requires a new changed-file scan.
+
+Peer commits 4bea1fe5 and f80ddff9 preserve the plan and exact invalid-path guard
+bytes with acceptance explicitly pending. They do not change the c573e11e code
+manifest. The resource-ID correction is a subsequent source epoch; preceding
+compiler/scanner results are not its acceptance.
 
 The full-disk failure and prepared recovery candidate are preserved in the NAS
 recovery copy. Capacity is now restored independently of the blocked cache move;
