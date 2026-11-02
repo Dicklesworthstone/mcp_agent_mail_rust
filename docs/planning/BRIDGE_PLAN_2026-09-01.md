@@ -1,5 +1,29 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 2: qualify reservation reads during writer contention (br-list-write-lock-kx4vn)
+
+- [x] Recheck governing document identities, current ownership and ready Beads.
+  Contact-stat CPU and release publication issues retain their outstanding
+  production/platform probes. Do not close them from source inspection.
+- [x] Claim the reservation-listing Bead and reserve its exact source files.
+  The implementation and native regressions already landed in 0a8b0633;
+  preserve that authorship and give this block qualification credit only.
+- [x] Review the original read/write separation, writable/query-only pool
+  regression, independent writer, committed-state freshness, durable-family
+  byte controls and queued-release stage assertion without weakening them.
+- [ ] Run both original native regressions through strict, normal RCH on
+  the current source/dependency graph; retain the source and executable
+  identities, terminal outcomes and any failures.
+- [ ] Resolve any demonstrated implementation failure in the existing files;
+  if code changes, run the required workspace checks and strict Clippy.
+- [ ] Re-execute original acceptance in a fresh solo verification pass.
+  Explicitly distinguish that pass from independent review.
+- [ ] Complete the required real-work audit and honesty inventory. Record
+  test counts, remaining limits and the original negative controls.
+- [ ] Cite terminal evidence on the Bead; close only if its original named
+  probe passes, then flush Beads, review the diff and publish the work.
+- [ ] Verify remote branch identities and release these file reservations.
+
 ## November 2: qualify landed retention policy (br-refused-pass-window-policy-q7mxt)
 
 - [x] Read the original refusal/window bug and already-landed 7e9d2466 policy.
