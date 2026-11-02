@@ -2,7 +2,107 @@
 
 ## November 1 mailbox-routing repair (br-eos8u)
 
-Latest continuation, November 2, 01:09 UTC:
+Latest continuation, November 2, 03:50 UTC:
+
+- [x] Native routing acceptance 30090344884338730 finishes with 57/57
+  selected tests passing (3462 skipped), including both real Linux daemon
+  round trips, unresolved-owner refusal, invalid-path isolation and the actual
+  FastMCP resource-ID decoder controls. Live and post-run routing inputs match
+  all 3,770 files. The executing CLI unit, integration and `am` ELF hashes are
+  retained from stable open `/proc/PID/exe` descriptors. This is selected Linux
+  acceptance, not release or whole-workspace runtime qualification.
+- [x] Separate production gate 30090344884338735 passes (42m46s); its live
+  and post-run inputs match all 3,770 files of manifest a61defcb. Preserve the
+  earlier hz4 transport-255 failure separately.
+- [x] Strict Clippy on a61defcb finishes 101 on one additional existing
+  queries.rs test assertion. Replace only its empty-vector assertion with an
+  equality diagnostic; no production behavior or lint policy changes. Current
+  manifest 435f811f differs only at that cfg(test) assertion. Formatting and
+  whitespace pass. Its UBS scan remains exit 1 (0 critical / 3835 warning /
+  634 informational); the sole changed-line warning is the test assertion.
+- [x] Execute all three DB regression controls on the frozen a61defcb source:
+  index density passes both original page sizes and all thresholds; legacy
+  payload equality fails on canonical Int versus native BigInt representations;
+  connection memory fails at 57,160 KiB above baseline against the original
+  32 MiB limit. Preserve exit 100 and the actual integration ELF identity.
+  Neither failure is waived or represented as passing.
+- [ ] Resolve or track the canonical integer-representation oracle separately;
+  retain exact payload, type, null, row-order and timestamp controls.
+- [x] Record the memory failure against existing br-kp1in.46 (comment 3878);
+  live and post-run DB source both match all 3,770 inputs. The new registry
+  engine does not yet meet this probe's bounded-memory budget.
+- [ ] Complete the three existing project_threads_ query tests on 435f811f.
+  Their actual Cargo/Nextest namespaces match all 3,770 inputs.
+- [ ] Finish current strict Clippy on hz3, then all-target and separate
+  production checks. The hz3 transfer omits six historical tests/artifacts/perf
+  JSON receipts; all 3,764 present files match. Keep that explicit exclusion,
+  rather than claiming an exact full-tree match or changing transfer policy.
+- [x] Apply the explicitly requested system-performance-remediation move to
+  healthy trj:/bulk. The first inactive scratch tree is retained in a private
+  verified 11,937,157,120-byte archive (166,099 entries; SHA-256
+  95b0f86cde72b0e2ac43a46c43b8863c7903b97d2acf8625a475f55e85bee6f7).
+  All three copy checks pass and archive/manifests are durable before cutover.
+  The source now has a restore pointer; root headroom rises from 1,068 to
+  12,734 MiB. Exact authorization, command and invocation time are logged.
+- [ ] Finish COPY/VERIFY of the two selected inactive CASS scratchpad trees
+  gh537 and gh483, then recheck protection markers, modification times, open
+  files and process working directories before each authorized cutover.
+  Keep active/recent and protected scratch trees in place; leave the failed
+  NAS untouched. Preserve source-operation logs durably on trj.
+- [x] Verify gh537's 22,858,557,440-byte archive (595,319 entries;
+  SHA-256 8fe610a3437978bbd8be0688ab8ae6dbee247c9e0f76ee35c609b3d2e10dad7c)
+  by all three checks; sync archive/log/manifests. Source cutover then refuses
+  on its open-file check and removes nothing. Two subsequent read-only lsof
+  checks are clear, including the helper's exact invocation; retain the refusal
+  and defer retry while gh483 copies. A verified archive is not a completed move.
+- [x] Identify the recurring scratch writer: six-day experimental daemon
+  3839886, private port 47299, absent launcher/session leader 3567556, no
+  external connected clients. A strict empty-socket check first aborts without
+  signaling on a self-health connection. Recheck executable/arguments and
+  allow only sockets owned by that same process; send SIGTERM through its
+  pidfd at 03:57:35 UTC. It exits cleanly. Preserve all its data and leave
+  shared mailbox PID 3047470 running. Root free space then holds near 9.2 GiB
+  in subsequent samples; do not infer that every possible writer is fixed.
+- [ ] Finish acceptance, export/graph checks and publication; update the
+  existing Bead without converting these selected results into release
+  clearance. Seven owned leases are renewed. Mailbox health currently reports
+  one unrelated reservation-thread provenance finding (346), left untouched.
+
+Earlier continuation, November 2, 02:10 UTC:
+
+- [x] Complete routing-source all-target check 30090344884338731: exit 0,
+  57m20s. Its live and post-run source both match all 3,770 routing inputs.
+  The separate production request refuses admission 103 before Cargo.
+- [x] Preserve strict Clippy's real failure: five incoming DB-test lints,
+  remote 101 plus caller 1 after local ENOSPC obscures completion. Exact-wrapper
+  recovery initially fails on the full disk, then acknowledges 101 when 117 MiB
+  returns. No compiler pass is inferred from the edited CLI crate checking.
+- [x] Reserve the two DB test files (348/349, through 05:06 UTC), preserve their
+  originals in RAM, and manually implement all five lint remediations. Improve
+  the empty-result diagnostic; add doc backticks; move only canonical fixture
+  setup into two helpers. Every schema, timestamp, row, index-density, memory,
+  child-process and acknowledgement assertion remains. No lint suppression.
+- [x] Formatting and whitespace pass. New manifest a61defcb differs from
+  routing manifest 37fce3fd only in canonical_schema_readable.rs and
+  startup_page_leak.rs. CLI/runtime production bytes are unchanged. The running
+  native routing job remains on its original frozen remote source; do not replay
+  it or claim that it tests these subsequent DB fixture edits.
+- [x] Scan both edited DB test files: 1s, exit 1, 4 critical / 215 warning /
+  49 informational. The four critical sites are existing test-failure panics.
+  All 16 changed-line findings (14 warning / 2 info) are retained fixture
+  unwraps/assertions, the owned body clone and a slash in SQL misread as division.
+  Review is complete; the raw scan remains red, with no new suppressions.
+- [ ] Execute the three existing populated DB regressions after normal admission:
+  canonical_legacy_mailbox_survives_native_upgrade_and_new_writes,
+  descending_metrics_insertions_keep_index_pages_dense, and
+  existing_mailbox_reads_have_bounded_connection_memory. Retain every original
+  count, page size, byte/RSS budget and child acknowledgement.
+- [ ] Obtain new-source all-target, separate production and strict Clippy gates.
+  First new Clippy request refuses admission 103: requested worker is draining
+  or unavailable. Do not force admission, compile locally or change fleet policy.
+- [ ] Finish the existing native CLI acceptance job, then fresh original
+  acceptance, Beads export/graph checks and publication. Routing proof and DB
+  fixture proof must retain their distinct source identities.
 
 - [x] Review peer commits d575364e and 7f9c3bfd: they preserve the exact
   resource-ID repair and its pending-acceptance record. All 3,770 source inputs
@@ -30,9 +130,11 @@ Latest continuation, November 2, 01:09 UTC:
   nodev, inode settings and every file; the failed NAS is untouched. This
   reversible operational change restores 8 GiB of capture headroom. All three
   owned wrappers remain active; their compilations are not replayed.
-- [ ] Restore the former 64 GiB tmpfs limit only after usage is safely below it
-  and active captures cannot be disrupted; otherwise hand off the exact 72 GiB
-  setting. Do not shrink a full filesystem or remove peer files to meet this.
+- [x] At 01:39 UTC /tmp usage independently falls to 48 GiB. Restore the
+  original limit with `sudo -n mount -o remount,size=64G /tmp`, retaining
+  16 GiB of headroom and the original mount protections. No files are moved or
+  removed by this task. Root free space has independently fallen to 4.2 GiB;
+  preserve both actual capacity observations rather than claiming global relief.
 
 - [x] Preserve the exact resource-ID correction and Unicode long-URI fixture.
   Current manifest 2c86bd93 has 3,770 tracked inputs except Beads/planning;
