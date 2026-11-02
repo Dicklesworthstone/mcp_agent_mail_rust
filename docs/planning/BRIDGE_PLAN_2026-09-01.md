@@ -1,5 +1,137 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 2: qualify landed retention policy (br-refused-pass-window-policy-q7mxt)
+
+- [x] Read the original refusal/window bug and already-landed 7e9d2466 policy.
+  No retention source or acceptance condition changes in this work block.
+- [x] Reuse the exact real server test executable, SHA-256 047478ddeedbb230,
+  retained during the source-bound native run; all three retention files
+  match HEAD and the full live/post 3,770-input manifest 399faa76.
+- [x] Run the real older-first/window-capacity controls, publication after
+  refusals and 24 real producer iterations. Four tests pass. Invoke the
+  publication child directly and reject any unasserted-publication early
+  return; none appears. Preserve stdout/stderr and exact filtered counts.
+- [x] Fresh solo re-execution passes all four again in new private roots.
+  The 24 scheduled iterations take 32.62/32.72 seconds, not a 24-hour soak.
+  Complete the bounded honesty inventory. No independent review is claimed.
+- [x] Hash-verify and sync the exact executable, source witnesses and both
+  logs to trj:/bulk/worker-relocated-20261102-am-sri/retention-qualified-1232/.
+  Cite the evidence and close only this claimed Bead. No new implementation,
+  performance win, broader platform, release or whole-project claim follows.
+- [ ] Publish this closure with the pending integrity/numeric work after
+  preserving the existing graph and completing its separate acceptance.
+
+## November 2: finish Mail UI asset integrity (br-kp1in.43)
+
+- [x] Verify governing AGENTS.md and README.md are byte-identical to the full
+  review; recheck suite rules, current Beads readiness and file ownership.
+- [x] Keep existing engine, platform and release blockers open. Choose the
+  remaining concrete Tailwind integrity gap; claim br-kp1in.43 as BlueSpring.
+- [x] Reuse the already shipped Tailwind 3.4.17 bytes from the share viewer.
+  Add a filesystem-free embedded-asset accessor and an exact, public versioned
+  bootstrap URL; preserve authentication on every private/unknown Mail route.
+- [x] Point the template at those bytes with their SHA-256 SRI. Preserve the
+  existing Tailwind configuration and asset bytes; remove the CDN exception.
+- [x] Add the original missing-SRI Tailwind tag as a failing validator control,
+  immutable-byte/lookup controls and native handler/authentication controls.
+- [x] Add an actual private daemon HTTP test for the page/script hash binding,
+  missing-token rejection, unknown-asset rejection and HEAD framing.
+- [x] Formatting and whitespace checks pass. UBS scans all four changed Rust
+  files and exits 1: 1 critical / 5,985 warnings / 2,804 informational findings.
+  Review all 83 located changed-line findings: the critical flags the predictable
+  token of an empty private test mailbox, not production token generation;
+  the others are test assertions/parsing, slash-bearing strings and test-only
+  validator allocations. Keep this red scanner receipt and its 14 unlocated
+  occurrences explicit. No suppression or scanner policy change is added.
+- [x] Fetch all 40 external script/stylesheet URLs with the honest project
+  User-Agent. All 40 response bodies match their declared SHA-384 SRI; all
+  40 tags carry integrity/crossorigin. The shared local Tailwind bytes also
+  match a fresh fetch of the previously pinned 3.4.17 URL.
+- [x] Execute populated native template, embedded-asset, HTTP/authentication
+  and private-daemon tests through normal strict RCH; retain every failure.
+- [x] Preserve Clippy's first two exit-101 receipts. Correct redundant
+  pub(crate) inside the private template module, then use an equality
+  diagnostic for the empty HEAD body. No assertion is weakened. Add the
+  route's explicit Allow header and its native assertion. Freeze final
+  source manifest 399faa76; formatting and whitespace pass.
+- [x] Cancel and reconcile only this task's superseded builds through RCH's
+  exact wrapper identities, preserving their cache work and exit 143.
+  Preserve the daemon-130/delivery-143 reconciliation warnings. Two malformed
+  queued Nextest retries were caught and canceled before admission.
+- [x] Restore compiler-worker headroom through the operator-authorized
+  lossless relocation process. hz3's 20,263 MiB HFDT target contains evidence:
+  preserve the complete tree, never treat it as disposable pure build output.
+  Initial full marker/open-file/cwd checks pass; newest entry is 162 hours old.
+  Copy/verify on trj before any cutover; recheck all activity and protection.
+  Keep pressure-based admission intact. Final Clippy/all-target retries exit
+  103 without compiling while worker disk pressure is critical.
+  All three archive checks pass: 8,030 entries, 21,230,448,640 bytes,
+  SHA-256 c961d29d82a2a0be42f2ecd473b3dce37110388a3082e78399360d7d0c78353c.
+  Sync the archive and receipts, then repeat full protection, modification,
+  strict lsof and cwd guards before the authorized cutover. Free space rises
+  from 14,589 to 34,853 MiB. Keep the complete evidence at
+  trj:/bulk/worker-relocated-20261102-am-sri/hz3-hfdt-target-1022/ and a
+  rename-before-extract restore pointer. No pressure threshold is changed.
+- [x] Coordinator headroom falls to 12,467 MiB again. Reject relocating the
+  complete mb-sound tree because SunnySnow still has live cwd/open-file users.
+  Its separate parked-20261102 archive directory is idle for 7.7 hours with
+  no protection markers, mounts or live users. Copy all 11 entries (8,380,692,480
+  bytes) to trj, verify all three checks, sync and repeat strict guards before
+  the operator-authorized cutover. SHA-256 5af60871d08be9b9bd70e892d127b7bd218eaa0e272798d8f7de59334e548d77.
+  Free space rises to 20,464 MiB; active processes remain untouched. Exact
+  authorization, command, time, manifests and archive are retained at
+  trj:/bulk/worker-relocated-20261102-am-sri/ts1-mb-parked-1230/.
+- [x] Re-admit final-source native tests on vmi1152480/vmi1153651 and allow
+  normal scheduling to place all-target checking on healthy hz4. Actual live
+  Cargo/Nextest directories match all 3,770 final manifest inputs. The native
+  retries recompile dependencies despite identical pool paths; do not claim
+  that restarting reused earlier compilation time. Leave final runs intact.
+- [x] Strict workspace/all-target Clippy passes on final source (remote
+  239.3 seconds). All 3,764 present inputs match live and post-run; retain
+  the six missing historical performance JSON files as explicit exclusions.
+- [x] Workspace/all-target check passes on hz4: Cargo 28m24s, remote 1729.7s.
+  All 3,770 inputs match both live and post-run. The dependency's existing
+  future-compatibility notice remains. Separate production checking starts
+  through normal scheduling on vmi1149989; do not misattribute it to hz3.
+- [x] Separate workspace production lib/bins check passes on vmi1149989,
+  remote 3557.2 seconds. All 3,770 inputs match live and post-run.
+- [x] Final-source formatting and whitespace checks pass.
+- [x] In Chromium against the repaired native daemon, verify generated styles
+  load without the Tailwind CDN and a tampered response is blocked by SRI.
+- [x] Run the original tests/e2e/test_web_dashboard.sh acceptance against a
+  rebuilt native server, preserving every assertion and reporting actual counts.
+  Original suite: 8 cases, 23 pass, 0 fail, 0 skip. Fresh Chromium Projects
+  probe loads local Tailwind with CDN blocked (60px heading, custom primary
+  color); an altered server response is rejected by SRI (32px heading,
+  transparent background). Preserve the first probe's wrong-root failure:
+  /mail is Unified Inbox; Projects is /mail/projects. No product fix or
+  weakened browser criterion was used to correct that probe.
+- [x] Preserve the populated native result: 41/44 pass; three unchanged JSON
+  conversation-template assertions fail. New asset, authentication and real
+  conversation-handler tests all pass. The direct pinned-SDK reproduction
+  passes the typed context and fails the JSON context with private Serde
+  number maps. Claim br-mail-json-template-numbers-4zje9; leave both items
+  open while repairing and validating the rendering boundary.
+- [x] Convert JSON public values into native MiniJinja scalars at the private
+  Mail rendering boundary. Preserve integer precision, ordinary typed DTOs,
+  arrays/maps, booleans/null and finite decimals; reject out-of-range numbers.
+  Existing assertions and dependency graph remain unchanged. The first
+  copied-module probe fixes all three original failures but fails one new
+  expected boolean spelling (True, not true); retain that 30/31 result.
+- [ ] Execute the corrected production module under arbitrary_precision,
+  then the actual native server tests and all required compiler checks on
+  the final numeric repair. Copied-module proof is explicitly scoped.
+- [x] Re-execute the original SRI acceptance in a fresh solo pass; fill the
+  honesty inventory. CLI daemon passes 1/1 again, both browser controls pass
+  in new profiles and original dashboard E2E again passes 23 assertions,
+  8 cases, zero fail/skip. Keep both Beads open pending numeric qualification.
+- [x] Commit the separately qualified integrity source as 07ebe869. Every
+  staged source file matches the tested SRI manifest 399faa76 byte-for-byte.
+  Leave numeric source unstaged while its full native/compiler runs finish.
+  No original test failure or final-source pending gate is called a pass.
+- [ ] Export and preserve Beads, check cycles, commit/push qualified changes
+  and release this task's file leases. No whole-project/release claim follows.
+
 ## November 1 mailbox-routing repair (br-eos8u)
 
 Latest continuation, November 2, 09:08 UTC:
