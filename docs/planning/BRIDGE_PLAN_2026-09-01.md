@@ -114,10 +114,16 @@
   preserve exit 103 and refresh normal worker health, without a gate override.
   Fresh telemetry reports warning-level pressure and admits the check; the
   all-targets check then passes. Attribute no external headroom changes to us.
-- [ ] Preserve native/runtime receipts durably, audit the work, update Beads
-  honestly and publish the reviewed changes with original failures intact.
-  Preserve the quiescent 10,002-message mailbox and old/new executable identities
-  for real-path replay; copy only, without removing the original fixture.
+- [x] Preserve the quiescent 10,002-message mailbox for real-path replay,
+  without removing its original. All three copy checks pass at 20:00:30 UTC:
+  134,370 entries, 2,120,519,680 bytes, SHA-256
+  517d7472e09e0f9443bcf02a7262c54c0b2bf390b52c5dbe7d1ae70dc2d4fd82.
+  Archive/manifests, replay harnesses and the old CLI c2d7351c0e9581d3 are
+  verified and synced in kind-read-fixture-1955/ on trj. Native and compiler
+  receipts are also hash-verified and synced in kind-read-20261102/.
+- [ ] Preserve the real CLI comparison, new executable and fresh solo receipts
+  durably; audit the work, update Beads honestly and publish the reviewed
+  changes with original failures intact.
 
 ## November 2: qualify reservation reads during writer contention (br-list-write-lock-kx4vn)
 
