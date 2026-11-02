@@ -18,8 +18,8 @@
   logs to trj:/bulk/worker-relocated-20261102-am-sri/retention-qualified-1232/.
   Cite the evidence and close only this claimed Bead. No new implementation,
   performance win, broader platform, release or whole-project claim follows.
-- [ ] Publish this closure with the pending integrity/numeric work after
-  preserving the existing graph and completing its separate acceptance.
+- [x] Publish this closure in 9cc92c90 after preserving the existing graph.
+  Numeric repair's separate acceptance is recorded below.
 
 ## November 2: finish Mail UI asset integrity (br-kp1in.43)
 
@@ -118,9 +118,36 @@
   Existing assertions and dependency graph remain unchanged. The first
   copied-module probe fixes all three original failures but fails one new
   expected boolean spelling (True, not true); retain that 30/31 result.
-- [ ] Execute the corrected production module under arbitrary_precision,
+- [x] Execute the corrected production module under arbitrary_precision,
   then the actual native server tests and all required compiler checks on
   the final numeric repair. Copied-module proof is explicitly scoped.
+- [x] The exact copied production module passes 31/31 under arbitrary_precision
+  and 31/31 with ordinary JSON serialization. Two additional real-boundary
+  probes preserve u128::MAX exactly and reject u128::MAX + 1 rather than
+  rounding it. These temporary native SDK/module probes do not replace the
+  actual server build. Both original SDK fault controls remain unchanged.
+  The pre-comment module SHA-256 is b7f1d7825b6a4427f4357d23a22147685bd4062405b979fb9bdb08c359d556ec;
+  manifest 97f0f86 binds its 3,770 inputs; the sole later doc edit is below.
+- [x] Workspace all-target check passes on numeric source 97f0f86, Cargo
+  27m44s / remote 1687.6s, with 3,770 live/post matches. Clippy first fails
+  solely because MiniJinja needs backticks in the new doc comment. Preserve
+  that exit 101; correct only the comment and freeze f4341af6. Strict
+  workspace/all-target Clippy then passes (3m26s / remote 215.3s), with all
+  3,764 present live/post inputs matching and six historical JSON omissions
+  explicit. Formatting passes. The production/native jobs continue on the
+  behavior-identical pre-comment source; no assertion or runtime token changes.
+- [x] Separate production lib/bins check passes on vmi1149989, remote
+  3360.9 seconds. Keep its pre-comment source binding explicit rather than
+  claiming the later documentation bytes executed. No dev-feature waiver.
+- [x] Expand actual HTTP regression coverage against the verified SRI server
+  and CLI binaries using the supported direct suite. Parent: 107 assertions,
+  39 cases, zero failure/skip. Children: JWT 33 pass/1 skip; rate-limit 11
+  pass/1 skip; peer-address 8 pass; Mail UI 37 pass; streamable HTTP 17 pass.
+  These nested counts are not an additive independent-proof denominator.
+  Preserve both native-runner dispatch failures: the isolated HOME has no
+  worker SSH key, so RCH refuses before tests (103). Recover only those two
+  exact wrapper leases to acknowledged terminal exit 1; do not present the
+  direct suite as a canonical native-runner pass or hide either child skip.
 - [x] Re-execute the original SRI acceptance in a fresh solo pass; fill the
   honesty inventory. CLI daemon passes 1/1 again, both browser controls pass
   in new profiles and original dashboard E2E again passes 23 assertions,
@@ -129,8 +156,29 @@
   staged source file matches the tested SRI manifest 399faa76 byte-for-byte.
   Leave numeric source unstaged while its full native/compiler runs finish.
   No original test failure or final-source pending gate is called a pass.
-- [ ] Export and preserve Beads, check cycles, commit/push qualified changes
-  and release this task's file leases. No whole-project/release claim follows.
+- [x] Full numeric native server/share run passes 46/46, 6,284 filtered,
+  execution 4.609 seconds after 116m15s compilation (remote 7013.4 seconds).
+  All 3,770 pre-comment inputs match the actual live and post-run source.
+  The actual executing server ELF is 331,668,496 bytes, stable-open SHA-256
+  f31f25356d3eaed63e57f8f6e90696278910c808e625f3dc1bc8ee5fb9c0c745.
+  Automatic observer copying was unavailable; retrieve a byte-identical ELF
+  afterward, verify its full hash and preserve it on trj before further work.
+- [x] Fresh solo acceptance uses that exact executable in a new private
+  environment: 44/44 server tests pass, zero failure/ignore, 5,432 filtered,
+  4.41 seconds. Original three failures and all existing assertions remain
+  unchanged. This is real native acceptance, not the copied-module probe.
+  Native/production evidence predates only the doc-backticks correction;
+  strict Clippy checks the final f4341af6 source. No independent review claimed.
+- [x] Commit numeric source as e6a637ff. Complete the written work/honesty
+  audit, explicitly recording excess repeated inspection and stopping extra
+  process work. Close only the two claimed integrity/numeric Beads on cited
+  populated evidence. Keep wider engine, release and platform holds open.
+- [x] Export and preserve Beads, check cycles and publish the qualified source.
+  e6a637ff is verified on both remote refs. All 2,847 original issue IDs and
+  every prior comment remain; the sole added issue is the observed JSON bug.
+  Release the implementation leases; preserve the failed probes and complete
+  written audit with terminal evidence on trj. Final tracker publication is
+  documentation only. No whole-project, release or native-platform claim.
 
 ## November 1 mailbox-routing repair (br-eos8u)
 
