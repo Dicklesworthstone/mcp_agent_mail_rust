@@ -8932,6 +8932,118 @@ fn legacy_am_serve_reports_migration_preflight() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_serves_integrity_checked_tailwind_without_exposing_mailbox_pages() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let token = format!("private-asset-test-{}", std::process::id());
+    let log_path = env.tmp.path().join("asset-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = OwnedServer(
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("HTTP_BEARER_TOKEN", &token)
+            .env("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+            .env("AM_ATC_ENABLED", "false")
+            .env("TMPDIR", env.tmp.path())
+            .current_dir(&env.hostile_repo)
+            .args([
+                "serve-http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--no-tui",
+            ])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        assert!(Instant::now() < deadline, "asset daemon did not bind");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let request = |method: &str, path: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: mcp_agent_mail_rust-agent\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let split = response
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8(response[..split].to_vec()).unwrap(),
+            response[split + 4..].to_vec(),
+        )
+    };
+    let path = "/mail/static/tailwind-3.4.17.min.js";
+    let (headers, script) = request("GET", path);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/javascript")
+    );
+    assert_eq!(script.len(), 407_279);
+    let integrity = format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&script))
+    );
+    assert_eq!(
+        integrity,
+        "sha256-F26JRmGqnNyaXLpscgBEy797i9gNHJoUKnwksbbFDRU="
+    );
+    let (headers, _) = request("GET", "/mail");
+    assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+    let (headers, html) = request("GET", &format!("/mail?token={token}"));
+    assert!(
+        headers.starts_with("HTTP/1.1 200"),
+        "{headers}\n{}",
+        std::fs::read_to_string(&log_path).unwrap()
+    );
+    let html = String::from_utf8(html).unwrap().replace("&#x2f;", "/");
+    assert!(html.contains(&format!("src=\"{path}\"")));
+    assert!(html.contains(&format!("integrity=\"{integrity}\"")));
+    assert!(!html.contains("https://cdn.tailwindcss.com"));
+    let (headers, body) = request("HEAD", path);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-length: 407279")
+    );
+    assert!(body.is_empty());
+    let (headers, _) = request("GET", "/mail/static/vendor_manifest.json");
+    assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_discovers_nondefault_mailbox_daemon_port() {
     struct OwnedServer(std::process::Child);
     impl Drop for OwnedServer {

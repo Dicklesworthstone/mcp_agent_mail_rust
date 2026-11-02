@@ -11732,6 +11732,11 @@ impl HttpState {
         }
 
         let (path, _query) = split_path_query(&req.uri);
+        // This one versioned bootstrap asset contains only embedded public
+        // code. It must load before the browser can attach mailbox credentials.
+        if let Some(resp) = self.handle_embedded_mail_asset(&req, &path) {
+            return resp;
+        }
         // Legacy parity: health routes bypass bearer auth even when configured.
         //
         // Note: the legacy FastAPI stack used a `/health/` prefix check, but this
@@ -11746,7 +11751,7 @@ impl HttpState {
 
         let auth_cx = self.request_cx();
 
-        // Legacy parity: bearer auth applies to all non-health routes (even unknown paths/methods),
+        // Bearer auth applies to all remaining non-health routes (even unknown paths/methods),
         // so missing/invalid auth yields 401 instead of downstream 404/405/400.
         if let Some(resp) = self.check_bearer_auth_with_cx(&auth_cx, &req).await {
             return resp;
@@ -11976,6 +11981,38 @@ impl HttpState {
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
         );
+        Some(resp)
+    }
+
+    fn handle_embedded_mail_asset(&self, req: &Http1Request, path: &str) -> Option<Http1Response> {
+        if path != templates::MAIL_TAILWIND_ASSET_PATH {
+            return None;
+        }
+        if !matches!(req.method, Http1Method::Get | Http1Method::Head) {
+            let mut resp = self.error_response(req, 405, "Method Not Allowed");
+            resp.headers
+                .push(("allow".to_string(), "GET, HEAD, OPTIONS".to_string()));
+            return Some(resp);
+        }
+        let Some(bytes) =
+            mcp_agent_mail_share::bundle::embedded_viewer_asset("vendor/tailwind.min.js")
+        else {
+            return Some(self.error_response(req, 500, "Embedded asset unavailable"));
+        };
+        let body = if matches!(req.method, Http1Method::Head) {
+            Vec::new()
+        } else {
+            bytes.to_vec()
+        };
+        let mut resp = self.raw_response(req, 200, "text/javascript; charset=utf-8", body);
+        resp.headers.push((
+            "cache-control".to_string(),
+            "public, max-age=31536000, immutable".to_string(),
+        ));
+        resp.headers
+            .push(("content-length".to_string(), bytes.len().to_string()));
+        resp.headers
+            .push(("x-content-type-options".to_string(), "nosniff".to_string()));
         Some(resp)
     }
 
@@ -37984,6 +38021,86 @@ first body
     }
 
     // ── D3: query-parameter token auth for /mail ─────────────────
+
+    #[test]
+    fn mail_tailwind_asset_serves_embedded_bytes_without_opening_a_mailbox() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("must-not-be-created");
+        let state = build_state(mcp_agent_mail_core::Config {
+            database_url: "unsupported://asset-must-not-open-db".to_string(),
+            storage_root: absent.clone(),
+            http_bearer_token: Some("private-mailbox-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        });
+        let req = make_request(Http1Method::Get, templates::MAIL_TAILWIND_ASSET_PATH, &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.len(), 407_279);
+        let integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&resp.body))
+        );
+        assert_eq!(integrity, templates::MAIL_TAILWIND_INTEGRITY);
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == "content-type" && value == "text/javascript; charset=utf-8"
+        }));
+        let html = templates::render_template("error.html", serde_json::json!({"message":"test"}))
+            .unwrap()
+            .replace("&#x2f;", "/");
+        assert!(html.contains(&format!("src=\"{}\"", templates::MAIL_TAILWIND_ASSET_PATH)));
+        assert!(html.contains(&format!("integrity=\"{integrity}\"")));
+        assert!(!html.contains("https://cdn.tailwindcss.com"));
+        assert!(
+            !absent.exists(),
+            "static serving must not create mailbox state"
+        );
+    }
+
+    #[test]
+    fn mail_tailwind_asset_only_exposes_the_exact_public_asset() {
+        let state = build_state(mcp_agent_mail_core::Config {
+            http_bearer_token: Some("private-mailbox-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        });
+        for path in [
+            "/mail",
+            "/mail/static/vendor_manifest.json",
+            "/mail/static/tailwind-3.4.16.min.js",
+            "/mail/static/../storage.sqlite3",
+            "/mail/static/tailwind-3.4.17.min.js/extra",
+        ] {
+            let resp = block_on(state.handle(make_request(Http1Method::Get, path, &[])));
+            assert_eq!(resp.status, 401, "private or unknown route {path}");
+        }
+        let resp = block_on(state.handle(make_request(
+            Http1Method::Post,
+            templates::MAIL_TAILWIND_ASSET_PATH,
+            &[],
+        )));
+        assert_eq!(resp.status, 405);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(name, value)| name == "allow" && value == "GET, HEAD, OPTIONS")
+        );
+        let head = block_on(state.handle(make_request(
+            Http1Method::Head,
+            templates::MAIL_TAILWIND_ASSET_PATH,
+            &[],
+        )));
+        assert_eq!(head.status, 200);
+        assert_eq!(head.body, Vec::<u8>::new());
+        assert!(
+            head.headers
+                .iter()
+                .any(|(name, value)| { name == "content-length" && value == "407279" })
+        );
+    }
 
     #[test]
     fn mail_route_accepts_query_token_when_bearer_configured() {

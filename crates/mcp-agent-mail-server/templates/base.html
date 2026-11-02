@@ -32,12 +32,10 @@
       })();
     </script>
 
-    <!-- Third-party assets are pinned to exact versions and carry SRI where the
-         CDN allows it (br-kp1in.43), so an upstream release or a compromised CDN
-         cannot change what runs on a page that renders the mailbox. The Tailwind
-         play CDN sends no CORS headers, so it is version-pinned without SRI. -->
+    <!-- Remote assets name exact versions and carry SRI. Tailwind uses the same
+         embedded, integrity-checked bytes as the share viewer (br-kp1in.43). -->
     <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+    <script src="{{ mail_tailwind_asset_path }}" integrity="{{ mail_tailwind_integrity }}" crossorigin="anonymous"></script>
     <script>
       tailwind.config = {
         darkMode: 'class',

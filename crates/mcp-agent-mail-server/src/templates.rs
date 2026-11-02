@@ -12,6 +12,9 @@ use minijinja::{AutoEscape, Environment, Error, ErrorKind};
 
 static TEMPLATE_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/templates");
 
+pub const MAIL_TAILWIND_ASSET_PATH: &str = "/mail/static/tailwind-3.4.17.min.js";
+pub const MAIL_TAILWIND_INTEGRITY: &str = "sha256-F26JRmGqnNyaXLpscgBEy797i9gNHJoUKnwksbbFDRU=";
+
 /// Strip HTML tags from a string (Jinja2 `striptags` filter).
 #[allow(clippy::needless_pass_by_value)]
 fn striptags(value: Value) -> Value {
@@ -98,6 +101,8 @@ fn current_year() -> i32 {
 static ENV: LazyLock<Environment<'static>> = LazyLock::new(|| {
     let mut env = Environment::new();
     env.add_function("current_year", current_year);
+    env.add_global("mail_tailwind_asset_path", MAIL_TAILWIND_ASSET_PATH);
+    env.add_global("mail_tailwind_integrity", MAIL_TAILWIND_INTEGRITY);
 
     env.set_auto_escape_callback(|name| {
         let is_html = std::path::Path::new(name)
@@ -620,61 +625,75 @@ mod tests {
         }
     }
 
-    /// Every third-party script and stylesheet the Mail UI loads names an exact
-    /// version and, where the CDN serves CORS, carries SRI. A floating tag lets
-    /// an upstream release or a compromised CDN change what runs on pages that
-    /// render the mailbox (lucide@latest resolved to a same-day release).
+    fn validate_external_assets(html: &str) -> Result<usize, String> {
+        let mut with_sri = 0;
+        for tag in html.split('<').skip(1) {
+            let tag = tag.split('>').next().unwrap_or_default();
+            let attr = if tag.starts_with("script") {
+                "src=\""
+            } else if tag.starts_with("link") && tag.contains("stylesheet") {
+                "href=\""
+            } else {
+                continue;
+            };
+            let Some(url) = tag
+                .split(attr)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+            else {
+                continue;
+            };
+            if url.starts_with("http://") || url.starts_with("//") {
+                return Err(format!("{url} must use HTTPS"));
+            }
+            if !url.starts_with("https://") {
+                continue;
+            }
+            if !version_pinned(url) {
+                return Err(format!("{url} is not pinned to an exact version"));
+            }
+            if !tag.contains("integrity=\"sha384-") || !tag.contains("crossorigin=\"anonymous\"") {
+                return Err(format!("{url} loads without SRI"));
+            }
+            with_sri += 1;
+        }
+        // A module import cannot carry SRI, so none may load from a CDN.
+        for quote in ['\'', '"'] {
+            if html.contains(&format!("from {quote}https://"))
+                || html.contains(&format!("import({quote}https://"))
+            {
+                return Err("a module import loads a CDN URL without SRI".to_string());
+            }
+        }
+        Ok(with_sri)
+    }
+
+    #[test]
+    fn external_asset_validation_rejects_the_old_tailwind_exemption() {
+        let legacy = "<script src=\"https://cdn.tailwindcss.com/3.4.17\"></script>";
+        assert_eq!(
+            validate_external_assets(legacy).unwrap_err(),
+            "https://cdn.tailwindcss.com/3.4.17 loads without SRI"
+        );
+        for url in [
+            "http://cdn.example.test/library/1.2.3/script.js",
+            "//cdn.example.test/library/1.2.3/script.js",
+        ] {
+            assert!(validate_external_assets(&format!("<script src=\"{url}\"></script>")).is_err());
+        }
+    }
+
+    /// Every remote script/stylesheet names an exact version and carries SRI.
+    /// The original missing-integrity Tailwind tag is a failing negative control.
     #[test]
     fn third_party_assets_are_version_pinned_with_sri() {
-        // The Tailwind play CDN sends no CORS headers, so it cannot carry SRI.
-        const NO_SRI: [&str; 1] = ["https://cdn.tailwindcss.com/"];
         let mut with_sri = 0;
         for file in TEMPLATE_DIR.files() {
             let Some(html) = file.contents_utf8() else {
                 continue;
             };
-            let name = file.path().display();
-            for tag in html.split('<').skip(1) {
-                let tag = tag.split('>').next().unwrap_or_default();
-                let attr = if tag.starts_with("script") {
-                    "src=\""
-                } else if tag.starts_with("link") && tag.contains("stylesheet") {
-                    "href=\""
-                } else {
-                    continue;
-                };
-                let Some(url) = tag
-                    .split(attr)
-                    .nth(1)
-                    .and_then(|rest| rest.split('"').next())
-                else {
-                    continue;
-                };
-                if !url.starts_with("https://") {
-                    continue;
-                }
-                assert!(
-                    version_pinned(url),
-                    "{name}: {url} is not pinned to an exact version"
-                );
-                if NO_SRI.iter().any(|host| url.starts_with(host)) {
-                    continue;
-                }
-                assert!(
-                    tag.contains("integrity=\"sha384-")
-                        && tag.contains("crossorigin=\"anonymous\""),
-                    "{name}: {url} loads without SRI"
-                );
-                with_sri += 1;
-            }
-            // A module import cannot carry SRI, so none may load from a CDN.
-            for quote in ['\'', '"'] {
-                assert!(
-                    !html.contains(&format!("from {quote}https://"))
-                        && !html.contains(&format!("import({quote}https://")),
-                    "{name}: a module import loads a CDN URL without SRI"
-                );
-            }
+            with_sri += validate_external_assets(html)
+                .unwrap_or_else(|error| panic!("{}: {error}", file.path().display()));
         }
         assert!(
             with_sri >= 30,
