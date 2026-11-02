@@ -30173,7 +30173,7 @@ mod tests {
                 .await
                 .into_result()
                 .unwrap();
-            assert!(empty.threads.is_empty());
+            assert_eq!(empty.threads, [] as [ProjectThreadSummary; 0]);
             assert_eq!(empty.snapshot_id, 0);
         });
     }

@@ -367,5 +367,8 @@ fn canonical_legacy_mailbox_survives_native_upgrade_and_new_writes() {
         query_values(&canonical, "PRAGMA integrity_check"),
         vec![vec![Value::Text("ok".into())]]
     );
-    assert!(query_values(&canonical, "PRAGMA foreign_key_check").is_empty());
+    assert_eq!(
+        query_values(&canonical, "PRAGMA foreign_key_check"),
+        [] as [Vec<Value>; 0]
+    );
 }

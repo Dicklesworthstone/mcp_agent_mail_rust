@@ -479,9 +479,33 @@ fn metrics_index_shape(path: &Path, root_page: usize) -> MetricsIndexShape {
     shape
 }
 
-/// GH#372 / FrankenSQLite #521: run the persisted metrics migration's actual
+fn seed_legacy_metrics_fixture(path: &Path, page_size: i64, tool: &str) {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    // Canonical SQLite supplies an existing file with the unchanged v9
+    // schema and one old sample. The upgraded runtime must append without
+    // rebuilding the schema or losing that pre-existing row.
+    let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+    seed.execute_raw(&format!("PRAGMA page_size = {page_size}"))
+        .unwrap();
+    let migrations: Vec<_> = mcp_agent_mail_db::schema::schema_migrations()
+        .into_iter()
+        .filter(|migration| migration.id.starts_with("v9_"))
+        .collect();
+    assert_eq!(migrations.len(), 3, "exercise all three metrics migrations");
+    for migration in migrations {
+        seed.execute_raw(&migration.up).unwrap();
+    }
+    seed.execute_sync(
+        "INSERT INTO tool_metrics_snapshots (tool_name, collected_ts, calls) VALUES (?, 0, 7)",
+        &[Value::Text(tool.to_string())],
+    )
+    .unwrap();
+}
+
+/// GH#372 / `FrankenSQLite` #521: run the persisted metrics migration's actual
 /// composite DESC index through repeated leaf and interior splits. The old
-/// engine passed integrity_check while allocating almost one leaf per two rows.
+/// engine passed `integrity_check` while allocating almost one leaf per two rows.
 #[test]
 fn descending_metrics_insertions_keep_index_pages_dense() {
     use mcp_agent_mail_db::sqlmodel::Value;
@@ -490,27 +514,8 @@ fn descending_metrics_insertions_keep_index_pages_dense() {
     let dir = tempfile::tempdir().expect("descending metrics fixture directory");
     for page_size in [512, 4096] {
         let path = dir.path().join(format!("metrics-{page_size}.sqlite3"));
-        // Canonical SQLite supplies an existing file with the unchanged v9
-        // schema and one old sample. The upgraded runtime must append without
-        // rebuilding the schema or losing that pre-existing row.
-        let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
-        seed.execute_raw(&format!("PRAGMA page_size = {page_size}"))
-            .unwrap();
-        let migrations: Vec<_> = mcp_agent_mail_db::schema::schema_migrations()
-            .into_iter()
-            .filter(|migration| migration.id.starts_with("v9_"))
-            .collect();
-        assert_eq!(migrations.len(), 3, "exercise all three metrics migrations");
-        for migration in migrations {
-            seed.execute_raw(&migration.up).unwrap();
-        }
         let tool = format!("send_message_{}", "x".repeat(48));
-        seed.execute_sync(
-            "INSERT INTO tool_metrics_snapshots (tool_name, collected_ts, calls) VALUES (?, 0, 7)",
-            &[Value::Text(tool.clone())],
-        )
-        .unwrap();
-        drop(seed);
+        seed_legacy_metrics_fixture(&path, page_size, &tool);
 
         let writer = DbConn::open_file(path.to_str().unwrap()).expect("open existing metrics file");
         let actual_page_size = writer.query_sync("PRAGMA page_size", &[]).unwrap()[0]
@@ -608,6 +613,36 @@ fn process_memory_kib(field: &str) -> u64 {
         .unwrap_or_else(|| panic!("missing {field} in /proc/self/status"))
 }
 
+#[cfg(target_os = "linux")]
+fn seed_legacy_memory_mailbox(path: &Path, message_count: i64) -> String {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+    seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        .expect("seed the unchanged mailbox schema using canonical SQLite");
+    seed.execute_raw(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'gh372', '/gh372', 1); \
+         INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+         VALUES (1, 1, 'BlueLake', 'codex', 'test', 1, 1); BEGIN",
+    )
+    .unwrap();
+    let body = "retained body ".repeat(320);
+    for id in 1..=message_count {
+        seed.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (?, 1, 1, 'before upgrade', ?, ?)",
+            &[
+                Value::BigInt(id),
+                Value::Text(body.clone()),
+                Value::BigInt(id),
+            ],
+        )
+        .unwrap();
+    }
+    seed.execute_raw("COMMIT").unwrap();
+    body
+}
+
 /// GH#372 / br-kp1in.46: 0.4.10 multiplied each mailbox's logical image by
 /// its connection count, even for tiny reads. Use a fresh process so an earlier
 /// test's allocator high-water mark cannot hide another whole-image allocation.
@@ -682,30 +717,7 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
     let path = std::fs::canonicalize(dir.path())
         .unwrap()
         .join("storage.sqlite3");
-    let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
-    seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-        .expect("seed the unchanged mailbox schema using canonical SQLite");
-    seed.execute_raw(
-        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'gh372', '/gh372', 1); \
-         INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
-         VALUES (1, 1, 'BlueLake', 'codex', 'test', 1, 1); BEGIN",
-    )
-    .unwrap();
-    let body = "retained body ".repeat(320);
-    for id in 1..=MESSAGE_COUNT {
-        seed.execute_sync(
-            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
-             VALUES (?, 1, 1, 'before upgrade', ?, ?)",
-            &[
-                Value::BigInt(id),
-                Value::Text(body.clone()),
-                Value::BigInt(id),
-            ],
-        )
-        .unwrap();
-    }
-    seed.execute_raw("COMMIT").unwrap();
-    drop(seed);
+    let body = seed_legacy_memory_mailbox(&path, MESSAGE_COUNT);
     assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
     let output = Command::new(std::env::current_exe().unwrap())
         .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
