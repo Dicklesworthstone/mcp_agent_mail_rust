@@ -1,5 +1,63 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 2: populated CLI reads and coordinator headroom
+
+- [x] Claim br-kp1in.18. Bind the retained real CLI to its SHA-256
+  c2d7351c0e9581d3 and the already-qualified source manifest 399faa76.
+  Current robot commands, CLI library, DB queries and reservation tools are
+  byte-identical to those captured build inputs. No new implementation credit.
+- [x] Create a private authenticated daemon and send 10,000 messages through
+  the actual MCP transport and runtime engine, using two senders. Confirm
+  10,002 stored messages, recipients and archive files (two automatic messages).
+- [x] Run search, robot health and doctor health three times with the daemon
+  running; all finish below the predeclared 10-second ceiling, without LockBusy.
+  Retain the real post-load red health detail rather than declaring it green.
+- [x] Stop only this private daemon and run all three direct fallbacks; all
+  succeed. Search returns actual scored fixture hits without a daemon.
+- [x] Restart the same populated mailbox in a fresh solo verification pass.
+  Check three live searches for 20 distinct positive-score matching hits and
+  a missing-term negative control; verify daemon route and no CLI database
+  open using strace. Both health commands complete; robot health is green.
+- [x] Finish the recipient-kind negative control and fresh stopped fallbacks.
+  The kind-filtered branch explicitly bypasses the daemon in current source;
+  `--kind bcc` returns the correct empty result in 28.9699 seconds. The fresh
+  stopped search/robot-health/doctor-health calls pass in 1.83/1.75/1.45 seconds.
+- [x] Prepare the bounded empty-kind pagination repair in the detached,
+  isolated checkout /data/projects/am-kind-read-20261102. Preserve the first
+  backend call and diagnostics; stop later pages only if the real recipient
+  table proves the kind absent. Add absent-kind, later-page and backend-error
+  controls; leave the original cursor/paging tests intact. Formatting passes.
+- [x] UBS scans the changed CLI file: exit 0, no critical findings, 2,725
+  warnings and 911 informational findings. All 20 findings on added lines
+  concern test setup/assertions. No suppression or scanner-policy edit.
+- [ ] Execute the five collector tests and the mandatory workspace checks.
+  Preserve two exact-worker and one automatic exit-103 admission refusals;
+  worker pressure and slot limits are not bypassed. No native pass yet.
+- [ ] Build the real repaired CLI and compare old/new against the same
+  populated mailbox in one invocation, including nonempty-kind and malformed
+  cursor controls. Report any self-speedup as maintenance, not an incumbent win.
+- [ ] Fresh solo recheck; merge only the qualified source change into main.
+  Keep br-kp1in.18 open for any original scope left incomplete.
+- [x] Measure current coordinator writers: a peer FrankenSearch build writes
+  197 MiB in 45 seconds. Preserve that useful work; do not call it the unique
+  cause of root growth. Root has approximately 15 GiB free before relocation.
+- [x] Recheck the idle 13,867 MiB target under mistycondor-53bnp/work with the
+  provided dry-run guard. Scan all marker depths, ancestors and mounts; no
+  protection, nested mount, open file or cwd is present. Newest entry is over
+  six hours old. This is preservation, not permission to discard cache work.
+- [x] Record the operator's exact move authorization. The provided archive
+  helpers reject hidden basenames; atomically rename only this idle target to
+  am-read-cold-target-20261102-1645 with no-clobber and leave an original-path
+  restore pointer. The complete source bytes remain until verified cutover.
+- [ ] Finish copying to trj:/bulk/worker-relocated-20261102-am-reservation-read/
+  ts1-cold-target-1645/. Require stream hash, entry count and per-file metadata/
+  content agreement; sync archive, manifests and authorization before cutover.
+- [ ] Repeat full marker, activity, modification and mount checks. Run the
+  provided cutover helper under the existing authorization; preserve exact
+  command/time, restore pointers and before/after disk headroom on both hosts.
+- [ ] Preserve native/runtime receipts durably, audit the work, update Beads
+  honestly and publish the reviewed changes with original failures intact.
+
 ## November 2: qualify reservation reads during writer contention (br-list-write-lock-kx4vn)
 
 - [x] Recheck governing document identities, current ownership and ready Beads.
