@@ -2,7 +2,23 @@
 
 ## November 1 mailbox-routing repair (br-eos8u)
 
-Latest continuation, November 2, 08:49 UTC:
+Latest continuation, November 2, 09:08 UTC:
+
+- [x] Final storage follow-up after source/acceptance publication: concurrent
+  work reduces root headroom to 14 GiB and the ballast reserve is empty.
+  Recheck current writers and preserve a bounded allocation trace; do not
+  claim a unique cause of every prior burst. Select inactive rp496, last
+  modified October 26, with no ancestor/nested protection or open files.
+  Its verified private archive is 19,757,834,240 bytes, 14,213 entries,
+  SHA-256 87fc72120ff215dd42f09f2caca2d4807550ba77432966c5b90337398adb8770.
+  All three checks pass; sync archive/manifests/logs before fresh activity
+  checks and the already authorized cutover. Relocate 18,846 MiB and leave a
+  restore pointer, raising root free 13,631 to 32,474 MiB. Five moves now
+  total 91,725 MiB (89.6 GiB). Additional receipts are on
+  trj:/bulk/ts1-relocated-20261102-am-eos8u/cass-rp496-0900/.
+  Preserve the optional compression-export warning: ordinary SSH completes
+  the valid copy and every verification. No project source is changed by
+  this follow-up; ongoing work can still consume the recovered space.
 
 - [x] Publish the routing acceptance record in a19dad71. Fresh remote refs
   at 06:19 UTC agree with the pushed main commit and its legacy mirror.
