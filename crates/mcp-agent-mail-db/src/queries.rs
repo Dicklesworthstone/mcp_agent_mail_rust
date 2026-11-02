@@ -10289,7 +10289,9 @@ pub async fn list_project_threads(
 }
 
 /// Fetch one canonical conversation without the numeric-seed expansion of
-/// [`list_thread_messages`]. A numeric key only admits its root when that
+/// [`list_thread_messages`].
+///
+/// A numeric key only admits its root when that
 /// root's canonical key is exactly equal; `0042`, `+42` and a message numbered
 /// 42 that belongs to another named thread cannot collide with key `42`.
 #[allow(clippy::too_many_lines)]

@@ -8940,7 +8940,11 @@ fn cli_discovers_nondefault_mailbox_daemon_port() {
             let _ = self.0.wait();
         }
     }
-    let env = TestEnv::new();
+    let mut env = TestEnv::new();
+    // Percent-encoding makes this URI exceed the request-ID limit without
+    // inflating its ASCII archive slug or exceeding a filesystem component.
+    env.hostile_repo = env.hostile_repo.join("é".repeat(100));
+    std::fs::create_dir_all(&env.hostile_repo).unwrap();
     let project = env.hostile_repo.to_str().unwrap();
     let port = unused_loopback_port();
     let log_path = env.tmp.path().join("discovered-daemon.log");

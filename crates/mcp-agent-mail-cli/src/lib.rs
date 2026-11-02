@@ -98717,6 +98717,17 @@ pub(crate) async fn try_call_server_tool(
     )
 }
 
+/// Keep resource correlation IDs bounded even when project paths or thread
+/// identifiers make the URI longer than the protocol's string-ID limit.
+pub(crate) fn resource_read_request_id(uri: &str) -> String {
+    use sha2::Digest as _;
+
+    format!(
+        "cli-resource-read-{}",
+        hex::encode(sha2::Sha256::digest(uri.as_bytes()))
+    )
+}
+
 /// Read an MCP resource over the daemon's JSON-RPC lane (`resources/read`).
 ///
 /// Shares the request deadline and the Success / Rejected / Unavailable
@@ -98730,7 +98741,7 @@ pub(crate) async fn try_read_server_resource(
 ) -> ServerToolCall {
     let req = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": format!("cli-resources-read-{uri}"),
+        "id": resource_read_request_id(uri),
         "method": "resources/read",
         "params": {
             "uri": uri,

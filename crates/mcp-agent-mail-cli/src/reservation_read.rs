@@ -92,7 +92,7 @@ impl ServerResourceSession {
         if !is_local_mailbox_endpoint(&session.server_url)? {
             return Ok(None);
         }
-        let id = format!("cli-resource-read-{MAILBOX_CONFIG_RESOURCE}");
+        let id = crate::resource_read_request_id(MAILBOX_CONFIG_RESOURCE);
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": &id,
@@ -453,7 +453,7 @@ async fn read_resource_json(
     uri: &str,
     timeout_seconds: u64,
 ) -> CliResult<Value> {
-    let id = format!("cli-resource-read-{uri}");
+    let id = crate::resource_read_request_id(uri);
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": &id,
@@ -853,6 +853,36 @@ fn validate_snapshot(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn resource_request_ids_fit_the_real_protocol_for_long_resource_uris() {
+        let uris = [
+            MAILBOX_CONFIG_RESOURCE.to_string(),
+            format!("resource://project/{}?format=json", "deep%2F".repeat(100)),
+            format!(
+                "resource://thread/{}?include_bodies=true",
+                "日本語🦀".repeat(80)
+            ),
+        ];
+        let mut identities = HashSet::new();
+        for uri in uris {
+            let id = crate::resource_read_request_id(&uri);
+            let encoded = serde_json::to_string(&id).unwrap();
+            assert!(encoded.len() <= fastmcp::MAX_JSONRPC_STRING_ID_ENCODED_BYTES);
+            let decoded: fastmcp::RequestId = serde_json::from_str(&encoded)
+                .expect("the actual FastMCP decoder must accept the generated identity");
+            assert_eq!(decoded, fastmcp::RequestId::String(id.clone()));
+            assert_eq!(crate::resource_read_request_id(&uri), id);
+            assert!(identities.insert(id));
+            if uri.len() > fastmcp::MAX_JSONRPC_STRING_ID_ENCODED_BYTES {
+                let old = serde_json::to_string(&format!("cli-resource-read-{uri}")).unwrap();
+                assert!(
+                    serde_json::from_str::<fastmcp::RequestId>(&old).is_err(),
+                    "the old unbounded ID must fail the same protocol boundary"
+                );
+            }
+        }
+    }
 
     pub(crate) enum TestReply {
         Resource(Value),
