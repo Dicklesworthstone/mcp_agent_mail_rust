@@ -2,7 +2,83 @@
 
 ## November 1 mailbox-routing repair (br-eos8u)
 
-Latest continuation, November 2, 06:05 UTC:
+Latest continuation, November 2, 08:49 UTC:
+
+- [x] Publish the routing acceptance record in a19dad71. Fresh remote refs
+  at 06:19 UTC agree with the pushed main commit and its legacy mirror.
+  Tracker export and cycle checks pass; no existing issue or comment is lost.
+  Release the completed routing repair's leases. Retain only this plan and
+  queries.rs under BlueSpring while working on the next observed bug.
+- [x] Claim br-kp1in.79 and inspect both real conversation-browser callers.
+  The existing server test project_conversations_follow_stable_rendered_pagination_links
+  exercises project preview, rendered older/newer links and concurrent inserts
+  through the real native pool. Retain it as the caller acceptance probe.
+- [x] Try explicit SQL parameter slots across the scoped CTE and outer page
+  query. Preserve the original binding vector, covering index, high-water
+  query, page bounds and all existing assertions. The native probes below
+  accept this repair; compiler passes alone did not establish correctness.
+- [x] Preserve the first native attempt's remote exit 101: the normally
+  selected hz3 worker lacks nextest, so no test executes there. Retry through
+  normal strict RCH on known-capable vmi1152480. Formatted source manifest
+  048b157f differs from the qualified baseline only in queries.rs; the actual
+  Cargo and Nextest working directories match all 3,770 frozen inputs.
+- [x] Finish native DB probe 30090344884338748: 4/4 pass, 3494 skipped,
+  remote exit 0, 55m57s compilation and 5.756s execution. All three original
+  failing project_threads_ tests and the existing cross-engine covering-index
+  control pass unchanged. Live and post-run source match all 3,770 inputs.
+  The actual executing DB test ELF is 126,724,008 bytes, stable-open SHA-256
+  494310fc453ade5485528ba80920b57bd4ed373269c301b8d762afb4bd6dc561.
+  Preserve the baseline 0/3 failures; the fourth control was not executed in
+  that baseline. Bead progress comment 3881 records this bounded acceptance.
+- [x] Admit the existing three conversation UI tests on vmi1153651 and the
+  all-target workspace compiler check on vmi1149989 while the DB tests compile.
+  Both actual worker source trees match all 3,770 frozen inputs. The new UBS
+  scan exits 0 with no changed-region findings; its whole-file totals remain
+  0 critical / 3,835 warning / 634 informational. This does not clear earlier
+  scans or substitute for executing the native probes.
+- [x] All-target workspace check 30090344884338751 on vmi1149989 exits 0:
+  Cargo 59m32s, remote 3600.6s. All 3,770 inputs match both live and post-run.
+  The existing proc-macro-error2 future-compatibility notice remains.
+- [x] Admit separate production check 30090344884338753 on vmi1152480 and
+  strict Clippy on normally recovered hz3 capacity. Production's actual Cargo
+  source matches all 3,770 inputs. Clippy's 3,764 present inputs match; its
+  source audit explicitly retains the same six omitted historical performance
+  JSON files as the earlier hz3 receipt. No transfer policy is changed.
+- [x] Strict workspace/all-target Clippy on hz3 exits 0 with -D warnings:
+  Cargo 31m03s, remote 1879.3s. All 3,764 present inputs match both live and
+  post-run; the same six historical performance JSON files remain absent.
+  Full-manifest source audits correctly exit 2 for those omissions; retain
+  that explicit exclusion rather than claiming a 3,770-file match. The
+  existing dependency future-compatibility notice remains.
+- [x] Separate production check 30090344884338753 exits 0: Cargo 38m29s,
+  remote 2335.2s. All 3,770 inputs match live and post-run. This checks the
+  default production library/binary graph independently of dev dependencies.
+- [x] Final cargo fmt --check and git diff --check pass.
+- [x] Native caller probe 30090344884338750 passes 3/3, 5468 skipped:
+  remote exit 0, 114m compilation and 4.953s execution. Existing native
+  file-backed WAL fixtures exercise rendered preview, forward/back links,
+  concurrent inserts and exact conversation/search links; the third test
+  checks bounded project-specific cursors. These are direct handler tests,
+  not browser/network E2E. All 3,770 inputs match live and post-run.
+  Actual executing server test ELF: 329,443,496 bytes, stable-open SHA-256
+  fd26b42d5322183091bf47ab91f779f9333ebd29a012c799c069fd89ff409007.
+- [x] Complete a fresh solo review of the original br-kp1in.79 acceptance.
+  All four DB probes, the real native caller and every required compiler/style
+  gate pass without relaxing assertions, budgets or index controls. Close
+  br-kp1in.79 at 08:48 UTC; comment 3882 cites exact receipts and exclusions.
+  This is selected Linux portable acceptance, not independent review,
+  whole-workspace runtime, release, macOS/Windows or soak qualification.
+- [x] Preserve terminal receipts on healthy trj storage, record the final
+  disposition in Beads, export/check the graph and publish the repaired source.
+  Commit 0d876c0a is pushed to main and its legacy mirror at 08:47 UTC.
+  Full receipts are retained in trj:/bulk/ts1-relocated-20261102-am-eos8u/
+  thread-slots-candidate-0656/. Preserve the baseline failures and missing-runner
+  attempt. Engine memory/import (br-kp1in.46), cache/normal-route evidence
+  (br-kp1in.75) and release holds remain open. No original criterion is moved
+  elsewhere to close this repair.
+- [x] Final tracker preservation check: both exported JSONL files retain all
+  2,847 issue IDs and every pre-existing comment. Only br-kp1in.79 changes;
+  no issue is added or removed. The dependency-cycle check remains empty.
 
 - [x] Native routing acceptance 30090344884338730 finishes with 57/57
   selected tests passing (3462 skipped), including both real Linux daemon
@@ -43,11 +119,11 @@ Latest continuation, November 2, 06:05 UTC:
   previous-page navigation includes a concurrent reply. These failures precede
   the edited empty-result assertion or occur in untouched tests. Live and
   post-run source match all 3,770 inputs. No assertion is relaxed.
-- [ ] Diagnose and repair native thread-browser completeness and stable
-  pagination. Compare the existing cross-engine metadata-query control with
-  the production high-water query before changing SQL; the cause is not yet
-  established. Tracked in P1 bug br-kp1in.79, whose named closure probe retains
-  all original assertions. Failed runtime/source receipts are synced on trj.
+- [x] Diagnose and repair native thread-browser completeness and stable
+  pagination in br-kp1in.79. Explicit SQL parameter slots preserve bindings
+  when the engine separates CTE materialization from the outer query. The
+  original named DB probes and actual caller pass as recorded above, with
+  every assertion retained. Failed runtime/source receipts remain on trj.
   Preserve these actual failures independently of routing proof. The one-bead
   structural batch held exclusive reservation 361 and ended with no cycles;
   that graph reservation is released.
@@ -133,9 +209,8 @@ Latest continuation, November 2, 06:05 UTC:
   retained failures. There is no independent runtime, full-workspace runtime,
   release, macOS/Windows or soak clearance. No original routing requirement is
   transferred to the new conversation bug.
-- [ ] Complete final tracker export/graph checks and publish the acceptance
-  record; release this repair's file leases as ownership moves to the next
-  task. Mailbox health currently reports
+- [x] Complete final tracker export/graph checks and publish the routing
+  acceptance record; hand off leases as described above. Mailbox health reports
   one unrelated reservation-thread provenance finding (346), left untouched.
 
 Earlier continuation, November 2, 02:10 UTC:
