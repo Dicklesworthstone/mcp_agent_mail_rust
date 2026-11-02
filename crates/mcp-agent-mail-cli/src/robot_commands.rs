@@ -8456,6 +8456,7 @@ where
     let mut explain = None;
     let mut assistance = None;
     let mut guidance = None;
+    let mut checked_kind_presence = false;
 
     loop {
         let response = run_query(&paged_query)?;
@@ -8477,6 +8478,25 @@ where
             )?),
             None => None,
         };
+
+        // Validate and execute the query once before this shortcut, preserving
+        // backend errors and diagnostics. If no recipient of this kind exists
+        // anywhere in this snapshot, later search pages cannot contribute a
+        // match. Do not walk the whole mailbox to prove that negative result.
+        if !checked_kind_presence && let Some(kind) = recipient_kind {
+            checked_kind_presence = true;
+            if kind_id_filter.as_ref().is_some_and(HashSet::is_empty)
+                && !has_message_recipients_of_kind(conn, kind)?
+            {
+                return Ok(CollectedSearchRows {
+                    rows: out,
+                    explain,
+                    assistance,
+                    guidance,
+                    next_cursor: None,
+                });
+            }
+        }
 
         let mut omitted_matching_row_in_page = false;
         for row in response.results {
@@ -8578,6 +8598,15 @@ fn execute_robot_search_query(
         Outcome::Cancelled(_) => Err(CliError::Other("search request cancelled".to_string())),
         Outcome::Panicked(p) => Err(CliError::Other(format!("search request panicked: {p}"))),
     }
+}
+
+fn has_message_recipients_of_kind(conn: &DbConn, kind: &str) -> Result<bool, CliError> {
+    conn.query_sync(
+        "SELECT 1 FROM message_recipients WHERE kind = ? LIMIT 1",
+        &[Value::Text(kind.to_string())],
+    )
+    .map(|rows| !rows.is_empty())
+    .map_err(|error| CliError::Other(format!("kind presence query failed: {error}")))
 }
 
 fn search_message_ids_by_recipient_kind(
@@ -21635,6 +21664,120 @@ mod tests {
             redacted: false,
             redaction_reason: None,
             ..PlannerSearchResult::default()
+        }
+    }
+
+    #[test]
+    fn collect_search_rows_stops_after_one_page_when_recipient_kind_is_absent() {
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
+
+        let conn = DbConn::open_memory().expect("real recipient database");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER, kind TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (10, 'to'), (20, 'cc')",
+            &[],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let rows = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "an absent kind must not scan the next page");
+                Ok(SearchResponse {
+                    results: vec![planner_search_result_row(
+                        10, "first", 0.9, 100, "th-1", "Alpha",
+                    )],
+                    next_cursor: Some("more-search-results".into()),
+                    explain: None,
+                    assistance: None,
+                    guidance: Some(empty_search_guidance()),
+                    audit: vec![],
+                })
+            },
+        )
+        .expect("absent recipient kind");
+        assert_eq!(calls, 1, "execute the backend once to preserve validation");
+        assert!(rows.rows.is_empty());
+        assert!(rows.next_cursor.is_none());
+        assert_eq!(
+            serde_json::to_value(rows.guidance).unwrap(),
+            serde_json::to_value(Some(empty_search_guidance())).unwrap(),
+            "keep the backend's diagnostics"
+        );
+    }
+
+    #[test]
+    fn collect_search_rows_keeps_paging_when_kind_exists_beyond_the_first_page() {
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
+
+        let conn = DbConn::open_memory().expect("real recipient database");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER, kind TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (10, 'to'), (20, 'bcc')",
+            &[],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let rows = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |query| {
+                calls += 1;
+                let (id, next_cursor) = if query.cursor.is_none() {
+                    (10, Some("second-page".into()))
+                } else {
+                    assert_eq!(query.cursor.as_deref(), Some("second-page"));
+                    (20, None)
+                };
+                Ok(SearchResponse {
+                    results: vec![planner_search_result_row(
+                        id, "match", 0.9, 100, "th-1", "Alpha",
+                    )],
+                    next_cursor,
+                    explain: None,
+                    assistance: None,
+                    guidance: None,
+                    audit: vec![],
+                })
+            },
+        )
+        .expect("recipient kind on a later page");
+        assert_eq!(calls, 2);
+        assert_eq!(rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(), [20]);
+        assert!(rows.next_cursor.is_none());
+    }
+
+    #[test]
+    fn collect_search_rows_preserves_backend_errors_before_kind_presence_probe() {
+        use mcp_agent_mail_db::search_planner::SearchQuery;
+
+        // No recipient table: probing it before the backend would hide the
+        // actual query/cursor error behind an unrelated database error.
+        let conn = DbConn::open_memory().expect("real empty database");
+        let result = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |_| Err(CliError::Other("invalid search cursor control".into())),
+        );
+        match result {
+            Err(CliError::Other(message)) => assert_eq!(message, "invalid search cursor control"),
+            _ => panic!("the original backend error must survive"),
         }
     }
 
