@@ -2,7 +2,7 @@
 
 ## November 1 mailbox-routing repair (br-eos8u)
 
-Latest continuation, November 2, 03:50 UTC:
+Latest continuation, November 2, 06:05 UTC:
 
 - [x] Native routing acceptance 30090344884338730 finishes with 57/57
   selected tests passing (3462 skipped), including both real Linux daemon
@@ -18,25 +18,55 @@ Latest continuation, November 2, 03:50 UTC:
   queries.rs test assertion. Replace only its empty-vector assertion with an
   equality diagnostic; no production behavior or lint policy changes. Current
   manifest 435f811f differs only at that cfg(test) assertion. Formatting and
-  whitespace pass. Its UBS scan remains exit 1 (0 critical / 3835 warning /
+  whitespace pass. Its actual UBS scan exits 0 (0 critical / 3835 warning /
   634 informational); the sole changed-line warning is the test assertion.
+  Correct the earlier grouping of this scan with the two nonzero scans;
+  neither the CLI nor the DB-fixture scanner result is thereby cleared.
 - [x] Execute all three DB regression controls on the frozen a61defcb source:
   index density passes both original page sizes and all thresholds; legacy
   payload equality fails on canonical Int versus native BigInt representations;
   connection memory fails at 57,160 KiB above baseline against the original
   32 MiB limit. Preserve exit 100 and the actual integration ELF identity.
   Neither failure is waived or represented as passing.
-- [ ] Resolve or track the canonical integer-representation oracle separately;
+  Read-only comparison of the complete printed payloads confirms equality
+  after only the 25 integer tags are normalized. Later migration/write phases
+  remain unexecuted because the original assertion aborts the test.
+- [ ] Resolve the canonical integer-representation oracle within the existing
+  br-kp1in.46 engine-adoption acceptance work;
   retain exact payload, type, null, row-order and timestamp controls.
 - [x] Record the memory failure against existing br-kp1in.46 (comment 3878);
   live and post-run DB source both match all 3,770 inputs. The new registry
   engine does not yet meet this probe's bounded-memory budget.
-- [ ] Complete the three existing project_threads_ query tests on 435f811f.
-  Their actual Cargo/Nextest namespaces match all 3,770 inputs.
-- [ ] Finish current strict Clippy on hz3, then all-target and separate
-  production checks. The hz3 transfer omits six historical tests/artifacts/perf
+- [x] Execute the three existing project_threads_ query tests on 435f811f:
+  native 30090344884338738 exits 100, 0/3 pass (3495 skipped), after 58m31s
+  compilation and 3.839s execution. Thread counts return 1 instead of 14/200;
+  previous-page navigation includes a concurrent reply. These failures precede
+  the edited empty-result assertion or occur in untouched tests. Live and
+  post-run source match all 3,770 inputs. No assertion is relaxed.
+- [ ] Diagnose and repair native thread-browser completeness and stable
+  pagination. Compare the existing cross-engine metadata-query control with
+  the production high-water query before changing SQL; the cause is not yet
+  established. Tracked in P1 bug br-kp1in.79, whose named closure probe retains
+  all original assertions. Failed runtime/source receipts are synced on trj.
+  Preserve these actual failures independently of routing proof. The one-bead
+  structural batch held exclusive reservation 361 and ended with no cycles;
+  that graph reservation is released.
+- [x] Current strict Clippy 30090344884338739 on hz3 passes exit 0
+  (33m28s Cargo / 2018.3s frontdoor). The hz3 transfer omits six historical tests/artifacts/perf
   JSON receipts; all 3,764 present files match. Keep that explicit exclusion,
-  rather than claiming an exact full-tree match or changing transfer policy.
+  both live and post-run, rather than claiming an exact full-tree match or
+  changing transfer policy. The existing proc-macro-error2 future-compatibility
+  notice remains; this is not a claim of warning-free dependencies.
+- [x] Finish all-target 30090344884338740 on vmi1153651: exit 0,
+  Cargo 58m38s, frontdoor 3543.1s. Live and post-run source match all 3,770
+  inputs. Its following production request refuses admission 103 before Cargo;
+  preserve the two outcomes separately. The existing future-compatibility
+  notice remains.
+- [x] Finish normal fleet-selected production check 30090344884338743, admitted on
+  vmi1152480 at 05:13 UTC. Actual Cargo PID 2081079 matches all 3,770 inputs.
+  Its source tag is a0023222; source bytes still match 435f811f after the shared
+  a143e70d/a0023222 commits. Exit 0, Cargo 43m41s, frontdoor 2648.1s; post-run
+  all 3,770 inputs also match. No worker-policy override or local compilation.
 - [x] Apply the explicitly requested system-performance-remediation move to
   healthy trj:/bulk. The first inactive scratch tree is retained in a private
   verified 11,937,157,120-byte archive (166,099 entries; SHA-256
@@ -44,17 +74,51 @@ Latest continuation, November 2, 03:50 UTC:
   All three copy checks pass and archive/manifests are durable before cutover.
   The source now has a restore pointer; root headroom rises from 1,068 to
   12,734 MiB. Exact authorization, command and invocation time are logged.
-- [ ] Finish COPY/VERIFY of the two selected inactive CASS scratchpad trees
+- [x] Finish COPY/VERIFY of the two selected inactive CASS scratchpad trees
   gh537 and gh483, then recheck protection markers, modification times, open
   files and process working directories before each authorized cutover.
   Keep active/recent and protected scratch trees in place; leave the failed
   NAS untouched. Preserve source-operation logs durably on trj.
+  All three selected moves are now complete, relocating about 53 GiB of
+  original disk use. The latest observed root headroom is 36 GiB; concurrent
+  work still consumes space, so this is not a promise of permanent relief.
+- [x] Complete an additional verified move of inactive codexnoop10k (about
+  19 GiB, 136,500 entries, last modified October 12). Continued active work
+  creates new preservation archives on root, consuming the recovered space;
+  leave those recent artifacts in place. All ancestor/nested protections are
+  clear and strict lsof returns 1 with empty stdout/stderr. COPY/VERIFY starts
+  at 05:15 UTC with the same reviewed helpers. A bounded 64 MiB source-to-trj
+  uncompressed transfer measures 12.3 MiB/s, so retain per-invocation SSH
+  compression. All three checks pass at 05:39 UTC: SHA-256
+  3bd58b53e11388c4d107ef0ca05f451265a077491a80837b49e4368d3e8c738c,
+  136,500 entries, 19,527,843,840 archive bytes. Sync archive/log/manifests
+  before cutover; relocate 18,728 MiB, leave a restore pointer, and observe
+  root 19,207 to 37,935 MiB free. The four moves total 72,879 MiB (71.2 GiB)
+  of original disk use. Complete authorization/command/time/result log is
+  synced as evidence-0350/relocation-source-complete-0552.log on trj.
+- [x] Preserve completed compiler/scanner/source receipts separately on healthy
+  trj storage. A bounded allocation trace captures ordinary database checkpoint
+  and linker allocations, not a proven single cause for every root-space
+  change. Journals are on RAM-backed /run. No shared service or kernel setting
+  is changed; concurrent work continues consuming recovered headroom.
 - [x] Verify gh537's 22,858,557,440-byte archive (595,319 entries;
   SHA-256 8fe610a3437978bbd8be0688ab8ae6dbee247c9e0f76ee35c609b3d2e10dad7c)
   by all three checks; sync archive/log/manifests. Source cutover then refuses
   on its open-file check and removes nothing. Two subsequent read-only lsof
   checks are clear, including the helper's exact invocation; retain the refusal
   and defer retry while gh483 copies. A verified archive is not a completed move.
+- [x] After the gh483 tar stream finishes, retry gh537 through the unchanged
+  helper. Cutover succeeds: 22,290 MiB relocated, source pointer left, root
+  8,526 to 30,814 MiB free. Preserve the initial refusal and successful retry
+  separately. Source authorization/command/result log and completed README
+  are synced on trj; restore instructions preserve the pointer by renaming it.
+- [x] Verify gh483's 21,140,008,960-byte archive (28,583 entries; SHA-256
+  554dfffa4ad691fe3a1fbe533b9285f280678230f54f650c8cc67e2fd29e8d9c),
+  sync archive/log/manifests, then complete its protected/idleness-checked
+  cutover: 20,195 MiB relocated, source pointer retained, root 16,759 to
+  36,943 MiB free. Complete authorization, exact commands, timestamps and
+  results are retained in trj:/bulk/ts1-relocated-20261102-am-eos8u/
+  evidence-0350/relocation-source-complete-0443.log. No data is discarded.
 - [x] Identify the recurring scratch writer: six-day experimental daemon
   3839886, private port 47299, absent launcher/session leader 3567556, no
   external connected clients. A strict empty-socket check first aborts without
@@ -63,9 +127,15 @@ Latest continuation, November 2, 03:50 UTC:
   pidfd at 03:57:35 UTC. It exits cleanly. Preserve all its data and leave
   shared mailbox PID 3047470 running. Root free space then holds near 9.2 GiB
   in subsequent samples; do not infer that every possible writer is fixed.
-- [ ] Finish acceptance, export/graph checks and publication; update the
-  existing Bead without converting these selected results into release
-  clearance. Seven owned leases are renewed. Mailbox health currently reports
+- [x] Finish a fresh solo pass against the original routing criteria and close
+  owned br-eos8u on native 57/57 plus the required compiler gates. Closure
+  comment 3880 records exact source/ELF identities, transfer exclusions and
+  retained failures. There is no independent runtime, full-workspace runtime,
+  release, macOS/Windows or soak clearance. No original routing requirement is
+  transferred to the new conversation bug.
+- [ ] Complete final tracker export/graph checks and publish the acceptance
+  record; release this repair's file leases as ownership moves to the next
+  task. Mailbox health currently reports
   one unrelated reservation-thread provenance finding (346), left untouched.
 
 Earlier continuation, November 2, 02:10 UTC:
