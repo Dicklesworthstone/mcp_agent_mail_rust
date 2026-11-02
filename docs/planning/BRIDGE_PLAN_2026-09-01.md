@@ -2,6 +2,76 @@
 
 ## November 1 mailbox-routing repair (br-eos8u)
 
+Latest continuation, November 2, 01:09 UTC:
+
+- [x] Review peer commits d575364e and 7f9c3bfd: they preserve the exact
+  resource-ID repair and its pending-acceptance record. All 3,770 source inputs
+  still match manifest 2c86bd93; committed-head manifest 37fce3fd records the
+  same inputs at 7f9c3bfd. No source edit or test result is inferred from a commit.
+- [x] Complete the three-file UBS scan with reliable RAM output: 739 seconds,
+  exit 1, 4 critical / 12,069 warning / 5,471 informational findings. All four
+  critical flags are existing reservation_read.rs comparisons at lines
+  182/183/205/218: protocol version, public tool request ID, content type and
+  equality of two returned payload representations. These are not comparisons
+  of authentication secrets. All 14 findings on new lines are test-only
+  (12 warnings / 2 informational). Preserve the nonzero scan; no annotation,
+  skipped category, baseline regeneration or unrelated gate-clearing rewrite.
+- [x] Admit current-source native, all-target and strict Clippy jobs through
+  normal RCH policy. Each actual Cargo namespace matches all 3,770 frozen
+  inputs with no exclusion or mismatch. Their output is RAM-backed. The native
+  selection includes all original routing controls and reservation_read::tests.
+- [ ] Observe populated native results, required compiler exits and a separate
+  current production lib/bins check. No current runtime pass exists yet.
+- [ ] Keep the red scanner result explicit in acceptance; do not label it clean
+  or manufacture a green result by rewriting unrelated response checks.
+- [x] At 01:21 UTC the coordinator's /tmp tmpfs also reaches 64/64 GiB.
+  Inspect memory first (49 GiB available), then raise only its capacity limit
+  to 72 GiB with `sudo -n mount -o remount,size=72G /tmp`. Preserve nosuid,
+  nodev, inode settings and every file; the failed NAS is untouched. This
+  reversible operational change restores 8 GiB of capture headroom. All three
+  owned wrappers remain active; their compilations are not replayed.
+- [ ] Restore the former 64 GiB tmpfs limit only after usage is safely below it
+  and active captures cannot be disrupted; otherwise hand off the exact 72 GiB
+  setting. Do not shrink a full filesystem or remove peer files to meet this.
+
+- [x] Preserve the exact resource-ID correction and Unicode long-URI fixture.
+  Current manifest 2c86bd93 has 3,770 tracked inputs except Beads/planning;
+  CLI hash 382dfa13, reservation reader 05605eb8, integration e5fa4d4c.
+  The encoded URI grows without enlarging the fixture's ASCII archive slug.
+- [x] Verify fresh formatting/whitespace and the current read-only mailbox
+  health: same owner PID, parity 343/343, healthy. Renew only the five owned
+  source/plan leases through 04:01–04:12 UTC.
+- [x] Observe build 30090344884338728's actual Cargo and Nextest namespaces:
+  all 3,770 inputs match, no exclusions or mismatch. It is ordinary strict RCH
+  after the receipt-enabled compile request fails before Cargo on excluded
+  fuzz manifests' unavailable sibling paths. No sibling dependency is smuggled
+  in and no manifest or source-admission policy is weakened.
+- [x] Preserve the second full-disk failure: the first three-file scanner
+  exits 2 on its home-cache write. New cache and temporary output paths use
+  supported per-process RAM settings; protected existing home caches stay put.
+- [x] Preserve the NAS failure separately. Kernel buffer I/O errors on sda1
+  make the existing NAS evidence directory inaccessible. Source, patches,
+  manifests and tracker are copied to local recovery storage; earlier NAS
+  receipts are currently unreadable, not missing-test successes. No filesystem
+  repair, remount, service restart or shared-mailbox reconstruction is performed.
+- [x] Recover old all-target build 30090344884338723 after its caller aborts
+  134: actual remote exit 143, terminal acknowledged. No all-target pass follows.
+  Cancel only owned native build 30090344884338728 while it is compiling into
+  the failed capture destination; recover exit 143/acknowledged, not a test pass.
+- [ ] Complete the replacement native selection with the same cases, features
+  and watchdogs, using RAM logs/artifacts. No test result for the resource-ID
+  correction exists yet; normal requests have also refused admission 103.
+- [ ] Complete current-source strict Clippy, all-target and separate production
+  checks through ordinary admission. The earlier production pass (28m30s,
+  all 3,770 source files matched afterward) qualifies c573e11e only.
+- [ ] Finish the replacement three-file scanner with reliable local/RAM output,
+  review changed-line findings, then fresh original acceptance and publication.
+
+Current reliable recovery root:
+`/data/tmp/am-eos8u-io-recovery-20261102T0044/`; new run output is under
+`/tmp/am-eos8u-runs-20261102T0050/`. Preserve the NAS receipts for operator
+recovery. Do not run its old cache-relocation helper while the volume is failing.
+
 - [x] Resume after disk recovery: 22 GiB available; read-only mailbox health
   passes again with the same owner PID, reservation parity 327/327. No repair,
   reconstruction, service change or protected-home cache move was performed.
