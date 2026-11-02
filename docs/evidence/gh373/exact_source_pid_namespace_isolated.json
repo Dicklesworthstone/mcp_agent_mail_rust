@@ -1,0 +1,27 @@
+{
+  "fixture": "/tmp/am373-proc-view-eukr6nw0/candidate",
+  "controller_local_pid": 1,
+  "controller_proc_pid": "94503",
+  "controller_uids": "Uid:\t0\t0\t0\t0",
+  "before_preflight": {
+    "rc": 0,
+    "stdout": "OK before preflight",
+    "stderr": ""
+  },
+  "before_delete": {
+    "rc": 1,
+    "stdout": "ERR before delete WouldBlock: backup has an active file reader in process 94505",
+    "stderr": ""
+  },
+  "current_preflight": {
+    "rc": 0,
+    "stdout": "OK current preflight",
+    "stderr": ""
+  },
+  "current_delete": {
+    "rc": 0,
+    "stdout": "OK current delete",
+    "stderr": ""
+  },
+  "exists": false
+}

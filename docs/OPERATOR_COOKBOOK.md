@@ -577,9 +577,14 @@ incident evidence into `doctor/reclaimable/` remains a move: those bytes still
 occupy the filesystem.
 
 `AM_BACKUP_KEEP_COUNT` requests the newest three generations per backup kind by
-default, with a minimum of one. The current `.bak` publication slot and the
-exact verified recovery generation remain protected, even when an older verified
-generation falls outside that window. Automatic deletion accepts only strict
+default, with a minimum of one. For periodic backups, this is one window across
+images beside the database and eligible images in native
+`doctor/reclaimable/rotation-*/` directories. Dated periodic generations are
+ordered by their filename timestamps and collision suffixes, independently of
+directory names or copy-preserved modification times. The current `.bak`
+publication slot retains its modification-time ordering and counts toward that
+window; it and the exact verified recovery generation remain protected even
+when they fall outside it. Automatic deletion accepts only strict
 timestamped periodic names, requires a fully verified newer restore point and
 a valid standalone candidate, and proves common mailbox scope through a
 matching nonempty database lineage or an exact byte-for-byte match to the
@@ -588,6 +593,19 @@ Companion recovery state, changed files, unsafe paths, or observed active
 readers cause refusal. On Linux this includes memory mappings whose file
 descriptors have already closed. A bad backup cannot become disposable merely
 because its filename looks old.
+
+On Linux, an unreadable same-user `/proc/<pid>/fd` or `maps` entry remains a
+refusal when the process's readers cannot be established. The error names the
+process entry, rather than alleging a permissions problem with the backup.
+Session-daemon names, different groups, and capability changes do not prove
+that inherited descriptors or mappings have closed. A terminated thread-group
+leader is skipped only when kernel evidence proves its own descriptor table
+and address space are gone; surviving workers are still inspected. Cleanup
+uses the mounted `/proc/self` PID when excluding its own retained descriptor,
+so an ancestor procfs mount does not make it count itself as another reader.
+This inspection is bounded and best-effort for noncooperating external opens;
+snapshot authority supplies the separate exclusion for cooperating publishers
+and restore readers. Permission uncertainty never authorizes a blanket skip.
 
 Retention inventories both resident backups and material already accumulated
 under `doctor/reclaimable/`. Native historical rotation files are eligible only
@@ -626,7 +644,7 @@ by older interrupted inspections also spend the parent-wide staging count
 and byte budget. They remain uncertain recovery evidence; automatic retention
 does not delete them. A failed inspection preserves its new staging directory
 and reports that path, while successful metadata publication removes it.
-The resident retention window can shorten to restore count or byte capacity,
+The periodic retention window can shorten to restore count or byte capacity,
 while preserving the publication slot and verified recovery generation. Only
 confirmed removals reduce that calculation; a refused candidate cannot prevent
 cleanup from considering another safely superseded generation in the window.

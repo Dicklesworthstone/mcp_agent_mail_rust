@@ -1,0 +1,144 @@
+warning: patch `fsqlite v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-ast v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-btree v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-core v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-error v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-ext-fts5 v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-ext-icu v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-ext-json v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-ext-misc v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-ext-rtree v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-func v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-mvcc v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-observability v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-pager v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-parser v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-planner v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-types v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-vdbe v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-vfs v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+warning: patch `fsqlite-wal v0.3.18 (https://github.com/Dicklesworthstone/frankensqlite?rev=2633b38a26bde68db23172b12aa402ed698cc309#2633b38a)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+     Locking 7 packages to highest compatible versions
+      Adding git2 v0.21.0
+      Adding jobserver v0.1.35
+      Adding libgit2-sys v0.18.8+1.9.7
+      Adding libz-sys v1.1.31
+      Adding mcp-agent-mail-test-helpers v0.3.40 (/workspace/scratch/1fd7fe6e98fc/mcp_agent_mail_rust/crates/mcp-agent-mail-test-helpers)
+      Adding openssl-src v300.6.1+3.6.3
+      Adding openssl-sys v0.9.117
+    Blocking waiting for file lock on package cache
+   Compiling syn v3.0.9
+   Compiling libc v0.2.190
+   Compiling jobserver v0.1.35
+   Compiling cc v1.6.0
+   Compiling displaydoc v0.2.7
+   Compiling serde_derive v1.0.229
+   Compiling serde v1.0.229
+   Compiling semver v1.0.28
+   Compiling rustc_version v0.4.1
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling thiserror-impl v2.0.21
+   Compiling rustix v1.1.5
+   Compiling smallvec v1.16.2
+   Compiling thiserror v2.0.21
+   Compiling cipher v0.5.2
+   Compiling zerocopy v0.8.61
+   Compiling time-macros v0.2.32
+   Compiling pem-rfc7468 v0.7.0
+   Compiling universal-hash v0.6.1
+   Compiling ring v0.17.14
+   Compiling synstructure v0.13.2
+   Compiling serde_json v1.0.151
+   Compiling log v0.4.34
+   Compiling const-oid v0.9.6
+   Compiling deranged v0.5.8
+   Compiling time v0.3.55
+   Compiling der v0.7.10
+   Compiling asn1-rs-derive v0.6.0
+   Compiling rusticata-macros v4.1.0
+   Compiling signature v2.2.0
+   Compiling rand_core v0.6.4
+   Compiling curve25519-dalek v4.1.3
+   Compiling asn1-rs-impl v0.2.0
+   Compiling subtle v2.6.1
+   Compiling cpubits v0.1.1
+   Compiling nix v0.31.3
+   Compiling asn1-rs v0.7.2
+   Compiling ppv-lite86 v0.2.21
+   Compiling spki v0.7.3
+   Compiling num-integer v0.1.47
+   Compiling rustls-pki-types v1.15.1
+   Compiling oid-registry v0.8.1
+   Compiling untrusted v0.9.0
+   Compiling num-bigint v0.4.8
+   Compiling pkcs8 v0.10.2
+   Compiling rand_chacha v0.3.1
+   Compiling parking_lot_core v0.9.12
+   Compiling tempfile v3.27.0
+   Compiling polyval v0.7.3
+   Compiling sha2 v0.10.9
+   Compiling ed25519 v2.2.3
+   Compiling chacha20 v0.10.2
+   Compiling tracing-core v0.1.36
+   Compiling aead v0.6.1
+   Compiling tinyvec v1.13.3
+   Compiling virtue-next v0.1.3
+   Compiling rustls v0.23.46
+   Compiling data-encoding v2.11.1
+   Compiling bincode-next v3.1.1
+   Compiling bincode_derive-next v3.1.1
+   Compiling unicode-normalization v0.1.25
+   Compiling tracing v0.1.44
+   Compiling ed25519-dalek v2.2.0
+   Compiling ghash v0.6.0
+   Compiling rapidhash v4.5.1
+   Compiling prost-derive v0.14.4
+   Compiling rand v0.8.8
+   Compiling signatory v0.27.1
+   Compiling der-parser v10.0.0
+   Compiling rustls-webpki v0.103.16
+   Compiling franken-evidence v0.5.0
+   Compiling aes v0.9.3
+   Compiling poly1305 v0.9.1
+   Compiling ctr v0.10.1
+   Compiling sha1 v0.11.0
+   Compiling sha2 v0.11.1
+   Compiling franken-kernel v0.5.0
+   Compiling rmp v0.8.15
+   Compiling pin-project-internal v1.1.13
+   Compiling unty-next v0.1.2
+   Compiling lazy_static v1.5.1
+   Compiling pastey v0.2.3
+   Compiling bytes v1.12.1
+   Compiling hex v0.4.3
+   Compiling asupersync v0.5.0
+   Compiling futures-core v0.3.34
+   Compiling parking v2.2.1
+   Compiling futures-lite v2.6.1
+   Compiling prost v0.14.4
+   Compiling x509-parser v0.18.1
+   Compiling pin-project v1.1.13
+   Compiling rmp-serde v1.3.1
+   Compiling franken-decision v0.5.0
+   Compiling aes-gcm v0.11.1
+   Compiling chacha20poly1305 v0.11.0
+   Compiling nkeys v0.4.5
+   Compiling parking_lot v0.12.5
+   Compiling webpki-roots v1.0.11
+   Compiling crossbeam-queue v0.3.14
+   Compiling polling v3.11.0
+   Compiling xattr v1.6.1
+   Compiling hmac v0.13.0
+   Compiling sysinfo v0.39.6
+   Compiling asupersync-macros v0.5.0
+   Compiling socket2 v0.6.5
+   Compiling base64 v0.23.1
+error: could not compile `asupersync` (lib)
+
+Caused by:
+  process didn't exit successfully: `/tmp/am373-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc --crate-name asupersync --edition=2024 /tmp/am373-cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -Z embed-metadata=no -C opt-level=1 -C embed-bitcode=no -C debug-assertions=on --cfg 'feature="default"' --cfg 'feature="nightly-outcome-try"' --cfg 'feature="proc-macros"' --cfg 'feature="tls"' --cfg 'feature="tls-webpki-roots"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("atp-cli", "atpd-daemon", "benchmark-adapters", "browser-io", "browser-trace", "cancel-correctness-oracle", "channel-mpsc-select-e2e", "ci-cross-platform", "cli", "compression", "config-file", "criterion-benches", "cross-subsystem-recovery-e2e", "debug-server", "default", "dependency-ledger", "deterministic-mode", "distributed-hash-snapshot-recovery-e2e", "fuzz", "h3-websocket-e2e", "http3", "io-uring", "kafka", "lab-stack-traces", "legacy-internal-test-harnesses", "lock-metrics", "loom-tests", "messaging-fabric", "metrics", "mysql", "native-runtime", "nightly-outcome-try", "obligation-cleanup-e2e", "obligation-leak-detection", "postgres", "proc-macros", "quic", "raptorq-roundtrip-e2e", "real-service-e2e", "remote-service", "runtime-metrics", "serialization-golden-harnesses", "simd-intrinsics", "sqlite", "tailscale-path-provider", "test-internals", "tls", "tls-native-roots", "tls-webpki-roots", "tokio-compat", "tower", "trace-compression", "tracing-integration", "waker-profiling", "wasm-browser-deterministic", "wasm-browser-dev", "wasm-browser-minimal", "wasm-browser-preview", "wasm-browser-prod", "wasm-runtime"))' -C metadata=d876a4b1f9aa6f9a -C extra-filename=-9d88b0e1fe606cea --out-dir /tmp/am373-target/debug/build/asupersync/9d88b0e1fe606cea/out -C strip=debuginfo -L dependency=/tmp/am373-target/debug/build/aead/d1c2ef37a1fe6e52/out -L dependency=/tmp/am373-target/debug/build/aes/3e73b15a2d21b72e/out -L dependency=/tmp/am373-target/debug/build/aes-gcm/937b7cd5f2a503d6/out -L dependency=/tmp/am373-target/debug/build/allocator-api2/97a3f85e614e3e7f/out -L dependency=/tmp/am373-target/debug/build/asn1-rs/f024ece86374625e/out -L dependency=/tmp/am373-target/debug/build/asn1-rs-derive/6fc9f32f65903fff/out -L dependency=/tmp/am373-target/debug/build/asn1-rs-impl/bd66991ab41fe998/out -L dependency=/tmp/am373-target/debug/build/asupersync-macros/4fc852f936f59328/out -L dependency=/tmp/am373-target/debug/build/base64/1a441a9a5d995fb6/out -L dependency=/tmp/am373-target/debug/build/base64ct/768def87096dcbbb/out -L dependency=/tmp/am373-target/debug/build/bincode-next/2e16f8e779841d29/out -L dependency=/tmp/am373-target/debug/build/bincode_derive-next/d3d5d1dad3924da1/out -L dependency=/tmp/am373-target/debug/build/bitflags/dcde2d1f1e0427d5/out -L dependency=/tmp/am373-target/debug/build/block-buffer/3598aed4b7afd81d/out -L dependency=/tmp/am373-target/debug/build/block-buffer/4d12ee8ff1e5691d/out -L dependency=/tmp/am373-target/debug/build/bytes/fdfd1af25cd361dc/out -L dependency=/tmp/am373-target/debug/build/cfg-if/ce341fc238abd1da/out -L dependency=/tmp/am373-target/debug/build/chacha20/097ee0fb9a0b9b5a/out -L dependency=/tmp/am373-target/debug/build/chacha20poly1305/1a70d6e47e31a27a/out -L dependency=/tmp/am373-target/debug/build/cipher/a38740679b0a0277/out -L dependency=/tmp/am373-target/debug/build/cmov/e80f5f4bebecb480/out -L dependency=/tmp/am373-target/debug/build/const-oid/5142080a30f2b6d0/out -L dependency=/tmp/am373-target/debug/build/const-oid/69040a898d9c82e0/out -L dependency=/tmp/am373-target/debug/build/cpubits/22617541dc46326a/out -L dependency=/tmp/am373-target/debug/build/cpufeatures/1a99e1206fd6af30/out -L dependency=/tmp/am373-target/debug/build/cpufeatures/2dfb8203b32118e1/out -L dependency=/tmp/am373-target/debug/build/crc32fast/01e62088acd0a60d/out -L dependency=/tmp/am373-target/debug/build/crossbeam-queue/cb7a78778d3c5952/out -L dependency=/tmp/am373-target/debug/build/crossbeam-utils/73b7aa733be28de1/out -L dependency=/tmp/am373-target/debug/build/crypto-common/7454890c74071f44/out -L dependency=/tmp/am373-target/debug/build/crypto-common/a028f4b22cff40d0/out -L dependency=/tmp/am373-target/debug/build/ctr/4f53e9fa1cd3b65f/out -L dependency=/tmp/am373-target/debug/build/ctutils/e8413c74589f965c/out -L dependency=/tmp/am373-target/debug/build/curve25519-dalek/951bd5d8553d9ed0/out -L dependency=/tmp/am373-target/debug/build/curve25519-dalek-derive/4d2a113f8f7198a3/out -L dependency=/tmp/am373-target/debug/build/data-encoding/30ad1ca80b89903f/out -L dependency=/tmp/am373-target/debug/build/der/9a9f30e32a2edd7c/out -L dependency=/tmp/am373-target/debug/build/der-parser/7c3db0b3c70becb2/out -L dependency=/tmp/am373-target/debug/build/deranged/e8104114fc8975a3/out -L dependency=/tmp/am373-target/debug/build/digest/25a277e3450bda81/out -L dependency=/tmp/am373-target/debug/build/digest/77394843ddcbd7e5/out -L dependency=/tmp/am373-target/debug/build/displaydoc/ce2e6f114025049f/out -L dependency=/tmp/am373-target/debug/build/ed25519/d5ea02da51452d8f/out -L dependency=/tmp/am373-target/debug/build/ed25519-dalek/1bcdd91011a6f895/out -L dependency=/tmp/am373-target/debug/build/equivalent/f56d7b01e127f555/out -L dependency=/tmp/am373-target/debug/build/errno/8b96881349e5d416/out -L dependency=/tmp/am373-target/debug/build/fastrand/1ea006c1392e1a76/out -L dependency=/tmp/am373-target/debug/build/foldhash/25b50bbf1d487745/out -L dependency=/tmp/am373-target/debug/build/franken-decision/07c465f96f4662f6/out -L dependency=/tmp/am373-target/debug/build/franken-evidence/2fdb861a6b246a34/out -L dependency=/tmp/am373-target/debug/build/franken-kernel/cf429f89ffbf9366/out -L dependency=/tmp/am373-target/debug/build/futures-core/21cd024cff928a9d/out -L dependency=/tmp/am373-target/debug/build/futures-io/13b3d9f8032ab75e/out -L dependency=/tmp/am373-target/debug/build/futures-lite/4108a32421904927/out -L dependency=/tmp/am373-target/debug/build/generic-array/38b06c8d9238a0a9/out -L dependency=/tmp/am373-target/debug/build/getrandom/97fa23f7712ae995/out -L dependency=/tmp/am373-target/debug/build/getrandom/c0b7bbc5be359805/out -L dependency=/tmp/am373-target/debug/build/ghash/7a84fdae8b656baf/out -L dependency=/tmp/am373-target/debug/build/hashbrown/e537424730d8f660/out -L dependency=/tmp/am373-target/debug/build/hex/a7827db727680271/out -L dependency=/tmp/am373-target/debug/build/hmac/ca800c7cb6dc483b/out -L dependency=/tmp/am373-target/debug/build/hybrid-array/a47767acb34fd64c/out -L dependency=/tmp/am373-target/debug/build/indexmap/2a37c4cde7690cec/out -L dependency=/tmp/am373-target/debug/build/inout/3a6ac9259cc4da0d/out -L dependency=/tmp/am373-target/debug/build/itoa/f8c13be710584985/out -L dependency=/tmp/am373-target/debug/build/lazy_static/4786f107b3ca39af/out -L dependency=/tmp/am373-target/debug/build/libc/e7d7bf53876f1713/out -L dependency=/tmp/am373-target/debug/build/linux-raw-sys/ee46ca8011bf5981/out -L dependency=/tmp/am373-target/debug/build/lock_api/815d99771406a282/out -L dependency=/tmp/am373-target/debug/build/log/4b261e638430570c/out -L dependency=/tmp/am373-target/debug/build/memchr/a3f2bed728f657f6/out -L dependency=/tmp/am373-target/debug/build/memoffset/2d09004f88164f70/out -L dependency=/tmp/am373-target/debug/build/minimal-lexical/7c4202616cb3f030/out -L dependency=/tmp/am373-target/debug/build/nix/7d278db156167807/out -L dependency=/tmp/am373-target/debug/build/nkeys/50c02bc2cc94d2b6/out -L dependency=/tmp/am373-target/debug/build/nom/d7e38726fff5397d/out -L dependency=/tmp/am373-target/debug/build/num-bigint/5361635cd8776b82/out -L dependency=/tmp/am373-target/debug/build/num-conv/385e00718fa8b497/out -L dependency=/tmp/am373-target/debug/build/num-integer/1853a40a0f6170f0/out -L dependency=/tmp/am373-target/debug/build/num-traits/1927affba26ecac1/out -L dependency=/tmp/am373-target/debug/build/oid-registry/faf7855cb07bd4b8/out -L dependency=/tmp/am373-target/debug/build/once_cell/e03746ef665551bc/out -L dependency=/tmp/am373-target/debug/build/parking/ac6a3c3c5b055839/out -L dependency=/tmp/am373-target/debug/build/parking_lot/f0682501380cf6b9/out -L dependency=/tmp/am373-target/debug/build/parking_lot_core/815ae559e82c06b0/out -L dependency=/tmp/am373-target/debug/build/pastey/8bcdca046ca540bd/out -L dependency=/tmp/am373-target/debug/build/pem-rfc7468/f2970e04f696dfef/out -L dependency=/tmp/am373-target/debug/build/pin-project/04e4d126c9e88272/out -L dependency=/tmp/am373-target/debug/build/pin-project-internal/122b7eea859f536b/out -L dependency=/tmp/am373-target/debug/build/pin-project-lite/9a7198f1b056fdbe/out -L dependency=/tmp/am373-target/debug/build/pkcs8/f9b35d0e4291a68b/out -L dependency=/tmp/am373-target/debug/build/polling/7d0563e20868a69f/out -L dependency=/tmp/am373-target/debug/build/poly1305/4295b38e29779a96/out -L dependency=/tmp/am373-target/debug/build/polyval/a887da19c446323d/out -L dependency=/tmp/am373-target/debug/build/powerfmt/055d49b44106ea10/out -L dependency=/tmp/am373-target/debug/build/ppv-lite86/69d7f6dc58a66d9e/out -L dependency=/tmp/am373-target/debug/build/prost/06e0bce2345f9e43/out -L dependency=/tmp/am373-target/debug/build/prost-derive/33c5b913ea20fd06/out -L dependency=/tmp/am373-target/debug/build/rand/ef804d9128ab6966/out -L dependency=/tmp/am373-target/debug/build/rand_chacha/cd5ad6940ceceb4f/out -L dependency=/tmp/am373-target/debug/build/rand_core/47759f8b2463dc43/out -L dependency=/tmp/am373-target/debug/build/rand_core/58dc191437aa4a4a/out -L dependency=/tmp/am373-target/debug/build/rapidhash/3e7d5705e9e4ba55/out -L dependency=/tmp/am373-target/debug/build/ring/d75fb2bcdd452bb7/out -L dependency=/tmp/am373-target/debug/build/rmp/d45390915359e80e/out -L dependency=/tmp/am373-target/debug/build/rmp-serde/acf573f060ecc1a2/out -L dependency=/tmp/am373-target/debug/build/rusticata-macros/1e19f631376d3c7c/out -L dependency=/tmp/am373-target/debug/build/rustix/f08116ae56faad10/out -L dependency=/tmp/am373-target/debug/build/rustls/a73113765b4da564/out -L dependency=/tmp/am373-target/debug/build/rustls-pki-types/9fd617b526d0150f/out -L dependency=/tmp/am373-target/debug/build/rustls-webpki/d69412e2e9bdb239/out -L dependency=/tmp/am373-target/debug/build/rustversion/4ffcfbd5a3217c9b/out -L dependency=/tmp/am373-target/debug/build/scopeguard/c533d2dcd202b08f/out -L dependency=/tmp/am373-target/debug/build/semver/8fe70fd8ff97c9fe/out -L dependency=/tmp/am373-target/debug/build/serde/a1bd8aafde4fb687/out -L dependency=/tmp/am373-target/debug/build/serde_core/67a01f447e9b0398/out -L dependency=/tmp/am373-target/debug/build/serde_derive/ed430e5d5aad500e/out -L dependency=/tmp/am373-target/debug/build/serde_json/01725adfa9b5f911/out -L dependency=/tmp/am373-target/debug/build/sha1/e3c3b4a25d2eded3/out -L dependency=/tmp/am373-target/debug/build/sha2/201b68e62a224cce/out -L dependency=/tmp/am373-target/debug/build/sha2/ba5d08f3dd0a446e/out -L dependency=/tmp/am373-target/debug/build/signal-hook/87d5c241d2a982e4/out -L dependency=/tmp/am373-target/debug/build/signal-hook-registry/bd5d30a1a4e17ac1/out -L dependency=/tmp/am373-target/debug/build/signatory/505ec0a839b2593f/out -L dependency=/tmp/am373-target/debug/build/signature/ece5d004a366207a/out -L dependency=/tmp/am373-target/debug/build/slab/f5c919b45c2c5569/out -L dependency=/tmp/am373-target/debug/build/smallvec/74863d5e08b65bbb/out -L dependency=/tmp/am373-target/debug/build/socket2/8fd19fbe650d6ab8/out -L dependency=/tmp/am373-target/debug/build/spki/a2b2c70bd994b319/out -L dependency=/tmp/am373-target/debug/build/subtle/8feabc43626428fd/out -L dependency=/tmp/am373-target/debug/build/sysinfo/4a14b34edb2cd5c0/out -L dependency=/tmp/am373-target/debug/build/tempfile/73bcfb740fa3fe1a/out -L dependency=/tmp/am373-target/debug/build/thiserror/ebee07ca50238a8e/out -L dependency=/tmp/am373-target/debug/build/thiserror-impl/e4cfcb10dad0c9b2/out -L dependency=/tmp/am373-target/debug/build/time/ea42f1d1d890878a/out -L dependency=/tmp/am373-target/debug/build/time-core/e27c41f2fb16ca3b/out -L dependency=/tmp/am373-target/debug/build/time-macros/e7af42b2269cecd7/out -L dependency=/tmp/am373-target/debug/build/tinyvec/7f068afd272bf141/out -L dependency=/tmp/am373-target/debug/build/typenum/63ab611cea46aa34/out -L dependency=/tmp/am373-target/debug/build/unicode-normalization/437a4dc476322edd/out -L dependency=/tmp/am373-target/debug/build/universal-hash/0ff75f1615a04b9e/out -L dependency=/tmp/am373-target/debug/build/untrusted/50b721d2a2006e84/out -L dependency=/tmp/am373-target/debug/build/unty-next/fb37aaf26d6dc9a9/out -L dependency=/tmp/am373-target/debug/build/webpki-roots/f459542134300df8/out -L dependency=/tmp/am373-target/debug/build/x509-parser/f4a1bc289aa72176/out -L dependency=/tmp/am373-target/debug/build/xattr/8c29b66773bd9507/out -L dependency=/tmp/am373-target/debug/build/zerocopy/3dddadc6acff5756/out -L dependency=/tmp/am373-target/debug/build/zeroize/2edb00ea665d5dbb/out -L dependency=/tmp/am373-target/debug/build/zeroize_derive/7747e7131fa864b0/out -L dependency=/tmp/am373-target/debug/build/zmij/4576d566f3624203/out --extern aes_gcm=/tmp/am373-target/debug/build/aes-gcm/937b7cd5f2a503d6/out/libaes_gcm-937b7cd5f2a503d6.rmeta --extern asupersync_macros=/tmp/am373-target/debug/build/asupersync-macros/4fc852f936f59328/out/libasupersync_macros-4fc852f936f59328.so --extern base64=/tmp/am373-target/debug/build/base64/1a441a9a5d995fb6/out/libbase64-1a441a9a5d995fb6.rmeta --extern bincode=/tmp/am373-target/debug/build/bincode-next/2e16f8e779841d29/out/libbincode_next-2e16f8e779841d29.rmeta --extern chacha20poly1305=/tmp/am373-target/debug/build/chacha20poly1305/1a70d6e47e31a27a/out/libchacha20poly1305-1a70d6e47e31a27a.rmeta --extern crc32fast=/tmp/am373-target/debug/build/crc32fast/01e62088acd0a60d/out/libcrc32fast-01e62088acd0a60d.rmeta --extern crossbeam_queue=/tmp/am373-target/debug/build/crossbeam-queue/cb7a78778d3c5952/out/libcrossbeam_queue-cb7a78778d3c5952.rmeta --extern franken_decision=/tmp/am373-target/debug/build/franken-decision/07c465f96f4662f6/out/libfranken_decision-07c465f96f4662f6.rmeta --extern franken_evidence=/tmp/am373-target/debug/build/franken-evidence/2fdb861a6b246a34/out/libfranken_evidence-2fdb861a6b246a34.rmeta --extern franken_kernel=/tmp/am373-target/debug/build/franken-kernel/cf429f89ffbf9366/out/libfranken_kernel-cf429f89ffbf9366.rmeta --extern futures_lite=/tmp/am373-target/debug/build/futures-lite/4108a32421904927/out/libfutures_lite-4108a32421904927.rmeta --extern getrandom=/tmp/am373-target/debug/build/getrandom/97fa23f7712ae995/out/libgetrandom-97fa23f7712ae995.rmeta --extern hashbrown=/tmp/am373-target/debug/build/hashbrown/e537424730d8f660/out/libhashbrown-e537424730d8f660.rmeta --extern hex=/tmp/am373-target/debug/build/hex/a7827db727680271/out/libhex-a7827db727680271.rmeta --extern hmac=/tmp/am373-target/debug/build/hmac/ca800c7cb6dc483b/out/libhmac-ca800c7cb6dc483b.rmeta --extern libc=/tmp/am373-target/debug/build/libc/e7d7bf53876f1713/out/liblibc-e7d7bf53876f1713.rmeta --extern memchr=/tmp/am373-target/debug/build/memchr/a3f2bed728f657f6/out/libmemchr-a3f2bed728f657f6.rmeta --extern nix=/tmp/am373-target/debug/build/nix/7d278db156167807/out/libnix-7d278db156167807.rmeta --extern nkeys=/tmp/am373-target/debug/build/nkeys/50c02bc2cc94d2b6/out/libnkeys-50c02bc2cc94d2b6.rmeta --extern parking_lot=/tmp/am373-target/debug/build/parking_lot/f0682501380cf6b9/out/libparking_lot-f0682501380cf6b9.rmeta --extern pin_project=/tmp/am373-target/debug/build/pin-project/04e4d126c9e88272/out/libpin_project-04e4d126c9e88272.rmeta --extern polling=/tmp/am373-target/debug/build/polling/7d0563e20868a69f/out/libpolling-7d0563e20868a69f.rmeta --extern prost=/tmp/am373-target/debug/build/prost/06e0bce2345f9e43/out/libprost-06e0bce2345f9e43.rmeta --extern rmp_serde=/tmp/am373-target/debug/build/rmp-serde/acf573f060ecc1a2/out/librmp_serde-acf573f060ecc1a2.rmeta --extern rustls=/tmp/am373-target/debug/build/rustls/a73113765b4da564/out/librustls-a73113765b4da564.rmeta --extern rustls_pki_types=/tmp/am373-target/debug/build/rustls-pki-types/9fd617b526d0150f/out/librustls_pki_types-9fd617b526d0150f.rmeta --extern semver=/tmp/am373-target/debug/build/semver/8fe70fd8ff97c9fe/out/libsemver-8fe70fd8ff97c9fe.rmeta --extern serde=/tmp/am373-target/debug/build/serde/a1bd8aafde4fb687/out/libserde-a1bd8aafde4fb687.rmeta --extern serde_json=/tmp/am373-target/debug/build/serde_json/01725adfa9b5f911/out/libserde_json-01725adfa9b5f911.rmeta --extern sha1=/tmp/am373-target/debug/build/sha1/e3c3b4a25d2eded3/out/libsha1-e3c3b4a25d2eded3.rmeta --extern sha2=/tmp/am373-target/debug/build/sha2/201b68e62a224cce/out/libsha2-201b68e62a224cce.rmeta --extern signal_hook=/tmp/am373-target/debug/build/signal-hook/87d5c241d2a982e4/out/libsignal_hook-87d5c241d2a982e4.rmeta --extern slab=/tmp/am373-target/debug/build/slab/f5c919b45c2c5569/out/libslab-f5c919b45c2c5569.rmeta --extern smallvec=/tmp/am373-target/debug/build/smallvec/74863d5e08b65bbb/out/libsmallvec-74863d5e08b65bbb.rmeta --extern socket2=/tmp/am373-target/debug/build/socket2/8fd19fbe650d6ab8/out/libsocket2-8fd19fbe650d6ab8.rmeta --extern subtle=/tmp/am373-target/debug/build/subtle/8feabc43626428fd/out/libsubtle-8feabc43626428fd.rmeta --extern sysinfo=/tmp/am373-target/debug/build/sysinfo/4a14b34edb2cd5c0/out/libsysinfo-4a14b34edb2cd5c0.rmeta --extern tempfile=/tmp/am373-target/debug/build/tempfile/73bcfb740fa3fe1a/out/libtempfile-73bcfb740fa3fe1a.rmeta --extern thiserror=/tmp/am373-target/debug/build/thiserror/ebee07ca50238a8e/out/libthiserror-ebee07ca50238a8e.rmeta --extern unicode_normalization=/tmp/am373-target/debug/build/unicode-normalization/437a4dc476322edd/out/libunicode_normalization-437a4dc476322edd.rmeta --extern webpki_roots=/tmp/am373-target/debug/build/webpki-roots/f459542134300df8/out/libwebpki_roots-f459542134300df8.rmeta --extern x509_parser=/tmp/am373-target/debug/build/x509-parser/f4a1bc289aa72176/out/libx509_parser-f4a1bc289aa72176.rmeta --extern xattr=/tmp/am373-target/debug/build/xattr/8c29b66773bd9507/out/libxattr-8c29b66773bd9507.rmeta --extern zeroize=/tmp/am373-target/debug/build/zeroize/2edb00ea665d5dbb/out/libzeroize-2edb00ea665d5dbb.rmeta --cap-lints allow -L native=/tmp/am373-target/debug/build/ring/da8483c86aff0f51/out` (signal: 9, SIGKILL: kill)

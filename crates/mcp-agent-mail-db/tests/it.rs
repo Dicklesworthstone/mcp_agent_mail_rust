@@ -45,6 +45,7 @@ mod pool_exhaustion;
 mod query_assistance_explain;
 mod query_integration;
 mod relevance_harness;
+mod retention_linux;
 mod s3fifo_bug;
 mod schema_invariants;
 mod schema_migration;

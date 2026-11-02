@@ -1,0 +1,43 @@
+
+running 39 tests
+test current::namespace::tests::a_clean_preflight_never_caches_authority_over_a_later_reader ... ok
+test current::namespace::tests::claimed_directory_substitution_is_rejected_before_moving_a_source ... ok
+test current::namespace::tests::deletion_accounting_distinguishes_sparse_length_from_allocated_blocks ... ok
+test current::namespace::tests::deletion_permission_failure_retains_bytes_and_does_not_claim_unlink ... ok
+test current::namespace::tests::deletion_refuses_an_active_advisory_reader_lock ... ok
+test current::namespace::tests::deletion_refuses_replacements_links_and_symlinked_parents ... ok
+test current::namespace::tests::deletion_refuses_same_length_edits_with_restored_mtime ... ok
+test current::namespace::tests::deletion_reports_post_unlink_sync_failure_without_retrying_a_replacement ... ok
+test current::namespace::tests::deletion_retains_a_mapping_after_its_descriptor_and_alias_are_removed ... ok
+test current::namespace::tests::deletion_retains_a_nondumpable_same_user_reader ... ok
+test current::namespace::tests::deletion_retains_a_reader_opened_through_an_unlinked_alias ... ok
+test current::namespace::tests::deletion_retains_an_open_reader_then_reclaims_after_it_closes ... ok
+test current::namespace::tests::deletion_works_for_an_unprivileged_owner_with_protected_foreign_processes ... ok
+test current::namespace::tests::descriptor_inode_keeps_the_original_scan_bound ... ok
+test current::namespace::tests::descriptor_inode_preserves_errors_before_a_complete_identity ... ok
+test current::namespace::tests::descriptor_inode_reassembles_short_reads_and_retries_interrupts ... ok
+test current::namespace::tests::descriptor_inode_rejects_missing_malformed_and_partial_records ... ok
+test current::namespace::tests::destination_swap_at_rename_cannot_overwrite_the_replacement_namespace ... ok
+test current::namespace::tests::empty_directory_reclamation_excludes_live_batches_and_parent_claims ... ok
+test current::namespace::tests::empty_directory_reclamation_never_follows_a_replaced_parent ... ok
+test current::namespace::tests::empty_directory_reclamation_preserves_an_ordinary_open_reader ... ok
+test current::namespace::tests::empty_directory_reclamation_rejects_replacement_symlinks_and_new_evidence ... ok
+test current::namespace::tests::empty_directory_reclamation_reports_completed_unconfirmed_removal ... ok
+test current::namespace::tests::exited_task_requires_all_terminal_reader_evidence ... ok
+test current::namespace::tests::foreign_reader_requires_disjoint_caller_and_file_owner_uids ... ok
+test current::namespace::tests::inventoried_file_stage_preserves_collision_evidence_and_publishes_exact_file ... ok
+test current::namespace::tests::inventoried_file_stage_rejects_changed_content_and_hardlink_alias ... ok
+test current::namespace::tests::inventoried_file_stage_rejects_same_size_replacement ... ok
+test current::namespace::tests::inventoried_file_stage_reports_sync_failure_as_a_completed_move ... ok
+test current::namespace::tests::mapped_reader_scan_failures_name_the_process_and_entry ... ok
+test current::namespace::tests::parent_traversal_is_rejected_before_directory_creation ... ok
+test current::namespace::tests::private_ancestor_creation_keeps_existing_parent_permissions ... ok
+test current::namespace::tests::proc_entry_error_names_the_entry_and_keeps_the_kind ... ok
+test current::namespace::tests::proc_task_gone_recognizes_not_found_and_esrch_only ... ok
+test current::namespace::tests::reader_preflight_preserves_same_process_posix_locks ... ok
+test current::namespace::tests::source_entry_identifies_a_directory_without_its_size ... ok
+test current::namespace::tests::source_leaf_substitution_between_collision_retries_is_refused ... ok
+test current::namespace::tests::source_parent_swap_at_rename_does_not_move_the_replacement_file ... ok
+test current::namespace::tests::symlinked_ancestor_cannot_create_quarantine_outside_the_storage_root ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 0.28s

@@ -1,0 +1,84 @@
+{
+  "builds": [
+    {
+      "exit_code": 101,
+      "failure": "rustc asupersync0.5.0 SIGKILL",
+      "log": "build.log",
+      "profile": "opt-level1, debug0, j1"
+    },
+    {
+      "exit_code": 101,
+      "failure": "rustc asupersync0.5.0 SIGKILL",
+      "log": "build-low-memory.log",
+      "profile": "opt-level1, asupersync-only opt-level0, debug0, j1"
+    },
+    {
+      "command": {
+        "argv": [
+          "/tmp/am373-cargo/bin/cargo",
+          "+nightly-2026-08-31",
+          "-Zprofile-hint-mostly-unused",
+          "--config",
+          "profile.dev.package.asupersync.hint-mostly-unused=true",
+          "test",
+          "--offline",
+          "--locked",
+          "--no-run",
+          "-j1"
+        ],
+        "cwd": "/tmp/am373-count-harness",
+        "environment": {
+          "CARGO_HOME": "/tmp/am373-cargo",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "CARGO_TARGET_DIR": "/tmp/am373-target",
+          "RUSTUP_HOME": "/tmp/am373-rustup"
+        }
+      },
+      "exit_code": 101,
+      "failure": "rustc asupersync0.5.0 SIGKILL during shared8GiB cgroup OOM pressure",
+      "log": "build-mostly-unused.log",
+      "profile": "opt-level1, asupersync-only opt-level0 and -Zhint-mostly-unused, debug0, j1",
+      "resource_log": "hint-resources.jsonl"
+    }
+  ],
+  "dependency_provenance": {
+    "harness_dependency_records_excluding_harness": 362,
+    "harness_packages": 363,
+    "original_packages": 868,
+    "patch_values_identical": true,
+    "unknown_locked_tuples": []
+  },
+  "final_linux_test_sha256": "5212422ed52640a88ba79cbda4ea49e9f5bfec6f71e09d4cf4fa3c4ac7bcabc6",
+  "owned_compiler_remaining_at_final_sample": false,
+  "recorded_utc": "2026-11-02T22:06:19Z",
+  "source_changes_during_builds": [
+    {
+      "after": "559b7616653d29e999329014ae9da4c7f0a1baee1985493b097879ddbdf59da6",
+      "before": "ff7762d8078134a88d9d017a4ce6b3a2858a1bd6a1132b20a4eefe4f9dc675f3",
+      "path": "/tmp/am373-count-harness/Cargo.toml"
+    },
+    {
+      "after": "4e7b4bf6ec498417a567d006958a49c43fdc503ef0b614abe71598a799c4571c",
+      "before": "6b4ea4bbfd78529e20294cd5eb248cb06364c270b72fa797289f36de42646b60",
+      "path": "/workspace/scratch/1fd7fe6e98fc/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/retention_linux.rs"
+    }
+  ],
+  "source_changes_during_hint_build": [],
+  "source_provenance": {
+    "baseline_rotation_sha256": "e885d7321c6d37bb2787b60fef657f5fbfb9f0dbbd6e86fe81a115ca82683500",
+    "changes_during_hint_build": [],
+    "corrected_rotation_sha256": "b50fd4841634bbf6441ee69a3586ec6f907c47daefc30caf4bbfe8a6afb78298",
+    "harness_lock_sha256": "4a888088457ee9e24af63c9d54618490c056665042fdeff7f7051f570be83ce6",
+    "harness_manifest_sha256": "559b7616653d29e999329014ae9da4c7f0a1baee1985493b097879ddbdf59da6",
+    "linux_integration_sha256": "5212422ed52640a88ba79cbda4ea49e9f5bfec6f71e09d4cf4fa3c4ac7bcabc6",
+    "namespace_sha256": "3bdb9444f51e2d7c2951558c676103257f6bfabdf69c8c7329b52fce136f85f1",
+    "repository_lock_sha256": "d69180894da5f16cb4230d1e27631cc524992f731a84c7ba336b66efdc4f9d7e",
+    "starting_main": "de449d46f905785dfe561514e9f8bc1d1804d17c"
+  },
+  "tests": {
+    "baseline_count": "not executed",
+    "corrected_count": "not executed",
+    "retention_linux": "not executed"
+  }
+}

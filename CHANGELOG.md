@@ -73,6 +73,30 @@ release commit in 3fdda50c.
   This upgrade does not by itself qualify the separate full swarm/RSS soak
   tracked by `br-kp1in.46`.
 
+### Backup keep window and Linux reader protections (GH#373)
+
+- **Eligible parked periodic images share the configured keep window.**
+  `AM_BACKUP_KEEP_COUNT` now ranks periodic generations beside the database and
+  in native `doctor/reclaimable/rotation-*` directories together, using their
+  generation timestamps and collision suffixes. The publication slot and
+  verified snapshot remain protected; interrupted or manifest-bearing recovery
+  evidence retains its existing safeguards and publication-budget accounting.
+- **Linux reader inspection no longer trusts session-daemon names.** A
+  nondumpable process can keep a descriptor or mapping after changing its name,
+  group, or capabilities. Such uncertainty now refuses deletion. A terminated
+  leader is exempted only with positive kernel evidence that its own file table
+  and address space are gone, and surviving workers are still inspected.
+- **A different procfs PID namespace no longer creates a false self-reader.**
+  Cleanup identifies its retained descriptor using the mounted `/proc/self`
+  identity. Generic opaque same-user processes still cause conservative
+  refusals; this change does not promise that every unreadable process can be
+  safely ignored.
+
+The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
+preserves the current-main counterexamples, the 39 passing namespace tests,
+real-process controls, and the distinction between those results and the
+larger native count/public-guard tests blocked by build-memory limits.
+
 ### Other changes on main
 
 - **Reservation reads stay available while a writer holds the lock.** Reservation and mail-activity

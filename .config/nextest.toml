@@ -108,6 +108,8 @@ filter = '''
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 | test(=recovery_retention::namespace::tests::deletion_retains_a_nondumpable_same_user_reader)
+| test(=retention_linux::nondumpable_process_names_never_authorize_deletion)
+| test(=retention_linux::exited_thread_group_leader_does_not_hide_a_live_backup_reader)
 '''
 threads-required = "num-test-threads"
 
@@ -174,6 +176,9 @@ filter = '''
 | binary_id(mcp-agent-mail-server::golden_snapshots)
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
+| test(=recovery_retention::namespace::tests::deletion_retains_a_nondumpable_same_user_reader)
+| test(=retention_linux::nondumpable_process_names_never_authorize_deletion)
+| test(=retention_linux::exited_thread_group_leader_does_not_hide_a_live_backup_reader)
 '''
 threads-required = "num-test-threads"
 
