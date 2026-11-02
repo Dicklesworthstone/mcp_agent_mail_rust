@@ -573,7 +573,14 @@ fn ensure_no_file_readers(
 ) -> io::Result<()> {
     const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
     let canonical_source = source.canonicalize()?;
-    let own_pid = std::process::id();
+    // `/proc` may be mounted from an ancestor PID namespace. getpid() then
+    // names a different task in this mount (or no task at all), so only the
+    // procfs spelling can identify our retained descriptor in this inventory.
+    let own_process = std::fs::read_link("/proc/self")?;
+    let own_pid = own_process
+        .to_str()
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .ok_or_else(|| invalid("open-reader inventory cannot identify /proc/self"))?;
     let self_status = read_process_status_summary(Path::new("/proc/self"))?;
     let mut remaining = MAX_READER_INVENTORY_ENTRIES;
     let mut charge = || -> io::Result<()> {
@@ -596,82 +603,182 @@ fn ensure_no_file_readers(
         else {
             continue;
         };
-        let descriptors = match std::fs::read_dir(entry.path().join("fd")) {
-            Ok(descriptors) => descriptors,
+        inspect_process_file_readers(
+            &entry.path(),
+            pid,
+            &self_status,
+            retained_identity,
+            &canonical_source,
+            (pid == own_pid).then_some(excluded_descriptor).flatten(),
+            &mut charge,
+        )?;
+        // A terminated thread-group leader can have empty fd/maps files
+        // while its workers still retain the backup. Check *after* the scan
+        // so a leader exiting during it cannot turn empty files into proof
+        // that the entire process has released its readers.
+        inspect_surviving_thread_readers(
+            &entry.path(),
+            pid,
+            &self_status,
+            retained_identity,
+            &canonical_source,
+            &mut charge,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_file_readers(
+    process: &Path,
+    process_id: u32,
+    self_status: &ProcessStatusSummary,
+    retained_identity: &Metadata,
+    canonical_source: &Path,
+    excluded_descriptor: Option<i32>,
+    mut charge: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let descriptors = match std::fs::read_dir(process.join("fd")) {
+        Ok(descriptors) => descriptors,
+        Err(error) if is_proc_task_gone(&error) => return Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && reader_inventory_denial_can_be_skipped(
+                    process,
+                    self_status,
+                    retained_identity.uid(),
+                )? =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(proc_entry_error(&process.join("fd"), &error)),
+    };
+    for descriptor in descriptors {
+        charge()?;
+        let descriptor = match descriptor {
+            Ok(descriptor) => descriptor,
+            Err(error) if is_proc_task_gone(&error) => continue,
+            Err(error) => return Err(proc_entry_error(&process.join("fd"), &error)),
+        };
+        if excluded_descriptor.is_some_and(|excluded| {
+            descriptor
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+                == Some(excluded)
+        }) {
+            continue;
+        }
+        let target = match std::fs::read_link(descriptor.path()) {
+            Ok(target) => target,
             Err(error) if is_proc_task_gone(&error) => continue,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
+                    && reader_inventory_denial_can_be_skipped(
+                        process,
+                        self_status,
+                        retained_identity.uid(),
+                    )? =>
             {
                 continue;
             }
-            Err(error) => return Err(proc_entry_error(&entry.path().join("fd"), &error)),
+            Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
         };
-        for descriptor in descriptors {
-            charge()?;
-            let descriptor = match descriptor {
-                Ok(descriptor) => descriptor,
-                Err(error) if is_proc_task_gone(&error) => continue,
-                Err(error) => return Err(proc_entry_error(&entry.path().join("fd"), &error)),
-            };
-            if pid == own_pid
-                && excluded_descriptor.is_some_and(|excluded| {
-                    descriptor
-                        .file_name()
-                        .to_str()
-                        .and_then(|name| name.parse::<i32>().ok())
-                        == Some(excluded)
-                })
-            {
-                continue;
-            }
-            let target = match std::fs::read_link(descriptor.path()) {
-                Ok(target) => target,
+        // Non-filesystem descriptors (`socket:[...]`, `pipe:[...]`,
+        // `anon_inode:[...]`) never reference a regular file inode on disk.
+        if !target.is_absolute() {
+            continue;
+        }
+        let same_inode = if target == canonical_source {
+            true
+        } else {
+            match descriptor_references_inode(process, &descriptor, retained_identity) {
+                Ok(same_inode) => same_inode,
                 Err(error) if is_proc_task_gone(&error) => continue,
                 Err(error)
                     if error.kind() == io::ErrorKind::PermissionDenied
-                        && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
+                        && reader_inventory_denial_can_be_skipped(
+                            process,
+                            self_status,
+                            retained_identity.uid(),
+                        )? =>
                 {
                     continue;
                 }
                 Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
-            };
-            // Non-filesystem descriptors (`socket:[...]`, `pipe:[...]`,
-            // `anon_inode:[...]`) never reference a regular file inode on disk.
-            if !target.is_absolute() {
-                continue;
             }
-            let same_inode = if target == canonical_source {
-                true
-            } else {
-                match descriptor_references_inode(&entry.path(), &descriptor, retained_identity) {
-                    Ok(same_inode) => same_inode,
-                    Err(error) if is_proc_task_gone(&error) => continue,
-                    Err(error)
-                        if error.kind() == io::ErrorKind::PermissionDenied
-                            && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
-                }
-            };
-            if same_inode {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("backup has an active file reader in process {pid}"),
-                ));
-            }
+        };
+        if same_inode {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("backup has an active file reader in process/task {process_id}"),
+            ));
         }
-        if retained_identity.file_type().is_file() {
-            ensure_no_mapped_file_readers(
-                &entry.path(),
-                pid,
-                &self_status,
-                retained_identity,
-                &mut charge,
-            )?;
+    }
+    if retained_identity.file_type().is_file() {
+        ensure_no_mapped_file_readers(
+            process,
+            process_id,
+            self_status,
+            retained_identity,
+            &mut charge,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_surviving_thread_readers(
+    process: &Path,
+    process_id: u32,
+    self_status: &ProcessStatusSummary,
+    retained_identity: &Metadata,
+    canonical_source: &Path,
+    mut charge: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let summary = match read_process_status_summary(process) {
+        Ok(summary) => summary,
+        Err(error) if is_proc_task_gone(&error) => return Ok(()),
+        Err(error) => return Err(proc_entry_error(&process.join("status"), &error)),
+    };
+    if summary.has_vm_size || summary.threads == 1 {
+        return Ok(());
+    }
+    let tasks_path = process.join("task");
+    let tasks = match std::fs::read_dir(&tasks_path) {
+        Ok(tasks) => tasks,
+        Err(error) if is_proc_task_gone(&error) => return Ok(()),
+        Err(error) => return Err(proc_entry_error(&tasks_path, &error)),
+    };
+    for task in tasks {
+        charge()?;
+        let task = match task {
+            Ok(task) => task,
+            Err(error) if is_proc_task_gone(&error) => continue,
+            Err(error) => return Err(proc_entry_error(&tasks_path, &error)),
+        };
+        let Some(task_id) = task
+            .file_name()
+            .to_str()
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            return Err(invalid("open-reader task inventory has an invalid task ID"));
+        };
+        if task_id == process_id {
+            continue;
         }
+        // Do not exclude the caller's descriptor number in another task's
+        // table: Linux threads can unshare their descriptors. An ambiguous
+        // self-reader is a refusal, never authority to ignore a real reader.
+        inspect_process_file_readers(
+            &task.path(),
+            task_id,
+            self_status,
+            retained_identity,
+            canonical_source,
+            None,
+            &mut charge,
+        )?;
     }
     Ok(())
 }
@@ -695,7 +802,11 @@ fn ensure_no_mapped_file_readers(
         Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
-                && reader_inventory_denial_is_foreign(process, self_status)? =>
+                && reader_inventory_denial_can_be_skipped(
+                    process,
+                    self_status,
+                    retained.uid(),
+                )? =>
         {
             return Ok(());
         }
@@ -710,7 +821,11 @@ fn ensure_no_mapped_file_readers(
         Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
-                && reader_inventory_denial_is_foreign(process, self_status)? =>
+                && reader_inventory_denial_can_be_skipped(
+                    process,
+                    self_status,
+                    retained.uid(),
+                )? =>
         {
             return Ok(());
         }
@@ -822,23 +937,22 @@ fn read_descriptor_inode(mut reader: impl io::Read) -> io::Result<u64> {
 /// treating an inaccessible process as another user's observer limitation.
 #[cfg(target_os = "linux")]
 struct ProcessStatusSummary {
-    name: String,
     state: char,
     has_vm_size: bool,
+    fd_size: u64,
+    threads: u32,
     uids: [u32; 4],
-    gids: [u32; 4],
-    cap_prm: u64,
-    cap_eff: u64,
 }
 
 #[cfg(target_os = "linux")]
-fn parse_status_hex_u64(status: &[u8], prefix: &[u8]) -> u64 {
-    status
-        .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(prefix))
-        .and_then(|line| std::str::from_utf8(line).ok())
-        .and_then(|line| u64::from_str_radix(line.trim(), 16).ok())
-        .unwrap_or(0)
+impl ProcessStatusSummary {
+    const fn is_exited_without_files_or_address_space(&self) -> bool {
+        // These are kernel-owned facts, unlike a process's mutable name.
+        // Once terminal, a task cannot acquire a new table or address space.
+        // This certifies only this task: the caller still scans any surviving
+        // workers of a terminated thread-group leader.
+        matches!(self.state, 'Z' | 'X' | 'x') && !self.has_vm_size && self.fd_size == 0
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -880,34 +994,35 @@ fn read_process_status_summary(process: &Path) -> io::Result<ProcessStatusSummar
             "open-reader process status exceeded its bounded scan",
         ));
     }
-    let name = status
-        .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"Name:"))
-        .and_then(|line| std::str::from_utf8(line).ok())
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_owned();
     let state = status
         .split(|byte| *byte == b'\n')
         .find_map(|line| line.strip_prefix(b"State:"))
         .and_then(|line| std::str::from_utf8(line).ok())
         .and_then(|line| line.trim_start().chars().next())
-        .unwrap_or('\0');
+        .ok_or_else(|| invalid("open-reader process status has no state"))?;
+    let fd_size = status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"FDSize:"))
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| line.trim().parse::<u64>().ok())
+        .ok_or_else(|| invalid("open-reader process status has no descriptor-table size"))?;
+    let threads = status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"Threads:"))
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| line.trim().parse::<u32>().ok())
+        .filter(|threads| *threads > 0)
+        .ok_or_else(|| invalid("open-reader process status has no valid thread count"))?;
     let has_vm_size = status
         .split(|byte| *byte == b'\n')
         .any(|line| line.starts_with(b"VmSize:"));
     let uids = parse_status_id_quad(&status, b"Uid:", "UID")?;
-    let gids = parse_status_id_quad(&status, b"Gid:", "GID")?;
-    let cap_prm = parse_status_hex_u64(&status, b"CapPrm:");
-    let cap_eff = parse_status_hex_u64(&status, b"CapEff:");
     Ok(ProcessStatusSummary {
-        name,
         state,
         has_vm_size,
+        fd_size,
+        threads,
         uids,
-        gids,
-        cap_prm,
-        cap_eff,
     })
 }
 
@@ -918,57 +1033,45 @@ fn process_reader_uids(process: &Path) -> io::Result<[u32; 4]> {
 }
 
 #[cfg(target_os = "linux")]
-fn is_ambient_nondumpable_session_daemon(name: &str) -> bool {
-    matches!(
-        name,
-        "(sd-pam)" | "sshd-session" | "sshd" | "ssh-agent" | "gpg-agent"
-    )
-}
-
-#[cfg(target_os = "linux")]
 fn status_summary_denial_is_foreign(
     summary: &ProcessStatusSummary,
     self_status: &ProcessStatusSummary,
+    file_owner: u32,
 ) -> bool {
-    let own_uid = self_status.uids[1];
-    if !summary.uids.contains(&own_uid) || summary.uids != self_status.uids {
-        return true;
-    }
-    // Setgid helpers (e.g. `ssh-agent`, `unix_chkpwd`) have altered
-    // real/effective/saved GIDs and root-owned `/proc/<pid>/fd`.
-    if summary.gids != self_status.gids {
-        return true;
-    }
-    // Linux `cap_ptrace_access_check` denies `/proc/<pid>/maps` and
-    // `fdinfo` when the target task holds permitted capabilities absent from
-    // the caller's effective set (e.g. `systemd --user` and its session
-    // tree holding `CAP_WAKE_ALARM`).
-    if (summary.cap_prm & !self_status.cap_eff) != 0 {
-        return true;
-    }
-    // Tasks without `VmSize:` (`task->mm == NULL` after `exit_mm()` in
-    // `do_exit()`, or kernel/zombie tasks) have already torn down their
-    // address space, and privilege-dropped OS session daemons have
-    // root-owned `/proc/<pid>/fd` on every standard Linux login session.
-    !summary.has_vm_size
-        || matches!(summary.state, 'Z' | 'X' | 'x')
-        || is_ambient_nondumpable_session_daemon(&summary.name)
+    // Names are mutable, and credential/capability changes do not close
+    // inherited descriptors or mappings. A nondumpable session helper can
+    // therefore still be a real reader, even with a different saved UID or
+    // GID. Missing leader VmSize or a zombie leader likewise says nothing
+    // about descriptors held by the rest of its thread group.
+    //
+    // Preserve the documented limitation for inaccessible *other-user*
+    // processes, but do not mistake any caller or file-owner UID for one.
+    !summary.uids.contains(&file_owner)
+        && !summary
+            .uids
+            .iter()
+            .any(|uid| self_status.uids.contains(uid))
 }
 
 #[cfg(target_os = "linux")]
-fn reader_inventory_denial_is_foreign(
+fn reader_inventory_denial_can_be_skipped(
     process: &Path,
     self_status: &ProcessStatusSummary,
+    file_owner: u32,
 ) -> io::Result<bool> {
     for attempt in 0..2 {
         match read_process_status_summary(process) {
-            Ok(summary) if status_summary_denial_is_foreign(&summary, self_status) => {
+            Ok(summary)
+                if status_summary_denial_is_foreign(&summary, self_status, file_owner)
+                    || summary.is_exited_without_files_or_address_space() =>
+            {
                 return Ok(true);
             }
             Ok(_) if attempt == 0 => {
                 // A task entering `do_exit()` or `execve` can deny `/proc/<pid>`
-                // access microseconds before its status reflects `mm` teardown
-                // or credential change. Re-check once before failing closed.
+                // access microseconds before the entry disappears. Re-check
+                // once, but never infer closed readers from a process name,
+                // changed credentials or the leader's address-space teardown.
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Ok(_) => return Ok(false),
@@ -2244,6 +2347,68 @@ mapping.close()
             "/proc/7/fd/3: Permission denied (os error 13)"
         );
         assert!(!is_proc_task_gone(&error));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_reader_requires_disjoint_caller_and_file_owner_uids() {
+        let caller = ProcessStatusSummary {
+            state: 'S',
+            has_vm_size: true,
+            fd_size: 64,
+            threads: 1,
+            uids: [1000; 4],
+        };
+        for uids in [
+            [1000; 4],
+            [1000, 0, 0, 0],
+            [0, 1000, 0, 0],
+            [0, 0, 1000, 0],
+            [0, 0, 0, 1000],
+            [2000; 4],
+        ] {
+            let process = ProcessStatusSummary { uids, ..caller };
+            assert!(!status_summary_denial_is_foreign(&process, &caller, 2000));
+        }
+        let foreign = ProcessStatusSummary {
+            uids: [3000; 4],
+            ..caller
+        };
+        assert!(status_summary_denial_is_foreign(&foreign, &caller, 2000));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_task_requires_all_terminal_reader_evidence() {
+        let terminal = ProcessStatusSummary {
+            state: 'Z',
+            has_vm_size: false,
+            fd_size: 0,
+            threads: 2,
+            uids: [1000; 4],
+        };
+        // The leader itself is empty; Threads=2 still requires the separate
+        // live-task inspection exercised by the real pthread_exit regression.
+        assert!(terminal.is_exited_without_files_or_address_space());
+        for uncertain in [
+            ProcessStatusSummary {
+                state: 'S',
+                ..terminal
+            },
+            ProcessStatusSummary {
+                has_vm_size: true,
+                ..terminal
+            },
+            ProcessStatusSummary {
+                fd_size: 64,
+                ..terminal
+            },
+        ] {
+            assert!(!uncertain.is_exited_without_files_or_address_space());
+            assert!(!status_summary_denial_is_foreign(
+                &uncertain, &terminal, 1000
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
