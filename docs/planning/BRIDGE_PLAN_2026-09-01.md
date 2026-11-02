@@ -70,11 +70,55 @@
   remotely, 10m18s. Live/post source audit matches all 3,871 present frozen
   inputs, with the same six historical JSON omissions. No source edit or
   suppression is needed. The dependency's future-Rust warning remains explicit.
-- [ ] Build the real repaired CLI and compare old/new against the same
+- [x] Build the real repaired CLI through normal RCH: 199m28s, executable
+  SHA-256 4b7b100560f93a15. All 3,770 frozen source inputs match live/post.
+- [ ] Complete the declared 24-call old/new comparison against the same
   populated mailbox in one invocation, including nonempty-kind and malformed
   cursor controls. Report any self-speedup as maintenance, not an incumbent win.
-- [ ] Fresh solo recheck; merge only the qualified source change into main.
-  Keep br-kp1in.18 open for any original scope left incomplete.
+  Two attempts remain failed: guidance equality, then equal-count facet order.
+  Preserve both original checkers and raw failures. Existing source already
+  specifies kind-specific guidance and sorts facets only by count. Six unchanged
+  baseline calls produce both tied facet orders; 13 checker controls accept only
+  those documented differences and reject semantic drift. The complete pair
+  remains unexecuted. The returned new executable subsequently became unavailable
+  locally and at its recorded remote pool path; its cause is unestablished.
+  A normal hz3 rebuild is now admitted after a queue-timeout refusal, with 3,871
+  present inputs matching and six historical JSON omissions explicit. Retain the
+  returned executable outside the build target and sync it to trj immediately.
+- [x] Fresh solo recheck: six real new-CLI calls pass, including matching and
+  absent recipient kinds, daemon routing, rejected cursor and stopped fallbacks.
+  Absent-kind calls take 1.877/1.879 seconds; no independent-review credit.
+  Source was committed by another actor as 1af19a7c before qualification.
+  Keep br-kp1in.18 in progress: its broader routing acceptance remains incomplete.
+- [ ] Execute full workspace native tests. The earlier Nextest invocation was
+  canceled before admission and ran no tests; compiler passes are not test passes.
+- [x] Diagnose the live installed mailbox write breaker independently: stock
+  SQLite confirms pages 135/136 never used; the responsive owner is an unmanaged
+  am 0.3.38 TUI in FrankenTerm pane 42. Preserve failed reservation renewals.
+- [x] Gracefully stop that exact foreground owner through the native mux input
+  API and documented two-press Ctrl-C confirmation. No process kill, takeover,
+  owner override, mux restart or deployment. Doctor drain reports safe_to_mutate.
+- [x] Preserve the complete quiesced mailbox on trj before mutation: archive
+  SHA-256 a924bd4b77d2cd19, 78,254,080 bytes, all 3,657 file hashes verified and
+  synced at live-quiesced-2206/ beneath the existing relocation root.
+- [x] Rehearse actual installed doctor repair on live and quiesced copies;
+  all 22 table row counts/content hashes survive. Preserve the generic live
+  repair failure at its backup-integrity guard; it did not complete repair.
+- [x] Preview and rehearse the dedicated am doctor vacuum operation on an
+  untouched quiesced copy, then apply with no live owner. Stock integrity and
+  foreign-key checks pass; all 22 tables exactly match the quiesced snapshot.
+  Two physical pages are reclaimed. Restart the unchanged installed executable
+  in the original shell/pane. The previously blocked reservation write succeeds
+  (leases 402/403, no conflicts); this is operator recovery, not an upstream fix.
+- [x] Finish post-restart owner/config/health checks: new live owner 2886325;
+  authenticated MCP health reports green; actual authenticated MCP renewal
+  succeeds for both leases. Subsequent stock integrity and foreign keys pass.
+  Preserve the separate CLI health finding: FrankenSearch reservation 346 has
+  thread-provenance drift; the native per-FM detector plans zero automatic fixes.
+  Attach incident evidence as br-htobc comment 3902 and CLI limits as br-kp1in.18
+  comment 3903. Keep that
+  upstream corruption bead open: neither SIGKILL causality nor an engine fix
+  has been established by this recovery.
 - [x] Measure current coordinator writers: a peer FrankenSearch build writes
   197 MiB in 45 seconds. Preserve that useful work; do not call it the unique
   cause of root growth. Root has approximately 15 GiB free before relocation.
