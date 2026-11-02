@@ -1,0 +1,2 @@
+#!/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python
+print('test result: ok. 0 passed; 0 failed; 2 ignored;')

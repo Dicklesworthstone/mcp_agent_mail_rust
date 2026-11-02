@@ -1,0 +1,98 @@
+{
+  "started": "2026-11-02T17:36:48.764828+00:00",
+  "scope": "storage public-writer mechanism experiment; no release or operational verdict",
+  "runner_sha256": "7e65e225ef7448de5d2ad22106aaeba11081562dc4358bd0049c5aa3ae6a571a",
+  "runner_common_sha256": "d54c11060c1c5c96d34e79ec356e0be9331dc8d752326766ca77543f5e9fcefb",
+  "selector": "canonical_id_tests::canonical_publication_public_writer_benchmark",
+  "rounds": 2,
+  "scenario": "all",
+  "schedule": [
+    [
+      "baseline",
+      5000,
+      "small_AA_null"
+    ],
+    [
+      "baseline",
+      5000,
+      "small_AA_null"
+    ],
+    [
+      "baseline",
+      5000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      5000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      5000,
+      "AB_BA"
+    ],
+    [
+      "baseline",
+      5000,
+      "AB_BA"
+    ]
+  ],
+  "warm_fixture": "three tracked copies; historical mailbox copies hardlinked; new copies independent",
+  "foreign_append_span": "completed independent public write and flush precede timed parent publication",
+  "controlled_fence_span": "controlled scheduling, if enabled; wall time includes orchestration and is not production p99",
+  "canonical_counter_scope": "instrumented identity-check metadata/enumeration, not total syscalls",
+  "small_AA_tolerance": "publication median ratio in [1/1.2,1.2], descriptive noise flag only; not a release budget",
+  "host": {
+    "time": "2026-11-02T17:36:48.765222+00:00",
+    "host": "4c7b5900111b",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 9,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "load_average": [
+      7.27197265625,
+      5.85498046875,
+      4.78759765625
+    ],
+    "cpu_governor": null,
+    "inotify_max_user_watches": "80485",
+    "inotify_max_user_instances": "128",
+    "cgroup_memory_max": "8589934592",
+    "cgroup_memory_current": "5727969280",
+    "cgroup_cpu_max": "800000 100000",
+    "free_disk_bytes": 24067305472
+  },
+  "binaries": {
+    "baseline": {
+      "path": "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_aa_and_ab_ba_schedule_and_corpus_check/baseline",
+      "sha256": "713720985eb31e188ec3c867f6ac7589a8eeac9782eb29bb0fc380d0badece12"
+    },
+    "candidate": {
+      "path": "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_aa_and_ab_ba_schedule_and_corpus_check/candidate",
+      "sha256": "cb55554d03ec6da5c0e586fee46d2948f2a56f5debc023a77b12794835d85ce0"
+    }
+  },
+  "sources": {
+    "baseline": {},
+    "candidate": {}
+  },
+  "build_receipt": null,
+  "build_receipt_binding": {
+    "supplied": false,
+    "qualified": false,
+    "errors": [],
+    "source_coverage": {}
+  },
+  "profile_status": "build receipt checked for identity and paired compiler/profile parity; absent receipt is unqualified"
+}

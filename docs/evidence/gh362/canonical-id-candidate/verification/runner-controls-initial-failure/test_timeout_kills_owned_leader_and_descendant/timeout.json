@@ -1,0 +1,15 @@
+{
+  "elapsed_seconds": 2.5199203870006386,
+  "exit_code": -9,
+  "timed_out": true,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": {
+    "signals": [
+      "SIGTERM",
+      "SIGKILL",
+      "direct_child_SIGKILL"
+    ],
+    "remaining_owned_group_members": []
+  }
+}

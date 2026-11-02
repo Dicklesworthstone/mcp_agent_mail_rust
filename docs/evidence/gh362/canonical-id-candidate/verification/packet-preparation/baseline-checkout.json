@@ -1,0 +1,18 @@
+{
+  "command": [
+    "git",
+    "-C",
+    "/workspace/scratch/68420b93bbca/mcp_agent_mail_rust",
+    "worktree",
+    "add",
+    "--detach",
+    "/workspace/scratch/68420b93bbca/gh362-packet-prepare-check/baseline",
+    "bc5d0a02a5d23a39fbb2fce83bb352a4bcc3df97"
+  ],
+  "elapsed_seconds": 1.2641074430002845,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": null
+}

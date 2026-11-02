@@ -1,0 +1,41 @@
+{
+  "finished": "2026-11-02T17:28:15.281233+00:00",
+  "small_AA_null": {
+    "warm_single_writer": {
+      "publication_medians_us": [
+        10.0,
+        10.0
+      ],
+      "second_over_first": 1.0,
+      "within_descriptive_20_percent_tolerance": true
+    },
+    "foreign_append": {
+      "publication_medians_us": [
+        10.0,
+        10.0
+      ],
+      "second_over_first": 1.0,
+      "within_descriptive_20_percent_tolerance": true
+    },
+    "controlled_fence_deferral": {
+      "publication_medians_us": [
+        10.0,
+        10.0
+      ],
+      "second_over_first": 1.0,
+      "within_descriptive_20_percent_tolerance": true
+    }
+  },
+  "seeded_git_tree_oids": {
+    "5000": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "runs": [
+    "00-5000-baseline",
+    "01-5000-baseline",
+    "02-5000-baseline",
+    "03-5000-candidate",
+    "04-5000-candidate",
+    "05-5000-baseline"
+  ],
+  "comparative_verdict": "not assigned; inspect raw scenarios, both orders, null, host conditions, and correctness separately"
+}

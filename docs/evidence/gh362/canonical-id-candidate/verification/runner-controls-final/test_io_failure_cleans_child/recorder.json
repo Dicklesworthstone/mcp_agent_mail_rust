@@ -1,0 +1,13 @@
+{
+  "elapsed_seconds": 0.06210276499950851,
+  "exit_code": -15,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": "OSError: synthetic recorder failure",
+  "cleanup": {
+    "signals": [
+      "SIGTERM"
+    ],
+    "remaining_owned_group_members": []
+  }
+}

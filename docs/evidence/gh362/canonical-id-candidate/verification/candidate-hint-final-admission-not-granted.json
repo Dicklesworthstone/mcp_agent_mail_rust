@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "label": "candidate-hint-final",
+  "started_utc": "2026-11-02T17:41:09Z",
+  "wait_limit_seconds": 600,
+  "required_continuous_quiet_seconds": 45,
+  "required_foreign_cargo_count": 0,
+  "required_foreign_rustc_count": 0,
+  "minimum_usable_headroom_bytes": 7516192768,
+  "target_source_sha256": {
+    "Cargo.lock": "d69180894da5f16cb4230d1e27631cc524992f731a84c7ba336b66efdc4f9d7e",
+    "crates/mcp-agent-mail-storage/src/lib.rs": "633c631e6a7b46a5085a9dccd4e478d92e767043d404a2754ac24b3f2c613231",
+    "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "ab04a4898e258d3cc80d2166f5fcdcbf0603e58b8417ec8e5c722236ebfad96a",
+    "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "14aac5a67d09158476ee5c800fcc12191f8169e2c4caf23bfbe31138b5ff6891"
+  },
+  "status": "admission_not_granted",
+  "observed_at": 1793641868.5015936,
+  "elapsed_seconds": 600.3043876830006,
+  "foreign_cargo_count": 2,
+  "foreign_rustc_count": 0,
+  "estimated_reclaimable_headroom_bytes": 5628190112,
+  "quiet_seconds": 0,
+  "cargo_command_started": false,
+  "exit_code": 75,
+  "compiler_hint_attempted": false,
+  "interpretation": "External admission/capacity block; no native compile or runtime result."
+}

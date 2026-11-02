@@ -1,0 +1,15 @@
+{
+  "command": [
+    "git",
+    "-C",
+    "/workspace/scratch/68420b93bbca/gh362-packet-prepare-check/baseline",
+    "apply",
+    "/workspace/scratch/68420b93bbca/mcp_agent_mail_rust/docs/evidence/gh362/canonical-id-candidate/baseline-fixture.patch"
+  ],
+  "elapsed_seconds": 0.2715226079999411,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": null
+}

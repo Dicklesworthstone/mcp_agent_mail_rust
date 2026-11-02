@@ -1,0 +1,8 @@
+{
+  "started": "2026-11-02T17:47:29.111835+00:00",
+  "base": "bc5d0a02a5d23a39fbb2fce83bb352a4bcc3df97",
+  "prepare_only": true,
+  "scope": "candidate qualification packet; no runtime deployment or release verdict",
+  "outcome": "patches reproduced; native gates not invoked",
+  "finished": "2026-11-02T17:47:33.522237+00:00"
+}

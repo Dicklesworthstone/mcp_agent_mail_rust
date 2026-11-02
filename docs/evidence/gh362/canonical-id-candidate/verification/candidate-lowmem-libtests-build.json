@@ -1,0 +1,82 @@
+{
+  "label": "candidate-lowmem",
+  "checkout": "/workspace/scratch/68420b93bbca/mcp_agent_mail_rust",
+  "command": [
+    "/tmp/sqlmodel-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+    "test",
+    "--locked",
+    "-p",
+    "mcp-agent-mail-storage",
+    "-p",
+    "mcp-agent-mail-core",
+    "--no-default-features",
+    "--features",
+    "mcp-agent-mail-storage/portable",
+    "--lib",
+    "--no-run",
+    "--config",
+    "net.git-fetch-with-cli=true"
+  ],
+  "environment": {
+    "PATH": "/tmp/sqlmodel-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin:/root/.codex/tmp/arg0-linux/codex-arg0erFVA1:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback",
+    "CARGO_HOME": "/tmp/sqlmodel-cargo",
+    "CARGO_TARGET_DIR": "/workspace/scratch/68420b93bbca/mail-target",
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_DEV_OPT_LEVEL": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_PROFILE_TEST_OPT_LEVEL": "0",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_TERM_COLOR": "never",
+    "MALLOC_CONF": "narenas:1,dirty_decay_ms:0,muzzy_decay_ms:0,background_thread:false,tcache:false",
+    "RUSTFLAGS": "-Zthreads=1",
+    "RUSTC_WRAPPER": "/workspace/scratch/68420b93bbca/rustc-concurrency-wrapper.py"
+  },
+  "profile": "unoptimized dev/test; opt-level=0; debuginfo=0; incremental=false; Asupersync only uses MIR optimization level 0 and fewer LLVM-IR names to reduce compiler memory",
+  "compiler": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+  "base_revision": "bc5d0a02a5d23a39fbb2fce83bb352a4bcc3df97",
+  "started_utc": "2026-11-02T17:03:57Z",
+  "source_sha256_before": {
+    "Cargo.lock": "d69180894da5f16cb4230d1e27631cc524992f731a84c7ba336b66efdc4f9d7e",
+    "Cargo.toml": "a05e032d958a52d259f6a4236e16a955e33756a0d27de405588f287daf704d59",
+    "crates/mcp-agent-mail-storage/Cargo.toml": "f0e87182f99847c07d625ba5f641c922c3f453ee83d7d758d29b9b29ba96b68d",
+    "crates/mcp-agent-mail-core/Cargo.toml": "e41c41555e1fa2acbbb79bfbea056458e0b142706a2a267cce8b2dace27d7de2",
+    "crates/mcp-agent-mail-storage/src/lib.rs": "8cc9135556bf35a470b3ba237c832e8ef5730b09774f029ec948536656222a81",
+    "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "14aac5a67d09158476ee5c800fcc12191f8169e2c4caf23bfbe31138b5ff6891",
+    "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "279c657ab692881c4368a703857589ff0a7efe04b7835c962d395ed6ed3056a3"
+  },
+  "host": {
+    "uname": {
+      "system": "Linux",
+      "node": "4c7b5900111b",
+      "release": "6.18.57",
+      "version": "#1 SMP Tue Oct 20 21:56:04 UTC 2026",
+      "machine": "x86_64",
+      "processor": "x86_64"
+    },
+    "cgroup_memory_max": "8589934592",
+    "cgroup_cpu_max": "800000 100000"
+  },
+  "cgroup_memory_events_before": "low 0\nhigh 0\nmax 3489840\noom 32\noom_kill 8\noom_group_kill 0\n",
+  "compiler_wrapper": {
+    "path": "/workspace/scratch/68420b93bbca/rustc-concurrency-wrapper.py",
+    "sha256": "5b7665f7561a9fb005068a26faca70be40ae9139695a7ac5c7eed5bac8e8bd92",
+    "behavior": "Appends -Zunstable-options --jobs-backend=1 --jobs-linker=1 only to actual crate compilation; additionally appends -Zfewer-names=yes -Zmir-opt-level=0 -Ztime-passes only for Asupersync. Version and target probes pass through unchanged. No source, feature, dependency fingerprint, or artifact modification; the Asupersync MIR optimization adjustment is an explicit compiler memory tradeoff shared by both benchmark arms. time-passes only logs compiler phase timing and memory."
+  },
+  "log": "/workspace/scratch/68420b93bbca/candidate-lowmem-libtests-build.log",
+  "elapsed_seconds": 254.73908876099995,
+  "exit_code": 101,
+  "max_child_rss_kib": 7113024,
+  "finished_utc": "2026-11-02T17:08:12Z",
+  "cgroup_memory_events_after": "low 0\nhigh 0\nmax 3676084\noom 35\noom_kill 10\noom_group_kill 0\n",
+  "source_sha256_after": {
+    "Cargo.lock": "d69180894da5f16cb4230d1e27631cc524992f731a84c7ba336b66efdc4f9d7e",
+    "Cargo.toml": "a05e032d958a52d259f6a4236e16a955e33756a0d27de405588f287daf704d59",
+    "crates/mcp-agent-mail-storage/Cargo.toml": "f0e87182f99847c07d625ba5f641c922c3f453ee83d7d758d29b9b29ba96b68d",
+    "crates/mcp-agent-mail-core/Cargo.toml": "e41c41555e1fa2acbbb79bfbea056458e0b142706a2a267cce8b2dace27d7de2",
+    "crates/mcp-agent-mail-storage/src/lib.rs": "8cc9135556bf35a470b3ba237c832e8ef5730b09774f029ec948536656222a81",
+    "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "14aac5a67d09158476ee5c800fcc12191f8169e2c4caf23bfbe31138b5ff6891",
+    "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "279c657ab692881c4368a703857589ff0a7efe04b7835c962d395ed6ed3056a3"
+  },
+  "artifacts": []
+}

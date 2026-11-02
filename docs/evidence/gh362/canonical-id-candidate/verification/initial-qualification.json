@@ -1,0 +1,57 @@
+{
+  "issue": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/362",
+  "base_commit": "0358e2d99da21661fcd679118e8000815ab865ab",
+  "runtime_activated": false,
+  "qualification": "blocked before storage compilation by dependency OOM; no integration or scale results",
+  "patch": "2026-11-02-canonical-id-candidate.patch",
+  "patch_sha256": "bf5400573cc4d303cfda4e5ac9f516bf936c8f27a486b6b598b5161ed226054b",
+  "candidate_files": [
+    {
+      "path": "crates/mcp-agent-mail-storage/Cargo.toml",
+      "sha256": "f0e87182f99847c07d625ba5f641c922c3f453ee83d7d758d29b9b29ba96b68d",
+      "bytes": 2291
+    },
+    {
+      "path": "crates/mcp-agent-mail-storage/src/lib.rs",
+      "sha256": "8cc9135556bf35a470b3ba237c832e8ef5730b09774f029ec948536656222a81",
+      "bytes": 1316738
+    },
+    {
+      "path": "crates/mcp-agent-mail-storage/src/canonical_watch.rs",
+      "sha256": "14aac5a67d09158476ee5c800fcc12191f8169e2c4caf23bfbe31138b5ff6891",
+      "bytes": 19364
+    },
+    {
+      "path": "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs",
+      "sha256": "e7ee56420e708e4327809479153778cad1927859f29a0704385b2170e5a1976a",
+      "bytes": 43677
+    },
+    {
+      "path": "docs/performance/gh362-canonical-id-verification.md",
+      "sha256": "85b61f702a897150781f5593e90919b0833b5f2ec6cd31f7953849d3a0db346e",
+      "bytes": 20988
+    }
+  ],
+  "verified": {
+    "workspace_cargo_fmt_check": "passed",
+    "git_diff_check": "passed",
+    "standalone_actual_adapter_tests": {
+      "passed": 7,
+      "failed": 0,
+      "nix": "0.31.3",
+      "tempfile": "3.27.0",
+      "compiler": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+      "scope": "actual canonical_watch.rs with ordinary symlink_metadata wrapper; excludes full storage integration"
+    },
+    "standalone_actual_adapter_clippy": "passed with pedantic/nursery and -D warnings, workspace documented allows",
+    "packed_git_fixture_protocol": "passed with 101 canonical messages and 303 tracked archive copies plus .gitattributes"
+  },
+  "not_executed": [
+    "full storage correctness tests",
+    "5000-message publication benchmark",
+    "50000-message publication benchmark",
+    "150000-message publication benchmark",
+    "workspace production/all-target checks",
+    "full storage/workspace Clippy"
+  ]
+}

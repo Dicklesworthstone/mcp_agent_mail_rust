@@ -1,0 +1,15 @@
+{
+  "admitted_time": 1793639037.750885,
+  "other_rustc_count": 0,
+  "other_cargo_count": 2,
+  "quiet_seconds": 4.009920583999701,
+  "waiting_seconds": 169.3425874479999,
+  "estimated_reclaimable_headroom_bytes": 8230842120,
+  "memory_stat": {
+    "anon": 323354624,
+    "file": 5949288448,
+    "shmem": 27410432,
+    "kernel": 1135214592,
+    "slab_reclaimable": 1126887176
+  }
+}

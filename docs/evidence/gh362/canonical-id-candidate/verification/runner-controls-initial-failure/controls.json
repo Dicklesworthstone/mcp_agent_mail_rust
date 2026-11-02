@@ -1,0 +1,14 @@
+{
+  "scope": "Python runner controls with synthetic records and tiny owned subprocesses; no Rust/native gate claim",
+  "tests_run": 10,
+  "failures": 1,
+  "errors": 0,
+  "skipped": 0,
+  "successful": false,
+  "scripts_sha256": {
+    "gh362_compare.py": "1930a28f9b4ef2f3971973fdd05eea5896835624108a7c54e6163a11b028dd5e",
+    "gh362_run_focused.py": "e08060673b8b86bfc2de6b1753ccb49512d6575637d8afe82133b5e2d495b997",
+    "gh362_runner_common.py": "fcb23d6c87ad4f44f8fc60bfbaeeb5e9fdbaad322e88cc39bde2462ce68c5685",
+    "gh362_runner_checks.py": "315166565823c6779c6d27efc7247eeb9486b5e4268b5639085f889eb4a3f6e9"
+  }
+}

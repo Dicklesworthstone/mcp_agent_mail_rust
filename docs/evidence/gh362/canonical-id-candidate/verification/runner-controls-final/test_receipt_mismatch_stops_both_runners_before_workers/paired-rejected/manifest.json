@@ -1,0 +1,271 @@
+{
+  "started": "2026-11-02T17:36:53.093411+00:00",
+  "scope": "storage public-writer mechanism experiment; no release or operational verdict",
+  "runner_sha256": "7e65e225ef7448de5d2ad22106aaeba11081562dc4358bd0049c5aa3ae6a571a",
+  "runner_common_sha256": "d54c11060c1c5c96d34e79ec356e0be9331dc8d752326766ca77543f5e9fcefb",
+  "selector": "canonical_id_tests::canonical_publication_public_writer_benchmark",
+  "rounds": 8,
+  "scenario": "all",
+  "schedule": [
+    [
+      "baseline",
+      5000,
+      "small_AA_null"
+    ],
+    [
+      "baseline",
+      5000,
+      "small_AA_null"
+    ],
+    [
+      "baseline",
+      5000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      5000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      5000,
+      "AB_BA"
+    ],
+    [
+      "baseline",
+      5000,
+      "AB_BA"
+    ],
+    [
+      "baseline",
+      50000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      50000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      50000,
+      "AB_BA"
+    ],
+    [
+      "baseline",
+      50000,
+      "AB_BA"
+    ],
+    [
+      "baseline",
+      150000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      150000,
+      "AB_BA"
+    ],
+    [
+      "candidate",
+      150000,
+      "AB_BA"
+    ],
+    [
+      "baseline",
+      150000,
+      "AB_BA"
+    ]
+  ],
+  "warm_fixture": "three tracked copies; historical mailbox copies hardlinked; new copies independent",
+  "foreign_append_span": "completed independent public write and flush precede timed parent publication",
+  "controlled_fence_span": "controlled scheduling, if enabled; wall time includes orchestration and is not production p99",
+  "canonical_counter_scope": "instrumented identity-check metadata/enumeration, not total syscalls",
+  "small_AA_tolerance": "publication median ratio in [1/1.2,1.2], descriptive noise flag only; not a release budget",
+  "host": {
+    "time": "2026-11-02T17:36:53.093846+00:00",
+    "host": "4c7b5900111b",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 9,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "load_average": [
+      6.9296875,
+      5.80712890625,
+      4.77783203125
+    ],
+    "cpu_governor": null,
+    "inotify_max_user_watches": "80485",
+    "inotify_max_user_instances": "128",
+    "cgroup_memory_max": "8589934592",
+    "cgroup_memory_current": "5660262400",
+    "cgroup_cpu_max": "800000 100000",
+    "free_disk_bytes": 24067100672
+  },
+  "binaries": {
+    "baseline": {
+      "path": "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_receipt_mismatch_stops_both_runners_before_workers/wrong-binary",
+      "sha256": "cf82f1370dae765e023615768d90acd69315ef23f709140090375165eb83ef6e"
+    },
+    "candidate": {
+      "path": "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_receipt_mismatch_stops_both_runners_before_workers/wrong-binary",
+      "sha256": "cf82f1370dae765e023615768d90acd69315ef23f709140090375165eb83ef6e"
+    }
+  },
+  "sources": {
+    "baseline": {
+      "head": "dddddddddddddddddddddddddddddddddddddddd",
+      "files_sha256": {
+        "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    },
+    "candidate": {
+      "head": "dddddddddddddddddddddddddddddddddddddddd",
+      "files_sha256": {
+        "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    }
+  },
+  "build_receipt": {
+    "schema_version": 1,
+    "arms": {
+      "baseline": {
+        "binaries": {
+          "storage": {
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        },
+        "sources": {
+          "head": "dddddddddddddddddddddddddddddddddddddddd",
+          "files_sha256_before": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "files_sha256_after": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        },
+        "build": {
+          "exit_code": 0,
+          "compiler": "synthetic rustc identity",
+          "profile": {
+            "opt_level": 0
+          },
+          "features": {
+            "packages": [
+              "storage",
+              "core"
+            ],
+            "default_features": false
+          },
+          "rustflags": "synthetic flags",
+          "wrapper_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      },
+      "candidate": {
+        "binaries": {
+          "storage": {
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        },
+        "sources": {
+          "head": "dddddddddddddddddddddddddddddddddddddddd",
+          "files_sha256_before": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "files_sha256_after": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        },
+        "build": {
+          "exit_code": 0,
+          "compiler": "synthetic rustc identity",
+          "profile": {
+            "opt_level": 0
+          },
+          "features": {
+            "packages": [
+              "storage",
+              "core"
+            ],
+            "default_features": false
+          },
+          "rustflags": "synthetic flags",
+          "wrapper_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      }
+    }
+  },
+  "build_receipt_binding": {
+    "supplied": true,
+    "qualified": false,
+    "errors": [
+      "baseline.storage binary SHA256 differs from its build receipt",
+      "candidate.storage binary SHA256 differs from its build receipt"
+    ],
+    "source_coverage": {
+      "baseline": {
+        "captured_files": [
+          "Cargo.lock",
+          "Cargo.toml",
+          "crates/mcp-agent-mail-storage/Cargo.toml",
+          "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs",
+          "crates/mcp-agent-mail-storage/src/lib.rs"
+        ],
+        "observed_checkout_checked": true,
+        "scope": "declared source files and HEAD; not a hash of every compiled dependency source"
+      },
+      "candidate": {
+        "captured_files": [
+          "Cargo.lock",
+          "Cargo.toml",
+          "crates/mcp-agent-mail-storage/Cargo.toml",
+          "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs",
+          "crates/mcp-agent-mail-storage/src/canonical_watch.rs",
+          "crates/mcp-agent-mail-storage/src/lib.rs"
+        ],
+        "observed_checkout_checked": true,
+        "scope": "declared source files and HEAD; not a hash of every compiled dependency source"
+      }
+    }
+  },
+  "profile_status": "build receipt checked for identity and paired compiler/profile parity; absent receipt is unqualified"
+}

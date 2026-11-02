@@ -1,0 +1,32 @@
+{
+  "label": "ignored",
+  "command": [
+    "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_focused_all_ignored_receipt_is_not_success/fake-native",
+    "canonical_id_tests::",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "selected_tests": [
+    "canonical_id_tests::canonical_publication_public_writer_benchmark",
+    "canonical_id_tests::canonical_publication_scale_benchmark"
+  ],
+  "elapsed_seconds": 0.256017824999617,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": null,
+  "counts": {
+    "passed": 0,
+    "failed": 0,
+    "ignored": 2
+  },
+  "terminal_verdict": "ok",
+  "expected_active_tests": 0,
+  "expected_ignored_tests": 2,
+  "unexpected_ignored_tests": [],
+  "complete_test_record": true,
+  "success": false,
+  "log": "ignored.log",
+  "log_sha256": "87ff87c522cf0cc04d17165408addf679e9800cff92f99963720c8b23d3c14d2"
+}

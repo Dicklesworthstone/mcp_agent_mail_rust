@@ -1,0 +1,97 @@
+{
+  "run_id": "interrupt",
+  "purpose": "control",
+  "arm": "candidate",
+  "history_messages": 5000,
+  "command": [
+    "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_interrupted_benchmark_retains_raw_receipt/fake-native",
+    "--exact",
+    "canonical_id_tests::canonical_publication_public_writer_benchmark",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "time": "2026-11-02T17:36:49.034678+00:00",
+    "host": "4c7b5900111b",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 9,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "load_average": [
+      7.27197265625,
+      5.85498046875,
+      4.78759765625
+    ],
+    "cpu_governor": null,
+    "inotify_max_user_watches": "80485",
+    "inotify_max_user_instances": "128",
+    "cgroup_memory_max": "8589934592",
+    "cgroup_memory_current": "5738856448",
+    "cgroup_cpu_max": "800000 100000",
+    "free_disk_bytes": 24067239936
+  },
+  "after": {
+    "time": "2026-11-02T17:36:49.598501+00:00",
+    "host": "4c7b5900111b",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 9,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "load_average": [
+      7.27197265625,
+      5.85498046875,
+      4.78759765625
+    ],
+    "cpu_governor": null,
+    "inotify_max_user_watches": "80485",
+    "inotify_max_user_instances": "128",
+    "cgroup_memory_max": "8589934592",
+    "cgroup_memory_current": "5762842624",
+    "cgroup_cpu_max": "800000 100000",
+    "free_disk_bytes": 24067227648
+  },
+  "elapsed_seconds": 0.5630747209997935,
+  "exit_code": -15,
+  "timed_out": false,
+  "interrupted": true,
+  "execution_error": "SIGTERM",
+  "cleanup": {
+    "signals": [
+      "SIGTERM"
+    ],
+    "remaining_owned_group_members": []
+  },
+  "complete_raw_record": false,
+  "expected_samples": 6,
+  "validation_errors": [
+    "expected one setup record, received 0",
+    "sample set is incomplete, duplicated, or differs from the requested experiment",
+    "exact benchmark selector did not finish as one passing native test"
+  ],
+  "log": "interrupt.log",
+  "log_sha256": "eff64b343dcb2b1dc113648e7089b9ce9f8a7f6c7808a03a2cffb4ad7302f606",
+  "telemetry": "interrupt.telemetry.jsonl",
+  "telemetry_scope": "primary worker process, 250ms observations; foreign sender resources excluded",
+  "rows": []
+}

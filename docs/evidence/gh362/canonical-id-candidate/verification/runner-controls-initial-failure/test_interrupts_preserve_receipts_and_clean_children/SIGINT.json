@@ -1,0 +1,13 @@
+{
+  "elapsed_seconds": 0.5604618400002437,
+  "exit_code": -15,
+  "timed_out": false,
+  "interrupted": true,
+  "execution_error": "KeyboardInterrupt",
+  "cleanup": {
+    "signals": [
+      "SIGTERM"
+    ],
+    "remaining_owned_group_members": []
+  }
+}

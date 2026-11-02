@@ -1,0 +1,9 @@
+{
+  "time": "2026-11-02T17:36:53.095317+00:00",
+  "error": "build receipt binding failed",
+  "details": [
+    "baseline.storage binary SHA256 differs from its build receipt",
+    "candidate.storage binary SHA256 differs from its build receipt"
+  ],
+  "comparative_verdict": "NO_VERDICT; no benchmark worker was started"
+}

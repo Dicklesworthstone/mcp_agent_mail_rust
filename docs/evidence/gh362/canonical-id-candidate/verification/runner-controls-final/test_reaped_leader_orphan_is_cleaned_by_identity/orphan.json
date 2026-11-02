@@ -1,0 +1,14 @@
+{
+  "elapsed_seconds": 2.289012965999973,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": "worker exited with live owned descendants",
+  "cleanup": {
+    "signals": [
+      "SIGTERM",
+      "SIGKILL"
+    ],
+    "remaining_owned_group_members": []
+  }
+}

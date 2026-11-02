@@ -1,0 +1,130 @@
+{
+  "started": "2026-11-02T17:36:53.098775+00:00",
+  "runner_sha256": "6491233bf3c15ec9b8d491a2df1b8a8d84f0448be18bc3978b4b620fc2b55b6d",
+  "runner_common_sha256": "d54c11060c1c5c96d34e79ec356e0be9331dc8d752326766ca77543f5e9fcefb",
+  "binaries": {
+    "storage": {
+      "path": "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_receipt_mismatch_stops_both_runners_before_workers/wrong-binary",
+      "sha256": "cf82f1370dae765e023615768d90acd69315ef23f709140090375165eb83ef6e"
+    }
+  },
+  "source": null,
+  "build_receipt": {
+    "schema_version": 1,
+    "arms": {
+      "baseline": {
+        "binaries": {
+          "storage": {
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        },
+        "sources": {
+          "head": "dddddddddddddddddddddddddddddddddddddddd",
+          "files_sha256_before": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "files_sha256_after": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        },
+        "build": {
+          "exit_code": 0,
+          "compiler": "synthetic rustc identity",
+          "profile": {
+            "opt_level": 0
+          },
+          "features": {
+            "packages": [
+              "storage",
+              "core"
+            ],
+            "default_features": false
+          },
+          "rustflags": "synthetic flags",
+          "wrapper_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      },
+      "candidate": {
+        "binaries": {
+          "storage": {
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        },
+        "sources": {
+          "head": "dddddddddddddddddddddddddddddddddddddddd",
+          "files_sha256_before": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "files_sha256_after": {
+            "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/canonical_watch.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "Cargo.lock": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/Cargo.toml": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "crates/mcp-agent-mail-storage/src/lib.rs": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        },
+        "build": {
+          "exit_code": 0,
+          "compiler": "synthetic rustc identity",
+          "profile": {
+            "opt_level": 0
+          },
+          "features": {
+            "packages": [
+              "storage",
+              "core"
+            ],
+            "default_features": false
+          },
+          "rustflags": "synthetic flags",
+          "wrapper_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      }
+    }
+  },
+  "build_receipt_binding": {
+    "supplied": true,
+    "qualified": false,
+    "errors": [
+      "candidate.storage binary SHA256 differs from its build receipt"
+    ],
+    "source_coverage": {
+      "candidate": {
+        "captured_files": [
+          "Cargo.lock",
+          "Cargo.toml",
+          "crates/mcp-agent-mail-storage/Cargo.toml",
+          "crates/mcp-agent-mail-storage/src/canonical_id_tests.rs",
+          "crates/mcp-agent-mail-storage/src/canonical_watch.rs",
+          "crates/mcp-agent-mail-storage/src/lib.rs"
+        ],
+        "observed_checkout_checked": false,
+        "scope": "declared source files and HEAD; not a hash of every compiled dependency source"
+      }
+    }
+  },
+  "test_inventories": {},
+  "ignored_test_inventories": {},
+  "allowed_ignored_tests": [
+    "canonical_id_tests::canonical_publication_public_writer_benchmark",
+    "canonical_id_tests::canonical_publication_scale_benchmark",
+    "reservation_artifact::tests::exact_generation_lookup_history_scaling"
+  ],
+  "runs": [],
+  "failure": "RuntimeError: build receipt binding failed: candidate.storage binary SHA256 differs from its build receipt",
+  "finished": "2026-11-02T17:36:53.099795+00:00"
+}

@@ -1,0 +1,6 @@
+{
+  "time": "2026-11-02T17:28:15.284586+00:00",
+  "run_id": "01-5000-baseline",
+  "error": "seeded corpus tree differs at 5000: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa versus bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "comparative_verdict": "NO_VERDICT; failed or mismatched run retained"
+}

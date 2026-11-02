@@ -1,0 +1,15 @@
+{
+  "command": [
+    "git",
+    "-C",
+    "/workspace/scratch/68420b93bbca/gh362-packet-prepare-check/baseline",
+    "diff",
+    "--check"
+  ],
+  "elapsed_seconds": 0.5243143229999987,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": null
+}

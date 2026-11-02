@@ -1,0 +1,13 @@
+{
+  "elapsed_seconds": 0.5582759870003429,
+  "exit_code": -15,
+  "timed_out": false,
+  "interrupted": true,
+  "execution_error": "SIGTERM",
+  "cleanup": {
+    "signals": [
+      "SIGTERM"
+    ],
+    "remaining_owned_group_members": []
+  }
+}

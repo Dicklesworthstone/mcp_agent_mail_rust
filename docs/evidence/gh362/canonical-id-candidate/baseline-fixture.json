@@ -1,0 +1,36 @@
+{
+  "baseline_commit": "bc5d0a02a5d23a39fbb2fce83bb352a4bcc3df97",
+  "incumbent_storage_blob": "19de0eb88deef2ec9308554689cd69d707d94d4c",
+  "scope": "Only test instrumentation, test module, and dev-dependency Nix feature alignment; production algorithms unchanged",
+  "baseline_watch_observer": "null, not applicable to incumbent",
+  "shared_worker_function_sha256": "8875b98ee5a1a547387a610664e7bbc46f6a9c65f3fe04b8431148aa39d091f3",
+  "identical_shared_functions": 14,
+  "patch_sha256": "34ad08e1e510e0e43d05a1626fd035c93192f2642b74ca5f2d3c680bec00ff72",
+  "runner_sha256": "7e65e225ef7448de5d2ad22106aaeba11081562dc4358bd0049c5aa3ae6a571a",
+  "focused_runner_sha256": "6491233bf3c15ec9b8d491a2df1b8a8d84f0448be18bc3978b4b620fc2b55b6d",
+  "runner_common_sha256": "d54c11060c1c5c96d34e79ec356e0be9331dc8d752326766ca77543f5e9fcefb",
+  "runner_checks_sha256": "2511dd9f60291ecfdd366dd1521212e1a049022955371d183973c5a32d6a5ca7",
+  "test_feature_alignment": "nix dev-dependency enables fs,inotify to match candidate libtest graph; normal incumbent nix.workspace=true remains",
+  "validation": [
+    "git diff --check passed",
+    "pinned rustfmt --check lib.rs and test module passed",
+    "14 shared function bodies byte-identical",
+    "Both Python runner --help checks passed",
+    "17 Python schema/process/build-receipt controls passed; prior control receipts and initial failed PID-namespace control retained; not native Rust gate evidence",
+    "negative test and four helpers byte-identical; seed differs only by absent watch-enrollment assertion; pinned rustfmt passed"
+  ],
+  "native_compile_and_runtime": "pending build agent, not executed by canonical_design",
+  "baseline_test_module_sha256": "67563285b8a4e7a980186923d5990882a701e80f62214165968177691b26d6af",
+  "historical_negative_control": {
+    "selector": "canonical_id_tests::historical_in_place_rewrite_is_detected_before_the_next_publication",
+    "test_function_sha256": "a86a901993239aa73d2a5a6834219945119256bbbdf1fa9d651ec7393d8b82b9",
+    "fixture_difference": "Only candidate-specific change-watch enrollment assertion omitted from seed_old_history; incumbent has no watch API",
+    "identical_additional_functions": 5,
+    "assertions": "same-length rewrite; restored mtime; unchanged parent/root stamps; actual single and batch public writer must refuse duplicate; retained bytes and no published copies",
+    "expected_baseline_result": "Nonzero failure old in-place rewrite was missed; do not mark should_panic or count as functional pass",
+    "observed_result": "pending native execution"
+  },
+  "fixture_coalescer_errors_assertion": "Cumulative coalescer.stats().errors must be zero, including failed commit groups/spills later retried; not every internal Git retry",
+  "shared_helpers_comparison": "14 benchmark and 5 negative-control function bodies byte-identical after coalescer-error assertion update",
+  "test_hook_parity": "Candidate additionally polls an unset AFTER_FIRST_INSTALL test hook after each installed copy; production verifier behavior is the experimental variable, and complete libtest source bodies are not claimed byte-identical"
+}

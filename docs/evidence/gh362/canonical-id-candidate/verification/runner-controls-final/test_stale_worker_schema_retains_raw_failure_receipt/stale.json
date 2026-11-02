@@ -1,0 +1,158 @@
+{
+  "run_id": "stale",
+  "purpose": "control",
+  "arm": "candidate",
+  "history_messages": 5000,
+  "command": [
+    "/workspace/scratch/68420b93bbca/gh362-runner-controls-04/test_stale_worker_schema_retains_raw_failure_receipt/fake-native",
+    "--exact",
+    "canonical_id_tests::canonical_publication_public_writer_benchmark",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "time": "2026-11-02T17:36:53.182242+00:00",
+    "host": "4c7b5900111b",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 9,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "load_average": [
+      6.9296875,
+      5.80712890625,
+      4.77783203125
+    ],
+    "cpu_governor": null,
+    "inotify_max_user_watches": "80485",
+    "inotify_max_user_instances": "128",
+    "cgroup_memory_max": "8589934592",
+    "cgroup_memory_current": "5662134272",
+    "cgroup_cpu_max": "800000 100000",
+    "free_disk_bytes": 24067055616
+  },
+  "after": {
+    "time": "2026-11-02T17:36:53.440743+00:00",
+    "host": "4c7b5900111b",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 9,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "load_average": [
+      6.9296875,
+      5.80712890625,
+      4.77783203125
+    ],
+    "cpu_governor": null,
+    "inotify_max_user_watches": "80485",
+    "inotify_max_user_instances": "128",
+    "cgroup_memory_max": "8589934592",
+    "cgroup_memory_current": "5669949440",
+    "cgroup_cpu_max": "800000 100000",
+    "free_disk_bytes": 24067043328
+  },
+  "elapsed_seconds": 0.25781897700017,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": null,
+  "complete_raw_record": false,
+  "expected_samples": 6,
+  "validation_errors": [
+    "worker scenario list differs from the requested experiment",
+    "sample set is incomplete, duplicated, or differs from the requested experiment"
+  ],
+  "log": "stale.log",
+  "log_sha256": "4d7946d38dabf996ae3b803025ec645fed22ac5839815244ae18fb9ac83e7c67",
+  "telemetry": "stale.telemetry.jsonl",
+  "telemetry_scope": "primary worker process, 250ms observations; foreign sender resources excluded",
+  "rows": [
+    {
+      "history_messages": 5000,
+      "watch_supported_and_enrolled": true,
+      "kind": "canonical_publication_public_setup",
+      "scenarios": [
+        "warm_single_writer",
+        "foreign_append"
+      ],
+      "rounds": 2,
+      "historical_tracked_copies": 15000,
+      "seeded_git_tree_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "cold_publication_us": 10,
+      "setup_ms": 20
+    },
+    {
+      "history_messages": 5000,
+      "watch_supported_and_enrolled": true,
+      "kind": "canonical_publication_public_sample",
+      "scenario": "warm_single_writer",
+      "round": 0,
+      "publication_us": 10,
+      "canonical_read_dirs": 10,
+      "canonical_metadata_calls": 10,
+      "publication_thread_fence_held_us": 10,
+      "publication_thread_project_lock_held_us": 10,
+      "async_commit_flush_us": 10
+    },
+    {
+      "history_messages": 5000,
+      "watch_supported_and_enrolled": true,
+      "kind": "canonical_publication_public_sample",
+      "scenario": "warm_single_writer",
+      "round": 1,
+      "publication_us": 10,
+      "canonical_read_dirs": 10,
+      "canonical_metadata_calls": 10,
+      "publication_thread_fence_held_us": 10,
+      "publication_thread_project_lock_held_us": 10,
+      "async_commit_flush_us": 10
+    },
+    {
+      "history_messages": 5000,
+      "watch_supported_and_enrolled": true,
+      "kind": "canonical_publication_public_sample",
+      "scenario": "foreign_append",
+      "round": 0,
+      "publication_us": 10,
+      "canonical_read_dirs": 10,
+      "canonical_metadata_calls": 10,
+      "publication_thread_fence_held_us": 10,
+      "publication_thread_project_lock_held_us": 10,
+      "async_commit_flush_us": 10
+    },
+    {
+      "history_messages": 5000,
+      "watch_supported_and_enrolled": true,
+      "kind": "canonical_publication_public_sample",
+      "scenario": "foreign_append",
+      "round": 1,
+      "publication_us": 10,
+      "canonical_read_dirs": 10,
+      "canonical_metadata_calls": 10,
+      "publication_thread_fence_held_us": 10,
+      "publication_thread_project_lock_held_us": 10,
+      "async_commit_flush_us": 10
+    }
+  ]
+}

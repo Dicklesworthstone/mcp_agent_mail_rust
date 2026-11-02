@@ -1,0 +1,30 @@
+{
+  "time": "2026-11-02T17:47:29.129941+00:00",
+  "host": "4c7b5900111b",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "cpu_model": "AMD EPYC 7763 64-Core Processor",
+  "logical_cpus": 9,
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "load_average": [
+    5.1953125,
+    4.5400390625,
+    4.408203125
+  ],
+  "cpu_governor": null,
+  "inotify_max_user_watches": "80485",
+  "inotify_max_user_instances": "128",
+  "cgroup_memory_max": "8589934592",
+  "cgroup_memory_current": "8112205824",
+  "cgroup_cpu_max": "800000 100000",
+  "free_disk_bytes": 23487934464
+}

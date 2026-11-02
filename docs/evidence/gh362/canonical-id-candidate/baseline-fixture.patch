@@ -1,0 +1,734 @@
+diff --git a/crates/mcp-agent-mail-storage/Cargo.toml b/crates/mcp-agent-mail-storage/Cargo.toml
+index f9f54d3..b3f3add 100644
+--- a/crates/mcp-agent-mail-storage/Cargo.toml
++++ b/crates/mcp-agent-mail-storage/Cargo.toml
+@@ -46,6 +46,9 @@ default = ["mcp-agent-mail-db/default"]
+ portable = ["mcp-agent-mail-db/portable"]
+ 
+ [dev-dependencies]
++# Match the candidate's compiled Nix APIs for this paired test-only fixture;
++# the incumbent production dependency declaration and algorithms are unchanged.
++nix = { workspace = true, features = ["fs", "inotify"] }
+ # Enable asupersync `test-internals` for TEST builds only so tests can
+ # construct `Cx::for_testing()`; the release build excludes dev-deps and keeps
+ # the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
+diff --git a/crates/mcp-agent-mail-storage/src/lib.rs b/crates/mcp-agent-mail-storage/src/lib.rs
+index 19de0eb..e703dd4 100644
+--- a/crates/mcp-agent-mail-storage/src/lib.rs
++++ b/crates/mcp-agent-mail-storage/src/lib.rs
+@@ -12,6 +12,8 @@
+ //! - Notification signals
+ 
+ pub mod boot_check;
++#[cfg(test)]
++mod canonical_id_tests;
+ pub mod recovery;
+ 
+ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+@@ -488,6 +490,12 @@ static ARCHIVE_PUBLICATION_FENCE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::
+ 
+ thread_local! {
+     static ARCHIVE_MUTATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
++    #[cfg(test)]
++    static CANONICAL_PUBLICATION_FENCE_HELD: std::cell::Cell<Duration> =
++        const { std::cell::Cell::new(Duration::ZERO) };
++    #[cfg(test)]
++    static CANONICAL_PROJECT_LOCK_HELD: std::cell::Cell<Duration> =
++        const { std::cell::Cell::new(Duration::ZERO) };
+ }
+ 
+ /// Who holds `ARCHIVE_PUBLICATION_FENCE` (br-kp1in.29/.13). Every archive
+@@ -700,9 +708,24 @@ impl FenceLease {
+ 
+ impl Drop for FenceLease {
+     fn drop(&mut self) {
+-        *FENCE_HOLDER
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
++        #[cfg(test)]
++        {
++            let record = FENCE_HOLDER
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .take();
++            if let Some(record) = &record {
++                CANONICAL_PUBLICATION_FENCE_HELD.with(|held| {
++                    held.set(held.get().saturating_add(record.since.elapsed()));
++                });
++            }
++        }
++        #[cfg(not(test))]
++        {
++            *FENCE_HOLDER
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
++        }
+         drop(self.guard.take());
+     }
+ }
+@@ -5335,6 +5358,8 @@ where
+     } else {
+         lock.acquire_existing_parent()?;
+     }
++    #[cfg(test)]
++    let held_since = Instant::now();
+     mcp_agent_mail_core::global_metrics()
+         .storage
+         .archive_lock_wait_us
+@@ -5343,6 +5368,10 @@ where
+     let result = f();
+     drop(_gen_guard);
+     lock.release()?;
++    #[cfg(test)]
++    CANONICAL_PROJECT_LOCK_HELD.with(|held| {
++        held.set(held.get().saturating_add(held_since.elapsed()));
++    });
+     result
+ }
+ 
+diff --git a/crates/mcp-agent-mail-storage/src/canonical_id_tests.rs b/crates/mcp-agent-mail-storage/src/canonical_id_tests.rs
+new file mode 100644
+index 0000000..3a13b35
+--- /dev/null
++++ b/crates/mcp-agent-mail-storage/src/canonical_id_tests.rs
+@@ -0,0 +1,640 @@
++//! Test-only paired public-writer benchmark for the unchanged incumbent.
++//! The worker and fixture helpers match the candidate verbatim. The enrollment
++//! observer returns None because this revision has no change-watch backend.
++
++use super::*;
++use std::process::{Command, Stdio};
++use tempfile::TempDir;
++
++const CHILD_CASE: &str = "AM_CANONICAL_ID_REGRESSION_CHILD";
++const SENDER: &str = "BlueLake";
++const RECIPIENT: &str = "GreenCastle";
++
++fn isolated_case(name: &str) -> bool {
++    isolated_case_inner(name, false)
++}
++
++fn isolated_case_inner(name: &str, ignored: bool) -> bool {
++    let selector = format!("canonical_id_tests::{name}");
++    if std::env::var(CHILD_CASE).ok().as_deref() == Some(selector.as_str()) {
++        return true;
++    }
++    let root = TempDir::new().unwrap();
++    let mut command = Command::new(std::env::current_exe().unwrap());
++    command
++        .args(["--exact", &selector, "--nocapture"])
++        .env(CHILD_CASE, &selector)
++        .env("STORAGE_ROOT", root.path())
++        .env("AM_COALESCER_MAX_WORKERS", "1");
++    if ignored {
++        command.arg("--ignored");
++    }
++    let output = command
++        .output()
++        .expect("run isolated canonical-ID regression");
++    assert!(
++        output.status.success(),
++        "{selector} failed:\n{}\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr),
++    );
++    assert!(
++        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
++        "the child selector must run exactly one test"
++    );
++    if ignored {
++        print!("{}", String::from_utf8_lossy(&output.stdout));
++    }
++    false
++}
++
++struct Mailbox {
++    _root: TempDir,
++    config: Config,
++    archive: ProjectArchive,
++}
++
++impl Mailbox {
++    fn new() -> Self {
++        let root = TempDir::new().unwrap();
++        let config = Config {
++            storage_root: root.path().to_path_buf(),
++            ..Config::default()
++        };
++        let archive = ensure_archive(&config, "canonical-history").unwrap();
++        Self {
++            _root: root,
++            config,
++            archive,
++        }
++    }
++
++    fn message(&self, id: i64, subject: &str) -> serde_json::Value {
++        fixture_message(&self.archive, id, subject)
++    }
++
++    fn publish(&self, message: &serde_json::Value) -> Result<()> {
++        write_message_bundle(
++            &self.archive,
++            &self.config,
++            message,
++            "immutable message body",
++            SENDER,
++            &[RECIPIENT.to_owned()],
++            &[],
++            None,
++        )
++    }
++
++    fn paths(&self, message: &serde_json::Value) -> MessageArchivePaths {
++        message_paths_for_bundle(&self.archive, message, SENDER, &[RECIPIENT.to_owned()])
++            .unwrap()
++            .0
++    }
++
++    fn seed_old_history(&self) -> PathBuf {
++        let month = self.archive.root.join("messages/2024/01");
++        fs::create_dir_all(&month).unwrap();
++        fs::create_dir_all(self.archive.root.join("messages/2026/10")).unwrap();
++        for id in 10..26 {
++            fs::write(
++                month.join(format!("historical__{id}.md")),
++                historical_content(id),
++            )
++            .unwrap();
++        }
++        self.publish(&self.message(80, "Warm the real publication cache"))
++            .unwrap();
++        flush_fixture_commits();
++        self.publish(&self.message(81, "Settle the initial publication"))
++            .unwrap();
++        flush_fixture_commits();
++        month.join("historical__10.md")
++    }
++
++    fn assert_unpublished(&self, message: &serde_json::Value) {
++        let paths = self.paths(message);
++        for path in [&paths.canonical, &paths.outbox]
++            .into_iter()
++            .chain(&paths.inbox)
++        {
++            assert!(!path.exists(), "refused message created {}", path.display());
++        }
++    }
++}
++
++fn fixture_message(archive: &ProjectArchive, id: i64, subject: &str) -> serde_json::Value {
++    serde_json::json!({
++        "id": id,
++        "from": SENDER,
++        "to": [RECIPIENT],
++        "cc": [],
++        "bcc": [],
++        "subject": subject,
++        "created": "2026-10-31T12:00:00Z",
++        "project": archive.slug,
++    })
++}
++
++fn historical_content(id: i64) -> String {
++    render_message_bundle_content(&serde_json::json!({ "id": id }), "historical evidence").unwrap()
++}
++
++fn assert_collision(error: &StorageError, id: i64) {
++    assert!(
++        error
++            .to_string()
++            .contains(&format!("canonical message id {id} already exists")),
++        "expected duplicate canonical identity refusal, got {error}"
++    );
++}
++
++fn assert_fixture_coalescer_idle() {
++    let Some(coalescer) = COMMIT_COALESCER.get() else {
++        return;
++    };
++    // flush_async_commits() has a timeout and returns no Result. A timed-out
++    // queue must not be mistaken for a settled fixture or contaminate the next
++    // sample with previous Git work.
++    assert_eq!(
++        coalescer.pending_requests(),
++        0,
++        "fixture commit flush left pending archive requests"
++    );
++    // This cumulative count includes failed commit groups/spills even if a
++    // later coalescer retry succeeds. An empty queue must not hide that error.
++    assert_eq!(
++        coalescer.stats().errors,
++        0,
++        "fixture commit group or spill failed, including recovered coalescer retries"
++    );
++    let repos = coalescer
++        .repos
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    assert!(
++        repos.values().all(|queue| {
++            queue.depth.load(Ordering::Relaxed) == 0 && !queue.processing.load(Ordering::Relaxed)
++        }),
++        "fixture commit flush returned while a repository was still active"
++    );
++}
++
++fn flush_fixture_commits() {
++    flush_async_commits();
++    assert_fixture_coalescer_idle();
++}
++
++#[test]
++fn historical_in_place_rewrite_is_detected_before_the_next_publication() {
++    if !isolated_case("historical_in_place_rewrite_is_detected_before_the_next_publication") {
++        return;
++    }
++    for batch in [false, true] {
++        let mailbox = Mailbox::new();
++        let historical = mailbox.seed_old_history();
++        let parent = historical.parent().unwrap();
++        let parent_before = current_path_stamp(parent);
++        let root_before = current_path_stamp(&mailbox.archive.root.join("messages"));
++        let before = fs::metadata(&historical).unwrap();
++        let retained = historical_content(90);
++        assert_eq!(retained.len() as u64, before.len());
++        fs::write(&historical, &retained).unwrap();
++        fs::File::options()
++            .write(true)
++            .open(&historical)
++            .unwrap()
++            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
++            .unwrap();
++        assert_eq!(current_path_stamp(parent), parent_before);
++        assert_eq!(
++            current_path_stamp(&mailbox.archive.root.join("messages")),
++            root_before
++        );
++
++        let message = mailbox.message(90, "Must notice an old rewritten identity");
++        let result = if batch {
++            write_message_batch_bundle(
++                &mailbox.archive,
++                &mailbox.config,
++                &[MessageBundleBatchEntry {
++                    message: &message,
++                    body_md: "immutable message body",
++                    sender: SENDER,
++                    recipients: &[RECIPIENT.to_owned()],
++                    extra_paths: &[],
++                }],
++                None,
++            )
++        } else {
++            mailbox.publish(&message)
++        };
++        assert_collision(&result.expect_err("old in-place rewrite was missed"), 90);
++        assert_eq!(fs::read_to_string(&historical).unwrap(), retained);
++        mailbox.assert_unpublished(&message);
++    }
++}
++
++/// Run Git against only the temporary fixture, regardless of enclosing Git
++/// environment variables.
++fn fixture_git(mailbox: &Mailbox) -> Command {
++    let mut command = Command::new("git");
++    command
++        .arg("-C")
++        .arg(&mailbox.archive.repo_root)
++        .arg("--git-dir")
++        .arg(mailbox.archive.repo_root.join(".git"))
++        .arg("--work-tree")
++        .arg(&mailbox.archive.repo_root);
++    // A developer's enclosing Git command must not redirect fixture writes to
++    // their repository, index, object database, or quarantine directory.
++    for variable in [
++        "GIT_DIR",
++        "GIT_COMMON_DIR",
++        "GIT_WORK_TREE",
++        "GIT_INDEX_FILE",
++        "GIT_OBJECT_DIRECTORY",
++        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
++        "GIT_QUARANTINE_PATH",
++        "GIT_NAMESPACE",
++    ] {
++        command.env_remove(variable);
++    }
++    command
++}
++
++/// Build the three-copy archive layout and a Git commit/index before measuring.
++/// Historical mailbox copies are hard-linked to their canonical file to bound
++/// fixture disk use; each canonical message has a distinct inode. Measured new
++/// messages use the real writer and create independent durable copies. No
++/// seeding, aging, cold initialization, or Git setup is charged to the samples.
++fn seed_scale_mailbox(mailbox: &Mailbox, count: usize) {
++    let body = "A real archived coordination message with enough text to exercise JSON and Markdown reads.\n".repeat(8);
++    let (branch, parent) = {
++        let repo = Repository::open(&mailbox.archive.repo_root).unwrap();
++        let head = repo.head().unwrap();
++        assert!(
++            head.is_branch(),
++            "fixture HEAD must name its initialized branch"
++        );
++        (
++            head.name().unwrap().to_owned(),
++            head.peel_to_commit().unwrap().id(),
++        )
++    };
++    // Stream blobs directly into a pack instead of creating one loose object
++    // per historical message. The worktree and committed 3*count paths are the
++    // same as an add_all/write_tree seed; only unmeasured fixture setup differs.
++    let mut importer = fixture_git(mailbox)
++        .args(["fast-import", "--quiet"])
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .expect("start Git fast-import for packed benchmark history");
++    let mut stream = std::io::BufWriter::new(importer.stdin.take().unwrap());
++    stream.write_all(b"feature done\n").unwrap();
++    for month in 1..=12 {
++        for base in [
++            mailbox.archive.root.join("messages"),
++            mailbox.archive.root.join(format!("agents/{SENDER}/outbox")),
++            mailbox
++                .archive
++                .root
++                .join(format!("agents/{RECIPIENT}/inbox")),
++        ] {
++            fs::create_dir_all(base.join(format!("2025/{month:02}"))).unwrap();
++            fs::create_dir_all(base.join("2026/10")).unwrap();
++        }
++    }
++    for id in 1..=count {
++        let month = (id - 1) % 12 + 1;
++        let filename = format!("2025-{month:02}-01T00-00-00Z__history__{id}.md");
++        let mut message = mailbox.message(i64::try_from(id).unwrap(), "Archived history");
++        message["created"] = format!("2025-{month:02}-01T00:00:00Z").into();
++        let content = render_message_bundle_content(&message, &body).unwrap();
++        writeln!(stream, "blob\nmark :{id}\ndata {}", content.len()).unwrap();
++        stream.write_all(content.as_bytes()).unwrap();
++        stream.write_all(b"\n").unwrap();
++        let canonical = mailbox
++            .archive
++            .root
++            .join(format!("messages/2025/{month:02}"))
++            .join(&filename);
++        fs::write(&canonical, &content).unwrap();
++        for base in [
++            mailbox.archive.root.join(format!("agents/{SENDER}/outbox")),
++            mailbox
++                .archive
++                .root
++                .join(format!("agents/{RECIPIENT}/inbox")),
++        ] {
++            fs::hard_link(
++                &canonical,
++                base.join(format!("2025/{month:02}")).join(&filename),
++            )
++            .unwrap();
++        }
++    }
++    let timestamp = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_secs();
++    let commit_message = b"Seed canonical publication benchmark history\n";
++    writeln!(stream, "commit {branch}").unwrap();
++    writeln!(
++        stream,
++        "committer Canonical archive benchmark <bench@localhost> {timestamp} +0000"
++    )
++    .unwrap();
++    writeln!(stream, "data {}", commit_message.len()).unwrap();
++    stream.write_all(commit_message).unwrap();
++    writeln!(stream, "\nfrom {parent}").unwrap();
++    for id in 1..=count {
++        let month = (id - 1) % 12 + 1;
++        let filename = format!("2025-{month:02}-01T00-00-00Z__history__{id}.md");
++        for base in [
++            "messages".to_owned(),
++            format!("agents/{SENDER}/outbox"),
++            format!("agents/{RECIPIENT}/inbox"),
++        ] {
++            writeln!(
++                stream,
++                "M 100644 :{id} projects/{}/{base}/2025/{month:02}/{filename}",
++                mailbox.archive.slug,
++            )
++            .unwrap();
++        }
++    }
++    stream.write_all(b"\ndone\n").unwrap();
++    stream.flush().unwrap();
++    drop(stream);
++    let imported = importer.wait_with_output().unwrap();
++    assert!(
++        imported.status.success(),
++        "Git fast-import failed: {}",
++        String::from_utf8_lossy(&imported.stderr)
++    );
++    // Populate the real on-disk Git index without changing the fixture files.
++    // Preserve the initialized parent tree, including archive attributes.
++    let indexed = fixture_git(mailbox)
++        .args(["read-tree", "HEAD"])
++        .output()
++        .expect("populate benchmark Git index from its seeded commit");
++    assert!(
++        indexed.status.success(),
++        "Git read-tree failed: {}",
++        String::from_utf8_lossy(&indexed.stderr)
++    );
++    let repo = Repository::open(&mailbox.archive.repo_root).unwrap();
++    let index = repo.index().unwrap();
++    assert!(index.len() >= count * 3, "all three copies must be tracked");
++    let seeded_commit = repo.head().unwrap().peel_to_commit().unwrap();
++    assert_eq!(seeded_commit.parent_id(0).unwrap(), parent);
++    assert!(
++        seeded_commit
++            .tree()
++            .unwrap()
++            .get_path(Path::new(".gitattributes"))
++            .is_ok()
++    );
++    // A freshly created file is intentionally uncacheable inside the Git-style
++    // racy timestamp window. Age the fixture, not the cache's trusted stamps.
++    std::thread::sleep(RACY_STAMP_WINDOW + Duration::from_millis(20));
++}
++
++fn benchmark_watch_enrollment(_mailbox: &Mailbox) -> Option<bool> {
++    None
++}
++
++fn append_foreign_benchmark_message(mailbox: &Mailbox, id: i64) {
++    let output = Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "canonical_id_tests::canonical_publication_foreign_sender",
++            "--nocapture",
++        ])
++        .env(
++            "AM_CANONICAL_BENCH_FOREIGN_ROOT",
++            &mailbox.config.storage_root,
++        )
++        .env("AM_CANONICAL_BENCH_FOREIGN_ID", id.to_string())
++        .output()
++        .expect("run completed foreign publication before the parent sample");
++    assert!(
++        output.status.success(),
++        "foreign benchmark publication failed:\n{}\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++    assert!(
++        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
++        "foreign sender selector must run exactly one test"
++    );
++}
++
++#[test]
++fn canonical_publication_foreign_sender() {
++    let Some(root) = std::env::var_os("AM_CANONICAL_BENCH_FOREIGN_ROOT") else {
++        return;
++    };
++    let id = std::env::var("AM_CANONICAL_BENCH_FOREIGN_ID")
++        .unwrap()
++        .parse()
++        .unwrap();
++    let config = Config {
++        storage_root: PathBuf::from(root),
++        ..Config::default()
++    };
++    let archive = ensure_archive(&config, "canonical-history").unwrap();
++    let message = fixture_message(&archive, id, "Completed foreign current-month append");
++    // This is a real public write with its project lock, immutable copies,
++    // commit enqueue, and flush. The process exits before the parent timer.
++    write_message_bundle(
++        &archive,
++        &config,
++        &message,
++        "immutable message body",
++        SENDER,
++        &[RECIPIENT.to_owned()],
++        &[],
++        None,
++    )
++    .unwrap();
++    flush_fixture_commits();
++}
++
++fn begin_controlled_fence_append(mailbox: &Mailbox, id: i64) -> std::thread::JoinHandle<()> {
++    let archive = mailbox.archive.clone();
++    let message = mailbox.message(id, "Controlled append while publication is deferred");
++    let path = mailbox.paths(&message).canonical;
++    let content = render_message_bundle_content(&message, "immutable message body").unwrap();
++    let (held_tx, held_rx) = std::sync::mpsc::channel();
++    let (deferred_tx, deferred_rx) = std::sync::mpsc::channel();
++    let controller = std::thread::spawn(move || {
++        let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
++        held_tx.send(()).unwrap();
++        deferred_rx.recv_timeout(Duration::from_secs(15)).unwrap();
++        // The publisher has released its preparation locks. This is a real
++        // intervening project-lock generation and a new canonical artifact
++        // with synced file bytes, while the controller owns the global fence.
++        with_project_lock(&archive, || {
++            let mut file = fs::OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(&path)?;
++            file.write_all(content.as_bytes())?;
++            file.sync_all()?;
++            Ok(())
++        })
++        .unwrap();
++        drop(fence);
++    });
++    held_rx.recv_timeout(Duration::from_secs(15)).unwrap();
++    MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK.with(|slot| {
++        assert!(
++            slot.borrow().is_none(),
++            "a previous deferral hook was not consumed"
++        );
++        *slot.borrow_mut() = Some(Box::new(move || {
++            deferred_tx.send(()).unwrap();
++        }));
++    });
++    controller
++}
++
++/// A public-writer-only worker for comparing two actual source revisions in
++/// one orchestrated run. Copy this test and its fixture helpers unchanged into
++/// the baseline test build; only test-only counters are needed there. Unlike
++/// the live conservative control below, this worker never selects a verifier.
++#[test]
++#[ignore = "paired revision benchmark worker; set AM_CANONICAL_BENCH_MESSAGES and run explicitly"]
++fn canonical_publication_public_writer_benchmark() {
++    if !isolated_case_inner("canonical_publication_public_writer_benchmark", true) {
++        return;
++    }
++    let count: usize = std::env::var("AM_CANONICAL_BENCH_MESSAGES")
++        .expect("set AM_CANONICAL_BENCH_MESSAGES to 5000, 50000, or 150000")
++        .parse()
++        .expect("parse benchmark history count");
++    assert!([5_000, 50_000, 150_000].contains(&count));
++    let rounds: i64 = std::env::var("AM_CANONICAL_BENCH_ROUNDS")
++        .unwrap_or_else(|_| "8".to_owned())
++        .parse()
++        .expect("parse benchmark sample count");
++    assert!((1..=1_000).contains(&rounds));
++    let requested_scenario =
++        std::env::var("AM_CANONICAL_BENCH_SCENARIO").unwrap_or_else(|_| "all".to_owned());
++    let scenarios: &[&str] = match requested_scenario.as_str() {
++        "all" => &[
++            "warm_single_writer",
++            "foreign_append",
++            "controlled_fence_deferral",
++        ],
++        "warm_single_writer" => &["warm_single_writer"],
++        "foreign_append" => &["foreign_append"],
++        "controlled_fence_deferral" => &["controlled_fence_deferral"],
++        other => panic!("unknown benchmark scenario {other}"),
++    };
++    let mailbox = Mailbox::new();
++    let seeded = Instant::now();
++    seed_scale_mailbox(&mailbox, count);
++    let seeded_tree_oid = Repository::open(&mailbox.archive.repo_root)
++        .unwrap()
++        .head()
++        .unwrap()
++        .peel_to_tree()
++        .unwrap()
++        .id()
++        .to_string();
++    let base_id = i64::try_from(count).unwrap() + 100;
++    let cold = Instant::now();
++    mailbox
++        .publish(&mailbox.message(base_id, "Cold canonical verification"))
++        .unwrap();
++    let cold_us = cold.elapsed().as_micros();
++    flush_fixture_commits();
++    mailbox
++        .publish(&mailbox.message(base_id + 1, "Settle own publication events"))
++        .unwrap();
++    flush_fixture_commits();
++    println!(
++        "{}",
++        serde_json::json!({
++            "kind": "canonical_publication_public_setup",
++            "history_messages": count,
++            "historical_tracked_copies": count * 3,
++            "seeded_git_tree_oid": seeded_tree_oid,
++            "historical_mailbox_copies": "hardlinked fixture; measured new copies are independent",
++            "setup_ms": seeded.elapsed().as_millis(),
++            "cold_publication_us": cold_us,
++            "rounds": rounds,
++            "scenarios": scenarios,
++            "watch_supported_and_enrolled": benchmark_watch_enrollment(&mailbox),
++        })
++    );
++    let mut next_id = base_id + 2;
++    for &scenario in scenarios {
++        for round in 0..rounds {
++            let controller = match scenario {
++                "foreign_append" => {
++                    append_foreign_benchmark_message(&mailbox, next_id);
++                    next_id += 1;
++                    None
++                }
++                "controlled_fence_deferral" => {
++                    let controller = begin_controlled_fence_append(&mailbox, next_id);
++                    next_id += 1;
++                    Some(controller)
++                }
++                _ => None,
++            };
++            let message = mailbox.message(
++                next_id,
++                &format!("Measured public-writer publication {round}"),
++            );
++            next_id += 1;
++            reset_canonical_id_check_fs_counts();
++            CANONICAL_PUBLICATION_FENCE_HELD.with(|held| held.set(Duration::ZERO));
++            CANONICAL_PROJECT_LOCK_HELD.with(|held| held.set(Duration::ZERO));
++            let started = Instant::now();
++            let publication = mailbox.publish(&message);
++            let publication_us = started.elapsed().as_micros();
++            let (read_dirs, metadata_calls) = canonical_id_check_fs_counts();
++            let fence_us = CANONICAL_PUBLICATION_FENCE_HELD
++                .with(std::cell::Cell::get)
++                .as_micros();
++            let project_lock_us = CANONICAL_PROJECT_LOCK_HELD
++                .with(std::cell::Cell::get)
++                .as_micros();
++            if let Some(controller) = controller {
++                controller.join().expect("controlled publication scheduler");
++            }
++            publication.unwrap();
++            let flush_started = Instant::now();
++            flush_async_commits();
++            let commit_flush_us = flush_started.elapsed().as_micros();
++            assert_fixture_coalescer_idle();
++            println!(
++                "{}",
++                serde_json::json!({
++                    "kind": "canonical_publication_public_sample",
++                    "history_messages": count,
++                    "round": round,
++                    "scenario": scenario,
++                    "watch_supported_and_enrolled": benchmark_watch_enrollment(&mailbox),
++                    "publication_us": publication_us,
++                    "canonical_read_dirs": read_dirs,
++                    "canonical_metadata_calls": metadata_calls,
++                    "publication_thread_fence_held_us": fence_us,
++                    "publication_thread_project_lock_held_us": project_lock_us,
++                    "async_commit_flush_us": commit_flush_us,
++                })
++            );
++        }
++    }
++    CANONICAL_ID_CACHES
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .remove(&mailbox.archive.root.join("messages"));
++}

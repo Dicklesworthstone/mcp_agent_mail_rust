@@ -1,0 +1,15 @@
+{
+  "command": [
+    "git",
+    "-C",
+    "/workspace/scratch/68420b93bbca/gh362-packet-prepare-check/candidate",
+    "diff",
+    "--check"
+  ],
+  "elapsed_seconds": 0.25414817399996537,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": null
+}

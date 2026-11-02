@@ -1,0 +1,16 @@
+{
+  "command": [
+    "git",
+    "-C",
+    "/workspace/scratch/68420b93bbca/gh362-packet-prepare-check/candidate",
+    "apply",
+    "--check",
+    "/workspace/scratch/68420b93bbca/mcp_agent_mail_rust/docs/evidence/gh362/canonical-id-candidate/final-runtime.patch"
+  ],
+  "elapsed_seconds": 0.2656477740001719,
+  "exit_code": 0,
+  "timed_out": false,
+  "interrupted": false,
+  "execution_error": null,
+  "cleanup": null
+}
