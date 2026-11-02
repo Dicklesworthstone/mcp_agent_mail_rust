@@ -41,11 +41,18 @@
 - [x] Execute the five collector tests: 5/5 pass, 3,200 skipped; the same
   five pass in a fresh private-root solo repeat. Retain the actual executing
   CLI test ELF c8df80458aa3a6df. These backend-runner controls use real recipient
-  tables but are R2 search evidence; the real CLI comparison remains required.
+  tables but are R3 search evidence under the canonical rubric: their backend
+  pages are fabricated to force branches. Correct the earlier R2 label;
+  the real CLI comparison remains required.
   Original live/post source inputs match (3,764 present, six historical JSONs
   omitted). The final typed source receipt fails on 139 peer-added file/directory
   deltas; preserve that red barrier and separate recovered remote exit 0.
-- [ ] Complete the mandatory workspace checks and strict Clippy.
+- [x] Complete both mandatory workspace compiler checks: production lib/bins
+  and all-targets pass remotely. All-targets finishes in 11m12s on hz3 after
+  relocation and fresh normal telemetry. Its live/post source audit includes
+  the 107 peer-added preservation files: 3,871 present inputs match, with six
+  omitted historical perf JSONs explicit. The dependency proc-macro-error2
+  emits a future-Rust compatibility warning; no warning is hidden.
   Preserve admission refusals and optional source-receipt containment failures;
   use normal strict RCH with actual live Cargo source witnesses. All-targets
   fails with ENOSPC, exit 101; exact-wrapper recovery acknowledges that failure.
@@ -59,6 +66,10 @@
   externally restored headroom a second recovery acknowledges the terminal
   result. Resume gates only with usable worker headroom. Real CLI build remains
   pending; no admission, source, pressure or lint gate is weakened.
+- [x] Finish strict workspace all-targets Clippy with -D warnings: exit 0
+  remotely, 10m18s. Live/post source audit matches all 3,871 present frozen
+  inputs, with the same six historical JSON omissions. No source edit or
+  suppression is needed. The dependency's future-Rust warning remains explicit.
 - [ ] Build the real repaired CLI and compare old/new against the same
   populated mailbox in one invocation, including nonempty-kind and malformed
   cursor controls. Report any self-speedup as maintenance, not an incumbent win.
@@ -98,11 +109,15 @@
   without an override. Authorized cutover at 19:25:49 UTC raises actual root
   free space from 2,721 to 38,871 MiB. Preserve exact authorization, command,
   execution interval, logs and safe restore pointers beside the archive.
-- [ ] Resume required checks through normal RCH admission. The first hz3
+- [x] Resume required checks through normal RCH admission. The first hz3
   attempt after cutover is still refused for critical disk-pressure telemetry;
   preserve exit 103 and refresh normal worker health, without a gate override.
+  Fresh telemetry reports warning-level pressure and admits the check; the
+  all-targets check then passes. Attribute no external headroom changes to us.
 - [ ] Preserve native/runtime receipts durably, audit the work, update Beads
   honestly and publish the reviewed changes with original failures intact.
+  Preserve the quiescent 10,002-message mailbox and old/new executable identities
+  for real-path replay; copy only, without removing the original fixture.
 
 ## November 2: qualify reservation reads during writer contention (br-list-write-lock-kx4vn)
 
