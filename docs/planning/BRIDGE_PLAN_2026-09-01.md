@@ -85,6 +85,14 @@
   A normal hz3 rebuild is now admitted after a queue-timeout refusal, with 3,871
   present inputs matching and six historical JSON omissions explicit. Retain the
   returned executable outside the build target and sync it to trj immediately.
+- [x] Start copy-only executable retention and bounded continuation under
+  /tmp/am-reservation-read-20261102/. It waits for a successful returned build,
+  runs the 13 checker controls, declared 24-call pair and fresh six-call solo,
+  then preserves the executable and all raw results on trj, including failures.
+  It makes no tracker closure, publication or release decision automatically.
+- [ ] Observe that continuation's terminal result and source/ELF identities;
+  a running process is not a passed comparison. Its state is recorded in
+  kind-continuation-status.json; no pair pass has been observed yet.
 - [x] Fresh solo recheck: six real new-CLI calls pass, including matching and
   absent recipient kinds, daemon routing, rejected cursor and stopped fallbacks.
   Absent-kind calls take 1.877/1.879 seconds; no independent-review credit.
@@ -92,6 +100,10 @@
   Keep br-kp1in.18 in progress: its broader routing acceptance remains incomplete.
 - [ ] Execute full workspace native tests. The earlier Nextest invocation was
   canceled before admission and ran no tests; compiler passes are not test passes.
+  A fresh normal hz3 Nextest invocation was submitted at 22:25 UTC with private
+  HOME/TMP/XDG roots and application credentials unset. It is queued before
+  admission, not running tests. Other probed workers lacked sufficient root
+  headroom or the runner; trj is healthy storage but not a configured RCH worker.
 - [x] Diagnose the live installed mailbox write breaker independently: stock
   SQLite confirms pages 135/136 never used; the responsive owner is an unmanaged
   am 0.3.38 TUI in FrankenTerm pane 42. Preserve failed reservation renewals.
