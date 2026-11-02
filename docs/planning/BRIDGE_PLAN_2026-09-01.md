@@ -30,9 +30,35 @@
 - [x] UBS scans the changed CLI file: exit 0, no critical findings, 2,725
   warnings and 911 informational findings. All 20 findings on added lines
   concern test setup/assertions. No suppression or scanner-policy edit.
-- [ ] Execute the five collector tests and the mandatory workspace checks.
-  Preserve two exact-worker and one automatic exit-103 admission refusals;
-  worker pressure and slot limits are not bypassed. No native pass yet.
+- [x] Re-execute the five original archive-inventory cache controls with the
+  retained real tools ELF in a fresh private root. All five pass. The health
+  test asserts one scan for five calls, then a second scan and an error verdict
+  after an epoch/message advance ahead of SQLite. This qualifies existing
+  cache behavior, with no new implementation or independent-review credit.
+- [x] Promote the exact reviewed patch into the canonical checkout; source
+  SHA-256 af582885189e1d87 is unchanged. Another actor committed it as
+  1af19a7c while validation was running; this is not a completed qualification.
+- [x] Execute the five collector tests: 5/5 pass, 3,200 skipped; the same
+  five pass in a fresh private-root solo repeat. Retain the actual executing
+  CLI test ELF c8df80458aa3a6df. These backend-runner controls use real recipient
+  tables but are R2 search evidence; the real CLI comparison remains required.
+  Original live/post source inputs match (3,764 present, six historical JSONs
+  omitted). The final typed source receipt fails on 139 peer-added file/directory
+  deltas; preserve that red barrier and separate recovered remote exit 0.
+- [ ] Complete the mandatory workspace checks and strict Clippy.
+  Preserve admission refusals and optional source-receipt containment failures;
+  use normal strict RCH with actual live Cargo source witnesses. All-targets
+  fails with ENOSPC, exit 101; exact-wrapper recovery acknowledges that failure.
+  Retry with debug/incremental artifacts disabled, without changing feature
+  coverage, assertions or lint policy. Production lib/bins graph passes;
+  its post-source audit matches 3,764 present inputs, with six omitted
+  historical perf JSONs explicit. The low-debug retry is canceled through RCH
+  when worker root falls below 2 GiB: local wrapper exits 143, exact recovery
+  reports remote exit 101. Its terminal compiler diagnostic was not captured;
+  do not invent one. First recovery fails releasing the source lock; after
+  externally restored headroom a second recovery acknowledges the terminal
+  result. Resume gates only with usable worker headroom. Real CLI build remains
+  pending; no admission, source, pressure or lint gate is weakened.
 - [ ] Build the real repaired CLI and compare old/new against the same
   populated mailbox in one invocation, including nonempty-kind and malformed
   cursor controls. Report any self-speedup as maintenance, not an incumbent win.
@@ -49,12 +75,32 @@
   helpers reject hidden basenames; atomically rename only this idle target to
   am-read-cold-target-20261102-1645 with no-clobber and leave an original-path
   restore pointer. The complete source bytes remain until verified cutover.
-- [ ] Finish copying to trj:/bulk/worker-relocated-20261102-am-reservation-read/
+- [x] Finish copying to trj:/bulk/worker-relocated-20261102-am-reservation-read/
   ts1-cold-target-1645/. Require stream hash, entry count and per-file metadata/
   content agreement; sync archive, manifests and authorization before cutover.
-- [ ] Repeat full marker, activity, modification and mount checks. Run the
+- [x] Repeat full marker, activity, modification and mount checks. Run the
   provided cutover helper under the existing authorization; preserve exact
   command/time, restore pointers and before/after disk headroom on both hosts.
+  Coordinator cutover completes 17:27:55 UTC: 13,867 MiB allocated, net
+  13,839 MiB headroom. The separate external space jump receives no credit.
+- [x] Preserve two idle hz3 scratch trees with all three archive checks and
+  authorized cutover. Correct the volume-selection mistake: /tmp is tmpfs;
+  14,282 MiB freed there provides no root-disk gain. Keep that result explicit.
+- [x] Finish the verified archive of hz3's actual root-volume vt-4bde2b1b4
+  tree to hz3-vt-root-1816/ on trj. Its 36,150 MiB allocation has no outside
+  hardlinks. Require all three checks, sync, and fresh full activity/protection
+  guards before cutover; measure actual root headroom and retain safe restore
+  pointers. Do not move protected or recently active peers' trees.
+  All three checks pass: 20,295 entries, 38,419,292,160 bytes, SHA-256
+  9b0f3b0a7b6c1fb912d5f1332a8d29e4643f7413025969497e0853c73200a77d.
+  Sync archive/manifests/authorization, then two full guards pass. DCG rejects
+  an assembled SCP argument list before execution; literal commands succeed
+  without an override. Authorized cutover at 19:25:49 UTC raises actual root
+  free space from 2,721 to 38,871 MiB. Preserve exact authorization, command,
+  execution interval, logs and safe restore pointers beside the archive.
+- [ ] Resume required checks through normal RCH admission. The first hz3
+  attempt after cutover is still refused for critical disk-pressure telemetry;
+  preserve exit 103 and refresh normal worker health, without a gate override.
 - [ ] Preserve native/runtime receipts durably, audit the work, update Beads
   honestly and publish the reviewed changes with original failures intact.
 
@@ -69,17 +115,27 @@
 - [x] Review the original read/write separation, writable/query-only pool
   regression, independent writer, committed-state freshness, durable-family
   byte controls and queued-release stage assertion without weakening them.
-- [ ] Run both original native regressions through strict, normal RCH on
+- [x] Run both original native regressions through strict, normal RCH on
   the current source/dependency graph; retain the source and executable
   identities, terminal outcomes and any failures.
-- [ ] Resolve any demonstrated implementation failure in the existing files;
-  if code changes, run the required workspace checks and strict Clippy.
-- [ ] Re-execute original acceptance in a fresh solo verification pass.
+  Three named real-engine probes pass, with 4,715 tests skipped. Actual DB/tool
+  executable hashes bc67135d7ccd5524 / 12e05b16a1cff914 are retained. Preserve
+  the original cache-only source-content barrier failure; exact RCH recovery
+  acknowledges exit 0 without issuing a successful typed source receipt.
+- [x] No implementation failure is demonstrated and no reservation code is
+  changed. Give already-landed 0a8b0633 qualification credit only.
+- [x] Re-execute original acceptance in a fresh solo verification pass.
   Explicitly distinguish that pass from independent review.
-- [ ] Complete the required real-work audit and honesty inventory. Record
+  The same three cases pass again in private roots, not six independent cases.
+- [x] Complete the required real-work audit and honesty inventory. Record
   test counts, remaining limits and the original negative controls.
-- [ ] Cite terminal evidence on the Bead; close only if its original named
-  probe passes, then flush Beads, review the diff and publish the work.
+  Durable evidence: trj:/bulk/worker-relocated-20261102-am-reservation-read/
+  reservation-qualified-1750/; 19 files hash-verified and synced. Present source
+  inputs match (3,764), with six omitted historical perf JSONs explicit.
+- [x] Cite terminal evidence and close only br-list-write-lock-kx4vn against
+  its original held-writer/freshness/release-stage acceptance. No independent,
+  platform, release or whole-project qualification is claimed.
+- [ ] Flush Beads, review the diff and publish the qualification record.
 - [ ] Verify remote branch identities and release these file reservations.
 
 ## November 2: qualify landed retention policy (br-refused-pass-window-policy-q7mxt)
