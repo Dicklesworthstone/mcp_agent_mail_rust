@@ -91,6 +91,11 @@ release commit in 3fdda50c.
   identity. Generic opaque same-user processes still cause conservative
   refusals; this change does not promise that every unreadable process can be
   safely ignored.
+- **Transient procfs permission denials retry the actual reader inventory.**
+  One retry after 5 ms rechecks descriptors, mappings and surviving workers
+  within the same scan budget. A retained process-directory descriptor prevents
+  PID reuse from redirecting the retry. Persistent same-user permission denials
+  still retain the backup.
 
 The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
 preserves the current-main counterexamples, the 39 passing namespace tests,
@@ -163,9 +168,12 @@ and the bullets say so where a commit does.
   `AGENT_DEREGISTERED`. Releases and keyed replays of an earlier grant still work (ee135465,
   1160b3d9).
 - **On Unix, superseded periodic backups are now deleted by default.**
-  - **What is deleted.** With `AM_BACKUP_ROTATION_DELETE` unset, the server deletes dated periodic
-    backups (`<database>.bak.YYYYMMDD_HHMMSS[-NN]`) beyond the newest `AM_BACKUP_KEEP_COUNT`
-    (default 3), including ones earlier rotations moved into `doctor/reclaimable/rotation-*/`.
+  - **What is deleted.** With `AM_BACKUP_ROTATION_DELETE` unset, v0.3.40 deletes dated periodic
+    backups (`<database>.bak.YYYYMMDD_HHMMSS[-NN]`) beyond the newest resident
+    `AM_BACKUP_KEEP_COUNT` window (default 3). It also reclaims eligible periodic images
+    previously moved into native `doctor/reclaimable/rotation-*/` directories, independently
+    of that window. The Unreleased GH#373 fix above combines resident and eligible staged
+    images into one keep window.
   - **Safeguards.** Nothing is deleted until a newer backup has passed a full integrity check.
     Incident backups, unknown names, symlinks and hard links are still only moved.
   - **Opting out.** Any explicit value other than `1`, `true`, `t`, `yes` or `y` keeps v0.3.39's

@@ -603,7 +603,7 @@ fn ensure_no_file_readers(
         else {
             continue;
         };
-        inspect_process_file_readers(
+        inspect_process_reader_inventory(
             &entry.path(),
             pid,
             &self_status,
@@ -612,24 +612,93 @@ fn ensure_no_file_readers(
             (pid == own_pid).then_some(excluded_descriptor).flatten(),
             &mut charge,
         )?;
-        // A terminated thread-group leader can have empty fd/maps files
-        // while its workers still retain the backup. Check *after* the scan
-        // so a leader exiting during it cannot turn empty files into proof
-        // that the entire process has released its readers.
-        inspect_surviving_thread_readers(
-            &entry.path(),
-            pid,
-            &self_status,
-            retained_identity,
-            &canonical_source,
-            &mut charge,
-        )?;
     }
     Ok(())
 }
 
+/// Retry an actual denied inventory once, not just the process's status.
+/// Dumpability can change during exec or exit; a readable status record does
+/// not say whether the fd/maps operation that failed is now permitted. A
+/// second denial remains a refusal, including for an ordinary session daemon.
 #[cfg(target_os = "linux")]
-fn inspect_process_file_readers(
+fn retry_process_reader_scan(
+    mut scan: impl FnMut() -> io::Result<()>,
+    mut pause: impl FnMut(),
+) -> io::Result<()> {
+    match scan() {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            pause();
+            scan()
+        }
+        result => result,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_reader_inventory(
+    process: &Path,
+    process_id: u32,
+    self_status: &ProcessStatusSummary,
+    retained_identity: &Metadata,
+    canonical_source: &Path,
+    excluded_descriptor: Option<i32>,
+    mut charge: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // A proc directory descriptor stays bound to the original task after
+    // exit; reopening the numeric pathname could instead inspect a reused
+    // PID on the retry. O_PATH requires no access to the protected fd table.
+    // Use thread-self because the caller's thread can have its own fd table.
+    let directory = match rustix::fs::open(
+        process,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_proc_task_gone(&io::Error::from(error)) => return Ok(()),
+        Err(error) => return Err(proc_entry_error(process, &io::Error::from(error))),
+    };
+    let anchored = PathBuf::from(format!("/proc/thread-self/fd/{}", directory.as_raw_fd()));
+    let result = retry_process_reader_scan(
+        || {
+            inspect_process_file_readers_once(
+                &anchored,
+                process_id,
+                self_status,
+                retained_identity,
+                canonical_source,
+                excluded_descriptor,
+                &mut charge,
+            )?;
+            // An exited leader can have empty fd/maps files while its workers
+            // still retain the backup. Both scans use the same pinned task.
+            inspect_surviving_thread_readers(
+                &anchored,
+                process_id,
+                self_status,
+                retained_identity,
+                canonical_source,
+                &mut charge,
+            )
+        },
+        || std::thread::sleep(std::time::Duration::from_millis(5)),
+    );
+    // Keep operator diagnostics in /proc/<pid> terms, not this short-lived
+    // internal descriptor spelling. This translation never decides admission.
+    result.map_err(|error| {
+        let detail = error.to_string();
+        let prefix = format!("{}/", anchored.display());
+        if let Some(entry) = detail.strip_prefix(&prefix) {
+            io::Error::new(error.kind(), format!("{}/{entry}", process.display()))
+        } else {
+            error
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_file_readers_once(
     process: &Path,
     process_id: u32,
     self_status: &ProcessStatusSummary,
@@ -770,7 +839,7 @@ fn inspect_surviving_thread_readers(
         // Do not exclude the caller's descriptor number in another task's
         // table: Linux threads can unshare their descriptors. An ambiguous
         // self-reader is a refusal, never authority to ignore a real reader.
-        inspect_process_file_readers(
+        inspect_process_file_readers_once(
             &task.path(),
             task_id,
             self_status,
@@ -1059,29 +1128,17 @@ fn reader_inventory_denial_can_be_skipped(
     self_status: &ProcessStatusSummary,
     file_owner: u32,
 ) -> io::Result<bool> {
-    for attempt in 0..2 {
-        match read_process_status_summary(process) {
-            Ok(summary)
-                if status_summary_denial_is_foreign(&summary, self_status, file_owner)
-                    || summary.is_exited_without_files_or_address_space() =>
-            {
-                return Ok(true);
-            }
-            Ok(_) if attempt == 0 => {
-                // A task entering `do_exit()` or `execve` can deny `/proc/<pid>`
-                // access microseconds before the entry disappears. Re-check
-                // once, but never infer closed readers from a process name,
-                // changed credentials or the leader's address-space teardown.
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Ok(_) => return Ok(false),
-            // A process that exited between the denial and status inspection no
-            // longer retains a descriptor. Other unavailable evidence refuses.
-            Err(error) if is_proc_task_gone(&error) => return Ok(true),
-            Err(error) => return Err(proc_entry_error(&process.join("status"), &error)),
-        }
+    match read_process_status_summary(process) {
+        Ok(summary) => Ok(
+            status_summary_denial_is_foreign(&summary, self_status, file_owner)
+                || summary.is_exited_without_files_or_address_space(),
+        ),
+        // A task that exited between denial and inspection no longer holds a
+        // reader. A live opaque task or unavailable ownership evidence still
+        // refuses; the enclosing inventory retries the actual scan once.
+        Err(error) if is_proc_task_gone(&error) => Ok(true),
+        Err(error) => Err(proc_entry_error(&process.join("status"), &error)),
     }
-    Ok(false)
 }
 
 #[cfg(not(target_os = "linux"))]
