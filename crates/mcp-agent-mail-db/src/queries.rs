@@ -10096,7 +10096,7 @@ const PROJECT_THREAD_RANKED_SQL: &str = "WITH scoped AS (\
            CASE WHEN thread_id IS NOT NULL AND TRIM(thread_id) <> '' \
                 THEN thread_id ELSE CAST(id AS TEXT) END AS conversation_key \
     FROM messages INDEXED BY idx_messages_project_thread_activity \
-    WHERE project_id = ? AND id <= ?\
+    WHERE project_id = ?1 AND id <= ?2\
 ), ranked AS (\
     SELECT id, created_ts, conversation_key, \
            ROW_NUMBER() OVER (PARTITION BY conversation_key ORDER BY created_ts DESC, id DESC) AS position, \
@@ -10111,17 +10111,22 @@ fn project_thread_page_sql(cursor: Option<&ProjectThreadCursor>) -> String {
     use std::fmt::Write as _;
 
     let mut sql = PROJECT_THREAD_RANKED_SQL.to_string();
+    // Keep one parameter map across the scoped CTE and the outer page query.
+    let limit_slot = if cursor.is_some() { 6 } else { 3 };
     if let Some(cursor) = cursor {
         let comparison = if cursor.newer { ">" } else { "<" };
         let _ = write!(
             sql,
-            " AND (created_ts {comparison} ? OR (created_ts = ? AND id {comparison} ?))"
+            " AND (created_ts {comparison} ?3 OR (created_ts = ?4 AND id {comparison} ?5))"
         );
     }
     if cursor.is_some_and(|cursor| cursor.newer) {
-        sql.push_str(" ORDER BY created_ts ASC, id ASC LIMIT ?");
+        let _ = write!(sql, " ORDER BY created_ts ASC, id ASC LIMIT ?{limit_slot}");
     } else {
-        sql.push_str(" ORDER BY created_ts DESC, id DESC LIMIT ?");
+        let _ = write!(
+            sql,
+            " ORDER BY created_ts DESC, id DESC LIMIT ?{limit_slot}"
+        );
     }
     sql
 }
