@@ -139,12 +139,97 @@ static ENV: LazyLock<Environment<'static>> = LazyLock::new(|| {
 
 pub fn render_template<T: serde::Serialize>(name: &str, ctx: T) -> Result<String, Error> {
     let tpl = ENV.get_template(name)?;
-    tpl.render(ctx)
+    let json = serde_json::to_value(ctx).map_err(|err| {
+        Error::new(ErrorKind::BadSerialization, "cannot serialize Mail context").with_source(err)
+    })?;
+    tpl.render(json_template_value(json)?)
+}
+
+/// Convert through JSON's public value API: its arbitrary-precision numbers
+/// otherwise serialize as private structs that `MiniJinja` treats as maps.
+fn json_template_value(json: serde_json::Value) -> Result<Value, Error> {
+    match json {
+        serde_json::Value::Null => Ok(Value::from(())),
+        serde_json::Value::Bool(value) => Ok(Value::from(value)),
+        serde_json::Value::String(value) => Ok(Value::from(value)),
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                return Ok(Value::from(value));
+            }
+            if let Some(value) = number.as_u64() {
+                return Ok(Value::from(value));
+            }
+            if let Some(value) = number.as_i128() {
+                return Ok(Value::from(value));
+            }
+            if let Some(value) = number.as_u128() {
+                return Ok(Value::from(value));
+            }
+            // Do not silently round an oversized integer into a floating ID.
+            if number.is_f64()
+                && let Some(value) = number.as_f64().filter(|value| value.is_finite())
+            {
+                return Ok(Value::from(value));
+            }
+            Err(Error::new(
+                ErrorKind::BadSerialization,
+                "Mail context number is outside the template numeric range",
+            ))
+        }
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(json_template_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::from),
+        serde_json::Value::Object(values) => values
+            .into_iter()
+            .map(|(key, value)| json_template_value(value).map(|value| (key, value)))
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+            .map(Value::from_object),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_context_preserves_numeric_types_and_exact_integer_ids() {
+        let ctx = json_template_value(serde_json::json!({
+            "rows": [{"count": 1, "id": u64::MAX}],
+            "minimum": i64::MIN,
+            "fraction": 2.5,
+            "enabled": true,
+            "absent": null,
+            "text": "<message>",
+        }))
+        .unwrap();
+        let html = ENV
+            .render_str(
+                "{% for row in rows %}{% if row.count == 1 %}one{% endif %}:{{ row.count + 1 }}:{{ row.id }}{% endfor %};{{ minimum }};{{ fraction + 0.5 }};{{ enabled }};{{ absent is none }};{{ text }}",
+                ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            html,
+            "one:2:18446744073709551615;-9223372036854775808;3.0;True;True;<message>"
+        );
+    }
+
+    #[test]
+    fn typed_context_and_json_context_render_the_same_exact_numeric_message() {
+        #[derive(serde::Serialize)]
+        struct Context {
+            message: u64,
+        }
+        let typed = Context { message: u64::MAX };
+        let json = serde_json::to_value(&typed).unwrap();
+        let typed_html = render_template("error.html", &typed).unwrap();
+        let json_html = render_template("error.html", json).unwrap();
+        assert_eq!(typed_html, json_html);
+        assert!(json_html.contains("18446744073709551615"));
+        assert!(!json_html.contains("$serde_json::private::Number"));
+    }
 
     // --- striptags ---
 
