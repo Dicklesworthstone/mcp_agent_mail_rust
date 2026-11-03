@@ -1710,10 +1710,10 @@ mod tests {
             assert_eq!(std::fs::read(&owner.path).unwrap(), checkpoint);
             drop(owner);
 
-            let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            let report = run_with_slow_first_scan(cx, pool, config, &mut cursor, &stop);
             assert!(report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert_eq!(report.repaired, 1);
             assert!(cursor.retries.is_empty());
             // Uses real committed Git blobs and verifies the source row count
             // and both recipients' read/ACK values, not just created files.
@@ -2045,11 +2045,12 @@ mod tests {
             );
             drop(store);
 
-            let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            let report =
+                run_with_slow_first_scan(cx, pool, config, &mut cursor, &AtomicBool::new(false));
             assert!(!report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
-            assert_message_committed(cx, pool, config, 940, 40);
+            assert_eq!(report.repaired, 1);
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
             assert_eq!(
                 cursor.checkpoint_database_generation.as_deref(),
                 Some(current.database_generation.as_str())
@@ -2123,6 +2124,36 @@ mod tests {
                 assert_eq!(repeat.deferred, 0);
             });
         }
+    }
+
+    fn run_with_slow_first_scan(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        cursor: &mut ReconcileCursor,
+        stop: &AtomicBool,
+    ) -> ReconcileReport {
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        let scan = super::super::super::cancellable_tests::ObserveScan::new(move |stage| {
+            if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                // Exercise the production cooperative turn limit after one
+                // real item. Source reads, Git authority and publication all
+                // remain native; a loaded runner may yield at this boundary.
+                std::thread::sleep(super::super::MAX_BATCH_TURN);
+            }
+        });
+        let report = super::super::reconcile_message_batch(cx, pool, config, cursor, stop);
+        drop(scan);
+        let report = report.unwrap();
+        assert!(fired.load(Ordering::Acquire), "slow scan was not observed");
+        assert_eq!(report.scanned, 1, "{report:?}");
+        assert_eq!(report.repaired + report.unchanged, 1, "{report:?}");
+        assert_eq!(report.deferred, 0, "{report:?}");
+        assert!(!report.interrupted, "{report:?}");
+        assert!(report.budget_exhausted, "{report:?}");
+        assert!(report.payload_bytes <= super::super::MAX_BATCH_PAYLOAD_BYTES);
+        report
     }
 
     fn seed_obsolete_progress(cx: &Cx, pool: &DbPool, config: &Config) -> (Store, ReconcileCursor) {
@@ -2214,16 +2245,18 @@ mod tests {
             );
             drop(store);
             let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let report = run(cx, pool, config, &mut restarted, &AtomicBool::new(false)).unwrap();
+            let report =
+                run_with_slow_first_scan(cx, pool, config, &mut restarted, &AtomicBool::new(false));
             assert!(
                 !report.checkpoint_restored,
                 "old logical-generation hints are invalid"
             );
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert_eq!(report.repaired, 1);
             // A restored tail=940/history=0 cursor would inspect no messages
-            // in this pass, delaying repair until the next history round.
-            assert_message_committed(cx, pool, config, 940, 40);
+            // in this pass. The fresh tail's first item must be committed even
+            // when the cooperative turn ends before history can inspect 940.
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
         });
     }
 
@@ -2239,10 +2272,11 @@ mod tests {
             assert_eq!(std::fs::read(&store.path).unwrap(), before);
             assert!(cursor.source_identity.is_empty(), "next pass must rescan");
             drop(store);
-            let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            let report = run_with_slow_first_scan(cx, pool, config, &mut cursor, &stop);
             assert!(!report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_message_committed(cx, pool, config, 940, 40);
+            assert_eq!(report.repaired, 1);
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
         });
     }
 
@@ -3034,18 +3068,13 @@ mod tests {
             drop(store);
 
             let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let report = super::super::reconcile_message_batch(
-                cx,
-                pool,
-                config,
-                &mut restarted,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let report =
+                run_with_slow_first_scan(cx, pool, config, &mut restarted, &AtomicBool::new(false));
             assert!(report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert_eq!(report.repaired, 1);
             assert!(restarted.retries.is_empty());
+            assert_message_committed(cx, pool, config, 901, 40);
             let prepared = super::super::prepare_message(cx, pool, 901).unwrap();
             let archive = crate::open_archive(config, "project").unwrap().unwrap();
             let paths = crate::message_paths_for_bundle(
@@ -3097,45 +3126,123 @@ mod tests {
             previous.backfill_ceiling = Some(904);
             previous.next_lane_is_retry = true;
             previous.defer_transient(901, Instant::now());
+            let cooling_until = Instant::now() + MAX_RETRY_BACKOFF;
             previous.retries.push_back(DeferredRetry {
                 id: 902,
                 attempts: 3,
-                ready_at: Instant::now() + MAX_RETRY_BACKOFF,
+                ready_at: cooling_until,
             });
             let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
             store.save(&previous).unwrap();
+            assert!(
+                store
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .retries
+                    .iter()
+                    .any(|retry| retry.id == 902 && retry.attempts == 3 && retry.wait_us > 0)
+            );
             drop(store);
 
+            let repo = git2::Repository::open(&config.storage_root).unwrap();
+            let before = repo.head().unwrap().peel_to_commit().unwrap().id();
+            let expected_repairs = [901, 940, 939, 903];
+            let mut observed_repairs = Vec::new();
+            let mut repaired = 0;
             let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let report = super::super::reconcile_message_batch(
-                cx,
-                pool,
-                config,
-                &mut restarted,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-            assert!(report.checkpoint_restored);
-            assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, 4);
-            assert_eq!(report.deferred, 0);
-            assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
-            assert!(report.payload_bytes <= super::super::MAX_BATCH_PAYLOAD_BYTES);
-            for id in [901, 903, 939, 940] {
+            for pass in 0..16 {
+                // Force the due retry and the first startup orphan into
+                // separate real turns. Later passes may also yield early;
+                // correctness is the repair order, not four repairs/second.
+                let report = if pass < 2 {
+                    run_with_slow_first_scan(
+                        cx,
+                        pool,
+                        config,
+                        &mut restarted,
+                        &AtomicBool::new(false),
+                    )
+                } else {
+                    super::super::reconcile_message_batch(
+                        cx,
+                        pool,
+                        config,
+                        &mut restarted,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap()
+                };
+                assert!(report.checkpoint_restored);
+                assert_eq!(report.checkpoint_saved, Some(true));
+                assert!(!report.interrupted, "{report:?}");
+                assert_eq!(report.deferred, 0, "{report:?}");
+                assert!(report.repaired <= super::super::MAX_REPAIRS_PER_BATCH);
+                assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+                assert!(report.payload_bytes <= super::super::MAX_BATCH_PAYLOAD_BYTES);
+                repaired += report.repaired;
+
+                // Read actual committed repair order. Eventual presence alone
+                // would let an ordinary tail walk hide lost startup priority.
+                observed_repairs.clear();
+                let mut commit = repo.head().unwrap().peel_to_commit().unwrap();
+                while commit.id() != before {
+                    assert!(observed_repairs.len() < expected_repairs.len());
+                    assert_eq!(commit.parent_count(), 1);
+                    let id = commit
+                        .summary()
+                        .unwrap()
+                        .expect("reconciliation commit must have a summary")
+                        .strip_prefix("repair: reconcile message ")
+                        .and_then(|message| message.strip_suffix(" archive"))
+                        .unwrap()
+                        .parse::<i64>()
+                        .unwrap();
+                    observed_repairs.push(id);
+                    commit = commit.parent(0).unwrap();
+                }
+                observed_repairs.reverse();
+                assert_eq!(observed_repairs.len(), repaired);
+                assert!(
+                    expected_repairs.starts_with(&observed_repairs),
+                    "repair priority changed: {observed_repairs:?}"
+                );
+                if pass < 2 {
+                    assert_eq!(observed_repairs, expected_repairs[..=pass]);
+                    assert_eq!(restarted.tail_after, Some(905));
+                    assert_eq!(restarted.backfill_ceiling, Some(904));
+                }
+                assert!(restarted.tail_after.is_some_and(|id| id < 939));
+                assert!(restarted.backfill_ceiling.is_some_and(|id| id <= 904));
+
+                let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+                let saved = store.load().unwrap().unwrap();
+                assert_eq!(saved.tail_after, restarted.tail_after);
+                assert_eq!(saved.backfill_ceiling, restarted.backfill_ceiling);
+                assert!(saved.retries.len() <= 1);
+                if let Some(retry) = saved.retries.first() {
+                    assert_eq!(retry.id, 902);
+                    assert_eq!(retry.attempts, 3);
+                }
+                // The original cooldown must survive while it is live. A
+                // slow native run can legitimately outlast it and verify the
+                // already-committed 902, clearing that retry without a repair.
+                if Instant::now() < cooling_until {
+                    assert_eq!(saved.retries.len(), 1);
+                    assert!(saved.retries[0].wait_us > 0);
+                }
+                if repaired == expected_repairs.len() {
+                    break;
+                }
+            }
+            assert_eq!(observed_repairs, expected_repairs);
+            for id in [901, 902, 903, 939, 940] {
                 assert_message_committed(cx, pool, config, id, 40);
             }
             // Recent coverage must not falsely certify the intervening range
-            // or restart history at its newest ID. The old cooldown survives.
+            // or restart history at its newest ID.
             assert!(restarted.tail_after.is_some_and(|id| id > 905 && id < 939));
             assert!(restarted.backfill_ceiling.is_some_and(|id| id < 904));
-            let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
-            let saved = store.load().unwrap().unwrap();
-            assert_eq!(saved.tail_after, restarted.tail_after);
-            assert_eq!(saved.backfill_ceiling, restarted.backfill_ceiling);
-            assert_eq!(saved.retries.len(), 1);
-            assert_eq!(saved.retries[0].id, 902);
-            assert_eq!(saved.retries[0].attempts, 3);
-            assert!(saved.retries[0].wait_us > 0);
         });
     }
 
