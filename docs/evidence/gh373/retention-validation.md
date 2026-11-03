@@ -495,10 +495,12 @@ The existing public negative gains actual live FD and O_PATH worker cases,
 with explicit inode, leader-liveness and descriptor-table witnesses. All its
 original cases and refusal/byte-preservation/accounting assertions remain.
 Formatting, all-targets checking (237 seconds) and strict workspace Clippy
-(385.5 seconds) pass on this repair. Its separate production and native
-qualification remain pending. The production namespace refusals and queue
-timeout do not execute Cargo; exact owned-job recovery acknowledges remote
-exit 1 without replay. A separate-checkout hz4 native build is compiling,
+(385.5 seconds) pass on this repair. The separate production library/binary
+check also passes through normal hz2 execution in 1,712.5 seconds; its live
+source witness matches all 3,896 present inputs, retaining the six historical
+JSON omissions and zero changed present inputs. Earlier namespace refusals
+and queue timeouts do not execute Cargo; exact owned-job recovery acknowledges
+remote exit 1 without replay. A separate-checkout hz4 native build is compiling,
 with executable collectors already running before test execution.
 
 The original f0 native run finishes with 112 passes, 21 failures and one
@@ -520,3 +522,16 @@ The actual counterexample image is retained separately in the earlier
 private-native recovery bundle. This copy-only preservation receives no
 reclaim credit. Neither older compiler passes nor the stale native run
 qualifies the new production change.
+
+The original f0 executable images and terminal/source receipts are also
+independently verified and fsynced in `retention09-canonical-native-1350/`:
+
+| Archive | SHA-256 | Scope |
+| --- | --- | --- |
+| `executables-3432534-retention09-canonical-db-library.tar` | `c18b5048bb3c1b87e0415e6d2451bd7594a36456c706c09f26381a3ae5af88f6` | 146,831,360 bytes; actual DB image `3c9a5087`. |
+| `executables-3432534-retention09-canonical-server.tar` | `4711222a35a905222ddb70f968ff2b49921fa4d8d2f846c65afb48850d12c7f3` | 477,347,840 bytes; actual integration `3449a7ba` and server `9d309750` images. |
+| `retention09-terminal-source-receipts-1355.tar` | `6cb8b21af7de4c8127172d80955a351a57c853985c13060b082cd5daf809f8c7` | Eight verified members: original terminal logs, source witnesses and all collector receipts, including the generic collector's raw copy errors. |
+
+The clean server collector establishes the integration image identity without
+hiding those independent generic-collector errors. All originals remain on
+the source worker; this preservation has zero root-disk reclaim credit.

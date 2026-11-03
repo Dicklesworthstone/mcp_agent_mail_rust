@@ -26,9 +26,11 @@
   its live witness has 3,896 matching present inputs and six historical JSON
   omissions, with no changed present inputs.
 - [x] Strict workspace Clippy passes on 11d262da in 385.5 seconds.
-- [ ] Finish the separate production graph on this repair. The hz3 namespace
-  refusals and queue timeout never reach Cargo; exact owned-job recovery
-  acknowledges remote exit 1 without replay. A normal hz4 request is pending.
+- [x] Finish the separate production graph on this repair: normal hz2
+  execution passes in 1,712.5 seconds. Its live source witness matches all
+  3,896 present inputs, with the same six historical JSON omissions. Earlier
+  namespace refusals and queue timeouts never reach Cargo and stay failures;
+  exact owned-job recovery acknowledges remote exit 1 without replay.
 - [x] Let the f0 native job finish: 112 pass, 21 fail and one original
   240-second timeout across 134 cases. Retain the three actual images,
   including clean library and integration/server collector receipts.
