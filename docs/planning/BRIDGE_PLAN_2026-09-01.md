@@ -1,5 +1,57 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## Current priority: live workers with unshared reader tables
+
+- [x] Check the suspected live-worker gap against the real kernel: an
+  unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
+  its leader has no matching descriptor and the leader still has VmSize.
+- [x] Reproduce through the unchanged actual public SnapshotRetentionGuard
+  test and image 90210e68. Ordinary reader: pass in 27.66 seconds. The same
+  reader program b3592c84 in a live unshared worker: exit 101 in 1.117 seconds,
+  with an admitted ReclaimedFileBytes at the original refusal assertion.
+  Independent kernel evidence is captured before publishing readiness.
+  This counterexample already exists in the pre-follow-up image; it is not
+  proof that 09b362e0 introduced the external-worker gap.
+- [x] Checkpoint repair 11d262da: pinned live-worker descriptor scans, shared
+  mappings checked once, full dead-leader survivor inspection and no recursive
+  group enumeration. Preserve current-thread strict preflight, own-worker
+  no-open coverage, PID/task pinning, real retry and the shared inventory bound.
+- [x] Extend the existing public visible-reader negative with real live FD
+  and O_PATH workers. Require a distinct worker TID, a still-live leader,
+  matching worker inode and no matching leader descriptor. Preserve every
+  original mode, refusal, byte, accounting and release assertion.
+- [x] Formatting/diff checks pass. UBS retains four existing critical fixture
+  patterns; all 15 added-line findings are reviewed, with no added critical
+  or production findings and no suppression. All-targets passes in 237 seconds;
+  its live witness has 3,896 matching present inputs and six historical JSON
+  omissions, with no changed present inputs.
+- [x] Strict workspace Clippy passes on 11d262da in 385.5 seconds.
+- [ ] Finish the separate production graph on this repair. The hz3 namespace
+  refusals and queue timeout never reach Cargo; exact owned-job recovery
+  acknowledges remote exit 1 without replay. A normal hz4 request is pending.
+- [x] Let the f0 native job finish: 112 pass, 21 fail and one original
+  240-second timeout across 134 cases. Retain the three actual images,
+  including clean library and integration/server collector receipts.
+- [x] Reject the later canonical 0.45-second fresh build as stale: its
+  failure locations match f0 rather than 11d262da despite transferred source
+  hashes matching. Its 112/21/1 results do not execute the new worker cases.
+  Preserve this recurrence under br-kp1in.75; do not infer cache repair from
+  isolated validation or alter the original task's acceptance.
+- [ ] Execute all original namespace, public-guard, rotation, legacy and
+  warning controls on the repaired source, including both new live-worker
+  cases and original 16,641-directory/720-cycle workloads and deadlines.
+- [x] Preserve the counterexample wrapper, unchanged input program identity,
+  kernel witnesses and original failing output on trj, with full archive,
+  member/metadata verification and fsync. This is a failing counterexample,
+  not passing repair evidence; no source data is removed.
+- [ ] Finish the separate-checkout hz4 native run, with collectors already
+  running before test execution. Verify the actual integration image contains
+  both new modes and capture the real positive/negative runtime results.
+- [ ] Preserve the final runtime evidence and original f0 terminal log on trj.
+- [ ] Update the existing validation record, Beads and final commit/push after
+  qualification. The broader br-5nr0m acceptance remains open; no performance
+  win, whole-workspace runtime or release qualification is inferred.
+
 ## November 3 UTC: qualify the published opaque-reader retention change
 
 - [x] Finish and commit the source-bound doctor and legacy-comparison repairs
@@ -66,12 +118,57 @@
 - [x] Review all seven files in newly fetched maintainer follow-up 09b362e0.
   It adds logical-byte accounting, avoids redundant own-thread reader scans,
   and adds parked-window regressions. Preserve the earlier-source runs above.
-- [ ] Merge 09b362e0 with the local reporting and private-fixture repairs;
+- [x] Merge 09b362e0 with the local reporting and private-fixture repairs;
   retain one reporting vocabulary, the default warning and real reader test.
-  Preserve both histories and import Beads after merging.
-- [ ] Repeat all-targets on the final reporting/fixture source.
-- [ ] Complete the separate production library/binary compiler check.
-- [ ] Complete strict workspace all-targets Clippy.
+  Preserve both histories at f0a835cc and import Beads after merging.
+  Resolve all three overlapping files manually. Keep upstream count and
+  logical-byte accounting, including completed-but-unsynced operations;
+  retain the local default warning, private fixtures and actual hidden-reader
+  test, now checking both aggregate and per-kind logical bytes.
+- [x] Finish the complete pre-follow-up unprivileged server replay using
+  actual ELF 89d9fae6, umask 002 and unchanged 240-second per-test bounds:
+  67 pass, one timeout of 68 cases. The original 720-cycle case passes in
+  77.696 seconds in this role; the 16,641-directory case still times out.
+  Preserve both this failed aggregate and the ordinary-worker 61/6/1 result.
+- [x] Freeze the merged source and create an isolated verification checkout
+  at `/data/projects/am-retention09-qualification-20261103`; all 3,902
+  tracked regular inputs match. Preserve two pre-compiler source-ownership
+  refusals on vmi1227854 and a queued-worker refusal on hz3, all exit 103.
+  Do not override the unfinished broad source claim on vmi1227854.
+  Merged-source Clippy starts on normally admitted hz3 from the isolated
+  checkout. Its live witness matches all 3,896 present inputs; preserve
+  the same six omitted historical performance JSON files and observer exit 2.
+- [x] Review merged-source UBS: exit 1, the same four unchanged critical
+  fixture patterns, 2,243 warnings and 783 informational findings. None of
+  the 70 changed-line findings is critical; no suppression or weakened guard.
+- [x] Check merged f0a835cc before the final corrupt-file fixture edit:
+  strict workspace Clippy passes in 1,915.9 seconds, all-targets in 266.3,
+  and the separate production library/binary check in 351.1 seconds.
+  Live source witnesses have 3,896 matching present inputs, the same six
+  omitted historical performance JSON files and zero changed present inputs.
+- [x] Finish the private-fixture pre-follow-up DB run: 49 pass, 14 fail of
+  63 in 80.629 seconds after a 3,408.333-second remote invocation. Six public
+  cases pass; the restart case rejects its deliberately corrupt file's
+  inherited mode 0664 before the intended full-verification assertion.
+  The other 13 failures retain strict ambient-process reader refusals.
+- [x] Diagnose that last fixture with identical retained image 90210e68:
+  the complete restart case fails under umask 002 and passes under 077
+  in one paired invocation, with unchanged image hashes and assertions.
+  Commit c004204a makes only that corrupt fixture mode 0600. Its bytes,
+  full-verification refusal, real SIGKILL/restart and deadlines stay intact.
+  Formatting passes. UBS remains red on three unchanged fixture panic paths;
+  the only added-line finding is the required setup unwrap.
+- [x] Preserve a collector mistake: stdout redirection prematurely created
+  each helper's exclusive receipt path. Both collectors copied the actual
+  live images, then failed to write their final local receipts. Retain both
+  tracebacks and independently recover/re-hash the retained c2c71a07 library
+  and 90210e68 integration images. Do not call these intact original receipts.
+  Later collectors use distinct stdout and helper-owned receipt paths.
+- [x] Repeat all-targets, production lib/bins and strict workspace Clippy
+  after the final one-line fixture edit in c004204a: pass in 40.2, 37.5 and
+  34.9 seconds, respectively; formatting also passes. Preserve the first
+  queued Clippy refusal and the observer attempts before Cargo started.
+  These short reruns have no separate live-observer qualification claim.
 - [ ] Execute every public Linux retention case on the merged source,
   including opaque FD/O_PATH/mapping byte preservation, visible-reader
   refusal, dead-leader threads, real permission refusal and interrupted cleanup.

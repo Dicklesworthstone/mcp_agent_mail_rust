@@ -382,3 +382,141 @@ cargo test --locked -p mcp-agent-mail-db --no-default-features --test it \
 cargo test --locked -p mcp-agent-mail-server --no-default-features \
   --features portable --lib backup_rotation::tests:: -- --test-threads=1
 ```
+
+## 2026-11-03 fleet qualification follow-up
+
+The following are separate source-bound runs, not a combined green suite.
+They use actual workspace test binaries and real SQLite files, processes,
+descriptor tables, mappings and snapshot authority. Compiler work uses normal
+remote-only RCH admission, the pinned toolchain and unchanged lockfile. Worker
+pressure, source-ownership and queue refusals are retained as pre-test failures;
+no worker capacity, source-ownership policy or test deadline is overridden.
+
+| Source and actual image | Executed result | Qualification limit |
+| --- | --- | --- |
+| Published `159e9bb5`, DB library `dd4dea95` and integration `cda0281f` | Initial 63-case run: 41 pass, 22 fail. A later complete same-image run as UID 65534 with a readable controller and child umask 077: 63 pass, zero fail. | The ordinary UID 1000 run with secure fixtures still has 13 strict census failures. The role-specific pass precedes later source edits. |
+| Private-fixture/reporting source, DB library `c2c71a07` and integration `90210e68` | 49 pass, 14 fail of 63 in 80.629 seconds; six of seven public Linux cases pass. | Thirteen strict census refusals remain. The restart case fails on a corrupt fixture's inherited shared mode before its intended verification refusal. |
+| Private-fixture/reporting source, server `89d9fae6` | Ordinary worker: 61 pass, six fail, one original 240-second timeout of 68. Complete same-image UID 65534 replay with umask 002: 67 pass, one timeout. | Both added real-opaque-reader and default-warning controls pass. The 16,641-directory workload still exceeds 240 seconds. The 720-cycle case passes in 77.696 seconds in the replay role; its original worker timeout remains red. |
+
+The private-fixture changes follow discriminating same-image controls, not
+weakened production admission. Three original cases each fail under umask 002
+and pass under 077. Test roots and historical directories are made mode 0700,
+and owned source images mode 0600. Unsafe-mode, owner, alias, replacement,
+known-reader and interrupted-operation assertions remain. The replacement
+fixture itself is private, so its inode-refusal control is independent of an
+accidental permission refusal.
+
+The final restart-fixture counterexample receives its own paired control:
+unchanged image `90210e68` fails under umask 002 and passes under 077 in one
+invocation, with identical hashes before and after both runs. Commit `c004204a`
+sets only the deliberately incomplete snapshot to mode 0600. Its original
+bytes, full-verification refusal, completed-unlink checks and real
+SIGKILL/restart assertions stay unchanged. This paired control diagnoses the
+fixture; it does not execute the subsequent source edit.
+
+Maintainer follow-up `09b362e0` is merged with the local changes at `f0a835cc`,
+preserving both histories. Reports use the maintainer's single count-and-byte
+vocabulary. The local actual-reader test now checks aggregate and per-kind
+logical bytes as well as zero allocation credit; the shared startup and
+automatic-cleanup renderer warns at the default level for opaque-reader
+unlinks. No new reader-admission exception is added by this reporting repair.
+
+Strict workspace Clippy, all-targets and the separate production library/binary
+check pass on `f0a835cc` in 1,915.9, 266.3 and 351.1 seconds. After the one-line
+fixture edit, they pass again on `c004204a` in 34.9, 40.2 and 37.5 seconds;
+formatting passes too. The earlier live witnesses match all 3,896 present
+tracked inputs and preserve six omitted historical performance JSON files,
+with zero changed present inputs. The fast final reruns have no separate live
+observer claim. These are compiler results, not runtime or release clearance.
+The broader merged-source native run and final public-guard follow-up remain
+pending at this checkpoint.
+
+UBS remains red on four unchanged fixture patterns: three intentional panic
+guards and a fixed Python program passed as an argument without a shell or
+untrusted interpolation. The merged four-file scan has 2,243 warnings and 783
+informational findings; none of the 70 changed-line findings is critical.
+The last one-line edit adds only a test-setup unwrap finding. No scanner
+suppression, failure guard or deadline is removed.
+
+Evidence is preserved on trj under
+`/bulk/worker-relocated-20261102-am-reservation-read/`:
+
+| Bundle | SHA-256 | Preserved scope |
+| --- | --- | --- |
+| `retention159-native-boundaries-1110/retention159-native-boundaries-20261103.tar` | `b320068b609df8e9dc49748b811e6ed9b212061a4f5e4bf5a2579b92576ec299` | 680,468,480 bytes, 479 verified members: earlier actual images, source witnesses, raw failures and role-specific replays. |
+| `retention159-private-native-recovery-1200/executables-1706466-retention159-private-db-library.tar` | `37557a2058026bf3ea275496956d7891c6d3a006f36a8515230d6a5807086adf` | Actual retained `c2c71a07` image, independently recovered after the collector failure below. |
+| `retention159-private-native-recovery-1200/executables-1706466-retention159-private-db-integration.tar` | `3b8d98699492c1eb49617dfb6312cd9facb267ed495981b8066af58761192a48` | Actual retained `90210e68` image and the complete FAIL002/PASS077 control outputs and receipt. |
+
+Archive contents, full hashes, manifests, receipts and containing directories
+are verified and fsynced. Copy-only proof preservation removes no source data
+and receives no disk-reclaim credit. Two original collectors copied live
+executable FDs but lost their final local receipts because stdout redirection
+prematurely created their exclusive receipt paths. Both tracebacks and the
+independent whole-image recovery hashes are preserved. Those recoveries are
+not intact original live-FD receipts. Later collectors use separate stdout
+and helper-owned receipt paths.
+
+None of these receipts closes br-5nr0m's original five acceptance items. The
+load-20, 16,641-directory bound, namespace-hidden-reader negative, doctor/metric
+surface, inventory-bound behavior and macOS work remain open. Role-specific
+timings are not incumbent comparisons or performance wins. Windows and full
+workspace/release qualification are not established by this selected evidence.
+
+### Newly confirmed live-worker counterexample
+
+A further actual-kernel check finds an observable reader missed while its
+leader remains alive: a worker uses `unshare(CLONE_FILES)` and opens the
+generation in its private descriptor table. The leader has no matching FD
+and still has VmSize, so the old survivor scan returns before visiting the
+worker. This is a counterexample in the pre-follow-up `90210e68` image too;
+it is not attributed to the later maintainer commit.
+
+One paired invocation executes the unchanged actual public test
+`visible_reader_still_refuses_deletion_amid_inaccessible_processes` and binary.
+The ordinary leader case passes in 27.66 seconds. The identical Python reader
+program `b3592c84` running in a live unshared worker fails in 1.117 seconds:
+the original `unwrap_err` receives successful `ReclaimedFileBytes`, proving
+admitted unlink. The experimental wrapper changes only fixture execution and
+delays its ready-file publication until an independent kernel witness proves
+the worker-only inode reference and live leader; it does not substitute the
+production scanner or its original oracle. Image hashes remain identical.
+
+Checkpoint `11d262da` adds pinned FD-only inspection of live workers, retaining
+full inspection for dead-leader survivors and strict own-process preflight.
+It does not assume shared descriptor tables. Live thread groups share their
+address space, so the leader's mapping inventory is not repeated per worker;
+Linux enforces those thread-group/VM constraints in
+[`copy_process` and `check_unshare_flags`](https://raw.githubusercontent.com/torvalds/linux/v6.18/kernel/fork.c).
+The [kernel unshare documentation](https://docs.kernel.org/userspace-api/unshare.html)
+describes descriptor-table separation. The scan budget and original timeouts
+are unchanged; descriptor work remains bounded and no performance win is claimed.
+
+The existing public negative gains actual live FD and O_PATH worker cases,
+with explicit inode, leader-liveness and descriptor-table witnesses. All its
+original cases and refusal/byte-preservation/accounting assertions remain.
+Formatting, all-targets checking (237 seconds) and strict workspace Clippy
+(385.5 seconds) pass on this repair. Its separate production and native
+qualification remain pending. The production namespace refusals and queue
+timeout do not execute Cargo; exact owned-job recovery acknowledges remote
+exit 1 without replay. A separate-checkout hz4 native build is compiling,
+with executable collectors already running before test execution.
+
+The original f0 native run finishes with 112 passes, 21 failures and one
+240-second timeout across 134 cases. A later canonical run with the repaired
+source transferred reports a fresh build in 0.45 seconds and again 112/21/1.
+Its panic points at namespace line 2028, the f0 preflight line, while the
+corresponding 11d262da line is 2094. This repeats the known br-kp1in.75 stale
+cache defect. The later run receives no repaired-source runtime credit, even
+though its live namespace matches all 3,896 present inputs; six historical
+performance JSON omissions remain explicit. No assertion or deadline is
+weakened to make these runs green.
+
+The counterexample wrapper, kernel witnesses, original failing output and
+paired receipt are independently verified and fsynced on trj in
+`retention-live-worker-counterexample-1311/` under the preservation root above.
+Its nine-member, 20,480-byte archive has SHA-256
+`2f18abf4c51b3d1423ccd5812bc22ed5037ee437b3023204fe5b0126ce8b63f9`.
+The actual counterexample image is retained separately in the earlier
+private-native recovery bundle. This copy-only preservation receives no
+reclaim credit. Neither older compiler passes nor the stale native run
+qualifies the new production change.
