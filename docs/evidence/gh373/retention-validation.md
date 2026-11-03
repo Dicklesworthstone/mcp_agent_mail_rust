@@ -751,9 +751,11 @@ and no changed present input. All-targets passes in 3,937.2 seconds; Cargo also
 reports an existing third-party future-compatibility notice. The following
 production request refuses before Cargo starts. That worker reaches zero root
 headroom during unrelated batch builds, whose sessions subsequently exit; none
-is signalled. The remaining production/strict-Clippy pipeline is admitted
-normally on vmi1149989, with the same live input witness. Those gates remain
-pending. No source identity, worker capacity, deadline or product policy
+is signalled. The remaining production request is admitted
+normally on vmi1149989, with the same live input witness. It finishes with
+Cargo exit0 in 103m07s, remote exit0 in 6,200.579 seconds and terminal RCH
+client exit0. The old Clippy follow-up does not run. No source identity,
+worker capacity, deadline or product policy
 override is used.
 
 The merged native run compiles in 92 minutes 42 seconds, then executes every
@@ -833,11 +835,42 @@ The namespace draft SHA-256 is
 It is reproduced manually in a separate validation worktree at clean base
 05d2bc1b plus an explicit source overlay, SHA-256
 `ea33ba6a97b802aaf58db009b3f3c6009e089c5d37f9041e980c4fc139b417be`.
-The earlier 9d checkout remains frozen for its ongoing gates. Formatting passes.
+The remote 9d checkout remains frozen for its ongoing production gate. The
+original local producer is deliberately advanced at 20:24 UTC to 05d2bc1b plus
+the identical manual parser overlay. All 3,902 producer inputs match the
+separate compiler checkout. Before/after live input witnesses confirm the old
+remote production compiler still sees the 9d inputs, including after that
+local advance. Its local sequential Python controller alone is paused to
+prevent an obsolete Clippy follow-up; the RCH client and remote compiler are
+uninterrupted. At 20:36:01 UTC, after verifying the child's original start
+identity, zombie state and exit0, send SIGTERM then SIGCONT only to the stopped
+Python controller. Both processes are confirmed gone; the outer driver exits
+143 from this deliberate cleanup. An independent receipt binds the old
+production log hash, Cargo completion, remote exit0 and RCH child exit0.
+The unfinished original driver state cannot substitute for that receipt.
+The shared checkout records the parser change in b2a29afa. Formatting passes.
 The one-file UBS scan remains red: one unchanged critical fixed Python lock
 fixture, 581 warnings and 458 informational findings. All 47 added-line findings
 are reviewed; none is critical or in production code. Nothing is suppressed.
 The new required compiler pipeline is active under normal vmi1152480 admission;
 its live witness matches 3,896 present inputs plus the same six historical JSON
 omissions. The initial 141-case native request refuses before Cargo because hz4
-has no admitted slots. No passing older gate qualifies this new draft.
+has no admitted slots. At 20:24:52 UTC a retry from the original producer path
+is admitted normally on hz4, using its protected 357d41b1 target. Both live
+native processes match all 3,896 present inputs and the same six historical
+JSON omissions. Whole-executable collectors are active before tests begin.
+The compiler and native runs remain pending; no passing older gate qualifies
+this new draft.
+
+A separate native arm64 Mac probe exercises the exact production
+`lsof -n -P -Fpf -- <candidate>` invocation on Darwin25.2.0/macOS26.2 with
+lsof4.91. Three samples each cover clear-before, one real FD, two real FDs,
+clear-after-close, a real mmap with its FD closed (`trackfd=False`), and
+clear-after-unmap. All 18 raw results independently match the expected
+process/descriptor fields: clean empty inventories return1, reader inventories
+return0, and the mapping is reported as `ftxt`. Stderr is empty throughout and
+candidate bytes remain unchanged. Per-mode medians range 0.191–0.313 seconds.
+The raw receipt and separate field-by-field review are retained; this is
+native dependency-boundary evidence only. No Rust retention execution,
+scan-cost improvement, paired incumbent performance or macOS acceptance
+closure follows. The configured Windows endpoint still times out on SSH.

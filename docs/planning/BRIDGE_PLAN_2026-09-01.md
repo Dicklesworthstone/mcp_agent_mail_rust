@@ -24,7 +24,13 @@
   3,896 present files with the same six historical JSON omissions. Native
   execution finishes 117 pass and 22 fail across all 139 cases, with no timeout
   and 10,461 outside selection. All five new regressions and the five-mode
-  visible-reader negative pass. Production and strict Clippy remain pending.
+  visible-reader negative pass. Separate production passes on vmi1149989:
+  Cargo 103m07s, remote 6,200.579 seconds, RCH exit0. At 20:36:01 UTC retire
+  only the paused sequential Python controller after verifying its child is
+  terminal with exit0; neither RCH client nor compiler is signalled. Preserve
+  an independent terminal receipt because the original driver did not record
+  the result. The old Clippy follow-up does not run. Both controller and child
+  are confirmed gone. The new parser pipeline retains its own strict Clippy.
   11d compiler/server results do not qualify the new server edits.
 - [x] Complete the authorized hz4 storage relocation before admitting its
   native retry. Preserve and verify all 78,193 entries in the 14,378,229,760-byte
@@ -68,13 +74,12 @@
   FDSize=0 and no VmSize while its leader remains present. Capture the whole
   status after 25 reads in the first bounded attempt. This is a real kernel
   input, not a captured status from the exact failed test PID.
-- [x] Draft a minimal production parser correction on main, leaving the 9d
-  validation checkout frozen: accept the kernel's unsigned zero count;
+- [x] Draft a minimal production parser correction on main: accept the kernel's unsigned zero count;
   preserve terminal-state/UID predicates, pinned group enumeration, bounds,
   retries and all existing refusal behavior. Add two Linux unit cases covering
   missing/malformed/negative/overflow records and both live/dead-leader group
   scans with a planted surviving reader. Formatting passes after manual fixes.
-- [ ] Qualify that draft in its separate checkout while 9d stays frozen. The new selection
+- [ ] Qualify that draft in its separate checkout while the remote 9d build stays frozen. The new selection
   is the original 139 plus two parser/group controls, 141 total. Run actual
   production/all-targets/strict-Clippy checks and real-reader native tests;
   the parser fixtures alone are R3, compensated only by separately cited real
@@ -82,6 +87,23 @@
   Normal vmi1152480 admission is executing the new compiler pipeline, with
   all 3,896 present inputs matching and the same six historical omissions.
   The first native request refuses before Cargo at zero admitted hz4 slots.
+  At 20:24 UTC, fast-forward the original local producer to 05d2bc1b and apply
+  the identical parser overlay manually. All 3,902 inputs match the separate
+  compiler checkout. A new native request is admitted normally on hz4 using
+  the existing protected target path. Before/after remote witnesses confirm
+  vmi1149989 retains the older 9d inputs despite the local producer advance;
+  both new native processes match all 3,896 present inputs, with the same six
+  historical JSON omissions. Actual-executable collectors are running. The
+  shared checkout now records the parser change in b2a29afa; the validation
+  base plus explicit overlay remains the qualification identity.
+- [x] Refresh the available native platform boundaries without interrupting
+  the frozen builds. Windows SSH still times out. On the reachable arm64
+  Mac (Darwin25.2.0/macOS26.2, lsof4.91), run the exact production lsof argv
+  against real closed, single-FD, two-FD and mapping-only states, three times
+  each including closed-after controls: all 18 raw outcomes match, no stderr,
+  original bytes preserved. Median calls cost 0.191–0.313 seconds. This is
+  dependency-boundary evidence, not a Rust retention run, cost optimization,
+  incumbent comparison or completion of the original macOS acceptance.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
