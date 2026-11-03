@@ -15,7 +15,19 @@
   Normal hz3 admission refuses unavailable slots; the hz4 rerun refuses the
   combined I/O/disk-pressure gate before Cargo. Preserve both failures and
   finish the authorized verified move; never override admission or capacity.
+  After the move, normal hz4 admission starts the frozen 9d native build;
+  normal vmi1152480 admission starts the sequential all-targets, production
+  and strict Clippy pipeline. Live input witnesses match all 3,896 present
+  files with the same six historical JSON omissions. Both builds are active.
   11d compiler/server results do not qualify the new server edits.
+- [x] Complete the authorized hz4 storage relocation before admitting its
+  native retry. Preserve and verify all 78,193 entries in the 14,378,229,760-byte
+  archive on trj, independently hash/fsync it, repeat the complete source
+  manifest and idle/open/cwd/protection/Git checks, then cut over at 17:10:24
+  UTC. Recover a measured 13,492 MiB and leave a synced owner1000:1000/mode0775
+  restore stub. Preserve and verify all 17 operator receipts, including the
+  user's authorization, exact command and UTC time. Keep active/protected
+  caches and proof images; no NAS recovery is inferred.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
@@ -71,17 +83,23 @@
   hashes matching. Its 112/21/1 results do not execute the new worker cases.
   Preserve this recurrence under br-kp1in.75; do not infer cache repair from
   isolated validation or alter the original task's acceptance.
-- [ ] Execute all original namespace, public-guard, rotation, legacy and
+- [x] Execute all original namespace, public-guard, rotation, legacy and
   warning controls on the repaired source, including both new live-worker
   cases and original 16,641-directory/720-cycle workloads and deadlines.
+  The 11d result is the explicit 113/20/1 result above; execution does not
+  establish passing acceptance. The merged 9d rerun remains open separately.
 - [x] Preserve the counterexample wrapper, unchanged input program identity,
   kernel witnesses and original failing output on trj, with full archive,
   member/metadata verification and fsync. This is a failing counterexample,
   not passing repair evidence; no source data is removed.
-- [ ] Finish the separate-checkout hz4 native run, with collectors already
+- [x] Finish the separate-checkout 11d hz4 native run, with collectors already
   running before test execution. Verify the actual integration image contains
   both new modes and capture the real positive/negative runtime results.
-- [ ] Preserve the final runtime evidence and original f0 terminal log on trj.
+- [x] Preserve the 11d runtime evidence and original f0 terminal log on trj.
+  Independently verify and fsync all three actual 11d image hashes and the
+  1,002-member terminal/source/role archive. Retain the raced collector error,
+  initial 28/35 harness result and corrected 63/0 result. These proof copies
+  preserve their sources and claim zero reclaimed root bytes.
 - [ ] Update the existing validation record, Beads and final commit/push after
   qualification. The broader br-5nr0m acceptance remains open; no performance
   win, whole-workspace runtime or release qualification is inferred.

@@ -705,3 +705,48 @@ old-production/new-test ordering counterexample has not executed. The passing
 native namespace evidence above still applies to its unchanged source; the
 passing compile/lint results in this continuation do not replace the outstanding
 runtime validation. No issue closure or release qualification is inferred.
+
+## November 3: durable 11d proof and normal merged-source admission
+
+The completed 11d run remains **113 pass, 20 fail and one timeout**. Its three
+actual images are independently rehashed inside their preserved archives on
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/retention-live-worker-11d-native-1705/`:
+
+| Preserved payload | Archive SHA-256 |
+| --- | --- |
+| DB library image | `5480e87ea91bae7f3b9841c20b86fe6732ca4e563b41ff248555e00d3ac4786d` |
+| Integration and server images | `85733b8dedd7f924899dcb57b8138a01286286d528ba1b3e1cddce1add07e65e` |
+| Terminal/source records and both role contexts, 1,002 members | `f889551737ef03e2cd29755fc3fff3e1a091ec0667ff2cea2cd1250a720ffece` |
+
+The terminal bundle retains the ordinary-worker failures, raced live collector
+error, initial 28/35 parent-permission harness result, corrected 63/0 role
+result, original case listings, controller, configuration and per-case output.
+All member contents and archived ownership/modes are verified; payloads,
+manifests and directories are synced. Proof sources remain intact and protected;
+these copies claim zero reclaimed bytes. The corrected role result remains
+separate from the ordinary-worker run and does not qualify the merged server.
+
+The user authorized operator remediation with: "you do it!!! use
+$system-performance-remediation !!! and move stuff to /bulk on trj". Following
+full preservation and fresh source checks, the provided relocation helper cut
+over hz4's idle, non-Git `/data/projects/fastmcp_rust_batchverify` at
+**2026-11-03 17:10:24 UTC**. All 78,193 entries are preserved in the independently
+verified and synced 14,378,229,760-byte archive under
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/hz4-fastmcp-batch-1524/`.
+Its SHA-256 is `3aafa0e4bebb594b12908858c7570330de3945eedf2f06dd3bda3c0e1af6e8d2`;
+source/archive/fresh-source manifest SHA-256 is
+`ab1b5240860292603572c3470b0ebe2401cbc382e89cf38fb40719f7f82a2d7f`.
+The measured root gain is **13,492 MiB**, from 19,557 to 33,049 MiB available
+at cutover. Owner1000:1000/mode0775 and a synced restore pointer remain.
+The 17-member operator archive preserves the exact authorization, executed
+command, UTC time, full guards, source manifests and restore-stub verification;
+its SHA-256 is `88364a233196e35f45fbac10dd7ea6f19ad29dbd84d159d64c7ea6230fe98b98`.
+Active/protected trees were excluded. Current free space can fall as other jobs
+write; this is neither a persistent-headroom guarantee nor a NAS repair claim.
+
+Normal RCH admission then started the frozen 9d38fd84 139-case native rerun on
+hz4 and the sequential required compiler gates on vmi1152480. Both live source
+witnesses match 3,896 present inputs, with the same six historical performance
+JSON omissions and no changed present input. Both builds are active at this
+checkpoint. No source identity, worker capacity, deadline or production policy
+override was used, and no merged-source runtime or compiler pass is inferred.
