@@ -108,8 +108,12 @@ filter = '''
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 | test(=recovery_retention::namespace::tests::deletion_retains_a_nondumpable_same_user_reader)
-| test(=retention_linux::nondumpable_process_names_never_authorize_deletion)
+| test(=recovery_retention::namespace::tests::superseded_unlink_preserves_opaque_reader_bytes_and_interrupted_accounting)
+| test(=retention_linux::nondumpable_readers_keep_exact_bytes_after_admitted_unlink)
+| test(=retention_linux::inaccessible_same_user_process_does_not_block_eight_backups)
+| test(=retention_linux::visible_reader_still_refuses_deletion_amid_inaccessible_processes)
 | test(=retention_linux::exited_thread_group_leader_does_not_hide_a_live_backup_reader)
+| test(=retention_linux::concurrent_cleanup_and_process_restart_preserve_recovery_evidence)
 '''
 threads-required = "num-test-threads"
 
@@ -177,8 +181,12 @@ filter = '''
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 | test(=recovery_retention::namespace::tests::deletion_retains_a_nondumpable_same_user_reader)
-| test(=retention_linux::nondumpable_process_names_never_authorize_deletion)
+| test(=recovery_retention::namespace::tests::superseded_unlink_preserves_opaque_reader_bytes_and_interrupted_accounting)
+| test(=retention_linux::nondumpable_readers_keep_exact_bytes_after_admitted_unlink)
+| test(=retention_linux::inaccessible_same_user_process_does_not_block_eight_backups)
+| test(=retention_linux::visible_reader_still_refuses_deletion_amid_inaccessible_processes)
 | test(=retention_linux::exited_thread_group_leader_does_not_hide_a_live_backup_reader)
+| test(=retention_linux::concurrent_cleanup_and_process_restart_preserve_recovery_evidence)
 '''
 threads-required = "num-test-threads"
 
