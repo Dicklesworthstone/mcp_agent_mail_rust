@@ -792,7 +792,7 @@ fn prepare_periodic_publication(
             report_backup_rotation(&report, "before automatic publication");
             if report.admission_refused {
                 return Err(std::io::Error::other(
-                    "backup retention admission is unavailable; no repair export was reserved, retry after the reported reader, namespace, or inventory refusal is resolved",
+                    "backup retention admission is unavailable; no repair export was reserved, retry after the reported reader, namespace, inventory, or durability failure is resolved",
                 ));
             }
             crate::backup_rotation::admit_periodic_publication(

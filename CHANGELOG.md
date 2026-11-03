@@ -81,6 +81,11 @@ release commit in 3fdda50c.
   generation timestamps and collision suffixes. The publication slot and
   verified snapshot remain protected; interrupted or manifest-bearing recovery
   evidence retains its existing safeguards and publication-budget accounting.
+- **Capacity-driven cleanup preserves the newer retained generations.** Keep
+  selection and the reclamation queue now share the same timestamp, numeric
+  collision-suffix and mtime ordering. Shortening the window removes `-99`
+  before `-100`, including mixed resident/parked images with misleading copied
+  mtimes. The progress cursor remains a fairness hint for expired generations.
 - **Linux reader inspection no longer trusts session-daemon names.** A
   nondumpable process can keep a descriptor or mapping after changing its name,
   group, or capabilities. Such uncertainty is recorded explicitly. A terminated
@@ -107,6 +112,19 @@ release commit in 3fdda50c.
   their count and logical bytes without claiming that their allocation was freed.
   Post-unlink sync failures retain both this uncertainty and the existing
   completed-operation receipt, preventing blind retries after interruption.
+- **Unconfirmed namespace mutations stop the current retention pass.** A
+  completed rename or unlink followed by failed durability or namespace
+  validation now refuses publication admission and preserves remaining
+  candidates. A later inventory cannot turn that uncertain result into fresh
+  export capacity during the same pass. Ordinary candidate-local refusals before
+  mutation still allow other eligible candidates to make bounded progress.
+- **Expired startup cleanup budgets defer snapshot admission.** Once inventory
+  completes, a spent budget retains and accounts for the remaining files without
+  admitting new backup-file reclamation or survivor verification work. The earlier
+  empty-directory sweep checks its own deadline before acquiring authority.
+  Deadline deferral does not invent an admission failure or create control files.
+  The budget remains cooperative: inventory finishes and an operation already
+  underway is not interrupted.
 
 The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
 preserves the earlier conservative-policy counterexamples and validation,

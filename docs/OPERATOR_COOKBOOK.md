@@ -671,9 +671,15 @@ and byte budget. They remain uncertain recovery evidence; automatic retention
 does not delete them. A failed inspection preserves its new staging directory
 and reports that path, while successful metadata publication removes it.
 The periodic retention window can shorten to restore count or byte capacity,
-while preserving the publication slot and verified recovery generation. Only
-confirmed removals reduce that calculation; a refused candidate cannot prevent
-cleanup from considering another safely superseded generation in the window.
+while preserving the publication slot and verified recovery generation. It
+uses the same generation ordering as keep-window selection: the oldest
+eligible image goes first, including numeric collision suffixes across resident
+and parked locations. Directory spelling and copied mtimes cannot promote a
+newer dated collision ahead of an older one for deletion. Only
+confirmed removals reduce that calculation; an ordinary candidate-local refusal
+before mutation cannot prevent cleanup from considering another safely
+superseded generation in the window. Loss of the shared snapshot or namespace
+authority still stops the pass.
 These are bounds on cooperating automatic producers, not a filesystem quota
 on operator exports or other programs.
 
@@ -733,7 +739,10 @@ An incomplete backup namespace inventory refuses backup-file mutations and
 marks totals as lower bounds; the separately admitted empty-directory sweep
 can still make progress.
 Uncertain moves or unlinks have separate counters rather than being reported
-as successful reclamation. Each cleanup pass attempts at most 128 periodic
+as successful reclamation. If a rename or unlink completed but its durability
+or namespace validation failed, the current pass stops further mutations and
+refuses backup publication. The apparent absence of a pathname cannot override
+that unconfirmed result. Each cleanup pass attempts at most 128 periodic
 candidates, with a candidate-byte budget of the larger of 512 MiB and the
 current database's size. One oversized candidate can still be attempted so a
 large mailbox can make progress. Verifying the pinned restore point adds I/O
@@ -744,6 +753,16 @@ same candidate-byte limit, so incident verification cannot spend the periodic
 queue's entire cleanup allowance.
 Bounded cleanup passes can leave more work for a later attempt; the publication
 limit remains in force while that work is pending.
+
+Startup cleanup also has a wall-clock budget. Its early empty-directory sweep
+checks the deadline before acquiring authority. After inventory finishes for
+retained counts and bytes, a further deadline check precedes admission of new
+backup-file reclamation and survivor verification work. If the budget has
+expired, it preserves the remaining files for a later pass and reports
+`deadline_reached`; deferral alone does not report an admission refusal or create
+snapshot/recovery control files.
+This is a cooperative budget: it does not interrupt an operation already
+underway or impose a hard limit on inventory, a syscall, or a SQLite check.
 
 `am doctor health` prints a `backup_retention:` line for this state. It reads
 `storage.sqlite3.bak.meta.json` the way a verified backup would and computes

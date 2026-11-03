@@ -100,8 +100,9 @@ pub struct RotateReport {
     /// At least one path could not be inventoried. Byte totals are then known
     /// lower bounds; inaccessible evidence is never treated as zero bytes.
     pub inventory_incomplete: bool,
-    /// Namespace, inventory, or snapshot admission was unavailable. A quota
-    /// refusal following this pass must not authorize a repair export.
+    /// Namespace, inventory, or snapshot admission was unavailable, or a
+    /// completed mutation has unconfirmed durability. A quota refusal following
+    /// this pass must not authorize a repair export.
     pub admission_refused: bool,
     /// The pass reached its wall-clock budget. What it did not reach stays on
     /// disk, counted as kept, for a later pass.
@@ -131,7 +132,17 @@ impl RotateReport {
             .saturating_add(self.bytes_unconfirmed_moves)
     }
 
+    fn record_failure(&mut self, failure: RotationFailure) {
+        // A completed namespace operation with uncertain durability is not
+        // evidence of reusable publication capacity. Stop this pass before
+        // another mutation can build on the unconfirmed result.
+        self.admission_refused |= failure.rename_completed || failure.deletion_completed;
+        self.failures.push(failure);
+    }
+
     fn add_kind(&mut self, kind: &'static str, summary: &RotateKindSummary) {
+        self.admission_refused |=
+            summary.unconfirmed_moves > 0 || summary.unconfirmed_deletions > 0;
         if summary == &RotateKindSummary::default() {
             return;
         }
@@ -375,6 +386,44 @@ fn occupies_rotation_window(primary: &Path, path: &Path, periodic_reclaim: bool)
         || path
             .file_name()
             .is_some_and(|name| is_periodic_backup(primary, name))
+}
+
+/// Use the same recovery preference for keep-window selection and reclamation.
+/// Generation timestamps and numeric collision suffixes take precedence over
+/// copy-preserved mtimes and the directory that happens to contain an image.
+fn backup_order_newest_first(
+    primary: &Path,
+    left: (&Path, SystemTime),
+    right: (&Path, SystemTime),
+) -> std::cmp::Ordering {
+    let candidate = |path: &Path| {
+        let database_name = primary.file_name()?;
+        let name = path.file_name()?;
+        ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
+            let mut stem = database_name.to_os_string();
+            stem.push(sidecar);
+            mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&stem, name)
+        })
+    };
+    let left_candidate = candidate(left.0);
+    let right_candidate = candidate(right.0);
+    let generation = |name: Option<mcp_agent_mail_core::disk::SqliteRecoveryCandidateName>,
+                      modified| {
+        name.and_then(mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(modified).timestamp_micros())
+    };
+    let order = generation(right_candidate, right.1)
+        .cmp(&generation(left_candidate, left.1))
+        .then_with(|| right_candidate.is_some().cmp(&left_candidate.is_some()));
+    let collision_order = match (left_candidate, right_candidate) {
+        (Some(left_name), Some(right_name)) => {
+            left_name.cmp_newest_first(left.1, right_name, right.1)
+        }
+        _ => std::cmp::Ordering::Equal,
+    };
+    order
+        .then(collision_order)
+        .then_with(|| left.0.cmp(right.0))
 }
 
 fn is_native_rotation_directory(name: &std::ffi::OsStr) -> bool {
@@ -694,9 +743,8 @@ fn reclaim_empty_rotation_directories(
             Err(error) => {
                 let failure = RotationFailure::from_error(&path, &error);
                 let completed = failure.deletion_completed;
-                report.failures.push(failure);
+                report.record_failure(failure);
                 if completed {
-                    report.admission_refused = true;
                     break;
                 }
             }
@@ -896,7 +944,7 @@ fn reclaim_periodic_file(
         Err(error) => {
             let failure = RotationFailure::from_error(path, &error);
             summary.record_failure(&failure, metadata.len());
-            report.failures.push(failure);
+            report.record_failure(failure);
         }
     }
     true
@@ -915,7 +963,7 @@ struct PendingReclaim {
 }
 
 #[cfg(unix)]
-type ReclaimCursor = (i64, PathBuf);
+type ReclaimCursor = (SystemTime, PathBuf);
 
 #[cfg(unix)]
 fn reclaim_pending(
@@ -931,25 +979,30 @@ fn reclaim_pending(
     static CURSORS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, ReclaimCursor>>> =
         std::sync::OnceLock::new();
     let cursors = CURSORS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
-    let key = |entry: &PendingReclaim| {
-        let generation = primary
-            .file_name()
-            .zip(entry.path.file_name())
-            .and_then(|(database, name)| {
-                mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(database, name)
-            })
-            .and_then(mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros)
-            .unwrap_or(i64::MIN);
-        (generation, entry.path.clone())
+    let modified =
+        |entry: &PendingReclaim| entry.metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let oldest_first = |left: &PendingReclaim, right: &PendingReclaim| {
+        backup_order_newest_first(
+            primary,
+            (&right.path, modified(right)),
+            (&left.path, modified(left)),
+        )
     };
-    pending.sort_by_key(&key);
+    pending.sort_by(oldest_first);
     let cursor = cursors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(primary)
         .cloned();
     if let Some(cursor) = cursor {
-        let start = pending.partition_point(|entry| key(entry) <= cursor);
+        let start = pending.partition_point(|entry| {
+            !backup_order_newest_first(
+                primary,
+                (&cursor.1, cursor.0),
+                (&entry.path, modified(entry)),
+            )
+            .is_gt()
+        });
         pending.rotate_left(start);
     }
     // Stable, so older entries keep the cursor's fair turn, and each has had its
@@ -958,7 +1011,7 @@ fn reclaim_pending(
     // first and the next still gets its try in the same pass.
     pending.sort_by_key(|entry| entry.within_window);
     let window_start = pending.partition_point(|entry| !entry.within_window);
-    pending[window_start..].sort_by_key(&key);
+    pending[window_start..].sort_by(oldest_first);
     let (mut window_images, mut window_bytes) = pending
         .iter()
         .filter(|entry| entry.within_window)
@@ -1000,7 +1053,7 @@ fn reclaim_pending(
             report,
             entry.historical,
         ) {
-            last_attempted = Some(key(&entry));
+            last_attempted = Some((modified(&entry), entry.path.clone()));
         } else {
             // Do not skip an oversized candidate and keep advancing the
             // cursor through smaller files behind it. It needs to be first
@@ -1227,7 +1280,8 @@ pub fn rotate_storage_backups(
 ///
 /// At `budget` it stops reclaiming and leaves the rest to a later pass, with
 /// nothing refused. One entry already under way finishes, so the bound is not
-/// exact.
+/// exact. Inventory still completes for retained-byte accounting, but a spent
+/// budget does not admit new snapshot verification work.
 pub fn rotate_storage_backups_within(
     storage_root: &Path,
     database_path: &Path,
@@ -1450,10 +1504,15 @@ where
             .push((entry.path(), mtime, meta));
     }
 
+    // Finish inventory even after the budget expires so deferred files remain
+    // visible in retained counts. Snapshot admission selects and fully verifies
+    // the survivor, so checking only the later per-file budget is too late.
+    report.deadline_reached |= deadline.is_some_and(|deadline| Instant::now() >= deadline);
     // Inventory is only a hint: every move checks its retained file witness.
     // Acquire before choosing a pin, then retain admission for the whole pass.
-    // Do not create control state for a missing/empty backup inventory.
-    if report.inventory_incomplete || report.admission_refused {
+    // Do not create control state for a missing/empty backup inventory or work
+    // deferred by the deadline. Deferral is not an admission refusal.
+    if report.inventory_incomplete || report.admission_refused || report.deadline_reached {
         // An unreadable entry may be the recovery record for a visible payload.
         // Preserve every known file and report lower bounds until the complete
         // namespace can be inspected; never infer absence from an I/O error.
@@ -1682,37 +1741,7 @@ where
         // Published backup generations outrank copy-preserved mtimes. Other
         // debris uses mtime; raw paths make ties deterministic.
         files.sort_by(|left, right| {
-            let candidate = |path: &Path| {
-                let name = path.file_name()?;
-                ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
-                    let mut stem = database_name.to_os_string();
-                    stem.push(sidecar);
-                    mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&stem, name)
-                })
-            };
-            let left_candidate = candidate(&left.0);
-            let right_candidate = candidate(&right.0);
-            let generation =
-                |name: Option<mcp_agent_mail_core::disk::SqliteRecoveryCandidateName>, modified| {
-                    name.and_then(
-                        mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros,
-                    )
-                    .unwrap_or_else(|| {
-                        chrono::DateTime::<chrono::Utc>::from(modified).timestamp_micros()
-                    })
-                };
-            let order = generation(right_candidate, right.1)
-                .cmp(&generation(left_candidate, left.1))
-                .then_with(|| right_candidate.is_some().cmp(&left_candidate.is_some()));
-            let collision_order = match (left_candidate, right_candidate) {
-                (Some(left_name), Some(right_name)) => {
-                    left_name.cmp_newest_first(left.1, right_name, right.1)
-                }
-                _ => std::cmp::Ordering::Equal,
-            };
-            order
-                .then(collision_order)
-                .then_with(|| left.0.cmp(&right.0))
+            backup_order_newest_first(snapshot_primary, (&left.0, left.1), (&right.0, right.1))
         });
         let periodic_reclaim = kind == BackupKind::ManualBackup && periodic_reclamation_enabled();
         let to_evict = files
@@ -1753,12 +1782,17 @@ where
             #[cfg(not(unix))]
             let _ = within_window;
             let size = metadata.len();
+            if report.admission_refused {
+                summary.kept = summary.kept.saturating_add(1);
+                summary.bytes_kept = summary.bytes_kept.saturating_add(size);
+                continue;
+            }
             #[cfg(unix)]
             if let Err(error) = snapshot_guard.revalidate() {
                 report.admission_refused = true;
                 let failure = RotationFailure::from_error(path, &error);
                 summary.record_failure(&failure, size);
-                report.failures.push(failure);
+                report.record_failure(failure);
                 continue;
             }
             #[cfg(unix)]
@@ -1821,7 +1855,7 @@ where
                         );
                         let failure = RotationFailure::from_error(path, &err);
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                     }
                 }
                 continue;
@@ -1840,7 +1874,7 @@ where
                         );
                         let failure = RotationFailure::from_error(path, &err);
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                         continue;
                     }
                 }
@@ -1849,14 +1883,13 @@ where
                 let error = std::io::Error::other("rotation quarantine directory unavailable");
                 let failure = RotationFailure::from_error(path, &error);
                 summary.record_failure(&failure, size);
-                report.failures.push(failure);
+                report.record_failure(failure);
                 continue;
             };
             match stage(path, directory, metadata) {
                 Ok(dest) => {
                     #[cfg(unix)]
                     if let Err(error) = snapshot_guard.revalidate() {
-                        report.admission_refused = true;
                         let failure = RotationFailure {
                             source: path.clone(),
                             rename_completed: true,
@@ -1868,7 +1901,7 @@ where
                             ),
                         };
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                         continue;
                     }
                     debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
@@ -1895,7 +1928,7 @@ where
                         );
                     }
                     summary.record_failure(&failure, size);
-                    report.failures.push(failure);
+                    report.record_failure(failure);
                 }
             }
         }
@@ -2293,6 +2326,99 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn periodic_retention_shortens_the_window_by_numeric_generation_order() {
+        // Crossing the two-digit suffix boundary defeats lexical filename
+        // order. A parked newer image also defeats full-path ordering even
+        // for equally padded suffixes. Neither is authority to discard it first.
+        for (older_suffix, newer_suffix, parked_newer) in [
+            ("99", "100", false),
+            ("99", "100", true),
+            ("01", "02", true),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let primary = verified_mailbox(tmp.path());
+            let live = fs::read(&primary).unwrap();
+            let metadata_path = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+            let metadata = fs::read(&metadata_path).unwrap();
+            let generation_bytes = fs::metadata(&primary).unwrap().len();
+            let newer_parent = if parked_newer {
+                let history = tmp
+                    .path()
+                    .join("doctor/reclaimable/rotation-19990101T000000Z");
+                fs::create_dir_all(&history).unwrap();
+                history
+            } else {
+                tmp.path().to_path_buf()
+            };
+            let older = tmp.path().join(format!(
+                "storage.sqlite3.bak.20000102_000000-{older_suffix}"
+            ));
+            let newer = newer_parent.join(format!(
+                "storage.sqlite3.bak.20000102_000000-{newer_suffix}"
+            ));
+            for (path, seconds) in [(&older, 2_100_000_000), (&newer, 1)] {
+                fs::copy(&primary, path).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                    )
+                    .unwrap();
+            }
+            let refused = (1..=3)
+                .map(|day| {
+                    let path = tmp
+                        .path()
+                        .join(format!("storage.sqlite3.bak.1999120{day}_000000"));
+                    fs::write(&path, b"incomplete export evidence").unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+
+            // The exact slot plus five dated generations exhaust keep+3.
+            // Three invalid older images must survive, so one window image
+            // must go to permit publication, and the newer one must remain.
+            let before = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
+            assert_eq!(before.images, 6);
+            assert!(before.publication_refused());
+            let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "true")],
+                || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+            );
+            assert_eq!(report.deleted, 1);
+            assert_eq!(report.window_images_deleted, 1);
+            assert!(!older.exists(), "the older collision must go first");
+            assert_eq!(fs::read(newer).unwrap(), live);
+            assert!(!report.inventory_incomplete);
+            assert!(!report.admission_refused);
+            assert_eq!(report.kept, 5);
+            assert_eq!(report.failures.len(), 3);
+            assert!(
+                report
+                    .failures
+                    .iter()
+                    .all(|failure| refused.contains(&failure.source))
+            );
+            assert_eq!(report.bytes_deleted, generation_bytes);
+            assert_eq!(
+                report.bytes_deleted + report.bytes_retained(),
+                before.retained_bytes
+            );
+            for path in refused {
+                assert_eq!(fs::read(path).unwrap(), b"incomplete export evidence");
+            }
+            assert_eq!(fs::read(&primary).unwrap(), live);
+            assert_eq!(fs::read(metadata_path).unwrap(), metadata);
+            admit_periodic_publication(tmp.path(), &primary, 3).unwrap();
+            assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn periodic_retention_reenabled_after_staging_honors_the_current_keep_count() {
         let tmp = TempDir::new().unwrap();
         let primary = verified_mailbox(tmp.path());
@@ -2458,6 +2584,99 @@ mod tests {
             "the kept set must not depend on which pass reclaimed the backlog"
         );
         assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_budget_does_not_acquire_snapshot_authority() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let (primary, _) = mailbox_with_mixed_periodic_history(tmp.path());
+        let generation_bytes = fs::metadata(&primary).unwrap().len();
+        let protected = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-19991230T235959Z");
+        fs::create_dir_all(&protected).unwrap();
+        fs::copy(
+            &primary,
+            protected.join("storage.sqlite3.bak.19991230_000000"),
+        )
+        .unwrap();
+        let manifest = b"interrupted recovery must retain its complete transaction";
+        fs::write(protected.join("manifest.json"), manifest).unwrap();
+        let incident = b"independent incident evidence";
+        fs::write(
+            tmp.path().join("storage.sqlite3.corrupt-evidence"),
+            incident,
+        )
+        .unwrap();
+
+        // Hold the real authority directly, without first acquiring retention's
+        // recovery election or selecting a pin. Trying admission would refuse
+        // and could create control files before reaching the per-file budget.
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join("storage.sqlite3.bak.authority.lock"))
+            .unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let paths = || {
+            walkdir::WalkDir::new(tmp.path())
+                .min_depth(1)
+                .into_iter()
+                .map(|entry| entry.unwrap().into_path())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = paths();
+        let contents = before
+            .iter()
+            .filter(|path| path.is_file())
+            .map(|path| (path.clone(), fs::read(path).unwrap()))
+            .collect::<Vec<_>>();
+        let rotate = |budget| {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+                rotate_storage_backups_within(tmp.path(), &primary, 3, budget).unwrap()
+            })
+        };
+
+        let spent = rotate(Duration::ZERO);
+        assert!(spent.deadline_reached);
+        assert!(!spent.admission_refused, "{:?}", spent.failures);
+        assert!(!spent.inventory_incomplete);
+        assert!(spent.failures.is_empty(), "{:?}", spent.failures);
+        assert_eq!(spent.evicted(), 0);
+        assert_eq!(spent.empty_directories_deleted, 0);
+        assert_eq!(spent.kept, 16);
+        assert_eq!(spent.per_kind[BackupKind::ManualBackup.label()].kept, 13);
+        assert_eq!(spent.per_kind["protected_quarantine"].kept, 2);
+        assert_eq!(spent.per_kind[BackupKind::Corrupt.label()].kept, 1);
+        assert_eq!(
+            spent.bytes_retained(),
+            14 * generation_bytes
+                + u64::try_from(manifest.len()).unwrap()
+                + u64::try_from(incident.len()).unwrap()
+        );
+        assert_eq!(
+            paths(),
+            before,
+            "a deferred pass must not create control state"
+        );
+        for (path, bytes) in contents {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+
+        // This is real contention, not an inventory that happens to fit the
+        // window: with time remaining the same pass must still try admission.
+        let contended = rotate(Duration::from_secs(3600));
+        assert!(!contended.deadline_reached);
+        assert!(contended.admission_refused);
+        assert!(!contended.inventory_incomplete);
+        assert_eq!(contended.failures.len(), 1);
+        assert_eq!(contended.failures[0].source, primary);
+        assert_eq!(contended.evicted(), 0);
+        assert_eq!(contended.kept, spent.kept);
+        assert_eq!(contended.bytes_retained(), spent.bytes_retained());
     }
 
     #[cfg(unix)]
@@ -3418,9 +3637,9 @@ mod tests {
                 report.bytes_unconfirmed_moves,
                 b"retained backup contents".len() as u64
             );
-            assert_eq!(report.failures.len(), 2);
+            assert!(report.admission_refused);
+            assert_eq!(report.failures.len(), 1);
             assert!(report.failures[0].rename_completed);
-            assert!(!report.failures[1].rename_completed);
             assert_eq!(
                 report.failures[0].requested_destination.as_ref(),
                 Some(&moves[0].1)
@@ -3451,6 +3670,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_continues_after_a_refusal_before_any_namespace_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let contents = b"retained backup contents";
+        let paths =
+            [1, 2, 3].map(|day| root.join(format!("storage.sqlite3.bak.2026010{day}_000000")));
+        for path in &paths {
+            fs::write(path, contents).unwrap();
+        }
+        let mut attempts = 0;
+        let mut moved = None;
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || {
+                rotate_storage_backups_with(&root, &primary, 1, |source, directory, metadata| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected refusal before rename",
+                        ));
+                    }
+                    let destination = stage_backup_noreplace(source, directory, metadata)?;
+                    moved = Some(destination.clone());
+                    Ok(destination)
+                })
+                .unwrap()
+            },
+        );
+        assert_eq!(attempts, 2);
+        assert!(!report.admission_refused);
+        assert_eq!(
+            (report.staged, report.kept, report.unconfirmed_moves),
+            (1, 2, 0)
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].source, paths[1]);
+        assert!(!report.failures[0].rename_completed);
+        assert!(!report.failures[0].deletion_completed);
+        assert!(!paths[0].exists());
+        assert_eq!(fs::read(moved.unwrap()).unwrap(), contents);
+        for path in &paths[1..] {
+            assert_eq!(fs::read(path).unwrap(), contents);
+        }
+        assert_eq!(report.bytes_retained(), 3 * contents.len() as u64);
+        assert_eq!(report.bytes_reclaimed, 0);
     }
 
     #[test]
@@ -4551,6 +4821,7 @@ mod tests {
         assert_eq!(summary.bytes_unlinked_with_unobserved_readers, 13);
         let mut report = RotateReport::default();
         report.add_kind(BackupKind::ManualBackup.label(), &summary);
+        assert!(report.admission_refused);
         assert_eq!(report.evicted(), 0);
         assert_eq!(report.bytes_retained(), 18);
         assert_eq!(report.bytes_reclaimed, 0);
@@ -4558,6 +4829,113 @@ mod tests {
         assert_eq!(report.unlinks_with_unobserved_readers, 1);
         assert_eq!(report.bytes_unlinked_with_unobserved_readers, 13);
         assert_eq!(report.per_kind[BackupKind::ManualBackup.label()], summary);
+    }
+
+    #[test]
+    fn completed_namespace_failure_receipts_refuse_publication_admission() {
+        // Receipt policy is distinct from the real post-rename/post-unlink
+        // sync-fault tests in recovery_retention_namespace. An ordinary
+        // refusal leaves capacity unchanged and must permit other candidates.
+        for (rename_completed, deletion_completed, reader_inventory_incomplete) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let failure = RotationFailure {
+                source: PathBuf::from("source"),
+                rename_completed,
+                deletion_completed,
+                reader_inventory_incomplete,
+                requested_destination: rename_completed.then(|| PathBuf::from("quarantine/source")),
+                error: "namespace operation refused or durability unconfirmed".to_owned(),
+            };
+            let completed = rename_completed || deletion_completed;
+            let mut report = RotateReport::default();
+            report.record_failure(failure.clone());
+            assert_eq!(report.admission_refused, completed);
+            assert_eq!(report.failures.as_slice(), std::slice::from_ref(&failure));
+            let mut summary = RotateKindSummary::default();
+            summary.record_failure(&failure, 17);
+            let mut aggregated = RotateReport::default();
+            aggregated.add_kind(BackupKind::ManualBackup.label(), &summary);
+            assert_eq!(aggregated.admission_refused, completed);
+            assert_eq!(aggregated.kept, usize::from(!completed));
+            assert_eq!(aggregated.unconfirmed_moves, usize::from(rename_completed));
+            assert_eq!(
+                aggregated.unconfirmed_deletions,
+                usize::from(deletion_completed)
+            );
+            assert_eq!(aggregated.bytes_reclaimed, 0);
+            assert_eq!(aggregated.evicted(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_failure_receipts_block_remaining_periodic_reclaims() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let paths = [1, 2].map(|day| {
+            tmp.path()
+                .join(format!("storage.sqlite3.bak.2000010{day}_000000"))
+        });
+        let original = fs::read(&primary).unwrap();
+        for path in &paths {
+            fs::copy(&primary, path).unwrap();
+        }
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        for rename_completed in [false, true] {
+            let pending = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| PendingReclaim {
+                    path: path.clone(),
+                    metadata: fs::metadata(path).unwrap(),
+                    historical: false,
+                    within_window: index == 1,
+                })
+                .collect();
+            let mut budget = ReclaimBudget {
+                attempted: 0,
+                bytes: 0,
+                byte_limit: u64::MAX,
+                publication: Some(PeriodicPublicationBudget {
+                    count: 6,
+                    bytes: 0,
+                    projected: 0,
+                    count_limit: 6,
+                    byte_limit: u64::MAX,
+                }),
+                deadline: None,
+                deadline_reached: false,
+            };
+            // Seed the report at the receipt boundary, without pretending to
+            // reproduce a filesystem sync failure in this coordinator test.
+            let mut report = RotateReport::default();
+            report.record_failure(RotationFailure {
+                source: tmp.path().join("earlier-candidate"),
+                rename_completed,
+                deletion_completed: !rename_completed,
+                reader_inventory_incomplete: !rename_completed,
+                requested_destination: rename_completed
+                    .then(|| tmp.path().join("parked-candidate")),
+                error: "namespace mutation completed; durability unconfirmed".to_owned(),
+            });
+            reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+            assert!(report.admission_refused);
+            assert_eq!(budget.attempted, 0);
+            assert_eq!(
+                (report.deleted, report.kept, report.window_images_deleted),
+                (0, 2, 0)
+            );
+            assert_eq!(report.bytes_retained(), 2 * original.len() as u64);
+            assert_eq!(report.failures.len(), 1);
+            assert_eq!(budget.publication.as_ref().unwrap().count, 6);
+            for path in &paths {
+                assert_eq!(fs::read(path).unwrap(), original);
+            }
+        }
     }
 
     #[test]
