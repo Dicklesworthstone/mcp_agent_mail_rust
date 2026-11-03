@@ -603,7 +603,7 @@ fn ensure_no_file_readers(
         else {
             continue;
         };
-        inspect_process_file_readers(
+        inspect_process_reader_inventory(
             &entry.path(),
             pid,
             &self_status,
@@ -612,24 +612,93 @@ fn ensure_no_file_readers(
             (pid == own_pid).then_some(excluded_descriptor).flatten(),
             &mut charge,
         )?;
-        // A terminated thread-group leader can have empty fd/maps files
-        // while its workers still retain the backup. Check *after* the scan
-        // so a leader exiting during it cannot turn empty files into proof
-        // that the entire process has released its readers.
-        inspect_surviving_thread_readers(
-            &entry.path(),
-            pid,
-            &self_status,
-            retained_identity,
-            &canonical_source,
-            &mut charge,
-        )?;
     }
     Ok(())
 }
 
+/// Retry an actual denied inventory once, not just the process's status.
+/// Dumpability can change during exec or exit; a readable status record does
+/// not say whether the fd/maps operation that failed is now permitted. A
+/// second denial remains a refusal, including for an ordinary session daemon.
 #[cfg(target_os = "linux")]
-fn inspect_process_file_readers(
+fn retry_process_reader_scan(
+    mut scan: impl FnMut() -> io::Result<()>,
+    mut pause: impl FnMut(),
+) -> io::Result<()> {
+    match scan() {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            pause();
+            scan()
+        }
+        result => result,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_reader_inventory(
+    process: &Path,
+    process_id: u32,
+    self_status: &ProcessStatusSummary,
+    retained_identity: &Metadata,
+    canonical_source: &Path,
+    excluded_descriptor: Option<i32>,
+    mut charge: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // A proc directory descriptor stays bound to the original task after
+    // exit; reopening the numeric pathname could instead inspect a reused
+    // PID on the retry. O_PATH requires no access to the protected fd table.
+    // Use thread-self because the caller's thread can have its own fd table.
+    let directory = match rustix::fs::open(
+        process,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_proc_task_gone(&io::Error::from(error)) => return Ok(()),
+        Err(error) => return Err(proc_entry_error(process, &io::Error::from(error))),
+    };
+    let anchored = PathBuf::from(format!("/proc/thread-self/fd/{}", directory.as_raw_fd()));
+    let result = retry_process_reader_scan(
+        || {
+            inspect_process_file_readers_once(
+                &anchored,
+                process_id,
+                self_status,
+                retained_identity,
+                canonical_source,
+                excluded_descriptor,
+                &mut charge,
+            )?;
+            // An exited leader can have empty fd/maps files while its workers
+            // still retain the backup. Both scans use the same pinned task.
+            inspect_surviving_thread_readers(
+                &anchored,
+                process_id,
+                self_status,
+                retained_identity,
+                canonical_source,
+                &mut charge,
+            )
+        },
+        || std::thread::sleep(std::time::Duration::from_millis(5)),
+    );
+    // Keep operator diagnostics in /proc/<pid> terms, not this short-lived
+    // internal descriptor spelling. This translation never decides admission.
+    result.map_err(|error| {
+        let detail = error.to_string();
+        let prefix = format!("{}/", anchored.display());
+        if let Some(entry) = detail.strip_prefix(&prefix) {
+            io::Error::new(error.kind(), format!("{}/{entry}", process.display()))
+        } else {
+            error
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_file_readers_once(
     process: &Path,
     process_id: u32,
     self_status: &ProcessStatusSummary,
@@ -770,7 +839,7 @@ fn inspect_surviving_thread_readers(
         // Do not exclude the caller's descriptor number in another task's
         // table: Linux threads can unshare their descriptors. An ambiguous
         // self-reader is a refusal, never authority to ignore a real reader.
-        inspect_process_file_readers(
+        inspect_process_file_readers_once(
             &task.path(),
             task_id,
             self_status,
@@ -1059,29 +1128,17 @@ fn reader_inventory_denial_can_be_skipped(
     self_status: &ProcessStatusSummary,
     file_owner: u32,
 ) -> io::Result<bool> {
-    for attempt in 0..2 {
-        match read_process_status_summary(process) {
-            Ok(summary)
-                if status_summary_denial_is_foreign(&summary, self_status, file_owner)
-                    || summary.is_exited_without_files_or_address_space() =>
-            {
-                return Ok(true);
-            }
-            Ok(_) if attempt == 0 => {
-                // A task entering `do_exit()` or `execve` can deny `/proc/<pid>`
-                // access microseconds before the entry disappears. Re-check
-                // once, but never infer closed readers from a process name,
-                // changed credentials or the leader's address-space teardown.
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Ok(_) => return Ok(false),
-            // A process that exited between the denial and status inspection no
-            // longer retains a descriptor. Other unavailable evidence refuses.
-            Err(error) if is_proc_task_gone(&error) => return Ok(true),
-            Err(error) => return Err(proc_entry_error(&process.join("status"), &error)),
-        }
+    match read_process_status_summary(process) {
+        Ok(summary) => Ok(
+            status_summary_denial_is_foreign(&summary, self_status, file_owner)
+                || summary.is_exited_without_files_or_address_space(),
+        ),
+        // A task that exited between denial and inspection no longer holds a
+        // reader. A live opaque task or unavailable ownership evidence still
+        // refuses; the enclosing inventory retries the actual scan once.
+        Err(error) if is_proc_task_gone(&error) => Ok(true),
+        Err(error) => Err(proc_entry_error(&process.join("status"), &error)),
     }
-    Ok(false)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1740,7 +1797,7 @@ for name in os.listdir("/proc/self/fd"):
     if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
         os.close(descriptor)
 os.unlink(alias)
-print("mapping without a descriptor ready", flush=True)
+print("mapping without a descriptor ready " + os.readlink("/proc/self"), flush=True)
 assert sys.stdin.readline().strip() == "release"
 assert mapping[:] == b"recovery bytes retained only by a memory mapping"
 mapping.close()
@@ -1761,9 +1818,13 @@ mapping.close()
         let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut ready = String::new();
         output.read_line(&mut ready).unwrap();
-        assert_eq!(ready.trim(), READY);
+        let reader_pid = ready
+            .trim()
+            .strip_prefix(READY)
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .expect("mapping reader must report its PID in the mounted procfs");
         let inventoried = std::fs::metadata(&source).unwrap();
-        let child_descriptors = PathBuf::from(format!("/proc/{}/fd", child.id()));
+        let child_descriptors = PathBuf::from(format!("/proc/{reader_pid}/fd"));
         let reader_has_descriptor = std::fs::read_dir(child_descriptors).unwrap().any(|entry| {
             let observed = std::fs::metadata(entry.unwrap().path()).unwrap();
             observed.dev() == inventoried.dev() && observed.ino() == inventoried.ino()
@@ -1862,7 +1923,10 @@ mapping.close()
         if let Some(source) = std::env::var_os(CHILD_SOURCE) {
             let _reader = File::open(source).unwrap();
             nix::sys::prctl::set_dumpable(false).unwrap();
-            println!("{READY}");
+            println!(
+                "{READY} {}",
+                std::fs::read_link("/proc/self").unwrap().display()
+            );
             std::io::stdout().flush().unwrap();
             let mut release = String::new();
             std::io::stdin().read_line(&mut release).unwrap();
@@ -1888,27 +1952,55 @@ mapping.close()
             .unwrap();
         let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
-        loop {
+        let reader_pid = loop {
             assert_ne!(
                 output.read_line(&mut line).unwrap(),
                 0,
                 "reader exited before readiness"
             );
-            if line.contains(READY) {
-                break;
+            if let Some((_, pid)) = line.split_once(READY) {
+                break pid
+                    .trim()
+                    .parse::<u32>()
+                    .expect("protected reader must report its PID in the mounted procfs");
             }
             line.clear();
-        }
-        let child_proc = PathBuf::from(format!("/proc/{}", child.id()));
+        };
+        let child_proc = PathBuf::from(format!("/proc/{reader_pid}"));
         assert_eq!(
             process_reader_uids(&child_proc).unwrap()[1],
             process_reader_uids(Path::new("/proc/self")).unwrap()[1],
         );
         let descriptors_hidden = std::fs::read_dir(child_proc.join("fd"))
             .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+        let caller = read_process_status_summary(Path::new("/proc/self")).unwrap();
+        // Inspect this exact protected fixture as well as the public deletion
+        // path: another opaque host process must not make this test pass.
+        let direct = inspect_process_reader_inventory(
+            &child_proc,
+            reader_pid,
+            &caller,
+            &inventoried,
+            &source,
+            None,
+            || Ok(()),
+        );
         let result = delete_inventoried_file(&source, &inventoried);
         writeln!(child.stdin.take().unwrap(), "release").unwrap();
         assert!(child.wait().unwrap().success());
+        let direct = direct.unwrap_err();
+        assert!(matches!(
+            direct.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+        ));
+        if direct.kind() == io::ErrorKind::PermissionDenied {
+            assert!(
+                direct
+                    .to_string()
+                    .starts_with(&format!("{}/", child_proc.display())),
+                "{direct}"
+            );
+        }
         let error = result.unwrap_err();
         if descriptors_hidden {
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -2351,6 +2443,238 @@ mapping.close()
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn transient_denial_retries_real_descriptors_and_still_refuses_a_reader() {
+        for open_reader in [false, true] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(&source, b"reader retry fixture").unwrap();
+            let identity = std::fs::metadata(&source).unwrap();
+            let reader = open_reader.then(|| File::open(&source).unwrap());
+            let process = Path::new("/proc").join(std::fs::read_link("/proc/thread-self").unwrap());
+            let self_status = read_process_status_summary(&process).unwrap();
+            let mut attempts = 0;
+            let mut pauses = 0;
+            let result = retry_process_reader_scan(
+                || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(io::Error::from_raw_os_error(13));
+                    }
+                    inspect_process_reader_inventory(
+                        &process,
+                        std::process::id(),
+                        &self_status,
+                        &identity,
+                        &source,
+                        None,
+                        || Ok(()),
+                    )
+                },
+                || pauses += 1,
+            );
+            assert_eq!((attempts, pauses), (2, 1));
+            if open_reader {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(error.to_string().contains("active file reader"));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(std::fs::read(&source).unwrap(), b"reader retry fixture");
+            drop(reader);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transient_denial_retries_mapping_inventory_after_empty_descriptors() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"mapped retry fixture").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let process = root.join("process");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        // Inject a kernel-shaped mapping record. The existing native mapped
+        // reader test separately proves this inventory against real procfs.
+        std::fs::write(
+            process.join("maps"),
+            format!(
+                "1000-2000 r--p 00000000 {:02x}:{:02x} {} /removed-alias (deleted)\n",
+                nix::sys::stat::major(identity.dev()),
+                nix::sys::stat::minor(identity.dev()),
+                identity.ino(),
+            ),
+        )
+        .unwrap();
+        let self_status = read_process_status_summary(Path::new("/proc/self")).unwrap();
+        let mut attempts = 0;
+        let error = retry_process_reader_scan(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(io::Error::from_raw_os_error(13));
+                }
+                inspect_process_reader_inventory(
+                    &process,
+                    4242,
+                    &self_status,
+                    &identity,
+                    &source,
+                    None,
+                    || Ok(()),
+                )
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active memory mapping"));
+        assert_eq!(std::fs::read(source).unwrap(), b"mapped retry fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_retry_is_bounded_and_does_not_retry_other_refusals() {
+        for (kind, expected_attempts) in [
+            (io::ErrorKind::PermissionDenied, 2),
+            (io::ErrorKind::WouldBlock, 1),
+            (io::ErrorKind::InvalidInput, 1),
+            (io::ErrorKind::Other, 1),
+        ] {
+            let mut attempts = 0;
+            let mut pauses = 0;
+            let error = retry_process_reader_scan(
+                || {
+                    attempts += 1;
+                    Err(io::Error::new(kind, "reader evidence unavailable"))
+                },
+                || pauses += 1,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(attempts, expected_attempts);
+            assert_eq!(pauses, expected_attempts - 1);
+        }
+        let mut remaining = 1_u32;
+        let error = retry_process_reader_scan(
+            || {
+                remaining = remaining
+                    .checked_sub(1)
+                    .ok_or_else(|| io::Error::other("inventory bound retained across retry"))?;
+                Err(io::Error::from_raw_os_error(13))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("inventory bound"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_retry_does_not_turn_malformed_owner_evidence_into_absence() {
+        let root = fixture();
+        std::fs::write(
+            root.join("status"),
+            b"State:\tS (sleeping)\nFDSize:\t64\nThreads:\t1\nVmSize:\t4096 kB\n",
+        )
+        .unwrap();
+        let caller = read_process_status_summary(Path::new("/proc/self")).unwrap();
+        let mut attempts = 0;
+        let error = retry_process_reader_scan(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(io::Error::from_raw_os_error(13));
+                }
+                assert!(!reader_inventory_denial_can_be_skipped(
+                    &root,
+                    &caller,
+                    caller.uids[1],
+                )?);
+                Err(io::Error::from_raw_os_error(13))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("UID"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_retry_accepts_a_reaped_process_through_its_retained_directory() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                "import os,sys; print(os.readlink('/proc/self'),flush=True); sys.stdin.readline()",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pid = String::new();
+        let process = std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut pid)
+            .and_then(|_| {
+                rustix::fs::open(
+                    format!("/proc/{}", pid.trim()),
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(io::Error::from)
+            });
+        // Always release and reap the fixture before asserting observations.
+        let release = writeln!(child.stdin.take().unwrap(), "release");
+        let exited = child.wait();
+        let process = process.unwrap();
+        release.unwrap();
+        assert!(exited.unwrap().success());
+        let pinned = PathBuf::from(format!("/proc/thread-self/fd/{}", process.as_raw_fd()));
+        let gone = std::fs::read_to_string(pinned.join("status")).unwrap_err();
+        assert!(is_proc_task_gone(&gone), "{gone}");
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"process exit retry fixture").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let caller = read_process_status_summary(Path::new("/proc/self")).unwrap();
+        let mut attempts = 0;
+        retry_process_reader_scan(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(io::Error::from_raw_os_error(13));
+                }
+                inspect_process_file_readers_once(
+                    &pinned,
+                    4242,
+                    &caller,
+                    &identity,
+                    &source,
+                    None,
+                    || Ok(()),
+                )
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"process exit retry fixture"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn foreign_reader_requires_disjoint_caller_and_file_owner_uids() {
         let caller = ProcessStatusSummary {
             state: 'S',
@@ -2409,6 +2733,109 @@ mapping.close()
                 &uncertain, &terminal, 1000
             ));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_reader_inventory_does_not_follow_a_replaced_process_directory() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"pinned process reader fixture").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let alias = root.join("reader-alias");
+        std::fs::hard_link(&source, &alias).unwrap();
+        let caller = read_process_status_summary(Path::new("/proc/self")).unwrap();
+        let process = root.join("4242");
+        let original = root.join("original-process");
+        let owner = identity.uid();
+        let status = format!(
+            "State:\tS (sleeping)\nFDSize:\t64\nThreads:\t1\nVmSize:\t4096 kB\nUid:\t{owner}\t{owner}\t{owner}\t{owner}\n"
+        );
+        let make_empty_process = |path: &Path| -> io::Result<()> {
+            std::fs::create_dir_all(path.join("fd"))?;
+            std::fs::create_dir(path.join("fdinfo"))?;
+            std::fs::write(path.join("maps"), b"")?;
+            std::fs::write(path.join("status"), &status)
+        };
+        make_empty_process(&process).unwrap();
+        std::os::unix::fs::symlink(&alias, process.join("fd/7")).unwrap();
+        std::fs::write(
+            process.join("fdinfo/7"),
+            format!("ino:\t{}\n", identity.ino()),
+        )
+        .unwrap();
+
+        // Replace the numeric pathname after enumeration has charged the
+        // original descriptor. A pinned inventory must still inspect that
+        // descriptor and its fdinfo through the original directory. The
+        // hard-link spelling also requires the device/inode check to work.
+        let mut replaced = false;
+        let error = inspect_process_reader_inventory(
+            &process,
+            4242,
+            &caller,
+            &identity,
+            &source,
+            None,
+            || {
+                if !replaced {
+                    std::fs::rename(&process, &original)?;
+                    make_empty_process(&process)?;
+                    replaced = true;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(replaced);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active file reader"), "{error}");
+        assert_eq!(std::fs::read_link(original.join("fd/7")).unwrap(), alias);
+        assert!(!process.join("fd/7").exists());
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"pinned process reader fixture"
+        );
+
+        // The replacement really is reader-free; a failure above must come
+        // from the retained original inventory, not a malformed fixture.
+        inspect_process_reader_inventory(&process, 4242, &caller, &identity, &source, None, || {
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_reader_inventory_preserves_original_path_in_descriptor_errors() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"descriptor diagnostic fixture").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let caller = read_process_status_summary(Path::new("/proc/self")).unwrap();
+        let process = root.join("4242");
+        std::fs::create_dir(&process).unwrap();
+        std::fs::write(process.join("fd"), b"not a descriptor directory").unwrap();
+
+        let error = inspect_process_reader_inventory(
+            &process,
+            4242,
+            &caller,
+            &identity,
+            &source,
+            None,
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+        let detail = error.to_string();
+        let expected = format!("{}: ", process.join("fd").display());
+        assert!(detail.starts_with(&expected), "{error}");
+        assert!(!detail.contains("/proc/thread-self/fd/"), "{error}");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"descriptor diagnostic fixture"
+        );
     }
 
     #[cfg(target_os = "linux")]

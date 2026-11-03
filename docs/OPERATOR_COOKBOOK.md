@@ -597,6 +597,12 @@ because its filename looks old.
 On Linux, an unreadable same-user `/proc/<pid>/fd` or `maps` entry remains a
 refusal when the process's readers cannot be established. The error names the
 process entry, rather than alleging a permissions problem with the backup.
+Retention retries the actual descriptor, mapping and surviving-worker inventory
+once after a permission denial, after a 5 ms pause and within the original scan
+budget. Both attempts use a retained process-directory descriptor, so a reused
+PID cannot redirect the retry to another process. A second permission denial
+still refuses reclamation: this handles transient access changes, not persistent
+inaccessibility of a same-user process.
 Session-daemon names, different groups, and capability changes do not prove
 that inherited descriptors or mappings have closed. A terminated thread-group
 leader is skipped only when kernel evidence proves its own descriptor table
