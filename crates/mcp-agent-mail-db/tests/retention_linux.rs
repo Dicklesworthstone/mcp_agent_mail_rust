@@ -388,6 +388,93 @@ fn assert_real_procfs_denial(proc: &Path) {
     assert_eq!(fs::metadata(proc.join("fd")).unwrap().uid(), 0);
 }
 
+fn assert_posix_reader_lock(path: &Path, held: bool) {
+    let mut probe = TestProcess::spawn(
+        Command::new("python3")
+            .arg("-c")
+            .arg(concat!(
+                "import errno,fcntl,os,sys\n",
+                "fd=os.open(sys.argv[1],os.O_RDWR)\n",
+                "blocked=False\n",
+                "try:\n",
+                " fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB,1,0,os.SEEK_SET)\n",
+                "except OSError as error:\n",
+                " assert error.errno in (errno.EACCES,errno.EAGAIN),error\n",
+                " blocked=True\n",
+                "assert blocked == (sys.argv[2]=='held'), 'unexpected POSIX lock state'\n",
+                "os.close(fd)\n",
+            ))
+            .arg(path)
+            .arg(if held { "held" } else { "free" }),
+    );
+    assert_success(&probe.output());
+}
+
+#[test]
+fn retention_selection_preserves_posix_locks_on_pins_and_rejected_candidates() {
+    use nix::fcntl::{FcntlArg, fcntl};
+
+    let _serial = reader_fixture_guard();
+    for locked_candidate_is_pin in [true, false] {
+        let mailbox = Mailbox::new();
+        let fallback = mailbox.root.join("storage.sqlite3.bak.20261101_000000");
+        if !locked_candidate_is_pin {
+            // Selection tries canonical .bak first, even when metadata names
+            // the exact bytes now preserved in a dated generation. Opening
+            // and rejecting this earlier file used to release its POSIX lock.
+            fs::rename(&mailbox.snapshot, &fallback).unwrap();
+            fs::write(&mailbox.snapshot, INCOMPLETE).unwrap();
+        }
+        let original = fs::read(&mailbox.snapshot).unwrap();
+        let reader = File::open(&mailbox.snapshot).unwrap();
+        let lock = nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_RDLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        fcntl(&reader, FcntlArg::F_SETLK(&lock)).unwrap();
+        assert_posix_reader_lock(&mailbox.snapshot, true);
+
+        let selection = SnapshotRetentionGuard::acquire(&mailbox.primary);
+        if locked_candidate_is_pin {
+            let error = selection.err().expect("a reader must refuse pin admission");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        } else {
+            let guard = selection.unwrap();
+            assert!(guard.metadata_occupied());
+            assert_eq!(guard.verified_source_path(), Some(fallback.as_path()));
+            drop(guard);
+        }
+        // Never open/close the locked inode in this process just to inspect
+        // its contents: the independent lock probe is the decisive assertion.
+        assert_posix_reader_lock(&mailbox.snapshot, true);
+        drop(reader);
+        assert_posix_reader_lock(&mailbox.snapshot, false);
+
+        let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
+        assert_eq!(
+            guard.verified_source_path(),
+            Some(if locked_candidate_is_pin {
+                mailbox.snapshot.as_path()
+            } else {
+                fallback.as_path()
+            })
+        );
+        drop(guard);
+        assert_eq!(fs::read(&mailbox.snapshot).unwrap(), original);
+        assert_eq!(fs::read(&mailbox.primary).unwrap(), mailbox.bytes);
+        assert_eq!(
+            fs::read(snapshot_meta_path(&mailbox.primary)).unwrap(),
+            mailbox.metadata
+        );
+        if !locked_candidate_is_pin {
+            assert_eq!(fs::read(fallback).unwrap(), mailbox.bytes);
+        }
+    }
+}
+
 #[test]
 fn external_descriptors_and_mappings_preserve_backups_until_reader_exit() {
     let _serial = reader_fixture_guard();

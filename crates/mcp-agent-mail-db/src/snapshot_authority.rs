@@ -82,13 +82,44 @@ impl SnapshotRetentionGuard {
         ensure_no_recovery_references(&primary)?;
         let metadata_path = super::snapshot_meta_path(&primary);
         let metadata = retention_metadata(&metadata_path);
+        #[cfg(target_os = "linux")]
+        let mut reader_refusal = None;
         let selected = if matches!(metadata, RetentionMetadata::Bytes(_)) {
             // Already exclusive: reacquiring the public selector's shared lock
             // would reject our own admission and discard a valid pin.
-            super::select_verified_snapshot_inner(&primary)
+            super::select_verified_snapshot_inner(&primary, |candidate, inventoried| {
+                #[cfg(target_os = "linux")]
+                {
+                    match crate::recovery_retention::preflight_current_thread_file_readers(
+                        candidate,
+                        inventoried,
+                    ) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            let refusal = io::Error::new(error.kind(), error.to_string());
+                            reader_refusal.get_or_insert(error);
+                            Err(refusal)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (candidate, inventoried);
+                    Ok(())
+                }
+            })
         } else {
             None
         };
+        // A verified fallback may bypass a busy earlier candidate. Without
+        // that fallback, preserve the admission refusal: treating a blocked
+        // pin as missing verification could authorize a repair export.
+        #[cfg(target_os = "linux")]
+        if selected.is_none()
+            && let Some(error) = reader_refusal
+        {
+            return Err(error);
+        }
         let selected_identity = selected
             .as_ref()
             .map(|selected| selected.source.metadata())

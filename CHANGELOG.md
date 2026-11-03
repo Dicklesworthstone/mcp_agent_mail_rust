@@ -94,8 +94,19 @@ release commit in 3fdda50c.
 - **A different procfs PID namespace no longer creates a false self-reader.**
   Cleanup identifies its retained descriptor using the mounted `/proc/self`
   identity. Its current descriptor table is inspected strictly before canonical
-  verification opens a file, protecting same-process SQLite locks without
-  multiplying the scan by the number of worker threads.
+  verification opens a file, protecting same-process SQLite locks.
+- **Live workers with private descriptor tables remain visible to retention.**
+  Every worker's descriptors are inspected even while its leader is alive.
+  Successfully inspected shared mappings are reused within the thread group.
+  The cleaner excludes its retained descriptor only with matching kernel
+  evidence of its exclusive flock; another thread reusing that descriptor
+  number for an independent reader still blocks reclamation.
+- **Verified-pin selection preserves existing same-process reader locks.**
+  Retention performs a no-open reader check before inspecting each possible
+  restore point, including an earlier candidate later rejected by verification.
+  Without a verified fallback, a blocked pin refuses admission instead of
+  becoming permission for a repair export.
+  Shared snapshot selection for cooperating restore readers remains supported.
 - **Transient procfs permission denials retry the actual reader inventory.**
   One retry after 5 ms rechecks descriptors, mappings and surviving workers
   within the same scan budget. A retained process-directory descriptor prevents

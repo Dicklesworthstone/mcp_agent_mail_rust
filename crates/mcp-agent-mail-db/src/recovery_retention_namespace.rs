@@ -553,10 +553,7 @@ where
     // generic file/directory reclamation retains its strict same-owner policy.
     fs2::FileExt::try_lock_exclusive(&file)?;
     let reader_inventory_incomplete = if let Some(preflight) = readers {
-        use std::os::fd::AsRawFd as _;
-
-        let final_scan =
-            inspect_snapshot_file_readers(&source, &file.metadata()?, Some(file.as_raw_fd()))?;
+        let final_scan = inspect_snapshot_file_readers(&source, &file.metadata()?, Some(&file))?;
         preflight.incomplete || final_scan.incomplete
     } else {
         ensure_no_other_file_readers(&source, &file)?;
@@ -610,11 +607,46 @@ pub(crate) fn preflight_superseded_snapshot_readers(
     inspect_snapshot_file_readers(source, inventoried, None)
 }
 
+/// Protect this thread's POSIX locks before snapshot selection first opens a
+/// candidate. This does not inspect unrelated processes or grant deletion
+/// authority. A same-table descriptor or shared mapping always refuses.
+#[cfg(target_os = "linux")]
+pub(crate) fn preflight_current_thread_file_readers(
+    source: &Path,
+    inventoried: &Metadata,
+) -> io::Result<()> {
+    const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
+    let source = source.canonicalize()?;
+    let process = Path::new("/proc").join(std::fs::read_link("/proc/thread-self")?);
+    let task_id = process
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| invalid("open-reader inventory cannot identify /proc/thread-self"))?;
+    let caller = read_process_status_summary(&process)?;
+    let mut remaining = MAX_READER_INVENTORY_ENTRIES;
+    inspect_process_file_readers_once(
+        &process,
+        task_id,
+        &caller,
+        inventoried,
+        &source,
+        None,
+        &mut false,
+        || {
+            remaining = remaining.checked_sub(1).ok_or_else(|| {
+                io::Error::other("open-reader inventory exceeded its bounded scan")
+            })?;
+            Ok(())
+        },
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn inspect_snapshot_file_readers(
     source: &Path,
     inventoried: &Metadata,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&File>,
 ) -> io::Result<SnapshotReaderEvidence> {
     inspect_file_readers(source, inventoried, excluded_descriptor, true)
 }
@@ -623,16 +655,14 @@ fn inspect_snapshot_file_readers(
 fn inspect_snapshot_file_readers(
     source: &Path,
     inventoried: &Metadata,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&File>,
 ) -> io::Result<SnapshotReaderEvidence> {
     ensure_no_file_readers(source, inventoried, excluded_descriptor)?;
     Ok(SnapshotReaderEvidence::default())
 }
 
 fn ensure_no_other_file_readers(source: &Path, retained: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-
-    ensure_no_file_readers(source, &retained.metadata()?, Some(retained.as_raw_fd()))
+    ensure_no_file_readers(source, &retained.metadata()?, Some(retained))
 }
 
 /// External readers do not necessarily participate in snapshot admission.
@@ -659,7 +689,7 @@ fn proc_entry_error(entry: &Path, error: &io::Error) -> io::Error {
 fn ensure_no_file_readers(
     source: &Path,
     retained_identity: &Metadata,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&File>,
 ) -> io::Result<()> {
     inspect_file_readers(source, retained_identity, excluded_descriptor, false).map(|_| ())
 }
@@ -688,11 +718,65 @@ fn is_unobservable_reader_inventory(error: &io::Error) -> bool {
         .is_some_and(<dyn std::error::Error + Send + Sync>::is::<UnobservableReaderInventory>)
 }
 
+/// Only the retained, exclusively flocked description may be excluded in our
+/// own task group. A descriptor number alone does not identify a description
+/// after a worker unshares its table and independently reuses that number.
+#[cfg(target_os = "linux")]
+struct RetainedReaderDescriptor<'a> {
+    file: &'a File,
+    owner_pid: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedReaderDescriptor<'_> {
+    fn number(&self) -> i32 {
+        use std::os::fd::AsRawFd as _;
+
+        self.file.as_raw_fd()
+    }
+
+    fn validate(&self, retained: &Metadata) -> io::Result<()> {
+        let own = self.file.metadata()?;
+        if own.dev() != retained.dev() || own.ino() != retained.ino() {
+            return Err(invalid(
+                "reader exclusion does not retain the inventoried inode",
+            ));
+        }
+        let info = Path::new("/proc/thread-self/fdinfo").join(self.number().to_string());
+        if !read_descriptor_flock(File::open(info)?, retained, self.owner_pid)? {
+            return Err(invalid("reader exclusion has no retained exclusive flock"));
+        }
+        Ok(())
+    }
+
+    fn matches(
+        &self,
+        process: &Path,
+        descriptor: &std::fs::DirEntry,
+        retained: &Metadata,
+    ) -> io::Result<bool> {
+        if descriptor
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+            != Some(self.number())
+        {
+            return Ok(false);
+        }
+        let info = File::open(process.join("fdinfo").join(descriptor.file_name()))?;
+        if !read_descriptor_flock(info, retained, self.owner_pid)? {
+            return Ok(false);
+        }
+        let observed = std::fs::metadata(descriptor.path())?;
+        Ok(observed.dev() == retained.dev() && observed.ino() == retained.ino())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn inspect_file_readers(
     source: &Path,
     retained_identity: &Metadata,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&File>,
     superseded_snapshot: bool,
 ) -> io::Result<SnapshotReaderEvidence> {
     const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
@@ -706,6 +790,13 @@ fn inspect_file_readers(
         .and_then(|pid| pid.parse::<u32>().ok())
         .ok_or_else(|| invalid("open-reader inventory cannot identify /proc/self"))?;
     let self_status = read_process_status_summary(Path::new("/proc/thread-self"))?;
+    let excluded_descriptor = excluded_descriptor.map(|file| RetainedReaderDescriptor {
+        file,
+        owner_pid: own_pid,
+    });
+    if let Some(excluded) = &excluded_descriptor {
+        excluded.validate(retained_identity)?;
+    }
     let mut remaining = MAX_READER_INVENTORY_ENTRIES;
     let mut charge = || -> io::Result<()> {
         remaining = remaining
@@ -722,15 +813,13 @@ fn inspect_file_readers(
         &self_status,
         retained_identity,
         &canonical_source,
-        excluded_descriptor,
+        excluded_descriptor.as_ref(),
         &mut charge,
     )?;
-    // Linux POSIX locks belong to the current files_struct. The strict scan
-    // above covers every thread sharing that descriptor table; closing our
-    // verifier cannot release locks owned by an unshared table. Do not scan
-    // the same descriptors and address space once per worker thread: that
-    // would consume the bounded inventory solely because the server is busy.
-    // The leader and any surviving workers are still checked below as before.
+    // Linux POSIX locks belong to the current files_struct. This preflight
+    // protects that table before verification opens the inode. Other workers
+    // may have private tables even with a live leader, so the process scan
+    // below inspects them too, while sharing successful mapping coverage.
     let mut evidence = SnapshotReaderEvidence::default();
     for entry in std::fs::read_dir("/proc")? {
         charge()?;
@@ -752,7 +841,9 @@ fn inspect_file_readers(
             &self_status,
             retained_identity,
             &canonical_source,
-            (pid == own_pid).then_some(excluded_descriptor).flatten(),
+            (pid == own_pid)
+                .then_some(excluded_descriptor.as_ref())
+                .flatten(),
             &mut charge,
         );
         match result {
@@ -837,7 +928,7 @@ fn inspect_process_reader_inventory(
     self_status: &ProcessStatusSummary,
     retained_identity: &Metadata,
     canonical_source: &Path,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&RetainedReaderDescriptor<'_>>,
     mut charge: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     inspect_pinned_process_reader_inventory(
@@ -847,6 +938,8 @@ fn inspect_process_reader_inventory(
         retained_identity,
         canonical_source,
         excluded_descriptor,
+        true,
+        &mut false,
         &mut charge,
     )
 }
@@ -858,7 +951,9 @@ fn inspect_pinned_process_reader_inventory(
     self_status: &ProcessStatusSummary,
     retained_identity: &Metadata,
     canonical_source: &Path,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&RetainedReaderDescriptor<'_>>,
+    inspect_workers: bool,
+    mappings_covered: &mut bool,
     mut charge: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -877,8 +972,13 @@ fn inspect_pinned_process_reader_inventory(
         Err(error) => return Err(proc_entry_error(process, &io::Error::from(error))),
     };
     let anchored = PathBuf::from(format!("/proc/thread-self/fd/{}", directory.as_raw_fd()));
+    let earlier_mappings_covered = *mappings_covered;
     let result = retry_process_reader_scan(
         || {
+            // A retry must inspect this task's mappings again when an earlier
+            // task did not already cover the shared address space. Coverage
+            // from the preceding attempt cannot hide a newly added mapping.
+            *mappings_covered = earlier_mappings_covered;
             let mut unobservable = None;
             record_reader_inventory_result(
                 inspect_process_file_readers_once(
@@ -888,23 +988,28 @@ fn inspect_pinned_process_reader_inventory(
                     retained_identity,
                     canonical_source,
                     excluded_descriptor,
+                    mappings_covered,
                     &mut charge,
                 ),
                 &mut unobservable,
             )?;
-            // An exited leader can have empty fd/maps files while its workers
-            // still retain the backup. Both scans use the same pinned task.
-            record_reader_inventory_result(
-                inspect_surviving_thread_readers(
-                    &anchored,
-                    process_id,
-                    self_status,
-                    retained_identity,
-                    canonical_source,
-                    &mut charge,
-                ),
-                &mut unobservable,
-            )?;
+            if inspect_workers {
+                // A live worker can have a private table; an exited leader
+                // can have no table or mappings while workers retain both.
+                record_reader_inventory_result(
+                    inspect_surviving_thread_readers(
+                        &anchored,
+                        process_id,
+                        self_status,
+                        retained_identity,
+                        canonical_source,
+                        excluded_descriptor,
+                        mappings_covered,
+                        &mut charge,
+                    ),
+                    &mut unobservable,
+                )?;
+            }
             unobservable.map_or(Ok(()), Err)
         },
         || std::thread::sleep(std::time::Duration::from_millis(5)),
@@ -969,7 +1074,8 @@ fn inspect_process_file_readers_once(
     self_status: &ProcessStatusSummary,
     retained_identity: &Metadata,
     canonical_source: &Path,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&RetainedReaderDescriptor<'_>>,
+    mappings_covered: &mut bool,
     mut charge: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let mut unobservable = None;
@@ -1009,14 +1115,13 @@ fn inspect_process_file_readers_once(
             }
             Err(error) => return Err(proc_entry_error(&process.join("fd"), &error)),
         };
-        if excluded_descriptor.is_some_and(|excluded| {
-            descriptor
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<i32>().ok())
-                == Some(excluded)
-        }) {
-            continue;
+        if let Some(excluded) = excluded_descriptor {
+            match excluded.matches(process, &descriptor, retained_identity) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) if is_proc_task_gone(&error) => continue,
+                Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
+            }
         }
         let target = match std::fs::read_link(descriptor.path()) {
             Ok(target) => target,
@@ -1078,7 +1183,7 @@ fn inspect_process_file_readers_once(
             ));
         }
     }
-    if retained_identity.file_type().is_file() {
+    if retained_identity.file_type().is_file() && !*mappings_covered {
         record_reader_inventory_result(
             ensure_no_mapped_file_readers(
                 process,
@@ -1086,7 +1191,8 @@ fn inspect_process_file_readers_once(
                 self_status,
                 retained_identity,
                 &mut charge,
-            ),
+            )
+            .map(|covered| *mappings_covered = covered),
             &mut unobservable,
         )?;
     }
@@ -1100,6 +1206,8 @@ fn inspect_surviving_thread_readers(
     self_status: &ProcessStatusSummary,
     retained_identity: &Metadata,
     canonical_source: &Path,
+    excluded_descriptor: Option<&RetainedReaderDescriptor<'_>>,
+    mappings_covered: &mut bool,
     mut charge: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let summary = match read_process_status_summary(process) {
@@ -1107,7 +1215,7 @@ fn inspect_surviving_thread_readers(
         Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error) => return Err(proc_entry_error(&process.join("status"), &error)),
     };
-    if summary.has_vm_size || summary.threads == 1 {
+    if summary.threads == 1 {
         return Ok(());
     }
     let tasks_path = process.join("task");
@@ -1134,9 +1242,9 @@ fn inspect_surviving_thread_readers(
         if task_id == process_id {
             continue;
         }
-        // Do not exclude the caller's descriptor number in another task's
-        // table: Linux threads can unshare their descriptors. An ambiguous
-        // self-reader is a refusal, never authority to ignore a real reader.
+        // All live task tables matter. Only a positive match for our retained
+        // flocked description may exclude the same-number entry in our group;
+        // external groups receive no exclusion at all.
         record_reader_inventory_result(
             inspect_pinned_process_reader_inventory(
                 &task.path(),
@@ -1144,7 +1252,9 @@ fn inspect_surviving_thread_readers(
                 self_status,
                 retained_identity,
                 canonical_source,
-                None,
+                excluded_descriptor,
+                false,
+                mappings_covered,
                 &mut charge,
             ),
             &mut unobservable,
@@ -1163,13 +1273,13 @@ fn ensure_no_mapped_file_readers(
     self_status: &ProcessStatusSummary,
     retained: &Metadata,
     mut charge: impl FnMut() -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use std::io::Read as _;
 
     const MAX_PROCESS_MAP_BYTES: u64 = 8 * 1024 * 1024;
     let maps_file = match File::open(process.join("maps")) {
         Ok(file) => file,
-        Err(error) if is_proc_task_gone(&error) => return Ok(()),
+        Err(error) if is_proc_task_gone(&error) => return Ok(false),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
                 && reader_inventory_denial_can_be_skipped(
@@ -1178,10 +1288,11 @@ fn ensure_no_mapped_file_readers(
                     retained.uid(),
                 )? =>
         {
-            return Ok(());
+            return Ok(false);
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return unobservable_reader_inventory(process, &process.join("maps"), &error);
+            return unobservable_reader_inventory(process, &process.join("maps"), &error)
+                .map(|()| false);
         }
         Err(error) => return Err(proc_entry_error(&process.join("maps"), &error)),
     };
@@ -1191,7 +1302,7 @@ fn ensure_no_mapped_file_readers(
         .read_to_end(&mut maps)
     {
         Ok(_) => {}
-        Err(error) if is_proc_task_gone(&error) => return Ok(()),
+        Err(error) if is_proc_task_gone(&error) => return Ok(false),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
                 && reader_inventory_denial_can_be_skipped(
@@ -1200,16 +1311,18 @@ fn ensure_no_mapped_file_readers(
                     retained.uid(),
                 )? =>
         {
-            return Ok(());
+            return Ok(false);
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return unobservable_reader_inventory(process, &process.join("maps"), &error);
+            return unobservable_reader_inventory(process, &process.join("maps"), &error)
+                .map(|()| false);
         }
         Err(error) => return Err(proc_entry_error(&process.join("maps"), &error)),
     }
     if u64::try_from(maps.len()).unwrap_or(u64::MAX) > MAX_PROCESS_MAP_BYTES {
         return Err(invalid("open-reader mappings exceeded their bounded scan"));
     }
+    let mut observed_mapping = false;
     for line in maps
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
@@ -1230,6 +1343,7 @@ fn ensure_no_mapped_file_readers(
             .map_err(io::Error::other)?
             .parse::<u64>()
             .map_err(io::Error::other)?;
+        observed_mapping = true;
         if inode != retained.ino() {
             continue;
         }
@@ -1248,7 +1362,7 @@ fn ensure_no_mapped_file_readers(
             ));
         }
     }
-    Ok(())
+    Ok(observed_mapping)
 }
 
 /// `read_link` alone misses an open hard-link alias whose directory entry has
@@ -1306,6 +1420,68 @@ fn read_descriptor_inode(mut reader: impl io::Read) -> io::Result<u64> {
     Err(invalid(
         "open-reader descriptor has no bounded inode record",
     ))
+}
+
+/// Linux emits FLOCK records in fdinfo only for the owning open description
+/// (`fs/locks.c::__show_fd_locks` checks `filp == flc_file`). While our borrowed
+/// file retains its exclusive flock, a matching record proves the same OFD;
+/// another independent open of that inode cannot acquire an exclusive flock.
+/// The per-file record ordinal is deliberately not used as an identity.
+#[cfg(target_os = "linux")]
+fn read_descriptor_flock(
+    reader: impl io::Read,
+    retained: &Metadata,
+    owner_pid: u32,
+) -> io::Result<bool> {
+    use std::io::Read as _;
+
+    const MAX_FDINFO_BYTES: usize = 4096;
+    let mut info = Vec::with_capacity(256);
+    reader
+        .take(MAX_FDINFO_BYTES as u64 + 1)
+        .read_to_end(&mut info)?;
+    if info.len() > MAX_FDINFO_BYTES {
+        return Err(invalid(
+            "retained-reader flock record exceeds its bounded scan",
+        ));
+    }
+    for line in info.split_inclusive(|byte| *byte == b'\n') {
+        let Some(record) = line.strip_prefix(b"lock:") else {
+            continue;
+        };
+        let record = record
+            .strip_suffix(b"\n")
+            .ok_or_else(|| invalid("retained-reader flock record is incomplete"))?;
+        let record = std::str::from_utf8(record).map_err(io::Error::other)?;
+        let fields = record.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 8
+            || fields[0]
+                .strip_suffix(':')
+                .and_then(|ordinal| ordinal.parse::<u64>().ok())
+                .is_none_or(|ordinal| ordinal == 0)
+            || fields[1..4] != ["FLOCK", "ADVISORY", "WRITE"]
+            || fields[4].parse::<u32>().ok() != Some(owner_pid)
+            || fields[6..] != ["0", "EOF"]
+        {
+            continue;
+        }
+        let mut identity = fields[5].split(':');
+        let major = identity
+            .next()
+            .and_then(|value| u64::from_str_radix(value, 16).ok());
+        let minor = identity
+            .next()
+            .and_then(|value| u64::from_str_radix(value, 16).ok());
+        let inode = identity.next().and_then(|value| value.parse::<u64>().ok());
+        if major == Some(nix::sys::stat::major(retained.dev()))
+            && minor == Some(nix::sys::stat::minor(retained.dev()))
+            && inode == Some(retained.ino())
+            && identity.next().is_none()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A nondumpable process has root-owned proc entries even when its effective
@@ -1452,8 +1628,11 @@ fn reader_inventory_denial_can_be_skipped(
 fn ensure_no_file_readers(
     source: &Path,
     _retained_identity: &Metadata,
-    excluded_descriptor: Option<i32>,
+    excluded_descriptor: Option<&File>,
 ) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let excluded_descriptor = excluded_descriptor.map(AsRawFd::as_raw_fd);
     let output = std::process::Command::new("lsof")
         .args(["-n", "-P", "-Fpf", "--"])
         .arg(source)
@@ -1965,8 +2144,13 @@ mod tests {
         shared.l_type = i16::try_from(nix::libc::F_RDLCK).unwrap();
         fcntl(&reader, FcntlArg::F_SETLK(&shared)).unwrap();
 
-        let error = preflight_inventoried_file_readers(&source, &inventoried).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        for result in [
+            preflight_current_thread_file_readers(&source, &inventoried),
+            preflight_inventoried_file_readers(&source, &inventoried),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
         // F_GETLK ignores locks owned by its own process. A real second
         // process proves that preflight did not close a new candidate handle
         // and silently discard this process's existing SQLite-style lock.
@@ -1986,6 +2170,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         drop(reader);
+        preflight_current_thread_file_readers(&source, &inventoried).unwrap();
         assert_eq!(
             std::fs::read(&source).unwrap(),
             b"same-process SQLite reader lock"
@@ -2967,6 +3152,7 @@ mapping.close()
                     &identity,
                     &source,
                     None,
+                    &mut false,
                     || Ok(()),
                 )
             },
@@ -3522,6 +3708,7 @@ mapping.close()
             &identity,
             &source,
             None,
+            &mut false,
             || {
                 charged += 1;
                 if charged == 2 {
@@ -3599,6 +3786,439 @@ mapping.close()
         let deleted = delete_superseded_snapshot_file(&source, &identity, evidence).unwrap();
         assert_eq!(deleted.logical_bytes, identity.len());
         assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_worker_private_descriptor_table_remains_visible_to_retention() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+
+        struct Reader(std::process::Child);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        const READER: &str = r"
+import ctypes, os, sys, threading
+source, mode = sys.argv[1:]
+expected = open(source, 'rb').read()
+ready = threading.Event()
+release = threading.Event()
+def worker():
+    try:
+        if mode != 'shared':
+            assert ctypes.CDLL(None).unshare(0x400) == 0
+        handle = None if mode == 'idle' else os.open(source, os.O_RDONLY)
+        ready.set()
+        assert release.wait(30)
+        if handle is not None:
+            assert os.pread(handle, len(expected), 0) == expected
+            os.close(handle)
+    except BaseException:
+        os._exit(23)
+thread = threading.Thread(target=worker)
+thread.start()
+assert ready.wait(10)
+print(os.readlink('/proc/self'), flush=True)
+assert sys.stdin.readline().strip() == 'release'
+release.set()
+thread.join()
+";
+        for mode in ["idle", "shared", "unshared"] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(&source, b"a live worker retains these exact bytes").unwrap();
+            let identity = std::fs::metadata(&source).unwrap();
+            let mut reader = Reader(
+                std::process::Command::new("python3")
+                    .args(["-u", "-c", READER])
+                    .arg(&source)
+                    .arg(mode)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut pid = String::new();
+            std::io::BufReader::new(reader.0.stdout.take().unwrap())
+                .read_line(&mut pid)
+                .unwrap();
+            let pid = pid.trim().parse::<u32>().unwrap();
+            let process = PathBuf::from(format!("/proc/{pid}"));
+            let summary = read_process_status_summary(&process).unwrap();
+            assert!(summary.has_vm_size);
+            assert_eq!(summary.threads, 2);
+            let leader_has_reader = std::fs::read_dir(process.join("fd"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|target| target == source));
+            assert_eq!(leader_has_reader, mode == "shared");
+            let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+            let result = inspect_process_reader_inventory(
+                &process,
+                pid,
+                &caller,
+                &identity,
+                &source,
+                None,
+                || Ok(()),
+            );
+            writeln!(reader.0.stdin.take().unwrap(), "release").unwrap();
+            assert!(reader.0.wait().unwrap().success());
+            if mode == "idle" {
+                result.unwrap();
+            } else {
+                let error = result.expect_err("a live worker's private reader must refuse cleanup");
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(error.to_string().contains("active file reader"));
+            }
+            assert_eq!(
+                std::fs::read(source).unwrap(),
+                b"a live worker retains these exact bytes"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_flock_proof_distinguishes_unshared_same_number_open() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+
+        struct Reader(std::process::Child);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        const READER: &str = r"
+import ctypes, fcntl, os, sys, threading
+source, mode = sys.argv[1:]
+handle = os.open(source, os.O_RDONLY)
+fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+ready = threading.Event()
+release = threading.Event()
+worker_id = []
+def worker():
+    try:
+        if mode != 'shared':
+            assert ctypes.CDLL(None).unshare(0x400) == 0
+        if mode == 'independent':
+            os.close(handle)
+            assert os.open(source, os.O_RDONLY) == handle
+        worker_id.append(os.readlink('/proc/thread-self').split('/')[-1])
+        ready.set()
+        assert release.wait(30)
+        if mode != 'shared':
+            os.close(handle)
+    except BaseException:
+        os._exit(23)
+thread = threading.Thread(target=worker)
+thread.start()
+assert ready.wait(10)
+print(os.readlink('/proc/self'), worker_id[0], handle, flush=True)
+assert sys.stdin.readline().strip() == 'release'
+release.set()
+thread.join()
+os.close(handle)
+";
+        for mode in ["shared", "copied", "independent"] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(&source, b"same descriptor number, different description").unwrap();
+            let identity = std::fs::metadata(&source).unwrap();
+            let mut reader = Reader(
+                std::process::Command::new("python3")
+                    .args(["-u", "-c", READER])
+                    .arg(&source)
+                    .arg(mode)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut ready = String::new();
+            std::io::BufReader::new(reader.0.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            let fields = ready.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3);
+            let pid = fields[0].parse::<u32>().unwrap();
+            let process = PathBuf::from(format!("/proc/{pid}"));
+            let worker = process.join("task").join(fields[1]);
+            let descriptor = fields[2];
+            let own = read_descriptor_flock(
+                File::open(process.join("fdinfo").join(descriptor)).unwrap(),
+                &identity,
+                pid,
+            );
+            let worker_lock = read_descriptor_flock(
+                File::open(worker.join("fdinfo").join(descriptor)).unwrap(),
+                &identity,
+                pid,
+            );
+            let observed = std::fs::metadata(worker.join("fd").join(descriptor)).unwrap();
+            writeln!(reader.0.stdin.take().unwrap(), "release").unwrap();
+            assert!(reader.0.wait().unwrap().success());
+            assert!(own.unwrap());
+            assert_eq!(worker_lock.unwrap(), mode != "independent");
+            assert_eq!(
+                (observed.dev(), observed.ino()),
+                (identity.dev(), identity.ino())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_flock_proof_requires_complete_exclusive_identity() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"flock record parser").unwrap();
+        let identity = std::fs::metadata(source).unwrap();
+        let device = format!(
+            "{:x}:{:x}:{}",
+            nix::sys::stat::major(identity.dev()),
+            nix::sys::stat::minor(identity.dev()),
+            identity.ino(),
+        );
+        let valid = format!("lock:\t1: FLOCK ADVISORY WRITE 4242 {device} 0 EOF\n");
+        assert!(read_descriptor_flock(valid.as_bytes(), &identity, 4242).unwrap());
+        assert!(
+            read_descriptor_flock(valid.replace("1:", "7:").as_bytes(), &identity, 4242).unwrap()
+        );
+        for (before, after) in [
+            ("1:", "0:"),
+            ("1:", "bogus:"),
+            ("FLOCK", "POSIX"),
+            ("FLOCK", "-> FLOCK"),
+            ("ADVISORY", "MANDATORY"),
+            ("WRITE", "READ"),
+            ("4242", "4243"),
+            (device.as_str(), "ff:ff:0"),
+            ("0 EOF", "1 EOF"),
+            ("0 EOF", "0 4096"),
+            ("EOF", "EOF extra"),
+        ] {
+            let malformed = valid.replace(before, after);
+            assert!(
+                !read_descriptor_flock(malformed.as_bytes(), &identity, 4242).unwrap(),
+                "{malformed}"
+            );
+        }
+        assert!(read_descriptor_flock(valid.trim_end().as_bytes(), &identity, 4242).is_err());
+        assert!(read_descriptor_flock(&[b' '; 4097][..], &identity, 4242).is_err());
+        assert!(!read_descriptor_flock(&b"ino:\t123\n"[..], &identity, 4242).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_flock_exclusion_keeps_shared_workers_clear_and_other_opens_visible() {
+        use std::sync::{Arc, Barrier};
+
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"ordinary shared worker tables").unwrap();
+        let retained = File::open(&source).unwrap();
+        fs2::FileExt::try_lock_exclusive(&retained).unwrap();
+        let identity = retained.metadata().unwrap();
+        let process = Path::new("/proc").join(std::fs::read_link("/proc/self").unwrap());
+        let pid = process
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+        let exclusion = RetainedReaderDescriptor {
+            file: &retained,
+            owner_pid: pid,
+        };
+        exclusion.validate(&identity).unwrap();
+        let ready = Arc::new(Barrier::new(17));
+        let release = Arc::new(Barrier::new(17));
+        let workers = (0..16)
+            .map(|_| {
+                let ready = Arc::clone(&ready);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    ready.wait();
+                    release.wait();
+                })
+            })
+            .collect::<Vec<_>>();
+        ready.wait();
+        let inspect = || {
+            let mut remaining = 131_072_usize;
+            inspect_process_reader_inventory(
+                &process,
+                pid,
+                &caller,
+                &identity,
+                &source,
+                Some(&exclusion),
+                || {
+                    remaining = remaining
+                        .checked_sub(1)
+                        .ok_or_else(|| io::Error::other("worker inventory bound exceeded"))?;
+                    Ok(())
+                },
+            )
+        };
+        let clear = inspect();
+        let independent = File::open(&source).unwrap();
+        let blocked = inspect();
+        drop(independent);
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        clear.unwrap();
+        let error = blocked.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active file reader"));
+        fs2::FileExt::unlock(&retained).unwrap();
+        assert!(exclusion.validate(&identity).is_err());
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"ordinary shared worker tables"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_mapping_coverage_requires_a_nonempty_successful_scan() {
+        for leader_has_mappings in [false, true] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(&source, b"worker mapping coverage").unwrap();
+            let identity = std::fs::metadata(&source).unwrap();
+            let process = root.join("4242");
+            let worker = process.join("task/4243");
+            for task in [&process, &worker] {
+                std::fs::create_dir_all(task.join("fd")).unwrap();
+                std::fs::write(
+                    task.join("status"),
+                    superseded_process_status(identity.uid()).replace("Threads:\t1", "Threads:\t2"),
+                )
+                .unwrap();
+            }
+            std::fs::create_dir(process.join("task/4242")).unwrap();
+            let unrelated = "1000-2000 r--p 00000000 00:00 0 [heap]\n".repeat(64);
+            let candidate = format!(
+                "1000-2000 r--p 00000000 {:x}:{:x} {} /generation\n",
+                nix::sys::stat::major(identity.dev()),
+                nix::sys::stat::minor(identity.dev()),
+                identity.ino(),
+            );
+            std::fs::write(
+                process.join("maps"),
+                if leader_has_mappings { &unrelated } else { "" },
+            )
+            .unwrap();
+            std::fs::write(
+                worker.join("maps"),
+                if leader_has_mappings {
+                    &unrelated
+                } else {
+                    &candidate
+                },
+            )
+            .unwrap();
+            let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+            let mut charged = 0;
+            let result = inspect_process_reader_inventory(
+                &process,
+                4242,
+                &caller,
+                &identity,
+                &source,
+                None,
+                || {
+                    charged += 1;
+                    if charged > 66 {
+                        return Err(io::Error::other("mapping work was repeated per worker"));
+                    }
+                    Ok(())
+                },
+            );
+            if leader_has_mappings {
+                result.unwrap();
+                assert_eq!(charged, 66);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(error.to_string().contains("active memory mapping"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_retry_does_not_reuse_prior_mapping_coverage() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if superseded_run_unprivileged("reader_retry_does_not_reuse_prior_mapping_coverage") {
+            return;
+        }
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"mapping appears between denied attempts").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let process = root.join("4242");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::write(
+            process.join("status"),
+            superseded_process_status(identity.uid()),
+        )
+        .unwrap();
+        std::fs::write(
+            process.join("maps"),
+            b"1000-2000 r--p 00000000 00:00 0 [heap]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(process.join("fd"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(process.join("fd")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+        let mut changed = false;
+        let result = inspect_process_reader_inventory(
+            &process,
+            4242,
+            &caller,
+            &identity,
+            &source,
+            None,
+            || {
+                if !changed {
+                    std::fs::write(
+                        process.join("maps"),
+                        format!(
+                            "1000-2000 r--p 00000000 {:x}:{:x} {} /generation\n",
+                            nix::sys::stat::major(identity.dev()),
+                            nix::sys::stat::minor(identity.dev()),
+                            identity.ino(),
+                        ),
+                    )?;
+                    changed = true;
+                }
+                Ok(())
+            },
+        );
+        std::fs::set_permissions(process.join("fd"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let error = result.unwrap_err();
+        assert!(changed);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active memory mapping"));
     }
 
     #[cfg(target_os = "linux")]

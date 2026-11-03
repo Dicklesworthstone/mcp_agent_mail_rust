@@ -905,7 +905,7 @@ fn select_verified_snapshot_checked(primary: &Path) -> DbResult<Option<SelectedV
     #[cfg(unix)]
     let authority =
         SnapshotAuthority::acquire(&primary, false).map_err(snapshot_authority_error)?;
-    let selected = select_verified_snapshot_inner(&primary);
+    let selected = select_verified_snapshot_inner(&primary, |_, _| Ok(()));
     #[cfg(unix)]
     {
         authority.revalidate().map_err(snapshot_authority_error)?;
@@ -920,7 +920,10 @@ fn select_verified_snapshot_checked(primary: &Path) -> DbResult<Option<SelectedV
     }
 }
 
-fn select_verified_snapshot_inner(primary: &Path) -> Option<SelectedVerifiedSnapshot> {
+fn select_verified_snapshot_inner(
+    primary: &Path,
+    mut before_open: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
+) -> Option<SelectedVerifiedSnapshot> {
     let primary = normalized_snapshot_primary(primary).ok()?;
     let meta = read_snapshot_metadata(&primary)?;
     let canonical_bak = snapshot_bak_path(&primary);
@@ -939,6 +942,17 @@ fn select_verified_snapshot_inner(primary: &Path) -> Option<SelectedVerifiedSnap
 
     for candidate in candidates {
         if !crate::pool::sqlite_recovery_candidate_is_standalone(&candidate) {
+            continue;
+        }
+        // Retention must protect an existing same-process reader before even
+        // a rejected candidate is opened and closed: closing any descriptor
+        // for that inode can release its POSIX locks. Shared restore readers
+        // keep their existing authority protocol and use a neutral callback.
+        let inventoried = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if before_open(&candidate, &inventoried).is_err() {
             continue;
         }
         let mut source = match mcp_agent_mail_core::disk::open_regular_file_no_follow(&candidate) {

@@ -602,8 +602,21 @@ that the process is unrelated to the backup. Scanning continues: any observable 
 still refuses deletion, as do malformed or unreadable process identity, scan
 exhaustion, and other IO errors. The cleaner's current descriptor table is
 strictly inspected first, before verification opens a candidate, preserving
-same-process SQLite locks. The process leader is also checked; identical shared
-tables and address spaces are not rescanned once per worker thread.
+same-process SQLite locks. Every worker's descriptor table is inspected because
+a worker can unshare its table while its leader remains alive. Shared memory
+mappings are reused only after a successful nonempty inventory. A matching
+exclusive kernel flock identifies the cleaner's own retained descriptor across
+its threads; another reader reusing that descriptor number is still protected.
+
+Retention also performs the no-open current-thread check before selecting its
+verified restore point. This protects reader locks on both the eventual pin and
+earlier candidates that verification would reject. Opening and closing such a
+candidate just to reject it could otherwise release a same-process POSIX lock.
+If no verified fallback can be selected after a reader refusal, admission
+fails; the blocked pin does not count as missing verification or authorize a
+repair export.
+The existing shared-authority protocol for cooperating restore readers is
+unchanged.
 
 For a fully verified, superseded periodic snapshot only, this uncertainty need
 not block retention. Under exclusive snapshot and recovery authority, an owned,

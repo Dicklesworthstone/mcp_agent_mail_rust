@@ -558,3 +558,164 @@ offline package and a canceled lock-generation attempt were not passing source
 checks; the final harnesses use repository-pinned versions and matching patch
 entries. No additional native Asupersync build was attempted. The new producer
 regression has compiled but has not executed here.
+
+## 2026-11-03 reader follow-through: private worker tables and pin selection
+
+This correction supersedes the earlier assumption that a live leader's
+descriptor inventory represents all its workers. A real Python worker called
+`unshare(CLONE_FILES)` and opened the candidate while the leader remained alive.
+The leader had `VmSize` and two threads, but only the worker's descriptor table
+contained the reader. The unchanged production inspection returned `Ok(())`.
+The new inline regression failed against the old implementation, after its idle
+and ordinary shared-table controls passed. This is an executed counterexample,
+not an inference from source or a synthetic proc tree.
+
+The scanner now inspects every worker's descriptors through pinned task
+directories, without recursively enumerating workers again. Mapping coverage is
+shared only after a successful nonempty scan; an empty, gone or inaccessible
+leader leaves worker mapping inspection necessary. Permission retries reset the
+coverage established by the previous failed attempt. The 131,072-entry bound
+and hard-error/refusal rules remain intact.
+
+The cleaner also cannot exclude a descriptor solely because its number matches
+the retained file's number. A worker with an unshared table can reuse that number
+for an independent reader. The scan now borrows the retained `File` and, only
+within its own process group, requires bounded `fdinfo` evidence of the same
+exclusive whole-file FLOCK, owner PID, device/inode and descriptor metadata.
+Linux's [`__show_fd_locks`](https://github.com/torvalds/linux/blob/v6.12/fs/locks.c)
+filters records by the open file description. The held exclusive lock therefore
+distinguishes the cleaner's description from an independent open of the same
+inode. The local record ordinal is not an identity. A real shared/copied/reused
+descriptor experiment confirmed that distinction; missing or malformed proof
+remains a refusal. Other processes receive no cleaner-descriptor exclusion.
+
+### No-open protection before pin selection
+
+The review also found that snapshot selection could open, hash and close a
+candidate before the later deletion preflight. Even rejecting a candidate on
+size or hash mismatch can release a same-current-table POSIX lock on its inode.
+Retention now supplies a no-open current-thread preflight before each
+selection candidate's first open. The public shared selector retains its
+existing shared-authority semantics with a neutral callback.
+
+A refused early candidate may be bypassed only when selection finds a fully
+verified fallback. If no fallback is selected, acquisition propagates the first
+reader-preflight error, preserving its kind, and releases both authority locks.
+In particular, an occupied but reader-blocked pin must not be classified as
+missing verification and turn into permission for a repair export. The
+pin-only regression requires `WouldBlock`; the valid dated fallback case still
+requires successful admission.
+
+The additional public-guard integration regression covers a locked actual pin
+and a locked nonmatching canonical `.bak` preceding a valid dated pin. It takes
+an actual `F_SETLK` read lock, probes from a separate process before and after
+guard acquisition, and avoids opening or closing the locked inode in the parent
+while checking it. After the reader closes, the probe must show the lock gone
+and selection must succeed. Primary, metadata and fallback bytes remain intact.
+The exact Python probe independently passed held/free controls and rejected both
+inverted expectations. This validates the probe, not execution of the complete
+public-guard regression.
+
+### Native namespace evidence
+
+For namespace source SHA-256
+`ea70a998c56c05adedcdb1032f8ddbb2a7930c349f9e97dc05c1768ef796d2de`,
+one final native invocation passed **14 tests**, with zero failures, zero
+ignored and 45 filtered, in 18.84 seconds. It includes six new regressions,
+the strengthened same-process POSIX-lock case, and all seven prior
+superseded-snapshot cases. The cases cover:
+
+- The live unshared-worker counterexample and ordinary idle/shared controls.
+- Actual shared and copied retained descriptions versus an independent open
+  reusing the same descriptor number, plus sixteen live shared Rust workers.
+- Missing, malformed, truncated, oversized and wrong-identity flock records.
+- Mapping reuse, empty-leader fallback and mapping reinspection on retry.
+- The new current-thread preflight and original global preflight, with an
+  independent process checking that a refused reader's POSIX lock survives.
+- Existing inaccessible-task, process/task replacement, ownership, observable
+  reader, hidden-handle unlink and interrupted-directory-sync protections.
+
+The causal baseline source, old implementation plus only the new live-worker
+test, has SHA-256
+`b247f2b4cfaa8b5e4ea4b66c75e114e1a5ca4d92dfa049cc1a7d8db81b67c500`.
+The passing focused test executable has SHA-256
+`b71b399e030eb71c0cc82590e5d2d02d4aea249b37e1b1b97ffc5adcdc76aaf7`.
+Strict exact-namespace Clippy passes with the existing workspace/DB allowances.
+Two independent source reviews found no blocker in the namespace and selector
+changes. No unsafe Rust, new dependency, scan-bound increase or weakened
+assertion was introduced.
+
+### Full namespace comparison and remaining qualification limits
+
+Both complete native namespace suites were executed by the same controller,
+with the same environment, working directory and real dependencies, one test
+thread, no filters or ignored cases, and a 240-second outer bound. Neither run
+timed out:
+
+| Source | Passed | Failed | Ignored | Filtered |
+| --- | ---: | ---: | ---: | ---: |
+| Starting namespace (`3f6ee67988610a6644d9a0f27a5d0d95400337a76e023d9beeb4cee1d4aa7ae5`) | 40 | 13 | 0 | 0 |
+| Changed namespace (`ea70a998c56c05adedcdb1032f8ddbb2a7930c349f9e97dc05c1768ef796d2de`) | 46 | 13 | 0 | 0 |
+
+The failing test names and diagnoses are identical. Twelve strict generic-file
+or empty-directory cases encounter the ambient `/proc/1/fd/0` permission denial
+before their intended later assertions. The unchanged UID-drop fixture fails
+with `EINVAL`. The six additional cases pass in the complete candidate run.
+This comparison does not make the full suite green, and the different test
+sets are not a performance benchmark. No visibility refusal, assertion or
+scan bound was weakened to change the result.
+
+The complete baseline log has SHA-256
+`deb4c8cbfc6c9a27e943e1c0759ab14f7c7ace0046ccf00e909daba0114afde1`;
+the complete candidate log has SHA-256
+`7b6c2cb7571c978e420f06c94c03c918dbda158abeaecd074371b73111790054`.
+The unchanged-baseline executable has SHA-256
+`f03906323d1d83133f7d5c785a7aa4fb8130fe88a26c3e2cb024a217a0479ea0`.
+The candidate executable is the same one used for the 14-case focused run.
+
+The final reader and selector source identities are:
+
+| File in `crates/mcp-agent-mail-db/` | SHA-256 |
+| --- | --- |
+| `src/recovery_retention.rs` | `4e38200ed52a96862b9b78c0fdb632ee3b7500764774dda191acc7110ef9d230` |
+| `src/recovery_retention_namespace.rs` | `ea70a998c56c05adedcdb1032f8ddbb2a7930c349f9e97dc05c1768ef796d2de` |
+| `src/snapshot.rs` | `77fde638e2a8118a67d5177e8cdc3a273ab3fab81fffad672b8b80f7f517d646` |
+| `src/snapshot_authority.rs` | `05d0370b782592aeb0eaaf0c5e7553d00c8642ad285df4c8992326853979e7cd` |
+| `tests/retention_linux.rs` | `2a0596aec4f03754465205049f8fc2918d4da1e50d0ddb6caa0fab2d890e3703` |
+
+Final checks against those source identities:
+
+| Gate | Result and proof class |
+| --- | --- |
+| Complete production DB source, no default features | Metadata/type checking passed in 26.142 seconds, zero diagnostics |
+| All eight public Linux retention integration tests | Metadata/type checking passed in 0.563 seconds against the fresh production DB artifact |
+| Those same eight integration tests | Strict Clippy passed in 0.446 seconds, zero diagnostics |
+| Exact namespace source | Strict Clippy passed; the native results are recorded above |
+| Formatting, diff checks and independent source review | Passed |
+
+The final DB check uses the recorded production compiler invocation and actual
+repository-pinned dependencies, including core metadata from the successful
+Cargo production check. To fit the exhausted overlay, it invokes `rustc`
+directly, disables incremental-cache writes and writes metadata to tmpfs;
+source, dependency versions and production feature selection are unchanged.
+The integration wrapper imports the exact production test file and uses that
+fresh DB metadata, the actual core and test-helper crates, and real `nix`
+metadata. No functions or assertions were replaced. These checks compile and
+lint the eight tests; they do not execute them.
+
+The preceding Cargo production DB check also passed before the final
+blocked-pin error-propagation refinement. Its full DB strict-Clippy run was
+killed by `SIGKILL` at the shared 8 GiB memory cap, without a source diagnostic;
+it is not a passing gate and was not repeatedly retried. The final direct DB
+metadata and integration checks completed without another OOM event. A scratch
+record write hit `ENOSPC` before the last integration lint started; the lint was
+then run successfully with its records on tmpfs. Final source hashes were
+checked again after all successful gates.
+
+Full native public-guard integration, the changed producer regression, the
+unchanged 720-generation and 16,641-directory qualification gates, and full
+workspace qualification remain unexecuted here. Earlier complete native builds
+were blocked by Asupersync code generation under the same resource limit.
+The native component results and exact-source compilation above do not replace
+those outstanding runtime gates. No dependency, feature default, test size,
+scan bound or assertion was changed to obtain a passing result.
