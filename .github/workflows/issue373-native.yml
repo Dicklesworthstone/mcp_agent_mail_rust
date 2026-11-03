@@ -1,0 +1,169 @@
+name: Issue 373 native retention qualification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/issue373-native.yml'
+      - '.cargo/**'
+      - 'crates/mcp-agent-mail-core/**'
+      - 'crates/mcp-agent-mail-db/**'
+      - 'crates/mcp-agent-mail-server/**'
+      - 'crates/mcp-agent-mail-storage/**'
+      - 'crates/mcp-agent-mail-test-helpers/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue373-native-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '1'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  RUST_TEST_THREADS: '1'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  native:
+    name: ${{ matrix.component }} retention and producer tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: db
+            package: mcp-agent-mail-db
+          - component: server
+            package: mcp-agent-mail-server
+    env:
+      PACKAGE: ${{ matrix.package }}
+      EVIDENCE_DIR: ${{ runner.temp }}/gh373-${{ matrix.component }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}/gh373-target-${{ matrix.component }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Record exact source and install its pinned compiler
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/source.sha"
+          test "$(cat "$EVIDENCE_DIR/source.sha")" = "$GITHUB_SHA"
+          git status --porcelain --untracked-files=no > "$EVIDENCE_DIR/source-before.txt"
+          test ! -s "$EVIDENCE_DIR/source-before.txt"
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          printf 'rustup toolchain install %q --profile minimal\n' "$toolchain" > "$EVIDENCE_DIR/compiler.command"
+          rustup toolchain install "$toolchain" --profile minimal 2>&1 | tee "$EVIDENCE_DIR/compiler-install.log"
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+          {
+            uname -a
+            id
+            rustc +"$toolchain" -vV
+            cargo +"$toolchain" -vV
+          } | tee "$EVIDENCE_DIR/environment.log"
+          cat > "$EVIDENCE_DIR/run-gate.sh" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          gate=$1
+          shift
+          printf '%q ' "$@" > "$EVIDENCE_DIR/$gate.command"
+          printf '\n' >> "$EVIDENCE_DIR/$gate.command"
+          set +e
+          "$@" 2>&1 | tee "$EVIDENCE_DIR/$gate.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf 'command_exit=%s\nlog_exit=%s\n' "${statuses[@]}" > "$EVIDENCE_DIR/$gate.status"
+          if [[ "$gate" != build ]]; then
+            # Subprocess fixtures can print earlier summaries. Require the
+            # final parent executable's summary, including zero ignored tests.
+            awk '/^test result:/ { result = $0 } END { print result }' "$EVIDENCE_DIR/$gate.log" > "$EVIDENCE_DIR/$gate.result"
+          fi
+          if (( statuses[0] != 0 )); then
+            exit "${statuses[0]}"
+          fi
+          if (( statuses[1] != 0 )); then
+            exit "${statuses[1]}"
+          fi
+          if [[ "$gate" != build ]]; then
+            grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$EVIDENCE_DIR/$gate.result"
+          fi
+          BASH
+      - name: Build actual test executables with locked default dependencies
+        id: build
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          targets=(--lib)
+          if [[ "$PACKAGE" == mcp-agent-mail-db ]]; then
+            targets+=(--test it)
+          fi
+          bash "$EVIDENCE_DIR/run-gate.sh" build cargo test --locked -p "$PACKAGE" "${targets[@]}" --no-run
+      # A failed build prevents every test gate. After a successful build,
+      # independent suites still run when a preceding suite fails. Cargo keeps
+      # its normal runtime environment and reuses the same target directory.
+      - name: Run complete namespace and reclamation suites
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'db' }}
+        timeout-minutes: 20
+        run: |
+          bash "$EVIDENCE_DIR/run-gate.sh" namespace cargo test --locked -p "$PACKAGE" --lib recovery_retention:: -- --nocapture --test-threads=1
+      - name: Run complete snapshot authority and recovery-pin suites
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'db' }}
+        timeout-minutes: 20
+        run: |
+          bash "$EVIDENCE_DIR/run-gate.sh" snapshot cargo test --locked -p "$PACKAGE" --lib snapshot:: -- --nocapture --test-threads=1
+      - name: Run real pool publication with its retained backup witness
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'db' }}
+        timeout-minutes: 45
+        run: |
+          bash "$EVIDENCE_DIR/run-gate.sh" pool cargo test --locked -p "$PACKAGE" --lib pool_impl::tests::verified_snapshot_uses_one_publication_admission_and_excludes_retention -- --exact --nocapture --test-threads=1
+      - name: Run public Linux retention with real restricted processes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'db' }}
+        timeout-minutes: 20
+        run: |
+          bash "$EVIDENCE_DIR/run-gate.sh" retention-linux cargo test --locked -p "$PACKAGE" --test it retention_linux:: -- --nocapture --test-threads=1
+      - name: Run complete rotation limits and interrupted reclamation suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'server' }}
+        timeout-minutes: 30
+        run: |
+          bash "$EVIDENCE_DIR/run-gate.sh" rotation cargo test --locked -p "$PACKAGE" --lib backup_rotation::tests:: -- --nocapture --test-threads=1
+      - name: Run complete real producer, admission, and durable journal suites
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'server' }}
+        timeout-minutes: 60
+        run: |
+          bash "$EVIDENCE_DIR/run-gate.sh" coordinator cargo test --locked -p "$PACKAGE" --lib integrity_guard:: -- --nocapture --test-threads=1
+      - name: Verify tracked source stayed unchanged
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/source-after.sha"
+          git status --porcelain --untracked-files=no | tee "$EVIDENCE_DIR/source-after.txt"
+          git diff --no-ext-diff --exit-code HEAD -- 2>&1 | tee "$EVIDENCE_DIR/source.diff"
+          cmp "$EVIDENCE_DIR/source.sha" "$EVIDENCE_DIR/source-after.sha"
+          test ! -s "$EVIDENCE_DIR/source-after.txt"
+      - name: Preserve commands, completed tests, and actual failures
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gh373-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}/
+          if-no-files-found: error
+          retention-days: 14

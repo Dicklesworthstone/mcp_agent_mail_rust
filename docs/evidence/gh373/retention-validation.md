@@ -966,3 +966,37 @@ not represented as compiled or executed tests. The genuine DB test graph
 requires Asupersync `test-internals`; an earlier attempt to build that graph
 was killed by the shared memory limit, and no alternate helper implementation
 or weakened feature graph was substituted to claim a pass.
+
+## Dedicated native qualification workflow
+
+The focused [Issue 373 workflow](../../../.github/workflows/issue373-native.yml)
+gives the remaining real-runtime gates independent DB and server jobs. The
+general CI job already declares workspace tests, but earlier formatting/lint
+or build failure can skip that test step. This workflow builds genuine test
+executables first, then runs the namespace/reclamation, snapshot authority,
+retained-pool-witness, public Linux retention, rotation, and integrity-guard
+suites without requiring an unrelated workspace lint step to succeed.
+
+Both jobs use the repository's exact pinned toolchain, locked dependencies and
+unchanged default features. They retain normal Cargo test execution, serial
+tests and the original workload sizes. The pool regression's actual module
+is `pool_impl::tests`; public Linux integration is selected through target
+`it`, not a nonexistent standalone `retention_linux` target.
+
+A failed test build prevents every later suite in that job. After a successful
+build, a failed suite remains a job failure but does not suppress the other
+independent suites. Each test gate checks its command and logging exit statuses
+and the final parent executable's summary, requiring a nonzero pass count,
+zero failures and zero ignored tests. Exact source identity, commands, logs,
+statuses and source-change checks are retained as artifacts, including after
+failure. A pending or failed run cannot be reported as runtime qualification.
+
+The workflow source at publication has SHA-256
+`97fad4ba2dafffff4588d4a1c2076ea412d0f9054fe0176b6c889b48183249d5`.
+YAML structure, all nine Bash blocks, the embedded gate helper and exact test
+names were checked. Nine synthetic helper controls checked acceptance and
+rejection of result/exit-status shapes; they are workflow-logic checks, not
+Agent Mail test results. Independent review repeated YAML and shell syntax
+checks. No native GitHub Actions result is claimed by this static validation;
+the runtime gaps recorded above remain pending until an actual run on the
+changed commit completes.
