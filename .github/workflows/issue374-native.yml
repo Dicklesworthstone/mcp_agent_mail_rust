@@ -1,0 +1,167 @@
+name: Issue 374 native reconciliation qualification
+
+on:
+  push:
+    branches: [main, 'qualification/gh374-*']
+    paths:
+      - '.github/workflows/issue374-native.yml'
+      - 'crates/mcp-agent-mail-db/**'
+      - 'crates/mcp-agent-mail-storage/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue374-native-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '1'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  RUST_TEST_THREADS: '1'
+
+jobs:
+  inbox:
+    name: Large inbox exactness and cancellation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned native compiler
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh374-inbox"
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          rustc -vV | tee "$RUNNER_TEMP/gh374-inbox/compiler.log"
+      - name: Compare exact large inbox results with the incumbent reader
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable gh374_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/regressions.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-inbox/regressions.log"
+      - name: Run adjacent real inbox correctness tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable sync::inbox::tests:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/inbox-suite.log"
+          # This adjacent suite has three deliberately opt-in benchmarks. The
+          # GH374 step above separately requires every regression to execute.
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored;' "$RUNNER_TEMP/gh374-inbox/inbox-suite.log"
+      - name: Preserve inbox evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gh374-inbox-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gh374-inbox/
+          if-no-files-found: error
+          retention-days: 14
+
+  reconciliation:
+    name: Native repair fairness, recovery, and convergence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned native compiler
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh374-reconciliation"
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          rustc -vV | tee "$RUNNER_TEMP/gh374-reconciliation/compiler.log"
+      - name: Check production storage feature graph
+        run: |
+          set -euo pipefail
+          cargo check --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/production.log"
+      - name: Run real message reconciliation and checkpoint tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable recovery::message_reconcile::database:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/message-recovery.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/message-recovery.log"
+      - name: Run native publication admission and cancellation tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable recovery::reservation_reconcile::repair_lock::fence::tests:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/fence.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/fence.log"
+      - name: Keep active Git writers and unrelated staged authority intact
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable archive_index_sync_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/git-index.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/git-index.log"
+      - name: Require convergence with competing readers and a live Git process
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --test it --no-default-features --features portable archive::gh374_reconciliation_converges_with_live_git_writer_and_inbox_readers -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/concurrent.log"
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/concurrent.log"
+      - name: Require full 25100-message convergence and responsive large inboxes
+        timeout-minutes: 100
+        env:
+          AM_TEST_GH374_LARGE_MAILBOX: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --test it --no-default-features --features portable archive::gh374_reconciliation_converges_with_live_git_writer_and_inbox_readers -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/concurrent-25100.log"
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/concurrent-25100.log"
+      - name: Preserve reconciliation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gh374-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gh374-reconciliation/
+          if-no-files-found: error
+          retention-days: 14
+
+  workspace:
+    name: Supported workspace qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned native compiler and checks
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh374-workspace"
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          rustc -vV | tee "$RUNNER_TEMP/gh374-workspace/compiler.log"
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          cargo fmt --check 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/format.log"
+      - name: Check all workspace targets
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/all-targets.log"
+      - name: Check production feature graph without dev dependencies
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --lib --bins 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/production.log"
+      - name: Run strict workspace Clippy
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/clippy.log"
+      - name: Verify qualification left sources unchanged
+        if: always()
+        run: git diff --exit-code
+      - name: Preserve every completed or failed workspace gate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gh374-workspace-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gh374-workspace/
+          if-no-files-found: error
+          retention-days: 14

@@ -47,6 +47,10 @@ const MAX_RETRY_IDS: usize = 1024;
 const MAX_RETRIES_PER_PASS: usize = 16;
 const MAX_IDS_PER_PASS: usize = 32;
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+// Yield between messages even when every candidate needs the guarded slow
+// path. A filesystem or Git call is not preemptible, so this is a cooperative
+// turn budget, not a hard deadline on an individual repair.
+const MAX_BATCH_TURN: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 struct DeferredRetry {
@@ -96,6 +100,18 @@ impl ReconcileFailure {
             transient: true,
             optimistic_observation_changed: true,
         }
+    }
+
+    fn optimistic_stamp_unavailable(error: crate::StorageError) -> Self {
+        // The stamp is only an optimization for reporting an unchanged
+        // bundle. A busy index writer or local mutation denies that
+        // observation, not the existing guarded repair protocol. Repeatedly
+        // retaining healthy IDs here can fill the retry lane and starve the
+        // unvisited crash window (GH#374). Keep every other error fail-closed.
+        let unavailable = matches!(error, crate::StorageError::LockContention { .. });
+        let mut failure = Self::from(error);
+        failure.optimistic_observation_changed = unavailable;
+        failure
     }
 }
 
@@ -174,6 +190,10 @@ pub struct ReconcileCursor {
     // A failed checkpoint must not replace newer in-memory retry debt with
     // an older disk snapshot on the next pass. A successful save clears this.
     checkpoint_dirty: bool,
+    // Independently sampled from the live DB, never restored from a sidecar.
+    // A legacy/unwritable checkpoint cannot detect an in-place generation
+    // change for the process, so bind its in-memory progress as well.
+    checkpoint_database_generation: Option<String>,
 }
 
 impl ReconcileCursor {
@@ -813,7 +833,7 @@ fn reconcile_prepared_inner(
         match verify_prepared_without_mutation(config, prepared, control) {
             Ok(true) => return Ok(ReconcileResult::default()),
             Ok(false) => {}
-            // An optimistic observation invalidated by another writer proves
+            // An optimistic observation unavailable or invalidated by a writer proves
             // neither completion nor a conflict. Recheck through the existing
             // guarded path instead of pinning healthy retry debt indefinitely.
             // All other failures retain their classification and refusal.
@@ -983,7 +1003,9 @@ fn verify_prepared_without_mutation(
     let Some(archive) = crate::open_archive(config, &prepared.project_slug)? else {
         return Ok(false);
     };
-    let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)? else {
+    let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)
+        .map_err(ReconcileFailure::optimistic_stamp_unavailable)?
+    else {
         return Ok(false);
     };
     let changed = ReconcileFailure::optimistic_observation_changed;
@@ -1034,7 +1056,10 @@ fn verify_prepared_without_mutation(
     }
     super::checkpoint(control)?;
     if !committed.same_head(&archive)?
-        || crate::archive_epoch_read_stamp(&archive.repo_root)?.as_ref() != Some(&before)
+        || crate::archive_epoch_read_stamp(&archive.repo_root)
+            .map_err(ReconcileFailure::optimistic_stamp_unavailable)?
+            .as_ref()
+            != Some(&before)
     {
         return Err(changed());
     }
@@ -1177,7 +1202,8 @@ impl CommittedMessages {
 /// catch-up reads one additional ID to distinguish a full page from its end;
 /// this lookahead performs no payload or archive work in the pass. At most
 /// four successful repairs and 16 MiB of serialized payload are admitted to
-/// archive work per pass. SQL projections are separately bounded before JSON
+/// archive work per pass, yielding between messages after one second of work.
+/// SQL projections are separately bounded before JSON
 /// serialization; an expanded payload that cannot fit any batch is deferred
 /// without pinning the cursor. These are work bounds, not deadlines on SQL,
 /// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace
@@ -1187,7 +1213,8 @@ impl CommittedMessages {
 /// archive refusals retain a bounded FIFO retry lane; conflicts stay on backfill
 /// with a cooldown. Retries never bypass source or archive authority checks.
 /// Database-promotion contention defers before consuming a candidate. A busy
-/// global archive fence or project lock defers that message within the finite
+/// global archive fence receives at most 50 ms of cancellation-aware admission
+/// attempts, and a busy project lock defers immediately within the finite
 /// scan; other messages can progress and the next pass revisits it. Shutdown
 /// reaches the archive admission path as well as the outer loop. Blocking I/O and Git
 /// operations still have no hard deadline.
@@ -1311,7 +1338,10 @@ fn reconcile_message_batch_at(
         if corruption_circuit_breaker().is_tripped() {
             return Err("message reconciliation stopped: source corruption observed".to_string());
         }
-        if report.repaired >= MAX_REPAIRS_PER_BATCH || report.scanned >= MAX_IDS_PER_PASS {
+        if report.repaired >= MAX_REPAIRS_PER_BATCH
+            || report.scanned >= MAX_IDS_PER_PASS
+            || (report.scanned > 0 && now.elapsed() >= MAX_BATCH_TURN)
+        {
             report.budget_exhausted = true;
             break;
         }
