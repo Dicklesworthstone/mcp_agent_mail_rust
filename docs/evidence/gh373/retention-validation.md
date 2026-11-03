@@ -1137,3 +1137,126 @@ sync with filesystem-wide sync, or claim another preflight makes that interval
 atomic. Resolving this remaining issue requires a reviewed I/O ownership
 design. The original full-runtime, public Linux integration, and large
 retention gates remain distinct from the component result above.
+
+## One retained directory for recovery and snapshot control acquisition
+
+The follow-up to `1fad15c` closes the separate control-file acquisition gap
+identified above. Retention previously checked an exporter's directory, then
+independently resolved the recovery election and snapshot authority paths.
+A replacement between those operations could create a snapshot authority in
+another directory or create/change permissions on its recovery election file
+before the eventual admission refusal. Restoring the original pathname did
+not undo those foreign-directory mutations.
+
+The actual `SnapshotRetentionGuard` now delegates control acquisition to one
+filesystem-only helper that captures a no-follow parent, compares any supplied
+exporter parent before mutation, and lends that same retained directory to
+both control constructors. Standalone retention captures the same shared
+parent even without an exporter token. Recovery election still precedes
+snapshot admission, and both controls are revalidated before pin selection.
+
+Both Unix constructors compare their newly captured parent with the retained
+directory before any control-file open. Creation and recovery-lock permission
+normalization then use `openat` against a retained clone. Snapshot authority
+keeps its existing strict empty/private/single-link rules, shared versus
+exclusive locking, and file/parent sync sequence. The generic Unix recovery
+election uses the same retained-directory implementation. Its revalidation
+compares the held control with `statat` in the retained directory and checks
+the current parent before and after, without reopening the control file.
+Private-mode drift also refuses continued authority. Non-Unix recovery-lock
+behavior is unchanged, and the existing recognized platform-directory alias
+rule is retained.
+
+Late replacement can still leave an empty control file in the admitted
+directory before admission refuses. No foreign directory inherits that
+creation or permission change. Control files are not removed on refusal or
+release; their persistent inode remains the cooperating processes' election
+authority. This change does not read or update recovery outcome/backoff state.
+
+### Actual native control-pair evidence
+
+The candidate and baseline native harnesses used 50 complete
+production/test/helper items verbatim, with source-byte ranges and hashes.
+The candidate includes the actual two-control helper called by retention,
+both real control constructors and guard revalidation bodies, and the real
+core permission/platform-alias helpers. No pool, database, syscall, or
+filesystem implementation was substituted. The selected native boundary
+passed **12 tests, zero failures,
+zero ignored, zero filtered**: six new regressions and six unchanged controls.
+Strict component Clippy also passed without diagnostics or policy changes.
+
+The new tests cover a captured foreign parent followed by restoration,
+replacement after a successful parent comparison, absent and existing foreign
+controls, and replacements before either constructor in the actual paired
+acquisition. The paired test exercises both supplied and absent expected
+parent identities. Foreign namespace checks preserve entries, bytes, device,
+inode, mode, link count and modification/change timestamps. Breaker controls
+include initially permissive and read-only modes. Existing and new controls
+also exercise real cross-process contention, release, reacquisition,
+shared/exclusive snapshot admission, symlinks, hard links, unsafe shapes,
+and retained-control replacement. The fixture filesystem was tmpfs.
+
+Two ordinary-parent controls using unchanged old code passed first. A
+separate old breaker-leaf probe then measured foreign control creation and
+`0666`/`0400` normalization to `0600`; its preservation invariant failed.
+A separate old complete snapshot-authority probe measured creation in the
+foreign directory before a later retained-parent refusal; its preservation
+invariant also failed. These are actual old-source component counterexamples,
+not full old recovery/retention runtime runs or transplanted new regression
+definitions.
+
+The reviewed source identities are:
+
+| File | SHA-256 |
+| --- | --- |
+| DB `src/recovery_breaker.rs` | `8b185f6ae4089d19279e3758df0894419ef0c1e3f2785b24b0c02e697778b4a0` |
+| DB `src/snapshot_authority.rs` | `af1e8324fb10b417c932d8082c4d0f2a54c2268110360bd64e51270f138316b4` |
+
+The native executable has SHA-256
+`ab973cef7af35086b9c9ad5721893d29c9c953c8dd701718ec243d390ddde4b9`,
+the complete selected-test log has SHA-256
+`e4c0de99282c820e4810f9941f1a965d007382d26d6c595727ce1fbc492ffc84`,
+and the native receipt has SHA-256
+`0b1759f7f257990630d6776fb3f2673785589cf9c711e689f2801f4bb2057057`.
+Exact source items, both native executables, commands, results and baseline
+scope are retained under `am-retention-control-parent-validation`.
+
+### Production integration attempt
+
+One fresh metadata/typecheck attempt used the complete production DB source
+with both final changed files and actual dependencies. It ended with SIGKILL
+(exit `-9`) after 40.198 seconds and emitted no compiler diagnostic. During
+that interval the shared cgroup's `oom_kill` counter increased from 21 to 23.
+The recorded initial usage was 8,589,926,400 of 8,589,934,592 bytes. This is a
+resource failure, not a passed typecheck or a reported source error.
+
+No fresh DB artifact was produced, so the planned downstream server checks
+were not started against an older artifact. A subsequent headroom check found
+the shared cgroup full again; the same large graph was not blindly retried.
+The failed command, empty log, resource samples, and result are preserved in
+`production-first-failure.json`, SHA-256
+`8593bd2587b7ea4a59465977a41d0556d98076822335732dbe03e62a5178b5f3`.
+The native component and strict component Clippy results above remain the
+executed evidence for this patch; whole-production integration qualification
+remains pending.
+
+### Hosted coverage and remaining scope
+
+The existing issue-373 native workflow now also runs the complete
+`recovery_breaker::` suite from its already-built real DB test executable.
+The new step uses the same build-success prerequisite, locked dependencies,
+default features, serial execution, and nonzero/zero-failure/zero-ignored
+result check as the other suites. It can run after another test suite fails,
+and its logs have a separate name. No existing gate was weakened. YAML and
+all ten Bash blocks passed static syntax checks; independent review confirmed
+the actual test namespace and conditions. This does not claim a completed
+hosted native run.
+
+The native result proves the real filesystem control pair and selected
+regressions. It does not execute `SnapshotRetentionGuard`'s SQLite pin
+selection, the full pool producer, or the large retention workloads. Recovery
+breaker outcome-sidecar storage still has its separate pathname-based flow;
+this commit does not claim all breaker state I/O or the broader
+`br-8asz3`/`br-xzgcj` work is complete. The previously identified ordinary
+descriptor-close/POSIX-reader-lock issue also remains unresolved. Its file
+lock and per-file synchronization protections have not been weakened.

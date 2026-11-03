@@ -127,6 +127,11 @@ jobs:
         timeout-minutes: 20
         run: |
           bash "$EVIDENCE_DIR/run-gate.sh" snapshot cargo test --locked -p "$PACKAGE" --lib snapshot:: -- --nocapture --test-threads=1
+      - name: Run complete recovery election and durable breaker suites
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'db' }}
+        timeout-minutes: 20
+        run: |
+          bash "$EVIDENCE_DIR/run-gate.sh" recovery-breaker cargo test --locked -p "$PACKAGE" --lib recovery_breaker:: -- --nocapture --test-threads=1
       - name: Run real pool publication with its retained backup witness
         if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.component == 'db' }}
         timeout-minutes: 45

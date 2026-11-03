@@ -278,6 +278,10 @@ pub fn breaker_lock_path(db_path: &Path) -> PathBuf {
 pub(crate) struct RecoveryBreakerFileLock {
     file: std::fs::File,
     path: PathBuf,
+    #[cfg(unix)]
+    parent: std::fs::File,
+    #[cfg(unix)]
+    name: std::ffi::OsString,
 }
 
 impl RecoveryBreakerFileLock {
@@ -285,20 +289,51 @@ impl RecoveryBreakerFileLock {
     /// to the same private, unaliased inode. Retention rechecks this before
     /// reclaiming evidence, so replacement cannot create two recovery owners.
     pub(crate) fn revalidate(&self) -> std::io::Result<()> {
-        crate::pool::validate_sqlite_target_path(&self.path, "recovery election lock")
-            .map_err(std::io::Error::other)?;
-        ensure_exclusive_breaker_authority_file(&self.file, &self.path)?;
-        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.path)?;
-        ensure_exclusive_breaker_authority_file(&current, &self.path)?;
-        let retained_identity = same_file::Handle::from_file(self.file.try_clone()?)?;
-        let current_identity = same_file::Handle::from_file(current)?;
-        if retained_identity != current_identity {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "recovery election lock identity or ownership changed",
-            ));
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType};
+            use std::os::unix::fs::MetadataExt as _;
+
+            let parent_path = breaker_parent_path(&self.path)?;
+            ensure_same_breaker_directory(&open_breaker_directory(parent_path)?, &self.parent)?;
+            ensure_exclusive_breaker_authority_file(&self.file, &self.path)?;
+            let retained = self.file.metadata()?;
+            if !retained.is_file() || retained.mode() & 0o777 != 0o600 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "recovery election lock is not a private regular file",
+                ));
+            }
+            let entry = rustix::fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)?;
+            let retained = rustix::fs::fstat(&self.file)?;
+            if FileType::from_raw_mode(entry.st_mode) != FileType::RegularFile
+                || entry.st_dev != retained.st_dev
+                || entry.st_ino != retained.st_ino
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "recovery election lock identity or ownership changed",
+                ));
+            }
+            ensure_same_breaker_directory(&open_breaker_directory(parent_path)?, &self.parent)
         }
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            crate::pool::validate_sqlite_target_path(&self.path, "recovery election lock")
+                .map_err(std::io::Error::other)?;
+            ensure_exclusive_breaker_authority_file(&self.file, &self.path)?;
+            let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.path)?;
+            ensure_exclusive_breaker_authority_file(&current, &self.path)?;
+            let retained_identity = same_file::Handle::from_file(self.file.try_clone()?)?;
+            let current_identity = same_file::Handle::from_file(current)?;
+            if retained_identity != current_identity {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "recovery election lock identity or ownership changed",
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -307,11 +342,149 @@ impl RecoveryBreakerFileLock {
 /// terminal state write; process death releases it automatically.
 pub(crate) fn try_acquire_file_lock(db_path: &Path) -> std::io::Result<RecoveryBreakerFileLock> {
     let path = std::path::absolute(breaker_lock_path(db_path))?;
-    crate::pool::validate_sqlite_target_path(&path, "recovery election lock")
-        .map_err(std::io::Error::other)?;
-    let file = open_breaker_lock_file(&path)?;
+    #[cfg(unix)]
+    {
+        let parent = open_breaker_directory(breaker_parent_path(&path)?)?;
+        acquire_breaker_file_lock_in_parent(path, &parent, || {}, || {})
+    }
+    #[cfg(not(unix))]
+    {
+        crate::pool::validate_sqlite_target_path(&path, "recovery election lock")
+            .map_err(std::io::Error::other)?;
+        let file = open_breaker_lock_file(&path)?;
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        let guard = RecoveryBreakerFileLock { file, path };
+        guard.revalidate()?;
+        Ok(guard)
+    }
+}
+
+/// Use the directory already retained by recovery or snapshot admission.
+/// Control-file creation and permission changes never resolve that directory
+/// again, even if its pathname is replaced after the identity check.
+#[cfg(unix)]
+pub(crate) fn try_acquire_file_lock_in_parent(
+    db_path: &Path,
+    parent: &std::fs::File,
+) -> std::io::Result<RecoveryBreakerFileLock> {
+    let path = std::path::absolute(breaker_lock_path(db_path))?;
+    acquire_breaker_file_lock_in_parent(path, parent, || {}, || {})
+}
+
+#[cfg(unix)]
+fn breaker_parent_path(path: &Path) -> std::io::Result<&Path> {
+    path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recovery election lock has no parent directory",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn ensure_same_breaker_directory(
+    captured: &std::fs::File,
+    expected: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let captured = captured.metadata()?;
+    let expected = expected.metadata()?;
+    if !captured.is_dir()
+        || !expected.is_dir()
+        || captured.dev() != expected.dev()
+        || captured.ino() != expected.ino()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recovery election parent differs from retained admission",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_breaker_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recovery election requires an absolute parent",
+        ));
+    }
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = std::fs::File::from(rustix::fs::open("/", flags, Mode::empty())?);
+    let mut current_path = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                current_path.push(name);
+                let entry = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+                if FileType::from_raw_mode(entry.st_mode) == FileType::Symlink
+                    && let Ok(resolved) = std::fs::canonicalize(&current_path)
+                    && mcp_agent_mail_core::disk::is_platform_temp_firmlink(
+                        &current_path,
+                        &resolved,
+                    )
+                {
+                    // Only the established top-level platform aliases are
+                    // allowed, and their resolved directory is walked again.
+                    directory = open_breaker_directory(&resolved)?;
+                    current_path = resolved;
+                    continue;
+                }
+                directory = std::fs::File::from(rustix::fs::openat(
+                    &directory,
+                    name,
+                    flags,
+                    Mode::empty(),
+                )?);
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "recovery election refuses parent traversal",
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn acquire_breaker_file_lock_in_parent(
+    path: PathBuf,
+    expected_parent: &std::fs::File,
+    after_parent_open: impl FnOnce(),
+    before_control_open: impl FnOnce(),
+) -> std::io::Result<RecoveryBreakerFileLock> {
+    let parent = expected_parent.try_clone()?;
+    let captured = open_breaker_directory(breaker_parent_path(&path)?)?;
+    after_parent_open();
+    // Compare the captured descriptor, not a fresh pathname observation: A
+    // may have been replaced by B and restored before this check completes.
+    ensure_same_breaker_directory(&captured, &parent)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery election lock has no leaf name",
+            )
+        })?
+        .to_os_string();
+    before_control_open();
+    let file = open_breaker_lock_file_in_parent(&parent, &name, &path)?;
     fs2::FileExt::try_lock_exclusive(&file)?;
-    let guard = RecoveryBreakerFileLock { file, path };
+    let guard = RecoveryBreakerFileLock {
+        file,
+        path,
+        parent,
+        name,
+    };
     guard.revalidate()?;
     Ok(guard)
 }
@@ -364,12 +537,32 @@ fn secure_existing_breaker_authority_file(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn open_breaker_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+fn open_breaker_lock_file_in_parent(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            secure_existing_breaker_authority_file(path)?;
+    let flags = OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) if FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile => {
+            // A readable legacy lock can be 0400. Normalize the actual
+            // retained-parent inode before requesting write access.
+            let file = std::fs::File::from(rustix::fs::openat(
+                parent,
+                name,
+                OFlags::RDONLY | flags,
+                Mode::empty(),
+            )?);
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is not a regular lock file", path.display()),
+                ));
+            }
+            ensure_exclusive_breaker_authority_file(&file, path)?;
+            mcp_agent_mail_core::disk::set_private_writable_file_permissions(&file)?;
         }
         Ok(_) => {
             return Err(std::io::Error::new(
@@ -377,16 +570,15 @@ fn open_breaker_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
                 format!("{} is not a regular lock file", path.display()),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) if error == rustix::io::Errno::NOENT => {}
+        Err(error) => return Err(error.into()),
     }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
+    let file = std::fs::File::from(rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDWR | OFlags::CREATE | flags,
+        Mode::RUSR | Mode::WUSR,
+    )?);
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1389,6 +1581,221 @@ mod tests {
             0o600,
             "an existing lock authority file must not retain group/world access"
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_foreign_breaker_parent_untouched(parent: &Path, lock_mode: Option<u32>) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let primary = parent.join("storage.sqlite3");
+        assert_eq!(std::fs::read(&primary).unwrap(), b"foreign primary");
+        let lock = breaker_lock_path(&primary);
+        if let Some(mode) = lock_mode {
+            assert_eq!(std::fs::read(&lock).unwrap(), b"foreign lock evidence");
+            assert_eq!(
+                std::fs::symlink_metadata(&lock)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode
+            );
+        } else {
+            assert_eq!(
+                std::fs::symlink_metadata(&lock).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(parent).unwrap().count(),
+            1 + usize::from(lock_mode.is_some()),
+            "refused admission must not create any foreign control file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn breaker_parent_binding_refuses_captured_replacement_even_after_restore() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for lock_mode in [None, Some(0o666), Some(0o400)] {
+            for restore_after_capture in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                let active = root.join("active");
+                let displaced = root.join("admitted-parent");
+                let foreign = root.join("foreign-parent");
+                std::fs::create_dir(&active).unwrap();
+                std::fs::create_dir(&foreign).unwrap();
+                let primary = active.join("storage.sqlite3");
+                std::fs::write(&primary, b"admitted primary").unwrap();
+                let foreign_primary = foreign.join("storage.sqlite3");
+                std::fs::write(&foreign_primary, b"foreign primary").unwrap();
+                if let Some(mode) = lock_mode {
+                    let lock = breaker_lock_path(&foreign_primary);
+                    std::fs::write(&lock, b"foreign lock evidence").unwrap();
+                    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
+                }
+                let expected_parent = open_breaker_directory(&active).unwrap();
+                std::fs::rename(&active, &displaced).unwrap();
+                std::fs::rename(&foreign, &active).unwrap();
+                let refusal = acquire_breaker_file_lock_in_parent(
+                    breaker_lock_path(&primary),
+                    &expected_parent,
+                    || {
+                        if restore_after_capture {
+                            std::fs::rename(&active, &foreign).unwrap();
+                            std::fs::rename(&displaced, &active).unwrap();
+                        }
+                    },
+                    || {},
+                )
+                .expect_err("a captured replacement must not inherit admitted authority");
+                assert_eq!(refusal.kind(), std::io::ErrorKind::InvalidInput);
+                let foreign_current = if restore_after_capture {
+                    &foreign
+                } else {
+                    &active
+                };
+                assert_foreign_breaker_parent_untouched(foreign_current, lock_mode);
+                let admitted_current = if restore_after_capture {
+                    &active
+                } else {
+                    &displaced
+                };
+                assert_eq!(std::fs::read_dir(admitted_current).unwrap().count(), 1);
+                assert_eq!(
+                    std::fs::read(admitted_current.join("storage.sqlite3")).unwrap(),
+                    b"admitted primary"
+                );
+                if !restore_after_capture {
+                    std::fs::rename(&active, &foreign).unwrap();
+                    std::fs::rename(&displaced, &active).unwrap();
+                }
+                let owner = try_acquire_file_lock_in_parent(&primary, &expected_parent).unwrap();
+                owner.revalidate().unwrap();
+                assert_eq!(
+                    try_acquire_file_lock_in_parent(&primary, &expected_parent)
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                drop(owner);
+                try_acquire_file_lock_in_parent(&primary, &expected_parent).unwrap();
+                assert_foreign_breaker_parent_untouched(&foreign, lock_mode);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn breaker_parent_binding_keeps_late_control_opens_in_admitted_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for lock_mode in [None, Some(0o666), Some(0o400)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let active = root.join("active");
+            let displaced = root.join("admitted-parent");
+            let foreign = root.join("foreign-parent");
+            std::fs::create_dir(&active).unwrap();
+            std::fs::create_dir(&foreign).unwrap();
+            let primary = active.join("storage.sqlite3");
+            std::fs::write(&primary, b"admitted primary").unwrap();
+            let foreign_primary = foreign.join("storage.sqlite3");
+            std::fs::write(&foreign_primary, b"foreign primary").unwrap();
+            if let Some(mode) = lock_mode {
+                let admitted_lock = breaker_lock_path(&primary);
+                std::fs::write(&admitted_lock, b"admitted lock evidence").unwrap();
+                std::fs::set_permissions(&admitted_lock, std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+                let foreign_lock = breaker_lock_path(&foreign_primary);
+                std::fs::write(&foreign_lock, b"foreign lock evidence").unwrap();
+                std::fs::set_permissions(&foreign_lock, std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+            }
+            let expected_parent = open_breaker_directory(&active).unwrap();
+            let refusal = acquire_breaker_file_lock_in_parent(
+                breaker_lock_path(&primary),
+                &expected_parent,
+                || {},
+                || {
+                    std::fs::rename(&active, &displaced).unwrap();
+                    std::fs::rename(&foreign, &active).unwrap();
+                },
+            )
+            .expect_err("a displaced pathname cannot retain recovery admission");
+            assert_eq!(refusal.kind(), std::io::ErrorKind::InvalidInput);
+            assert_foreign_breaker_parent_untouched(&active, lock_mode);
+            let admitted_lock = breaker_lock_path(&displaced.join("storage.sqlite3"));
+            assert_eq!(
+                std::fs::symlink_metadata(&admitted_lock)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "creation and normalization must use the admitted directory handle"
+            );
+            if lock_mode.is_some() {
+                assert_eq!(
+                    std::fs::read(&admitted_lock).unwrap(),
+                    b"admitted lock evidence"
+                );
+            }
+            assert_eq!(
+                std::fs::read(displaced.join("storage.sqlite3")).unwrap(),
+                b"admitted primary"
+            );
+            std::fs::rename(&active, &foreign).unwrap();
+            std::fs::rename(&displaced, &active).unwrap();
+            let owner = try_acquire_file_lock_in_parent(&primary, &expected_parent).unwrap();
+            owner.revalidate().unwrap();
+            assert_foreign_breaker_parent_untouched(&foreign, lock_mode);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn breaker_parent_binding_preserves_alias_and_no_follow_defenses() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let parent_path = root.join("mailbox");
+        std::fs::create_dir(&parent_path).unwrap();
+        let primary = parent_path.join("storage.sqlite3");
+        let parent = open_breaker_directory(&parent_path).unwrap();
+        let lock = breaker_lock_path(&primary);
+        let sentinel = root.join("sentinel");
+        std::fs::write(&sentinel, b"unrelated evidence").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::hard_link(&sentinel, &lock).unwrap();
+        assert!(try_acquire_file_lock_in_parent(&primary, &parent).is_err());
+        std::fs::rename(&lock, root.join("hard-linked-lock")).unwrap();
+        symlink(&sentinel, &lock).unwrap();
+        assert!(try_acquire_file_lock_in_parent(&primary, &parent).is_err());
+        std::fs::rename(&lock, root.join("symlink-lock")).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(try_acquire_file_lock_in_parent(&primary, &parent).is_err());
+        std::fs::rename(&lock, root.join("directory-lock")).unwrap();
+        let alias = root.join("mailbox-alias");
+        symlink(&parent_path, &alias).unwrap();
+        assert!(try_acquire_file_lock_in_parent(&alias.join("storage.sqlite3"), &parent).is_err());
+        let ordinary_file = std::fs::File::open(&sentinel).unwrap();
+        assert!(try_acquire_file_lock_in_parent(&primary, &ordinary_file).is_err());
+        assert!(!lock.exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated evidence");
+        assert_eq!(
+            std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        let owner = try_acquire_file_lock_in_parent(&primary, &parent).unwrap();
+        owner.revalidate().unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(owner.revalidate().is_err());
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        owner.revalidate().unwrap();
     }
 
     #[cfg(unix)]
