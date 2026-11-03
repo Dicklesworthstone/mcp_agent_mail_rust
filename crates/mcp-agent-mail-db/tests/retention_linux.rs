@@ -126,6 +126,19 @@ fn rerun_unprivileged_if_root(test: &str) -> bool {
     if fs::metadata("/proc/self").unwrap().uid() != 0 {
         return false;
     }
+    // A sandbox can map the caller to UID 0 while dropping every capability.
+    // Such a caller cannot setuid, bypass directory permissions, or inspect a
+    // nondumpable peer. Exercise the actual restrictions in that environment
+    // instead of failing before a test starts while trying to change UIDs.
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let capabilities = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(|value| u64::from_str_radix(value.trim(), 16).unwrap())
+        .expect("Linux status must include effective capabilities");
+    if capabilities == 0 {
+        return false;
+    }
     let mut process = spawn_test(test, |command| {
         command.uid(65_534).gid(65_534).env("TMPDIR", "/tmp");
     });
@@ -220,6 +233,7 @@ impl Mailbox {
 
 const READER: &str = r"
 import ctypes
+import hashlib
 import json
 import mmap
 import os
@@ -240,7 +254,10 @@ def hold_reader():
     handle = None
     mapping = None
     identity = None
+    expected = None
     if mode != 'idle':
+        with open(source, 'rb') as original:
+            expected = hashlib.sha256(original.read()).digest()
         flags = os.O_PATH if mode == 'opath' else os.O_RDONLY
         handle = os.open(source, flags | os.O_CLOEXEC)
         identity = os.fstat(handle)
@@ -284,10 +301,19 @@ def hold_reader():
     os.replace(ready + '.tmp', ready)
     assert sys.stdin.readline().strip() == 'release'
     if mapping is not None:
-        assert mapping[:16] == b'SQLite format 3\x00'
+        assert hashlib.sha256(mapping[:]).digest() == expected
         mapping.close()
     elif handle is not None:
         assert os.fstat(handle).st_ino == identity.st_ino
+        if mode == 'opath':
+            # An O_PATH holder can reopen its retained inode after unlink. The
+            # regression must check the actual bytes, not merely fstat success.
+            readable = os.open('/proc/thread-self/fd/' + str(handle), os.O_RDONLY)
+        else:
+            readable = handle
+        assert hashlib.sha256(os.pread(readable, identity.st_size, 0)).digest() == expected
+        if readable != handle:
+            os.close(readable)
         os.close(handle)
 
 def worker_main():
@@ -333,6 +359,33 @@ fn reader(
     let record: serde_json::Value = serde_json::from_slice(&fs::read(ready).unwrap()).unwrap();
     let proc = PathBuf::from(format!("/proc/{}", record["proc_pid"].as_u64().unwrap()));
     (process, proc)
+}
+
+fn assert_real_procfs_denial(proc: &Path) {
+    match fs::read_dir(proc.join("fd")) {
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
+        Ok(mut descriptors) => {
+            // A zero-capability UID-0 observer still owns the kernel's
+            // root-owned fd directory, but ptrace access to its entries is
+            // denied. Nonroot observers hit the reported directory denial.
+            assert_eq!(fs::metadata("/proc/self").unwrap().uid(), 0);
+            assert!(descriptors.any(|descriptor| {
+                fs::metadata(descriptor.unwrap().path())
+                    .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+            }));
+        }
+    }
+    assert_eq!(
+        fs::read(proc.join("maps")).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let status = fs::read_to_string(proc.join("status")).unwrap();
+    let own_status = fs::read_to_string("/proc/self/status").unwrap();
+    assert_eq!(
+        status.lines().find(|line| line.starts_with("Uid:")),
+        own_status.lines().find(|line| line.starts_with("Uid:"))
+    );
+    assert_eq!(fs::metadata(proc.join("fd")).unwrap().uid(), 0);
 }
 
 #[test]
@@ -398,9 +451,9 @@ fn external_descriptors_and_mappings_preserve_backups_until_reader_exit() {
 }
 
 #[test]
-fn nondumpable_process_names_never_authorize_deletion() {
+fn nondumpable_readers_keep_exact_bytes_after_admitted_unlink() {
     let _serial = reader_fixture_guard();
-    if rerun_unprivileged_if_root("nondumpable_process_names_never_authorize_deletion") {
+    if rerun_unprivileged_if_root("nondumpable_readers_keep_exact_bytes_after_admitted_unlink") {
         return;
     }
     for name in [
@@ -416,46 +469,113 @@ fn nondumpable_process_names_never_authorize_deletion() {
             let generation = mailbox.generation(1);
             let (process, proc) = reader(&mailbox.root, &generation, mode, true, name, false);
             // Real nondumpability, not a synthetic PermissionDenied error.
-            assert_eq!(
-                fs::read_dir(proc.join("fd")).unwrap_err().kind(),
-                io::ErrorKind::PermissionDenied
-            );
-            assert_eq!(
-                fs::read(proc.join("maps")).unwrap_err().kind(),
-                io::ErrorKind::PermissionDenied
-            );
-            let status = fs::read_to_string(proc.join("status")).unwrap();
-            let own_status = fs::read_to_string("/proc/self/status").unwrap();
-            assert_eq!(
-                status.lines().find(|line| line.starts_with("Uid:")),
-                own_status.lines().find(|line| line.starts_with("Uid:"))
-            );
-            assert_eq!(fs::metadata(proc.join("fd")).unwrap().uid(), 0);
+            assert_real_procfs_denial(&proc);
             let inventoried = fs::metadata(&generation).unwrap();
             let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
             let result =
                 guard.delete_superseded_generation(&mailbox.primary, &generation, &inventoried);
-            // Even an unrelated opaque process is not proof of no reader:
-            // the same credentials and mutable comm name admit all four cases.
-            assert_success(&process.release());
-            let Err(error) = result else {
-                panic!("opaque {name}/{mode} authorized deletion");
-            };
-            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
-            assert!(
-                error
-                    .to_string()
-                    .starts_with(&format!("{}/", proc.display()))
-            );
-            assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
-            assert_eq!(fs::read(&generation).unwrap(), mailbox.bytes);
-            guard
-                .delete_superseded_generation(&mailbox.primary, &generation, &inventoried)
-                .unwrap();
+            // No process name grants an exemption. The fully verified,
+            // superseded regular file may lose its name under snapshot
+            // authority, while every hidden reader must retain the exact bytes.
+            let removed = result.unwrap_or_else(|error| panic!("{name}/{mode}: {error}"));
+            assert_eq!(removed.logical_bytes, inventoried.len());
+            assert!(removed.reader_inventory_incomplete);
+            assert_eq!(removed.allocated_bytes, None);
             assert!(!generation.exists());
+            // The live child hashes its descriptor, descriptorless mapping, or
+            // reopened O_PATH inode only after the unlink has completed.
+            assert_success(&process.release());
             drop(guard);
             mailbox.assert_recovery_unchanged();
         }
+    }
+}
+
+#[test]
+fn inaccessible_same_user_process_does_not_block_eight_backups() {
+    let _serial = reader_fixture_guard();
+    if rerun_unprivileged_if_root("inaccessible_same_user_process_does_not_block_eight_backups") {
+        return;
+    }
+    let mailbox = Mailbox::new();
+    let generations: Vec<_> = (1..=8).map(|day| mailbox.generation(day)).collect();
+    let (process, proc) = reader(
+        &mailbox.root,
+        &mailbox.primary,
+        "idle",
+        true,
+        "ssh-agent",
+        false,
+    );
+    assert_real_procfs_denial(&proc);
+    let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
+    for generation in &generations {
+        let inventoried = fs::metadata(generation).unwrap();
+        let removed = guard
+            .delete_superseded_generation(&mailbox.primary, generation, &inventoried)
+            .unwrap();
+        assert_eq!(removed.logical_bytes, inventoried.len());
+        assert!(removed.reader_inventory_incomplete);
+        assert_eq!(removed.allocated_bytes, None);
+        assert!(!generation.exists());
+    }
+    assert_success(&process.release());
+    drop(guard);
+    mailbox.assert_recovery_unchanged();
+}
+
+#[test]
+fn visible_reader_still_refuses_deletion_amid_inaccessible_processes() {
+    let _serial = reader_fixture_guard();
+    if rerun_unprivileged_if_root(
+        "visible_reader_still_refuses_deletion_amid_inaccessible_processes",
+    ) {
+        return;
+    }
+    for mode in ["fd", "opath", "mmap"] {
+        let mailbox = Mailbox::new();
+        let generation = mailbox.generation(1);
+        let opaque_root = mailbox.root.join("opaque");
+        let visible_root = mailbox.root.join("visible");
+        fs::create_dir(&opaque_root).unwrap();
+        fs::create_dir(&visible_root).unwrap();
+        // Start the opaque process first so its smaller PID normally precedes
+        // the reader. The scan must continue after an inaccessible inventory.
+        let (opaque, proc) = reader(
+            &opaque_root,
+            &mailbox.primary,
+            "idle",
+            true,
+            "ssh-agent",
+            false,
+        );
+        assert_real_procfs_denial(&proc);
+        let (visible, _) = reader(
+            &visible_root,
+            &generation,
+            mode,
+            false,
+            "retention-read",
+            false,
+        );
+        let inventoried = fs::metadata(&generation).unwrap();
+        let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
+        let error = guard
+            .delete_superseded_generation(&mailbox.primary, &generation, &inventoried)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{mode}: {error}");
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        assert_eq!(fs::read(&generation).unwrap(), mailbox.bytes);
+        assert_success(&visible.release());
+        let removed = guard
+            .delete_superseded_generation(&mailbox.primary, &generation, &inventoried)
+            .unwrap();
+        assert!(removed.reader_inventory_incomplete);
+        assert_eq!(removed.allocated_bytes, None);
+        assert!(!generation.exists());
+        assert_success(&opaque.release());
+        drop(guard);
+        mailbox.assert_recovery_unchanged();
     }
 }
 
@@ -496,10 +616,7 @@ fn exited_thread_group_leader_does_not_hide_a_live_backup_reader() {
             let task = Path::new("/proc").join(readiness["task_path"].as_str().unwrap());
             assert!(task.starts_with(&proc));
             if opaque {
-                assert_eq!(
-                    fs::read_dir(task.join("fd")).unwrap_err().kind(),
-                    io::ErrorKind::PermissionDenied
-                );
+                assert_real_procfs_denial(&task);
             } else {
                 assert!(!fs::read(task.join("maps")).unwrap().is_empty());
             }
@@ -508,19 +625,20 @@ fn exited_thread_group_leader_does_not_hide_a_live_backup_reader() {
             let result =
                 guard.delete_superseded_generation(&mailbox.primary, &generation, &inventoried);
             assert_success(&process.release());
-            if mode == "dead-idle" && !opaque {
-                // A terminal leader's inaccessible descriptor directory is
-                // unrelated once its still-live, inspectable workers are clear.
-                assert_eq!(result.unwrap().logical_bytes, inventoried.len());
+            if mode == "dead-idle" || opaque {
+                // Inspectable idle workers are clear. Opaque workers retain
+                // their bytes after the admitted unlink, as the child checks.
+                let removed = result.unwrap();
+                assert_eq!(removed.logical_bytes, inventoried.len());
+                if opaque {
+                    assert!(removed.reader_inventory_incomplete);
+                    assert_eq!(removed.allocated_bytes, None);
+                }
             } else {
                 let error = result.expect_err("a dead leader does not release its worker's reader");
                 assert_eq!(
                     error.kind(),
-                    if opaque {
-                        io::ErrorKind::PermissionDenied
-                    } else {
-                        io::ErrorKind::WouldBlock
-                    },
+                    io::ErrorKind::WouldBlock,
                     "{mode}/{opaque}: {error}"
                 );
                 assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
@@ -620,6 +738,8 @@ fn concurrent_cleanup_and_process_restart_preserve_recovery_evidence() {
     let mailbox = Mailbox::new();
     let first = mailbox.generation(1);
     let second = mailbox.generation(2);
+    let (opaque_reader, proc) = reader(&mailbox.root, &first, "fd", true, "retention-read", false);
+    assert_real_procfs_denial(&proc);
     let partial = mailbox.root.join("storage.sqlite3.bak.20000103_000000");
     fs::write(&partial, INCOMPLETE).unwrap();
     let test = "concurrent_cleanup_and_process_restart_preserve_recovery_evidence";
@@ -638,6 +758,9 @@ fn concurrent_cleanup_and_process_restart_preserve_recovery_evidence() {
     assert_eq!(fs::read(&partial).unwrap(), INCOMPLETE);
     let killed = cleaner.kill();
     assert_eq!(killed.status.signal(), Some(9));
+    // Killing the cleanup process after unlink cannot revoke an opaque
+    // reader's existing descriptor. It still verifies all the original bytes.
+    assert_success(&opaque_reader.release());
 
     // A distinct process must rediscover durable metadata and acquire the
     // released kernel election after SIGKILL; no in-process cache survives.

@@ -124,6 +124,12 @@ impl SnapshotRetentionGuard {
     /// verified snapshot remains available under this same exclusive admission.
     /// The caller selects the retention window; this boundary enforces safety.
     ///
+    /// On Linux, a persistent denial of another process's procfs inventory is
+    /// recorded as uncertainty, not proof of reader absence. An owned snapshot
+    /// can still be unlinked after all checks below: existing descriptors and
+    /// mappings retain the old inode's bytes, while its pathname disappears.
+    /// Known readers and our own process's unobservable readers still refuse.
+    ///
     /// # Errors
     /// Refuses unresolved verification, unproven database lineage, a pinned or
     /// changed file, companion recovery state, newer generations, and unsafe
@@ -202,7 +208,18 @@ impl SnapshotRetentionGuard {
         if !crate::pool::sqlite_recovery_candidate_is_standalone(path) {
             return Err(invalid("generation has companion recovery state"));
         }
-        crate::recovery_retention::preflight_inventoried_file_readers(path, inventoried)?;
+        let reader_evidence = if incident_opted_in {
+            // Incident evidence retains the strict external-reader policy.
+            crate::recovery_retention::preflight_inventoried_file_readers(path, inventoried)?;
+            None
+        } else {
+            Some(
+                crate::recovery_retention::preflight_superseded_snapshot_readers(
+                    path,
+                    inventoried,
+                )?,
+            )
+        };
         // A dated spelling is not a completed, recoverable publication.
         // Truncated files, unrelated SQLite schemas, and corrupt snapshots
         // remain evidence even when a newer healthy restore point exists.
@@ -254,7 +271,14 @@ impl SnapshotRetentionGuard {
             ));
         }
         self.revalidate()?;
-        crate::recovery_retention::delete_inventoried_file(path, inventoried)
+        match reader_evidence {
+            Some(readers) => crate::recovery_retention::delete_superseded_snapshot_file(
+                path,
+                inventoried,
+                readers,
+            ),
+            None => crate::recovery_retention::delete_inventoried_file(path, inventoried),
+        }
     }
 
     /// Recheck ownership and metadata before another destructive operation.

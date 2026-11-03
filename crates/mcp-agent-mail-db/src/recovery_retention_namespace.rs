@@ -113,6 +113,18 @@ impl std::error::Error for CompletedReclaimMove {}
 pub struct ReclaimedFileBytes {
     pub logical_bytes: u64,
     pub allocated_bytes: Option<u64>,
+    /// A superseded snapshot was unlinked while another process's reader
+    /// inventory was inaccessible. Its open descriptors and mappings retain
+    /// their bytes, but its pathname is gone. Physical reclamation is unknown;
+    /// `allocated_bytes` is `None` in this case.
+    pub reader_inventory_incomplete: bool,
+}
+
+/// Evidence carried from the no-open preflight through verified snapshot
+/// admission. This is not a claim that an inaccessible process has no readers.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SnapshotReaderEvidence {
+    incomplete: bool,
 }
 
 /// An unlink completed, but its directory durability could not be confirmed.
@@ -486,6 +498,40 @@ where
     U: FnMut(&File, &OsStr) -> io::Result<()>,
     S: FnMut(&File) -> io::Result<()>,
 {
+    delete_inventoried_file_with_evidence(source, inventoried, None, &mut unlink, &mut sync)
+}
+
+/// Only snapshot authority may use this boundary, after verifying a newer
+/// recoverable image, lineage, standalone SQLite state, and unchanged pins.
+/// POSIX unlink leaves any unobservable reader's inode intact; it never
+/// truncates, overwrites, or reuses that reader's bytes.
+pub(crate) fn delete_superseded_snapshot_file(
+    source: &Path,
+    inventoried: &Metadata,
+    readers: SnapshotReaderEvidence,
+) -> io::Result<ReclaimedFileBytes> {
+    delete_inventoried_file_with_evidence(
+        source,
+        inventoried,
+        Some(readers),
+        |parent, name| {
+            rustix::fs::unlinkat(parent, name, AtFlags::empty()).map_err(io::Error::from)
+        },
+        File::sync_all,
+    )
+}
+
+fn delete_inventoried_file_with_evidence<U, S>(
+    source: &Path,
+    inventoried: &Metadata,
+    readers: Option<SnapshotReaderEvidence>,
+    mut unlink: U,
+    mut sync: S,
+) -> io::Result<ReclaimedFileBytes>
+where
+    U: FnMut(&File, &OsStr) -> io::Result<()>,
+    S: FnMut(&File) -> io::Result<()>,
+{
     let source = absolute_spelling(source)?;
     let parent_path = source
         .parent()
@@ -502,20 +548,37 @@ where
     )?);
     validate_delete_inventory(&file, inventoried)?;
     // Snapshot admission excludes cooperating readers throughout this call.
-    // Also refuse an ordinary observed reader or advisory file lock: unlinking
-    // an inode still held open would neither free its blocks nor preserve its
-    // pathname for a reader that needs to reopen it.
+    // Also refuse observed readers and advisory file locks. Only verified
+    // superseded snapshots may tolerate an unobservable external process;
+    // generic file/directory reclamation retains its strict same-owner policy.
     fs2::FileExt::try_lock_exclusive(&file)?;
-    ensure_no_other_file_readers(&source, &file)?;
+    let reader_inventory_incomplete = if let Some(preflight) = readers {
+        use std::os::fd::AsRawFd as _;
+
+        let final_scan =
+            inspect_snapshot_file_readers(&source, &file.metadata()?, Some(file.as_raw_fd()))?;
+        preflight.incomplete || final_scan.incomplete
+    } else {
+        ensure_no_other_file_readers(&source, &file)?;
+        false
+    };
     let expected = rustix::fs::fstat(&file)?;
     sync(&parent)?;
     validate_directory(parent_path, &parent)?;
     validate_source_entry(&parent, name, &expected)?;
     validate_delete_inventory(&file, inventoried)?;
+    #[cfg(target_os = "linux")]
+    if reader_inventory_incomplete {
+        let caller = read_process_status_summary(Path::new("/proc/thread-self"))?;
+        validate_opaque_snapshot_scope(&source, inventoried, caller.uids[3])?;
+    }
     let metadata = file.metadata()?;
     let bytes = ReclaimedFileBytes {
         logical_bytes: metadata.len(),
-        allocated_bytes: metadata.blocks().checked_mul(512),
+        allocated_bytes: (!reader_inventory_incomplete)
+            .then(|| metadata.blocks().checked_mul(512))
+            .flatten(),
+        reader_inventory_incomplete,
     };
     unlink(&parent, name)?;
     drop(file);
@@ -529,11 +592,41 @@ where
     Ok(bytes)
 }
 
-/// Check observable readers without opening the candidate at all. Closing a
-/// fresh descriptor could release a same-process SQLite reader's POSIX locks,
+/// Check observable readers without opening the candidate at all.
+///
+/// Closing a fresh descriptor could release a same-process SQLite reader's POSIX locks,
 /// so canonical verification must perform this preflight before its first open.
 pub fn preflight_inventoried_file_readers(source: &Path, inventoried: &Metadata) -> io::Result<()> {
     ensure_no_file_readers(source, inventoried, None)
+}
+
+/// No-open preflight for snapshot authority's verified periodic lane. Own
+/// process readers always refuse before canonical SQLite verification can
+/// open/close the inode and accidentally release that process's POSIX locks.
+pub(crate) fn preflight_superseded_snapshot_readers(
+    source: &Path,
+    inventoried: &Metadata,
+) -> io::Result<SnapshotReaderEvidence> {
+    inspect_snapshot_file_readers(source, inventoried, None)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_snapshot_file_readers(
+    source: &Path,
+    inventoried: &Metadata,
+    excluded_descriptor: Option<i32>,
+) -> io::Result<SnapshotReaderEvidence> {
+    inspect_file_readers(source, inventoried, excluded_descriptor, true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inspect_snapshot_file_readers(
+    source: &Path,
+    inventoried: &Metadata,
+    excluded_descriptor: Option<i32>,
+) -> io::Result<SnapshotReaderEvidence> {
+    ensure_no_file_readers(source, inventoried, excluded_descriptor)?;
+    Ok(SnapshotReaderEvidence::default())
 }
 
 fn ensure_no_other_file_readers(source: &Path, retained: &File) -> io::Result<()> {
@@ -543,13 +636,10 @@ fn ensure_no_other_file_readers(source: &Path, retained: &File) -> io::Result<()
 }
 
 /// External readers do not necessarily participate in snapshot admission.
-/// All same-owner processes must be observable; other users' readable handles
-/// are checked opportunistically. Linux normally denies inspection of root
-/// and other users' processes to an unprivileged mailbox owner, which must not
-/// permanently disable cleanup. This is not an atomic exclusion of external
-/// opens or invisible other-user readers. `SnapshotAuthority` supplies atomic
-/// exclusion for Agent Mail publishers and verified restore readers, while
-/// accounting reports unlinked allocation rather than a free-space delta.
+/// A strict scan requires same-owner processes to be observable. Snapshot
+/// authority has a separate, explicit unlink-only policy for verified,
+/// superseded regular files, recording denied inventories as uncertainty.
+/// Neither policy atomically excludes arbitrary external opens.
 #[cfg(target_os = "linux")]
 fn is_proc_task_gone(error: &io::Error) -> bool {
     // Linux procfs returns ENOENT when `/proc/<pid>` vanishes before open and
@@ -571,6 +661,40 @@ fn ensure_no_file_readers(
     retained_identity: &Metadata,
     excluded_descriptor: Option<i32>,
 ) -> io::Result<()> {
+    inspect_file_readers(source, retained_identity, excluded_descriptor, false).map(|_| ())
+}
+
+/// An actual, persistent procfs denial with readable kernel identity evidence
+/// from the same pinned task. Other PermissionDenied errors (including unreadable
+/// status/ownership) must never be downgraded to this classification.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct UnobservableReaderInventory(String);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for UnobservableReaderInventory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for UnobservableReaderInventory {}
+
+#[cfg(target_os = "linux")]
+fn is_unobservable_reader_inventory(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<UnobservableReaderInventory>)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_file_readers(
+    source: &Path,
+    retained_identity: &Metadata,
+    excluded_descriptor: Option<i32>,
+    superseded_snapshot: bool,
+) -> io::Result<SnapshotReaderEvidence> {
     const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
     let canonical_source = source.canonicalize()?;
     // `/proc` may be mounted from an ancestor PID namespace. getpid() then
@@ -581,7 +705,7 @@ fn ensure_no_file_readers(
         .to_str()
         .and_then(|pid| pid.parse::<u32>().ok())
         .ok_or_else(|| invalid("open-reader inventory cannot identify /proc/self"))?;
-    let self_status = read_process_status_summary(Path::new("/proc/self"))?;
+    let self_status = read_process_status_summary(Path::new("/proc/thread-self"))?;
     let mut remaining = MAX_READER_INVENTORY_ENTRIES;
     let mut charge = || -> io::Result<()> {
         remaining = remaining
@@ -589,6 +713,40 @@ fn ensure_no_file_readers(
             .ok_or_else(|| io::Error::other("open-reader inventory exceeded its bounded scan"))?;
         Ok(())
     };
+    // Never hide a same-process reader behind an unrelated opaque task. The
+    // current thread may have unshared its descriptor table from the leader.
+    let own_thread = Path::new("/proc").join(std::fs::read_link("/proc/thread-self")?);
+    inspect_process_reader_inventory(
+        &own_thread,
+        own_pid,
+        &self_status,
+        retained_identity,
+        &canonical_source,
+        excluded_descriptor,
+        &mut charge,
+    )?;
+    // Before any candidate open, inspect every own task's table, not merely
+    // the leader's. No descriptor is excluded during this preflight.
+    if excluded_descriptor.is_none() {
+        for task in std::fs::read_dir(Path::new("/proc").join(&own_process).join("task"))? {
+            charge()?;
+            let task = match task {
+                Ok(task) => task,
+                Err(error) if is_proc_task_gone(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            inspect_process_reader_inventory(
+                &task.path(),
+                own_pid,
+                &self_status,
+                retained_identity,
+                &canonical_source,
+                None,
+                &mut charge,
+            )?;
+        }
+    }
+    let mut evidence = SnapshotReaderEvidence::default();
     for entry in std::fs::read_dir("/proc")? {
         charge()?;
         let entry = match entry {
@@ -603,7 +761,7 @@ fn ensure_no_file_readers(
         else {
             continue;
         };
-        inspect_process_reader_inventory(
+        let result = inspect_process_reader_inventory(
             &entry.path(),
             pid,
             &self_status,
@@ -611,7 +769,60 @@ fn ensure_no_file_readers(
             &canonical_source,
             (pid == own_pid).then_some(excluded_descriptor).flatten(),
             &mut charge,
-        )?;
+        );
+        match result {
+            Err(error)
+                if superseded_snapshot
+                    && pid != own_pid
+                    && is_unobservable_reader_inventory(&error) =>
+            {
+                // Do not stop here: a later, readable process may be a known
+                // reader. Bounds, malformed status and all other IO failures
+                // remain refusals. This is uncertainty, never reader absence.
+                evidence.incomplete = true;
+            }
+            result => result?,
+        }
+    }
+    if evidence.incomplete {
+        validate_opaque_snapshot_scope(source, retained_identity, self_status.uids[3])?;
+    }
+    Ok(evidence)
+}
+
+/// Limit the uncertain-reader policy to owned, non-shared, single-link files
+/// in an owned directory that other users cannot modify. Snapshot authority
+/// separately establishes provenance and recoverability before any unlink.
+#[cfg(target_os = "linux")]
+fn validate_opaque_snapshot_scope(
+    source: &Path,
+    inventoried: &Metadata,
+    filesystem_uid: u32,
+) -> io::Result<()> {
+    let source = absolute_spelling(source)?;
+    let current = std::fs::symlink_metadata(&source)?;
+    let parent = open_directory(
+        source
+            .parent()
+            .ok_or_else(|| invalid("backup has no parent"))?,
+        false,
+    )?;
+    let parent = parent.metadata()?;
+    if !current.is_file()
+        || !inventoried.is_file()
+        || current.nlink() != 1
+        || inventoried.nlink() != 1
+        || current.dev() != inventoried.dev()
+        || current.ino() != inventoried.ino()
+        || current.uid() != filesystem_uid
+        || inventoried.uid() != filesystem_uid
+        || current.mode() & 0o022 != 0
+        || parent.uid() != filesystem_uid
+        || parent.mode() & 0o022 != 0
+    {
+        return Err(invalid(
+            "unobservable readers require an owned, non-shared, single-link snapshot namespace",
+        ));
     }
     Ok(())
 }
@@ -644,6 +855,27 @@ fn inspect_process_reader_inventory(
     excluded_descriptor: Option<i32>,
     mut charge: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
+    inspect_pinned_process_reader_inventory(
+        process,
+        process_id,
+        self_status,
+        retained_identity,
+        canonical_source,
+        excluded_descriptor,
+        &mut charge,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_pinned_process_reader_inventory(
+    process: &Path,
+    process_id: u32,
+    self_status: &ProcessStatusSummary,
+    retained_identity: &Metadata,
+    canonical_source: &Path,
+    excluded_descriptor: Option<i32>,
+    mut charge: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     // A proc directory descriptor stays bound to the original task after
@@ -662,39 +894,87 @@ fn inspect_process_reader_inventory(
     let anchored = PathBuf::from(format!("/proc/thread-self/fd/{}", directory.as_raw_fd()));
     let result = retry_process_reader_scan(
         || {
-            inspect_process_file_readers_once(
-                &anchored,
-                process_id,
-                self_status,
-                retained_identity,
-                canonical_source,
-                excluded_descriptor,
-                &mut charge,
+            let mut unobservable = None;
+            record_reader_inventory_result(
+                inspect_process_file_readers_once(
+                    &anchored,
+                    process_id,
+                    self_status,
+                    retained_identity,
+                    canonical_source,
+                    excluded_descriptor,
+                    &mut charge,
+                ),
+                &mut unobservable,
             )?;
             // An exited leader can have empty fd/maps files while its workers
             // still retain the backup. Both scans use the same pinned task.
-            inspect_surviving_thread_readers(
-                &anchored,
-                process_id,
-                self_status,
-                retained_identity,
-                canonical_source,
-                &mut charge,
-            )
+            record_reader_inventory_result(
+                inspect_surviving_thread_readers(
+                    &anchored,
+                    process_id,
+                    self_status,
+                    retained_identity,
+                    canonical_source,
+                    &mut charge,
+                ),
+                &mut unobservable,
+            )?;
+            unobservable.map_or(Ok(()), Err)
         },
         || std::thread::sleep(std::time::Duration::from_millis(5)),
     );
     // Keep operator diagnostics in /proc/<pid> terms, not this short-lived
     // internal descriptor spelling. This translation never decides admission.
     result.map_err(|error| {
+        let unobservable = is_unobservable_reader_inventory(&error);
         let detail = error.to_string();
         let prefix = format!("{}/", anchored.display());
         if let Some(entry) = detail.strip_prefix(&prefix) {
-            io::Error::new(error.kind(), format!("{}/{entry}", process.display()))
+            let detail = format!("{}/{entry}", process.display());
+            if unobservable {
+                io::Error::new(error.kind(), UnobservableReaderInventory(detail))
+            } else {
+                io::Error::new(error.kind(), detail)
+            }
         } else {
             error
         }
     })
+}
+
+/// Classify only the task whose fd/maps operation was denied. A denial while
+/// reading that task's identity is a hard error, not opaque-reader evidence.
+#[cfg(target_os = "linux")]
+fn unobservable_reader_inventory(
+    process: &Path,
+    entry: &Path,
+    error: &io::Error,
+) -> io::Result<()> {
+    match read_process_status_summary(process) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            UnobservableReaderInventory(proc_entry_error(entry, error).to_string()),
+        )),
+        Err(gone) if is_proc_task_gone(&gone) => Ok(()),
+        Err(status) => Err(proc_entry_error(&process.join("status"), &status)),
+    }
+}
+
+/// Keep uncertainty while finishing the other observable inventory lanes.
+/// A known reader, exhausted bound, or hard IO error always takes precedence.
+#[cfg(target_os = "linux")]
+fn record_reader_inventory_result(
+    result: io::Result<()>,
+    unobservable: &mut Option<io::Error>,
+) -> io::Result<()> {
+    match result {
+        Err(error) if is_unobservable_reader_inventory(&error) => {
+            unobservable.get_or_insert(error);
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -707,8 +987,9 @@ fn inspect_process_file_readers_once(
     excluded_descriptor: Option<i32>,
     mut charge: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
+    let mut unobservable = None;
     let descriptors = match std::fs::read_dir(process.join("fd")) {
-        Ok(descriptors) => descriptors,
+        Ok(descriptors) => Some(descriptors),
         Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
@@ -718,15 +999,29 @@ fn inspect_process_file_readers_once(
                     retained_identity.uid(),
                 )? =>
         {
-            return Ok(());
+            None
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            record_reader_inventory_result(
+                unobservable_reader_inventory(process, &process.join("fd"), &error),
+                &mut unobservable,
+            )?;
+            None
         }
         Err(error) => return Err(proc_entry_error(&process.join("fd"), &error)),
     };
-    for descriptor in descriptors {
+    for descriptor in descriptors.into_iter().flatten() {
         charge()?;
         let descriptor = match descriptor {
             Ok(descriptor) => descriptor,
             Err(error) if is_proc_task_gone(&error) => continue,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                record_reader_inventory_result(
+                    unobservable_reader_inventory(process, &process.join("fd"), &error),
+                    &mut unobservable,
+                )?;
+                continue;
+            }
             Err(error) => return Err(proc_entry_error(&process.join("fd"), &error)),
         };
         if excluded_descriptor.is_some_and(|excluded| {
@@ -749,6 +1044,13 @@ fn inspect_process_file_readers_once(
                         retained_identity.uid(),
                     )? =>
             {
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                record_reader_inventory_result(
+                    unobservable_reader_inventory(process, &descriptor.path(), &error),
+                    &mut unobservable,
+                )?;
                 continue;
             }
             Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
@@ -774,6 +1076,13 @@ fn inspect_process_file_readers_once(
                 {
                     continue;
                 }
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    record_reader_inventory_result(
+                        unobservable_reader_inventory(process, &descriptor.path(), &error),
+                        &mut unobservable,
+                    )?;
+                    continue;
+                }
                 Err(error) => return Err(proc_entry_error(&descriptor.path(), &error)),
             }
         };
@@ -785,15 +1094,18 @@ fn inspect_process_file_readers_once(
         }
     }
     if retained_identity.file_type().is_file() {
-        ensure_no_mapped_file_readers(
-            process,
-            process_id,
-            self_status,
-            retained_identity,
-            &mut charge,
+        record_reader_inventory_result(
+            ensure_no_mapped_file_readers(
+                process,
+                process_id,
+                self_status,
+                retained_identity,
+                &mut charge,
+            ),
+            &mut unobservable,
         )?;
     }
-    Ok(())
+    unobservable.map_or(Ok(()), Err)
 }
 
 #[cfg(target_os = "linux")]
@@ -819,6 +1131,7 @@ fn inspect_surviving_thread_readers(
         Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error) => return Err(proc_entry_error(&tasks_path, &error)),
     };
+    let mut unobservable = None;
     for task in tasks {
         charge()?;
         let task = match task {
@@ -839,17 +1152,20 @@ fn inspect_surviving_thread_readers(
         // Do not exclude the caller's descriptor number in another task's
         // table: Linux threads can unshare their descriptors. An ambiguous
         // self-reader is a refusal, never authority to ignore a real reader.
-        inspect_process_file_readers_once(
-            &task.path(),
-            task_id,
-            self_status,
-            retained_identity,
-            canonical_source,
-            None,
-            &mut charge,
+        record_reader_inventory_result(
+            inspect_pinned_process_reader_inventory(
+                &task.path(),
+                task_id,
+                self_status,
+                retained_identity,
+                canonical_source,
+                None,
+                &mut charge,
+            ),
+            &mut unobservable,
         )?;
     }
-    Ok(())
+    unobservable.map_or(Ok(()), Err)
 }
 
 /// Mappings retain an inode after the process closes its last descriptor.
@@ -879,6 +1195,9 @@ fn ensure_no_mapped_file_readers(
         {
             return Ok(());
         }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return unobservable_reader_inventory(process, &process.join("maps"), &error);
+        }
         Err(error) => return Err(proc_entry_error(&process.join("maps"), &error)),
     };
     let mut maps = Vec::with_capacity(64 * 1024);
@@ -897,6 +1216,9 @@ fn ensure_no_mapped_file_readers(
                 )? =>
         {
             return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return unobservable_reader_inventory(process, &process.join("maps"), &error);
         }
         Err(error) => return Err(proc_entry_error(&process.join("maps"), &error)),
     }
@@ -2882,5 +3204,591 @@ mapping.close()
         let mut shrunk = stat("artifact");
         shrunk.st_size -= 1;
         validate_source_entry(&parent, OsStr::new("artifact"), &shrunk).unwrap_err();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn superseded_run_unprivileged(test: &str) -> bool {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        if read_process_status_summary(Path::new("/proc/thread-self"))
+            .unwrap()
+            .uids[1]
+            != 0
+        {
+            return false;
+        }
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let capabilities = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+            .unwrap();
+        if capabilities & ((1 << 6) | (1 << 7)) != ((1 << 6) | (1 << 7)) {
+            // Container UID 0 can have no SETUID/SETGID or DAC capabilities.
+            // Such an observer already experiences real permission denials.
+            return false;
+        }
+        // Resolve the already-running ELF before changing credentials. Its
+        // build directory may have ancestors that are private to root.
+        let executable = File::open("/proc/self/exe").unwrap();
+        let module = module_path!().split_once("::").unwrap().1;
+        let output =
+            std::process::Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
+                .args([
+                    "--exact",
+                    &format!("{module}::{test}"),
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .uid(65_534)
+                .gid(65_534)
+                .env("TMPDIR", "/tmp")
+                .output()
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "unprivileged fixture failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn superseded_process_status(owner: u32) -> String {
+        format!(
+            "State:\tS (sleeping)\nFDSize:\t64\nThreads:\t1\nVmSize:\t4096 kB\nUid:\t{owner}\t{owner}\t{owner}\t{owner}\n"
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn superseded_opacity_requires_readable_identity_for_the_denied_task() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if superseded_run_unprivileged(
+            "superseded_opacity_requires_readable_identity_for_the_denied_task",
+        ) {
+            return;
+        }
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"retained task-identity evidence").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let process = root.join("4242");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::write(process.join("maps"), b"").unwrap();
+        let status = superseded_process_status(identity.uid());
+        std::fs::write(process.join("status"), &status).unwrap();
+        std::fs::set_permissions(process.join("fd"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(process.join("fd")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "the denial must come from the filesystem, not an injected error"
+        );
+        let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+        let inspect = || {
+            inspect_process_reader_inventory(
+                &process,
+                4242,
+                &caller,
+                &identity,
+                &source,
+                None,
+                || Ok(()),
+            )
+            .unwrap_err()
+        };
+        let denied = inspect();
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            denied
+                .get_ref()
+                .unwrap()
+                .is::<UnobservableReaderInventory>()
+        );
+        assert!(
+            denied
+                .to_string()
+                .starts_with(&format!("{}/fd:", process.display()))
+        );
+
+        std::fs::write(
+            process.join("status"),
+            b"State:\tS\nFDSize:\t64\nThreads:\t1\n",
+        )
+        .unwrap();
+        let malformed = inspect();
+        assert_eq!(malformed.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !malformed
+                .get_ref()
+                .unwrap()
+                .is::<UnobservableReaderInventory>()
+        );
+
+        std::fs::write(process.join("status"), &status).unwrap();
+        std::fs::set_permissions(
+            process.join("status"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let unreadable = inspect();
+        std::fs::set_permissions(
+            process.join("status"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_eq!(unreadable.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            !unreadable
+                .get_ref()
+                .unwrap()
+                .is::<UnobservableReaderInventory>()
+        );
+        assert!(unreadable.to_string().contains("/status:"));
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"retained task-identity evidence"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn superseded_denied_inventory_pins_reused_process_and_task_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if superseded_run_unprivileged(
+            "superseded_denied_inventory_pins_reused_process_and_task_paths",
+        ) {
+            return;
+        }
+        for spelling in ["4242", "4242/task/4243"] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(&source, b"retained PID-reuse evidence").unwrap();
+            let identity = std::fs::metadata(&source).unwrap();
+            let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+            let process = root.join(spelling);
+            let original = root.join("original-task");
+            let make_process = |path: &Path, owner| {
+                std::fs::create_dir_all(path.join("fd")).unwrap();
+                std::fs::create_dir(path.join("fdinfo")).unwrap();
+                std::fs::write(path.join("maps"), b"").unwrap();
+                std::fs::write(path.join("status"), superseded_process_status(owner)).unwrap();
+            };
+            make_process(&process, identity.uid());
+            std::os::unix::fs::symlink(root.join("unrelated-file"), process.join("fd/7")).unwrap();
+            std::fs::write(process.join("fdinfo/7"), b"ino:\t0\n").unwrap();
+            std::fs::set_permissions(
+                process.join("fdinfo/7"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            let mut replaced = false;
+            let error = inspect_process_reader_inventory(
+                &process,
+                4243,
+                &caller,
+                &identity,
+                &source,
+                None,
+                || {
+                    if !replaced {
+                        std::fs::rename(&process, &original)?;
+                        // A reused numeric pathname looks unrelated. Both
+                        // attempts and the denied task's identity must stay
+                        // anchored to the original process directory.
+                        make_process(&process, 12_345);
+                        replaced = true;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(replaced);
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.get_ref().unwrap().is::<UnobservableReaderInventory>());
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("{}/fd/7:", process.display()))
+            );
+            assert!(!error.to_string().contains("/proc/thread-self/fd/"));
+            inspect_process_reader_inventory(
+                &process,
+                4243,
+                &caller,
+                &identity,
+                &source,
+                None,
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(source).unwrap(),
+                b"retained PID-reuse evidence"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn superseded_denied_descriptors_do_not_hide_readable_mappings() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if superseded_run_unprivileged(
+            "superseded_denied_descriptors_do_not_hide_readable_mappings",
+        ) {
+            return;
+        }
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"visible mapping after denied descriptors").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let process = root.join("4242");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::set_permissions(process.join("fd"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        std::fs::write(
+            process.join("status"),
+            superseded_process_status(identity.uid()),
+        )
+        .unwrap();
+        std::fs::write(
+            process.join("maps"),
+            format!(
+                "1000-2000 r--p 00000000 {:02x}:{:02x} {} /removed-alias (deleted)\n",
+                nix::sys::stat::major(identity.dev()),
+                nix::sys::stat::minor(identity.dev()),
+                identity.ino(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_dir(process.join("fd")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+        let error = inspect_process_reader_inventory(
+            &process,
+            4242,
+            &caller,
+            &identity,
+            &source,
+            None,
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active memory mapping"));
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"visible mapping after denied descriptors"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn superseded_denied_descriptor_does_not_hide_a_later_visible_reader() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if superseded_run_unprivileged(
+            "superseded_denied_descriptor_does_not_hide_a_later_visible_reader",
+        ) {
+            return;
+        }
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"visible reader after denied descriptor").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let process = root.join("4242");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir(process.join("fdinfo")).unwrap();
+        std::fs::write(
+            process.join("status"),
+            superseded_process_status(identity.uid()),
+        )
+        .unwrap();
+        std::fs::write(process.join("maps"), b"").unwrap();
+        for name in ["7", "8"] {
+            std::os::unix::fs::symlink(root.join("unrelated-file"), process.join("fd").join(name))
+                .unwrap();
+            std::fs::write(process.join("fdinfo").join(name), b"ino:\t0\n").unwrap();
+            std::fs::set_permissions(
+                process.join("fdinfo").join(name),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&source, root.join(format!("visible-{name}"))).unwrap();
+        }
+        let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+        let mut charged = 0;
+        // Exercise a single attempt so a later retry cannot mask stopping at
+        // the first denial. On its second entry, whichever order readdir uses,
+        // the inventory encounters a genuine visible candidate reference.
+        let error = inspect_process_file_readers_once(
+            &process,
+            4242,
+            &caller,
+            &identity,
+            &source,
+            None,
+            || {
+                charged += 1;
+                if charged == 2 {
+                    for name in ["7", "8"] {
+                        std::fs::rename(
+                            root.join(format!("visible-{name}")),
+                            process.join("fd").join(name),
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(charged, 2);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active file reader"));
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"visible reader after denied descriptor"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn superseded_opaque_scope_rejects_shared_replaced_and_aliased_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"owned generation").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        validate_opaque_snapshot_scope(&source, &identity, identity.uid()).unwrap();
+        assert!(
+            validate_opaque_snapshot_scope(&source, &identity, identity.uid().wrapping_add(1))
+                .is_err()
+        );
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o622)).unwrap();
+        assert!(validate_opaque_snapshot_scope(&source, &identity, identity.uid()).is_err());
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        validate_opaque_snapshot_scope(&source, &identity, identity.uid()).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let shared_parent = validate_opaque_snapshot_scope(&source, &identity, identity.uid());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(shared_parent.is_err());
+        let symbolic = root.join("symbolic");
+        std::os::unix::fs::symlink(&source, &symbolic).unwrap();
+        assert!(validate_opaque_snapshot_scope(&symbolic, &identity, identity.uid()).is_err());
+        std::fs::hard_link(&source, root.join("hard-alias")).unwrap();
+        assert!(validate_opaque_snapshot_scope(&source, &identity, identity.uid()).is_err());
+        std::fs::rename(&source, root.join("retained-original")).unwrap();
+        std::fs::write(&source, b"replacement data").unwrap();
+        assert!(validate_opaque_snapshot_scope(&source, &identity, identity.uid()).is_err());
+        assert_eq!(std::fs::read(source).unwrap(), b"replacement data");
+        assert_eq!(
+            std::fs::read(root.join("retained-original")).unwrap(),
+            b"owned generation"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn superseded_preflight_never_hides_our_own_open_reader() {
+        let _scan_guard = reader_scan_test_guard();
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"own-process reader").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let reader = File::open(&source).unwrap();
+        let error = preflight_superseded_snapshot_readers(&source, &identity).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active file reader"));
+        drop(reader);
+        let evidence = preflight_superseded_snapshot_readers(&source, &identity).unwrap();
+        let deleted = delete_superseded_snapshot_file(&source, &identity, evidence).unwrap();
+        assert_eq!(deleted.logical_bytes, identity.len());
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn superseded_unlink_preserves_opaque_reader_bytes_and_interrupted_accounting() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+
+        if superseded_run_unprivileged(
+            "superseded_unlink_preserves_opaque_reader_bytes_and_interrupted_accounting",
+        ) {
+            return;
+        }
+        let _scan_guard = reader_scan_test_guard();
+        struct Reader(std::process::Child);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // A real non-dumpable same-user process. Python mmap may duplicate its
+        // input fd, so close every matching descriptor to test mapping-only
+        // retention. Every held reference checks its bytes after actual unlink.
+        const READER: &str = r"
+import ctypes, mmap, os, sys
+source, mode = sys.argv[1:]
+expected = open(source, 'rb').read()
+handle = None
+mapping = None
+if mode != 'idle':
+    handle = os.open(source, os.O_PATH if mode == 'opath' else os.O_RDONLY)
+    identity = os.fstat(handle)
+    if mode == 'mmap':
+        mapping = mmap.mmap(handle, 0, access=mmap.ACCESS_READ)
+        for entry in os.listdir('/proc/thread-self/fd'):
+            descriptor = int(entry)
+            try:
+                observed = os.fstat(descriptor)
+            except OSError:
+                continue
+            if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
+                os.close(descriptor)
+        handle = None
+assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0
+print(os.readlink('/proc/self'), flush=True)
+assert sys.stdin.readline().strip() == 'release'
+if mapping is not None:
+    assert mapping[:] == expected
+    mapping.close()
+elif handle is not None:
+    if mode == 'opath':
+        readable = os.open('/proc/thread-self/fd/' + str(handle), os.O_RDONLY)
+    else:
+        readable = handle
+    assert os.pread(readable, len(expected), 0) == expected
+    if readable != handle:
+        os.close(readable)
+    os.close(handle)
+";
+        for mode in ["idle", "fd", "opath", "mmap"] {
+            for interrupted in [false, true] {
+                let root = fixture();
+                let source = root.join("generation");
+                std::fs::write(&source, b"opaque readers retain exact backup bytes").unwrap();
+                let identity = std::fs::metadata(&source).unwrap();
+                let mut reader = Reader(
+                    std::process::Command::new("python3")
+                        .args(["-u", "-c", READER])
+                        .arg(&source)
+                        .arg(mode)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                );
+                let mut pid = String::new();
+                std::io::BufReader::new(reader.0.stdout.take().unwrap())
+                    .read_line(&mut pid)
+                    .unwrap();
+                let pid = pid.trim().parse::<u32>().unwrap();
+                let process = PathBuf::from(format!("/proc/{pid}"));
+                // UID 0 without CAP_SYS_PTRACE can list the root-owned fd
+                // directory, but still cannot inspect its targets or maps.
+                assert_eq!(
+                    std::fs::read(process.join("maps")).unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                assert_eq!(
+                    read_process_status_summary(&process).unwrap().uids,
+                    read_process_status_summary(Path::new("/proc/thread-self"))
+                        .unwrap()
+                        .uids
+                );
+                if mode == "idle" && !interrupted {
+                    use nix::fcntl::{FcntlArg, fcntl};
+
+                    let own_reader = File::open(&source).unwrap();
+                    let lock = nix::libc::flock {
+                        l_type: i16::try_from(nix::libc::F_RDLCK).unwrap(),
+                        l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+                        l_start: 0,
+                        l_len: 1,
+                        l_pid: 0,
+                    };
+                    fcntl(&own_reader, FcntlArg::F_SETLK(&lock)).unwrap();
+                    let error =
+                        preflight_superseded_snapshot_readers(&source, &identity).unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    // A separate process must still observe this SQLite-style
+                    // lock. Merely seeing our own descriptor does not prove
+                    // that preflight avoided opening/closing a second handle.
+                    let probe = std::process::Command::new("python3")
+                        .args([
+                            "-c",
+                            "import errno,fcntl,os,sys\nf=os.open(sys.argv[1],os.O_RDWR)\ntry:\n fcntl.lockf(f,fcntl.LOCK_EX|fcntl.LOCK_NB,1)\nexcept OSError as e:\n assert e.errno in (errno.EACCES,errno.EAGAIN)\nelse:\n raise AssertionError('same-process POSIX reader lock was released')\n",
+                        ])
+                        .arg(&source)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        probe.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&probe.stderr)
+                    );
+                    drop(own_reader);
+                }
+                let strict = preflight_inventoried_file_readers(&source, &identity).unwrap_err();
+                assert_eq!(strict.kind(), io::ErrorKind::PermissionDenied);
+                let evidence = preflight_superseded_snapshot_readers(&source, &identity).unwrap();
+                assert!(evidence.incomplete);
+                let mut sync_count = 0;
+                let result = delete_inventoried_file_with_evidence(
+                    &source,
+                    &identity,
+                    Some(evidence),
+                    |parent, name| {
+                        rustix::fs::unlinkat(parent, name, AtFlags::empty())
+                            .map_err(io::Error::from)
+                    },
+                    |directory| {
+                        sync_count += 1;
+                        if interrupted && sync_count == 2 {
+                            Err(io::Error::other("interrupted after actual unlink"))
+                        } else {
+                            directory.sync_all()
+                        }
+                    },
+                );
+                assert!(!source.exists(), "{mode}: the actual unlink must complete");
+                writeln!(reader.0.stdin.take().unwrap(), "release").unwrap();
+                assert!(
+                    reader.0.wait().unwrap().success(),
+                    "{mode}: retained reader bytes"
+                );
+                let bytes = if interrupted {
+                    let error = result.unwrap_err();
+                    let completed = CompletedReclaimDelete::from_io_error(&error).unwrap();
+                    assert_eq!(completed.source(), source);
+                    completed.bytes()
+                } else {
+                    result.unwrap()
+                };
+                assert_eq!(bytes.logical_bytes, identity.len());
+                assert!(bytes.reader_inventory_incomplete);
+                assert_eq!(bytes.allocated_bytes, None);
+                assert_eq!(sync_count, 2);
+                std::fs::write(&source, b"new evidence at the same pathname").unwrap();
+                assert!(delete_superseded_snapshot_file(&source, &identity, evidence).is_err());
+                assert_eq!(
+                    std::fs::read(source).unwrap(),
+                    b"new evidence at the same pathname"
+                );
+            }
+        }
     }
 }

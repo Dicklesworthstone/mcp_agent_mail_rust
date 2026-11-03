@@ -41,7 +41,10 @@ pub use namespace::{
 };
 
 #[cfg(unix)]
-pub(crate) use namespace::{delete_inventoried_file, preflight_inventoried_file_readers};
+pub(crate) use namespace::{
+    delete_inventoried_file, delete_superseded_snapshot_file, preflight_inventoried_file_readers,
+    preflight_superseded_snapshot_readers,
+};
 
 #[cfg(all(test, unix))]
 use namespace::{
