@@ -83,9 +83,14 @@ pub struct RotateReport {
     pub deleted: usize,
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
-    /// Allocated bytes of successfully unlinked, single-link files. This is
-    /// not a measurement of the filesystem's free-space delta.
+    /// Known allocated bytes of successfully unlinked, single-link files.
+    /// This is not a measurement of the filesystem's free-space delta, and
+    /// excludes files whose reader inventory was incomplete.
     pub bytes_reclaimed: u64,
+    /// Superseded image unlinks with opaque external reader inventories,
+    /// including completed but durability-unconfirmed unlinks. Existing
+    /// readers retain their bytes; physical reclamation is unknown.
+    pub unlinks_with_incomplete_reader_inventory: usize,
     pub unconfirmed_deletions: usize,
     pub bytes_unconfirmed_deletions: u64,
     pub unconfirmed_moves: usize,
@@ -134,6 +139,9 @@ impl RotateReport {
         self.bytes_staged = self.bytes_staged.saturating_add(summary.bytes_staged);
         self.bytes_deleted = self.bytes_deleted.saturating_add(summary.bytes_deleted);
         self.bytes_reclaimed = self.bytes_reclaimed.saturating_add(summary.bytes_reclaimed);
+        self.unlinks_with_incomplete_reader_inventory = self
+            .unlinks_with_incomplete_reader_inventory
+            .saturating_add(summary.unlinks_with_incomplete_reader_inventory);
         self.unconfirmed_moves = self
             .unconfirmed_moves
             .saturating_add(summary.unconfirmed_moves);
@@ -156,6 +164,9 @@ impl RotateReport {
         total.bytes_reclaimed = total
             .bytes_reclaimed
             .saturating_add(summary.bytes_reclaimed);
+        total.unlinks_with_incomplete_reader_inventory = total
+            .unlinks_with_incomplete_reader_inventory
+            .saturating_add(summary.unlinks_with_incomplete_reader_inventory);
         total.unconfirmed_moves = total
             .unconfirmed_moves
             .saturating_add(summary.unconfirmed_moves);
@@ -214,6 +225,7 @@ pub struct RotateKindSummary {
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
     pub bytes_reclaimed: u64,
+    pub unlinks_with_incomplete_reader_inventory: usize,
     pub unconfirmed_deletions: usize,
     pub bytes_unconfirmed_deletions: u64,
     pub unconfirmed_moves: usize,
@@ -832,11 +844,21 @@ fn reclaim_periodic_file(
             summary.bytes_reclaimed = summary
                 .bytes_reclaimed
                 .saturating_add(bytes.allocated_bytes.unwrap_or(0));
+            summary.unlinks_with_incomplete_reader_inventory = summary
+                .unlinks_with_incomplete_reader_inventory
+                .saturating_add(usize::from(bytes.reader_inventory_incomplete));
             if let Some(publication) = budget.publication.as_mut() {
                 publication.record_deletion(bytes.logical_bytes);
             }
         }
         Err(error) => {
+            if let Some(completed) =
+                mcp_agent_mail_db::recovery_retention::CompletedReclaimDelete::from_io_error(&error)
+            {
+                summary.unlinks_with_incomplete_reader_inventory = summary
+                    .unlinks_with_incomplete_reader_inventory
+                    .saturating_add(usize::from(completed.bytes().reader_inventory_incomplete));
+            }
             let failure = RotationFailure::from_error(path, &error);
             summary.record_failure(&failure, metadata.len());
             report.failures.push(failure);
@@ -1899,6 +1921,8 @@ where
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_incomplete_reader_inventory =
+                report.unlinks_with_incomplete_reader_inventory,
             bytes_retained = report.bytes_retained(),
             inventory_incomplete = report.inventory_incomplete,
             admission_refused = report.admission_refused,
@@ -1919,8 +1943,22 @@ where
 mod tests {
     use super::*;
 
+    fn create_fixture_directory(path: impl AsRef<Path>) {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(path).unwrap();
+    }
+
     #[cfg(unix)]
     fn verified_mailbox(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         let primary = root.join("storage.sqlite3");
         let conn =
             mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
@@ -1929,6 +1967,7 @@ mod tests {
         conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
             .unwrap();
         drop(conn);
+        fs::set_permissions(&primary, fs::Permissions::from_mode(0o600)).unwrap();
         fs::copy(
             &primary,
             mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary),
@@ -1976,7 +2015,7 @@ mod tests {
     fn mailbox_with_mixed_periodic_history(root: &Path) -> (PathBuf, Vec<(usize, PathBuf)>) {
         let primary = verified_mailbox(root);
         let history = root.join("doctor/reclaimable/rotation-19991231T235959Z");
-        fs::create_dir_all(&history).unwrap();
+        create_fixture_directory(&history);
         let images = (1..=12)
             .map(|day| {
                 let parent = if [2, 4, 6, 8].contains(&day) {
@@ -2026,6 +2065,99 @@ mod tests {
             }
         });
         assert_eq!(fs::read(&primary).unwrap(), live);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn periodic_retention_reports_opaque_reader_inventory() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::{fs::MetadataExt as _, process::CommandExt as _};
+        use std::process::{Command, Stdio};
+
+        struct OpaqueReader(std::process::Child);
+        impl Drop for OpaqueReader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // A privileged caller can inspect a nondumpable peer. Exercise the
+        // actual ordinary-user path, retaining this exact ELF across setuid.
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let capabilities = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .map(|value| u64::from_str_radix(value.trim(), 16).unwrap())
+            .unwrap();
+        if fs::metadata("/proc/self").unwrap().uid() == 0 && capabilities != 0 {
+            let executable = fs::File::open("/proc/self/exe").unwrap();
+            let name = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
+                .args(["--exact", &name, "--nocapture"])
+                .uid(65_534)
+                .gid(65_534)
+                .env("TMPDIR", "/tmp")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let old = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        fs::copy(&primary, &old).unwrap();
+        let original = fs::read(&old).unwrap();
+        let program = tmp.path().join("opaque_reader.py");
+        fs::write(
+            &program,
+            "import ctypes,sys\nf=open(sys.argv[1],'rb')\ndata=f.read()\nf.seek(0)\nassert ctypes.CDLL(None,use_errno=True).prctl(4,0,0,0,0)==0\nprint('ready',flush=True)\nassert sys.stdin.buffer.read(1)==b'r'\nassert f.read()==data\nprint('bytes preserved',flush=True)",
+        )
+        .unwrap();
+        let mut reader = OpaqueReader(
+            Command::new("python3")
+                .arg(program)
+                .arg(&old)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = std::io::BufReader::new(reader.0.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        assert_eq!(
+            fs::read_dir(format!("/proc/{}/fd", reader.0.id()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+            rotate_storage_backups(tmp.path(), &primary, 1).unwrap()
+        });
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(!report.admission_refused);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.bytes_deleted, u64::try_from(original.len()).unwrap());
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.unlinks_with_incomplete_reader_inventory, 1);
+        assert_eq!(
+            report.per_kind[BackupKind::ManualBackup.label()]
+                .unlinks_with_incomplete_reader_inventory,
+            1
+        );
+        assert!(!old.exists());
+        reader.0.stdin.take().unwrap().write_all(b"r").unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "bytes preserved");
+        assert!(reader.0.wait().unwrap().success());
+        assert_eq!(fs::read(primary).unwrap(), original);
     }
 
     #[cfg(unix)]
@@ -2081,7 +2213,7 @@ mod tests {
         let history = tmp
             .path()
             .join("doctor/reclaimable/rotation-19990101T000000Z");
-        fs::create_dir_all(&history).unwrap();
+        create_fixture_directory(&history);
         let older = tmp.path().join("storage.sqlite3.bak.20000101_000000");
         let first = tmp.path().join("storage.sqlite3.bak.20000102_000000-01");
         let newest = history.join("storage.sqlite3.bak.20000102_000000-02");
@@ -2171,7 +2303,7 @@ mod tests {
             let directory = tmp
                 .path()
                 .join(format!("doctor/reclaimable/rotation-1999122{n}T235959Z"));
-            fs::create_dir_all(&directory).unwrap();
+            create_fixture_directory(&directory);
             directory
         });
 
@@ -2196,7 +2328,7 @@ mod tests {
         let staged = tmp
             .path()
             .join("doctor/reclaimable/rotation-19991231T235959Z");
-        fs::create_dir_all(&staged).unwrap();
+        create_fixture_directory(&staged);
         fs::copy(&primary, staged.join("storage.sqlite3.bak.20000101_000000")).unwrap();
         fs::write(
             staged.join("storage.sqlite3.corrupt-evidence"),
@@ -2271,7 +2403,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let primary = tmp.path().join("storage.sqlite3");
         let staged = tmp.path().join("doctor/reclaimable/rotation-old");
-        fs::create_dir_all(&staged).unwrap();
+        create_fixture_directory(&staged);
         for index in 0..6 {
             fs::write(
                 staged.join(format!("storage.sqlite3.bak.20000101_00000{index}")),
@@ -2291,7 +2423,7 @@ mod tests {
         let history = tmp
             .path()
             .join("doctor/reclaimable/rotated-backups-recorded");
-        fs::create_dir_all(&history).unwrap();
+        create_fixture_directory(&history);
         fs::write(history.join("manifest.json"), b"operator restore authority").unwrap();
         let backup = history.join("storage.sqlite3.bak.20000101_000000");
         let file = fs::File::create(&backup).unwrap();
@@ -2341,7 +2473,7 @@ mod tests {
             let history = tmp
                 .path()
                 .join("doctor/reclaimable/rotated-backups-recorded");
-            fs::create_dir_all(&history).unwrap();
+            create_fixture_directory(&history);
             let manifest = history.join("manifest.json");
             let manifest_bytes = b"operator restore authority";
             fs::write(&manifest, manifest_bytes).unwrap();
@@ -2423,7 +2555,7 @@ mod tests {
         let history = tmp
             .path()
             .join("doctor/reclaimable/rotated-backups-recorded");
-        fs::create_dir_all(&history).unwrap();
+        create_fixture_directory(&history);
         fs::write(history.join("manifest.json"), b"restore authority").unwrap();
         for day in 1..=3 {
             fs::copy(
@@ -2485,7 +2617,7 @@ mod tests {
             ("proactive-staging-script", "manifest.json"),
         ] {
             let directory = tmp.path().join("doctor/reclaimable").join(name);
-            fs::create_dir_all(&directory).unwrap();
+            create_fixture_directory(&directory);
             fs::copy(
                 &primary,
                 directory.join("storage.sqlite3.bak.20000101_000000"),
@@ -2497,7 +2629,7 @@ mod tests {
         let completed = tmp
             .path()
             .join("doctor/reclaimable/rotation-19991231T235959Z");
-        fs::create_dir_all(&completed).unwrap();
+        create_fixture_directory(&completed);
         let retired = completed.join("storage.sqlite3.bak.20000101_000000");
         fs::copy(&primary, &retired).unwrap();
         let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
@@ -2538,7 +2670,7 @@ mod tests {
         let directory = tmp
             .path()
             .join("doctor/reclaimable/rotation-19991231T235959Z");
-        fs::create_dir_all(&directory).unwrap();
+        create_fixture_directory(&directory);
         fs::copy(
             &primary,
             directory.join("storage.sqlite3.bak.20000101_000000"),
@@ -2830,7 +2962,7 @@ mod tests {
         let directory = tmp
             .path()
             .join("doctor/reclaimable/rotation-20000101T000000Z");
-        fs::create_dir_all(&directory).unwrap();
+        create_fixture_directory(&directory);
         let backup = directory.join("storage.sqlite3.bak.20000101_000000");
         fs::write(&backup, b"recoverable transaction payload").unwrap();
         assert_eq!(
@@ -4246,7 +4378,7 @@ mod tests {
         let primary = tmp.path().join("storage.sqlite3");
         fs::write(&primary, b"live mailbox sentinel").unwrap();
         let reclaimable = tmp.path().join("doctor/reclaimable");
-        fs::create_dir_all(&reclaimable).unwrap();
+        create_fixture_directory(&reclaimable);
         let unknown = reclaimable.join("operator-empty-evidence");
         let recorded = reclaimable.join("rotation-20000101T000000Z");
         let nested = reclaimable.join("rotation-20000101T000000Z-1");
@@ -4257,7 +4389,7 @@ mod tests {
             b"recovery transaction evidence",
         )
         .unwrap();
-        fs::create_dir_all(nested.join("unfinished-stage")).unwrap();
+        create_fixture_directory(nested.join("unfinished-stage"));
 
         // The first bounded sweep still leaves an incomplete inventory. A
         // cleanup that waits for a complete inventory can never make progress

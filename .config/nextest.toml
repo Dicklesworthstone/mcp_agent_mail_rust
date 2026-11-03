@@ -113,6 +113,7 @@ filter = '''
 | test(=retention_linux::inaccessible_same_user_process_does_not_block_eight_backups)
 | test(=retention_linux::visible_reader_still_refuses_deletion_amid_inaccessible_processes)
 | test(=retention_linux::exited_thread_group_leader_does_not_hide_a_live_backup_reader)
+| test(=backup_rotation::tests::periodic_retention_reports_opaque_reader_inventory)
 | test(=retention_linux::concurrent_cleanup_and_process_restart_preserve_recovery_evidence)
 '''
 threads-required = "num-test-threads"
@@ -186,6 +187,7 @@ filter = '''
 | test(=retention_linux::inaccessible_same_user_process_does_not_block_eight_backups)
 | test(=retention_linux::visible_reader_still_refuses_deletion_amid_inaccessible_processes)
 | test(=retention_linux::exited_thread_group_leader_does_not_hide_a_live_backup_reader)
+| test(=backup_rotation::tests::periodic_retention_reports_opaque_reader_inventory)
 | test(=retention_linux::concurrent_cleanup_and_process_restart_preserve_recovery_evidence)
 '''
 threads-required = "num-test-threads"

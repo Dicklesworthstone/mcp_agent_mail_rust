@@ -123,7 +123,7 @@ pub struct ReclaimedFileBytes {
 /// Evidence carried from the no-open preflight through verified snapshot
 /// admission. This is not a claim that an inaccessible process has no readers.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct SnapshotReaderEvidence {
+pub struct SnapshotReaderEvidence {
     incomplete: bool,
 }
 
@@ -505,7 +505,7 @@ where
 /// recoverable image, lineage, standalone SQLite state, and unchanged pins.
 /// POSIX unlink leaves any unobservable reader's inode intact; it never
 /// truncates, overwrites, or reuses that reader's bytes.
-pub(crate) fn delete_superseded_snapshot_file(
+pub fn delete_superseded_snapshot_file(
     source: &Path,
     inventoried: &Metadata,
     readers: SnapshotReaderEvidence,
@@ -603,7 +603,7 @@ pub fn preflight_inventoried_file_readers(source: &Path, inventoried: &Metadata)
 /// No-open preflight for snapshot authority's verified periodic lane. Own
 /// process readers always refuse before canonical SQLite verification can
 /// open/close the inode and accidentally release that process's POSIX locks.
-pub(crate) fn preflight_superseded_snapshot_readers(
+pub fn preflight_superseded_snapshot_readers(
     source: &Path,
     inventoried: &Metadata,
 ) -> io::Result<SnapshotReaderEvidence> {
@@ -1678,7 +1678,11 @@ mod tests {
     use super::*;
 
     fn fixture() -> PathBuf {
-        tempfile::tempdir().unwrap().keep().canonicalize().unwrap()
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
     }
 
     #[cfg(target_os = "linux")]
@@ -3568,6 +3572,7 @@ mapping.close()
         let root = fixture();
         let source = root.join("generation");
         std::fs::write(&source, b"owned generation").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
         let identity = std::fs::metadata(&source).unwrap();
         validate_opaque_snapshot_scope(&source, &identity, identity.uid()).unwrap();
         assert!(
@@ -3589,6 +3594,7 @@ mapping.close()
         assert!(validate_opaque_snapshot_scope(&source, &identity, identity.uid()).is_err());
         std::fs::rename(&source, root.join("retained-original")).unwrap();
         std::fs::write(&source, b"replacement data").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(validate_opaque_snapshot_scope(&source, &identity, identity.uid()).is_err());
         assert_eq!(std::fs::read(source).unwrap(), b"replacement data");
         assert_eq!(
@@ -3600,10 +3606,13 @@ mapping.close()
     #[cfg(target_os = "linux")]
     #[test]
     fn superseded_preflight_never_hides_our_own_open_reader() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let _scan_guard = reader_scan_test_guard();
         let root = fixture();
         let source = root.join("generation");
         std::fs::write(&source, b"own-process reader").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
         let identity = std::fs::metadata(&source).unwrap();
         let reader = File::open(&source).unwrap();
         let error = preflight_superseded_snapshot_readers(&source, &identity).unwrap_err();
@@ -3621,6 +3630,7 @@ mapping.close()
     #[allow(clippy::too_many_lines)]
     fn superseded_unlink_preserves_opaque_reader_bytes_and_interrupted_accounting() {
         use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
         use std::process::Stdio;
 
         if superseded_run_unprivileged(
@@ -3680,6 +3690,7 @@ elif handle is not None:
                 let root = fixture();
                 let source = root.join("generation");
                 std::fs::write(&source, b"opaque readers retain exact backup bytes").unwrap();
+                std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
                 let identity = std::fs::metadata(&source).unwrap();
                 let mut reader = Reader(
                     std::process::Command::new("python3")

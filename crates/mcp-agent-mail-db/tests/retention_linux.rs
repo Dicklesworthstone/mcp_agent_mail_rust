@@ -168,6 +168,7 @@ impl Mailbox {
             .keep()
             .canonicalize()
             .unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let primary = root.join("storage.sqlite3");
         {
             let connection = CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
@@ -192,6 +193,7 @@ impl Mailbox {
                 )
                 .unwrap();
         }
+        fs::set_permissions(&primary, fs::Permissions::from_mode(0o600)).unwrap();
         let snapshot = snapshot_bak_path(&primary);
         fs::copy(&primary, &snapshot).unwrap();
         let created = chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z")

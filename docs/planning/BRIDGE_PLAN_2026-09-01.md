@@ -1,5 +1,91 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 3 UTC: qualify the published opaque-reader retention change
+
+- [x] Finish and commit the source-bound doctor and legacy-comparison repairs
+  in `715440a9`; close only br-doctor-project-config-discovery-j0bh5 and
+  br-kp1in.80 on their original acceptance evidence. The 147 native passes,
+  five fresh cases and real-MCP repair/undo passes precede the change below.
+- [x] Review all five files in published `159e9bb5`, including the complete
+  namespace diff, and merge both histories without conflict at `775cac5c`.
+  Run `br sync --import-only`; claim br-5nr0m without closing its broader work.
+- [x] Record the contract change explicitly: qualified superseded snapshots
+  may lose their pathname despite an opaque reader, while the reader retains
+  its inode bytes. Generic and incident reclamation keep strict exclusion.
+  Incomplete reader inventory never establishes physically reclaimed bytes.
+- [x] Preserve the first compiler request's pre-Cargo namespace refusal,
+  exit 103. Recover exact wrapper `rchw-e704bdb8-6657-498b-8b29-885afbd71376`:
+  remote exit 1 acknowledged, without replay. Retry through normal RCH;
+  do not alter admission, source isolation or worker capacity.
+- [x] Check formatting on the merged source: pass.
+- [x] Complete the pre-reporting merged-source all-targets compiler check:
+  exit 0 in 3,990.2 seconds. Its direct live Cargo witness matches all
+  3,902 tracked inputs. This precedes the reporting and fixture edits below.
+- [x] Wire the DB's incomplete-reader flag through rotation summaries,
+  completed-unlink errors and the shared default-warning renderer used by
+  startup and automatic cleanup. Add actual opaque-reader byte preservation
+  and tracing warning/ordinary-pass controls; no reader-admission change.
+- [x] Preserve the first native result: 41 pass, 22 fail of 63 cases,
+  4,645 outside selection. Three legacy cases pass; all seven public Linux
+  cases execute, with six failures. Retain the actual DB library dd4dea95
+  and integration cda0281f images. Thirteen failures retain strict census
+  refusal; nine reject accidentally shared test fixtures.
+- [x] Diagnose those fixtures with the same retained ELFs and assertions:
+  three selected cases each fail with umask 002 and pass with 077.
+  Actual retained roots are mode 0775 versus 0700. FIXTURE-CHANGE:
+  explicitly make fixture roots 0700 and mailbox/owned-source files 0600;
+  keep all file-0622, parent-0777, owner, alias and replacement refusals.
+  Make the replacement itself private so the inode negative is independent
+  of permission rejection. Production admission and deadlines are unchanged.
+  Formatting passes; the fresh runtime request refuses before tests because
+  hz3 has 13.9 GiB free and zero admitted slots. No pressure override.
+- [x] Restore hz3 headroom through the authorized verified relocation
+  process; preserve protected, active, Git-bearing or insufficiently idle trees.
+  Move the 200-hour-idle HFDT target to trj `/bulk`, verify all 2,548 entries
+  and the full archive, and fsync payload, manifests and directories before
+  the authorized source cutover. Archive SHA-256 is dff2c633bb1249b8a35bf5463876e2afe5a991a62897ae8d008f50764fb9640d.
+  Cutover at 10:41:24 UTC recovers a measured 13,005 MiB; preserve owner/mode
+  and a synced restore pointer. Verify/fsync all 17 operator receipts too.
+  Normal RCH admission restores three hz3 slots, without a policy override.
+- [x] Resolve strict Clippy's three redundant visibility errors inside the
+  private namespace module, keeping its effective crate-private exports.
+  Replace the extra report boolean with a count rather than allowing a lint.
+  Count-source Clippy, all-targets and production checks pass in 501.3,
+  277.1 and 250.6 seconds. These precede the last test-directory helper.
+- [x] Make historical test directories private at creation, independently
+  of umask. Final-source server run executes all 68 selected cases: 61 pass,
+  six fail and the original 720-cycle case times out at 240 seconds.
+  Both new real-opaque-reader and default-warning controls pass. Preserve
+  every failure and the actual 350,932,632-byte ELF, SHA-256 89d9fae6ddbf55f5090624cb783f01c4a0b5b85512c0cf01cf736fb71f4422bf.
+  A complete same-ELF unprivileged replay with umask 002 is diagnostic only;
+  it cannot erase the ordinary-worker failures or certify load-20 performance.
+- [x] Review the final four-file UBS result: exit 1, four unchanged critical
+  fixture patterns, 2,166 warnings and 783 informational findings. Review
+  all 67 added-line findings; none is critical. Keep the three intentional
+  failure panics and fixed Python argument literal; no scanner suppression.
+- [x] Review all seven files in newly fetched maintainer follow-up 09b362e0.
+  It adds logical-byte accounting, avoids redundant own-thread reader scans,
+  and adds parked-window regressions. Preserve the earlier-source runs above.
+- [ ] Merge 09b362e0 with the local reporting and private-fixture repairs;
+  retain one reporting vocabulary, the default warning and real reader test.
+  Preserve both histories and import Beads after merging.
+- [ ] Repeat all-targets on the final reporting/fixture source.
+- [ ] Complete the separate production library/binary compiler check.
+- [ ] Complete strict workspace all-targets Clippy.
+- [ ] Execute every public Linux retention case on the merged source,
+  including opaque FD/O_PATH/mapping byte preservation, visible-reader
+  refusal, dead-leader threads, real permission refusal and interrupted cleanup.
+- [ ] Execute strict namespace controls and the original legacy comparison;
+  preserve environmental refusals rather than turning them into skips/passes.
+- [ ] Exercise the existing server tests for the shared resident/historical
+  keep window; the GH#373 keep-count repair already exists in this checkout.
+- [ ] Retain actual source and executable witnesses, terminal results and
+  any failures; update this checklist and br-5nr0m with the bounded outcome.
+- [ ] Review and commit owned tracking changes; fetch again and preserve any
+  new remote history before a normal push and compatibility-branch mirror.
+- [ ] Continue original persistence, authority, performance and platform
+  acceptance work. This selected run cannot close those tasks or qualify a release.
+
 ## November 2: restore client access and connect doctor discovery
 
 - [x] Reproduce real client failures: six project configurations receive HTTP

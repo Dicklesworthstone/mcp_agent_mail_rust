@@ -839,6 +839,7 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
     if !report.failures.is_empty()
         || report.admission_refused
         || report.inventory_incomplete
+        || report.unlinks_with_incomplete_reader_inventory > 0
         || report.unconfirmed_moves > 0
         || report.unconfirmed_deletions > 0
     {
@@ -851,6 +852,7 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_incomplete_reader_inventory = report.unlinks_with_incomplete_reader_inventory,
             bytes_retained = report.bytes_retained(),
             unconfirmed_moves = report.unconfirmed_moves,
             bytes_unconfirmed_moves = report.bytes_unconfirmed_moves,
@@ -2095,6 +2097,36 @@ mod tests {
             "{warnings:?}"
         );
         assert!(warnings[0].contains("shortened pass"), "{warnings:?}");
+    }
+
+    #[test]
+    fn opaque_reader_inventory_is_reported_at_the_default_warning_level() {
+        let ordinary = crate::backup_rotation::RotateReport {
+            deleted: 1,
+            bytes_deleted: 4096,
+            bytes_reclaimed: 4096,
+            ..Default::default()
+        };
+        let opaque = crate::backup_rotation::RotateReport {
+            deleted: 1,
+            bytes_deleted: 4096,
+            unlinks_with_incomplete_reader_inventory: 1,
+            ..Default::default()
+        };
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            report_backup_rotation(&ordinary, "observable pass");
+            report_backup_rotation(&opaque, "opaque pass");
+        });
+        let warnings = capture.0.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("unlinks_with_incomplete_reader_inventory=1"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("bytes_reclaimed=0"), "{warnings:?}");
+        assert!(warnings[0].contains("bytes_deleted=4096"), "{warnings:?}");
+        assert!(warnings[0].contains("opaque pass"), "{warnings:?}");
     }
 
     /// A pass with refusals must keep backups moving, and it may spend the
