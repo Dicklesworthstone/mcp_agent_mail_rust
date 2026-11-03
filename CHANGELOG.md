@@ -81,6 +81,11 @@ release commit in 3fdda50c.
   generation timestamps and collision suffixes. The publication slot and
   verified snapshot remain protected; interrupted or manifest-bearing recovery
   evidence retains its existing safeguards and publication-budget accounting.
+- **Capacity-driven cleanup preserves the newer retained generations.** Keep
+  selection and the reclamation queue now share the same timestamp, numeric
+  collision-suffix and mtime ordering. Shortening the window removes `-99`
+  before `-100`, including mixed resident/parked images with misleading copied
+  mtimes. The progress cursor remains a fairness hint for expired generations.
 - **Linux reader inspection no longer trusts session-daemon names.** A
   nondumpable process can keep a descriptor or mapping after changing its name,
   group, or capabilities. Such uncertainty is recorded explicitly. A terminated

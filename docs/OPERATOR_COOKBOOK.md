@@ -671,7 +671,11 @@ and byte budget. They remain uncertain recovery evidence; automatic retention
 does not delete them. A failed inspection preserves its new staging directory
 and reports that path, while successful metadata publication removes it.
 The periodic retention window can shorten to restore count or byte capacity,
-while preserving the publication slot and verified recovery generation. Only
+while preserving the publication slot and verified recovery generation. It
+uses the same generation ordering as keep-window selection: the oldest
+eligible image goes first, including numeric collision suffixes across resident
+and parked locations. Directory spelling and copied mtimes cannot promote a
+newer dated collision ahead of an older one for deletion. Only
 confirmed removals reduce that calculation; a refused candidate cannot prevent
 cleanup from considering another safely superseded generation in the window.
 These are bounds on cooperating automatic producers, not a filesystem quota

@@ -377,6 +377,44 @@ fn occupies_rotation_window(primary: &Path, path: &Path, periodic_reclaim: bool)
             .is_some_and(|name| is_periodic_backup(primary, name))
 }
 
+/// Use the same recovery preference for keep-window selection and reclamation.
+/// Generation timestamps and numeric collision suffixes take precedence over
+/// copy-preserved mtimes and the directory that happens to contain an image.
+fn backup_order_newest_first(
+    primary: &Path,
+    left: (&Path, SystemTime),
+    right: (&Path, SystemTime),
+) -> std::cmp::Ordering {
+    let candidate = |path: &Path| {
+        let database_name = primary.file_name()?;
+        let name = path.file_name()?;
+        ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
+            let mut stem = database_name.to_os_string();
+            stem.push(sidecar);
+            mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&stem, name)
+        })
+    };
+    let left_candidate = candidate(left.0);
+    let right_candidate = candidate(right.0);
+    let generation = |name: Option<mcp_agent_mail_core::disk::SqliteRecoveryCandidateName>,
+                      modified| {
+        name.and_then(mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(modified).timestamp_micros())
+    };
+    let order = generation(right_candidate, right.1)
+        .cmp(&generation(left_candidate, left.1))
+        .then_with(|| right_candidate.is_some().cmp(&left_candidate.is_some()));
+    let collision_order = match (left_candidate, right_candidate) {
+        (Some(left_name), Some(right_name)) => {
+            left_name.cmp_newest_first(left.1, right_name, right.1)
+        }
+        _ => std::cmp::Ordering::Equal,
+    };
+    order
+        .then(collision_order)
+        .then_with(|| left.0.cmp(right.0))
+}
+
 fn is_native_rotation_directory(name: &std::ffi::OsStr) -> bool {
     let Some(suffix) = name
         .to_str()
@@ -915,7 +953,7 @@ struct PendingReclaim {
 }
 
 #[cfg(unix)]
-type ReclaimCursor = (i64, PathBuf);
+type ReclaimCursor = (SystemTime, PathBuf);
 
 #[cfg(unix)]
 fn reclaim_pending(
@@ -931,25 +969,30 @@ fn reclaim_pending(
     static CURSORS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, ReclaimCursor>>> =
         std::sync::OnceLock::new();
     let cursors = CURSORS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
-    let key = |entry: &PendingReclaim| {
-        let generation = primary
-            .file_name()
-            .zip(entry.path.file_name())
-            .and_then(|(database, name)| {
-                mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(database, name)
-            })
-            .and_then(mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros)
-            .unwrap_or(i64::MIN);
-        (generation, entry.path.clone())
+    let modified =
+        |entry: &PendingReclaim| entry.metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let oldest_first = |left: &PendingReclaim, right: &PendingReclaim| {
+        backup_order_newest_first(
+            primary,
+            (&right.path, modified(right)),
+            (&left.path, modified(left)),
+        )
     };
-    pending.sort_by_key(&key);
+    pending.sort_by(oldest_first);
     let cursor = cursors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(primary)
         .cloned();
     if let Some(cursor) = cursor {
-        let start = pending.partition_point(|entry| key(entry) <= cursor);
+        let start = pending.partition_point(|entry| {
+            !backup_order_newest_first(
+                primary,
+                (&cursor.1, cursor.0),
+                (&entry.path, modified(entry)),
+            )
+            .is_gt()
+        });
         pending.rotate_left(start);
     }
     // Stable, so older entries keep the cursor's fair turn, and each has had its
@@ -958,7 +1001,7 @@ fn reclaim_pending(
     // first and the next still gets its try in the same pass.
     pending.sort_by_key(|entry| entry.within_window);
     let window_start = pending.partition_point(|entry| !entry.within_window);
-    pending[window_start..].sort_by_key(&key);
+    pending[window_start..].sort_by(oldest_first);
     let (mut window_images, mut window_bytes) = pending
         .iter()
         .filter(|entry| entry.within_window)
@@ -1000,7 +1043,7 @@ fn reclaim_pending(
             report,
             entry.historical,
         ) {
-            last_attempted = Some(key(&entry));
+            last_attempted = Some((modified(&entry), entry.path.clone()));
         } else {
             // Do not skip an oversized candidate and keep advancing the
             // cursor through smaller files behind it. It needs to be first
@@ -1682,37 +1725,7 @@ where
         // Published backup generations outrank copy-preserved mtimes. Other
         // debris uses mtime; raw paths make ties deterministic.
         files.sort_by(|left, right| {
-            let candidate = |path: &Path| {
-                let name = path.file_name()?;
-                ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
-                    let mut stem = database_name.to_os_string();
-                    stem.push(sidecar);
-                    mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&stem, name)
-                })
-            };
-            let left_candidate = candidate(&left.0);
-            let right_candidate = candidate(&right.0);
-            let generation =
-                |name: Option<mcp_agent_mail_core::disk::SqliteRecoveryCandidateName>, modified| {
-                    name.and_then(
-                        mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros,
-                    )
-                    .unwrap_or_else(|| {
-                        chrono::DateTime::<chrono::Utc>::from(modified).timestamp_micros()
-                    })
-                };
-            let order = generation(right_candidate, right.1)
-                .cmp(&generation(left_candidate, left.1))
-                .then_with(|| right_candidate.is_some().cmp(&left_candidate.is_some()));
-            let collision_order = match (left_candidate, right_candidate) {
-                (Some(left_name), Some(right_name)) => {
-                    left_name.cmp_newest_first(left.1, right_name, right.1)
-                }
-                _ => std::cmp::Ordering::Equal,
-            };
-            order
-                .then(collision_order)
-                .then_with(|| left.0.cmp(&right.0))
+            backup_order_newest_first(snapshot_primary, (&left.0, left.1), (&right.0, right.1))
         });
         let periodic_reclaim = kind == BackupKind::ManualBackup && periodic_reclamation_enabled();
         let to_evict = files
@@ -2173,6 +2186,99 @@ mod tests {
         assert!(!older.exists());
         assert!(!first.exists());
         assert_eq!(fs::read(newest).unwrap(), fs::read(&primary).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_shortens_the_window_by_numeric_generation_order() {
+        // Crossing the two-digit suffix boundary defeats lexical filename
+        // order. A parked newer image also defeats full-path ordering even
+        // for equally padded suffixes. Neither is authority to discard it first.
+        for (older_suffix, newer_suffix, parked_newer) in [
+            ("99", "100", false),
+            ("99", "100", true),
+            ("01", "02", true),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let primary = verified_mailbox(tmp.path());
+            let live = fs::read(&primary).unwrap();
+            let metadata_path = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+            let metadata = fs::read(&metadata_path).unwrap();
+            let generation_bytes = fs::metadata(&primary).unwrap().len();
+            let newer_parent = if parked_newer {
+                let history = tmp
+                    .path()
+                    .join("doctor/reclaimable/rotation-19990101T000000Z");
+                fs::create_dir_all(&history).unwrap();
+                history
+            } else {
+                tmp.path().to_path_buf()
+            };
+            let older = tmp.path().join(format!(
+                "storage.sqlite3.bak.20000102_000000-{older_suffix}"
+            ));
+            let newer = newer_parent.join(format!(
+                "storage.sqlite3.bak.20000102_000000-{newer_suffix}"
+            ));
+            for (path, seconds) in [(&older, 2_100_000_000), (&newer, 1)] {
+                fs::copy(&primary, path).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                    )
+                    .unwrap();
+            }
+            let refused = (1..=3)
+                .map(|day| {
+                    let path = tmp
+                        .path()
+                        .join(format!("storage.sqlite3.bak.1999120{day}_000000"));
+                    fs::write(&path, b"incomplete export evidence").unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+
+            // The exact slot plus five dated generations exhaust keep+3.
+            // Three invalid older images must survive, so one window image
+            // must go to permit publication, and the newer one must remain.
+            let before = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
+            assert_eq!(before.images, 6);
+            assert!(before.publication_refused());
+            let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "true")],
+                || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+            );
+            assert_eq!(report.deleted, 1);
+            assert_eq!(report.window_images_deleted, 1);
+            assert!(!older.exists(), "the older collision must go first");
+            assert_eq!(fs::read(newer).unwrap(), live);
+            assert!(!report.inventory_incomplete);
+            assert!(!report.admission_refused);
+            assert_eq!(report.kept, 5);
+            assert_eq!(report.failures.len(), 3);
+            assert!(
+                report
+                    .failures
+                    .iter()
+                    .all(|failure| refused.contains(&failure.source))
+            );
+            assert_eq!(report.bytes_deleted, generation_bytes);
+            assert_eq!(
+                report.bytes_deleted + report.bytes_retained(),
+                before.retained_bytes
+            );
+            for path in refused {
+                assert_eq!(fs::read(path).unwrap(), b"incomplete export evidence");
+            }
+            assert_eq!(fs::read(&primary).unwrap(), live);
+            assert_eq!(fs::read(metadata_path).unwrap(), metadata);
+            admit_periodic_publication(tmp.path(), &primary, 3).unwrap();
+            assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+        }
     }
 
     #[cfg(unix)]
