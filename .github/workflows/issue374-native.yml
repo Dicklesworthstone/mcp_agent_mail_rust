@@ -13,12 +13,17 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
+  schedule:
+    # Temporary hosted-runner opportunity after local dependency builds exhausted
+    # memory. The qualification_window job prevents annual native rebuilds.
+    - cron: '47 23 3 11 *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: issue374-native-${{ github.ref }}
+  # An expired scheduled run must not replace a queued push or manual request.
+  group: issue374-native-${{ github.ref }}-${{ github.event_name == 'schedule' && 'scheduled' || 'requested' }}
   cancel-in-progress: false
 
 env:
@@ -30,8 +35,42 @@ env:
   RUST_TEST_THREADS: '1'
 
 jobs:
+  qualification_window:
+    name: Check dated qualification trigger
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      run_native: ${{ steps.window.outputs.run_native }}
+    steps:
+      - id: window
+        name: Keep the temporary schedule within 2026
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_native=false
+          case "$TRIGGER_EVENT" in
+            push|workflow_dispatch)
+              run_native=true
+              ;;
+            schedule)
+              qualification_year="$(date -u +%Y)"
+              if [[ "$qualification_year" == 2026 ]]; then
+                run_native=true
+              fi
+              ;;
+          esac
+          printf 'run_native=%s\n' "$run_native" >> "$GITHUB_OUTPUT"
+          if [[ "$run_native" == false ]]; then
+            printf '%s\n' 'Native tests were skipped by the dated trigger guard. This is not qualification evidence.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   inbox:
     name: Large inbox exactness and cancellation
+    needs: qualification_window
+    if: ${{ needs.qualification_window.outputs.run_native == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -68,6 +107,8 @@ jobs:
 
   reconciliation:
     name: Native repair fairness, recovery, and convergence
+    needs: qualification_window
+    if: ${{ needs.qualification_window.outputs.run_native == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -129,6 +170,8 @@ jobs:
 
   http:
     name: Native HTTP inbox responsiveness and cancellation
+    needs: qualification_window
+    if: ${{ needs.qualification_window.outputs.run_native == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -168,6 +211,8 @@ jobs:
 
   workspace:
     name: Supported workspace qualification
+    needs: qualification_window
+    if: ${{ needs.qualification_window.outputs.run_native == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
