@@ -1280,7 +1280,8 @@ pub fn rotate_storage_backups(
 ///
 /// At `budget` it stops reclaiming and leaves the rest to a later pass, with
 /// nothing refused. One entry already under way finishes, so the bound is not
-/// exact.
+/// exact. Inventory still completes for retained-byte accounting, but a spent
+/// budget does not admit new snapshot verification work.
 pub fn rotate_storage_backups_within(
     storage_root: &Path,
     database_path: &Path,
@@ -1503,10 +1504,15 @@ where
             .push((entry.path(), mtime, meta));
     }
 
+    // Finish inventory even after the budget expires so deferred files remain
+    // visible in retained counts. Snapshot admission selects and fully verifies
+    // the survivor, so checking only the later per-file budget is too late.
+    report.deadline_reached |= deadline.is_some_and(|deadline| Instant::now() >= deadline);
     // Inventory is only a hint: every move checks its retained file witness.
     // Acquire before choosing a pin, then retain admission for the whole pass.
-    // Do not create control state for a missing/empty backup inventory.
-    if report.inventory_incomplete || report.admission_refused {
+    // Do not create control state for a missing/empty backup inventory or work
+    // deferred by the deadline. Deferral is not an admission refusal.
+    if report.inventory_incomplete || report.admission_refused || report.deadline_reached {
         // An unreadable entry may be the recovery record for a visible payload.
         // Preserve every known file and report lower bounds until the complete
         // namespace can be inspected; never infer absence from an I/O error.
@@ -2462,6 +2468,99 @@ mod tests {
             "the kept set must not depend on which pass reclaimed the backlog"
         );
         assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_budget_does_not_acquire_snapshot_authority() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let (primary, _) = mailbox_with_mixed_periodic_history(tmp.path());
+        let generation_bytes = fs::metadata(&primary).unwrap().len();
+        let protected = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-19991230T235959Z");
+        fs::create_dir_all(&protected).unwrap();
+        fs::copy(
+            &primary,
+            protected.join("storage.sqlite3.bak.19991230_000000"),
+        )
+        .unwrap();
+        let manifest = b"interrupted recovery must retain its complete transaction";
+        fs::write(protected.join("manifest.json"), manifest).unwrap();
+        let incident = b"independent incident evidence";
+        fs::write(
+            tmp.path().join("storage.sqlite3.corrupt-evidence"),
+            incident,
+        )
+        .unwrap();
+
+        // Hold the real authority directly, without first acquiring retention's
+        // recovery election or selecting a pin. Trying admission would refuse
+        // and could create control files before reaching the per-file budget.
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join("storage.sqlite3.bak.authority.lock"))
+            .unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let paths = || {
+            walkdir::WalkDir::new(tmp.path())
+                .min_depth(1)
+                .into_iter()
+                .map(|entry| entry.unwrap().into_path())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = paths();
+        let contents = before
+            .iter()
+            .filter(|path| path.is_file())
+            .map(|path| (path.clone(), fs::read(path).unwrap()))
+            .collect::<Vec<_>>();
+        let rotate = |budget| {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+                rotate_storage_backups_within(tmp.path(), &primary, 3, budget).unwrap()
+            })
+        };
+
+        let spent = rotate(Duration::ZERO);
+        assert!(spent.deadline_reached);
+        assert!(!spent.admission_refused, "{:?}", spent.failures);
+        assert!(!spent.inventory_incomplete);
+        assert!(spent.failures.is_empty(), "{:?}", spent.failures);
+        assert_eq!(spent.evicted(), 0);
+        assert_eq!(spent.empty_directories_deleted, 0);
+        assert_eq!(spent.kept, 16);
+        assert_eq!(spent.per_kind[BackupKind::ManualBackup.label()].kept, 13);
+        assert_eq!(spent.per_kind["protected_quarantine"].kept, 2);
+        assert_eq!(spent.per_kind[BackupKind::Corrupt.label()].kept, 1);
+        assert_eq!(
+            spent.bytes_retained(),
+            14 * generation_bytes
+                + u64::try_from(manifest.len()).unwrap()
+                + u64::try_from(incident.len()).unwrap()
+        );
+        assert_eq!(
+            paths(),
+            before,
+            "a deferred pass must not create control state"
+        );
+        for (path, bytes) in contents {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+
+        // This is real contention, not an inventory that happens to fit the
+        // window: with time remaining the same pass must still try admission.
+        let contended = rotate(Duration::from_secs(3600));
+        assert!(!contended.deadline_reached);
+        assert!(contended.admission_refused);
+        assert!(!contended.inventory_incomplete);
+        assert_eq!(contended.failures.len(), 1);
+        assert_eq!(contended.failures[0].source, primary);
+        assert_eq!(contended.evicted(), 0);
+        assert_eq!(contended.kept, spent.kept);
+        assert_eq!(contended.bytes_retained(), spent.bytes_retained());
     }
 
     #[cfg(unix)]

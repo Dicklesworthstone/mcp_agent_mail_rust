@@ -382,3 +382,123 @@ cargo test --locked -p mcp-agent-mail-db --no-default-features --test it \
 cargo test --locked -p mcp-agent-mail-server --no-default-features \
   --features portable --lib backup_rotation::tests:: -- --test-threads=1
 ```
+
+## 2026-11-03 continuation: ordering, durability and startup admission
+
+Starting from `09b362e0c4f7b041fc12f76ce77c849f01851660`, a second review
+identified three gaps in the coordinator around the reader policy. These changes
+leave the namespace module, snapshot authority, public-guard integration tests,
+dependency versions and feature defaults unchanged. They do not relax the
+reader, recovery-election, ownership, verified-survivor or durability checks.
+
+### Capacity-driven keep-window ordering
+
+Commit `a73ae5e377cbab481643dfb8b29e8b146f71b94c` shares the existing
+keep-selection comparator with the oldest-first pending reclamation queue.
+Previously that queue sorted equal timestamps by the complete pathname, which
+could remove collision `-100` before `-99`, or let a parked parent directory
+override the generation order. This matters when publication capacity requires
+shortening the normal keep window. The progress cursor remains a fairness hint
+for expired candidates; it does not override oldest-first window shortening.
+
+`periodic_retention_shortens_the_window_by_numeric_generation_order` covers
+resident and mixed resident/parked generations, numeric suffixes and misleading
+mtimes. It sets up a real verified mailbox at its six-image publication limit,
+three refused older corrupt images, and two eligible window images. Exactly one
+necessary unlink must remove the older eligible image and admit publication,
+leaving the newer generation and refused evidence intact. An unchanged
+`09b362e` production module with the identical new test was also prepared and
+type-checked as a baseline. Type checking alone does not establish the expected
+baseline failure or a passing candidate runtime result.
+
+### Stop after an unconfirmed namespace mutation
+
+Commit `71fda742e96f8cc9162f0a68cde993fe10f9dca2` makes completed rename/unlink
+failure receipts a sticky publication-admission refusal. The coordinator now
+preserves all later candidates and skips the final empty-directory sweep after
+such a failure. A subsequent inventory cannot treat a missing pathname as new
+capacity or authorize a repair export during that pass. An ordinary
+candidate-local refusal before mutation still allows bounded progress on other
+candidates; loss of shared snapshot or namespace authority remains a refusal.
+
+The review traced the actual `CompletedReclaimMove` and `CompletedReclaimDelete`
+IO errors through snapshot authority and every mutation catch in the rotation
+coordinator. The existing namespace tests exercise actual rename/unlink followed
+by injected sync failure. New coordinator tests separately cover receipt
+aggregation and stopping a real periodic queue; they explicitly do not pretend
+that seeding a receipt reproduces a filesystem sync fault. The existing real
+post-stage authority-replacement regression now requires immediate refusal,
+one completed-move receipt and no subsequent attempt. A new continuation control
+injects a pre-mutation refusal and then permits a real later rename. Byte
+accounting still comes from each kind's summary exactly once.
+
+### Defer snapshot admission after the startup budget expires
+
+After the historical and resident inventories complete, rotation now checks its
+deadline before publication-budget planning and admission of new backup-file
+reclamation or survivor verification work. The existing early empty-directory
+sweep checks its own deadline before acquiring a `SnapshotRetentionGuard`.
+A spent budget uses the existing preserve-and-account path, sets
+`deadline_reached` and retains any genuine inventory/admission refusal already
+recorded. It does not turn ordinary deferral into an admission refusal.
+
+`spent_budget_does_not_acquire_snapshot_authority` uses a verified mailbox,
+13 resident/parked images, protected recovery payload and manifest, and a separate
+incident artifact. It holds the real existing authority-file flock without
+first acquiring the recovery election. The zero-budget pass must account for
+all 16 files and exact bytes, preserve every pathname and file content, and
+create no control files. The same inventory with ample time must actually
+encounter the held authority and refuse admission. The deadline remains a soft
+bound: inventory completes, and an operation already underway is not preempted.
+No SQLite cancellation hook or unsafe code was introduced.
+
+### Exact-source validation for this continuation
+
+| Rotation source | SHA-256 | Compile/lint result |
+| --- | --- | --- |
+| Ordering commit | `5bc934685e4cffe07fc51fe51454a6dbba7d345b65b307f08ce5dcef433503d5` | All-test metadata check and strict Clippy pass |
+| Durability commit | `c44b94adbfd1fd6b563dc991cf905d8bba1fdbf7cd46e9b02e9ddf94163f18f6` | Final strict Clippy, including all-test type checking, passes |
+| Combined ordering, durability and deadline | `6eb1f6c7602f6b38b45db02f40e36dea2dda3a1975a28d30f452ec37b96d4d7c` | All-test metadata check and strict Clippy pass |
+
+These checks used frozen copies of the exact rotation module, the pinned
+`nightly-2026-08-31` toolchain, and the real production DB/core dependencies.
+Separately named scratch harness packages prevented baseline/candidate cache
+identity collisions. Their lockfiles remained subsets of the repository's
+lockfile and their 20 patch entries matched the repository. No fake persistence,
+replacement helper, test macro, reduced inventory bound or skipped regression
+was used to obtain these compile/lint results. The existing 720-generation and
+16,641-directory tests remain unchanged.
+
+The unique ordering baseline check passed in 1.12 seconds; ordering candidate
+check and strict Clippy passed in 1.01 and 1.35 seconds. Durability's final strict
+Clippy passed in 1.70 seconds after an assertion-equivalent `from_ref` correction;
+the earlier standalone metadata check preceded that correction. The combined
+final source passed its metadata check in 1.38 seconds and strict Clippy in
+1.50 seconds. Formatting and `git diff --check` also passed. The only
+`integrity_guard.rs` change in this continuation is the refusal diagnostic's
+addition of durability failure; it received formatting and source review, not
+a full server-library build.
+
+Two additional native executable-build attempts in this continuation both
+received `SIGKILL` while compiling unchanged `asupersync 0.5.0`, before any
+application or test binary existed. Both used one Cargo job and the pinned
+compiler's Cranelift backend for that dependency only. The first ran for
+249.70 seconds and sampled a peak child RSS of 7,476,640 KiB. The final attempt
+also enabled the compiler's supported `hint-mostly-unused` option for
+Asupersync only, through command-line profile configuration. Its actual compiler
+arguments confirmed that option was active; it ran for 270.29 seconds and
+sampled a peak child RSS of 6,871,824 KiB. It still exited with Cargo status 101
+after the dependency was killed. Shared cgroup OOM-kill counters increased
+during both builds, and unrelated workspace compilers were also active. These
+observations do not establish a standalone memory requirement for Agent Mail
+or demonstrate that the hint would make this build viable on another host.
+
+No production source, feature default, dependency version or tracked profile
+was changed for those build attempts. There were no additional codegen retries
+after the second failure. The new ordering, durability and deadline runtime
+regressions, the seven public-guard integration tests, and full server/workspace
+execution therefore remain unproven here. In particular, the prepared
+old-production/new-test ordering counterexample has not executed. The passing
+native namespace evidence above still applies to its unchanged source; the
+passing compile/lint results in this continuation do not replace the outstanding
+runtime validation. No issue closure or release qualification is inferred.

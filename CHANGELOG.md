@@ -116,8 +116,15 @@ release commit in 3fdda50c.
   completed rename or unlink followed by failed durability or namespace
   validation now refuses publication admission and preserves remaining
   candidates. A later inventory cannot turn that uncertain result into fresh
-  export capacity during the same pass. Refusals before mutation still allow
-  other eligible candidates to make bounded progress.
+  export capacity during the same pass. Ordinary candidate-local refusals before
+  mutation still allow other eligible candidates to make bounded progress.
+- **Expired startup cleanup budgets defer snapshot admission.** Once inventory
+  completes, a spent budget retains and accounts for the remaining files without
+  admitting new backup-file reclamation or survivor verification work. The earlier
+  empty-directory sweep checks its own deadline before acquiring authority.
+  Deadline deferral does not invent an admission failure or create control files.
+  The budget remains cooperative: inventory finishes and an operation already
+  underway is not interrupted.
 
 The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
 preserves the earlier conservative-policy counterexamples and validation,
