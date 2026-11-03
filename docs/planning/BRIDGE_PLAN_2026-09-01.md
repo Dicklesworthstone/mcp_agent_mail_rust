@@ -16,9 +16,14 @@
   combined I/O/disk-pressure gate before Cargo. Preserve both failures and
   finish the authorized verified move; never override admission or capacity.
   After the move, normal hz4 admission starts the frozen 9d native build;
-  normal vmi1152480 admission starts the sequential all-targets, production
-  and strict Clippy pipeline. Live input witnesses match all 3,896 present
-  files with the same six historical JSON omissions. Both builds are active.
+  normal vmi1152480 admission passes all-targets in 3,937.2 seconds. Its
+  subsequent production request refuses before Cargo; that worker then reaches
+  zero disk headroom during unrelated builds. Preserve the pass and refusal
+  separately. A normal vmi1149989 request starts the remaining production and
+  strict Clippy pipeline. Live native/all-targets input witnesses match all
+  3,896 present files with the same six historical JSON omissions. Native
+  execution is active; its full five-mode visible-reader negative and both
+  completed-mutation receipt regressions pass. The full result remains pending.
   11d compiler/server results do not qualify the new server edits.
 - [x] Complete the authorized hz4 storage relocation before admitting its
   native retry. Preserve and verify all 78,193 entries in the 14,378,229,760-byte
@@ -28,6 +33,13 @@
   restore stub. Preserve and verify all 17 operator receipts, including the
   user's authorization, exact command and UTC time. Keep active/protected
   caches and proof images; no NAS recovery is inferred.
+- [ ] Recover emergency headroom on vmi1152480 without discarding data. Keep
+  the original six-hour idle refusal. At zero available bytes the operator
+  skill permits a shorter floor: the 5,924 MiB Cargo target passes the complete
+  one-hour guard after 1.276 hours idle, with no Git/protection/open/cwd/mount
+  or external-hardlink exceptions. Copy to trj and verify complete content and
+  metadata before any fresh guard or authorized cutover. No RCH capacity,
+  source, timeout or product gate changes are permitted.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
