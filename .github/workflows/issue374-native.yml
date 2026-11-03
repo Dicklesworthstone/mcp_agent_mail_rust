@@ -52,7 +52,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable sync::inbox::tests:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/inbox-suite.log"
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-inbox/inbox-suite.log"
+          # This adjacent suite has three deliberately opt-in benchmarks. The
+          # GH374 step above separately requires every regression to execute.
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored;' "$RUNNER_TEMP/gh374-inbox/inbox-suite.log"
       - name: Preserve inbox evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
