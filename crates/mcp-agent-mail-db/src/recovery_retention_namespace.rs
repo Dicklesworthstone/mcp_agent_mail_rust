@@ -1453,8 +1453,11 @@ fn read_process_status_summary(process: &Path) -> io::Result<ProcessStatusSummar
         .find_map(|line| line.strip_prefix(b"Threads:"))
         .and_then(|line| std::str::from_utf8(line).ok())
         .and_then(|line| line.trim().parse::<u32>().ok())
-        .filter(|threads| *threads > 0)
         .ok_or_else(|| invalid("open-reader process status has no valid thread count"))?;
+    // Procfs can emit zero while a worker loses its signal-handler state,
+    // even in a record whose earlier State field still says running. Zero
+    // is a valid count, not evidence that its thread group has no readers:
+    // the terminal-state predicate and surviving-worker scan remain strict.
     let has_vm_size = status
         .split(|byte| *byte == b'\n')
         .any(|line| line.starts_with(b"VmSize:"));
@@ -3109,6 +3112,108 @@ mapping.close()
             assert!(!status_summary_denial_is_foreign(
                 &uncertain, &terminal, 1000
             ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zero_thread_status_is_valid_without_establishing_terminal_authority() {
+        let root = fixture();
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        let write_status = |threads: &str| {
+            std::fs::write(
+                root.join("status"),
+                format!(
+                    "State:\tR (running)\nFDSize:\t0\n{threads}Uid:\t{owner}\t{owner}\t{owner}\t{owner}\n"
+                ),
+            )
+            .unwrap();
+        };
+        // Real procfs also emits this combination while a worker exits.
+        // State and Threads are sampled at different points in status output.
+        write_status("Threads:\t0\n");
+        let summary = read_process_status_summary(&root).unwrap();
+        assert_eq!(summary.threads, 0);
+        assert!(!summary.is_exited_without_files_or_address_space());
+        assert!(!status_summary_denial_is_foreign(&summary, &summary, owner));
+
+        for malformed in [
+            "",
+            "Threads:\tinvalid\n",
+            "Threads:\t-1\n",
+            "Threads:\t4294967296\n",
+            "Threads:\t0 1\n",
+        ] {
+            write_status(malformed);
+            let error = read_process_status_summary(&root).err().unwrap();
+            assert!(error.to_string().contains("no valid thread count"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zero_thread_count_never_hides_a_surviving_worker_reader() {
+        for leader_live in [false, true] {
+            for worker_has_reader in [false, true] {
+                let root = fixture();
+                let source = root.join("generation");
+                std::fs::write(&source, b"zero-thread group reader fixture").unwrap();
+                let identity = std::fs::metadata(&source).unwrap();
+                let owner = identity.uid();
+                let process = root.join("4242");
+                let task = process.join("task/4243");
+                for path in [&process, &task] {
+                    std::fs::create_dir_all(path.join("fd")).unwrap();
+                    std::fs::create_dir_all(path.join("fdinfo")).unwrap();
+                    std::fs::write(path.join("maps"), b"").unwrap();
+                }
+                let state = if leader_live { "R" } else { "Z" };
+                let vm_size = if leader_live {
+                    "VmSize:\t4096 kB\n"
+                } else {
+                    ""
+                };
+                std::fs::write(
+                    process.join("status"),
+                    format!(
+                        "State:\t{state}\nFDSize:\t0\nThreads:\t0\n{vm_size}Uid:\t{owner}\t{owner}\t{owner}\t{owner}\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::write(
+                    task.join("status"),
+                    format!(
+                        "State:\tS\nFDSize:\t64\nThreads:\t1\nVmSize:\t4096 kB\nUid:\t{owner}\t{owner}\t{owner}\t{owner}\n"
+                    ),
+                )
+                .unwrap();
+                if worker_has_reader {
+                    std::os::unix::fs::symlink(&source, task.join("fd/7")).unwrap();
+                    std::fs::write(task.join("fdinfo/7"), format!("ino:\t{}\n", identity.ino()))
+                        .unwrap();
+                }
+                let caller = read_process_status_summary(Path::new("/proc/thread-self")).unwrap();
+                let result = inspect_process_reader_inventory(
+                    &process,
+                    4242,
+                    &caller,
+                    &identity,
+                    &source,
+                    None,
+                    || Ok(()),
+                );
+                if worker_has_reader {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    assert!(error.to_string().contains("process/task 4243"));
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(
+                    std::fs::read(&source).unwrap(),
+                    b"zero-thread group reader fixture"
+                );
+            }
         }
     }
 
