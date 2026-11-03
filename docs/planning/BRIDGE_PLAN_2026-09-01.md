@@ -64,11 +64,23 @@
   Preserve the image, actual source, original observer failure and results in
   a 12-member archive on trj; every member and the archive are verified/fsynced.
   This pre-merge native scope does not qualify later namespace changes.
-- [ ] Build and retain the new CLI, then execute the private real-MCP test:
+- [x] Build and retain the new CLI, then execute the private real-MCP test:
   two token findings and one URL finding, dry-run byte neutrality, intended
   field-only repairs, real authenticated requests, idempotence, exact undo,
   renewed 401 rejection and untouched read-only fallback/unrelated entries.
-  Fresh solo verification remains separate from independent review.
+  Portable production CLI bf35a95b (290,327,568 bytes) builds successfully
+  in 7,134 seconds, with all 3,902 live source inputs matching. Primary and
+  fresh-fixture solo runs each pass all ten actual CLI calls, including the
+  original secret-artifact refusal before protection, intended field-only
+  changes, real HTTP 401 to 200, zero-action idempotence, reverse exact undo
+  of all six files and renewed 401. Read-only fallback/unrelated entries stay
+  untouched. Each executing CLI image matches bf35a95b; both private servers
+  exit 0 and both stderr logs are empty. Fresh solo is not independent review.
+  Preserve the executable, unchanged harness, both runs, per-call image
+  digests, original red runs and source/gate witnesses in trj
+  `doctor-undo-real-mcp-0630/`: 293,488,640 bytes, 69 verified members,
+  SHA-256 99b23e81ccb1f7009188cf0de830819b77962e379630cbbff8bba17c79476d8b.
+  Archive, manifest, receipt and directories are verified and fsynced.
 - [x] Retain the workspace-built standalone CLI 0c5e26bd (309,760,848 bytes)
   by stable source-file hash and byte-verified/fsynced coordinator copy. This
   is the merged workspace test feature graph, not the separate production
@@ -89,7 +101,20 @@
   project, and add positive/file-bounded/static-parent-symlink controls.
   Formatting passes; UBS exit 0 has zero critical findings. All 22 added-line
   findings are reviewed test expectations, filesystem fixtures and path strings;
-  no scanner suppression. Compiler, native undo controls and new-CLI repair/
+  no scanner suppression. Current-source all-targets passes on hz4 at
+  05:03 UTC (3,022.6 seconds); its live snapshot matches all 3,902 inputs.
+  Production lib/bins first refuses admission for a missing capability;
+  after normal capability refresh it starts on hz4 at 05:38 UTC, again with
+  3,902 matching inputs and no omissions, and passes in 583.2 seconds.
+  Final all-targets including the legacy comparison test also passes;
+  the live observer misses this short run and exits 1. Its later 3,902-match
+  read is explicitly post-terminal, not live proof. Final strict Clippy
+  passes in 538.8 seconds with all 3,902 live inputs matching. Formatting
+  passes locally and read-only on hz4 over SSH; its RCH non-compilation job
+  refuses an oversized default request, with no policy change or SSH compile.
+  The focused native request refuses
+  before execution because a healthy peer job occupies hz3; no override.
+  Native undo controls and new-CLI repair/
   idempotence/exact-undo/fresh-solo results remain required. Earlier build and
   native evidence predates this source change. Broader authority tasks stay open.
 - [ ] Close this bug only on those source-bound native/CLI results. Keep the
@@ -134,9 +159,13 @@
   exact authorization/command/time. Root free rises 19,307 to 24,184 MiB:
   credit only the measured net 4,877 MiB. The sole remaining child is a verified,
   synced restore pointer; its root owner and mode match the archived original.
-- [ ] Fsync all verified archives/manifests, repeat full guards and prove no
+- [x] Fsync all verified archives/manifests, repeat full guards and prove no
   change since copy start before any cutover. Preserve synced restore pointers,
   exact authorization/command/time and measured net root headroom afterward.
+  Remaining vt cutovers start 04:11:33 UTC; net root increases 7,982 MiB
+  (18,891 to 26,873 MiB). Both pointers, owners and modes match and are synced.
+  Three-directory total is 12,859 MiB measured net. All 36 operator-receipt
+  archive members verify on trj; archive/manifest/receipt/directory are fsynced.
 - [ ] Finish the doctor native/CLI qualification and commit only owned work.
 - [x] Commit the doctor repair as 58025b24 after its compiler/lint/format gates,
   explicitly retaining pending native/CLI acceptance and the open Bead.
@@ -147,23 +176,102 @@
   Never force-push or flatten. The old native pass is not incoming-code proof.
 - [ ] Run required checks and full-workspace native validation on the merged
   source. Normal RCH admits the hz3 workspace native run at 00:58 UTC; it is
-  compiles in 170 minutes and starts 20,762 tests across 27 binaries, with 54
-  existing skips. Run aee8ebe1-7a51-4397-9f4a-b93837aaf913 is active; no final
-  verdict yet. Its source witness matches 3,896 present inputs but misses
+  compiled in 170 minutes and starts 20,762 tests across 27 binaries, with 54
+  existing skips. Run aee8ebe1-7a51-4397-9f4a-b93837aaf913 reaches its unchanged
+  four-hour limit: 10,200 PASS and 42 FAIL terminal records survive; remaining
+  tests are unexecuted or unreported. No full-suite pass. Exact wrapper recovery
+  acknowledges exit 137 and releases ownership without replay. Its source
+  witness matches 3,896 present inputs but misses
   six historical perf JSONs: the complete-input observer exits 2, retained red.
   The first merged compiler request refuses 103 before admission. Retry only
   after the CLI worker advances to current source; no admission overrides.
-- [ ] Preserve and resolve the full run's two real-`br` fixture failures:
+- [x] Preserve and resolve the full run's six real-`br` fixture failures:
   this invocation's private PATH omitted `/home/ubuntu/.local/bin`, where the
   worker's actual installed `br` resides. Keep the current run's environment
   fixed and its failures visible; include that real directory in the next
   source-bound invocation. No mocks, assertion changes or test exclusions.
-- [ ] Finish the current-source standalone CLI build and its real-MCP/fresh
-  solo acceptance. Its live witness matches all 3,902 inputs at 13afff25.
-- [ ] Execute the original opt-in setup permission case within its 240-second
-  bound after full-workspace native processes finish; review actual fixture
-  privilege/skip behavior. Keep br-3cqr4 open until its original acceptance is
-  met. No Windows-native, release or soak qualification is implied here.
+  All six original cases pass individually in fresh private fixtures with
+  actual br 0.7.6 on PATH and retained CLI test image 9ec7794d. The other 136
+  CLI Rust source files match its producer; the newer doctor module is
+  explicitly outside this claim. Preserve the original full-run failures.
+- [x] GOLDEN-CHANGE: review the stale vacuum description in both doctor-help
+  goldens against actual CLI 0c5e26bd and immutable source change 3194449a.
+  `acquire_doctor_vacuum_locks` refuses live-owner overrides; the handler takes
+  locks, retains a content-verified backup before compaction, and verifies the
+  result. Six existing native vacuum controls pass in the running suite.
+  Semantic diff is exactly one line per fixture: "Reclaim orphaned pages
+  INSIDE the live database" becomes "Compact the mailbox database offline
+  (verified backup, VACUUM + ANALYZE)". Manually update only those two expected
+  descriptions under leases 441/442. No bulk regeneration, normalization
+  change, removed assertion, bypassed owner guard or new product behavior.
+  Preserve the original snapshot failure; full native recheck remains pending.
+- [x] Complete the original real-age matrix with required dependencies:
+  18/18 pass, zero skips, on retained production CLI 50658da2. Thirteen cases
+  use ordinary real age; five bounded publication probes delay return only
+  after real age completes, including two actual CLI contenders with one
+  complete winner. Age/keygen 1.2.1 binaries are byte-verified copies from trj.
+  This is existing crypto-path requalification on a pre-undo artifact, not new
+  implementation, latest undo qualification, Windows proof or release clearance.
+- [x] Retain actual Core test image 6b96e829 (19,935,760 bytes), verify/fsync
+  worker and coordinator copies, and verify current setup/embedded installer/
+  lock/toolchain match its producer source. The old run passed 235 setup tests.
+  Execute the original ignored group-readable case separately: one test passes
+  in 1.379 seconds within the unchanged 240-second bound, UID 1000, zero
+  effective capabilities; sudo only prepares the foreign-owned fixture.
+  Keep br-3cqr4 open pending its remaining compiler/lint/platform acceptance.
+  Fresh solo execution of the same image again passes all 235 default setup
+  tests in 16.94 seconds, with the original opt-in still ignored in that
+  default invocation. All 80 Core/installer/manifest/lock/toolchain inputs
+  match its producer. Required current compiler/lint/format gates now pass;
+  native Windows remains unverified, with no independent-review claim.
+- [ ] Resolve and retain the ordinary UID-1000 host's reclamation boundary:
+  same-UID systemd PID 2212 has unreadable `/proc/2212/fd/0`; strict reader
+  census correctly refuses. Do not whitelist names, loosen inspection, or
+  turn these failures into a general unprivileged Linux pass. br-cdsge stays open.
+- [ ] Investigate the legacy-upgrade preservation test's Int/BigInt comparison
+  and independently verify complete payloads before deciding on a gate fix.
+  Read-only analysis of the complete first failed assertion finds exactly
+  25 canonical Int wrappers versus native BigInt wrappers; widening those
+  wrappers alone makes both complete debug payloads identical, preserving all
+  quoted text. This does not execute the later migration/write phases and
+  is not yet a passing preservation test.
+  GATE-CHANGE for br-kp1in.80: primary adapter source independently confirms
+  canonical SQLite narrows i32-range INTEGERs while FrankenSQLite returns
+  BigInt. Widen only Int to BigInt in the existing test comparison helper;
+  preserve every original migration, payload, timestamp, ID-floor, recipient
+  and integrity assertion. Add a real two-engine file probe for raw wrapper
+  differences, signed integer boundaries and five unequal/type negatives
+  (8, text '7', float 7.0, blob 0x37, NULL versus integer 7). Native acceptance
+  must publish how the original veto and all negatives resolve; no runtime
+  repair or performance win is claimed. Formatting passes. UBS remains red
+  on two unchanged intentional test panic guards; no suppression or removal.
+  Preserve the original failure and the capacity-replay p95/p99 loss; no
+  threshold changes or data-preservation claim from a type-width hypothesis.
+- [x] Finish the undo-scope standalone CLI build and its real-MCP/fresh-solo
+  acceptance. The pre-undo production CLI 50658da2 reproduces undo exit 3;
+  the new build's live witness matches all 3,902 frozen inputs at 9513cc33-dirty.
+  New bf35a95b passes both original real-MCP runs. Source-bound selected native
+  checks are admitted on hz3 after the peer job ends: doctor/undo/new scope
+  controls, Beads, help snapshots, crypto and canonical legacy upgrade. The
+  two-job request uses two configured slots without an override. Both live
+  source witnesses match 3,896 present files; six historical perf JSONs remain
+  missing and the complete-input observer stays red. Retain actual CLI and
+  integration test images from Nextest PID 3004111. Native acceptance is pending.
+- [x] Execute the original opt-in setup permission case within its unchanged
+  240-second bound after full-workspace native processes finish: one actual
+  test passes, as detailed above. Recheck malformed Codex TOML with actual
+  retained production CLI 50658da2: exit 1, refusal, unchanged bytes, neither
+  credential in either output stream. Preserve the initial project-path
+  fixture failure; correct the fixture to setup's supported HOME path.
+  Comments 3912/3913 record the evidence and unmet acceptance. Keep br-3cqr4
+  open. No Windows-native, release or soak qualification is implied here.
+- [x] Preserve the exact pre-undo production/Core/age executables, actual
+  source witnesses, crypto/setup results and original full-run failures in
+  trj `real-crypto-core-0542/`: archive SHA-256
+  2a4b09aea8f8270082eca9f42e58a8904db4ac507f0bc9bfc211447f3a567b0a,
+  322,007,040 bytes, all 24 members verified. Archive, manifest, durable
+  receipt and containing directories are fsynced. Real operator configs and
+  their private backups are excluded. New undo qualification is still pending.
 
 ## November 2: populated CLI reads and coordinator headroom
 
@@ -269,6 +377,20 @@
   Absent-kind calls take 1.877/1.879 seconds; no independent-review credit.
   Source was committed by another actor as 1af19a7c before qualification.
   Keep br-kp1in.18 in progress: its broader routing acceptance remains incomplete.
+- [ ] Finish recipient-kind daemon routing within the same original task.
+  Source review confirms `robot_commands.rs` explicitly bypasses the server
+  for `--kind`, while the MCP search tool and typed `SearchQuery` have no
+  recipient-kind field. Add real server-side filtering; removing the CLI
+  condition alone would silently lose the filter. Preserve project authority,
+  relevance, pagination and cursor validation, including matches on later pages.
+- [ ] Route the remaining empty-query branch without losing its existing
+  CLI guidance: the server's compatibility response is intentionally empty
+  and has no guidance. Keep stopped-daemon direct reads correct.
+- [ ] Qualify the complete routing change on the original 10k-message real
+  daemon fixture with mixed recipient kinds, matching later-page results,
+  absent-kind and invalid-cursor negatives, and stopped-daemon fallbacks.
+  Preserve the original archive-walk counter controls and timing bounds.
+  No routing closure from the earlier absent-kind shortcut or these source reads.
 - [ ] Execute full workspace native tests. The earlier Nextest invocation was
   canceled before admission and ran no tests; compiler passes are not test passes.
   A fresh normal hz3 Nextest invocation was submitted at 22:25 UTC with private
