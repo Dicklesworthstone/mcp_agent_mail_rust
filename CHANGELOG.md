@@ -112,6 +112,12 @@ release commit in 3fdda50c.
   their count and logical bytes without claiming that their allocation was freed.
   Post-unlink sync failures retain both this uncertainty and the existing
   completed-operation receipt, preventing blind retries after interruption.
+- **Unconfirmed namespace mutations stop the current retention pass.** A
+  completed rename or unlink followed by failed durability or namespace
+  validation now refuses publication admission and preserves remaining
+  candidates. A later inventory cannot turn that uncertain result into fresh
+  export capacity during the same pass. Refusals before mutation still allow
+  other eligible candidates to make bounded progress.
 
 The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
 preserves the earlier conservative-policy counterexamples and validation,

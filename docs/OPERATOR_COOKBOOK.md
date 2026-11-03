@@ -676,8 +676,9 @@ uses the same generation ordering as keep-window selection: the oldest
 eligible image goes first, including numeric collision suffixes across resident
 and parked locations. Directory spelling and copied mtimes cannot promote a
 newer dated collision ahead of an older one for deletion. Only
-confirmed removals reduce that calculation; a refused candidate cannot prevent
-cleanup from considering another safely superseded generation in the window.
+confirmed removals reduce that calculation; a refusal before mutation cannot
+prevent cleanup from considering another safely superseded generation in the
+window.
 These are bounds on cooperating automatic producers, not a filesystem quota
 on operator exports or other programs.
 
@@ -737,7 +738,10 @@ An incomplete backup namespace inventory refuses backup-file mutations and
 marks totals as lower bounds; the separately admitted empty-directory sweep
 can still make progress.
 Uncertain moves or unlinks have separate counters rather than being reported
-as successful reclamation. Each cleanup pass attempts at most 128 periodic
+as successful reclamation. If a rename or unlink completed but its durability
+or namespace validation failed, the current pass stops further mutations and
+refuses backup publication. The apparent absence of a pathname cannot override
+that unconfirmed result. Each cleanup pass attempts at most 128 periodic
 candidates, with a candidate-byte budget of the larger of 512 MiB and the
 current database's size. One oversized candidate can still be attempted so a
 large mailbox can make progress. Verifying the pinned restore point adds I/O

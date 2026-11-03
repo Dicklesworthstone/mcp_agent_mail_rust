@@ -100,8 +100,9 @@ pub struct RotateReport {
     /// At least one path could not be inventoried. Byte totals are then known
     /// lower bounds; inaccessible evidence is never treated as zero bytes.
     pub inventory_incomplete: bool,
-    /// Namespace, inventory, or snapshot admission was unavailable. A quota
-    /// refusal following this pass must not authorize a repair export.
+    /// Namespace, inventory, or snapshot admission was unavailable, or a
+    /// completed mutation has unconfirmed durability. A quota refusal following
+    /// this pass must not authorize a repair export.
     pub admission_refused: bool,
     /// The pass reached its wall-clock budget. What it did not reach stays on
     /// disk, counted as kept, for a later pass.
@@ -131,7 +132,17 @@ impl RotateReport {
             .saturating_add(self.bytes_unconfirmed_moves)
     }
 
+    fn record_failure(&mut self, failure: RotationFailure) {
+        // A completed namespace operation with uncertain durability is not
+        // evidence of reusable publication capacity. Stop this pass before
+        // another mutation can build on the unconfirmed result.
+        self.admission_refused |= failure.rename_completed || failure.deletion_completed;
+        self.failures.push(failure);
+    }
+
     fn add_kind(&mut self, kind: &'static str, summary: &RotateKindSummary) {
+        self.admission_refused |=
+            summary.unconfirmed_moves > 0 || summary.unconfirmed_deletions > 0;
         if summary == &RotateKindSummary::default() {
             return;
         }
@@ -732,9 +743,8 @@ fn reclaim_empty_rotation_directories(
             Err(error) => {
                 let failure = RotationFailure::from_error(&path, &error);
                 let completed = failure.deletion_completed;
-                report.failures.push(failure);
+                report.record_failure(failure);
                 if completed {
-                    report.admission_refused = true;
                     break;
                 }
             }
@@ -934,7 +944,7 @@ fn reclaim_periodic_file(
         Err(error) => {
             let failure = RotationFailure::from_error(path, &error);
             summary.record_failure(&failure, metadata.len());
-            report.failures.push(failure);
+            report.record_failure(failure);
         }
     }
     true
@@ -1766,12 +1776,17 @@ where
             #[cfg(not(unix))]
             let _ = within_window;
             let size = metadata.len();
+            if report.admission_refused {
+                summary.kept = summary.kept.saturating_add(1);
+                summary.bytes_kept = summary.bytes_kept.saturating_add(size);
+                continue;
+            }
             #[cfg(unix)]
             if let Err(error) = snapshot_guard.revalidate() {
                 report.admission_refused = true;
                 let failure = RotationFailure::from_error(path, &error);
                 summary.record_failure(&failure, size);
-                report.failures.push(failure);
+                report.record_failure(failure);
                 continue;
             }
             #[cfg(unix)]
@@ -1834,7 +1849,7 @@ where
                         );
                         let failure = RotationFailure::from_error(path, &err);
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                     }
                 }
                 continue;
@@ -1853,7 +1868,7 @@ where
                         );
                         let failure = RotationFailure::from_error(path, &err);
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                         continue;
                     }
                 }
@@ -1862,14 +1877,13 @@ where
                 let error = std::io::Error::other("rotation quarantine directory unavailable");
                 let failure = RotationFailure::from_error(path, &error);
                 summary.record_failure(&failure, size);
-                report.failures.push(failure);
+                report.record_failure(failure);
                 continue;
             };
             match stage(path, directory, metadata) {
                 Ok(dest) => {
                     #[cfg(unix)]
                     if let Err(error) = snapshot_guard.revalidate() {
-                        report.admission_refused = true;
                         let failure = RotationFailure {
                             source: path.clone(),
                             rename_completed: true,
@@ -1881,7 +1895,7 @@ where
                             ),
                         };
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                         continue;
                     }
                     debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
@@ -1908,7 +1922,7 @@ where
                         );
                     }
                     summary.record_failure(&failure, size);
-                    report.failures.push(failure);
+                    report.record_failure(failure);
                 }
             }
         }
@@ -3408,9 +3422,9 @@ mod tests {
                 report.bytes_unconfirmed_moves,
                 b"retained backup contents".len() as u64
             );
-            assert_eq!(report.failures.len(), 2);
+            assert!(report.admission_refused);
+            assert_eq!(report.failures.len(), 1);
             assert!(report.failures[0].rename_completed);
-            assert!(!report.failures[1].rename_completed);
             assert_eq!(
                 report.failures[0].requested_destination.as_ref(),
                 Some(&moves[0].1)
@@ -3441,6 +3455,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_continues_after_a_refusal_before_any_namespace_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let contents = b"retained backup contents";
+        let paths =
+            [1, 2, 3].map(|day| root.join(format!("storage.sqlite3.bak.2026010{day}_000000")));
+        for path in &paths {
+            fs::write(path, contents).unwrap();
+        }
+        let mut attempts = 0;
+        let mut moved = None;
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || {
+                rotate_storage_backups_with(&root, &primary, 1, |source, directory, metadata| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected refusal before rename",
+                        ));
+                    }
+                    let destination = stage_backup_noreplace(source, directory, metadata)?;
+                    moved = Some(destination.clone());
+                    Ok(destination)
+                })
+                .unwrap()
+            },
+        );
+        assert_eq!(attempts, 2);
+        assert!(!report.admission_refused);
+        assert_eq!(
+            (report.staged, report.kept, report.unconfirmed_moves),
+            (1, 2, 0)
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].source, paths[1]);
+        assert!(!report.failures[0].rename_completed);
+        assert!(!report.failures[0].deletion_completed);
+        assert!(!paths[0].exists());
+        assert_eq!(fs::read(moved.unwrap()).unwrap(), contents);
+        for path in &paths[1..] {
+            assert_eq!(fs::read(path).unwrap(), contents);
+        }
+        assert_eq!(report.bytes_retained(), 3 * contents.len() as u64);
+        assert_eq!(report.bytes_reclaimed, 0);
     }
 
     #[test]
@@ -4541,6 +4606,7 @@ mod tests {
         assert_eq!(summary.bytes_unlinked_with_unobserved_readers, 13);
         let mut report = RotateReport::default();
         report.add_kind(BackupKind::ManualBackup.label(), &summary);
+        assert!(report.admission_refused);
         assert_eq!(report.evicted(), 0);
         assert_eq!(report.bytes_retained(), 18);
         assert_eq!(report.bytes_reclaimed, 0);
@@ -4548,6 +4614,113 @@ mod tests {
         assert_eq!(report.unlinks_with_unobserved_readers, 1);
         assert_eq!(report.bytes_unlinked_with_unobserved_readers, 13);
         assert_eq!(report.per_kind[BackupKind::ManualBackup.label()], summary);
+    }
+
+    #[test]
+    fn completed_namespace_failure_receipts_refuse_publication_admission() {
+        // Receipt policy is distinct from the real post-rename/post-unlink
+        // sync-fault tests in recovery_retention_namespace. An ordinary
+        // refusal leaves capacity unchanged and must permit other candidates.
+        for (rename_completed, deletion_completed, reader_inventory_incomplete) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let failure = RotationFailure {
+                source: PathBuf::from("source"),
+                rename_completed,
+                deletion_completed,
+                reader_inventory_incomplete,
+                requested_destination: rename_completed.then(|| PathBuf::from("quarantine/source")),
+                error: "namespace operation refused or durability unconfirmed".to_owned(),
+            };
+            let completed = rename_completed || deletion_completed;
+            let mut report = RotateReport::default();
+            report.record_failure(failure.clone());
+            assert_eq!(report.admission_refused, completed);
+            assert_eq!(report.failures.as_slice(), std::slice::from_ref(&failure));
+            let mut summary = RotateKindSummary::default();
+            summary.record_failure(&failure, 17);
+            let mut aggregated = RotateReport::default();
+            aggregated.add_kind(BackupKind::ManualBackup.label(), &summary);
+            assert_eq!(aggregated.admission_refused, completed);
+            assert_eq!(aggregated.kept, usize::from(!completed));
+            assert_eq!(aggregated.unconfirmed_moves, usize::from(rename_completed));
+            assert_eq!(
+                aggregated.unconfirmed_deletions,
+                usize::from(deletion_completed)
+            );
+            assert_eq!(aggregated.bytes_reclaimed, 0);
+            assert_eq!(aggregated.evicted(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_failure_receipts_block_remaining_periodic_reclaims() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let paths = [1, 2].map(|day| {
+            tmp.path()
+                .join(format!("storage.sqlite3.bak.2000010{day}_000000"))
+        });
+        let original = fs::read(&primary).unwrap();
+        for path in &paths {
+            fs::copy(&primary, path).unwrap();
+        }
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        for rename_completed in [false, true] {
+            let pending = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| PendingReclaim {
+                    path: path.clone(),
+                    metadata: fs::metadata(path).unwrap(),
+                    historical: false,
+                    within_window: index == 1,
+                })
+                .collect();
+            let mut budget = ReclaimBudget {
+                attempted: 0,
+                bytes: 0,
+                byte_limit: u64::MAX,
+                publication: Some(PeriodicPublicationBudget {
+                    count: 6,
+                    bytes: 0,
+                    projected: 0,
+                    count_limit: 6,
+                    byte_limit: u64::MAX,
+                }),
+                deadline: None,
+                deadline_reached: false,
+            };
+            // Seed the report at the receipt boundary, without pretending to
+            // reproduce a filesystem sync failure in this coordinator test.
+            let mut report = RotateReport::default();
+            report.record_failure(RotationFailure {
+                source: tmp.path().join("earlier-candidate"),
+                rename_completed,
+                deletion_completed: !rename_completed,
+                reader_inventory_incomplete: !rename_completed,
+                requested_destination: rename_completed
+                    .then(|| tmp.path().join("parked-candidate")),
+                error: "namespace mutation completed; durability unconfirmed".to_owned(),
+            });
+            reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+            assert!(report.admission_refused);
+            assert_eq!(budget.attempted, 0);
+            assert_eq!(
+                (report.deleted, report.kept, report.window_images_deleted),
+                (0, 2, 0)
+            );
+            assert_eq!(report.bytes_retained(), 2 * original.len() as u64);
+            assert_eq!(report.failures.len(), 1);
+            assert_eq!(budget.publication.as_ref().unwrap().count, 6);
+            for path in &paths {
+                assert_eq!(fs::read(path).unwrap(), original);
+            }
+        }
     }
 
     #[test]
