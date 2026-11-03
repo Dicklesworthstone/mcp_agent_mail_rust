@@ -992,7 +992,9 @@ where
                     Err(error.to_string())
                 }));
             }
-            let lease = match backup_journal::AutomaticBackupLease::try_begin(primary, requested) {
+            let lease = match backup_journal::AutomaticBackupLease::try_begin(
+                primary, requested, admission,
+            ) {
                 Ok(Some(lease)) => lease,
                 Ok(None) => {
                     tracing::debug!(

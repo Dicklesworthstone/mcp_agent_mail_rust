@@ -1022,3 +1022,118 @@ Agent Mail test results. Independent review repeated YAML and shell syntax
 checks. No native GitHub Actions result is claimed by this static validation;
 the runtime gaps recorded above remain pending until an actual run on the
 changed commit completes.
+
+## Journal authority follows retained exporter admission
+
+Further review of `501f455` found that the coordinator validated its retained
+parent admission and then called a pathname-only journal constructor. That
+constructor independently opened the database parent. Replacing directory A
+with B between those steps allowed B to receive the durable export intent.
+Restoring A before the next admission check made the pathname valid again,
+while the journal and its one-time repair reservation still belonged to B.
+The original directory could consequently accept another repair export.
+This is a durable admission defect, even though the journal's existing
+descriptor-relative completion code faithfully updated its captured parent.
+
+Production `AutomaticBackupLease::try_begin` now requires the actual retained
+`BackupParentAdmission`. It preserves the existing no-follow ancestor walk,
+absolute-path and regular-mailbox checks, compares the captured directory
+against the retained admission's device and inode before any journal open,
+then duplicates the admitted directory for every journal operation and sync.
+Both directory handles remain alive during the comparison, preventing inode
+reuse. Restoring the pathname cannot make a captured foreign directory pass.
+The pathname-only clock-controlled constructor is restricted to tests.
+
+The coordinator supplies its existing token. The journal format, slot
+checksums, retry/backoff state transitions, repair reservation, completion
+semantics, no-truncation rule, file lock, and file/parent sync ordering are
+unchanged. The pool's existing authority check after the before-export
+callback remains in place. Two independent source reviews found no blocking
+issue in this change.
+
+### Native regression and causal evidence
+
+Three new tests run the real admission and journal implementations. They
+cover replacement after token validation with both absent and valid existing
+foreign journals; restoration after the foreign parent has already been
+captured; successful admission after restoring the original directory;
+retained repair debt on reopening; completion after a later replacement; and
+preservation of the original no-follow ancestor policy. The foreign mailbox
+and complete journal namespace must remain unchanged. The replacement seam
+uses ordinary directory renames, not a mocked filesystem.
+
+All three new tests passed. The complete actual journal, schedule, parent
+admission and staging modules then passed **81 tests, zero failures, zero
+ignored, zero filtered**, serially. The native harness uses complete source
+modules, a neutral crate alias, and the production parent constant/type alias
+with real dependencies. It substitutes no syscall, admission, journal,
+schedule or staging implementation. Tests use real files, locks, and child
+processes; the native fixture filesystem was tmpfs. This is component-level
+runtime evidence, not execution of the full pool exporter or server.
+
+A separate native counterexample compiled the entire unchanged journal from
+`501f455` alongside the actual admission module. Its honest-parent control
+passed. The replacement probe observed A's admission passing before and
+after replacement, B retaining the journal and spent repair allowance, and
+restored A accepting another repair. The required original-parent debt
+invariant then failed as expected. This was an explicitly separate
+counterexample, not a claim that the new regression source compiled unchanged
+against the old API or that a full coordinator export was executed.
+
+The candidate journal has SHA-256
+`efa1d7a080b822a5c2eb56a264d2967ff1c5eec9deb700606e63748c37935442`;
+the coordinator has SHA-256
+`1e1407a332592ace494814644522763003c9b2752f1b24fe6f14dbf7960edfc1`.
+The native executable has SHA-256
+`a173ba9a151bfed88c3ea98323b1b69f7a007ef1dfbb552727027ae1b57d43b5`,
+the complete native log has SHA-256
+`470886595ffb9c1e8aa842074c7bb59aa9d68d47150d5bc2452733c761f3055b`,
+and the native receipt has SHA-256
+`e512f44c28b0ac0c19ca2f3d79a3b2c83c18c2073f4efba5333d94b9c41eacaf`.
+Exact source witnesses, commands, logs, both executables, and the baseline
+scope are recorded under `am-retention-journal-parent-validation`.
+
+### Production integration and lint checks
+
+The complete production `integrity_guard` and `backup_rotation` module graph,
+its actual sibling modules and the same three verbatim production root helpers
+passed metadata/type checking in 1.524 seconds and strict Clippy in 2.683
+seconds. The complete native component modules, including all 81 test
+definitions, also passed strict Clippy in 0.768 seconds. All three final logs
+contained zero diagnostics; no lint requirement was reduced.
+
+The existing actual production DB metadata was reused because this change
+modifies only the server journal and its call site. All 87 DB source-file
+hashes were checked against that artifact's source manifest before and after
+validation. Its SHA-256 remains
+`18a00719cde9b3f9058583bb724e82d54a88ad7bb69dceeccd176178d35bf425`.
+This is not a new DB build, a whole-server-crate check, or a substitute for the
+remaining full-runtime producer gate. The production/lint receipt has SHA-256
+`82e6eebc6c57049150d765bef55bb1a7954b4af47f6cb1d5dc326bf14f24b4f9`.
+The repository-wide `cargo fmt --check` and final `git diff --check` passed.
+
+### Remaining authority and reader limits
+
+This closes the journal part of the control-file limitation recorded above.
+Recovery-breaker control-file creation and permission changes still have
+separate pathname-based acquisition paths; this commit does not claim those
+paths are descriptor-relative. It also does not close the broader
+`br-xzgcj` pool/archive authority work.
+
+Source review also identified an unresolved POSIX-lock preservation gap in
+the shared reclamation primitives. Staging, or final deletion after a reader
+arrives beyond the earlier preflight, can open an ordinary descriptor and
+then close it on completion or refusal. Linux can release another descriptor's
+traditional POSIX lock in the same descriptor table when that close occurs.
+The existing preflight test does not cover the whole subsequent open/close
+interval. No new full-production runtime reproducer is claimed for this
+separate source finding.
+
+An `O_PATH` pin has lock-neutral close semantics in the
+[Linux close implementation](https://github.com/torvalds/linux/blob/v6.12/fs/open.c),
+but cannot directly supply the current per-file fsync and exclusive flock.
+The change therefore does not remove either protection, replace per-file
+sync with filesystem-wide sync, or claim another preflight makes that interval
+atomic. Resolving this remaining issue requires a reviewed I/O ownership
+design. The original full-runtime, public Linux integration, and large
+retention gates remain distinct from the component result above.
