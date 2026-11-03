@@ -193,8 +193,71 @@ fn query_values(conn: &impl SyncQuery, sql: &str) -> Vec<Vec<Value>> {
     conn.query_sync(sql, &[])
         .unwrap_or_else(|error| panic!("{sql}: {error}"))
         .into_iter()
-        .map(|row| row.values().cloned().collect())
+        .map(|row| {
+            row.values()
+                .cloned()
+                .map(|value| match value {
+                    // Canonical SQLite uses Int for i32-range INTEGERs;
+                    // FrankenSQLite always uses BigInt. Compare the exact SQL
+                    // integer without coercing text, floats, blobs or NULL.
+                    Value::Int(value) => Value::BigInt(i64::from(value)),
+                    value => value,
+                })
+                .collect()
+        })
         .collect()
+}
+
+#[test]
+fn cross_engine_payload_comparison_preserves_values_and_sql_types() {
+    let dir = tempfile::tempdir().expect("integer comparison fixture");
+    let path = dir.path().join("values.sqlite3").display().to_string();
+    let canonical = CanonicalDbConn::open_file(&path).expect("canonical value writer");
+    canonical
+        .execute_raw(
+            "CREATE TABLE payloads (value);
+             INSERT INTO payloads VALUES
+                (7), (8), ('7'), (7.0), (x'37'), (NULL),
+                (-2147483648), (2147483647), (-2147483649), (2147483648),
+                (-9223372036854775808), (9223372036854775807);",
+        )
+        .expect("seed integer bounds and distinct SQL types");
+    let sql = "SELECT value FROM payloads ORDER BY rowid";
+    let raw = canonical
+        .query_sync(sql, &[])
+        .expect("raw canonical values");
+    assert_eq!(raw[0].values().next(), Some(&Value::Int(7)));
+    let original = query_values(&canonical, sql);
+    assert_eq!(
+        original,
+        vec![
+            vec![Value::BigInt(7)],
+            vec![Value::BigInt(8)],
+            vec![Value::Text("7".into())],
+            vec![Value::Double(7.0)],
+            vec![Value::Bytes(vec![b'7'])],
+            vec![Value::Null],
+            vec![Value::BigInt(i64::from(i32::MIN))],
+            vec![Value::BigInt(i64::from(i32::MAX))],
+            vec![Value::BigInt(i64::from(i32::MIN) - 1)],
+            vec![Value::BigInt(i64::from(i32::MAX) + 1)],
+            vec![Value::BigInt(i64::MIN)],
+            vec![Value::BigInt(i64::MAX)],
+        ]
+    );
+    for distinct in &original[1..6] {
+        assert_ne!(
+            original[0], *distinct,
+            "SQL type/value must remain distinct"
+        );
+    }
+    drop(canonical);
+
+    let native = DbConn::open_file(&path).expect("native value reader");
+    let raw = native.query_sync(sql, &[]).expect("raw native values");
+    assert_eq!(raw[0].values().next(), Some(&Value::BigInt(7)));
+    assert_eq!(query_values(&native, sql), original);
+    native.close_sync().expect("close native value reader");
 }
 
 /// Original payloads and relational keys, excluding timestamps that the
