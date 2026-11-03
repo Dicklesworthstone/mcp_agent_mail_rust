@@ -984,3 +984,42 @@ reclaimed bytes. Fresh solo verification is not independent review. The
 bounded process audit remains DRIFTING because repeated bookkeeping and
 speculative analysis exceeded their value; the next work should repair an
 observed runtime blocker while preserving these original failed gates.
+
+### Live mailbox incident discovered during handoff
+
+At 23:24–23:25 UTC, both attempts to release the eleven owned reservations
+queue real deferred intents: the live corruption breaker refuses writes
+after reporting page149 never used. Independent stock SQLite full integrity
+finds seven orphaned pages149–155, not a healthy database or an observed
+lost-row/index corruption. The supported vacuum plan classifies the database
+as leaked-pages-only; its count of one is one multiline result, not seven
+independently counted pages.
+
+The original installed TUI is gracefully stopped with its documented two
+Ctrl-C confirmations through only native mux pane42. Its executable hash,
+PID/foreground identity and original shell/cwd are checked; no force signal,
+takeover or mux restart occurs. Drain confirms safe-to-mutate. The complete
+quiesced database family is copied, whole-file hashes verified and synced.
+The full-family rehearsal correctly refuses the copied namespace generation
+without changing rows. A separate primary/WAL/SHM copy establishes its own
+generation and passes the same retained CLIbf35a95b supported vacuum.
+
+The live operation then passes at 23:30:29 UTC, with its verified pre-vacuum
+backup retained. All 23 original non-statistics tables preserve identical
+schema and canonical typed rows, full stock integrity returns `ok` and
+foreign-key checks return no violations. Restart the same installed binary
+171713fa in the original pane/shell/environment: PID189418. Live MCP health
+reports green with a successful full integrity check; the first deferred
+release intent replays eleven IDs and its duplicate is a zero-row no-op.
+Read-only SQL independently confirms all eleven released timestamps and
+full integrity remains `ok`. CLI doctor health still exits1 for the existing,
+unrelated reservation346 thread-provenance drift. This recovery neither
+proves an engine root cause nor changes the open br-htobc acceptance.
+
+All bounded incident evidence is verified and synced in the same trj evidence
+directory: `live-breaker-2328.tar`, 64 entries, 4,229,120 bytes, SHA-256
+`723efcc8ce5e32581c01a36229ce868e184cdd3b280ea69c06047b6c73be75fe`.
+Content, modes, owners and symlinks match source/archive manifest
+`f33a261f89d4dcc4569485ad470731deeb1d2171ceeed9e5ef3d78c8e3dd13f4`.
+The archive, controls and directory chain are synced. All sources remain
+preserved; this proof copy credits zero reclaimed bytes.

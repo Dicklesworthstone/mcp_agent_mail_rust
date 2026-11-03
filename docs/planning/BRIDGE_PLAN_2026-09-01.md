@@ -2,6 +2,25 @@
 
 ## Current priority: live workers with unshared reader tables
 
+- [x] Restore the live mailbox's write outage discovered at handoff. The
+  corruption breaker refuses reservation release; stock SQLite independently
+  reports orphaned pages149-155. Gracefully quit the exact original TUI via
+  its native mux pane and confirm the supported drain is safe. Preserve the
+  complete quiesced DB family. Keep the first copied-namespace refusal; a
+  separate generation rehearsal passes the supported vacuum. Apply it only
+  after that proof: all 23 original non-statistics tables retain identical
+  typed rows and schema, full stock integrity is ok and foreign keys pass.
+  Restart the same installed binary in the same pane/shell/environment,
+  PID189418. Live MCP health is green; accepted queued intents release all
+  eleven owned leases, and read-only SQL confirms their released timestamps.
+  CLI doctor health still reports the unrelated reservation346 provenance
+  mismatch. Keep br-htobc open: this is operational recovery, not an engine fix.
+- [x] Preserve and independently verify the complete bounded incident bundle
+  on trj, including the raw database failure and both rehearsal outcomes:
+  64 entries, 4,229,120 bytes, SHA256
+  723efcc8ce5e32581c01a36229ce868e184cdd3b280ea69c06047b6c73be75fe.
+  Full content/mode/owner/symlink manifests match; archive, controls and
+  directory chain are synced. Preserve sources and credit zero reclaimed bytes.
 - [x] Review the subsequent shared-checkout merge 9d38fd84 in full. Upstream
   a73ae5e3/71fda742/a3cdd223 change only the rotation/guard production files:
   numeric-generation reclamation order, sticky refusal after unconfirmed
