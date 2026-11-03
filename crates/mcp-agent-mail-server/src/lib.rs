@@ -18259,6 +18259,8 @@ const fn http_error_status(
 
 #[cfg(test)]
 mod tests {
+    mod issue374_http;
+
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
@@ -20059,6 +20061,7 @@ mod tests {
             "isolated {test_name} did not pass exactly one test: {stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        print!("{stdout}");
         true
     }
 

@@ -7,6 +7,8 @@ on:
       - '.github/workflows/issue374-native.yml'
       - 'crates/mcp-agent-mail-db/**'
       - 'crates/mcp-agent-mail-storage/**'
+      - 'crates/mcp-agent-mail-server/**'
+      - 'crates/mcp-agent-mail-tools/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -122,6 +124,45 @@ jobs:
         with:
           name: gh374-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gh374-reconciliation/
+          if-no-files-found: error
+          retention-days: 14
+
+  http:
+    name: Native HTTP inbox responsiveness and cancellation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned native compiler
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh374-http"
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          rustc -vV | tee "$RUNNER_TEMP/gh374-http/compiler.log"
+      - name: Exercise real HTTP inbox reads and cancelled pool admission
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-server --lib --no-default-features --features portable tests::issue374_http:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-http/regressions.log"
+          grep -Eq 'test result: ok\. 2 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-http/regressions.log"
+      - name: Require responsive HTTP inbox reads during 25100-message reconciliation
+        timeout-minutes: 100
+        env:
+          AM_TEST_GH374_LARGE_MAILBOX: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-server --lib --no-default-features --features portable tests::issue374_http::gh374_http_inbox_stays_responsive_during_reconciliation -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-http/concurrent-25100.log"
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-http/concurrent-25100.log"
+          grep -F '"case":"gh374_native_http_reconciliation"' "$RUNNER_TEMP/gh374-http/concurrent-25100.log" | grep -F '"large_mailbox":true' | grep -F '"messages":25100'
+      - name: Preserve HTTP qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gh374-http-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gh374-http/
           if-no-files-found: error
           retention-days: 14
 
