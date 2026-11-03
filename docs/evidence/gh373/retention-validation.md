@@ -861,15 +861,64 @@ live source witness again matches all 3,896 present inputs with the same six
 omissions. Strict workspace Clippy with -D warnings also passes:
 Cargo15m33s, remote exit0 in 938.201 seconds and outer RCH exit0 in 970.8
 seconds. Its live witness has the same matches and omissions. The complete
-three-gate controller exits0 at 21:38:46 UTC. Actual native execution remains
-pending; compilation alone cannot qualify the reader behavior. The initial 141-case native
+three-gate controller exits0 at 21:38:46 UTC. A fresh formatting check also
+passes. The initial 141-case native
 request refuses before Cargo because hz4
 has no admitted slots. At 20:24:52 UTC a retry from the original producer path
 is admitted normally on hz4, using its protected 357d41b1 target. Both live
 native processes match all 3,896 present inputs and the same six historical
-JSON omissions. Whole-executable collectors are active before tests begin.
-Native execution remains pending; the new source's compiler passes do not
-substitute for that runtime qualification.
+JSON omissions. Whole-executable collectors are active before tests begin;
+the execution-time source witness repeats those matches and omissions.
+
+The native run is terminal red: **120 pass, 20 fail, one timeout**, all 141
+selected cases executed, 10,461 outside selection, 479.674 seconds after a
+122m58s build. RCH returns100. Both new zero-thread controls pass, as does the
+real five-mode public reader guard in 6.385 seconds. Opaque-unlink accounting
+passes in 5.450 seconds; the exact cause of its earlier failure remains
+unproved. Ordinary strict reader-census refusals remain. The 720-cycle case
+times out at its unchanged 240-second limit (240.100 seconds observed), and
+the large-directory case fails in 36.274 seconds. These outcomes do not
+establish a speed improvement or complete the original retention acceptance.
+
+The actual new images are DB unit
+`76c51a9c2b13db54be4fc2f7e923dba17f11cc96edf492f3b988bb38e5e842e8`
+(146,843,168 bytes), integration
+`48e35f92938960b63f72aba1b3a77ff51ed578a3e7bedb9f75404beb7b57732f`
+(125,985,208 bytes), and server
+`84588f861c3fdfa3cc6fb19c434f72be96940f55eb0aa958f9ab292ecfcf921c`
+(351,914,432 bytes). Complete held-descriptor hashes match their retained
+copies. One raced `/proc/1035138/exe` capture error remains in the original
+collector receipt; the successful complete captures are not reconstructed
+from that failed attempt. All three files are hash-verified and synced on trj
+beside the compiler archive below. No cache-policy fix is claimed.
+
+A second execution of the exact same 141 names, using those same three images,
+finishes in one consistent coordinator role: UID/GID65534, CapEff0,
+dumpable/readable controller, umask002 and full host procfs. **140 pass, one
+timeout, zero other failures**; the original 16,641-directory case reaches
+240.005 seconds. The 720-cycle case passes in 152.652 seconds. Image hashes
+remain stable before/after and the case population matches the ordinary run
+exactly. Both host and role differ, so this does not isolate a causal
+environment difference. It neither replaces ordinary120/20/1 nor establishes
+load-20 performance, platform, release or whole-project clearance. The
+original five-item Bead remains in progress.
+
+The entire stopped role tree, including its three images, controller, case
+outputs and timed-out fixture, is verified and synced on trj beside the
+compiler evidence: 15,356 entries, 202,067,520 compressed bytes, SHA-256
+`726dc631dd15baae76211f14d91d4030c1ff7fdb90e18dacda0323f420217dc3`.
+Its source and archive manifests match
+`61261a45f0c06f9af196b0ba303a1d994ece83e54887b5c5c6a7309ba8054731`.
+All content, modes, owners and symlinks are checked; files and directory
+chain are synced. Sources remain intact and reclaimed-byte credit is zero.
+
+The separate terminal/source/collector bundle is also verified and synced:
+25 members, 1,474,560 bytes, SHA-256
+`423f10864a83ef5f3e36f785095415b14c4ed0a1249dce33f56eb24062400958`.
+It retains the ordinary failures, execution-time source witness, original
+collector race, real kernel probe and bounded process audit. The compiler
+and complete role archives remain separate; no passing claim is reconstructed
+from an unsuccessful capture.
 
 A separate native arm64 Mac probe exercises the exact production
 `lsof -n -P -Fpf -- <candidate>` invocation on Darwin25.2.0/macOS26.2 with
@@ -893,3 +942,45 @@ Every member hash and metadata field, plus the complete archive hash, is
 verified on trj; the archive, control records and directory chain are synced.
 This is a copy-only preservation of completed bounded evidence. No native
 execution, release clearance, source removal or reclaimed bytes are inferred.
+
+### Separate retained-CLI reliability diagnostic
+
+The existing, unmodified release-smoke harness04210cb8 executes the retained
+production-feature CLIbf35a95b (290,327,568 bytes), bound to the older
+9513cc33 plus doctor811 source manifest. This is not the current parser
+candidate or a release-mode qualification. Original thresholds remain:
+300-second soak/convergence, 60 agents for 480 seconds and unchanged latency
+and progress gates. The run lasts 21:58:13–22:17:54 UTC and exits1 with clean
+shutdown. README flow, cross-project checks, 240-send storm, crash recovery
+and all nine mixed-soak checks pass. The swarm fails on four inbox
+RESOURCE_BUSY responses among 10,265 calls and failure to complete live Git
+archive convergence within 300 seconds. Error detail is `database is busy
+(recovery in progress)`. All 10,319 acknowledged swarm sends survive SIGKILL;
+full stock SQLite integrity passes after both crash phases.
+
+At 296.174 seconds the last completed live observation has 22,989 DB and
+archive messages, no missing/extra/duplicate/mismatched IDs, but 12 reported
+uncommitted copies and an advancing Git head. The terminal observation hits
+its deadline at 300.001 seconds; its zero counters are unobserved values,
+not proof of an empty database. After shutdown, the unchanged observer passes
+in 15.168 seconds: all 22,989 messages and 79,287 required copies are
+committed and consistent. That later result never replaces the live failure.
+The harness and gate remain unchanged; the original frozen-drain phenotype
+is not reproduced in the observed progress windows, and no root cause or
+closure is inferred. The inherited Git observer discards child stderr;
+those missing diagnostics cannot be recovered from this run. That limitation
+does not turn the failed live gate into a pass.
+
+The complete fixture, exact CLI, harness, source manifest and full retained
+logs are verified and synced under
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/retained-bf35-reliability-2240/`.
+All 353,969 entries match content, modes, owners and symlinks. The
+2,586,600,289-byte gzip has SHA-256
+`3ffc3aa56188d66b481f4b8393de45c7a98aa3f76d2e91f09b098961d9303adf`;
+source/archive manifest SHA-256 is
+`6ee96138d5a0003bbf2f0220c291b87f06d0ade79123f1d9efef1af0990943be`.
+Files and the directory chain are synced. Sources remain intact, with zero
+reclaimed bytes. Fresh solo verification is not independent review. The
+bounded process audit remains DRIFTING because repeated bookkeeping and
+speculative analysis exceeded their value; the next work should repair an
+observed runtime blocker while preserving these original failed gates.

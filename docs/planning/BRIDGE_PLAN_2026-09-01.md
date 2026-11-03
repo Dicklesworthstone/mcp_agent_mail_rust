@@ -79,7 +79,8 @@
   retries and all existing refusal behavior. Add two Linux unit cases covering
   missing/malformed/negative/overflow records and both live/dead-leader group
   scans with a planted surviving reader. Formatting passes after manual fixes.
-- [ ] Qualify that draft in its separate checkout while the remote 9d build stays frozen. The new selection
+- [x] Execute the draft's required static gates and full native selection in
+  its separate checkout while the remote 9d build stays frozen. The new selection
   is the original 139 plus two parser/group controls, 141 total. Run actual
   production/all-targets/strict-Clippy checks and real-reader native tests;
   the parser fixtures alone are R3, compensated only by separately cited real
@@ -92,8 +93,7 @@
   Strict workspace Clippy with -D warnings passes: Cargo15m33s, remote exit0
   in 938.201 seconds, outer RCH exit0 in 970.8 seconds. Its live source
   witness again has 3,896 matches and the same six omissions. The complete
-  three-gate controller exits0 at 21:38:46 UTC. Actual native execution
-  remains pending; these compiler passes cannot substitute for it.
+  three-gate controller exits0 at 21:38:46 UTC. Fresh formatting also passes.
   The first native request refuses before Cargo at zero admitted hz4 slots.
   At 20:24 UTC, fast-forward the original local producer to 05d2bc1b and apply
   the identical parser overlay manually. All 3,902 inputs match the separate
@@ -101,9 +101,28 @@
   the existing protected target path. Before/after remote witnesses confirm
   vmi1149989 retains the older 9d inputs despite the local producer advance;
   both new native processes match all 3,896 present inputs, with the same six
-  historical JSON omissions. Actual-executable collectors are running. The
+  historical JSON omissions. The execution-time witness confirms the same
+  source. Native compilation takes 122m58s; all 141 cases execute in 479.674
+  seconds: 120 pass, 20 fail, one times out, 10,461 outside selection. Both
+  added zero-thread controls pass; the real five-mode public reader guard
+  passes in 6.385 seconds. Opaque-unlink accounting passes in 5.450 seconds,
+  without establishing the cause of its earlier failure. The 720-cycle case
+  reaches its unchanged limit at 240.100 seconds. Preserve every refusal and
+  the large-directory failure; no performance qualification follows. The
   shared checkout now records the parser change in b2a29afa; the validation
   base plus explicit overlay remains the qualification identity.
+- [x] Replay the exact complete 141-case population on the three captured
+  images in one consistent coordinator role: UID/GID65534, CapEff0,
+  dumpable/readable controller, umask002 and full host procfs. All 141 names
+  match the ordinary selection and image hashes are stable before/after.
+  Result: 140 pass, zero non-timeout failures, one 240.005-second timeout on
+  the original 16,641-directory case. The 720-cycle case passes in 152.652
+  seconds. Host and role both differ; keep the ordinary 120/20/1 result
+  separate. The original five acceptance criteria and root Bead remain open.
+- [x] Preserve the actual executed images on trj, with whole-file hashes and
+  fsync: DB unit76c51a9c, integration48e35f92, server84588f86. One raced
+  /proc/1035138/exe capture error is retained; the successful complete copies
+  have stable open identities. Do not describe the entire collector as clean.
 - [x] Refresh the available native platform boundaries without interrupting
   the frozen builds. Windows SSH still times out. On the reachable arm64
   Mac (Darwin25.2.0/macOS26.2, lsof4.91), run the exact production lsof argv
@@ -117,8 +136,18 @@
   26 members, 5,406,720 bytes, SHA256 b39aff5111a61558576c17b3d90c01fb08867a217c317472a18b250143e81c47.
   Verify all member hashes/metadata and the full archive, then sync files and
   directory chain. This copy removes no source and credits zero reclaimed
-  bytes; it does not qualify the still-pending 141-case native run.
-- [ ] While native compilation continues, execute the existing full isolated
+  bytes; its compiler evidence is separate from the native results above.
+- [x] Preserve the complete native terminal/source/collector records and
+  finish the evidence handoff on trj: the 25-member terminal archive is
+  1,474,560 bytes, SHA256
+  423f10864a83ef5f3e36f785095415b14c4ed0a1249dce33f56eb24062400958,
+  with every member hash/metadata and the whole archive checked and synced.
+  The entire stopped role-replay tree is
+  already verified and synced: 15,356 entries, compressed SHA256
+  726dc631dd15baae76211f14d91d4030c1ff7fdb90e18dacda0323f420217dc3,
+  manifest61261a45, including all images, outputs and the timed-out fixture.
+  No source is removed and no reclaimed bytes are credited.
+- [x] Finish preserving the executed full isolated
   release-smoke harness against retained CLI bf35a95b with its original
   300-second soak/convergence and 60-agent/480-second swarm. Bind it to its
   older 9513cc33 plus doctor811 source manifest; it is a diagnostic for the
@@ -126,9 +155,35 @@
   No source, harness, latency or population setting changes. README flow,
   cross-project, 240-send storm, 356 acknowledged crash-survivor IDs, archive
   convergence and stopped-server stock integrity checks pass in the log.
-  Mixed soak and swarm, terminal receipt and final clean shutdown remain
-  required. Preserve all isolated mailbox data and do not take over the
-  other owner's P0 tasks from these intermediate results.
+  Five-minute mixed soak passes all nine checks. The complete run exits1 and
+  shuts down cleanly at 22:17:54 UTC: five phases pass, swarm fails on four
+  fetch_inbox RESOURCE_BUSY responses among 10,265 calls and live Git archive
+  convergence exceeding the original 300-second observation budget. All
+  10,319 acknowledged swarm sends survive the crash and full stock integrity
+  passes. The last completed live observation has all 22,989 DB/archive
+  messages, with some uncommitted copies and an advancing HEAD. A separate
+  stopped-server comparison passes in 15.168 seconds with all 79,287 required
+  copies committed; it never replaces the original live failure. No harness
+  or gate is edited. Preserve all 353,969 fixture/provenance entries, exact
+  CLI and full logs on trj: all content/modes/owners/symlinks match, files
+  and directory chain synced, gzip SHA256
+  3ffc3aa56188d66b481f4b8393de45c7a98aa3f76d2e91f09b098961d9303adf,
+  source/archive manifest6ee96138. Sources remain intact, zero reclaim credit.
+  The inherited Git observer discards child stderr, which limits diagnosis;
+  preserve the original failure rather than infer missing diagnostics.
+  Keep the other owner's P0 task and original br-kp1in.35
+  release-build/named-probe acceptance open.
+- [x] Complete the bounded anti-ceremony/honesty review. Verdict DRIFTING:
+  useful runtime repairs and original failing probes are real; repeated
+  bookkeeping and speculative analysis cost too much. Fresh solo verification
+  is not independent review. The next implementation must address an observed
+  runtime blocker, without expanding reports, weakening an oracle or splitting
+  acceptance to close a task.
+- [ ] Resolve the original retention acceptance: named refusal diagnostics,
+  hidden-reader namespace negative, the 16,641-directory load-20 bound,
+  scan-bound/per-pass cost and native Rust macOS validation. The ordinary
+  native failures and separate role timeout remain red, with Windows and
+  release qualification also open.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
@@ -201,9 +256,11 @@
   1,002-member terminal/source/role archive. Retain the raced collector error,
   initial 28/35 harness result and corrected 63/0 result. These proof copies
   preserve their sources and claim zero reclaimed root bytes.
-- [ ] Update the existing validation record, Beads and final commit/push after
-  qualification. The broader br-5nr0m acceptance remains open; no performance
-  win, whole-workspace runtime or release qualification is inferred.
+- [x] Update the existing validation record and Beads and preserve the final
+  small terminal bundle. Release only this agent's reservations at handoff.
+  Preserve the shared unpublished history; publication stays held. The broader
+  br-5nr0m acceptance remains open; no performance win, whole-workspace runtime
+  or release qualification is inferred.
 
 ## November 3 UTC: qualify the published opaque-reader retention change
 
