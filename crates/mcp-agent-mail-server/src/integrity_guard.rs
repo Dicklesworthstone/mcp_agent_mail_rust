@@ -836,10 +836,18 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             "backup retention removed newest images because the publication budget stayed exhausted"
         );
     }
+    if report.unlinks_with_unobserved_readers > 0 {
+        tracing::info!(
+            phase,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
+            "verified superseded backup paths unlinked with incomplete reader visibility; physical blocks may remain until open descriptors and mappings close"
+        );
+    }
     if !report.failures.is_empty()
         || report.admission_refused
         || report.inventory_incomplete
-        || report.unlinks_with_incomplete_reader_inventory > 0
+        || report.unlinks_with_unobserved_readers > 0
         || report.unconfirmed_moves > 0
         || report.unconfirmed_deletions > 0
     {
@@ -852,7 +860,8 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
-            unlinks_with_incomplete_reader_inventory = report.unlinks_with_incomplete_reader_inventory,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
             unconfirmed_moves = report.unconfirmed_moves,
             bytes_unconfirmed_moves = report.bytes_unconfirmed_moves,
@@ -877,6 +886,8 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
             deadline_reached = report.deadline_reached,
             "backup retention completed"
@@ -2110,7 +2121,8 @@ mod tests {
         let opaque = crate::backup_rotation::RotateReport {
             deleted: 1,
             bytes_deleted: 4096,
-            unlinks_with_incomplete_reader_inventory: 1,
+            unlinks_with_unobserved_readers: 1,
+            bytes_unlinked_with_unobserved_readers: 4096,
             ..Default::default()
         };
         let capture = WarnCapture::default();
@@ -2121,7 +2133,11 @@ mod tests {
         let warnings = capture.0.lock().unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
-            warnings[0].contains("unlinks_with_incomplete_reader_inventory=1"),
+            warnings[0].contains("unlinks_with_unobserved_readers=1"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("bytes_unlinked_with_unobserved_readers=4096"),
             "{warnings:?}"
         );
         assert!(warnings[0].contains("bytes_reclaimed=0"), "{warnings:?}");

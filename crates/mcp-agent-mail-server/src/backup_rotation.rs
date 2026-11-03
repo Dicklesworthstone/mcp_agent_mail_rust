@@ -63,9 +63,10 @@ pub use mcp_agent_mail_db::recovery_retention::{
 /// Report returned by `rotate_storage_backups`. One entry per non-empty kind.
 ///
 /// "Staged" means moved into a `doctor/reclaimable/rotation-<ts>[-<n>]/`
-/// quarantine directory; "deleted" means hard-removed. Superseded periodic
-/// generations can be deleted by default under verified snapshot admission;
-/// other kinds require explicit `AM_BACKUP_ROTATION_DELETE` opt-in.
+/// quarantine directory; "deleted" means its pathname was durably unlinked.
+/// Superseded periodic generations can be deleted by default under verified
+/// snapshot admission; other kinds require explicit `AM_BACKUP_ROTATION_DELETE`
+/// opt-in.
 /// Staged bytes are *not* reclaimed disk. On Unix, staging also requires the
 /// source-file and parent-directory syncs and identity checks to complete.
 /// A rename followed by failed sync or validation is separately unconfirmed:
@@ -83,14 +84,15 @@ pub struct RotateReport {
     pub deleted: usize,
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
-    /// Known allocated bytes of successfully unlinked, single-link files.
-    /// This is not a measurement of the filesystem's free-space delta, and
-    /// excludes files whose reader inventory was incomplete.
+    /// Allocated bytes of successfully unlinked, single-link files. This is
+    /// not a measurement of the filesystem's free-space delta. Files with
+    /// incomplete reader visibility do not contribute to this total.
     pub bytes_reclaimed: u64,
-    /// Superseded image unlinks with opaque external reader inventories,
-    /// including completed but durability-unconfirmed unlinks. Existing
-    /// readers retain their bytes; physical reclamation is unknown.
-    pub unlinks_with_incomplete_reader_inventory: usize,
+    /// Completed unlinks whose external reader inventory was incomplete.
+    /// This includes completed unlinks with unconfirmed directory durability;
+    /// surviving descriptors and mappings can still retain the inode's blocks.
+    pub unlinks_with_unobserved_readers: usize,
+    pub bytes_unlinked_with_unobserved_readers: u64,
     pub unconfirmed_deletions: usize,
     pub bytes_unconfirmed_deletions: u64,
     pub unconfirmed_moves: usize,
@@ -119,8 +121,9 @@ impl RotateReport {
         self.staged.saturating_add(self.deleted)
     }
 
-    /// Known retained logical bytes, including quarantined and incompletely
-    /// staged files. Unconfirmed unlinks have their own separate counter.
+    /// Known logical bytes at retained paths, including quarantined and
+    /// incompletely staged files. Unconfirmed unlinks have their own counter;
+    /// unlinked bytes possibly held by unobserved readers are also separate.
     #[must_use]
     pub const fn bytes_retained(&self) -> u64 {
         self.bytes_kept
@@ -139,9 +142,12 @@ impl RotateReport {
         self.bytes_staged = self.bytes_staged.saturating_add(summary.bytes_staged);
         self.bytes_deleted = self.bytes_deleted.saturating_add(summary.bytes_deleted);
         self.bytes_reclaimed = self.bytes_reclaimed.saturating_add(summary.bytes_reclaimed);
-        self.unlinks_with_incomplete_reader_inventory = self
-            .unlinks_with_incomplete_reader_inventory
-            .saturating_add(summary.unlinks_with_incomplete_reader_inventory);
+        self.unlinks_with_unobserved_readers = self
+            .unlinks_with_unobserved_readers
+            .saturating_add(summary.unlinks_with_unobserved_readers);
+        self.bytes_unlinked_with_unobserved_readers = self
+            .bytes_unlinked_with_unobserved_readers
+            .saturating_add(summary.bytes_unlinked_with_unobserved_readers);
         self.unconfirmed_moves = self
             .unconfirmed_moves
             .saturating_add(summary.unconfirmed_moves);
@@ -164,9 +170,12 @@ impl RotateReport {
         total.bytes_reclaimed = total
             .bytes_reclaimed
             .saturating_add(summary.bytes_reclaimed);
-        total.unlinks_with_incomplete_reader_inventory = total
-            .unlinks_with_incomplete_reader_inventory
-            .saturating_add(summary.unlinks_with_incomplete_reader_inventory);
+        total.unlinks_with_unobserved_readers = total
+            .unlinks_with_unobserved_readers
+            .saturating_add(summary.unlinks_with_unobserved_readers);
+        total.bytes_unlinked_with_unobserved_readers = total
+            .bytes_unlinked_with_unobserved_readers
+            .saturating_add(summary.bytes_unlinked_with_unobserved_readers);
         total.unconfirmed_moves = total
             .unconfirmed_moves
             .saturating_add(summary.unconfirmed_moves);
@@ -188,6 +197,8 @@ pub struct RotationFailure {
     pub source: PathBuf,
     pub rename_completed: bool,
     pub deletion_completed: bool,
+    /// A completed unlink had incomplete external reader visibility.
+    pub reader_inventory_incomplete: bool,
     /// Requested spelling, not a guarantee that a concurrently renamed parent
     /// can still be reached through this path. Never use it for blind rollback.
     pub requested_destination: Option<PathBuf>,
@@ -210,6 +221,12 @@ impl RotationFailure {
                     .is_some(),
             #[cfg(not(unix))]
             deletion_completed: false,
+            #[cfg(unix)]
+            reader_inventory_incomplete:
+                mcp_agent_mail_db::recovery_retention::CompletedReclaimDelete::from_io_error(error)
+                    .is_some_and(|completed| completed.bytes().reader_inventory_incomplete),
+            #[cfg(not(unix))]
+            reader_inventory_incomplete: false,
             requested_destination,
             error: error.to_string(),
         }
@@ -225,7 +242,8 @@ pub struct RotateKindSummary {
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
     pub bytes_reclaimed: u64,
-    pub unlinks_with_incomplete_reader_inventory: usize,
+    pub unlinks_with_unobserved_readers: usize,
+    pub bytes_unlinked_with_unobserved_readers: u64,
     pub unconfirmed_deletions: usize,
     pub bytes_unconfirmed_deletions: u64,
     pub unconfirmed_moves: usize,
@@ -233,11 +251,38 @@ pub struct RotateKindSummary {
 }
 
 impl RotateKindSummary {
+    fn record_reader_visibility(&mut self, incomplete: bool, bytes: u64) {
+        if incomplete {
+            self.unlinks_with_unobserved_readers =
+                self.unlinks_with_unobserved_readers.saturating_add(1);
+            self.bytes_unlinked_with_unobserved_readers = self
+                .bytes_unlinked_with_unobserved_readers
+                .saturating_add(bytes);
+        }
+    }
+
+    fn record_deletion(
+        &mut self,
+        logical_bytes: u64,
+        allocated_bytes: Option<u64>,
+        reader_inventory_incomplete: bool,
+    ) {
+        self.deleted = self.deleted.saturating_add(1);
+        self.bytes_deleted = self.bytes_deleted.saturating_add(logical_bytes);
+        if !reader_inventory_incomplete {
+            self.bytes_reclaimed = self
+                .bytes_reclaimed
+                .saturating_add(allocated_bytes.unwrap_or(0));
+        }
+        self.record_reader_visibility(reader_inventory_incomplete, logical_bytes);
+    }
+
     fn record_failure(&mut self, failure: &RotationFailure, bytes: u64) {
         if failure.deletion_completed {
             self.unconfirmed_deletions = self.unconfirmed_deletions.saturating_add(1);
             self.bytes_unconfirmed_deletions =
                 self.bytes_unconfirmed_deletions.saturating_add(bytes);
+            self.record_reader_visibility(failure.reader_inventory_incomplete, bytes);
         } else if failure.rename_completed {
             self.unconfirmed_moves = self.unconfirmed_moves.saturating_add(1);
             self.bytes_unconfirmed_moves = self.bytes_unconfirmed_moves.saturating_add(bytes);
@@ -839,26 +884,16 @@ fn reclaim_periodic_file(
     };
     match result {
         Ok(bytes) => {
-            summary.deleted = summary.deleted.saturating_add(1);
-            summary.bytes_deleted = summary.bytes_deleted.saturating_add(bytes.logical_bytes);
-            summary.bytes_reclaimed = summary
-                .bytes_reclaimed
-                .saturating_add(bytes.allocated_bytes.unwrap_or(0));
-            summary.unlinks_with_incomplete_reader_inventory = summary
-                .unlinks_with_incomplete_reader_inventory
-                .saturating_add(usize::from(bytes.reader_inventory_incomplete));
+            summary.record_deletion(
+                bytes.logical_bytes,
+                bytes.allocated_bytes,
+                bytes.reader_inventory_incomplete,
+            );
             if let Some(publication) = budget.publication.as_mut() {
                 publication.record_deletion(bytes.logical_bytes);
             }
         }
         Err(error) => {
-            if let Some(completed) =
-                mcp_agent_mail_db::recovery_retention::CompletedReclaimDelete::from_io_error(&error)
-            {
-                summary.unlinks_with_incomplete_reader_inventory = summary
-                    .unlinks_with_incomplete_reader_inventory
-                    .saturating_add(usize::from(completed.bytes().reader_inventory_incomplete));
-            }
             let failure = RotationFailure::from_error(path, &error);
             summary.record_failure(&failure, metadata.len());
             report.failures.push(failure);
@@ -1756,20 +1791,26 @@ where
                 #[cfg(unix)]
                 let deletion = snapshot_guard
                     .delete_superseded_incident_generation(snapshot_primary, path, metadata)
-                    .map(|bytes| (bytes.logical_bytes, bytes.allocated_bytes));
+                    .map(|bytes| {
+                        (
+                            bytes.logical_bytes,
+                            bytes.allocated_bytes,
+                            bytes.reader_inventory_incomplete,
+                        )
+                    });
                 #[cfg(not(unix))]
-                let deletion: std::io::Result<(u64, Option<u64>)> = Err(std::io::Error::new(
+                let deletion: std::io::Result<(u64, Option<u64>, bool)> = Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "verified descriptor-bound incident reclamation is unavailable",
                 ));
                 match deletion {
-                    Ok((logical_bytes, allocated_bytes)) => {
+                    Ok((logical_bytes, allocated_bytes, reader_inventory_incomplete)) => {
                         debug!(kind = kind.label(), path = %path.display(), logical_bytes, "deleted verified rotated backup (explicit opt-in)");
-                        summary.deleted += 1;
-                        summary.bytes_deleted = summary.bytes_deleted.saturating_add(logical_bytes);
-                        summary.bytes_reclaimed = summary
-                            .bytes_reclaimed
-                            .saturating_add(allocated_bytes.unwrap_or(0));
+                        summary.record_deletion(
+                            logical_bytes,
+                            allocated_bytes,
+                            reader_inventory_incomplete,
+                        );
                     }
                     Err(err) => {
                         warn!(
@@ -1820,6 +1861,7 @@ where
                             source: path.clone(),
                             rename_completed: true,
                             deletion_completed: false,
+                            reader_inventory_incomplete: false,
                             requested_destination: Some(dest),
                             error: format!(
                                 "backup moved but snapshot authority changed: {error}; evidence retained, do not retry"
@@ -1921,8 +1963,8 @@ where
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
-            unlinks_with_incomplete_reader_inventory =
-                report.unlinks_with_incomplete_reader_inventory,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
             inventory_incomplete = report.inventory_incomplete,
             admission_refused = report.admission_refused,
@@ -2145,11 +2187,19 @@ mod tests {
         assert_eq!(report.deleted, 1);
         assert_eq!(report.bytes_deleted, u64::try_from(original.len()).unwrap());
         assert_eq!(report.bytes_reclaimed, 0);
-        assert_eq!(report.unlinks_with_incomplete_reader_inventory, 1);
+        assert_eq!(report.unlinks_with_unobserved_readers, 1);
+        assert_eq!(
+            report.bytes_unlinked_with_unobserved_readers,
+            u64::try_from(original.len()).unwrap()
+        );
+        assert_eq!(
+            report.per_kind[BackupKind::ManualBackup.label()].unlinks_with_unobserved_readers,
+            1
+        );
         assert_eq!(
             report.per_kind[BackupKind::ManualBackup.label()]
-                .unlinks_with_incomplete_reader_inventory,
-            1
+                .bytes_unlinked_with_unobserved_readers,
+            u64::try_from(original.len()).unwrap()
         );
         assert!(!old.exists());
         reader.0.stdin.take().unwrap().write_all(b"r").unwrap();
@@ -2239,6 +2289,139 @@ mod tests {
         assert!(!older.exists());
         assert!(!first.exists());
         assert_eq!(fs::read(newest).unwrap(), fs::read(&primary).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_reenabled_after_staging_honors_the_current_keep_count() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let metadata_path = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+        let metadata = fs::read(&metadata_path).unwrap();
+        for day in 1..=4 {
+            fs::copy(
+                &primary,
+                tmp.path()
+                    .join(format!("storage.sqlite3.bak.200001{day:02}_000000")),
+            )
+            .unwrap();
+        }
+
+        // Exercise the real move-only producer of native history. Its old
+        // keep decision must not become permanent deletion authority when
+        // the operator later raises the window and re-enables reclamation.
+        let staged = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_BACKUP_ROTATION_DELETE", "false"),
+                ("AM_BACKUP_KEEP_COUNT", "2"),
+            ],
+            || rotate_storage_backups(tmp.path(), &primary, resolved_keep_per_kind()).unwrap(),
+        );
+        assert!(staged.failures.is_empty(), "{:?}", staged.failures);
+        assert!(!staged.admission_refused);
+        assert_eq!((staged.staged, staged.deleted, staged.kept), (3, 0, 2));
+        let history = inspect_historical_backups(tmp.path(), &primary);
+        assert!(!history.incomplete);
+        assert_eq!(history.eligible.len(), 3);
+        assert!(admit_periodic_publication(tmp.path(), &primary, 2).is_err());
+
+        let retained = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_BACKUP_ROTATION_DELETE", "true"),
+                ("AM_BACKUP_KEEP_COUNT", "5"),
+            ],
+            || rotate_storage_backups(tmp.path(), &primary, resolved_keep_per_kind()).unwrap(),
+        );
+        assert!(retained.failures.is_empty(), "{:?}", retained.failures);
+        assert!(!retained.admission_refused);
+        assert_eq!(
+            (retained.staged, retained.deleted, retained.kept),
+            (0, 0, 5)
+        );
+        assert_eq!(retained.bytes_retained(), staged.bytes_retained());
+        assert_eq!(retained.window_images_deleted, 0);
+        admit_periodic_publication(tmp.path(), &primary, 5).unwrap();
+        for (path, _) in &history.eligible {
+            assert_eq!(fs::read(path).unwrap(), live);
+        }
+
+        // Reducing the current window makes exactly those older generations
+        // eligible again, without disturbing the slot or verified authority.
+        let reclaimed = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_BACKUP_ROTATION_DELETE", "true"),
+                ("AM_BACKUP_KEEP_COUNT", "2"),
+            ],
+            || rotate_storage_backups(tmp.path(), &primary, resolved_keep_per_kind()).unwrap(),
+        );
+        assert!(reclaimed.failures.is_empty(), "{:?}", reclaimed.failures);
+        assert!(!reclaimed.admission_refused);
+        assert_eq!(
+            (reclaimed.staged, reclaimed.deleted, reclaimed.kept),
+            (0, 3, 2)
+        );
+        assert_eq!(reclaimed.window_images_deleted, 0);
+        assert_eq!(
+            reclaimed.bytes_deleted + reclaimed.bytes_retained(),
+            staged.bytes_retained()
+        );
+        assert!(history.eligible.iter().all(|(path, _)| !path.exists()));
+        assert_eq!(
+            fs::read(tmp.path().join("storage.sqlite3.bak.20000104_000000")).unwrap(),
+            live
+        );
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert_eq!(fs::read(metadata_path).unwrap(), metadata);
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_interrupted_history_does_not_displace_the_keep_window() {
+        let tmp = TempDir::new().unwrap();
+        let (primary, images) = mailbox_with_mixed_periodic_history(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let generation_bytes = fs::metadata(&primary).unwrap().len();
+        let marker = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-19991231T235959Z/manifest.json");
+        let unfinished = b"interrupted recovery; preserve every transaction payload";
+        fs::write(&marker, unfinished).unwrap();
+
+        // The newest dated images happen to be in the interrupted directory.
+        // They consume publication capacity but cannot displace independently
+        // retained resident generations, or be deleted to satisfy the quota.
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "true")],
+            || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(!report.admission_refused);
+        assert!(!report.inventory_incomplete);
+        assert_eq!((report.staged, report.deleted, report.kept), (0, 2, 12));
+        assert_eq!(report.per_kind["protected_quarantine"].kept, 9);
+        assert_eq!(report.per_kind[BackupKind::ManualBackup.label()].kept, 3);
+        assert_eq!(report.window_images_deleted, 0);
+        assert_eq!(report.bytes_deleted, 2 * generation_bytes);
+        assert_eq!(
+            report.bytes_retained(),
+            11 * generation_bytes + u64::try_from(unfinished.len()).unwrap()
+        );
+        for (day, path) in &images {
+            if path.parent() == Some(tmp.path()) && *day < 6 {
+                assert!(!path.exists(), "{}", path.display());
+            } else {
+                assert_eq!(fs::read(path).unwrap(), live, "{}", path.display());
+            }
+        }
+        assert_eq!(fs::read(marker).unwrap(), unfinished);
+        let footprint = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
+        assert_eq!(footprint.images, 11);
+        assert_eq!(footprint.retained_bytes, report.bytes_retained());
+        assert!(footprint.publication_refused());
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
     }
 
     #[cfg(unix)]
@@ -4341,6 +4524,7 @@ mod tests {
             source: PathBuf::from("source"),
             rename_completed: true,
             deletion_completed: false,
+            reader_inventory_incomplete: false,
             requested_destination: Some(PathBuf::from("quarantine/source")),
             error: "post-move validation failure".to_string(),
         };
@@ -4349,6 +4533,7 @@ mod tests {
             source: PathBuf::from("deleted-source"),
             rename_completed: false,
             deletion_completed: true,
+            reader_inventory_incomplete: true,
             requested_destination: None,
             error: "unlink completed; directory sync failed".to_string(),
         };
@@ -4362,12 +4547,58 @@ mod tests {
         assert_eq!(summary.bytes_unconfirmed_moves, 11);
         assert_eq!(summary.unconfirmed_deletions, 1);
         assert_eq!(summary.bytes_unconfirmed_deletions, 13);
+        assert_eq!(summary.unlinks_with_unobserved_readers, 1);
+        assert_eq!(summary.bytes_unlinked_with_unobserved_readers, 13);
         let mut report = RotateReport::default();
         report.add_kind(BackupKind::ManualBackup.label(), &summary);
         assert_eq!(report.evicted(), 0);
         assert_eq!(report.bytes_retained(), 18);
         assert_eq!(report.bytes_reclaimed, 0);
         assert_eq!(report.bytes_unconfirmed_deletions, 13);
+        assert_eq!(report.unlinks_with_unobserved_readers, 1);
+        assert_eq!(report.bytes_unlinked_with_unobserved_readers, 13);
+        assert_eq!(report.per_kind[BackupKind::ManualBackup.label()], summary);
+    }
+
+    #[test]
+    fn completed_unlinks_distinguish_unobserved_readers_from_reclaimed_blocks() {
+        let mut first = RotateKindSummary::default();
+        first.record_deletion(11, Some(4096), false);
+        // Even a supplied allocation estimate cannot be counted as reclaimed
+        // when an unobserved reader may retain the inode after its unlink.
+        first.record_deletion(17, Some(8192), true);
+        let refused = RotationFailure::from_error(
+            Path::new("still-present"),
+            &std::io::Error::other("reader refusal before unlink"),
+        );
+        first.record_failure(&refused, 23);
+        let mut second = RotateKindSummary::default();
+        second.record_deletion(29, None, true);
+
+        let mut report = RotateReport::default();
+        report.add_kind(BackupKind::ManualBackup.label(), &first);
+        report.add_kind(BackupKind::ManualBackup.label(), &second);
+        assert_eq!(report.deleted, 3);
+        assert_eq!(report.bytes_deleted, 57);
+        assert_eq!(report.bytes_reclaimed, 4096);
+        assert_eq!(report.unlinks_with_unobserved_readers, 2);
+        assert_eq!(report.bytes_unlinked_with_unobserved_readers, 46);
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.bytes_retained(), 23);
+        assert_eq!(report.unconfirmed_deletions, 0);
+        assert_eq!(report.bytes_unconfirmed_deletions, 0);
+        let kind = &report.per_kind[BackupKind::ManualBackup.label()];
+        assert_eq!(kind.deleted, report.deleted);
+        assert_eq!(kind.bytes_deleted, report.bytes_deleted);
+        assert_eq!(kind.bytes_reclaimed, report.bytes_reclaimed);
+        assert_eq!(
+            kind.unlinks_with_unobserved_readers,
+            report.unlinks_with_unobserved_readers
+        );
+        assert_eq!(
+            kind.bytes_unlinked_with_unobserved_readers,
+            report.bytes_unlinked_with_unobserved_readers
+        );
     }
 
     #[cfg(unix)]

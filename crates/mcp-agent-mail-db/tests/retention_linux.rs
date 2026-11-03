@@ -597,7 +597,7 @@ fn exited_thread_group_leader_does_not_hide_a_live_backup_reader() {
                 Ok(descriptors) => assert_eq!(descriptors.count(), 0),
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
             }
-            assert_eq!(fs::read(proc.join("maps")).unwrap(), Vec::<u8>::new());
+            assert_eq!(fs::read(proc.join("maps")).unwrap(), [] as [u8; 0]);
             let leader_status = fs::read_to_string(proc.join("status")).unwrap();
             assert!(leader_status.lines().any(|line| {
                 line.strip_prefix("State:")
@@ -620,7 +620,7 @@ fn exited_thread_group_leader_does_not_hide_a_live_backup_reader() {
             if opaque {
                 assert_real_procfs_denial(&task);
             } else {
-                assert_ne!(fs::read(task.join("maps")).unwrap(), Vec::<u8>::new());
+                assert_ne!(fs::read(task.join("maps")).unwrap(), [] as [u8; 0]);
             }
             let inventoried = fs::metadata(&generation).unwrap();
             let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
