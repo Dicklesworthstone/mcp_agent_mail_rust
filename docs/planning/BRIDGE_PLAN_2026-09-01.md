@@ -2,6 +2,15 @@
 
 ## Current priority: live workers with unshared reader tables
 
+- [x] Review the subsequent shared-checkout merge 9d38fd84 in full. Upstream
+  a73ae5e3/71fda742/a3cdd223 change only the rotation/guard production files:
+  numeric-generation reclamation order, sticky refusal after unconfirmed
+  namespace mutations, and budget deferral before snapshot admission. Five
+  added tests preserve the original populations and deadlines.
+- [ ] After the frozen 11d262da native job terminates, fast-forward the clean
+  validation checkout to the combined source. Re-run required compiler gates
+  and the complete now-139-case selection. Verify actual image freshness;
+  11d compiler and server-runtime results do not qualify the new server edits.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
