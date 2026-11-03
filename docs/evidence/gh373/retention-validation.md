@@ -745,8 +745,99 @@ Active/protected trees were excluded. Current free space can fall as other jobs
 write; this is neither a persistent-headroom guarantee nor a NAS repair claim.
 
 Normal RCH admission then started the frozen 9d38fd84 139-case native rerun on
-hz4 and the sequential required compiler gates on vmi1152480. Both live source
-witnesses match 3,896 present inputs, with the same six historical performance
-JSON omissions and no changed present input. Both builds are active at this
-checkpoint. No source identity, worker capacity, deadline or production policy
-override was used, and no merged-source runtime or compiler pass is inferred.
+hz4 and the required compiler gates on vmi1152480. Live source witnesses match
+3,896 present inputs, with the same six historical performance JSON omissions
+and no changed present input. All-targets passes in 3,937.2 seconds; Cargo also
+reports an existing third-party future-compatibility notice. The following
+production request refuses before Cargo starts. That worker reaches zero root
+headroom during unrelated batch builds, whose sessions subsequently exit; none
+is signalled. The remaining production/strict-Clippy pipeline is admitted
+normally on vmi1149989, with the same live input witness. Those gates remain
+pending. No source identity, worker capacity, deadline or product policy
+override is used.
+
+The merged native run compiles in 92 minutes 42 seconds, then executes every
+selected case: **117 pass, 22 fail, no timeout**, in 535.602 seconds, with
+10,461 cases outside selection. All five added ordering/durability/deadline
+regressions pass. The five-mode public visible-reader negative passes in
+8.043 seconds. Every failure remains retained. The original 720-cycle case
+fails after 110.882 seconds because a worker's proc status has no valid thread
+count; transient teardown is a hypothesis, not an independently reproduced
+kernel explanation. The opaque-unlink accounting case and ample-time empty
+directory cleanup also fail and need diagnosis. No faster-runtime or
+whole-suite conclusion follows from this changed failure split.
+
+Both collectors retain the actual complete images with no copy errors. DB
+library ab40be30 and integration 74eee95c match the unchanged 11d source;
+their bit identity is not a cache-freshness repair claim. The changed server's
+SHA-256 is `6e0b047411b67b75b38c49f3c5968e9a1029f7a50d5cb3d68e9d976aaaeee5c9`,
+351,912,336 bytes. All three images are independently checked inside their
+verified, synced archives under `trj:/bulk/worker-relocated-20261102-am-reservation-read/retention-merged-9d38-native-1854/`.
+The library archive SHA-256 is
+`84bc98091c0e2d26d1d6caa9a966d81693d91dc6bb094bf52e0db36b980cf54f`;
+integration/server archive SHA-256 is
+`53ccc5aea4ae68d3f53f9975052fe1eeaae188c3beebd4a258707ff9dbf6a3e7`.
+Sources remain protected and intact; proof copies claim zero reclaimed bytes.
+
+A separate replay of all 76 server cases finishes in the established
+coordinator UID/GID65534, CapEff-zero, readable-controller, umask002 role,
+with full host procfs, unchanged executable/assertions and original 240-second
+deadlines: **75 pass, one timeout**. The 16,641-directory backlog times out at
+240.005 seconds; the 720-cycle case passes in 150.274 seconds and ample-time
+empty-directory cleanup passes in 2.027 seconds. This shows success in that
+role and host; it does not isolate which environment difference caused the
+ordinary failure or rule out an intermittent defect. It does not qualify the
+load-20 performance acceptance. The first staging attempt preceded completion of the image transfer;
+its 345,984,000-byte partial copy is preserved. Staging was corrected with the
+complete hash-verified image before execution. Automatic review rejected a
+combined driver with an opaque constructed subprocess argument list; no driver
+code ran. Explicit, statically reviewable move/install/hash/runner commands
+completed staging without a review bypass. No role result replaces the
+ordinary-worker 117/22 result, and no independent or release clearance is claimed.
+
+The complete ordinary-run terminal record, source witnesses, clean live capture
+receipts, all 76 role-case outputs and the kernel probe below are independently
+verified and synced in a 178-member, 2,846,720-byte archive alongside the actual
+images on trj. Its SHA-256 is
+`d067585d462906d155d5c1c2024b5a8ef132b8acb69b0c4328670e164d776ed7`.
+The partial diagnostic install is an independently hashed exact prefix of the
+preserved full server image; it remains locally protected and never executed.
+No unrelated live mailbox configuration or database is included.
+
+### Valid zero-thread status: a separate parser repair
+
+The affected worker's real `7.0.0-31-generic` procfs emitted a pinned worker
+status with `Threads: 0`, `State: R`, `FDSize: 0`, no `VmSize`, and its leader
+still present. The first bounded attempt observes this after 25 status reads;
+the entire raw record, probe and six ESRCH observations are retained. This is
+not the exact status of the PID from the earlier failing test. The separate
+probe establishes a valid kernel input that the current positive-only count
+parser rejects. Upstream [Linux 6.8 procfs source](https://raw.githubusercontent.com/torvalds/linux/v6.8/fs/proc/array.c)
+also explicitly initializes this output to zero when the signal-handler lock
+cannot be obtained; that older implementation is a mechanism reference, not
+proof of the exact timing in the earlier test.
+
+The new draft removes only the positive-value filter after unsigned parsing.
+Zero does not satisfy the existing terminal-state or foreign-UID predicates,
+and it does not bypass group enumeration. Two added unit cases retain refusal
+of missing/malformed/negative/overflow counts and plant a surviving reader
+behind both live and dead zero-count leaders, alongside an empty-group control.
+These parser/proc-shaped fixtures are R3; the real kernel observation and
+existing real-public-reader path are separate evidence. The change admits
+syntactically valid unsigned zero counts previously refused by the parser;
+all other reader exclusions remain. No test is disabled, deadline widened or
+count bound changed.
+
+The namespace draft SHA-256 is
+`27e569dd96b5da2bd080e3662ff0182773d98b67a796a2f87a1f5854216cc58d`.
+It is reproduced manually in a separate validation worktree at clean base
+05d2bc1b plus an explicit source overlay, SHA-256
+`ea33ba6a97b802aaf58db009b3f3c6009e089c5d37f9041e980c4fc139b417be`.
+The earlier 9d checkout remains frozen for its ongoing gates. Formatting passes.
+The one-file UBS scan remains red: one unchanged critical fixed Python lock
+fixture, 581 warnings and 458 informational findings. All 47 added-line findings
+are reviewed; none is critical or in production code. Nothing is suppressed.
+The new required compiler pipeline is active under normal vmi1152480 admission;
+its live witness matches 3,896 present inputs plus the same six historical JSON
+omissions. The initial 141-case native request refuses before Cargo because hz4
+has no admitted slots. No passing older gate qualifies this new draft.

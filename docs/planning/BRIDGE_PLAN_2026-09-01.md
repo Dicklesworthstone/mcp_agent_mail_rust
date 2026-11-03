@@ -22,8 +22,9 @@
   separately. A normal vmi1149989 request starts the remaining production and
   strict Clippy pipeline. Live native/all-targets input witnesses match all
   3,896 present files with the same six historical JSON omissions. Native
-  execution is active; its full five-mode visible-reader negative and both
-  completed-mutation receipt regressions pass. The full result remains pending.
+  execution finishes 117 pass and 22 fail across all 139 cases, with no timeout
+  and 10,461 outside selection. All five new regressions and the five-mode
+  visible-reader negative pass. Production and strict Clippy remain pending.
   11d compiler/server results do not qualify the new server edits.
 - [x] Complete the authorized hz4 storage relocation before admitting its
   native retry. Preserve and verify all 78,193 entries in the 14,378,229,760-byte
@@ -33,13 +34,54 @@
   restore stub. Preserve and verify all 17 operator receipts, including the
   user's authorization, exact command and UTC time. Keep active/protected
   caches and proof images; no NAS recovery is inferred.
-- [ ] Recover emergency headroom on vmi1152480 without discarding data. Keep
+- [x] Diagnose the full vmi1152480 disk and preserve a safe recovery candidate. Keep
   the original six-hour idle refusal. At zero available bytes the operator
   skill permits a shorter floor: the 5,924 MiB Cargo target passes the complete
   one-hour guard after 1.276 hours idle, with no Git/protection/open/cwd/mount
-  or external-hardlink exceptions. Copy to trj and verify complete content and
-  metadata before any fresh guard or authorized cutover. No RCH capacity,
+  or external-hardlink exceptions. Complete the verified 12,803-entry,
+  6,176,040,960-byte archive and independently hash/fsync its manifests and
+  ten operator receipts on trj. Root headroom returns independently to about
+  33.5 GiB before cutover, so retain the source and cancel source removal:
+  the emergency shorter floor no longer applies. Credit zero reclaimed bytes.
+  No RCH capacity,
   source, timeout or product gate changes are permitted.
+- [x] Retain and independently verify/fsync the actual merged-source images on
+  trj. The unchanged DB images match ab40be30/74eee95c; the changed server image
+  is 6e0b047411b67b75b38c49f3c5968e9a1029f7a50d5cb3d68e9d976aaaeee5c9,
+  351,912,336 bytes. Both live collectors finish with no copy errors. The
+  535.602-second runtime is a red result, not a performance qualification.
+- [x] Check the empty-directory failure with the complete original server
+  selection: the same 6e0b0474 image executes all 76 cases as UID65534,
+  umask002, full host procfs: 75 pass and the 16,641-directory case times out
+  at its original 240 seconds. Empty-directory cleanup passes in 2.027 seconds;
+  the 720-cycle case passes in 150.274 seconds. Preserve the ordinary-worker
+  117/22 split separately; this is neither a role-independent pass nor a
+  load-20/incumbent performance comparison. Role and host both differ, so
+  the precise cause of the ordinary empty-directory failure remains open.
+- [ ] Diagnose the newly observed opaque-unlink, empty-directory and worker-status failures
+  without changing policy or assertions. The original 720-cycle case fails
+  after 110.882 seconds on a worker status with no valid thread count. Preserve a
+  premature partial image install before staging the complete hash-verified
+  executable; no test ran against the partial image.
+- [x] Reproduce the parser's rejected input directly on hz4's actual
+  7.0.0-31 kernel. A pinned real worker status emits Threads=0, State=R,
+  FDSize=0 and no VmSize while its leader remains present. Capture the whole
+  status after 25 reads in the first bounded attempt. This is a real kernel
+  input, not a captured status from the exact failed test PID.
+- [x] Draft a minimal production parser correction on main, leaving the 9d
+  validation checkout frozen: accept the kernel's unsigned zero count;
+  preserve terminal-state/UID predicates, pinned group enumeration, bounds,
+  retries and all existing refusal behavior. Add two Linux unit cases covering
+  missing/malformed/negative/overflow records and both live/dead-leader group
+  scans with a planted surviving reader. Formatting passes after manual fixes.
+- [ ] Qualify that draft in its separate checkout while 9d stays frozen. The new selection
+  is the original 139 plus two parser/group controls, 141 total. Run actual
+  production/all-targets/strict-Clippy checks and real-reader native tests;
+  the parser fixtures alone are R3, compensated only by separately cited real
+  kernel/public-reader evidence. No passing 9d gate qualifies the new draft.
+  Normal vmi1152480 admission is executing the new compiler pipeline, with
+  all 3,896 present inputs matching and the same six historical omissions.
+  The first native request refuses before Cargo at zero admitted hz4 slots.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
