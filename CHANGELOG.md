@@ -83,24 +83,34 @@ release commit in 3fdda50c.
   evidence retains its existing safeguards and publication-budget accounting.
 - **Linux reader inspection no longer trusts session-daemon names.** A
   nondumpable process can keep a descriptor or mapping after changing its name,
-  group, or capabilities. Such uncertainty now refuses deletion. A terminated
+  group, or capabilities. Such uncertainty is recorded explicitly. A terminated
   leader is exempted only with positive kernel evidence that its own file table
   and address space are gone, and surviving workers are still inspected.
 - **A different procfs PID namespace no longer creates a false self-reader.**
   Cleanup identifies its retained descriptor using the mounted `/proc/self`
-  identity. Generic opaque same-user processes still cause conservative
-  refusals; this change does not promise that every unreadable process can be
-  safely ignored.
+  identity. Its current descriptor table is inspected strictly before canonical
+  verification opens a file, protecting same-process SQLite locks without
+  multiplying the scan by the number of worker threads.
 - **Transient procfs permission denials retry the actual reader inventory.**
   One retry after 5 ms rechecks descriptors, mappings and surviving workers
   within the same scan budget. A retained process-directory descriptor prevents
-  PID reuse from redirecting the retry. Persistent same-user permission denials
-  still retain the backup.
+  PID reuse from redirecting the retry, including surviving workers.
+- **Persistent procfs denials no longer disable verified periodic retention.**
+  Only after snapshot authority proves a newer verified restore point, lineage,
+  standalone recovery state and an unchanged owned namespace may it unlink a
+  superseded periodic image with unobservable external readers. Known readers
+  still refuse deletion. Hidden descriptors, `O_PATH` handles and memory mappings
+  keep their original inode's bytes; the original pathname can disappear.
+  This is an explicit unlink-safety policy, not a claim that an inaccessible
+  process is harmless. Generic cleanup and incident deletion remain strict.
+- **Unlinks with unobservable readers have separate accounting.** Reports expose
+  their count and logical bytes without claiming that their allocation was freed.
+  Post-unlink sync failures retain both this uncertainty and the existing
+  completed-operation receipt, preventing blind retries after interruption.
 
 The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
-preserves the current-main counterexamples, the 39 passing namespace tests,
-real-process controls, and the distinction between those results and the
-larger native count/public-guard tests blocked by build-memory limits.
+preserves the earlier conservative-policy counterexamples and validation,
+alongside the current unlink policy and its real-process and retention tests.
 
 ### Other changes on main
 

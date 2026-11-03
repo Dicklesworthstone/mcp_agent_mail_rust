@@ -725,27 +725,12 @@ fn inspect_file_readers(
         excluded_descriptor,
         &mut charge,
     )?;
-    // Before any candidate open, inspect every own task's table, not merely
-    // the leader's. No descriptor is excluded during this preflight.
-    if excluded_descriptor.is_none() {
-        for task in std::fs::read_dir(Path::new("/proc").join(&own_process).join("task"))? {
-            charge()?;
-            let task = match task {
-                Ok(task) => task,
-                Err(error) if is_proc_task_gone(&error) => continue,
-                Err(error) => return Err(error),
-            };
-            inspect_process_reader_inventory(
-                &task.path(),
-                own_pid,
-                &self_status,
-                retained_identity,
-                &canonical_source,
-                None,
-                &mut charge,
-            )?;
-        }
-    }
+    // Linux POSIX locks belong to the current files_struct. The strict scan
+    // above covers every thread sharing that descriptor table; closing our
+    // verifier cannot release locks owned by an unshared table. Do not scan
+    // the same descriptors and address space once per worker thread: that
+    // would consume the bounded inventory solely because the server is busy.
+    // The leader and any surviving workers are still checked below as before.
     let mut evidence = SnapshotReaderEvidence::default();
     for entry in std::fs::read_dir("/proc")? {
         charge()?;

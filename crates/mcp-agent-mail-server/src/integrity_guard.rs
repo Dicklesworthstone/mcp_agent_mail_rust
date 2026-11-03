@@ -836,6 +836,14 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             "backup retention removed newest images because the publication budget stayed exhausted"
         );
     }
+    if report.unlinks_with_unobserved_readers > 0 {
+        tracing::info!(
+            phase,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
+            "verified superseded backup paths unlinked with incomplete reader visibility; physical blocks may remain until open descriptors and mappings close"
+        );
+    }
     if !report.failures.is_empty()
         || report.admission_refused
         || report.inventory_incomplete
@@ -851,6 +859,8 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
             unconfirmed_moves = report.unconfirmed_moves,
             bytes_unconfirmed_moves = report.bytes_unconfirmed_moves,
@@ -875,6 +885,8 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
             deadline_reached = report.deadline_reached,
             "backup retention completed"

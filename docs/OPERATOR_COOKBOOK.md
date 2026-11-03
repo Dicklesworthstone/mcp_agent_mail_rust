@@ -594,15 +594,34 @@ readers cause refusal. On Linux this includes memory mappings whose file
 descriptors have already closed. A bad backup cannot become disposable merely
 because its filename looks old.
 
-On Linux, an unreadable same-user `/proc/<pid>/fd` or `maps` entry remains a
-refusal when the process's readers cannot be established. The error names the
-process entry, rather than alleging a permissions problem with the backup.
-Retention retries the actual descriptor, mapping and surviving-worker inventory
-once after a permission denial, after a 5 ms pause and within the original scan
-budget. Both attempts use a retained process-directory descriptor, so a reused
-PID cannot redirect the retry to another process. A second permission denial
-still refuses reclamation: this handles transient access changes, not persistent
-inaccessibility of a same-user process.
+On Linux, retention retries a denied descriptor, mapping or surviving-worker
+inventory once after 5 ms, within the same bounded scan. Retained process and
+task directory descriptors prevent PID reuse from redirecting that inspection.
+A persistent same-user denial is recorded as **unobservable readers**, not proof
+that the process is unrelated to the backup. Scanning continues: any observable reader
+still refuses deletion, as do malformed or unreadable process identity, scan
+exhaustion, and other IO errors. The cleaner's current descriptor table is
+strictly inspected first, before verification opens a candidate, preserving
+same-process SQLite locks. The process leader is also checked; identical shared
+tables and address spaces are not rescanned once per worker thread.
+
+For a fully verified, superseded periodic snapshot only, this uncertainty need
+not block retention. Under exclusive snapshot and recovery authority, an owned,
+single-link file in an owned directory without group/world write access may be
+**unlinked**, with every verification and namespace check above still required.
+An external process's existing descriptor, `O_PATH` handle or memory mapping
+keeps the original inode and its bytes alive; the original pathname disappears,
+and reopening that pathname is not guaranteed. Cooperating Agent Mail restore
+readers remain excluded by snapshot authority. Retention never truncates or
+overwrites an unseen reader's bytes. Incident evidence, generic file cleanup,
+and empty-directory cleanup retain the strict same-owner visibility policy.
+
+The report distinguishes these successful unlinks with
+`unlinks_with_unobserved_readers` and `bytes_unlinked_with_unobserved_readers`.
+Their allocation is unknown and is not added to `bytes_reclaimed`: a hidden
+reader may retain blocks until its last descriptor or mapping closes. Namespace
+removal and directory-sync uncertainty are accounted separately. No reader scan,
+including a complete one, makes `bytes_reclaimed` a measured free-space delta.
 Session-daemon names, different groups, and capability changes do not prove
 that inherited descriptors or mappings have closed. A terminated thread-group
 leader is skipped only when kernel evidence proves its own descriptor table
@@ -611,7 +630,8 @@ uses the mounted `/proc/self` PID when excluding its own retained descriptor,
 so an ancestor procfs mount does not make it count itself as another reader.
 This inspection is bounded and best-effort for noncooperating external opens;
 snapshot authority supplies the separate exclusion for cooperating publishers
-and restore readers. Permission uncertainty never authorizes a blanket skip.
+and restore readers. Permission uncertainty grants no deletion authority by
+itself and never makes a generic reclaim operation safe.
 
 Retention inventories both resident backups and material already accumulated
 under `doctor/reclaimable/`. Native historical rotation files are eligible only
@@ -683,8 +703,9 @@ the same admission limits when staging cannot release space. Leaving the
 variable unset enables the verified periodic reclamation policy. Setting it
 to `true` also allows incident-backup reclamation. On Unix, this requires an
 older, standalone SQLite image with a fully verified successor, matching
-mailbox lineage or exact duplicate bytes, and the same pin, reader, hardlink,
-and namespace checks used for periodic generations. Corrupt or insufficiently
+mailbox lineage or exact duplicate bytes, and the same pin, hardlink, and
+namespace checks used for periodic generations, plus the strict same-owner
+reader-visibility policy. Corrupt or insufficiently
 verified incident evidence stays available even with explicit deletion enabled.
 Platforms without the verified descriptor-bound deletion boundary preserve
 incident evidence. Explicit opt-in never falls back to unchecked pathname deletion.
@@ -703,12 +724,14 @@ Startup and publication logs report `bytes_staged`, `bytes_deleted`,
 `empty_directories_deleted` separately from backup payload counts and bytes.
 Staged and retained values are logical file lengths still occupying storage.
 Deleted bytes are the logical lengths of confirmed removals; reclaimed bytes
-count the allocated blocks associated with verified backup unlinks. The latter
+count the allocated blocks associated with verified backup unlinks without
+recorded reader uncertainty. The latter
 is not a measurement of the
 filesystem's free-space delta: filesystem snapshots and shared storage can
 retain blocks independently. Refused operations retain their byte accounting.
-An incomplete inventory refuses backup-file mutations and marks totals as lower
-bounds; the separately admitted empty-directory sweep can still make progress.
+An incomplete backup namespace inventory refuses backup-file mutations and
+marks totals as lower bounds; the separately admitted empty-directory sweep
+can still make progress.
 Uncertain moves or unlinks have separate counters rather than being reported
 as successful reclamation. Each cleanup pass attempts at most 128 periodic
 candidates, with a candidate-byte budget of the larger of 512 MiB and the
