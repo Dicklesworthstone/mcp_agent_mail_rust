@@ -1,5 +1,101 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 2: restore client access and connect doctor discovery
+
+- [x] Reproduce real client failures: six project configurations receive HTTP
+  401 from the live MCP server. Preserve original files privately before repair.
+- [x] Run native project-only setup for Cline, Cursor, Factory, Gemini,
+  OpenCode and Windsurf with hooks/user-config updates disabled. All six
+  configurations subsequently authenticate with HTTP 200 and green MCP health.
+  The canonical token file remains byte-identical; files are mode 0600.
+- [x] Preserve and manually repair the remaining three project entries:
+  Codex TOML, legacy Codex JSON and Claude settings. Canonicalize the Codex
+  source alias to remove OMP's duplicate. Requests using all three repaired
+  entries return HTTP 200. `am doctor check` now reports healthy=true and
+  token parity OK; lesser missing/unclassified/stdio warnings remain visible.
+  This validates the configuration entries, not an application restart for
+  each coding-agent product. The separate reservation-provenance drift stays
+  open. Native setup's secret-ignore additions to `.gitignore` are reviewed.
+- [x] Reproduce the repair blind spot on an authenticated private MCP server:
+  the installed CLI finds one stale home token but misses the stale project
+  token and wrong project URL. Its read-only OMP fallback is untouched.
+  Baseline-only evidence is not a successful repair claim.
+- [x] Claim br-doctor-project-config-discovery-j0bh5 and remove the accidental
+  OMP-only filter from the existing shared mutation inventory. Preserve legacy
+  home paths, deduplication and read-only OMP exclusions. Add two discriminating
+  inventory tests; the original OMP test and all fixer assertions stay intact.
+  Formatting and whitespace checks pass. No dependency or feature change.
+- [x] Preserve the next real baseline failure: installed CLI detects
+  `~/.claude.json` but applying its token repair refuses with exit 4 because
+  that supported file is outside the default scopes. Reproduce the refusal
+  again with the same installed executable; all six files remain byte-identical.
+  Add only that explicit file to default scopes, plus a native control that
+  HOME, `.claude.json.bak` and an unrelated sibling remain out of scope.
+  This admits one documented config path, no broader home-directory authority.
+  Real candidate repair/undo still must pass; the original red run is retained.
+- [x] Finish the strict remote workspace all-targets check on vmi1156319.
+  Its actual source snapshot matches all 3,902 tracked regular-file inputs,
+  including the dirty patch, with zero omissions or changed present inputs.
+  The separate release-box request refused because that id is not in the
+  active RCH configuration; no worker configuration or admission policy changed.
+  That first snapshot predates the file-specific scope repair; repeat the
+  all-targets gate on the final source rather than crediting it to later edits.
+  Final doctor-source check passes in 73 seconds. After the two equivalent
+  assertion edits below, all-targets passes again in 38 seconds.
+- [x] Complete the production lib/bins check: 645.7 seconds initially,
+  then 24.3 seconds after the test-only assertion edits. Preserve the actual
+  source witnesses and distinguish compiler checks from executed tests.
+- [x] Preserve strict Clippy's exit 101 on two pre-existing retention-test
+  `assert_is_empty` lints. Acquire conflict-free lease 422 and replace only
+  those two conditions with equivalent empty-vector equality/inequality
+  assertions. Formatting passes; strict workspace Clippy then passes in
+  206.9 seconds. No assertion, timeout or scanner exemption is removed.
+  UBS reports three unchanged intentional fixture panic paths in this test
+  file; keep its red result and review, with no UBS-green claim for that file.
+- [ ] Finish native inventory/token/URL/alias fixer tests through normal RCH
+  on vmi1156319, with the verified Nextest runner and private root-owned
+  HOME/TMP/XDG paths. Both actual runner processes match all 3,902 frozen
+  tracked inputs. The build is active; no test pass has been observed yet.
+- [ ] Build and retain the new CLI, then execute the private real-MCP test:
+  two token findings and one URL finding, dry-run byte neutrality, intended
+  field-only repairs, real authenticated requests, idempotence, exact undo,
+  renewed 401 rejection and untouched read-only fallback/unrelated entries.
+  Fresh solo verification remains separate from independent review.
+- [ ] Close this bug only on those source-bound native/CLI results. Keep the
+  existing authority tasks br-3cqr4/br-x2jf5 and wider release work open.
+
+## November 3 UTC: finish headroom recovery and integrate retained work
+
+- [x] Preserve the full-workspace native retry's admission refusal at
+  23:52:37 UTC: exit 103, zero tests. Normal hz3 telemetry reports critical
+  I/O pressure and low headroom; do not override admission or pause peer builds.
+- [x] Reject the 28 GiB cold fln-wf-gate tree because it is protected by
+  `.sbh-protect`. Select the unprotected MossyTrout tree only after full
+  ancestor/tree marker, idle, mount, root-privileged open-file and cwd guards.
+  It has been idle over 54 hours and has no external hard links.
+- [x] Under the user's explicit relocation authorization, preserve all 124,227
+  entries in a 24,118,026,240-byte archive on trj `/bulk`. Stream digest,
+  entry count and source/archive per-file metadata/content manifests match.
+  Archive SHA-256 c5192654fd4e12ba63103bf103b1a7d4de33b1ff1364deaffc57aa462c06a8c9.
+  Fsync archive, manifests and directory before the fresh full source guard.
+- [x] Execute the provided relocation cutover at 00:43:25 UTC. It removes
+  only the verified source payload and leaves a verified, synced restore
+  pointer. Net root space rises 23,222 MiB during cutover, from 15,046 to
+  38,268 MiB. Do not credit later external space jumps. Exact authorization,
+  command, time and ten byte-verified/fsynced receipts are retained on trj in
+  `hz3-mossy-root-2357/` under the existing relocation root.
+- [x] Refresh normal RCH telemetry: initial stale critical state remains a
+  refusal boundary; the next normal probe clears it to warning, with over
+  53 GiB free. No pressure, cache, source, slot or admission policy changes.
+- [ ] Finish the doctor native/CLI qualification and commit only owned work.
+- [ ] Preserve both histories when integrating remote f4b9da4f/534a8dd6
+  (procfs retry/pinned-inventory fixes). The checkout and remote each have
+  two unique commits at the observed fetch. Incoming changes are reviewed,
+  not qualified by the current pre-merge build. Never force-push or flatten.
+- [ ] Run required checks and full-workspace native validation on the merged
+  source. Preserve scoped namespace evidence as scoped; release, crossplatform
+  and soak work remain open. This planning update changes no compiled source.
+
 ## November 2: populated CLI reads and coordinator headroom
 
 - [x] Claim br-kp1in.18. Bind the retained real CLI to its SHA-256
@@ -72,7 +168,7 @@
   suppression is needed. The dependency's future-Rust warning remains explicit.
 - [x] Build the real repaired CLI through normal RCH: 199m28s, executable
   SHA-256 4b7b100560f93a15. All 3,770 frozen source inputs match live/post.
-- [ ] Complete the declared 24-call old/new comparison against the same
+- [x] Complete the declared 24-call old/new comparison against the same
   populated mailbox in one invocation, including nonempty-kind and malformed
   cursor controls. Report any self-speedup as maintenance, not an incumbent win.
   Two attempts remain failed: guidance equality, then equal-count facet order.
@@ -80,7 +176,7 @@
   specifies kind-specific guidance and sorts facets only by count. Six unchanged
   baseline calls produce both tied facet orders; 13 checker controls accept only
   those documented differences and reject semantic drift. The complete pair
-  remains unexecuted. The returned new executable subsequently became unavailable
+  subsequently passes with the retained rebuild. The first returned executable became unavailable
   locally and at its recorded remote pool path; its cause is unestablished.
   A normal hz3 rebuild is now admitted after a queue-timeout refusal, with 3,871
   present inputs matching and six historical JSON omissions explicit. Retain the
@@ -90,9 +186,15 @@
   runs the 13 checker controls, declared 24-call pair and fresh six-call solo,
   then preserves the executable and all raw results on trj, including failures.
   It makes no tracker closure, publication or release decision automatically.
-- [ ] Observe that continuation's terminal result and source/ELF identities;
-  a running process is not a passed comparison. Its state is recorded in
-  kind-continuation-status.json; no pair pass has been observed yet.
+- [x] Observe the continuation's terminal pass: all 13 checker controls,
+  24 old/new calls and six fresh solo calls pass. Empty-kind old calls take
+  31.07/31.68/31.71 seconds versus 1.98/1.93/2.07 seconds after repair.
+  Matching-kind, daemon-route and invalid-cursor controls pass. This is
+  maintenance against our own prior binary, not an incumbent campaign win.
+  Rebuilt ELF f7637a6ecc100b93 is retained and synced to trj; evidence archive
+  7746ffbb95a0aaa1 verifies all 72 files and is fsynced. Post-build source
+  matches 3,871 present frozen inputs; six historical JSON omissions remain
+  explicit. This older source excludes subsequent retention and doctor edits.
 - [x] Fresh solo recheck: six real new-CLI calls pass, including matching and
   absent recipient kinds, daemon routing, rejected cursor and stopped fallbacks.
   Absent-kind calls take 1.877/1.879 seconds; no independent-review credit.
@@ -101,8 +203,9 @@
 - [ ] Execute full workspace native tests. The earlier Nextest invocation was
   canceled before admission and ran no tests; compiler passes are not test passes.
   A fresh normal hz3 Nextest invocation was submitted at 22:25 UTC with private
-  HOME/TMP/XDG roots and application credentials unset. It is queued before
-  admission, not running tests. Other probed workers lacked sufficient root
+  HOME/TMP/XDG roots and application credentials unset. It refused before
+  admission at 22:29:51 UTC (exit 103, queue_timeout): zero tests ran. Retry only
+  after worker capacity changes. Other probed workers lacked sufficient root
   headroom or the runner; trj is healthy storage but not a configured RCH worker.
 - [x] Diagnose the live installed mailbox write breaker independently: stock
   SQLite confirms pages 135/136 never used; the responsive owner is an unmanaged

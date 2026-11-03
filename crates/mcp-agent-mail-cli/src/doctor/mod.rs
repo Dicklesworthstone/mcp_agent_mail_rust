@@ -1918,7 +1918,6 @@ fn default_mcp_config_candidates() -> Vec<PathBuf> {
     v.extend(
         mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default()
             .into_iter()
-            .filter(|location| location.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
             .map(|location| location.config_path),
     );
     let mut seen = std::collections::HashSet::new();
@@ -4075,6 +4074,10 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
         v.push(home.join(".config").join("mcp-agent-mail"));
         v.push(home.join(".codex"));
         v.push(home.join(".claude"));
+        // Claude Code's primary config is a file beside `.claude`, not
+        // inside it. Match the detector's explicit input without granting
+        // write authority over the rest of HOME.
+        v.push(home.join(".claude.json"));
         v.push(home.join(".gemini"));
         v.push(home.join(".cursor"));
         v.push(home.join(".windsurf"));
@@ -4900,6 +4903,66 @@ mod tests {
                 .any(|path| path.ends_with(".omp/mcp.json")),
             "doctor MCP failure modes must inspect OMP's project-native config"
         );
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_include_non_omp_project_paths() {
+        let project = std::env::current_dir().expect("current project directory");
+        let candidates = default_mcp_config_candidates();
+        for relative in [
+            ".claude/settings.local.json",
+            ".codex/config.toml",
+            "codex.mcp.json",
+            "cursor.mcp.json",
+            "gemini.mcp.json",
+            ".vscode/mcp.json",
+            "windsurf.mcp.json",
+            "cline.mcp.json",
+            "opencode.json",
+            "factory.mcp.json",
+        ] {
+            assert!(
+                candidates.contains(&project.join(relative)),
+                "per-FM fixers must inspect the shared mutable project config {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_exclude_read_only_omp_fallbacks() {
+        let project = std::env::current_dir().expect("current project directory");
+        let candidates = default_mcp_config_candidates();
+        for relative in [".mcp.json", "mcp.json", ".omp/.mcp.json"] {
+            assert!(
+                !candidates.contains(&project.join(relative)),
+                "read-only OMP compatibility source must stay outside mutation authority: {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_home_config_scope_is_file_bounded() {
+        let home = dirs::home_dir().expect("private test home directory");
+        let config = home.join(".claude.json");
+        assert!(default_mcp_config_candidates().contains(&config));
+        let caps = mutate::Capabilities {
+            write_scopes: default_write_scopes(),
+        };
+        assert!(mutate::ensure_in_scope(&caps, &config).is_ok());
+        for outside in [
+            home.clone(),
+            home.join(".claude.json.bak"),
+            home.join("other.json"),
+        ] {
+            assert!(
+                matches!(
+                    mutate::ensure_in_scope(&caps, &outside),
+                    Err(mutate::MutateError::OutOfScope(_))
+                ),
+                "adding the supported Claude config must not authorize {}",
+                outside.display()
+            );
+        }
     }
 
     #[test]

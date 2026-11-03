@@ -278,3 +278,9 @@ agy.mcp.json
 .beads/*-fsqlite-ns-use
 .beads/*.vacuum-wal-cert*
 .beads-recovery-*/
+cline.mcp.json
+/cline.mcp.json
+/.cline.mcp.json.*.tmp
+/.cline.mcp.json.*.bak
+/.cline.mcp.json.*.replaced
+/cline.mcp.json.bak*
