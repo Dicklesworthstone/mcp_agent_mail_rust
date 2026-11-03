@@ -961,11 +961,33 @@ The DB check uses the same exact-source tmpfs approach as the preceding pin
 fix. The server check compiles the full production modules and real token
 callers; it is not a whole-server-crate qualification or a runtime execution.
 It excludes `cfg(test)`. The two new authority unit-test definitions and new
-full rotation/coordinator regressions are source-reviewed only on this runner,
-not represented as compiled or executed tests. The genuine DB test graph
-requires Asupersync `test-internals`; an earlier attempt to build that graph
-was killed by the shared memory limit, and no alternate helper implementation
-or weakened feature graph was substituted to claim a pass.
+full rotation/coordinator regressions were initially source-reviewed only.
+The genuine whole-DB test graph requires Asupersync `test-internals`; an earlier
+attempt to build that graph was killed by the shared memory limit, and no
+alternate helper implementation or weakened feature graph was substituted to
+claim a pass.
+
+A subsequent scoped check compiled the entire final rotation module and 16
+verbatim source-item spans from the final integrity guard, including its real
+producer, admission, cleanup and coordinator bodies, five fixture helpers,
+and the new coordinator regression. Complete actual budget, journal and
+schedule test modules were also included. Test metadata passed in 2.392
+seconds and strict Clippy passed in 2.334 seconds, with zero diagnostics.
+Every selected source span was rechecked byte-for-byte against the final
+production file. No producer method, helper, assertion, fixture or type was
+substituted; unrelated integrity pool/runtime tests requiring unavailable
+test-internals metadata were excluded rather than faked.
+
+This typechecks and lints
+`replaced_parent_blocks_coordinator_and_all_admitted_cleanup`,
+`exporter_cleanup_cannot_adopt_a_replaced_database_parent`, and
+`borrowed_admission_keeps_its_parent_identity_after_path_replacement`.
+The first two were not executed natively; the third also passed in the
+separate 25-test native foundation suite. The two new DB authority unit-test
+definitions remain source-reviewed only. The final receipt has SHA-256
+`8b07435465aa2593e554d2d7b02c9342dfa0549a6521f9efac54bb7ba66c7dc9`
+and records all commands, source spans, hashes, earlier lint findings and
+remaining runtime limits.
 
 ## Dedicated native qualification workflow
 
