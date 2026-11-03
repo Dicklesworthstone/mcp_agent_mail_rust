@@ -355,7 +355,19 @@ am robot navigate "resource://file_reservations?project=$PROJECT&active_only=tru
 agent filtering, expiry warnings, conflict detection, and navigation ordering
 remain the same. Reservation attestation identifies `source: "mcp_server"`;
 the database/archive comparison fields are null because no local database was
-read. Without `--server`, the commands retain their direct-read behavior.
+read.
+
+Without `--server`, `am reservations`, `am robot reservations` and
+`am file_reservations list`, `active`, `soon` and `conflicts` first try a
+loopback server whose reported database and storage root match the CLI's own
+configuration. The probe has a 2 s timeout. If such a server answers, the read
+goes through it and its authentication, protocol and identity failures are
+errors. If no server answers, or the server is older and does not report its
+mailbox, or it serves a different mailbox, the command reads the local files
+directly. With `WORKTREES_ENABLED` and a Git `PROJECT_IDENTITY_MODE`, an
+absolute project path always uses the direct read. `am robot navigate` reads
+directly unless `--server` is given. Use `--server` when automation must never
+fall back to the local files.
 
 The endpoint follows the existing client configuration (`AGENT_MAIL_URL`, or
 the configured `HTTP_HOST`, `HTTP_PORT`, and `HTTP_PATH` with existing local
