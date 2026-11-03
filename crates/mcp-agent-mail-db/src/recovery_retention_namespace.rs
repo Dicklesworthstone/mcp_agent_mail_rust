@@ -716,13 +716,13 @@ fn inspect_file_readers(
     // Never hide a same-process reader behind an unrelated opaque task. The
     // current thread may have unshared its descriptor table from the leader.
     let own_thread = Path::new("/proc").join(std::fs::read_link("/proc/thread-self")?);
-    inspect_process_reader_inventory(
+    inspect_pinned_process_reader_inventory(
         &own_thread,
         own_pid,
         &self_status,
         retained_identity,
         &canonical_source,
-        excluded_descriptor,
+        ProcessReaderScope::Task(excluded_descriptor),
         &mut charge,
     )?;
     // Linux POSIX locks belong to the current files_struct. The strict scan
@@ -730,7 +730,9 @@ fn inspect_file_readers(
     // verifier cannot release locks owned by an unshared table. Do not scan
     // the same descriptors and address space once per worker thread: that
     // would consume the bounded inventory solely because the server is busy.
-    // The leader and any surviving workers are still checked below as before.
+    // The group scan below checks distinct worker descriptor tables without
+    // repeating their shared mappings. Before verification opens a handle,
+    // this also covers our own workers with unshared descriptor tables.
     let mut evidence = SnapshotReaderEvidence::default();
     for entry in std::fs::read_dir("/proc")? {
         charge()?;
@@ -831,6 +833,14 @@ fn retry_process_reader_scan(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum ProcessReaderScope {
+    Process(Option<i32>),
+    Task(Option<i32>),
+    Descriptors,
+}
+
+#[cfg(target_os = "linux")]
 fn inspect_process_reader_inventory(
     process: &Path,
     process_id: u32,
@@ -846,7 +856,7 @@ fn inspect_process_reader_inventory(
         self_status,
         retained_identity,
         canonical_source,
-        excluded_descriptor,
+        ProcessReaderScope::Process(excluded_descriptor),
         &mut charge,
     )
 }
@@ -858,7 +868,7 @@ fn inspect_pinned_process_reader_inventory(
     self_status: &ProcessStatusSummary,
     retained_identity: &Metadata,
     canonical_source: &Path,
-    excluded_descriptor: Option<i32>,
+    scope: ProcessReaderScope,
     mut charge: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -880,31 +890,51 @@ fn inspect_pinned_process_reader_inventory(
     let result = retry_process_reader_scan(
         || {
             let mut unobservable = None;
-            record_reader_inventory_result(
-                inspect_process_file_readers_once(
+            let (excluded_descriptor, scan_group) = match scope {
+                ProcessReaderScope::Process(excluded) => (excluded, true),
+                ProcessReaderScope::Task(excluded) => (excluded, false),
+                ProcessReaderScope::Descriptors => (None, false),
+            };
+            let direct = match scope {
+                ProcessReaderScope::Descriptors => inspect_process_descriptor_readers_once(
                     &anchored,
                     process_id,
                     self_status,
                     retained_identity,
                     canonical_source,
-                    excluded_descriptor,
+                    None,
                     &mut charge,
                 ),
-                &mut unobservable,
-            )?;
-            // An exited leader can have empty fd/maps files while its workers
-            // still retain the backup. Both scans use the same pinned task.
-            record_reader_inventory_result(
-                inspect_surviving_thread_readers(
-                    &anchored,
-                    process_id,
-                    self_status,
-                    retained_identity,
-                    canonical_source,
-                    &mut charge,
-                ),
-                &mut unobservable,
-            )?;
+                ProcessReaderScope::Process(_) | ProcessReaderScope::Task(_) => {
+                    inspect_process_file_readers_once(
+                        &anchored,
+                        process_id,
+                        self_status,
+                        retained_identity,
+                        canonical_source,
+                        excluded_descriptor,
+                        &mut charge,
+                    )
+                }
+            };
+            record_reader_inventory_result(direct, &mut unobservable)?;
+            // A live leader can have an unshared worker's private table.
+            // A dead leader can also hide that worker's mappings. Keep both
+            // inventories anchored to this retained process directory.
+            if scan_group {
+                record_reader_inventory_result(
+                    inspect_surviving_thread_readers(
+                        &anchored,
+                        process_id,
+                        self_status,
+                        retained_identity,
+                        canonical_source,
+                        excluded_descriptor,
+                        &mut charge,
+                    ),
+                    &mut unobservable,
+                )?;
+            }
             unobservable.map_or(Ok(()), Err)
         },
         || std::thread::sleep(std::time::Duration::from_millis(5)),
@@ -964,6 +994,44 @@ fn record_reader_inventory_result(
 
 #[cfg(target_os = "linux")]
 fn inspect_process_file_readers_once(
+    process: &Path,
+    process_id: u32,
+    self_status: &ProcessStatusSummary,
+    retained_identity: &Metadata,
+    canonical_source: &Path,
+    excluded_descriptor: Option<i32>,
+    mut charge: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut unobservable = None;
+    record_reader_inventory_result(
+        inspect_process_descriptor_readers_once(
+            process,
+            process_id,
+            self_status,
+            retained_identity,
+            canonical_source,
+            excluded_descriptor,
+            &mut charge,
+        ),
+        &mut unobservable,
+    )?;
+    if retained_identity.file_type().is_file() {
+        record_reader_inventory_result(
+            ensure_no_mapped_file_readers(
+                process,
+                process_id,
+                self_status,
+                retained_identity,
+                &mut charge,
+            ),
+            &mut unobservable,
+        )?;
+    }
+    unobservable.map_or(Ok(()), Err)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_descriptor_readers_once(
     process: &Path,
     process_id: u32,
     self_status: &ProcessStatusSummary,
@@ -1078,18 +1146,6 @@ fn inspect_process_file_readers_once(
             ));
         }
     }
-    if retained_identity.file_type().is_file() {
-        record_reader_inventory_result(
-            ensure_no_mapped_file_readers(
-                process,
-                process_id,
-                self_status,
-                retained_identity,
-                &mut charge,
-            ),
-            &mut unobservable,
-        )?;
-    }
     unobservable.map_or(Ok(()), Err)
 }
 
@@ -1100,6 +1156,7 @@ fn inspect_surviving_thread_readers(
     self_status: &ProcessStatusSummary,
     retained_identity: &Metadata,
     canonical_source: &Path,
+    excluded_descriptor: Option<i32>,
     mut charge: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let summary = match read_process_status_summary(process) {
@@ -1107,7 +1164,10 @@ fn inspect_surviving_thread_readers(
         Err(error) if is_proc_task_gone(&error) => return Ok(()),
         Err(error) => return Err(proc_entry_error(&process.join("status"), &error)),
     };
-    if summary.has_vm_size || summary.threads == 1 {
+    if summary.threads == 1 || (summary.has_vm_size && excluded_descriptor.is_some()) {
+        // A live caller's verifier is also present in its shared tables. Its
+        // workers were inspected by the no-open preflight; never exclude a
+        // descriptor number blindly in another worker's unshared table.
         return Ok(());
     }
     let tasks_path = process.join("task");
@@ -1134,9 +1194,15 @@ fn inspect_surviving_thread_readers(
         if task_id == process_id {
             continue;
         }
-        // Do not exclude the caller's descriptor number in another task's
-        // table: Linux threads can unshare their descriptors. An ambiguous
-        // self-reader is a refusal, never authority to ignore a real reader.
+        // Live threads share their address space, but can unshare descriptor
+        // tables. Scan each worker's descriptors without multiplying maps.
+        // A dead leader has no maps to cover its survivors, so inspect those
+        // workers completely. Neither lane recursively enumerates the group.
+        let scope = if summary.has_vm_size {
+            ProcessReaderScope::Descriptors
+        } else {
+            ProcessReaderScope::Task(None)
+        };
         record_reader_inventory_result(
             inspect_pinned_process_reader_inventory(
                 &task.path(),
@@ -1144,7 +1210,7 @@ fn inspect_surviving_thread_readers(
                 self_status,
                 retained_identity,
                 canonical_source,
-                None,
+                scope,
                 &mut charge,
             ),
             &mut unobservable,
