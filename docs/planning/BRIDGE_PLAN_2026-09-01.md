@@ -96,7 +96,7 @@
   that CLI. Preserve its next real failure: URL undo refuses the repaired
   project config as outside default write scopes. This is not an end-to-end
   pass, and the doctor Bead stays open.
-- [ ] Qualify the resulting undo repair: add only mutable project-config
+- [x] Qualify the resulting undo repair: add only mutable project-config
   files to shared fix/undo defaults, reject canonical paths escaping the
   project, and add positive/file-bounded/static-parent-symlink controls.
   Formatting passes; UBS exit 0 has zero critical findings. All 22 added-line
@@ -114,11 +114,16 @@
   refuses an oversized default request, with no policy change or SSH compile.
   The focused native request refuses
   before execution because a healthy peer job occupies hz3; no override.
-  Native undo controls and new-CLI repair/
-  idempotence/exact-undo/fresh-solo results remain required. Earlier build and
-  native evidence predates this source change. Broader authority tasks stay open.
-- [ ] Close this bug only on those source-bound native/CLI results. Keep the
-  existing authority tasks br-3cqr4/br-x2jf5 and wider release work open.
+  Final selected native run passes 147/147 in 32.304 seconds, with 8,080
+  tests outside the selection. Both new scope cases, original home and undo
+  controls, both help snapshots and the real crypto/Beads cases execute.
+  All five fresh cases pass individually on retained actual CLI/DB test images,
+  within unchanged 240-second bounds. The real-MCP primary and fresh-solo
+  flows pass on production CLI bf35a95b. Broader authority tasks stay open.
+- [x] Close this bug on those source-bound native/CLI results: closed
+  br-doctor-project-config-discovery-j0bh5 at 07:38:54 UTC. Keep the existing
+  authority tasks br-3cqr4/br-x2jf5 and wider release work open. Fresh solo
+  verification is not independent review or native Windows qualification.
 
 ## November 3 UTC: finish headroom recovery and integrate retained work
 
@@ -166,7 +171,11 @@
   (18,891 to 26,873 MiB). Both pointers, owners and modes match and are synced.
   Three-directory total is 12,859 MiB measured net. All 36 operator-receipt
   archive members verify on trj; archive/manifest/receipt/directory are fsynced.
-- [ ] Finish the doctor native/CLI qualification and commit only owned work.
+- [x] Finish the doctor native/CLI qualification. Shared commits abfc61fa
+  (legacy comparison), 3ccc84b1 (two help fields), cce5fa19 (tracker) and
+  d73e4bb5 (plan) record already-reviewed work; this agent did not invoke
+  those commits. All 647 code/lock/toolchain/help inputs still match the
+  actual native snapshot. Preserve them; commit only the owned final update.
 - [x] Commit the doctor repair as 58025b24 after its compiler/lint/format gates,
   explicitly retaining pending native/CLI acceptance and the open Bead.
 - [x] Preserve both histories with normal merge 6fef128c, integrating remote
@@ -228,13 +237,13 @@
   same-UID systemd PID 2212 has unreadable `/proc/2212/fd/0`; strict reader
   census correctly refuses. Do not whitelist names, loosen inspection, or
   turn these failures into a general unprivileged Linux pass. br-cdsge stays open.
-- [ ] Investigate the legacy-upgrade preservation test's Int/BigInt comparison
+- [x] Investigate the legacy-upgrade preservation test's Int/BigInt comparison
   and independently verify complete payloads before deciding on a gate fix.
   Read-only analysis of the complete first failed assertion finds exactly
   25 canonical Int wrappers versus native BigInt wrappers; widening those
   wrappers alone makes both complete debug payloads identical, preserving all
-  quoted text. This does not execute the later migration/write phases and
-  is not yet a passing preservation test.
+  quoted text. That read-only analysis alone did not execute later phases;
+  the subsequent original native test and fresh repeat now do, and pass.
   GATE-CHANGE for br-kp1in.80: primary adapter source independently confirms
   canonical SQLite narrows i32-range INTEGERs while FrankenSQLite returns
   BigInt. Widen only Int to BigInt in the existing test comparison helper;
@@ -242,11 +251,16 @@
   and integrity assertion. Add a real two-engine file probe for raw wrapper
   differences, signed integer boundaries and five unequal/type negatives
   (8, text '7', float 7.0, blob 0x37, NULL versus integer 7). Native acceptance
-  must publish how the original veto and all negatives resolve; no runtime
+  publishes how the original veto and all negatives resolve; no runtime
   repair or performance win is claimed. Formatting passes. UBS remains red
   on two unchanged intentional test panic guards; no suppression or removal.
   Preserve the original failure and the capacity-replay p95/p99 loss; no
   threshold changes or data-preservation claim from a type-width hypothesis.
+  Actual verdict: the one previously vetoed legacy test passes every original
+  migration/write/timestamp/recipient/integrity assertion in 6.330 seconds,
+  and passes again fresh on DB test image b4f9f486. The new real-engine
+  integer-bound/type test also passes twice. Close br-kp1in.80 at 07:39:11 UTC.
+  This is test maintenance, with no runtime corruption-repair or performance win.
 - [x] Finish the undo-scope standalone CLI build and its real-MCP/fresh-solo
   acceptance. The pre-undo production CLI 50658da2 reproduces undo exit 3;
   the new build's live witness matches all 3,902 frozen inputs at 9513cc33-dirty.
@@ -256,7 +270,18 @@
   two-job request uses two configured slots without an override. Both live
   source witnesses match 3,896 present files; six historical perf JSONs remain
   missing and the complete-input observer stays red. Retain actual CLI and
-  integration test images from Nextest PID 3004111. Native acceptance is pending.
+  integration test images from Nextest PID 3004111: all 147 selected tests pass.
+  Nineteen of the original 42 failures are rechecked and now pass; the other
+  23 are not selected. The original full run remains red/partial. The first
+  comparison script mistakenly included old passes; preserve that output and
+  the corrected FAIL/TIMEOUT-filtered count before citing the result.
+- [x] Preserve all four actual native ELF images, early/runtime source
+  witnesses, 147 results, five fresh cases and original failures on trj
+  `native-final-147-0730/`: 897,751,040 bytes, all 45 members verified,
+  SHA-256 7d0975c36ad5327aeb94f5da1ff1e73e6b397cdbd1de5e1f491f5955b471381b.
+  Archive, manifest, receipt and directories are fsynced. Two observer PIDs
+  disappear before a later proc lookup; both still bind the same complete
+  verified af132457 integration image. Preserve those raw observer errors.
 - [x] Execute the original opt-in setup permission case within its unchanged
   240-second bound after full-workspace native processes finish: one actual
   test passes, as detailed above. Recheck malformed Codex TOML with actual
@@ -271,7 +296,14 @@
   2a4b09aea8f8270082eca9f42e58a8904db4ac507f0bc9bfc211447f3a567b0a,
   322,007,040 bytes, all 24 members verified. Archive, manifest, durable
   receipt and containing directories are fsynced. Real operator configs and
-  their private backups are excluded. New undo qualification is still pending.
+  their private backups are excluded. This older archive remains scoped to
+  its pre-undo artifact; the two newer archives preserve the qualified repair.
+- [ ] Continue the remaining P0 authority/platform and P1 persistence work
+  against its original acceptance before lower-priority read-routing expansion.
+  Windows is online in Tailscale but its configured SSH port times out.
+  Existing reconciler candidate patches remain unapplied: refresh and verify
+  their current-base inputs before adoption, retaining the original orphan
+  counts, 300-second probe, BusySnapshot and release holds.
 
 ## November 2: populated CLI reads and coordinator headroom
 
