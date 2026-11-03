@@ -693,8 +693,11 @@ before that later check. A reader or a failed live check can therefore defer
 without spending the allowance. Once export begins, a crash, failed backup
 validation, or failed metadata publication does not replenish that allowance.
 Further over-budget exports remain refused
-until an ordinary admission check observes sufficient retained count and byte
-capacity after cleanup. Existing failed-stage admission is checked first. A
+until the next attempt's ordinary admission check observes sufficient retained
+count and byte capacity after cleanup. Completion and post-attempt cleanup never
+replenish the durable repair allowance: an unlink with unconfirmed durability
+can make a pathname inventory look smaller without confirming reusable capacity.
+Existing failed-stage admission is checked first. A
 refused export still permits independently admitted, bounded reclamation of
 superseded backups, including when interrupted staging or an unavailable
 journal prevents publication, or when the producer refuses disk headroom or

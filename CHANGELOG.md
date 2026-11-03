@@ -125,6 +125,11 @@ release commit in 3fdda50c.
   Deadline deferral does not invent an admission failure or create control files.
   The budget remains cooperative: inventory finishes and an operation already
   underway is not interrupted.
+- **Post-attempt cleanup cannot replenish the repair-export allowance.** The
+  producer keeps its durable one-repair reservation through completion and
+  cleanup, including an unlink whose durability could not be confirmed. Only
+  the next attempt's ordinary retention admission can clear that reservation;
+  a smaller pathname inventory during the current attempt is insufficient.
 
 The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
 preserves the earlier conservative-policy counterexamples and validation,

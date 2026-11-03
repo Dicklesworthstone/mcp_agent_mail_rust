@@ -1064,20 +1064,10 @@ where
                 Ok(())
             })
         });
-        if let Some(policy) = retention
-            && crate::backup_rotation::admit_periodic_publication(
-                policy.storage_root,
-                primary,
-                policy.keep,
-            )
-            .is_ok()
-            && let Err(error) = lease.clear_retention_repair_after_admission()
-        {
-            tracing::warn!(
-                %error,
-                "automatic retention regained capacity but the durable repair reservation could not be cleared; future admission remains conservative"
-            );
-        }
+        // Replenish the repair allowance only at the next attempt's ordinary
+        // admission above. Post-producer cleanup may have completed an unlink
+        // but failed its durability check: a smaller inventory does not erase
+        // that receipt, and completion alone must not replenish the allowance.
         let completion = match &result {
             Ok(true) => BackupCompletion::Published,
             Ok(false) => BackupCompletion::Skipped,
@@ -3241,6 +3231,192 @@ mod tests {
                 actual.next_attempt(now + schedule::BACKUP_RETRY_MAX),
                 expected.next_attempt(now + schedule::BACKUP_RETRY_MAX)
             );
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_retention_repair_restart_admission(
+        root: &Path,
+        primary: &Path,
+        reclaimed: &Path,
+        wall_now: u64,
+        now: Instant,
+    ) {
+        let policy = PeriodicBackupPolicy {
+            storage_root: root,
+            keep: 3,
+        };
+        let next_day = 24 * 3600;
+        backup_budget::with_admission(primary, || {
+            let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                primary,
+                BackupKind::Verified,
+                wall_now + next_day,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                lease.retention_repair_spent(),
+                "completion and post-attempt inventory cannot replenish a repair"
+            );
+            // If the next inventory is full again, the persisted reservation
+            // must still prevent another repair.
+            std::fs::copy(primary, reclaimed).unwrap();
+            let mut schedule = AutomaticBackupSchedule::default();
+            assert!(run_with_backup_lease(
+                primary,
+                &mut schedule,
+                || now + Duration::from_secs(next_day),
+                Some(policy),
+                lease,
+                |_, _| panic!("a spent repair cannot export into renewed pressure"),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        // A later attempt with genuine ordinary capacity must still clear
+        // the allowance and reach its producer.
+        std::fs::remove_file(reclaimed).unwrap();
+        backup_budget::with_admission(primary, || {
+            let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                primary,
+                BackupKind::Verified,
+                wall_now + 2 * next_day,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(lease.retention_repair_spent());
+            let mut schedule = AutomaticBackupSchedule::default();
+            let mut produced = false;
+            assert!(run_with_backup_lease(
+                primary,
+                &mut schedule,
+                || now + Duration::from_secs(2 * next_day),
+                Some(policy),
+                lease,
+                |_, before_export| {
+                    produced = true;
+                    before_export().unwrap();
+                    Ok(true)
+                },
+            ));
+            assert!(produced);
+            let reopened = backup_journal::AutomaticBackupLease::try_begin_at(
+                primary,
+                BackupKind::Verified,
+                wall_now + 3 * next_day,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!reopened.retention_repair_spent());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_attempt_cleanup_cannot_replenish_retention_repair_allowance() {
+        use crate::backup_rotation::{RotateReport, RotationFailure};
+
+        for outcome in [
+            Ok(true),
+            Ok(false),
+            Err("original export refusal".to_string()),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let (primary, _pool) = retention_mailbox(&root);
+            let live = std::fs::read(&primary).unwrap();
+            let candidates: Vec<_> = (1..=6)
+                .map(|day| root.join(format!("mail.sqlite3.bak.2000010{day}_000000")))
+                .collect();
+            for path in &candidates {
+                std::fs::copy(&primary, path).unwrap();
+            }
+            let policy = PeriodicBackupPolicy {
+                storage_root: &root,
+                keep: 3,
+            };
+            let wall_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let now = Instant::now();
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "1")],
+                || {
+                    // Six images fill ordinary admission. No verified pin is
+                    // installed, so real retention preserves them and asks for
+                    // the single over-budget repair export instead.
+                    backup_budget::with_admission(&primary, || {
+                        let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                            &primary,
+                            BackupKind::Proactive,
+                            wall_now,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        let mut schedule = AutomaticBackupSchedule::default();
+                        let followups = run_with_backup_lease(
+                            &primary,
+                            &mut schedule,
+                            || now,
+                            Some(policy),
+                            lease,
+                            |kind, before_export| {
+                                assert_eq!(kind, BackupKind::Verified);
+                                before_export().unwrap();
+                                // The producer result and sync-failure receipt
+                                // are injected at the coordinator seam. The
+                                // journal, inventory, unlink and reopen are
+                                // real; namespace tests separately exercise
+                                // the directory-sync fault boundary.
+                                std::fs::remove_file(&candidates[0]).unwrap();
+                                let report = RotateReport {
+                                    admission_refused: true,
+                                    unconfirmed_deletions: 1,
+                                    bytes_unconfirmed_deletions: live.len() as u64,
+                                    failures: vec![RotationFailure {
+                                        source: candidates[0].clone(),
+                                        rename_completed: false,
+                                        deletion_completed: true,
+                                        reader_inventory_incomplete: false,
+                                        requested_destination: None,
+                                        error: "unlink completed; directory durability unconfirmed"
+                                            .to_owned(),
+                                    }],
+                                    ..Default::default()
+                                };
+                                let result =
+                                    rotate_after_backup_attempt_with(outcome.clone(), || {
+                                        Ok(report)
+                                    });
+                                assert_eq!(result, outcome);
+                                result
+                            },
+                        );
+                        assert_eq!(followups, outcome != Ok(false));
+                        Ok(())
+                    })
+                    .unwrap();
+                    crate::backup_rotation::admit_periodic_publication(&root, &primary, 3)
+                        .expect("the unconfirmed unlink creates apparent capacity");
+
+                    assert_retention_repair_restart_admission(
+                        &root,
+                        &primary,
+                        &candidates[0],
+                        wall_now,
+                        now,
+                    );
+                },
+            );
+            assert_eq!(std::fs::read(&primary).unwrap(), live);
+            for path in &candidates[1..] {
+                assert_eq!(std::fs::read(path).unwrap(), live);
+            }
         }
     }
 

@@ -502,3 +502,59 @@ old-production/new-test ordering counterexample has not executed. The passing
 native namespace evidence above still applies to its unchanged source; the
 passing compile/lint results in this continuation do not replace the outstanding
 runtime validation. No issue closure or release qualification is inferred.
+
+## 2026-11-03 producer follow-through: preserve the durable repair allowance
+
+Review of the caller above rotation found a second path around the completed
+mutation barrier. `rotate_after_backup_attempt_with` preserves the producer's
+result and logs the cleanup report. After it returned, `run_with_backup_lease`
+independently counted the remaining paths and could clear the durable
+one-repair reservation, even if cleanup had reported an unconfirmed unlink.
+
+The producer now clears that reservation only at the beginning of a later
+attempt, after ordinary retention admission succeeds under the parent exporter
+lease. Post-attempt cleanup and completion never clear it. This preserves the
+published/skipped/failed outcome and the existing retry schedule without
+allowing an uncertain mutation to replenish the allowance in the same attempt.
+
+The new coordinator regression uses actual mailbox images, quota inventory,
+parent admission, journal slots, unlink and journal reopen. It injects the
+producer outcome and completed-unlink receipt at their explicit coordination
+boundary; it is not a physical fsync-fault test. All three outcomes must retain
+the spent reservation after reopen. Renewed quota pressure must then refuse
+another exporter, while a later attempt with ordinary capacity must reach its
+producer and clear the reservation. Existing namespace tests supply separate
+real-operation sync-fault coverage.
+
+For exact `integrity_guard.rs` SHA-256
+`41554272c120b9355f8306cda939e23b44ed92eef95bce2f4db20a860c31ce6f`:
+
+- The complete production integrity-guard and rotation modules pass metadata
+  checking and strict Clippy using real DB/core dependencies frozen at
+  `09b362e` (unchanged for this producer fix). The three surrounding server-root
+  helpers are verbatim production definitions. This is a module-level gate,
+  not a full server-crate build.
+- A focused compilation of the verbatim coordinator functions, actual fixture
+  helper and exact new regression passes metadata checking and strict Clippy.
+  It includes the complete real rotation, journal, schedule and budget modules.
+  Unrelated pool-runtime tests are outside this focused result; no persistence
+  implementation, helper behavior or assertion is substituted.
+- The unchanged production journal and scheduler execute **53 native tests**:
+  32 journal and 21 schedule tests, all passing, zero ignored. Their real
+  cross-process locks, journal writes, interruption and restart cases provide
+  compensating component evidence. Their strict Clippy check also passes.
+  This is not execution of the changed producer regression.
+- Formatting, diff checks and independent source review pass. No production
+  dependency, manifest, feature default or test threshold changed.
+
+The full integrity-guard test compilation remains blocked: metadata generation
+for unchanged Asupersync with its real `test-internals` feature was killed by
+`SIGKILL` before reaching those tests. An initially broader library harness also
+hit the dependency resource limit; its direct `fastmcp-core` dependency was then
+correctly classified as test-only for these selected production modules. The
+passing production gate uses the actual production dependency graph for those
+modules. Preliminary scratch-harness dependency omissions, an unavailable
+offline package and a canceled lock-generation attempt were not passing source
+checks; the final harnesses use repository-pinned versions and matching patch
+entries. No additional native Asupersync build was attempted. The new producer
+regression has compiled but has not executed here.
