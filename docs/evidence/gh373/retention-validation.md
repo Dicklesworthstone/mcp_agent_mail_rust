@@ -835,8 +835,8 @@ The namespace draft SHA-256 is
 It is reproduced manually in a separate validation worktree at clean base
 05d2bc1b plus an explicit source overlay, SHA-256
 `ea33ba6a97b802aaf58db009b3f3c6009e089c5d37f9041e980c4fc139b417be`.
-The remote 9d checkout remains frozen for its ongoing production gate. The
-original local producer is deliberately advanced at 20:24 UTC to 05d2bc1b plus
+The remote 9d checkout remained frozen through its completed production gate.
+The original local producer was deliberately advanced at 20:24 UTC to 05d2bc1b plus
 the identical manual parser overlay. All 3,902 producer inputs match the
 separate compiler checkout. Before/after live input witnesses confirm the old
 remote production compiler still sees the 9d inputs, including after that
@@ -852,15 +852,24 @@ The shared checkout records the parser change in b2a29afa. Formatting passes.
 The one-file UBS scan remains red: one unchanged critical fixed Python lock
 fixture, 581 warnings and 458 informational findings. All 47 added-line findings
 are reviewed; none is critical or in production code. Nothing is suppressed.
-The new required compiler pipeline is active under normal vmi1152480 admission;
-its live witness matches 3,896 present inputs plus the same six historical JSON
-omissions. The initial 141-case native request refuses before Cargo because hz4
+The new all-targets check passes under normal vmi1152480 admission:
+Cargo99m24s, remote exit0 in 5,968.364 seconds, outer RCH exit0 in 5,993.7
+seconds. Its live witness matches 3,896 present inputs plus the same six
+historical JSON omissions. The production check passes with Cargo20m59s,
+remote exit0 in 1,268.014 seconds and outer RCH exit0 in 1,303.0 seconds. Its
+live source witness again matches all 3,896 present inputs with the same six
+omissions. Strict workspace Clippy with -D warnings also passes:
+Cargo15m33s, remote exit0 in 938.201 seconds and outer RCH exit0 in 970.8
+seconds. Its live witness has the same matches and omissions. The complete
+three-gate controller exits0 at 21:38:46 UTC. Actual native execution remains
+pending; compilation alone cannot qualify the reader behavior. The initial 141-case native
+request refuses before Cargo because hz4
 has no admitted slots. At 20:24:52 UTC a retry from the original producer path
 is admitted normally on hz4, using its protected 357d41b1 target. Both live
 native processes match all 3,896 present inputs and the same six historical
 JSON omissions. Whole-executable collectors are active before tests begin.
-The compiler and native runs remain pending; no passing older gate qualifies
-this new draft.
+Native execution remains pending; the new source's compiler passes do not
+substitute for that runtime qualification.
 
 A separate native arm64 Mac probe exercises the exact production
 `lsof -n -P -Fpf -- <candidate>` invocation on Darwin25.2.0/macOS26.2 with
@@ -874,3 +883,13 @@ The raw receipt and separate field-by-field review are retained; this is
 native dependency-boundary evidence only. No Rust retention execution,
 scan-cost improvement, paired incumbent performance or macOS acceptance
 closure follows. The configured Windows endpoint still times out on SSH.
+
+The completed compiler logs, all source witnesses, explicit overlay, both UBS
+and formatting records, old production terminal/cleanup receipts, and Mac
+probe/review are preserved in a 26-member, 5,406,720-byte archive under
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/retention-zero-thread-native-2144/`.
+SHA-256 is `b39aff5111a61558576c17b3d90c01fb08867a217c317472a18b250143e81c47`.
+Every member hash and metadata field, plus the complete archive hash, is
+verified on trj; the archive, control records and directory chain are synced.
+This is a copy-only preservation of completed bounded evidence. No native
+execution, release clearance, source removal or reclaimed bytes are inferred.

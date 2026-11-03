@@ -84,8 +84,16 @@
   production/all-targets/strict-Clippy checks and real-reader native tests;
   the parser fixtures alone are R3, compensated only by separately cited real
   kernel/public-reader evidence. No passing 9d gate qualifies the new draft.
-  Normal vmi1152480 admission is executing the new compiler pipeline, with
-  all 3,896 present inputs matching and the same six historical omissions.
+  Normal vmi1152480 admission passes all-targets: Cargo99m24s, remote exit0,
+  outer RCH exit0 in 5,993.7 seconds, with all 3,896 present inputs matching
+  and the same six historical omissions. The separate production check passes:
+  Cargo20m59s, remote exit0 in 1,268.014 seconds, outer RCH exit0 in 1,303.0
+  seconds. Its live witness has the same 3,896 matches and six omissions.
+  Strict workspace Clippy with -D warnings passes: Cargo15m33s, remote exit0
+  in 938.201 seconds, outer RCH exit0 in 970.8 seconds. Its live source
+  witness again has 3,896 matches and the same six omissions. The complete
+  three-gate controller exits0 at 21:38:46 UTC. Actual native execution
+  remains pending; these compiler passes cannot substitute for it.
   The first native request refuses before Cargo at zero admitted hz4 slots.
   At 20:24 UTC, fast-forward the original local producer to 05d2bc1b and apply
   the identical parser overlay manually. All 3,902 inputs match the separate
@@ -104,6 +112,23 @@
   original bytes preserved. Median calls cost 0.191–0.313 seconds. This is
   dependency-boundary evidence, not a Rust retention run, cost optimization,
   incumbent comparison or completion of the original macOS acceptance.
+- [x] Preserve the completed new compiler/format/UBS/source records, old
+  production terminal and cleanup identities, and native Mac probe on trj:
+  26 members, 5,406,720 bytes, SHA256 b39aff5111a61558576c17b3d90c01fb08867a217c317472a18b250143e81c47.
+  Verify all member hashes/metadata and the full archive, then sync files and
+  directory chain. This copy removes no source and credits zero reclaimed
+  bytes; it does not qualify the still-pending 141-case native run.
+- [ ] While native compilation continues, execute the existing full isolated
+  release-smoke harness against retained CLI bf35a95b with its original
+  300-second soak/convergence and 60-agent/480-second swarm. Bind it to its
+  older 9513cc33 plus doctor811 source manifest; it is a diagnostic for the
+  open archive-stall/crash tasks, not current-parser or release qualification.
+  No source, harness, latency or population setting changes. README flow,
+  cross-project, 240-send storm, 356 acknowledged crash-survivor IDs, archive
+  convergence and stopped-server stock integrity checks pass in the log.
+  Mixed soak and swarm, terminal receipt and final clean shutdown remain
+  required. Preserve all isolated mailbox data and do not take over the
+  other owner's P0 tasks from these intermediate results.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
