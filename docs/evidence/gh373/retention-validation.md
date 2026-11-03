@@ -536,6 +536,56 @@ The clean server collector establishes the integration image identity without
 hiding those independent generic-collector errors. All originals remain on
 the source worker; this preservation has zero root-disk reclaim credit.
 
+### Repaired live-worker case executes on the new image
+
+The separate-checkout 11d262da hz4 build finishes compilation in 111 minutes
+and starts all 134 selected cases. Its original five-mode public negative,
+including real live FD and O_PATH workers, passes in 21.864 seconds. The
+restart/corrupt-evidence fixture, dead-leader, ordinary FD and mapping
+protections pass too. The captured integration image is 125,984,704 bytes,
+SHA-256 `74eee95c3f030c24da9cc7e7747b3d49e3780945c074d9b8b2ca043f540c6a09`;
+independent inspection confirms both new mode strings and reader_descriptor.
+The live execution namespace again matches all 3,896 present tracked inputs,
+with six historical JSON omissions and no changed present inputs.
+
+The DB unit image is `ab40be3025d34502a49f7dea85e41f9065f0f0447214c3c17b264c79efb42735`
+(146,831,704 bytes), and the server image is
+`78b45d5a78766dda66858a9176faf9d629d07f6614a5993f5b6c5484c13fb0ea`
+(351,390,544 bytes). Successful image records retain stable whole-file hashes
+and fsynced copies. The server collector also records one raced process-exit
+capture error, preserved verbatim; it is not reported as error-free.
+
+The frozen run finishes with 113 passes, 20 failures and one timeout across
+134 cases in 1,043.433 seconds; 10,461 cases are outside selection. The
+720-cycle case reaches its configured 240-second deadline, with 260.186
+seconds recorded including process termination. The large directory case
+fails on protected-process inventory refusal in 157.030 seconds. A separate
+lossless archival transfer runs concurrently from 15:25 UTC; these ambient
+timings are not performance qualification or an incumbent comparison.
+
+The later shared-checkout merge 9d38fd84 changes rotation/guard code and adds five
+tests; none of this frozen-source server evidence qualifies those new edits.
+Formatting and a two-file scanner review pass for that merged source, while
+its compiler/native checks remain pending. br-5nr0m stays in progress.
+
+The same actual 11d database images also execute all 63 original database cases
+in one consistent coordinator role: UID/GID 65534, CapEff zero, dumpable and
+independently readable controller, umask 002 and full host procfs. All 63 pass;
+each invocation must report exactly one populated passing test, and image
+hashes match before and after the run. This is additional real-path coverage
+for the strict namespace/mutation cases, not a replacement for the ordinary
+worker's failed run or qualification of the new server code.
+
+The first role harness records 28 passes and 35 failures because its outer
+parent is UID1000/mode0711: the unprivileged directory walk cannot open that
+parent RDONLY. Both actual failed outputs and the original directory remain.
+A direct kernel open probe returns EACCES there and succeeds on the new
+UID65534/mode0700 parent. The second run retains identical controller bytes,
+case names, executable hashes and assertions; only the harness root/ownership
+precondition changes. No directory enforcement, procfs inventory, deadline,
+test population or production code is weakened. Do not sum these two role
+results or combine them with the ordinary 134-case run into a green total.
+
 ## 2026-11-03 continuation: ordering, durability and startup admission
 
 Starting from `09b362e0c4f7b041fc12f76ce77c849f01851660`, a second review

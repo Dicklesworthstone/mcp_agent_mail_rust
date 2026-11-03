@@ -7,10 +7,15 @@
   numeric-generation reclamation order, sticky refusal after unconfirmed
   namespace mutations, and budget deferral before snapshot admission. Five
   added tests preserve the original populations and deadlines.
-- [ ] After the frozen 11d262da native job terminates, fast-forward the clean
-  validation checkout to the combined source. Re-run required compiler gates
-  and the complete now-139-case selection. Verify actual image freshness;
-  11d compiler and server-runtime results do not qualify the new server edits.
+- [x] After all frozen 11d binaries finish compiling, fast-forward the clean
+  validation checkout to 9d38fd84. The two changed server inputs receive mtimes
+  after the old artifacts finish, while the already-running remote namespace
+  continues to match 11d. Freeze all 3,902 expected source inputs again.
+- [ ] Re-run required compiler gates and the complete now-139-case selection.
+  Normal hz3 admission refuses unavailable slots; the hz4 rerun refuses the
+  combined I/O/disk-pressure gate before Cargo. Preserve both failures and
+  finish the authorized verified move; never override admission or capacity.
+  11d compiler/server results do not qualify the new server edits.
 - [x] Check the suspected live-worker gap against the real kernel: an
   unprivileged CLONE_FILES-unshared worker holds the exact generation inode,
   its leader has no matching descriptor and the leader still has VmSize.
@@ -29,6 +34,24 @@
   and O_PATH workers. Require a distinct worker TID, a still-live leader,
   matching worker inode and no matching leader descriptor. Preserve every
   original mode, refusal, byte, accounting and release assertion.
+- [x] Execute that complete five-mode negative on the actual repaired 11d
+  integration image: pass in 21.864 seconds. Whole image SHA-256 is
+  74eee95c3f030c24da9cc7e7747b3d49e3780945c074d9b8b2ca043f540c6a09;
+  both new modes and reader_descriptor are present. The restart fixture,
+  dead-leader and ordinary descriptor/mapping protections also pass. The
+  complete 134-case run finishes 113 pass, 20 fail and one timeout in
+  1,043.433 seconds, with 10,461 cases outside selection. This is not a green
+  full-run claim. The 720-cycle case reaches its configured 240-second limit;
+  the recorded 260.186 seconds includes process termination. Concurrent
+  archival I/O is explicit, and no performance qualification is inferred.
+- [x] Run all 63 original database cases on the same repaired images in one
+  consistent coordinator role: UID/GID 65534, CapEff zero, readable ordinary
+  controller, umask 002 and full host procfs. All 63 pass with one populated
+  test per invocation and stable image hashes before/after. Preserve the first
+  harness run's 28/35 result: its UID1000/0711 parent refused RDONLY directory
+  opens. A direct kernel probe demonstrates that refusal and the corrected
+  UID65534/0700 parent's successful open. No production policy or oracle changes.
+  This separate role result does not replace the ordinary 113/20/1 run.
 - [x] Formatting/diff checks pass. UBS retains four existing critical fixture
   patterns; all 15 added-line findings are reviewed, with no added critical
   or production findings and no suppression. All-targets passes in 237 seconds;
