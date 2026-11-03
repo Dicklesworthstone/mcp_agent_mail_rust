@@ -11701,10 +11701,14 @@ async fn fetch_inbox_impl(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    // Failed cleanup, cancellation during backoff, and unwinding must never
+    // return an uncertain read transaction to the live pool.
+    conn.retire_on_drop.store(true, Ordering::Release);
 
     let run_query = || {
-        crate::sync::fetch_inbox_filtered_rows_from_conn(
-            &conn,
+        crate::sync::fetch_inbox_filtered_rows_with_cx(
+            cx,
+            &**conn,
             project_id,
             agent_id,
             since_ts,
@@ -11732,7 +11736,7 @@ async fn fetch_inbox_impl(
     let mut attempt: u32 = 0;
     let result = loop {
         match run_query() {
-            Err(error)
+            Outcome::Err(error)
                 if attempt < *MVCC_MAX_RETRIES && is_plain_write_contention_error(&error) =>
             {
                 attempt += 1;
@@ -11749,10 +11753,12 @@ async fn fetch_inbox_impl(
         }
     };
 
-    match result {
-        Ok(rows) => Outcome::Ok(rows),
-        Err(error) => Outcome::Err(error),
+    // A successful retry cannot prove an earlier failed SAVEPOINT release
+    // cleaned up its read transaction. Reuse only a clean first attempt.
+    if attempt == 0 && matches!(&result, Outcome::Ok(_)) {
+        conn.retire_on_drop.store(false, Ordering::Release);
     }
+    result
 }
 
 fn decode_message_row_indexed(row: &SqlRow) -> std::result::Result<MessageRow, DbError> {

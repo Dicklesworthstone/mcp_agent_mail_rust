@@ -611,6 +611,26 @@ fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
 /// (see [`admit_direct_publication`]).
 static DIRECT_FENCE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
+/// Bounded message-repair admissions use the same give-way window as direct
+/// requests. A single unsuccessful try on each worker tick otherwise lets
+/// continuously reacquiring background writers starve deferred repair forever.
+static REPAIR_FENCE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+struct RepairFenceWaiter;
+
+impl RepairFenceWaiter {
+    fn register() -> Self {
+        REPAIR_FENCE_WAITERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for RepairFenceWaiter {
+    fn drop(&mut self) {
+        REPAIR_FENCE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Longest a blocking fence acquirer gives way to waiting direct writers.
 ///
 /// The fence is a plain `Mutex`. A writer that releases it and takes it again
@@ -640,14 +660,19 @@ impl Drop for DirectFenceWaiter {
 }
 
 /// Before a blocking acquisition, wait up to [`DIRECT_WAITER_GIVE_WAY`] for
-/// waiting direct writers to take and release the fence. One atomic load when
-/// none is waiting.
+/// waiting direct writers or bounded repair admissions to take the fence.
+/// The pause is bounded even if requests or repairs keep arriving; it grants
+/// an execution opportunity without reserving the fence or a project lock.
 fn give_way_to_direct_writers() {
-    if DIRECT_FENCE_WAITERS.load(Ordering::Acquire) == 0 {
+    let waiting = || {
+        DIRECT_FENCE_WAITERS.load(Ordering::Acquire) != 0
+            || REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0
+    };
+    if !waiting() {
         return;
     }
     let deadline = Instant::now() + DIRECT_WAITER_GIVE_WAY;
-    while DIRECT_FENCE_WAITERS.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+    while waiting() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_micros(200));
     }
 }
@@ -1676,11 +1701,26 @@ const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
 /// blocking acquirers leave it.
 const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
 
+/// A scheduling hint only: never reserve the fence or change holder metadata
+/// or mutation epochs while deciding whether to give a repair an opening.
+fn publication_fence_available_for_repair_turn() -> bool {
+    let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    drop(guard);
+    true
+}
+
 /// Admit a direct write to the publication fence. Contention is retried with a
 /// doubling pause until `deadline` (normally [`DIRECT_FENCE_ADMISSION_BUDGET`]
 /// after the write began); every attempt checks `cancelled` first, and any
 /// other error returns at once. While it retries, the writer is registered so
 /// blocking acquirers give way to it ([`give_way_to_direct_writers`]).
+/// A waiting message repair also receives one short opening per direct
+/// admission. Without it, back-to-back direct requests can take every release
+/// gap even when background publishers yield to the repair.
 fn admit_direct_publication(
     path: &Path,
     deadline: Instant,
@@ -1688,7 +1728,32 @@ fn admit_direct_publication(
 ) -> Result<ArchiveMutationGuard> {
     let mut pause = Duration::from_micros(200);
     let mut waiting = None;
+    let mut repair_turn_given = false;
     loop {
+        if !repair_turn_given
+            && REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0
+            && ARCHIVE_MUTATION_DEPTH
+                .try_with(std::cell::Cell::get)
+                .is_ok_and(|depth| depth == 0)
+            && publication_fence_available_for_repair_turn()
+        {
+            repair_turn_given = true;
+            let turn_deadline = deadline.min(Instant::now() + DIRECT_WAITER_GIVE_WAY);
+            while REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0 {
+                if cancelled() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "direct archive publication admission cancelled",
+                    )
+                    .into());
+                }
+                let remaining = turn_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(remaining.min(Duration::from_micros(200)));
+            }
+        }
         let contention = match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
             Err(error @ StorageError::LockContention { .. }) => error,
             admitted_or_failed => return admitted_or_failed,
@@ -15301,9 +15366,201 @@ enum ArchiveIndexSync {
     Locked,
 }
 
-/// Age after which an `index.lock` whose owner is gone may be reclaimed: the
-/// rule commits apply on their first retry.
-const ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS: f64 = 30.0;
+const INDEX_SYNC_LOCK_WITNESS_PREFIX: &str = "am-index-sync-lock-v1 ";
+const INDEX_SYNC_OWNER_MAX_BYTES: u64 = 1024;
+
+/// Bind a sync's ownership to its opened lock, including writes and metadata
+/// changes. An old advisory PID file cannot identify a later Git writer's lock.
+fn index_sync_lock_witness(file: &fs::File) -> std::io::Result<String> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "index sync lock is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(format!(
+            "unix:{}:{}:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        let (volume, index) = mcp_agent_mail_core::disk::windows_file_identity(file)?;
+        Ok(format!(
+            "windows:{volume}:{index}:{}:{}:{}",
+            metadata.len(),
+            metadata.creation_time(),
+            metadata.last_write_time(),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "index sync cannot establish file identity on this platform",
+    ))
+}
+
+fn index_sync_lock_witness_at(path: &Path) -> std::io::Result<String> {
+    index_sync_lock_witness(&mcp_agent_mail_core::disk::open_regular_file_no_follow(
+        path,
+    )?)
+}
+
+/// Only positive process evidence authorizes automatic reclamation. Permission
+/// and I/O errors are inconclusive; portable explicit cleanup keeps its policy.
+fn index_sync_owner_is_gone(pid: u32, expected_ticks: u64) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // Signal zero asks the kernel about ownership without signalling the
+        // process. Only ESRCH proves absence; EPERM and all other errors fail
+        // closed. Linux can additionally prove that a live PID was recycled.
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+            Err(nix::errno::Errno::ESRCH) => true,
+            Ok(()) => {
+                #[cfg(target_os = "linux")]
+                {
+                    expected_ticks > 0
+                        && process_start_ticks(pid as u32)
+                            .is_some_and(|actual| actual != expected_ticks)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = expected_ticks;
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No positive native ownership probe is available here. In particular,
+        // Windows must not infer abandonment from the age of an owner record.
+        let _ = (pid, expected_ticks);
+        false
+    }
+}
+
+/// Background housekeeping reclaims only a sync's exact witnessed lock whose
+/// recorded process is provably gone. Legacy owner files are advisory: ordinary
+/// commit attempts write them before acquiring a lock. They cannot authorize
+/// removal of a concurrent external Git writer's lock, however old it is.
+fn reclaim_abandoned_index_sync_lock(repo_root: &Path) -> bool {
+    let Some((_, owner_path)) = git_index_lock_paths_checked(repo_root) else {
+        return false;
+    };
+    let Ok(owner_file) = mcp_agent_mail_core::disk::open_regular_file_no_follow(&owner_path) else {
+        return false;
+    };
+    reclaim_index_sync_lock_with_owner(repo_root, owner_file)
+}
+
+fn reclaim_index_sync_lock_with_owner(repo_root: &Path, owner_file: fs::File) -> bool {
+    // Two automatic cleaners must not both approve the same abandoned pair,
+    // then let the later unlink hit a newly acquired lock. Claim its retained
+    // owner descriptor without waiting; keep that claim through removal.
+    if fs2::FileExt::try_lock_exclusive(&owner_file).is_err() {
+        return false;
+    }
+    let Some((lock_path, owner_path)) = git_index_lock_paths_checked(repo_root) else {
+        return false;
+    };
+    let Ok(owner_identity) = index_sync_lock_witness(&owner_file) else {
+        return false;
+    };
+    if index_sync_lock_witness_at(&owner_path).ok().as_ref() != Some(&owner_identity) {
+        // Another cleaner may have released this old descriptor's lock before
+        // we claimed it; it must still be the currently named owner file.
+        return false;
+    }
+    if !path_is_nonsymlink_file(&lock_path) {
+        return false;
+    }
+    let Some(identity) = git_lock_identity(&lock_path) else {
+        return false;
+    };
+    let mut owner = Vec::new();
+    if (&owner_file)
+        .take(INDEX_SYNC_OWNER_MAX_BYTES + 1)
+        .read_to_end(&mut owner)
+        .is_err()
+        || owner.len() as u64 > INDEX_SYNC_OWNER_MAX_BYTES
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&owner) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(pid_text) = lines.next() else {
+        return false;
+    };
+    let Some(pid) = pid_text.trim().parse::<u32>().ok().filter(|pid| *pid > 0) else {
+        return false;
+    };
+    if lines
+        .next()
+        .and_then(|timestamp| timestamp.trim().parse::<u64>().ok())
+        .is_none()
+    {
+        return false;
+    }
+    let Some(expected_ticks) = lines
+        .next()
+        .and_then(|ticks| ticks.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let Some(witness) = lines
+        .next()
+        .and_then(|line| line.strip_prefix(INDEX_SYNC_LOCK_WITNESS_PREFIX))
+    else {
+        return false;
+    };
+    if lines.next().is_some()
+        || index_sync_lock_witness_at(&lock_path).ok().as_deref() != Some(witness)
+        || !index_sync_owner_is_gone(pid, expected_ticks)
+    {
+        return false;
+    }
+    // Revalidate both complete pieces of evidence immediately before the
+    // existing conditional removal primitive's final PID/file identity checks.
+    if mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &owner_path,
+        INDEX_SYNC_OWNER_MAX_BYTES,
+    )
+    .ok()
+    .as_ref()
+        != Some(&owner)
+        || index_sync_lock_witness_at(&owner_path).ok().as_ref() != Some(&owner_identity)
+        || index_sync_lock_witness(&owner_file).ok().as_ref() != Some(&owner_identity)
+        || index_sync_lock_witness_at(&lock_path).ok().as_deref() != Some(witness)
+    {
+        return false;
+    }
+    remove_verified_stale_pair(
+        &lock_path,
+        &owner_path,
+        Some(&identity),
+        Some(pid_text.trim()),
+    )
+}
 
 fn create_index_lock(path: &Path) -> std::io::Result<fs::File> {
     fs::OpenOptions::new()
@@ -15312,13 +15569,90 @@ fn create_index_lock(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-/// Removes this process's `index.lock.owner` record when dropped.
-struct IndexLockOwner<'a>(Option<&'a Path>);
+fn write_index_sync_lock_witness(
+    repo_root: &Path,
+    lock: &fs::File,
+    pid: u32,
+    start_ticks: u64,
+) -> std::io::Result<Vec<u8>> {
+    let (lock_path, owner_path) = git_index_lock_paths_checked(repo_root)
+        .ok_or_else(|| std::io::Error::other("unsafe index sync owner path"))?;
+    let witness = index_sync_lock_witness(lock)?;
+    if index_sync_lock_witness_at(&lock_path)? != witness {
+        return Err(std::io::Error::other(
+            "index sync no longer owns the lock path",
+        ));
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bytes =
+        format!("{pid}\n{timestamp}\n{start_ticks}\n{INDEX_SYNC_LOCK_WITNESS_PREFIX}{witness}\n")
+            .into_bytes();
+    // This maintenance runs outside the archive fence. Publish a private owner
+    // candidate directly; the ordinary archive atomic writer takes that fence.
+    let mut staged = tempfile::NamedTempFile::new_in(owner_path.parent().unwrap())?;
+    staged.write_all(&bytes)?;
+    staged.as_file().sync_all()?;
+    if index_sync_lock_witness_at(&lock_path)? != witness
+        || path_existing_prefix_has_symlink(&owner_path).unwrap_or(true)
+    {
+        return Err(std::io::Error::other(
+            "index sync ownership changed before recording",
+        ));
+    }
+    staged.persist(&owner_path).map_err(|error| error.error)?;
+    Ok(bytes)
+}
 
-impl Drop for IndexLockOwner<'_> {
+/// Remove only the exact sync record we published, before releasing our lock.
+/// An ordinary commit may write an advisory owner while sync runs outside the
+/// fence; it is not this guard's record to remove.
+struct IndexSyncLockOwner<'a> {
+    root: Option<&'a Path>,
+    recorded: Option<Vec<u8>>,
+}
+
+impl<'a> IndexSyncLockOwner<'a> {
+    fn new(root: Option<&'a Path>, lock: &fs::File) -> Self {
+        let mut owner = Self {
+            root,
+            recorded: None,
+        };
+        owner.refresh(lock);
+        owner
+    }
+
+    fn refresh(&mut self, lock: &fs::File) {
+        let Some(root) = self.root else { return };
+        match write_index_sync_lock_witness(
+            root,
+            lock,
+            std::process::id(),
+            process_start_ticks(std::process::id()).unwrap_or(0),
+        ) {
+            Ok(bytes) => self.recorded = Some(bytes),
+            Err(error) => tracing::debug!(
+                "could not witness index sync ownership; abandoned lock will require explicit cleanup: {error}"
+            ),
+        }
+    }
+}
+
+impl Drop for IndexSyncLockOwner<'_> {
     fn drop(&mut self) {
-        if let Some(repo_root) = self.0 {
-            remove_lock_owner(repo_root);
+        if let (Some(root), Some(expected)) = (self.root, self.recorded.as_ref())
+            && let Some((_, owner_path)) = git_index_lock_paths_checked(root)
+            && mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                &owner_path,
+                INDEX_SYNC_OWNER_MAX_BYTES,
+            )
+            .ok()
+            .as_ref()
+                == Some(expected)
+        {
+            let _ = fs::remove_file(owner_path);
         }
     }
 }
@@ -15356,9 +15690,9 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // A process that exited mid-sync never releases its lock, which
             // would block every later sync and every archive read stamp.
-            let reclaimed = repo_root.as_deref().is_some_and(|root| {
-                try_clean_stale_git_lock(root, ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS)
-            });
+            let reclaimed = repo_root
+                .as_deref()
+                .is_some_and(reclaim_abandoned_index_sync_lock);
             match reclaimed.then(|| create_index_lock(&lock_path)) {
                 Some(Ok(file)) => file,
                 Some(Err(error)) if error.kind() != std::io::ErrorKind::AlreadyExists => {
@@ -15378,10 +15712,7 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
     // Written only once the lock is ours and declared after it, so it is
     // removed before the lock is released on every path: it can never erase
     // the record of whoever takes the lock next.
-    if let Some(root) = repo_root.as_deref() {
-        write_lock_owner(root);
-    }
-    let owner = IndexLockOwner(repo_root.as_deref());
+    let mut owner = IndexSyncLockOwner::new(repo_root.as_deref(), lock.as_file());
     // HEAD is read under the lock, so a slow sync cannot publish a tree older
     // than one another writer synced while this one waited.
     let Some(head_oid) = resolve_head_commit_oid(&repo)? else {
@@ -15479,6 +15810,9 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
     )?;
     lock.write_all(&bytes)?;
     lock.as_file().sync_all()?;
+    // A crash during a partial write changes the witness and is left for
+    // explicit cleanup. Only the fully written/synced lock gets fresh proof.
+    owner.refresh(lock.as_file());
     // A rename keeps inode, length and mtime, so this is the identity the
     // published index will have.
     let written = archive_index_file_identity(&lock.as_file().metadata()?);
@@ -30621,7 +30955,9 @@ mod tests {
         let mut exited = std::process::Command::new("true").spawn().unwrap();
         let dead = exited.id();
         exited.wait().unwrap();
-        fs::write(&owner, format!("{dead}\n0\n0\n")).unwrap();
+        let lock_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&lock).unwrap();
+        write_index_sync_lock_witness(&archive.repo_root, &lock_file, dead, 0).unwrap();
+        drop(lock_file);
         assert_eq!(sync(), ArchiveIndexSync::Settled);
         assert_eq!(shared_index_tree(&repo), head_tree());
         assert!(!lock.exists() && !owner.exists());
@@ -30667,6 +31003,298 @@ mod tests {
         commit("e.txt");
         assert_eq!(sync(), ArchiveIndexSync::Settled);
         assert_eq!(shared_index_tree(&repo), head_tree());
+    }
+
+    struct IndexWriterProcess(std::process::Child);
+
+    impl Drop for IndexWriterProcess {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn archive_index_sync_preserves_an_aged_live_git_writer_without_owner_metadata() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "live-index-writer").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let note = archive.root.join("ordinary.txt");
+        fs::write(&note, b"ordinary archive work").unwrap();
+        let relative = rel_path_cached(&archive.canonical_repo_root, &note).unwrap();
+        commit_paths_lockfree(&repo, &config, "ordinary", &[&relative]).unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Settled
+        );
+        let mut writer = IndexWriterProcess(
+            Command::new("git")
+                .arg("-C")
+                .arg(&archive.repo_root)
+                .args(["update-index", "--index-info"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let lock_path = git_dir.join("index.lock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock_path.is_file() {
+            assert!(writer.0.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline, "Git did not acquire index.lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Advancing only the timestamp exercises the old automatic 30-second
+        // age-based cleanup without making this regression sleep for minutes.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3_600)),
+            )
+            .unwrap();
+        assert!(!git_dir.join("index.lock.owner").exists());
+        let identity = git_lock_identity(&lock_path);
+        let index_before = fs::read(git_dir.join("index")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                sync_archive_index_to_head(&git_dir).unwrap(),
+                ArchiveIndexSync::Locked
+            );
+            assert_eq!(git_lock_identity(&lock_path), identity);
+            assert_eq!(fs::read(git_dir.join("index")).unwrap(), index_before);
+            assert!(writer.0.try_wait().unwrap().is_none());
+        }
+        // An advisory record left by a dead commit attempt never identified
+        // this Git writer's lock. A PID alone must not authorize its removal.
+        let mut exited = Command::new("git")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead = exited.id();
+        assert!(exited.wait().unwrap().success());
+        let owner_path = git_dir.join("index.lock.owner");
+        fs::write(&owner_path, format!("{dead}\n0\n0\n")).unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Locked
+        );
+        assert_eq!(git_lock_identity(&lock_path), identity);
+        // A witnessed record from a different lock file is equally powerless.
+        let prior_lock = tempfile::tempfile().unwrap();
+        let prior_witness = index_sync_lock_witness(&prior_lock).unwrap();
+        fs::write(
+            &owner_path,
+            format!("{dead}\n0\n0\n{INDEX_SYNC_LOCK_WITNESS_PREFIX}{prior_witness}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Locked
+        );
+        assert_eq!(git_lock_identity(&lock_path), identity);
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), index_before);
+
+        // The ordinary fallback also uses a private index: its advisory owner
+        // record and exact-path commit must leave the real Git lock untouched.
+        fs::write(&note, b"ordinary work while external Git owns its index").unwrap();
+        run_with_lock_owner(&archive.repo_root, || {
+            commit_paths(
+                &repo,
+                &config,
+                "ordinary private-index fallback",
+                &[&relative],
+            )
+        })
+        .unwrap();
+        assert_eq!(git_lock_identity(&lock_path), identity);
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), index_before);
+        let ordinary = repo
+            .head()
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .get_path(Path::new(&relative))
+            .unwrap();
+        assert_eq!(
+            repo.find_blob(ordinary.id()).unwrap().content(),
+            b"ordinary work while external Git owns its index"
+        );
+        let staged = repo.blob(b"irreplaceable operator staging").unwrap();
+        writeln!(
+            writer.0.stdin.as_mut().unwrap(),
+            "100644 {staged}\toperator-pending.txt"
+        )
+        .unwrap();
+        drop(writer.0.stdin.take());
+        assert!(writer.0.wait().unwrap().success());
+        assert!(!lock_path.exists());
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        assert_eq!(
+            index
+                .get_path(Path::new("operator-pending.txt"), 0)
+                .unwrap()
+                .id,
+            staged
+        );
+        let published = fs::read(git_dir.join("index")).unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Settled
+        );
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), published);
+        assert!(
+            repo.head()
+                .unwrap()
+                .peel_to_tree()
+                .unwrap()
+                .get_path(Path::new("operator-pending.txt"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn archive_index_sync_keeps_old_locks_when_owner_evidence_is_inconclusive() {
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "ambiguous-index-owner").unwrap();
+        let git_dir = archive.repo_root.join(".git");
+        let lock_path = git_dir.join("index.lock");
+        let owner_path = git_dir.join("index.lock.owner");
+        fs::write(&lock_path, b"retain uncertain ownership").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3_600)),
+            )
+            .unwrap();
+        let me = std::process::id();
+        for owner in [
+            String::new(),
+            "unknown\n0\n0\n".into(),
+            "0\n0\n0\n".into(),
+            format!("{me}\n0\n"),
+            format!("{me}\n0\n0\n"),
+            "999999999\ninvalid-time\n0\n".into(),
+            "999999999\n0\ninvalid-start\n".into(),
+        ] {
+            fs::write(&owner_path, &owner).unwrap();
+            assert_eq!(
+                sync_archive_index_to_head(&git_dir).unwrap(),
+                ArchiveIndexSync::Locked,
+                "owner {owner:?} is not proof that the lock was abandoned"
+            );
+            assert_eq!(fs::read(&lock_path).unwrap(), b"retain uncertain ownership");
+            assert_eq!(fs::read_to_string(&owner_path).unwrap(), owner);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_index_sync_requires_a_witness_for_the_exact_completed_lock_bytes() {
+        use std::io::Write as _;
+
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "witnessed-index-owner").unwrap();
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        let mut lock = create_index_lock(&lock_path).unwrap();
+        let me = std::process::id();
+        assert!(!index_sync_owner_is_gone(0, 0));
+        assert!(!index_sync_owner_is_gone(u32::MAX, 0));
+        for ticks in [0, process_start_ticks(me).unwrap_or(0)] {
+            let live = write_index_sync_lock_witness(&archive.repo_root, &lock, me, ticks).unwrap();
+            assert!(!reclaim_abandoned_index_sync_lock(&archive.repo_root));
+            assert_eq!(fs::read(&owner_path).unwrap(), live);
+            assert!(lock_path.exists());
+        }
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        let initial = write_index_sync_lock_witness(&archive.repo_root, &lock, dead, 0).unwrap();
+        lock.write_all(b"partially prepared index").unwrap();
+        lock.sync_all().unwrap();
+        assert!(!reclaim_abandoned_index_sync_lock(&archive.repo_root));
+        assert_eq!(fs::read(&owner_path).unwrap(), initial);
+        assert_eq!(fs::read(&lock_path).unwrap(), b"partially prepared index");
+
+        // A complete, fsynced write refreshes the exact witness. Reclamation
+        // of this abandoned sync does not authorize any staged publication.
+        let refreshed = write_index_sync_lock_witness(&archive.repo_root, &lock, dead, 0).unwrap();
+        assert_ne!(refreshed, initial);
+        assert!(reclaim_abandoned_index_sync_lock(&archive.repo_root));
+        assert!(!lock_path.exists() && !owner_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_index_sync_competing_cleaners_do_not_reclaim_a_replacement_lock() {
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "competing-index-cleaners").unwrap();
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        let lock = create_index_lock(&lock_path).unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        let bytes = write_index_sync_lock_witness(&archive.repo_root, &lock, dead, 0).unwrap();
+        drop(lock);
+
+        let first = mcp_agent_mail_core::disk::open_regular_file_no_follow(&owner_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&first).unwrap();
+        std::thread::scope(|scope| {
+            let root = &archive.repo_root;
+            assert!(
+                !scope
+                    .spawn(move || reclaim_abandoned_index_sync_lock(root))
+                    .join()
+                    .unwrap()
+            );
+        });
+        assert_eq!(fs::read(&owner_path).unwrap(), bytes);
+        assert!(lock_path.exists());
+        drop(first);
+
+        // Model a second cleaner paused after opening the old owner. The
+        // first completes cleanup and a writer acquires an entirely new pair.
+        let stale = mcp_agent_mail_core::disk::open_regular_file_no_follow(&owner_path).unwrap();
+        assert!(reclaim_abandoned_index_sync_lock(&archive.repo_root));
+        let replacement = create_index_lock(&lock_path).unwrap();
+        let me = std::process::id();
+        let current = write_index_sync_lock_witness(
+            &archive.repo_root,
+            &replacement,
+            me,
+            process_start_ticks(me).unwrap_or(0),
+        )
+        .unwrap();
+        let identity = index_sync_lock_witness_at(&lock_path).unwrap();
+        assert!(!reclaim_index_sync_lock_with_owner(
+            &archive.repo_root,
+            stale
+        ));
+        assert_eq!(index_sync_lock_witness_at(&lock_path).unwrap(), identity);
+        assert_eq!(fs::read(&owner_path).unwrap(), current);
     }
 
     #[test]

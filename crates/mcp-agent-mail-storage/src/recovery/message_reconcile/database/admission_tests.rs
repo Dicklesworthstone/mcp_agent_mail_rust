@@ -968,6 +968,196 @@ fn optimistic_epoch_drift_frees_saturated_retry_capacity_for_a_crash_orphan() {
 }
 
 #[test]
+fn active_git_index_writer_does_not_pin_healthy_retries_or_a_crash_orphan() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor {
+            source_identity: pool.sqlite_identity_key(),
+            ..Default::default()
+        };
+        cursor.defer_transient(901, Instant::now());
+        let lock_path = config.storage_root.join(".git/index.lock");
+        let held = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        let owned = tempfile::NamedTempFile::from_parts(
+            held,
+            tempfile::TempPath::try_from_path(lock_path.clone()).unwrap(),
+        );
+        fs::write(&lock_path, b"external writer's unpublished index").unwrap();
+        assert!(matches!(
+            crate::archive_epoch_read_stamp(&config.storage_root),
+            Err(crate::StorageError::LockContention { .. })
+        ));
+
+        // This is the real guarded path, not a forged successful observation:
+        // it verifies the healthy retry and publishes the missing bundle with
+        // the ordinary project lock, no-clobber checks and exact HEAD proof.
+        let mut repaired = 0;
+        let mut unchanged = 0;
+        let mut retry_len = cursor.retries.len();
+        for _ in 0..4 {
+            let report =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(report.deferred, 0, "{report:?}");
+            repaired += report.repaired;
+            unchanged += report.unchanged;
+            retry_len = report.retry_len;
+            if repaired == 1 && retry_len == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            repaired, 1,
+            "the missing bundle must converge under the held index lock"
+        );
+        assert!(unchanged > 0, "the healthy retry must be verified");
+        assert_eq!(retry_len, 0);
+        assert_eq!(
+            fs::read(&lock_path).unwrap(),
+            b"external writer's unpublished index"
+        );
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+
+        // Repeated passes cannot redeliver, duplicate files or create repair
+        // commits merely because the unrelated Git writer is still active.
+        let repo = git2::Repository::open(&config.storage_root).unwrap();
+        let head = repo.head().unwrap().target();
+        let mut replay = ReconcileCursor::default();
+        let mut verified = 0;
+        for _ in 0..4 {
+            let next =
+                reconcile_message_batch(cx, pool, config, &mut replay, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!((next.repaired, next.deferred), (0, 0));
+            verified += next.unchanged;
+            assert_eq!(repo.head().unwrap().target(), head);
+            assert_eq!(database_evidence(cx, pool), before);
+        }
+        assert!(
+            verified >= 2,
+            "restarted passes must revisit both complete bundles"
+        );
+        drop(owned);
+    });
+}
+
+#[test]
+fn busy_index_stamp_still_refuses_conflicting_staged_authority() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let original = fs::read(&paths.canonical).unwrap();
+        let mut conflicting = prepared.message.clone();
+        conflicting["reply_to"] = json!(701);
+        fs::write(
+            &paths.canonical,
+            crate::render_message_bundle_content(&conflicting, &prepared.body).unwrap(),
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        let mut index = repo.index().unwrap();
+        let relative =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        index.add_path(Path::new(&relative)).unwrap();
+        index.write().unwrap();
+        fs::write(&paths.canonical, &original).unwrap();
+        let before_index = fs::read(repo.path().join("index")).unwrap();
+        let before_head = repo.head().unwrap().target();
+        let lock_path = repo.path().join("index.lock");
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        let owned = tempfile::NamedTempFile::from_parts(
+            lock,
+            tempfile::TempPath::try_from_path(lock_path.clone()).unwrap(),
+        );
+        let stop = AtomicBool::new(false);
+        let error = reconcile_prepared_inner(
+            config,
+            &prepared,
+            Some(RepairControl { cx, stop: &stop }),
+            false,
+        )
+        .unwrap_err();
+        assert!(!error.transient, "{error:?}");
+        assert!(
+            error.detail.contains("staged canonical payload conflicts"),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), before_index);
+        assert_eq!(repo.head().unwrap().target(), before_head);
+        assert_eq!(fs::read(&paths.canonical).unwrap(), original);
+        assert!(
+            lock_path.exists(),
+            "never break the active Git writer's lock"
+        );
+        drop(owned);
+    });
+}
+
+#[test]
+fn slow_repair_yields_the_batch_without_consuming_the_next_message() {
+    fixture(|cx, pool, config| {
+        crate::ensure_archive(config, "project").unwrap();
+        crate::ensure_archive(config, "other").unwrap();
+        let before = database_evidence(cx, pool);
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        super::super::SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    // Stand in only for a slow individual filesystem read;
+                    // DB selection, authority and all publication remain real.
+                    std::thread::sleep(MAX_BATCH_TURN);
+                }
+            }));
+        });
+        let mut cursor = ReconcileCursor::default();
+        let first = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+        super::super::SCAN_HOOK.with(|slot| drop(slot.borrow_mut().take()));
+        let first = first.unwrap();
+        assert!(fired.load(Ordering::Acquire));
+        assert_eq!((first.scanned, first.repaired, first.deferred), (1, 1, 0));
+        assert!(first.budget_exhausted);
+        assert_eq!(cursor.tail_after, Some(901));
+        assert_eq!(cursor.backfill_ceiling, None);
+        assert_recovered(cx, pool, config, 901, false);
+        assert_eq!(database_evidence(cx, pool), before);
+
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(resumed.repaired, 1, "{resumed:?}");
+        assert_eq!(resumed.deferred, 0);
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
 fn optimistic_head_drift_still_requires_publication_admission() {
     fixture(|cx, pool, config| {
         let prepared = prepare_message(cx, pool, 901).unwrap();

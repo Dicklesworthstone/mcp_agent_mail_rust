@@ -5,9 +5,11 @@
 //! history-sized join plans. Bodies and sender names are hydrated only for
 //! the newest requested window. The caller supplies one read snapshot.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 
-use sqlmodel_core::{Row, Value};
+use asupersync::{CancelReason, Cx, Outcome};
+use sqlmodel_core::{Error as SqlError, Row, Value};
 
 use super::{InboxBodyPolicy, InboxFetchOptions};
 use crate::error::DbError;
@@ -38,6 +40,67 @@ pub const HEADER_COLUMNS: &str =
 
 fn db_error(error: impl std::fmt::Display) -> DbError {
     DbError::Sqlite(error.to_string())
+}
+
+/// Cancellation belongs to each request, not to a process-global read gate.
+/// Keep cleanup executable after cancellation so no read snapshot is left on
+/// a reused connection. Each query is a bounded page or primary-key lookup.
+pub(crate) struct CancellableRead<'a, C> {
+    connection: &'a C,
+    cx: &'a Cx,
+    interrupted: Cell<bool>,
+}
+
+impl<'a, C: SyncQuery> CancellableRead<'a, C> {
+    pub(crate) const fn new(connection: &'a C, cx: &'a Cx) -> Self {
+        Self {
+            connection,
+            cx,
+            interrupted: Cell::new(false),
+        }
+    }
+
+    fn checkpoint(&self) -> Result<(), SqlError> {
+        if self.cx.checkpoint().is_err() {
+            self.interrupted.set(true);
+            Err(SqlError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn finish<T>(&self, result: Result<T, DbError>) -> Outcome<T, DbError> {
+        if self.interrupted.get() || self.checkpoint().is_err() {
+            return Outcome::Cancelled(
+                self.cx
+                    .cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("inbox read cancelled")),
+            );
+        }
+        match result {
+            Ok(value) => Outcome::Ok(value),
+            Err(error) => Outcome::Err(error),
+        }
+    }
+}
+
+impl<C: SyncQuery> SyncQuery for CancellableRead<'_, C> {
+    fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
+        self.checkpoint()?;
+        let started = crate::tracking::query_timer();
+        let result = self.connection.query_sync(sql, params);
+        crate::tracking::record_query(sql, crate::tracking::elapsed_us(started));
+        let rows = result?;
+        self.checkpoint()?;
+        Ok(rows)
+    }
+
+    fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+        if sql != "RELEASE SAVEPOINT am_inbox_read" {
+            self.checkpoint()?;
+        }
+        self.connection.execute_raw(sql)
+    }
 }
 
 struct ReadSnapshot<'a, C: SyncQuery> {
@@ -144,6 +207,8 @@ pub(super) fn fetch_direct_with_policy(
 /// the newest-first walk (br-kp1in.40).
 const NEWEST_FIRST_MIN_INBOX: i64 = 256;
 pub const INBOX_STATS_HINT_SQL: &str = "SELECT total_count FROM inbox_stats WHERE agent_id = ?";
+const INBOX_RECEIPT_SIZE_PROBE_SQL: &str =
+    "SELECT message_id FROM message_recipients WHERE agent_id = ? LIMIT 256";
 
 /// Without a read/ACK-state filter the receipt scan reads one receipt and one
 /// header per inbox row, so its cost grows with the whole inbox. Walking the
@@ -151,9 +216,11 @@ pub const INBOX_STATS_HINT_SQL: &str = "SELECT total_count FROM inbox_stats WHER
 /// the window is complete, which pays when the agent receives a good share
 /// of the project's recent mail. `inbox_stats` only chooses the plan and caps
 /// the walk at a quarter of the receipt count; both plans are exact, so a
-/// stale count costs time, never rows. A missing count, or a mailbox without
-/// the table, keeps the receipt scan. Read/ACK-state filters keep it too: it
-/// skips their header lookups, while their rows can sit anywhere in history.
+/// stale count costs time, never rows. Missing or understated counts must not
+/// make an unfiltered five-message read scan a large inbox (GH#374): a bounded
+/// receipt probe can establish eligibility without rebuilding the hint or
+/// counting history. Read/ACK-state filters keep the receipt scan: it skips
+/// their header lookups, while their rows can sit anywhere in history.
 fn newest_first_budget(
     conn: &impl SyncQuery,
     agent_id: i64,
@@ -163,22 +230,40 @@ fn newest_first_budget(
     if options.unread_only || options.ack_required_only || options.ack_overdue_before.is_some() {
         return Ok(None);
     }
-    let rows = match conn.query_sync(INBOX_STATS_HINT_SQL, &[Value::BigInt(agent_id)]) {
-        Ok(rows) => rows,
-        Err(error) if super::is_missing_inbox_stats_table_error(&error.to_string()) => {
-            return Ok(None);
-        }
+    let total = match conn.query_sync(INBOX_STATS_HINT_SQL, &[Value::BigInt(agent_id)]) {
+        Ok(rows) => rows
+            .first()
+            .map(|row| row.get_named::<i64>("total_count"))
+            .transpose()
+            .map_err(db_error)?,
+        Err(error) if super::is_missing_inbox_stats_table_error(&error.to_string()) => None,
         Err(error) => return Err(db_error(error)),
     };
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-    let total = row.get_named::<i64>("total_count").map_err(db_error)?;
     let wanted = i64::try_from(limit).unwrap_or(i64::MAX);
-    if total < NEWEST_FIRST_MIN_INBOX || wanted.saturating_mul(4) > total {
+    if let Some(total) = total.filter(|total| *total >= NEWEST_FIRST_MIN_INBOX) {
+        if wanted.saturating_mul(4) > total {
+            return Ok(None);
+        }
+        return Ok(usize::try_from(total / 4).ok());
+    }
+    // The probe proves only a lower bound of PAGE_SIZE receipts. Restrict its
+    // use to small windows, keeping the existing quarter-inbox work budget.
+    // A dense inbox finishes in the first header page; a sparse one falls
+    // back after that page rather than trusting its partial selection.
+    if limit > PAGE_SIZE / 4 {
         return Ok(None);
     }
-    Ok(usize::try_from(total / 4).ok())
+    let receipts = query(
+        conn,
+        INBOX_RECEIPT_SIZE_PROBE_SQL,
+        &[Value::BigInt(agent_id)],
+    )?;
+    if receipts.len() > PAGE_SIZE {
+        return Err(DbError::Internal(
+            "inbox size probe exceeded its receipt bound".into(),
+        ));
+    }
+    Ok((receipts.len() == PAGE_SIZE).then_some(PAGE_SIZE / 4))
 }
 
 /// A page's receipts as one index range read. IDs usually follow creation
@@ -1076,15 +1161,18 @@ mod tests {
     #[test]
     fn indexed_pipeline_bounds_each_lookup_and_hydrates_only_selected_bodies() {
         let conn = seed(600);
-        // Pin the receipt scan this test bounds: without a count the
-        // newest-first walk is not tried (its bounds are asserted below).
-        conn.execute_raw("DELETE FROM inbox_stats").unwrap();
+        // State filters select the receipt scan this test bounds; the
+        // newest-first walk's bounds are asserted separately below.
+        let filters = InboxFetchOptions {
+            unread_only: true,
+            ..options()
+        };
         let recording = Recording {
             conn: &conn,
             calls: RefCell::new(Vec::new()),
         };
         let result = with_snapshot(&recording, || {
-            fetch_direct(&recording, 1, 2, None, 7, options())
+            fetch_direct(&recording, 1, 2, None, 7, filters)
         })
         .unwrap();
         assert_eq!(result.len(), 7);
@@ -1568,6 +1656,427 @@ mod tests {
         conn.execute_raw("DROP TABLE inbox_stats").unwrap();
         let (_, (pages, _, _)) = run(20, options());
         assert_eq!(pages, 0);
+    }
+
+    #[test]
+    fn gh374_missing_hint_probe_keeps_small_and_sparse_inboxes_exact() {
+        for (every, expected_header_pages) in [(40, 0), (8, 1)] {
+            let conn = walk_conn();
+            seed_walk(
+                &conn,
+                (1, 4096),
+                every,
+                |id| 1_000_000 + id * 1000,
+                mixed_importance,
+            );
+            conn.execute_raw("DELETE FROM inbox_stats WHERE agent_id = 2; PRAGMA query_only = ON")
+                .unwrap();
+            let recording = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let rows =
+                fetch_inbox_rows_from_conn_impl(&recording, 1, 2, None, 20, options()).unwrap();
+            same_rows(&rows, &newest_reference(&conn, None, 20, options()));
+            assert_eq!(rows.len(), 20);
+            let calls = recording.calls.borrow();
+            let (header_pages, receipt_pages, _) = query_counts(&calls);
+            assert_eq!(header_pages, expected_header_pages, "every {every}");
+            assert!(
+                receipt_pages > 0,
+                "every {every}: exact fallback did not run"
+            );
+            let probe_rows = calls
+                .iter()
+                .filter(|(sql, _, _)| sql == INBOX_RECEIPT_SIZE_PROBE_SQL)
+                .map(|(_, _, rows)| *rows)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                probe_rows,
+                [usize::try_from(4096 / every).unwrap().min(PAGE_SIZE)],
+            );
+            // The sparse case finds only 16 of the requested 20 receipts in
+            // its first header page. It must discard that partial window.
+            if every == 8 {
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.message.id.unwrap())
+                        .collect::<Vec<_>>(),
+                    (0..20).map(|offset| 4096 - offset * 8).collect::<Vec<_>>(),
+                );
+            }
+            conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+        }
+    }
+
+    /// The pre-GH#374 merge, retained as an independent exact-result/work
+    /// comparison: each lane reads its complete top-N before merging.
+    fn unbounded_shared_merge(
+        conn: &impl SyncQuery,
+        since: Option<i64>,
+        limit: usize,
+        filters: InboxFetchOptions<'_>,
+    ) -> Vec<InboxRow> {
+        with_snapshot(conn, || {
+            let direct = fetch_direct(conn, 1, 2, since, limit, filters)?;
+            let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+                conn, 1, 2, since, limit, filters,
+            )?;
+            Ok(crate::project_mailbox::merge_inbox_rows(
+                direct, shared, limit,
+            ))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn gh374_large_inbox_bounds_direct_and_sparse_shared_history() {
+        let conn = walk_conn();
+        seed_walk(
+            &conn,
+            (1, 25_100),
+            2,
+            |id| 1_000_000 + id * 1000,
+            |_| "normal",
+        );
+        let filters = InboxFetchOptions {
+            body_policy: InboxBodyPolicy::MetadataOnly,
+            ..options()
+        };
+        // A real direct-only inbox can lose its stats row during a failed
+        // rebuild. Compare against the exact whole-receipt plan before any
+        // shared deliveries exist, rather than relying on the shared fix.
+        let original_direct = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let started = std::time::Instant::now();
+        let expected_direct = with_snapshot(&original_direct, || {
+            let newest = receipt_window(&original_direct, 1, 2, None, 5, filters)?;
+            hydrate(&original_direct, 1, newest, filters.body_policy, false)
+        })
+        .unwrap();
+        let original_direct_us = started.elapsed().as_micros();
+        let (_, original_receipt_pages, _) = query_counts(&original_direct.calls.borrow());
+        assert!(original_receipt_pages > 45);
+        assert_eq!(
+            expected_direct
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            [25100, 25098, 25096, 25094, 25092],
+        );
+        for (hint, update) in [
+            (
+                "understated",
+                "UPDATE inbox_stats SET total_count = 64 WHERE agent_id = 2",
+            ),
+            ("missing", "DELETE FROM inbox_stats WHERE agent_id = 2"),
+        ] {
+            conn.execute_raw(update).unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            let candidate = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let started = std::time::Instant::now();
+            let actual =
+                fetch_inbox_rows_from_conn_impl(&candidate, 1, 2, None, 5, filters).unwrap();
+            let candidate_us = started.elapsed().as_micros();
+            same_rows(&actual, &expected_direct);
+            let calls = candidate.calls.borrow();
+            let (header_pages, receipt_pages, _) = query_counts(&calls);
+            assert_eq!((header_pages, receipt_pages), (1, 0), "{hint}");
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(sql, _, _)| sql == INBOX_RECEIPT_SIZE_PROBE_SQL)
+                    .map(|(_, _, rows)| *rows)
+                    .collect::<Vec<_>>(),
+                [PAGE_SIZE],
+                "{hint}: eligibility reads only one bounded receipt probe",
+            );
+            assert!(calls.iter().all(|(sql, _, _)| !sql.contains("COUNT(*)")));
+            println!(
+                "{{\"case\":\"gh374_direct_{hint}_hint\",\"messages\":25100,\"limit\":5,\"original_receipt_pages\":{original_receipt_pages},\"candidate_header_pages\":{header_pages},\"candidate_receipt_pages\":{receipt_pages},\"probe_rows\":256,\"original_us\":{original_direct_us},\"candidate_us\":{candidate_us}}}"
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        }
+        super::super::rebuild_agent_inbox_stats_sync(&conn, 2).unwrap();
+        // One old shared delivery made every inbox page traverse the full
+        // project's history. Include recent shared mail and a direct/shared
+        // duplicate to prove the bound preserves both ranking and precedence.
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(1,1,'to',90000000),(25099,1,'to',0),(25100,1,'to',0); \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let original = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let candidate = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let started = std::time::Instant::now();
+        let expected = unbounded_shared_merge(&original, None, 5, filters);
+        let original_us = started.elapsed().as_micros();
+        let started = std::time::Instant::now();
+        let actual = fetch_inbox_rows_from_conn_impl(&candidate, 1, 2, None, 5, filters).unwrap();
+        let candidate_us = started.elapsed().as_micros();
+        same_rows(&actual, &expected);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            [25100, 25099, 25098, 25096, 25094]
+        );
+        assert_eq!(
+            actual[0].kind, "bcc",
+            "direct receipt wins over shared delivery"
+        );
+        assert_eq!(actual[1].kind, crate::project_mailbox::PROJECT_MAILBOX_KIND);
+        let (original_pages, _, _) = query_counts(&original.calls.borrow());
+        let (candidate_pages, _, _) = query_counts(&candidate.calls.borrow());
+        assert!(
+            original_pages > 190,
+            "fixture must exercise the full-history scan"
+        );
+        assert!(
+            candidate_pages <= 2,
+            "a small inbox window rescanned history"
+        );
+        assert!(actual.iter().all(|row| row.message.body_md.is_empty()));
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            25_100
+        );
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+        println!(
+            "{{\"case\":\"gh374_sparse_shared\",\"messages\":25100,\"limit\":5,\"original_header_pages\":{original_pages},\"candidate_header_pages\":{candidate_pages},\"original_us\":{original_us},\"candidate_us\":{candidate_us}}}"
+        );
+    }
+
+    #[test]
+    fn gh374_shared_merge_bound_preserves_ties_filters_and_partial_windows() {
+        let conn = walk_conn();
+        conn.execute_raw(
+            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts,importance,ack_required,topic) VALUES \
+             (1,1,1,'one','body-one',100,'high',1,'Handoffs'), \
+             (2,1,1,'two','body-two',100,'normal',1,'other'), \
+             (3,1,1,'three','body-three',120,'urgent',1,'Handoffs'), \
+             (4,1,1,'four','body-four',100,'high',1,'Handoffs'), \
+             (5,1,1,'five','body-five',90,'normal',1,'other'), \
+             (6,1,1,'six','body-six',150,'low',1,'Handoffs'); \
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) VALUES \
+             (1,2,'to',NULL,NULL),(2,2,'cc',5,7),(3,2,'bcc',NULL,NULL); \
+             INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES \
+             (4,1,'to',1000),(5,1,'to',2000),(6,1,'to',0); \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES \
+             (4,2,1,NULL),(5,2,NULL,1); PRAGMA query_only = ON",
+        ).unwrap();
+        for flags in 0..8 {
+            for since in [None, Some(99), Some(100)] {
+                for limit in [0, 1, 2, 3, 4, 6, 10] {
+                    for body_policy in [InboxBodyPolicy::Full, InboxBodyPolicy::MetadataOnly] {
+                        let filters = InboxFetchOptions {
+                            urgent_only: flags & 1 != 0,
+                            unread_only: flags & 2 != 0,
+                            ack_required_only: flags & 4 != 0,
+                            body_policy,
+                            ..options()
+                        };
+                        let expected = unbounded_shared_merge(&conn, since, limit, filters);
+                        let actual =
+                            fetch_inbox_rows_from_conn_impl(&conn, 1, 2, since, limit, filters)
+                                .unwrap();
+                        same_rows(&actual, &expected);
+                    }
+                }
+            }
+        }
+        for topic in [Some("HANDOFFS"), Some("other"), Some("absent")] {
+            for ack_overdue_before in [None, Some(100), Some(121)] {
+                let filters = InboxFetchOptions {
+                    topic,
+                    ack_overdue_before,
+                    ..options()
+                };
+                for limit in [1, 3, 6] {
+                    same_rows(
+                        &fetch_inbox_rows_from_conn_impl(&conn, 1, 2, None, limit, filters)
+                            .unwrap(),
+                        &unbounded_shared_merge(&conn, None, limit, filters),
+                    );
+                }
+            }
+        }
+        let tied = fetch_inbox_rows_from_conn_impl(&conn, 1, 2, None, 3, options()).unwrap();
+        assert_eq!(
+            tied.iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            [6, 3, 4],
+            "same-time higher shared ID must displace the direct boundary"
+        );
+        let partial = fetch_inbox_rows_from_conn_impl(&conn, 1, 2, None, 6, options()).unwrap();
+        assert_eq!(
+            partial.len(),
+            6,
+            "partial direct windows must admit older shared mail"
+        );
+        conn.execute_raw(
+            "PRAGMA query_only = OFF; \
+             UPDATE messages SET created_ts = -9223372036854775808; \
+             UPDATE agents SET inception_ts = -9223372036854775808 WHERE id = 2; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        same_rows(
+            &fetch_inbox_rows_from_conn_impl(&conn, 1, 2, None, 3, options()).unwrap(),
+            &unbounded_shared_merge(&conn, None, 3, options()),
+        );
+    }
+
+    #[test]
+    fn gh374_cancelled_inbox_pages_release_snapshot_without_publishing_partial_mail() {
+        struct Interrupt<'a> {
+            conn: &'a DbConn,
+            cx: &'a Cx,
+            needle: &'a str,
+            matches: Cell<usize>,
+            cancel_after: usize,
+            queries_after_cancel: Cell<usize>,
+        }
+        impl SyncQuery for Interrupt<'_> {
+            fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
+                if self.cx.is_cancel_requested() {
+                    self.queries_after_cancel
+                        .set(self.queries_after_cancel.get() + 1);
+                }
+                let rows = self.conn.query_sync(sql, params)?;
+                if sql.contains(self.needle) {
+                    self.matches.set(self.matches.get() + 1);
+                    if self.matches.get() == self.cancel_after {
+                        self.cx.set_cancel_requested(true);
+                    }
+                }
+                Ok(rows)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+                self.conn.execute_raw(sql)
+            }
+        }
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 600), 2, |id| id * 1000, |_| "normal");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(1,1,'to',0),(599,1,'to',0)",
+        )
+        .unwrap();
+        for (needle, cancel_after) in [
+            (
+                "SELECT message_id, kind, read_ts, ack_ts FROM message_recipients WHERE agent_id",
+                2,
+            ),
+            ("FROM project_mailbox_deliveries WHERE message_id IN", 1),
+            ("body_md", 1),
+        ] {
+            for caller_transaction in [false, true] {
+                if caller_transaction {
+                    conn.execute_raw(
+                        "BEGIN; UPDATE messages SET subject='caller write' WHERE id=1",
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                }
+                let cx = Cx::for_testing();
+                let interrupted = Interrupt {
+                    conn: &conn,
+                    cx: &cx,
+                    needle,
+                    matches: Cell::new(0),
+                    cancel_after,
+                    queries_after_cancel: Cell::new(0),
+                };
+                let filters = InboxFetchOptions {
+                    unread_only: true,
+                    ..options()
+                };
+                assert!(
+                    matches!(
+                        crate::sync::fetch_inbox_filtered_rows_with_cx(
+                            &cx,
+                            &interrupted,
+                            1,
+                            2,
+                            None,
+                            5,
+                            filters,
+                        ),
+                        Outcome::Cancelled(_)
+                    ),
+                    "{needle}"
+                );
+                assert_eq!(interrupted.matches.get(), cancel_after, "{needle}");
+                assert_eq!(interrupted.queries_after_cancel.get(), 0, "{needle}");
+                if caller_transaction {
+                    assert_eq!(
+                        conn.query_sync("SELECT subject FROM messages WHERE id=1", &[])
+                            .unwrap()[0]
+                            .get_named::<String>("subject")
+                            .unwrap(),
+                        "caller write"
+                    );
+                    conn.execute_raw("ROLLBACK").unwrap();
+                } else {
+                    assert_eq!(
+                        conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                            .get_as::<i64>(0)
+                            .unwrap(),
+                        1
+                    );
+                    conn.execute_raw("BEGIN; ROLLBACK; PRAGMA query_only = OFF")
+                        .unwrap();
+                }
+            }
+        }
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        assert!(matches!(
+            crate::sync::fetch_inbox_filtered_rows_with_cx(
+                &cx,
+                &recording,
+                1,
+                2,
+                None,
+                5,
+                options(),
+            ),
+            Outcome::Cancelled(_)
+        ));
+        assert!(
+            recording.calls.borrow().is_empty(),
+            "pre-cancelled request did SQL work"
+        );
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            600
+        );
     }
 
     /// Stands in for a plan that ignores index order: unordered receipt pages

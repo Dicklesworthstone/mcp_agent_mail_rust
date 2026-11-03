@@ -811,6 +811,23 @@ pub fn fetch_inbox_filtered_rows_from_conn(
     fetch_inbox_rows_from_conn_impl(conn, project_id, agent_id, since_ts, limit, options)
 }
 
+/// The request-aware inbox lane stops between bounded SQL pages when its
+/// dispatch context is cancelled. It never returns a partial inbox window.
+pub(crate) fn fetch_inbox_filtered_rows_with_cx(
+    cx: &asupersync::Cx,
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> asupersync::Outcome<Vec<InboxRow>, DbError> {
+    let checked = inbox::CancellableRead::new(conn, cx);
+    let result =
+        fetch_inbox_rows_from_conn_impl(&checked, project_id, agent_id, since_ts, limit, options);
+    checked.finish(result)
+}
+
 fn fetch_inbox_rows_from_conn_impl(
     conn: &impl crate::pool::SyncQuery,
     project_id: i64,
@@ -822,8 +839,27 @@ fn fetch_inbox_rows_from_conn_impl(
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
     with_read_snapshot(conn, || {
         let direct = inbox::fetch_direct(conn, project_id, agent_id, since_ts, limit, options)?;
+        // Once the direct lane fills the global window, older shared mail
+        // cannot enter it. Without this bound, even one old shared delivery
+        // makes a five-message inbox read traverse the entire project history
+        // looking for five shared messages (GH#374). Keep the boundary
+        // timestamp inclusive: a shared row with a higher ID at the same time
+        // can still displace the oldest direct row. A partial direct window
+        // supplies no bound, so sparse mailboxes remain complete.
+        let shared_since = direct
+            .last()
+            .filter(|_| direct.len() == limit)
+            .and_then(|row| row.message.created_ts.checked_sub(1))
+            .map_or(since_ts, |floor| {
+                Some(since_ts.map_or(floor, |ts| ts.max(floor)))
+            });
         let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
-            conn, project_id, agent_id, since_ts, limit, options,
+            conn,
+            project_id,
+            agent_id,
+            shared_since,
+            limit,
+            options,
         )?;
         Ok(crate::project_mailbox::merge_inbox_rows(
             direct, shared, limit,
