@@ -90,7 +90,7 @@ impl SnapshotRetentionGuard {
             super::select_verified_snapshot_inner(&primary, |candidate, inventoried| {
                 #[cfg(target_os = "linux")]
                 {
-                    match crate::recovery_retention::preflight_current_thread_file_readers(
+                    match crate::recovery_retention::preflight_current_thread_file_locks(
                         candidate,
                         inventoried,
                     ) {

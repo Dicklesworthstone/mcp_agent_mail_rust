@@ -47,7 +47,7 @@ pub(crate) use namespace::{
 };
 
 #[cfg(target_os = "linux")]
-pub(crate) use namespace::preflight_current_thread_file_readers;
+pub(crate) use namespace::preflight_current_thread_file_locks;
 
 #[cfg(all(test, unix))]
 use namespace::{

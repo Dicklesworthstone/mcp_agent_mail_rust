@@ -719,3 +719,150 @@ were blocked by Asupersync code generation under the same resource limit.
 The native component results and exact-source compilation above do not replace
 those outstanding runtime gates. No dependency, feature default, test size,
 scan bound or assertion was changed to obtain a passing result.
+
+## 2026-11-03 producer witness and pin-lock integration correction
+
+Fresh review of `e16fc7f` found that its pin-selection preflight was too broad.
+`DbPool::create_proactive_backup_admitted` retains a `SqliteFileWitness` after
+publication, whose `same_file::Handle` keeps the backup inode open. Refusing
+every same-process descriptor during read-only pin selection therefore also
+refused the producer's own ordinary identity witness. Once retention needed
+the pin to reclaim a saturated window, that refusal could strand cleanup and
+subsequent automatic exports. This is a concrete integration regression in
+the preceding change, not an unrelated feature request.
+
+The existing real-pool regression
+`verified_snapshot_uses_one_publication_admission_and_excludes_retention`
+already expresses the decisive sequence: publish through the real pool, then
+acquire retention while the pool remains alive. Its original assertions are
+preserved. The earlier compilation-only gate could not expose its runtime
+failure; the component checks below do not claim that this full producer test
+has now executed.
+
+Pin selection now checks actual traditional POSIX lock records in the current
+thread's descriptor table before opening a candidate. An ordinary unlocked
+handle can coexist with read-only pin verification. All matching descriptors
+must be inspected: the locking descriptor and its duplicates expose the POSIX
+record, while an independent unlocked descriptor of the same inode does not.
+The printed lock PID is not an ownership filter; a descriptor table can be
+shared across process IDs. Unknown, incomplete or unreadable relevant lock
+evidence remains a refusal. The full descriptor/mapping checks for deleting a
+candidate are unchanged.
+
+Linux's [`__show_fd_locks`](https://github.com/torvalds/linux/blob/v6.12/fs/locks.c)
+filters records by both the open file description and its owning descriptor
+table (or open description for OFD/flock locks). Actual Linux memfd probes
+confirmed READ and WRITE POSIX ranges, including to-EOF locks, on the locking
+descriptor and its duplicate, their absence on independent ordinary/O_PATH
+descriptors, and a real independent-process conflict. Opening and closing a
+new same-table descriptor released the POSIX lock. In contrast, a worker's
+lock after real `unshare(CLONE_FILES)` survived the main thread's independent
+open/close and remained visible to an independent process until worker exit.
+Real FLOCK and OFD read/write locks likewise survived independent open/close,
+with conflict and post-unlock controls. These probes used disposable anonymous
+files and no substituted syscall results.
+
+The public Linux regression now retains the producer's concrete
+`same_file::Handle` identity type throughout all eight superseded-backup
+unlinks beside a genuinely nondumpable same-user process, then checks the
+pinned inode and bytes. Its POSIX-lock case also holds that independent
+unlocked identity handle before acquiring the lock on a second descriptor;
+the refusal must preserve the lock, and later selection must succeed while
+the identity handle remains open. This additional file/guard coverage does not
+substitute for native execution of the existing complete pool regression.
+
+### Executed component controls and full comparison
+
+Four new native namespace tests passed with real Linux descriptor tables and
+repository-pinned dependencies. Together with the prior 14 reader cases, the
+focused run passed **18 tests, zero failures, zero ignored**. The added cases
+cover retained producer witnesses, recognized and complete lock records,
+independently opened POSIX lockers, and real shared versus private worker
+descriptor tables. The witness case separately proves that allowing read-only
+pin selection does not admit deletion of the same open inode. FLOCK and OFD
+controls retain their conflicts after an independent open/read/close.
+
+A small causal control includes the entire unchanged preceding namespace
+source (`ea70a998c56c05adedcdb1032f8ddbb2a7930c349f9e97dc05c1768ef796d2de`)
+and calls its existing helper directly, without aliasing, editing visibility,
+or copying the production implementation. With the same payload and real
+`same_file::Handle` plus O_PATH setup, that helper returns `WouldBlock` and the
+control fails. The candidate witness test passes. This is a component
+counterexample, not a full pool execution or a verbatim transplant of all
+the candidate's later lock controls. The baseline fixture uses an absolute
+temporary directory without the candidate fixture's extra canonicalization;
+both helpers canonicalize their source, and failure precedes the differing
+later assertions.
+
+Both unfiltered native suites then ran in one controller invocation, with one
+test thread and the same environment and 240-second bound. Both used
+`TMPDIR=/dev/shm` because the shared overlay was full. No procfs restriction,
+test assertion, scan bound or ignored-test setting changed.
+
+| Namespace source | Passed | Failed | Ignored | Filtered |
+| --- | ---: | ---: | ---: | ---: |
+| Preceding `ea70a998` | 46 | 13 | 0 | 0 |
+| Candidate `bdf70eda` | 50 | 13 | 0 | 0 |
+
+The same 13 test names fail with the same diagnoses: twelve strict generic
+file or empty-directory cases encounter the ambient `/proc/1/fd/0` permission
+denial, and the unchanged UID-transition fixture encounters `EINVAL`. There
+are no new or resolved failing names. These are not green full-suite results,
+and the differing test sets are not a performance benchmark.
+
+The candidate native executable has SHA-256
+`f4a4ebd7d2aa8d2dbeea018c630c3b78700f392675da9eceac40b525952190cd`.
+The focused log has SHA-256
+`61d6f760cc02358fc55acafc3bbda95a038f433e58fe6b13d5a55e7391bd9ce6`.
+The complete baseline and candidate logs have SHA-256
+`7b0eae5076302cc34bf42ab2b630f6036c4ca8cc541d3f7b5e675f93bea0084e`
+and `4bd9e4a0c902844ab7944c0b6fe2cdda2c6ded70f94e3dab94239e106fe37783`.
+The comparison receipt has SHA-256
+`85debcdd4877dcd6554dbe2653582e20c00c750a74671f60b8a57a39cd1ed9ce`.
+
+The exact changed source identities are:
+
+| File in `crates/mcp-agent-mail-db/` | SHA-256 |
+| --- | --- |
+| `src/recovery_retention.rs` | `11476dd16b3f758a4675e5451946f351829c46e866ef9bbe5c4533f034b9d33f` |
+| `src/recovery_retention_namespace.rs` | `bdf70eda07f6996e929a5b818e46ad0cab223772bd6b3d1f7978058cf0e8131b` |
+| `src/snapshot_authority.rs` | `31433c8b3b45d66efba856a0483182271432b569a3161f1c3c63f8093170bce0` |
+| `tests/retention_linux.rs` | `445947b7468f2c0246c1a072adfbb89cd129eaab7e870e0c4ebb2b5f53554078` |
+
+The exact namespace also passes strict Clippy with the existing workspace/DB
+allowlist and real metadata/native dependencies, with zero diagnostics.
+Independent review confirmed that the deletion inventory remains unchanged.
+
+### Integrated compilation and remaining runtime limits
+
+The initial production DB metadata check and all eight Linux integration tests'
+metadata/strict-Clippy checks passed. While this work was being validated,
+`main` advanced to `835083b277cf750a027a9af817f21b78d6f691c3`, preserving the
+preceding retention change and merging unrelated inbox/archive work. None of
+the seven files in this correction overlapped that merge.
+
+To check the integrated DB source despite the full overlay, a separate source
+tree on tmpfs contains exact copies of module parents, the changed retention
+files, and all three DB files changed by that merge; unchanged modules point
+to the original source files. The merged `queries.rs`, `sync.rs`, and
+`sync/inbox.rs` bytes were independently checked against GitHub's exact blob
+identities. This changes the compiler's source-root/output paths, not the
+production code, dependencies, feature selection or Cargo package environment.
+
+| Final integrated gate | Result and proof class |
+| --- | --- |
+| Complete production DB source, no default features | Metadata/type check passed in 34.697 seconds, zero diagnostics |
+| Exact eight public Linux retention tests | Metadata/type check passed in 0.737 seconds against the fresh DB artifact |
+| Those same eight tests | Strict Clippy passed in 0.706 seconds, zero diagnostics |
+| Exact namespace | Strict Clippy passed; 18 focused native tests passed as recorded above |
+| Formatting, diff checks and independent source review | Passed |
+
+The integration checks import the exact production test file and actual
+dependencies, including `same_file`; no test or production function is replaced.
+These are compilation/lint results, not execution of the public guard tests.
+The existing complete pool regression, native public integration tests, the
+unchanged 720-generation and 16,641-directory qualification gates, and full
+workspace qualification remain unexecuted here. Earlier native DB builds were
+blocked by Asupersync code generation under the shared memory limit. The known
+resource-blocked broad builds were not repeatedly rerun, and no dependency,
+feature default, assertion, test size or scan bound was weakened.

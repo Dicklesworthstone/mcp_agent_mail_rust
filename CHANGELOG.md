@@ -102,8 +102,11 @@ release commit in 3fdda50c.
   evidence of its exclusive flock; another thread reusing that descriptor
   number for an independent reader still blocks reclamation.
 - **Verified-pin selection preserves existing same-process reader locks.**
-  Retention performs a no-open reader check before inspecting each possible
+  Retention performs a no-open lock check before inspecting each possible
   restore point, including an earlier candidate later rejected by verification.
+  This checks actual current-table POSIX locks, allowing the pool's retained
+  identity handle to coexist with read-only verification. Ordinary publication
+  therefore does not strand cleanup or later exports behind its own witness.
   Without a verified fallback, a blocked pin refuses admission instead of
   becoming permission for a repair export.
   Shared snapshot selection for cooperating restore readers remains supported.

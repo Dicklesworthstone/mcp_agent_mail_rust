@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, File};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -426,6 +426,11 @@ fn retention_selection_preserves_posix_locks_on_pins_and_rejected_candidates() {
             fs::write(&mailbox.snapshot, INCOMPLETE).unwrap();
         }
         let original = fs::read(&mailbox.snapshot).unwrap();
+        // The pool retains this concrete identity-handle type after publish.
+        // Its unlocked descriptor must not hide a lock acquired through the
+        // independent descriptor below or prevent later read-only selection.
+        let identity =
+            same_file::Handle::from_file(File::open(&mailbox.snapshot).unwrap()).unwrap();
         let reader = File::open(&mailbox.snapshot).unwrap();
         let lock = nix::libc::flock {
             l_type: i16::try_from(nix::libc::F_RDLCK).unwrap(),
@@ -463,6 +468,10 @@ fn retention_selection_preserves_posix_locks_on_pins_and_rejected_candidates() {
             })
         );
         drop(guard);
+        assert_eq!(
+            identity.as_file().metadata().unwrap().ino(),
+            fs::metadata(&mailbox.snapshot).unwrap().ino(),
+        );
         assert_eq!(fs::read(&mailbox.snapshot).unwrap(), original);
         assert_eq!(fs::read(&mailbox.primary).unwrap(), mailbox.bytes);
         assert_eq!(
@@ -595,7 +604,17 @@ fn inaccessible_same_user_process_does_not_block_eight_backups() {
         false,
     );
     assert_real_procfs_denial(&proc);
+    // SqliteFileWitness keeps a same_file::Handle alive after ordinary pool
+    // publication. Pin verification only reads this inode: its unlocked
+    // identity handle must not strand all eight superseded generations.
+    let mut identity =
+        same_file::Handle::from_file(File::open(&mailbox.snapshot).unwrap()).unwrap();
+    let pinned = identity.as_file().metadata().unwrap();
     let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
+    assert_eq!(
+        guard.verified_source_path(),
+        Some(mailbox.snapshot.as_path())
+    );
     for generation in &generations {
         let inventoried = fs::metadata(generation).unwrap();
         let removed = guard
@@ -608,6 +627,17 @@ fn inaccessible_same_user_process_does_not_block_eight_backups() {
     }
     assert_success(&process.release());
     drop(guard);
+    let mut retained_bytes = Vec::new();
+    identity
+        .as_file_mut()
+        .read_to_end(&mut retained_bytes)
+        .unwrap();
+    assert_eq!(retained_bytes, mailbox.bytes);
+    let still_pinned = fs::metadata(&mailbox.snapshot).unwrap();
+    assert_eq!(
+        (still_pinned.dev(), still_pinned.ino()),
+        (pinned.dev(), pinned.ino()),
+    );
     mailbox.assert_recovery_unchanged();
 }
 

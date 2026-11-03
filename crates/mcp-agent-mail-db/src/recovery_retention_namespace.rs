@@ -608,38 +608,67 @@ pub(crate) fn preflight_superseded_snapshot_readers(
 }
 
 /// Protect this thread's POSIX locks before snapshot selection first opens a
-/// candidate. This does not inspect unrelated processes or grant deletion
-/// authority. A same-table descriptor or shared mapping always refuses.
+/// candidate. An ordinary retained witness or mapping permits read-only pin
+/// verification; neither is permission to delete its inode. Closing a fresh
+/// description can release POSIX locks owned by this files_struct, so inspect
+/// every matching descriptor, including locks acquired through another open.
 #[cfg(target_os = "linux")]
-pub(crate) fn preflight_current_thread_file_readers(
+pub(crate) fn preflight_current_thread_file_locks(
+    source: &Path,
+    inventoried: &Metadata,
+) -> io::Result<()> {
+    let source = source.canonicalize()?;
+    let process = Path::new("/proc").join(std::fs::read_link("/proc/thread-self")?);
+    preflight_descriptor_table_file_locks(&process, &source, inventoried)
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_descriptor_table_file_locks(
+    process: &Path,
     source: &Path,
     inventoried: &Metadata,
 ) -> io::Result<()> {
     const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
-    let source = source.canonicalize()?;
-    let process = Path::new("/proc").join(std::fs::read_link("/proc/thread-self")?);
-    let task_id = process
-        .file_name()
-        .and_then(OsStr::to_str)
-        .and_then(|id| id.parse().ok())
-        .ok_or_else(|| invalid("open-reader inventory cannot identify /proc/thread-self"))?;
-    let caller = read_process_status_summary(&process)?;
     let mut remaining = MAX_READER_INVENTORY_ENTRIES;
-    inspect_process_file_readers_once(
-        &process,
-        task_id,
-        &caller,
-        inventoried,
-        &source,
-        None,
-        &mut false,
-        || {
-            remaining = remaining.checked_sub(1).ok_or_else(|| {
-                io::Error::other("open-reader inventory exceeded its bounded scan")
-            })?;
-            Ok(())
-        },
-    )
+    for descriptor in std::fs::read_dir(process.join("fd"))? {
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("snapshot lock inventory exceeded its bounded scan"))?;
+        let inspect = || -> io::Result<bool> {
+            let descriptor = descriptor?;
+            if !std::fs::read_link(descriptor.path())?.is_absolute()
+                || !descriptor_references_inode(process, &descriptor, inventoried)?
+            {
+                return Ok(false);
+            }
+            let locks = read_descriptor_posix_locks(
+                File::open(process.join("fdinfo").join(descriptor.file_name()))?,
+                inventoried,
+            )?;
+            let current = std::fs::metadata(descriptor.path())?;
+            if current.dev() != inventoried.dev() || current.ino() != inventoried.ino() {
+                return Err(invalid(
+                    "snapshot lock descriptor changed during inspection",
+                ));
+            }
+            Ok(locks)
+        };
+        match inspect() {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "snapshot candidate {} has a POSIX lock in the descriptor table",
+                        source.display()
+                    ),
+                ));
+            }
+            Err(error) if is_proc_task_gone(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1422,6 +1451,80 @@ fn read_descriptor_inode(mut reader: impl io::Read) -> io::Result<u64> {
     ))
 }
 
+/// `show_fd_locks` lists POSIX locks only on their owning description and
+/// files_struct. Thus every matching descriptor must be inspected: an
+/// independent open of the same inode need not list another open's lock.
+/// No printed PID filter is valid here, since tasks can share a files_struct.
+/// FLOCK and OFD locks survive closing a fresh independent description.
+#[cfg(target_os = "linux")]
+fn read_descriptor_posix_locks(reader: impl io::Read, retained: &Metadata) -> io::Result<bool> {
+    use std::io::Read as _;
+
+    const MAX_FDINFO_BYTES: usize = 4096;
+    let mut info = Vec::with_capacity(256);
+    reader
+        .take(MAX_FDINFO_BYTES as u64 + 1)
+        .read_to_end(&mut info)?;
+    if info.len() > MAX_FDINFO_BYTES || !info.ends_with(b"\n") {
+        return Err(invalid(
+            "snapshot lock record is incomplete or exceeds its bound",
+        ));
+    }
+    if read_descriptor_inode(info.as_slice())? != retained.ino() {
+        return Err(invalid("snapshot lock descriptor changed its inode"));
+    }
+    for line in info.split(|byte| *byte == b'\n') {
+        if !line.starts_with(b"lock") {
+            continue;
+        }
+        let record = line
+            .strip_prefix(b"lock:")
+            .ok_or_else(|| invalid("snapshot lock record has an invalid label"))?;
+        let record = std::str::from_utf8(record).map_err(io::Error::other)?;
+        let fields = record.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 8
+            || fields[0]
+                .strip_suffix(':')
+                .and_then(|ordinal| ordinal.parse::<u64>().ok())
+                .is_none_or(|ordinal| ordinal == 0)
+            || !matches!(fields[1], "POSIX" | "FLOCK" | "OFDLCK")
+            || fields[2] != "ADVISORY"
+            || !matches!(fields[3], "READ" | "WRITE")
+            || fields[4].parse::<i32>().is_err()
+        {
+            return Err(invalid("snapshot lock record is malformed or unrecognized"));
+        }
+        let mut identity = fields[5].split(':');
+        let major = identity
+            .next()
+            .and_then(|value| u64::from_str_radix(value, 16).ok());
+        let minor = identity
+            .next()
+            .and_then(|value| u64::from_str_radix(value, 16).ok());
+        let inode = identity.next().and_then(|value| value.parse::<u64>().ok());
+        let start = fields[6].parse::<u64>().ok();
+        let end = if fields[7] == "EOF" {
+            Some(u64::MAX)
+        } else {
+            fields[7].parse::<u64>().ok()
+        };
+        if major != Some(nix::sys::stat::major(retained.dev()))
+            || minor != Some(nix::sys::stat::minor(retained.dev()))
+            || inode != Some(retained.ino())
+            || identity.next().is_some()
+            || start.zip(end).is_none_or(|(start, end)| end < start)
+        {
+            return Err(invalid(
+                "snapshot lock record has an invalid identity or range",
+            ));
+        }
+        if fields[1] == "POSIX" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Linux emits FLOCK records in fdinfo only for the owning open description
 /// (`fs/locks.c::__show_fd_locks` checks `filp == flc_file`). While our borrowed
 /// file retains its exclusive flock, a matching record proves the same OFD;
@@ -2145,7 +2248,7 @@ mod tests {
         fcntl(&reader, FcntlArg::F_SETLK(&shared)).unwrap();
 
         for result in [
-            preflight_current_thread_file_readers(&source, &inventoried),
+            preflight_current_thread_file_locks(&source, &inventoried),
             preflight_inventoried_file_readers(&source, &inventoried),
         ] {
             let error = result.unwrap_err();
@@ -2170,11 +2273,293 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         drop(reader);
-        preflight_current_thread_file_readers(&source, &inventoried).unwrap();
+        preflight_current_thread_file_locks(&source, &inventoried).unwrap();
         assert_eq!(
             std::fs::read(&source).unwrap(),
             b"same-process SQLite reader lock"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_pin_preflight_accepts_retained_witness_without_admitting_deletion() {
+        use nix::fcntl::{FcntlArg, fcntl};
+
+        let _scan_guard = reader_scan_test_guard();
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"verified backup retained by the producer").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        // This is the exact retained handle type in pool::SqliteFileWitness.
+        let witness = same_file::Handle::from_file(File::open(&source).unwrap()).unwrap();
+        let path_handle = File::from(
+            rustix::fs::open(&source, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap(),
+        );
+        preflight_current_thread_file_locks(&source, &inventoried).unwrap();
+        let error = preflight_inventoried_file_readers(&source, &inventoried).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let owner = File::options()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let observer = File::open(&source).unwrap();
+        fs2::FileExt::try_lock_exclusive(&owner).unwrap();
+        preflight_current_thread_file_locks(&source, &inventoried).unwrap();
+        std::fs::read(&source).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&observer).is_err());
+        fs2::FileExt::unlock(&owner).unwrap();
+
+        let held = nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_RDLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 13,
+            l_len: 7,
+            l_pid: 0,
+        };
+        fcntl(&owner, FcntlArg::F_OFD_SETLK(&held)).unwrap();
+        preflight_current_thread_file_locks(&source, &inventoried).unwrap();
+        std::fs::read(&source).unwrap();
+        let mut requested = held;
+        requested.l_type = i16::try_from(nix::libc::F_WRLCK).unwrap();
+        fcntl(&observer, FcntlArg::F_OFD_GETLK(&mut requested)).unwrap();
+        assert_eq!(requested.l_type, held.l_type);
+        assert_eq!(requested.l_pid, -1);
+        let mut unlock = held;
+        unlock.l_type = i16::try_from(nix::libc::F_UNLCK).unwrap();
+        fcntl(&owner, FcntlArg::F_OFD_SETLK(&unlock)).unwrap();
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"verified backup retained by the producer"
+        );
+        assert_eq!(path_handle.metadata().unwrap().ino(), inventoried.ino());
+        assert_eq!(
+            witness,
+            same_file::Handle::from_file(File::open(&source).unwrap()).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_pin_lock_records_require_complete_recognized_identity() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"lock parser identity").unwrap();
+        let identity = std::fs::metadata(&source).unwrap();
+        let header = format!(
+            "pos:\t0\nflags:\t0100000\nmnt_id:\t27\nino:\t{}\n",
+            identity.ino()
+        );
+        let device_inode = format!(
+            "{:x}:{:x}:{}",
+            nix::sys::stat::major(identity.dev()),
+            nix::sys::stat::minor(identity.dev()),
+            identity.ino()
+        );
+        assert!(!read_descriptor_posix_locks(header.as_bytes(), &identity).unwrap());
+        for (kind, access, pid, start, end, expected) in [
+            ("POSIX", "READ", "1", "0", "0", true),
+            ("POSIX", "WRITE", "2147483647", "7", "22", true),
+            ("POSIX", "READ", "0", "19", "EOF", true),
+            ("FLOCK", "WRITE", "2", "0", "EOF", false),
+            ("OFDLCK", "READ", "-1", "13", "19", false),
+        ] {
+            let info = format!(
+                "{header}lock:\t1: {kind} ADVISORY {access} {pid} {device_inode} {start} {end}\n"
+            );
+            assert_eq!(
+                read_descriptor_posix_locks(info.as_bytes(), &identity).unwrap(),
+                expected
+            );
+        }
+        let valid = format!("{header}lock:\t1: FLOCK ADVISORY WRITE 2 {device_inode} 0 EOF\n");
+        for malformed in [
+            valid.trim_end().to_owned(),
+            valid.replace("lock:", "lock "),
+            valid.replace("1: FLOCK", "0: FLOCK"),
+            valid.replace("FLOCK", "LEASE"),
+            valid.replace("ADVISORY", "MANDATORY"),
+            valid.replace("WRITE", "UNLCK"),
+            valid.replace("WRITE 2", "WRITE invalid"),
+            valid.replace(&device_inode, "ff:ff:0"),
+            valid.replace("0 EOF", "8 7"),
+            valid.replace("0 EOF", "invalid EOF"),
+            valid.replace(&format!("ino:\t{}", identity.ino()), "ino:\t0"),
+            format!("{header}lock:\t1: -> POSIX ADVISORY READ 2 {device_inode} 0 EOF\n"),
+            format!("{header}{}\n", "x".repeat(4096)),
+            "lock:\t1: FLOCK ADVISORY WRITE 2 0:0:0 0 EOF\n".to_owned(),
+        ] {
+            assert!(
+                read_descriptor_posix_locks(malformed.as_bytes(), &identity).is_err(),
+                "malformed lock record was admitted: {malformed:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_pin_preflight_preserves_locks_on_an_independent_description() {
+        use nix::fcntl::{FcntlArg, fcntl};
+
+        const CHILD_SOURCE: &str = "MCP_AGENT_MAIL_PIN_LOCK_PROBE";
+        const CHILD_LOCK: &str = "MCP_AGENT_MAIL_PIN_LOCK_RANGE";
+        let request = |kind: i32, start: i64, len: i64| nix::libc::flock {
+            l_type: i16::try_from(kind).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: start,
+            l_len: len,
+            l_pid: 0,
+        };
+        if let Some(source) = std::env::var_os(CHILD_SOURCE) {
+            let parameters = std::env::var(CHILD_LOCK)
+                .unwrap()
+                .split(':')
+                .map(|field| field.parse::<i64>().unwrap())
+                .collect::<Vec<_>>();
+            let reader = File::open(source).unwrap();
+            let mut observed = request(nix::libc::F_WRLCK, parameters[1], parameters[2]);
+            fcntl(&reader, FcntlArg::F_GETLK(&mut observed)).unwrap();
+            assert_eq!(i64::from(observed.l_type), parameters[0]);
+            return;
+        }
+        let _scan_guard = reader_scan_test_guard();
+        for (kind, start, len) in [
+            (nix::libc::F_RDLCK, 0, 1),
+            (nix::libc::F_WRLCK, 7, 16),
+            (nix::libc::F_RDLCK, 19, 0),
+        ] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(
+                &source,
+                b"read-only pin admission must preserve every POSIX range",
+            )
+            .unwrap();
+            let inventoried = std::fs::metadata(&source).unwrap();
+            // The earlier descriptor has no lock record. Stopping at this
+            // matching witness would miss the independently opened locker.
+            let witness = same_file::Handle::from_file(File::open(&source).unwrap()).unwrap();
+            let locker = File::options()
+                .read(true)
+                .write(true)
+                .open(&source)
+                .unwrap();
+            let held = request(kind, start, len);
+            fcntl(&locker, FcntlArg::F_SETLK(&held)).unwrap();
+            let error = preflight_current_thread_file_locks(&source, &inventoried).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            let full_name = concat!(
+                module_path!(),
+                "::snapshot_pin_preflight_preserves_locks_on_an_independent_description"
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", full_name.split_once("::").unwrap().1])
+                .env(CHILD_SOURCE, &source)
+                .env(CHILD_LOCK, format!("{kind}:{start}:{len}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "pin preflight released a POSIX lock: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let unlock = request(nix::libc::F_UNLCK, start, len);
+            fcntl(&locker, FcntlArg::F_SETLK(&unlock)).unwrap();
+            preflight_current_thread_file_locks(&source, &inventoried).unwrap();
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                b"read-only pin admission must preserve every POSIX range"
+            );
+            drop(locker);
+            drop(witness);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_pin_lock_inventory_distinguishes_a_private_worker_table() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+
+        struct Reader(std::process::Child);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        const READER: &str = r"
+import ctypes, fcntl, os, sys, threading
+source, mode = sys.argv[1:]
+witness = os.open(source, os.O_RDONLY)
+locker = os.open(source, os.O_RDWR)
+ready = threading.Event()
+release = threading.Event()
+worker_id = []
+def worker():
+    try:
+        if mode == 'private':
+            assert ctypes.CDLL(None).unshare(0x400) == 0
+        fcntl.lockf(locker, fcntl.LOCK_SH | fcntl.LOCK_NB, 9, 3)
+        worker_id.append(os.readlink('/proc/thread-self').split('/')[-1])
+        ready.set()
+        assert release.wait(30)
+    except BaseException:
+        os._exit(23)
+thread = threading.Thread(target=worker)
+thread.start()
+assert ready.wait(10)
+print(os.readlink('/proc/self'), worker_id[0], flush=True)
+assert sys.stdin.readline().strip() == 'release'
+release.set()
+thread.join()
+os.close(locker)
+os.close(witness)
+";
+        for mode in ["shared", "private"] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(
+                &source,
+                b"POSIX lock ownership follows the descriptor table",
+            )
+            .unwrap();
+            let inventoried = std::fs::metadata(&source).unwrap();
+            let mut reader = Reader(
+                std::process::Command::new("python3")
+                    .args(["-u", "-c", READER])
+                    .arg(&source)
+                    .arg(mode)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut ready = String::new();
+            std::io::BufReader::new(reader.0.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            let fields = ready.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 2);
+            let process = PathBuf::from(format!("/proc/{}", fields[0]));
+            let worker = process.join("task").join(fields[1]);
+            let leader = preflight_descriptor_table_file_locks(&process, &source, &inventoried);
+            let worker = preflight_descriptor_table_file_locks(&worker, &source, &inventoried);
+            preflight_current_thread_file_locks(&source, &inventoried).unwrap();
+            writeln!(reader.0.stdin.take().unwrap(), "release").unwrap();
+            assert!(reader.0.wait().unwrap().success());
+            if mode == "shared" {
+                assert_eq!(leader.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            } else {
+                leader.unwrap();
+            }
+            assert_eq!(worker.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                b"POSIX lock ownership follows the descriptor table"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

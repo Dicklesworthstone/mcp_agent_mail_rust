@@ -609,9 +609,16 @@ exclusive kernel flock identifies the cleaner's own retained descriptor across
 its threads; another reader reusing that descriptor number is still protected.
 
 Retention also performs the no-open current-thread check before selecting its
-verified restore point. This protects reader locks on both the eventual pin and
-earlier candidates that verification would reject. Opening and closing such a
-candidate just to reject it could otherwise release a same-process POSIX lock.
+verified restore point. That read-only selection checks actual POSIX lock
+records on every matching descriptor in the current descriptor table. It
+permits unlocked identity handles retained by the backup producer, while
+protecting POSIX locks on both the eventual pin and earlier candidates that
+verification would reject. Opening and closing such a candidate just to reject
+it could otherwise release a same-process POSIX lock. Descriptor-specific
+flock and OFD locks are not released by that independent open/close operation.
+Unavailable descriptor inventory, incomplete records or unrecognized lock
+data cause refusal. The full reader and mapping checks before deleting a
+candidate remain unchanged.
 If no verified fallback can be selected after a reader refusal, admission
 fails; the blocked pin does not count as missing verification or authorize a
 repair export.
