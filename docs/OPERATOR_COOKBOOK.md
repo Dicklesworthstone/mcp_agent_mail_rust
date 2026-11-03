@@ -625,6 +625,14 @@ repair export.
 The existing shared-authority protocol for cooperating restore readers is
 unchanged.
 
+Automatic-export cleanup carries the retained parent-directory admission
+through preparation, publication and failure handling. Snapshot authority
+compares its captured directory handle with that retained parent before
+selecting a pin, and keeps the binding for later checks. A replaced parent
+pathname refuses cleanup of both backup files and empty rotation directories;
+it cannot lend the displaced directory's lease to a replacement mailbox.
+Standalone rotation acquires and binds its own parent admission.
+
 For a fully verified, superseded periodic snapshot only, this uncertainty need
 not block retention. Under exclusive snapshot and recovery authority, an owned,
 single-link file in an owned directory without group/world write access may be

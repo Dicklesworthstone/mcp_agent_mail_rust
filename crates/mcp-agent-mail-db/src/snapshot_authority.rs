@@ -34,6 +34,7 @@ pub(super) struct SnapshotAuthority {
 #[must_use]
 pub struct SnapshotRetentionGuard {
     authority: SnapshotAuthority,
+    expected_parent: Option<File>,
     primary: PathBuf,
     metadata_path: PathBuf,
     metadata: RetentionMetadata,
@@ -74,11 +75,41 @@ impl SnapshotRetentionGuard {
     /// Refuses recovery, live readers/publishers, pending recovery intents,
     /// unsafe lock paths, or changed authority.
     pub fn acquire(primary: &Path) -> io::Result<Self> {
+        Self::acquire_with_parent(primary, None)
+    }
+
+    /// Bind retention to the directory already held by an exporter admission.
+    /// The retained directory identity, rather than its reusable pathname,
+    /// determines which snapshot authority may authorize cleanup.
+    ///
+    /// # Errors
+    /// Refuses an already replaced parent before acquiring control files, a captured
+    /// snapshot authority in another directory, and every refusal of
+    /// [`Self::acquire`]. Concurrent namespace changes remain a refusal.
+    pub fn acquire_for_parent(primary: &Path, expected_parent: &File) -> io::Result<Self> {
+        Self::acquire_with_parent(primary, Some(expected_parent))
+    }
+
+    fn acquire_with_parent(primary: &Path, expected_parent: Option<&File>) -> io::Result<Self> {
         let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
+        let expected_parent = expected_parent.map(File::try_clone).transpose()?;
+        if let Some(expected) = &expected_parent {
+            let parent = primary
+                .parent()
+                .ok_or_else(|| invalid("snapshot primary has no parent"))?;
+            // Refuse an already stale admission before recovery or snapshot
+            // admission can create any control file in the replacement.
+            ensure_same_directory(&open_directory(parent)?, expected)?;
+        }
         // Recovery owns this election before selecting a snapshot. Use the
         // same ordering, and never acquire recovery's outcome/backoff state.
         let recovery = crate::recovery_breaker::try_acquire_file_lock(&primary)?;
         let authority = SnapshotAuthority::acquire(&primary, true)?;
+        if let Some(expected) = &expected_parent {
+            // A pathname check alone has an ABA gap. Compare the directory
+            // actually captured by snapshot admission before selecting a pin.
+            authority.ensure_parent(expected)?;
+        }
         ensure_no_recovery_references(&primary)?;
         let metadata_path = super::snapshot_meta_path(&primary);
         let metadata = retention_metadata(&metadata_path);
@@ -126,6 +157,7 @@ impl SnapshotRetentionGuard {
             .transpose()?;
         let guard = Self {
             authority,
+            expected_parent,
             primary,
             metadata_path,
             metadata,
@@ -316,6 +348,9 @@ impl SnapshotRetentionGuard {
     /// Participating writers are excluded; changed external evidence refuses
     /// further work rather than allowing a stale pin to authorize eviction.
     pub fn revalidate(&self) -> io::Result<()> {
+        if let Some(expected) = &self.expected_parent {
+            self.authority.ensure_parent(expected)?;
+        }
         self.recovery.revalidate()?;
         self.authority.revalidate()?;
         ensure_no_recovery_references(&self.primary)?;
@@ -435,6 +470,21 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+fn ensure_same_directory(captured: &File, expected: &File) -> io::Result<()> {
+    let captured = captured.metadata()?;
+    let expected = expected.metadata()?;
+    if !captured.is_dir()
+        || !expected.is_dir()
+        || captured.dev() != expected.dev()
+        || captured.ino() != expected.ino()
+    {
+        return Err(invalid(
+            "snapshot retention parent differs from exporter admission",
+        ));
+    }
+    Ok(())
+}
+
 fn open_directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(invalid("snapshot authority requires an absolute parent"));
@@ -458,6 +508,10 @@ fn open_directory(path: &Path) -> io::Result<File> {
 }
 
 impl SnapshotAuthority {
+    fn ensure_parent(&self, expected: &File) -> io::Result<()> {
+        ensure_same_directory(&self.parent, expected)
+    }
+
     pub(super) fn acquire(primary: &Path, exclusive: bool) -> io::Result<Self> {
         let parent_path = primary
             .parent()
@@ -666,6 +720,80 @@ mod tests {
                 .exists()
         );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retention_parent_binding_refuses_replacement_before_control_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let directory = root.join("mailbox");
+        let original = root.join("original");
+        let replacement = root.join("replacement");
+        std::fs::create_dir(&directory).unwrap();
+        let primary = directory.join("mail.sqlite3");
+        let expected = open_directory(&directory).unwrap();
+        std::fs::rename(&directory, &original).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let sentinel = directory.join("unrelated-owner");
+        std::fs::write(&sentinel, b"replacement directory evidence").unwrap();
+
+        let error = SnapshotRetentionGuard::acquire_for_parent(&primary, &expected)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"replacement directory evidence"
+        );
+
+        std::fs::rename(&directory, &replacement).unwrap();
+        std::fs::rename(&original, &directory).unwrap();
+        let guard = SnapshotRetentionGuard::acquire_for_parent(&primary, &expected).unwrap();
+        // The guard retains the admission identity after the caller drops its
+        // handle, and still refuses a later replacement of the pathname.
+        drop(expected);
+        guard.revalidate().unwrap();
+        std::fs::rename(&directory, &original).unwrap();
+        std::fs::rename(&replacement, &directory).unwrap();
+        assert!(guard.revalidate().is_err());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"replacement directory evidence"
+        );
+    }
+
+    #[test]
+    fn retention_parent_binding_compares_captured_descriptors_after_path_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let directory = root.join("mailbox");
+        let original = root.join("original");
+        let replacement = root.join("replacement");
+        std::fs::create_dir(&directory).unwrap();
+        let expected = open_directory(&directory).unwrap();
+        let primary = directory.join("mail.sqlite3");
+        std::fs::rename(&directory, &original).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let captured = SnapshotAuthority::acquire(&primary, true).unwrap();
+        captured.revalidate().unwrap();
+        assert!(captured.ensure_parent(&expected).is_err());
+
+        std::fs::rename(&directory, &replacement).unwrap();
+        std::fs::rename(&original, &directory).unwrap();
+        ensure_same_directory(&open_directory(&directory).unwrap(), &expected).unwrap();
+        assert!(captured.ensure_parent(&expected).is_err());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        assert!(
+            replacement
+                .join("mail.sqlite3.bak.authority.lock")
+                .is_file()
+        );
+
+        let ordinary = File::create(directory.join("ordinary-file")).unwrap();
+        assert!(ensure_same_directory(&ordinary, &ordinary).is_err());
     }
 
     #[test]

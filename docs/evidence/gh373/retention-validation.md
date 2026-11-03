@@ -866,3 +866,103 @@ workspace qualification remain unexecuted here. Earlier native DB builds were
 blocked by Asupersync code generation under the shared memory limit. The known
 resource-blocked broad builds were not repeatedly rerun, and no dependency,
 feature default, assertion, test size or scan bound was weakened.
+
+## 2026-11-03 retained exporter parent binding
+
+The next review found a separate stale-authority path. The exporter retained a
+directory lease, but its cleanup entry point accepted only a boolean assertion
+that a parent lease was held. If that directory's pathname was replaced, the
+cleanup path could acquire snapshot authority from the replacement while its
+caller still held the displaced directory's lease. Publication's later pool
+authority check and journal completion checks did not protect the earlier
+retention attempt. This finding comes from the actual call chain; a baseline
+full-runtime deletion has not been executed on this runner.
+
+The server now passes a borrowed opaque `Admission` containing the retained
+lease and frozen parent spelling through quota preparation, producer dispatch,
+export admission, completion cleanup and admitted-refusal cleanup. A failed
+outer admission still uses public rotation, which must acquire its own lease.
+In-memory operation supplies no filesystem token and performs no cleanup.
+
+Both early empty-directory reclamation and later payload reclamation bind
+snapshot selection through `SnapshotRetentionGuard::acquire_for_parent`. Its
+initial check refuses an already replaced parent before control-file
+acquisition. The decisive check compares the directory actually captured by
+snapshot authority with the expected retained directory, rather than merely
+checking the pathname again. The guard duplicates that expected handle and
+repeats the binding alongside its existing authority, recovery and pin checks.
+Retained descriptors prevent inode reuse from making an unrelated directory
+appear to be the admitted one. Reader, recovery, ownership and sync policies
+are unchanged.
+
+Added regressions cover a real directory lease across replacement and
+restoration; refusal before creating controls in an already replaced parent;
+captured-directory mismatch even after restoring the pathname; and real
+rotation/coordinator call paths with replacement before and during a producer.
+The replacement fixtures contain valid snapshot metadata created at their
+eventual configured pathname. Invalid foreign-path metadata cannot mask the
+stale-lease defect. They require the replacement's complete file/control tree
+to remain intact and require reclamation to resume after restoring the
+original directory. Existing workload sizes and interrupted-operation
+assertions remain intact, and no procfs-observability skip was added.
+
+### Executed admission and staging foundations
+
+The exact new borrowed-admission replacement test passed. The complete actual
+admission and staging modules then passed **25 tests, zero failures, zero
+ignored, zero filtered**. This includes real cross-process flock contention,
+release after panic, shared and independent parent directories, count/byte
+limits, bounded inventory and preservation of symlink or unclassified evidence.
+The harness uses only a neutral crate alias and source-module paths to compile
+the complete production modules with real dependencies; it substitutes no DB,
+pool, syscall or test implementation.
+
+The executable has SHA-256
+`d272a107e2fe9381a181c7312f6f1eb5884cfe93c805819fe5ccdf7173afc0e5`.
+The full native log has SHA-256
+`ac1bb75c90b6dd53125070e3ae001138cabca7be3ad40dc03ebbce309d908e71`,
+and the test receipt has SHA-256
+`0e2e04e772edbd02ff189ce7aa3054ba6645f03e8a84f457323b46e1a1ef678c`.
+The unchanged staging source has SHA-256
+`e7ad4a6824783ee2b2de398708bcf5ac99720ca8408552389f208dd039df8098`.
+
+The changed source identities are:
+
+| File | SHA-256 |
+| --- | --- |
+| DB `src/snapshot_authority.rs` | `e9227c1fd43146470ab3dbac780b6abbeceab9b8ee260202a482d4f6cdcd2afd` |
+| Server `src/integrity_guard_backup_budget.rs` | `e7716488150a1d93aa85995c3d8a212513ec8a72b3713f7c0c08f4f9d86381a8` |
+| Server `src/integrity_guard.rs` | `dc9cd498dd73d4caa33ee3314a9f19486d66325cba586552ff18babc4607d303` |
+| Server `src/backup_rotation.rs` | `75555cd0d517986444c0f81fb295895da25ee8ed903302f13c287187d0ea1037` |
+
+The two independent source reviews found no blocking issue in the token chain
+or retained-descriptor comparison. The native foundation result does not
+claim native execution of the full snapshot guard, rotation, pool or
+coordinator regressions. The unchanged recovery/journal control-file paths
+can still create control state if an uncooperative replacement occurs between
+checks; this change does not claim every control-file operation is
+atomically relative to the retained directory. The guarantee added here is
+that a stale exporter token cannot adopt a different captured snapshot parent
+as its reclamation authority.
+
+### Final production call-chain checks
+
+The complete production DB source, with the new authority and the exact merged
+inbox source from `117a56b`, passed metadata/type checking in 22.503 seconds.
+The complete production `integrity_guard` and `backup_rotation` modules, their
+actual sibling modules and three verbatim production root helpers then passed
+metadata/type checking in 1.294 seconds and strict Clippy in 1.043 seconds,
+using that fresh DB artifact and actual dependencies. Both final server gates
+had zero diagnostics. Four initial idiom/visibility lint findings were fixed
+without adding suppressions, and the native 25-test foundation gate was rerun
+against the final budget bytes recorded above.
+
+The DB check uses the same exact-source tmpfs approach as the preceding pin
+fix. The server check compiles the full production modules and real token
+callers; it is not a whole-server-crate qualification or a runtime execution.
+It excludes `cfg(test)`. The two new authority unit-test definitions and new
+full rotation/coordinator regressions are source-reviewed only on this runner,
+not represented as compiled or executed tests. The genuine DB test graph
+requires Asupersync `test-internals`; an earlier attempt to build that graph
+was killed by the shared memory limit, and no alternate helper implementation
+or weakened feature graph was substituted to claim a pass.

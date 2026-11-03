@@ -110,6 +110,11 @@ release commit in 3fdda50c.
   Without a verified fallback, a blocked pin refuses admission instead of
   becoming permission for a repair export.
   Shared snapshot selection for cooperating restore readers remains supported.
+- **Exporter cleanup remains bound to its retained directory lease.**
+  Preparation, publication and refusal cleanup now carry the actual admission
+  handle. Snapshot authority must capture that same parent inode before file
+  or empty-directory reclamation, so replacing a directory pathname cannot
+  transfer an earlier exporter's cleanup authority to the replacement.
 - **Transient procfs permission denials retry the actual reader inventory.**
   One retry after 5 ms rechecks descriptors, mappings and surviving workers
   within the same scan budget. A retained process-directory descriptor prevents
