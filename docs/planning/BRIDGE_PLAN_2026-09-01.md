@@ -52,15 +52,46 @@
   206.9 seconds. No assertion, timeout or scanner exemption is removed.
   UBS reports three unchanged intentional fixture panic paths in this test
   file; keep its red result and review, with no UBS-green claim for that file.
-- [ ] Finish native inventory/token/URL/alias fixer tests through normal RCH
+- [x] Finish native inventory/token/URL/alias fixer tests through normal RCH
   on vmi1156319, with the verified Nextest runner and private root-owned
-  HOME/TMP/XDG paths. Both actual runner processes match all 3,902 frozen
-  tracked inputs. The build is active; no test pass has been observed yet.
+  HOME/TMP/XDG paths: 64 pass, zero fail, 3,144 outside the selected scope.
+  Both actual runner processes and a late witness match all 3,902 frozen
+  tracked inputs. Cold build takes 7,545 seconds; test execution takes 6.736
+  seconds. The observer did not preserve its executable copy; retain that
+  failure. Recover the original 243,772,592-byte image by stable open-file
+  identity and full SHA-256 9ec7794d3f0227748033ddb665fc53678150312691f297b01de1aee9cdcbcff3.
+  All three new cases pass again individually in a fresh private root.
+  Preserve the image, actual source, original observer failure and results in
+  a 12-member archive on trj; every member and the archive are verified/fsynced.
+  This pre-merge native scope does not qualify later namespace changes.
 - [ ] Build and retain the new CLI, then execute the private real-MCP test:
   two token findings and one URL finding, dry-run byte neutrality, intended
   field-only repairs, real authenticated requests, idempotence, exact undo,
   renewed 401 rejection and untouched read-only fallback/unrelated entries.
   Fresh solo verification remains separate from independent review.
+- [x] Retain the workspace-built standalone CLI 0c5e26bd (309,760,848 bytes)
+  by stable source-file hash and byte-verified/fsynced coordinator copy. This
+  is the merged workspace test feature graph, not the separate production
+  artifact. Its source witness has the six historical JSON omissions below.
+- [x] Preserve its first real-MCP failure: the fixture's `.gitignore` does not
+  protect adjacent credential artifacts, so the unchanged safety gate refuses
+  exit 3. Preserve original harness 84e9f581 and failed fixtures. Correct only
+  the scratch fixture to native setup's exact five patterns per client file;
+  ten real-Git positive and three negative controls discriminate protection.
+  The revised harness first requires exit 3 with all six config bytes and
+  `.gitignore` unchanged. Original positive repair/undo assertions stay intact.
+- [x] Observe actual token/URL repair, HTTP authentication and idempotence on
+  that CLI. Preserve its next real failure: URL undo refuses the repaired
+  project config as outside default write scopes. This is not an end-to-end
+  pass, and the doctor Bead stays open.
+- [ ] Qualify the resulting undo repair: add only mutable project-config
+  files to shared fix/undo defaults, reject canonical paths escaping the
+  project, and add positive/file-bounded/static-parent-symlink controls.
+  Formatting passes; UBS exit 0 has zero critical findings. All 22 added-line
+  findings are reviewed test expectations, filesystem fixtures and path strings;
+  no scanner suppression. Compiler, native undo controls and new-CLI repair/
+  idempotence/exact-undo/fresh-solo results remain required. Earlier build and
+  native evidence predates this source change. Broader authority tasks stay open.
 - [ ] Close this bug only on those source-bound native/CLI results. Keep the
   existing authority tasks br-3cqr4/br-x2jf5 and wider release work open.
 
@@ -87,14 +118,52 @@
 - [x] Refresh normal RCH telemetry: initial stale critical state remains a
   refusal boundary; the next normal probe clears it to warning, with over
   53 GiB free. No pressure, cache, source, slot or admission policy changes.
+- [x] Recheck headroom as the full-workspace build progresses: root free
+  space falls to about 21 GiB. Select CreamHill, vt-891549b4b and vt-29c6eb0cf
+  (about 12,908 MiB combined) only after complete protection-marker, 64–70-hour
+  idle, root-device, no-Git-metadata, no-external-hardlink, nested-mount,
+  root-privileged open-file and process-cwd checks pass for all three.
+- [x] Complete the provided lossless copy/stream-hash/entry-count/per-file
+  manifest checks into trj `hz3-cold-targets-root-0327/`. Existing explicit
+  move authorization is recorded. All three are VERIFIED by 04:01 UTC;
+  remaining vt originals stay until durability and fresh cutover guards pass.
+- [x] Complete CreamHill independently while the other copies continue:
+  5,069,045,760 bytes, 48,595 entries, SHA-256 cd2c906aa44c78f18266e265fe9130943290bfb32e863a1f190b4891f14b06fd.
+  Verify all manifests and fsync before a fresh marker/metadata/hardlink/mount/
+  open-file/cwd guard. Execute the provided cutover at 03:43:57 UTC, recording
+  exact authorization/command/time. Root free rises 19,307 to 24,184 MiB:
+  credit only the measured net 4,877 MiB. The sole remaining child is a verified,
+  synced restore pointer; its root owner and mode match the archived original.
+- [ ] Fsync all verified archives/manifests, repeat full guards and prove no
+  change since copy start before any cutover. Preserve synced restore pointers,
+  exact authorization/command/time and measured net root headroom afterward.
 - [ ] Finish the doctor native/CLI qualification and commit only owned work.
-- [ ] Preserve both histories when integrating remote f4b9da4f/534a8dd6
-  (procfs retry/pinned-inventory fixes). The checkout and remote each have
-  two unique commits at the observed fetch. Incoming changes are reviewed,
-  not qualified by the current pre-merge build. Never force-push or flatten.
+- [x] Commit the doctor repair as 58025b24 after its compiler/lint/format gates,
+  explicitly retaining pending native/CLI acceptance and the open Bead.
+- [x] Preserve both histories with normal merge 6fef128c, integrating remote
+  f4b9da4f/534a8dd6 (procfs retry/pinned-inventory fixes). Review the entire
+  incoming code/test/doc diff and import Beads after the merge. Later peer
+  commit 13afff25 changes only tracker metadata; compiled inputs are identical.
+  Never force-push or flatten. The old native pass is not incoming-code proof.
 - [ ] Run required checks and full-workspace native validation on the merged
-  source. Preserve scoped namespace evidence as scoped; release, crossplatform
-  and soak work remain open. This planning update changes no compiled source.
+  source. Normal RCH admits the hz3 workspace native run at 00:58 UTC; it is
+  compiles in 170 minutes and starts 20,762 tests across 27 binaries, with 54
+  existing skips. Run aee8ebe1-7a51-4397-9f4a-b93837aaf913 is active; no final
+  verdict yet. Its source witness matches 3,896 present inputs but misses
+  six historical perf JSONs: the complete-input observer exits 2, retained red.
+  The first merged compiler request refuses 103 before admission. Retry only
+  after the CLI worker advances to current source; no admission overrides.
+- [ ] Preserve and resolve the full run's two real-`br` fixture failures:
+  this invocation's private PATH omitted `/home/ubuntu/.local/bin`, where the
+  worker's actual installed `br` resides. Keep the current run's environment
+  fixed and its failures visible; include that real directory in the next
+  source-bound invocation. No mocks, assertion changes or test exclusions.
+- [ ] Finish the current-source standalone CLI build and its real-MCP/fresh
+  solo acceptance. Its live witness matches all 3,902 inputs at 13afff25.
+- [ ] Execute the original opt-in setup permission case within its 240-second
+  bound after full-workspace native processes finish; review actual fixture
+  privilege/skip behavior. Keep br-3cqr4 open until its original acceptance is
+  met. No Windows-native, release or soak qualification is implied here.
 
 ## November 2: populated CLI reads and coordinator headroom
 
