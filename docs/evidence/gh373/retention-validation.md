@@ -1260,3 +1260,160 @@ this commit does not claim all breaker state I/O or the broader
 `br-8asz3`/`br-xzgcj` work is complete. The previously identified ordinary
 descriptor-close/POSIX-reader-lock issue also remains unresolved. Its file
 lock and per-file synchronization protections have not been weakened.
+
+## 2026-11-03 follow-up: recovery outcomes use the held election
+
+This change starts from `7dafa0af881e7d02f60216cd1921a38e4363ce48` and
+closes the outcome-sidecar boundary identified above. The actual automatic
+recovery wrapper retained an election lock but reloaded and stored the JSON
+history through independent pathname operations. A directory replacement
+could redirect the history read, legacy permission normalization, temporary
+creation, publication, or directory sync. Replacing only the election leaf
+also allowed the old wrapper to clear history under an obsolete lock while
+another owner held the replacement inode in the same directory.
+
+### Implementation and policy
+
+The Unix recovery wrapper now acquires its election through the actual
+`AnchoredRecoveryParent.parent_dir`. The guard owns immutable state names;
+its authoritative `load()` and `store()` take no caller-supplied database
+path. The reload and all five writes use this guard: entry arming, panic
+retargeting, successful completion, restoration after host storage failure,
+and terminal failure recording.
+
+Guarded loading checks the directory entry without following links, refuses
+nonregular or multiply linked controls before opening, compares the captured
+entry with the opened inode, and reads at most the existing 16 KiB limit plus
+one overflow-detection byte. It rechecks file metadata and name identity.
+Both present state and clean absence require final election validation.
+
+Guarded storage normalizes an existing readable legacy control through its
+verified descriptor, including a `0400` control. Temporary creation uses
+exclusive `openat` in the retained directory. The tempfile builder supplies
+random leaf names with its own pathname cleanup disabled before creation.
+After writing and syncing the complete private file, the implementation
+rechecks the destination, stage, and election, publishes with `renameat`,
+then syncs the published file and the retained parent. Cleanup checks the
+stage's identity and uses `unlinkat` in that same parent. Successful rename
+disarms cleanup immediately, so a later error cannot unlink authoritative
+state. A stage that was replaced by another entry is preserved.
+
+The wrapper revalidates election authority immediately before execution and
+after every nonpanicking result. Operator bypass still permits supervised
+recovery from malformed or tripped history and ordinary best-effort outcome
+persistence. It cannot suppress lost election ownership, including when a
+guarded store fails. Original operation errors remain in contextual refusal
+messages; the panic path preserves its original payload and leaves the
+already-durable unfinished marker when retargeting cannot be completed.
+
+The public pathname `load` remains nonmutating for pre-election refusal and
+diagnostic callers; it does not create an election artifact. Public standalone
+`store` remains compatible, while the production recovery wrapper no longer
+uses it. Both forms share the same JSON decoder, encoder, schema, fingerprint,
+size, and semantic rules. The pure failure-count, cooldown, unfinished-lineage,
+host-storage, and fingerprint transitions are unchanged. Non-Unix guard I/O
+revalidates around the existing pathname implementation; this change does not
+claim a new descriptor-relative implementation on those platforms.
+
+This is checked cooperative election ownership and retained-directory I/O.
+Unix rename and unlink are not inode compare-and-swap operations against an
+uncooperative actor changing leaf names after the final check. No such stronger
+guarantee is claimed. The broader ownership beads remain open, as does the
+separate ordinary-descriptor/POSIX-lock-close defect.
+
+### Regression coverage and qualification boundary
+
+Eleven new filesystem tests exercise guarded state loading, missing state,
+foreign controls absent or initially `0400`/`0666`, all six publication phases,
+productive directory replacement/restoration during file writes and directory
+syncs, replaced elections, unsafe destination shapes, substituted stages,
+malformed or oversized state, and invalid outgoing state. An open reader keeps
+the complete old JSON while new readers see the complete replacement. Errors
+injected before and after publication leave complete old or new authority.
+Separate child processes exit without destructors immediately before or after
+publication; restart reacquires the election and loads the appropriate complete
+state. These are process-interruption tests, not simulated power-loss tests.
+
+Three new tests in the actual pool module exercise automatic success, failure,
+quota failure, and panic after election replacement; operator bypass losing
+ownership before execution; and successful or failed operator operations that
+lose ownership before terminal handling. They retain exact unfinished-state
+bytes and genuine replacement locks. The panic case advances its completion
+clock so an incorrect old retarget write would change the bytes. The workflow
+adds these three tests and nine existing coordinator transition tests as twelve
+separately checked exact cases. Existing suites and workload bounds are unchanged.
+
+Independent source reviews covered the complete breaker implementation, caller
+wiring, temporary cleanup, publication ordering, bypass behavior, and the new
+regressions. YAML parsing and all eleven workflow Bash blocks passed syntax
+checks; all twelve selected coordinator names resolve to actual tests.
+
+### Executed evidence on the final source
+
+The final native component run passed **49 tests, zero failures, zero ignored,
+and zero filtered**. This consists of 37 unchanged Linux state, fingerprint,
+and election tests; all eleven new guarded-state tests; and the unchanged
+`retention_control_pair_refuses_replacement_between_each_acquisition` test
+against the new guard. The latter uses the actual shared recovery/snapshot
+control acquisition helper. Strict component Clippy passed without diagnostics
+or new lint allowances. The native build took 1.518 seconds, the tests 0.131
+seconds, and strict component Clippy 0.629 seconds.
+
+The selected native boundary uses 110 byte-identical breaker source spans,
+twelve unchanged snapshot spans, five actual core disk helpers, and the actual
+SQLite suffix helper. Module/import routing and allowances for otherwise-unused
+items in this selected harness do not substitute state, serializer, syscall,
+filesystem, or pool implementations. The complete production breaker module
+was separately metadata/typechecked against the genuine cached core/config and
+dependency artifacts in 0.235 seconds. That check includes its real environment
+configuration function. It is not a typecheck of the full DB crate or pool.
+
+The unchanged old production primitives passed an ordinary-parent round-trip
+control. Three separate preservation assertions then failed as expected:
+the raw load accepted the replacement directory's cleared history even after
+the original directory was restored; the raw store created or overwrote state
+in the replacement directory; and the raw terminal store cleared unfinished
+debt after another owner acquired a replacement election inode. These are
+actual old state/filesystem operations under real locks, not execution of the
+complete old coordinator.
+
+The first candidate run passed 48/49 tests. Its sole failure was `EPERM` from
+creating a listening Unix socket at fixture setup. Linux now creates a real
+`S_IFSOCK` filesystem inode with safe `nix::mknod`, explicitly verifies its
+type, and runs every original refusal and preservation assertion. Socket
+coverage was not removed or skipped. Other Unix platforms retain the listener
+fixture. The next run passed 49/49 and exposed eight strict-Clippy empty-vector
+assertion diagnostics; equivalent typed-vector equality assertions resolved
+them without changing the predicates. The exact final source was then rebuilt
+and all four scoped gates passed. Production bytes were identical throughout
+these test-only refinements.
+
+| Reviewed final file | SHA-256 |
+| --- | --- |
+| DB `src/recovery_breaker.rs` | `dfbaf573db5c1be38dd08c65257869f82460bc1c743e3cb9b5d2f136e8e00519` |
+| DB `src/pool.rs` | `9c910e5de3f0c090246090b85f147061611eeaae9fffdf85b1f6cdb449749e08` |
+| `.github/workflows/issue373-native.yml` | `5b0913e780def6f3ee96f87483bfad9427c06fe86d397e8ff34465088552efcd` |
+
+The complete command/log/provenance receipt is
+`am-retention-outcome-parent-validation-final/validation-receipt.json`,
+307,805 bytes, SHA-256
+`bbda4469f491c8ccea42c37dd0cd55bc2528fdb74df720b6cc64744e71572f62`.
+The exact source-span receipt has SHA-256
+`f3fff41660827f9a95fac6f3a2e9344b792f4ceb4f4cac4592530bb89dfadcc9`.
+The final native executable was 3,007,480 bytes with SHA-256
+`56fde711cec0989d61b1ee09d0d11061e40ed1b880461556a4d25d7ea48ab315`.
+The final module metadata was 82,238 bytes with SHA-256
+`b2044eb8374e38dd6f0ab21c16895c369825a842e10d3c7c165f26be254d3ca7`.
+Both were hashed within the successful invocation but remain ephemeral;
+shared temporary storage filled during an earlier executable-copy attempt.
+That incomplete copy is explicitly invalid and was never executed. The full
+receipt, final source witnesses, commands, and historical failures were
+preserved. The shared OOM counter did not increase during the final gates.
+
+Whole-workspace `cargo fmt --all -- --check` and `git diff --check` passed with
+the final code in the working tree. No complete DB build was retried under the
+shared resource pressure; the previous 40.198-second SIGKILL remains the
+documented full-graph blocker. The three new pool regressions are reviewed
+source and hosted-CI selections, not locally compiled or executed pool tests.
+No downstream server proof, full workspace test/Clippy pass, or completed
+hosted run is inferred from the component results.

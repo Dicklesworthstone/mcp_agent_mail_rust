@@ -278,13 +278,121 @@ pub fn breaker_lock_path(db_path: &Path) -> PathBuf {
 pub(crate) struct RecoveryBreakerFileLock {
     file: std::fs::File,
     path: PathBuf,
+    state_path: PathBuf,
     #[cfg(unix)]
     parent: std::fs::File,
     #[cfg(unix)]
     name: std::ffi::OsString,
+    #[cfg(unix)]
+    state_name: std::ffi::OsString,
 }
 
 impl RecoveryBreakerFileLock {
+    /// Reload only this election's state, including when its parent spelling
+    /// is temporarily replaced. Absence still requires a valid retained owner.
+    pub(crate) fn load(&self) -> std::io::Result<Option<RecoveryBreakerState>> {
+        #[cfg(unix)]
+        {
+            self.load_with(|| {}, || {})
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate()?;
+            let result = load_sidecar_path(&self.state_path);
+            self.revalidate()?;
+            result
+        }
+    }
+
+    #[cfg(unix)]
+    fn load_with(
+        &self,
+        before_read: impl FnOnce(),
+        after_read: impl FnOnce(),
+    ) -> std::io::Result<Option<RecoveryBreakerState>> {
+        self.revalidate()?;
+        before_read();
+        let result = load_breaker_state_in_parent(&self.parent, &self.state_name, &self.state_path);
+        after_read();
+        // Do not let a missing sidecar skip the final authority check.
+        self.revalidate()?;
+        result
+    }
+
+    /// Publish this election's outcome through the same retained directory.
+    /// Every failure remains visible to automatic recovery's admission policy.
+    pub(crate) fn store(&self, state: &RecoveryBreakerState) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.store_with(state, |_| Ok(()))
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate()?;
+            store_sidecar_path(&self.state_path, state)?;
+            self.revalidate()
+        }
+    }
+
+    #[cfg(unix)]
+    fn store_with(
+        &self,
+        state: &RecoveryBreakerState,
+        mut observed: impl FnMut(BreakerStorePhase) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        let serialized = encode_breaker_state(state)?;
+        self.revalidate()?;
+        observed(BreakerStorePhase::Admitted)?;
+        let prior = open_breaker_state_file(&self.parent, &self.state_name, &self.state_path)?;
+        self.revalidate()?;
+        if let Some(file) = &prior {
+            validate_breaker_state_destination(
+                &self.parent,
+                &self.state_name,
+                &self.state_path,
+                Some(file),
+            )?;
+            // Change only the retained destination checked under this
+            // election; never reopen it through the reusable parent path.
+            mcp_agent_mail_core::disk::set_private_writable_file_permissions(file)?;
+        }
+        let mut staged = BreakerStateStage::create(&self.parent, breaker_parent_path(&self.path)?)?;
+        observed(BreakerStorePhase::StageCreated)?;
+        staged.file.write_all(&serialized)?;
+        staged.file.sync_all()?;
+        observed(BreakerStorePhase::StageSynced)?;
+
+        self.revalidate()?;
+        observed(BreakerStorePhase::BeforePublish)?;
+        validate_breaker_state_destination(
+            &self.parent,
+            &self.state_name,
+            &self.state_path,
+            prior.as_ref(),
+        )?;
+        staged.revalidate()?;
+        self.revalidate()?;
+        // The election excludes cooperating writers. These identity checks
+        // refuse observed leaf replacement; renameat is not an inode CAS
+        // against an uncooperative actor concurrently changing this directory.
+        rustix::fs::renameat(&self.parent, &staged.name, &self.parent, &self.state_name)?;
+        staged.published = true;
+        observed(BreakerStorePhase::Published)?;
+        staged.file.sync_all()?;
+        self.parent.sync_all()?;
+        observed(BreakerStorePhase::DirectorySynced)?;
+        self.revalidate()?;
+        staged.validate_file()?;
+        validate_breaker_state_destination(
+            &self.parent,
+            &self.state_name,
+            &self.state_path,
+            Some(&staged.file),
+        )
+    }
+
     /// A retained flock is authority only while its original name still refers
     /// to the same private, unaliased inode. Retention rechecks this before
     /// reclaiming evidence, so replacement cannot create two recovery owners.
@@ -340,6 +448,7 @@ impl RecoveryBreakerFileLock {
 /// Try to become the sole process evaluating and updating this database's
 /// breaker state. The lock is held across the admitted recovery operation and
 /// terminal state write; process death releases it automatically.
+#[cfg(any(not(unix), test))]
 pub(crate) fn try_acquire_file_lock(db_path: &Path) -> std::io::Result<RecoveryBreakerFileLock> {
     let path = std::path::absolute(breaker_lock_path(db_path))?;
     #[cfg(unix)]
@@ -353,7 +462,12 @@ pub(crate) fn try_acquire_file_lock(db_path: &Path) -> std::io::Result<RecoveryB
             .map_err(std::io::Error::other)?;
         let file = open_breaker_lock_file(&path)?;
         fs2::FileExt::try_lock_exclusive(&file)?;
-        let guard = RecoveryBreakerFileLock { file, path };
+        let state_path = path.with_extension("json");
+        let guard = RecoveryBreakerFileLock {
+            file,
+            path,
+            state_path,
+        };
         guard.revalidate()?;
         Ok(guard)
     }
@@ -476,14 +590,28 @@ fn acquire_breaker_file_lock_in_parent(
             )
         })?
         .to_os_string();
+    // The constructor owns the complete .am-recovery-breaker.lock suffix;
+    // replacing only its final extension preserves non-UTF-8 database names.
+    let state_path = path.with_extension("json");
+    let state_name = state_path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery election state has no leaf name",
+            )
+        })?
+        .to_os_string();
     before_control_open();
     let file = open_breaker_lock_file_in_parent(&parent, &name, &path)?;
     fs2::FileExt::try_lock_exclusive(&file)?;
     let guard = RecoveryBreakerFileLock {
         file,
         path,
+        state_path,
         parent,
         name,
+        state_name,
     };
     guard.revalidate()?;
     Ok(guard)
@@ -1079,15 +1207,23 @@ fn fingerprint_metadata_matches(before: &std::fs::Metadata, after: &std::fs::Met
 /// recovery must not reinterpret corrupted breaker authority as a clean slate.
 pub fn load(db_path: &Path) -> std::io::Result<Option<RecoveryBreakerState>> {
     let path = breaker_sidecar_path(db_path);
+    load_sidecar_path(&path)
+}
+
+fn load_sidecar_path(path: &Path) -> std::io::Result<Option<RecoveryBreakerState>> {
     let bytes = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
-        &path,
+        path,
         MAX_SIDECAR_BYTES,
     ) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let state: RecoveryBreakerState = serde_json::from_slice(&bytes).map_err(|error| {
+    decode_breaker_state(path, &bytes).map(Some)
+}
+
+fn decode_breaker_state(path: &Path, bytes: &[u8]) -> std::io::Result<RecoveryBreakerState> {
+    let state: RecoveryBreakerState = serde_json::from_slice(bytes).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -1105,7 +1241,7 @@ pub fn load(db_path: &Path) -> std::io::Result<Option<RecoveryBreakerState>> {
             ),
         ));
     }
-    Ok(Some(state))
+    Ok(state)
 }
 
 fn canonical_fingerprint_hash(hash: &str) -> bool {
@@ -1149,21 +1285,29 @@ fn recovery_breaker_state_is_semantically_valid(state: &RecoveryBreakerState) ->
 /// Automatic recovery treats every failure as an admission error so durable
 /// circuit authority can never silently lag.
 pub fn store(db_path: &Path, state: &RecoveryBreakerState) -> std::io::Result<()> {
-    use std::io::Write as _;
-
     let path = breaker_sidecar_path(db_path);
+    store_sidecar_path(&path, state)
+}
+
+fn encode_breaker_state(state: &RecoveryBreakerState) -> std::io::Result<Vec<u8>> {
     if !recovery_breaker_state_is_semantically_valid(state) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "refusing to persist semantically invalid recovery-breaker state",
         ));
     }
-    let serialized = serde_json::to_vec_pretty(state).map_err(|error| {
+    serde_json::to_vec_pretty(state).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("cannot serialize recovery-breaker state: {error}"),
         )
-    })?;
+    })
+}
+
+fn store_sidecar_path(path: &Path, state: &RecoveryBreakerState) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let serialized = encode_breaker_state(state)?;
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1174,9 +1318,9 @@ pub fn store(db_path: &Path, state: &RecoveryBreakerState) -> std::io::Result<()
             format!("parent {} is not a real directory", parent.display()),
         ));
     }
-    match std::fs::symlink_metadata(&path) {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            secure_existing_breaker_authority_file(&path)?;
+            secure_existing_breaker_authority_file(path)?;
         }
         Ok(_) => {
             return Err(std::io::Error::new(
@@ -1201,9 +1345,9 @@ pub fn store(db_path: &Path, state: &RecoveryBreakerState) -> std::io::Result<()
 
     // Recheck immediately before publish. Replacing a raced-in symlink would
     // destroy that directory entry, so refuse every non-regular target.
-    match std::fs::symlink_metadata(&path) {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            secure_existing_breaker_authority_file(&path)?;
+            secure_existing_breaker_authority_file(path)?;
         }
         Ok(_) => {
             return Err(std::io::Error::new(
@@ -1214,11 +1358,254 @@ pub fn store(db_path: &Path, state: &RecoveryBreakerState) -> std::io::Result<()
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let persisted = staged.persist(&path).map_err(|error| error.error)?;
+    let persisted = staged.persist(path).map_err(|error| error.error)?;
     persisted.sync_all()?;
     #[cfg(unix)]
     std::fs::File::open(parent).and_then(|directory| directory.sync_all())?;
     Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BreakerStorePhase {
+    Admitted,
+    StageCreated,
+    StageSynced,
+    BeforePublish,
+    Published,
+    DirectorySynced,
+}
+
+#[cfg(unix)]
+fn load_breaker_state_in_parent(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> std::io::Result<Option<RecoveryBreakerState>> {
+    let Some(mut file) = open_breaker_state_file(parent, name, path)? else {
+        return Ok(None);
+    };
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular recovery-breaker file", path.display()),
+        ));
+    }
+    ensure_exclusive_breaker_authority_file(&file, path)?;
+    if before.len() > MAX_SIDECAR_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds the recovery-breaker size limit", path.display()),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or_default());
+    file.by_ref()
+        .take(MAX_SIDECAR_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SIDECAR_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} grew beyond the recovery-breaker size limit",
+                path.display()
+            ),
+        ));
+    }
+    if !fingerprint_metadata_matches(&before, &file.metadata()?) {
+        return Err(std::io::Error::other(
+            "recovery-breaker state changed while being read",
+        ));
+    }
+    validate_breaker_state_destination(parent, name, path, Some(&file))?;
+    decode_breaker_state(path, &bytes).map(Some)
+}
+
+#[cfg(unix)]
+fn open_breaker_state_file(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+    let entry = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(entry) => entry,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if FileType::from_raw_mode(entry.st_mode) != FileType::RegularFile || entry.st_nlink != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a single-link regular recovery-breaker file",
+                path.display()
+            ),
+        ));
+    }
+    // Reject known devices, sockets, FIFOs and links before opening. A leaf
+    // that disappears after this observation is an error, never clean absence.
+    let file = std::fs::File::from(rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let captured = rustix::fs::fstat(&file)?;
+    if FileType::from_raw_mode(captured.st_mode) != FileType::RegularFile
+        || captured.st_nlink != 1
+        || captured.st_dev != entry.st_dev
+        || captured.st_ino != entry.st_ino
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} changed during recovery-breaker open", path.display()),
+        ));
+    }
+    validate_breaker_state_destination(parent, name, path, Some(&file))?;
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn validate_breaker_state_destination(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    expected: Option<&std::fs::File>,
+) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+
+    let entry = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW);
+    match (expected, entry) {
+        (None, Err(error)) if error == rustix::io::Errno::NOENT => Ok(()),
+        (Some(file), Ok(entry)) => {
+            ensure_exclusive_breaker_authority_file(file, path)?;
+            let retained = rustix::fs::fstat(file)?;
+            if FileType::from_raw_mode(retained.st_mode) != FileType::RegularFile
+                || FileType::from_raw_mode(entry.st_mode) != FileType::RegularFile
+                || entry.st_nlink != 1
+                || entry.st_dev != retained.st_dev
+                || entry.st_ino != retained.st_ino
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} changed recovery-breaker identity or ownership",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        (_, Err(error)) => Err(error.into()),
+        (None, Ok(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} appeared before recovery-breaker publication",
+                path.display()
+            ),
+        )),
+    }
+}
+
+#[cfg(unix)]
+struct BreakerStateStage<'a> {
+    parent: &'a std::fs::File,
+    file: std::fs::File,
+    name: std::ffi::OsString,
+    published: bool,
+}
+
+#[cfg(unix)]
+impl<'a> BreakerStateStage<'a> {
+    fn create(parent: &'a std::fs::File, parent_path: &Path) -> std::io::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+
+        // Builder supplies random leaf names only. Disable its pathname
+        // cleanup before creation: every operation, including Drop below,
+        // must stay relative to the retained directory after a parent swap.
+        let generated = tempfile::Builder::new()
+            .prefix(".recovery-breaker-")
+            .suffix(".tmp")
+            .disable_cleanup(true)
+            .make_in(parent_path, |candidate| {
+                let name = candidate.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "recovery-breaker staging name has no leaf",
+                    )
+                })?;
+                if candidate.parent() != Some(parent_path)
+                    || name.is_empty()
+                    || !matches!(
+                        Path::new(name).components().next(),
+                        Some(std::path::Component::Normal(_))
+                    )
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "recovery-breaker staging name escaped its parent",
+                    ));
+                }
+                let file = std::fs::File::from(rustix::fs::openat(
+                    parent,
+                    name,
+                    OFlags::RDWR
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::NONBLOCK
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                )?);
+                Ok((file, name.to_os_string()))
+            })?;
+        let ((file, name), _disabled_path) = generated.into_parts();
+        let staged = Self {
+            parent,
+            file,
+            name,
+            published: false,
+        };
+        mcp_agent_mail_core::disk::set_private_writable_file_permissions(&staged.file)?;
+        staged.revalidate()?;
+        Ok(staged)
+    }
+
+    fn validate_file(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = self.file.metadata()?;
+        if !metadata.is_file() || metadata.mode() & 0o777 != 0o600 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery-breaker stage is not a private regular file",
+            ));
+        }
+        ensure_exclusive_breaker_authority_file(&self.file, Path::new(&self.name))
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        self.validate_file()?;
+        validate_breaker_state_destination(
+            self.parent,
+            &self.name,
+            Path::new(&self.name),
+            Some(&self.file),
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BreakerStateStage<'_> {
+    fn drop(&mut self) {
+        if !self.published
+            && self.revalidate().is_ok()
+            && rustix::fs::unlinkat(self.parent, &self.name, rustix::fs::AtFlags::empty()).is_ok()
+        {
+            let _ = self.parent.sync_all();
+        }
+    }
 }
 
 std::thread_local! {
@@ -1815,6 +2202,730 @@ mod tests {
         std::fs::hard_link(&lock, root.join("aliased-lock")).unwrap();
         assert!(replacement_owner.revalidate().is_err());
         assert!(displaced.exists());
+    }
+
+    #[cfg(unix)]
+    struct BreakerOutcomeParents {
+        active: PathBuf,
+        displaced: PathBuf,
+        foreign: PathBuf,
+        primary: PathBuf,
+        prior: RecoveryBreakerState,
+        root: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl BreakerOutcomeParents {
+        fn new(foreign_mode: Option<u32>) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let root = tempfile::tempdir().unwrap();
+            let physical = root.path().canonicalize().unwrap();
+            let active = physical.join("active");
+            let foreign = physical.join("foreign");
+            std::fs::create_dir(&active).unwrap();
+            std::fs::create_dir(&foreign).unwrap();
+            let primary = active.join("storage.sqlite3");
+            std::fs::write(&primary, b"admitted mailbox").unwrap();
+            let prior = record_attempt(None, &fingerprint_db(&primary), CFG, 100);
+            store(&primary, &prior).unwrap();
+            let foreign_primary = foreign.join("storage.sqlite3");
+            std::fs::write(&foreign_primary, b"foreign mailbox").unwrap();
+            if let Some(mode) = foreign_mode {
+                store(
+                    &foreign_primary,
+                    &cleared_state(&fingerprint_db(&foreign_primary)),
+                )
+                .unwrap();
+                std::fs::set_permissions(
+                    breaker_sidecar_path(&foreign_primary),
+                    std::fs::Permissions::from_mode(mode),
+                )
+                .unwrap();
+            }
+            Self {
+                active,
+                displaced: physical.join("admitted-parent"),
+                foreign,
+                primary,
+                prior,
+                root,
+            }
+        }
+
+        fn owner(&self) -> RecoveryBreakerFileLock {
+            let parent = open_breaker_directory(&self.active).unwrap();
+            try_acquire_file_lock_in_parent(&self.primary, &parent).unwrap()
+        }
+
+        fn replace(&self) {
+            std::fs::rename(&self.active, &self.displaced).unwrap();
+            std::fs::rename(&self.foreign, &self.active).unwrap();
+        }
+
+        fn restore(&self) {
+            std::fs::rename(&self.active, &self.foreign).unwrap();
+            std::fs::rename(&self.displaced, &self.active).unwrap();
+        }
+
+        fn replace_election(&self) -> RecoveryBreakerFileLock {
+            std::fs::rename(
+                breaker_lock_path(&self.primary),
+                self.root.path().join("displaced-election"),
+            )
+            .unwrap();
+            self.owner()
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct BreakerOutcomeEntry {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        links: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+        bytes: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    fn breaker_outcome_namespace(
+        parent: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, BreakerOutcomeEntry> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                assert!(metadata.is_file());
+                (
+                    entry.file_name(),
+                    BreakerOutcomeEntry {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        mode: metadata.mode(),
+                        links: metadata.nlink(),
+                        modified: (metadata.mtime(), metadata.mtime_nsec()),
+                        changed: (metadata.ctime(), metadata.ctime_nsec()),
+                        bytes: std::fs::read(entry.path()).unwrap(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn breaker_outcome_stages(parent: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.as_encoded_bytes().starts_with(b".recovery-breaker-")
+                        && name.as_encoded_bytes().ends_with(b".tmp")
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_load_keeps_state_and_absence_in_the_retained_parent() {
+        for foreign_mode in [None, Some(0o400), Some(0o666)] {
+            for admitted_state_present in [false, true] {
+                let parents = BreakerOutcomeParents::new(foreign_mode);
+                if !admitted_state_present {
+                    std::fs::rename(
+                        breaker_sidecar_path(&parents.primary),
+                        parents.root.path().join("prior-state-evidence"),
+                    )
+                    .unwrap();
+                }
+                let owner = parents.owner();
+                let foreign = breaker_outcome_namespace(&parents.foreign);
+                let expected = admitted_state_present.then_some(parents.prior.clone());
+                assert_eq!(owner.load().unwrap(), expected);
+                assert_eq!(
+                    owner
+                        .load_with(|| parents.replace(), || parents.restore())
+                        .unwrap(),
+                    expected,
+                    "A→B→A must not accept foreign state or foreign clean absence"
+                );
+                assert_eq!(breaker_outcome_namespace(&parents.foreign), foreign);
+                assert_eq!(
+                    owner
+                        .load_with(|| parents.replace(), || {})
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "even absent state must revalidate the admitted namespace"
+                );
+                assert_eq!(breaker_outcome_namespace(&parents.active), foreign);
+                parents.restore();
+                assert_eq!(owner.load().unwrap(), expected);
+                let completed = cleared_state(&parents.prior.db_fingerprint);
+                owner.store(&completed).unwrap();
+                assert_eq!(owner.load().unwrap(), Some(completed));
+                assert_eq!(breaker_outcome_namespace(&parents.foreign), foreign);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_store_refuses_parent_changes_at_every_mutation_phase() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for foreign_mode in [None, Some(0o400), Some(0o666)] {
+            for target in [
+                BreakerStorePhase::Admitted,
+                BreakerStorePhase::StageCreated,
+                BreakerStorePhase::StageSynced,
+                BreakerStorePhase::BeforePublish,
+                BreakerStorePhase::Published,
+                BreakerStorePhase::DirectorySynced,
+            ] {
+                let parents = BreakerOutcomeParents::new(foreign_mode);
+                std::fs::set_permissions(
+                    breaker_sidecar_path(&parents.primary),
+                    std::fs::Permissions::from_mode(foreign_mode.unwrap_or(0o600)),
+                )
+                .unwrap();
+                let owner = parents.owner();
+                let foreign = breaker_outcome_namespace(&parents.foreign);
+                let completed = cleared_state(&parents.prior.db_fingerprint);
+                let mut injected = false;
+                let error = owner
+                    .store_with(&completed, |phase| {
+                        if phase == target {
+                            parents.replace();
+                            injected = true;
+                        }
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert!(
+                    injected,
+                    "{target:?} must exercise the actual store boundary"
+                );
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{target:?}");
+                assert_eq!(
+                    breaker_outcome_namespace(&parents.active),
+                    foreign,
+                    "{target:?}"
+                );
+                assert_eq!(
+                    breaker_outcome_stages(&parents.displaced),
+                    Vec::<PathBuf>::new()
+                );
+                parents.restore();
+                let expected = if matches!(
+                    target,
+                    BreakerStorePhase::Published | BreakerStorePhase::DirectorySynced
+                ) {
+                    &completed
+                } else {
+                    &parents.prior
+                };
+                assert_eq!(owner.load().unwrap().as_ref(), Some(expected), "{target:?}");
+                owner.store(&completed).unwrap();
+                assert_eq!(owner.load().unwrap(), Some(completed));
+                assert_eq!(breaker_outcome_namespace(&parents.foreign), foreign);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_store_keeps_writes_and_syncs_in_parent_during_aba() {
+        for foreign_mode in [None, Some(0o400), Some(0o666)] {
+            for (displace_at, restore_at) in [
+                (
+                    BreakerStorePhase::StageCreated,
+                    BreakerStorePhase::StageSynced,
+                ),
+                (
+                    BreakerStorePhase::Published,
+                    BreakerStorePhase::DirectorySynced,
+                ),
+            ] {
+                let parents = BreakerOutcomeParents::new(foreign_mode);
+                let owner = parents.owner();
+                let foreign = breaker_outcome_namespace(&parents.foreign);
+                let completed = cleared_state(&parents.prior.db_fingerprint);
+                let mut displaced = false;
+                let mut restored = false;
+                owner
+                    .store_with(&completed, |phase| {
+                        if phase == displace_at {
+                            parents.replace();
+                            displaced = true;
+                        }
+                        if phase == restore_at {
+                            assert_eq!(breaker_outcome_namespace(&parents.active), foreign);
+                            parents.restore();
+                            restored = true;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(displaced && restored);
+                assert_eq!(owner.load().unwrap(), Some(completed));
+                assert_eq!(breaker_outcome_namespace(&parents.foreign), foreign);
+                assert_eq!(
+                    breaker_outcome_stages(&parents.active),
+                    Vec::<PathBuf>::new()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_store_refuses_a_replaced_election_before_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for replace_at in [
+            None,
+            Some(BreakerStorePhase::Admitted),
+            Some(BreakerStorePhase::BeforePublish),
+        ] {
+            let parents = BreakerOutcomeParents::new(None);
+            let owner = parents.owner();
+            let sidecar = breaker_sidecar_path(&parents.primary);
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let prior_bytes = std::fs::read(&sidecar).unwrap();
+            let mut replacement = replace_at.is_none().then(|| parents.replace_election());
+            let completed = cleared_state(&parents.prior.db_fingerprint);
+            assert_eq!(
+                owner
+                    .store_with(&completed, |phase| {
+                        if Some(phase) == replace_at {
+                            replacement = Some(parents.replace_election());
+                        }
+                        Ok(())
+                    })
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(std::fs::read(&sidecar).unwrap(), prior_bytes);
+            let expected_mode = if replace_at == Some(BreakerStorePhase::BeforePublish) {
+                0o600
+            } else {
+                0o400
+            };
+            assert_eq!(
+                std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+                expected_mode
+            );
+            assert_eq!(
+                breaker_outcome_stages(&parents.active),
+                Vec::<PathBuf>::new()
+            );
+            assert!(owner.load().is_err());
+            let replacement = replacement.expect("a new elected owner must hold the replacement");
+            assert_eq!(replacement.load().unwrap(), Some(parents.prior));
+            replacement.store(&completed).unwrap();
+            assert_eq!(replacement.load().unwrap(), Some(completed.clone()));
+            assert!(owner.store(&completed).is_err());
+            assert_eq!(replacement.load().unwrap(), Some(completed));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_store_atomically_replaces_state_without_changing_open_readers() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let parents = BreakerOutcomeParents::new(None);
+        let owner = parents.owner();
+        let sidecar = breaker_sidecar_path(&parents.primary);
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let prior_bytes = std::fs::read(&sidecar).unwrap();
+        let mut reader = std::fs::File::open(&sidecar).unwrap();
+        let old_inode = reader.metadata().unwrap().ino();
+        let completed = cleared_state(&parents.prior.db_fingerprint);
+        let mut saw_old = false;
+        let mut saw_new = false;
+        owner
+            .store_with(&completed, |phase| {
+                if phase == BreakerStorePhase::StageSynced {
+                    assert_eq!(owner.load().unwrap(), Some(parents.prior.clone()));
+                    saw_old = true;
+                }
+                if phase == BreakerStorePhase::Published {
+                    assert_eq!(owner.load().unwrap(), Some(completed.clone()));
+                    saw_new = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(saw_old && saw_new);
+        let mut retained_bytes = Vec::new();
+        reader.read_to_end(&mut retained_bytes).unwrap();
+        assert_eq!(retained_bytes, prior_bytes);
+        assert_eq!(reader.metadata().unwrap().nlink(), 0);
+        let current = std::fs::metadata(&sidecar).unwrap();
+        assert_ne!(current.ino(), old_inode);
+        assert_eq!(current.nlink(), 1);
+        assert_eq!(current.mode() & 0o777, 0o600);
+        assert_eq!(owner.load().unwrap(), Some(completed));
+        assert_eq!(
+            breaker_outcome_stages(&parents.active),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_store_reports_interruption_without_losing_complete_state() {
+        for stop_at in [
+            BreakerStorePhase::Admitted,
+            BreakerStorePhase::StageCreated,
+            BreakerStorePhase::StageSynced,
+            BreakerStorePhase::BeforePublish,
+            BreakerStorePhase::Published,
+            BreakerStorePhase::DirectorySynced,
+        ] {
+            let parents = BreakerOutcomeParents::new(None);
+            let owner = parents.owner();
+            let completed = cleared_state(&parents.prior.db_fingerprint);
+            let mut interrupted = false;
+            let error = owner
+                .store_with(&completed, |phase| {
+                    if phase == stop_at {
+                        interrupted = true;
+                        return Err(std::io::Error::other("interrupted outcome publication"));
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(interrupted);
+            assert!(
+                error
+                    .to_string()
+                    .contains("interrupted outcome publication")
+            );
+            let expected = if matches!(
+                stop_at,
+                BreakerStorePhase::Published | BreakerStorePhase::DirectorySynced
+            ) {
+                &completed
+            } else {
+                &parents.prior
+            };
+            assert_eq!(owner.load().unwrap().as_ref(), Some(expected));
+            assert_eq!(
+                breaker_outcome_stages(&parents.active),
+                Vec::<PathBuf>::new()
+            );
+            drop(owner);
+            let restarted = parents.owner();
+            assert_eq!(restarted.load().unwrap().as_ref(), Some(expected));
+            restarted.store(&completed).unwrap();
+            assert_eq!(restarted.load().unwrap(), Some(completed));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_restart_recovers_interrupted_publication() {
+        const CHILD_DB: &str = "AM_TEST_BREAKER_OUTCOME_CHILD_DB";
+        const CHILD_PHASE: &str = "AM_TEST_BREAKER_OUTCOME_CHILD_PHASE";
+        const INTERRUPTED_EXIT: i32 = 73;
+
+        if let Some(primary) = std::env::var_os(CHILD_DB) {
+            let primary = PathBuf::from(primary);
+            let parent = open_breaker_directory(primary.parent().unwrap()).unwrap();
+            let owner = try_acquire_file_lock_in_parent(&primary, &parent).unwrap();
+            let prior = owner.load().unwrap().unwrap();
+            let stop_at = match std::env::var(CHILD_PHASE).unwrap().as_str() {
+                "staged" => BreakerStorePhase::StageSynced,
+                "published" => BreakerStorePhase::Published,
+                other => panic!("unknown child interruption phase: {other}"),
+            };
+            owner
+                .store_with(&cleared_state(&prior.db_fingerprint), |phase| {
+                    if phase == stop_at {
+                        // Exit without Rust destructors, as a terminated worker
+                        // would. This is process interruption, not a power-loss test.
+                        std::process::exit(INTERRUPTED_EXIT);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            panic!("the real store never reached its interruption boundary");
+        }
+
+        for phase in ["staged", "published"] {
+            let parents = BreakerOutcomeParents::new(None);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("recovery_breaker::tests::guarded_breaker_restart_recovers_interrupted_publication")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD_DB, &parents.primary)
+                .env(CHILD_PHASE, phase)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(INTERRUPTED_EXIT), "{phase}");
+            let completed = cleared_state(&parents.prior.db_fingerprint);
+            let expected = if phase == "staged" {
+                &parents.prior
+            } else {
+                &completed
+            };
+            let restarted = parents.owner();
+            assert_eq!(restarted.load().unwrap().as_ref(), Some(expected));
+            let orphan_count = usize::from(phase == "staged");
+            assert_eq!(breaker_outcome_stages(&parents.active).len(), orphan_count);
+            restarted.store(&completed).unwrap();
+            assert_eq!(restarted.load().unwrap(), Some(completed));
+            assert_eq!(breaker_outcome_stages(&parents.active).len(), orphan_count);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_state_refuses_unsafe_shapes_before_mutation() {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _, symlink};
+
+        for shape in ["symlink", "hard-link", "directory", "fifo", "socket"] {
+            let parents = BreakerOutcomeParents::new(None);
+            let owner = parents.owner();
+            let sidecar = breaker_sidecar_path(&parents.primary);
+            let original = parents.root.path().join("prior-state-evidence");
+            std::fs::rename(&sidecar, &original).unwrap();
+            let original_bytes = std::fs::read(&original).unwrap();
+            let sentinel = parents.root.path().join("foreign-evidence");
+            std::fs::write(&sentinel, b"foreign outcome evidence").unwrap();
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let _socket: Option<std::os::unix::net::UnixListener> = match shape {
+                "symlink" => {
+                    symlink(&sentinel, &sidecar).unwrap();
+                    None
+                }
+                "hard-link" => {
+                    std::fs::hard_link(&sentinel, &sidecar).unwrap();
+                    None
+                }
+                "directory" => {
+                    std::fs::create_dir(&sidecar).unwrap();
+                    None
+                }
+                "fifo" => {
+                    nix::unistd::mkfifo(
+                        &sidecar,
+                        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                    )
+                    .unwrap();
+                    None
+                }
+                "socket" => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        // This gate concerns the actual socket inode type,
+                        // not permission to listen on a local socket.
+                        nix::sys::stat::mknod(
+                            &sidecar,
+                            nix::sys::stat::SFlag::S_IFSOCK,
+                            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                            0,
+                        )
+                        .unwrap();
+                        None
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Some(std::os::unix::net::UnixListener::bind(&sidecar).unwrap())
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let before = std::fs::symlink_metadata(&sidecar).unwrap();
+            if shape == "socket" {
+                assert!(before.file_type().is_socket());
+            }
+            assert!(owner.load().is_err(), "{shape}");
+            assert!(
+                owner
+                    .store(&cleared_state(&parents.prior.db_fingerprint))
+                    .is_err(),
+                "{shape}"
+            );
+            let after = std::fs::symlink_metadata(&sidecar).unwrap();
+            assert_eq!(
+                (after.dev(), after.ino(), after.mode(), after.nlink()),
+                (before.dev(), before.ino(), before.mode(), before.nlink()),
+                "{shape}"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"foreign outcome evidence"
+            );
+            assert_eq!(std::fs::metadata(&sentinel).unwrap().mode() & 0o777, 0o400);
+            assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+            assert_eq!(
+                breaker_outcome_stages(&parents.active),
+                Vec::<PathBuf>::new()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_state_preserves_json_and_size_validation() {
+        let parents = BreakerOutcomeParents::new(None);
+        let owner = parents.owner();
+        let sidecar = breaker_sidecar_path(&parents.primary);
+        let mut invalid = parents.prior.clone();
+        invalid.schema = 99;
+        for malformed in [
+            b"{ invalid JSON".to_vec(),
+            serde_json::to_vec(&invalid).unwrap(),
+            vec![b' '; usize::try_from(MAX_SIDECAR_BYTES + 1).unwrap()],
+        ] {
+            std::fs::write(&sidecar, &malformed).unwrap();
+            let before = breaker_outcome_namespace(&parents.active);
+            assert_eq!(
+                owner.load().unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                owner.store(&invalid).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(breaker_outcome_namespace(&parents.active), before);
+        }
+        let completed = cleared_state(&parents.prior.db_fingerprint);
+        owner.store(&completed).unwrap();
+        assert_eq!(owner.load().unwrap(), Some(completed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_state_preserves_a_replaced_destination_before_publication() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        for shape in ["regular", "hard-link", "symlink"] {
+            let parents = BreakerOutcomeParents::new(None);
+            let owner = parents.owner();
+            let sidecar = breaker_sidecar_path(&parents.primary);
+            let original = parents.root.path().join("prior-state-evidence");
+            let prior_bytes = std::fs::read(&sidecar).unwrap();
+            let sentinel = parents.root.path().join("foreign-evidence");
+            std::fs::write(&sentinel, b"foreign outcome evidence").unwrap();
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let completed = cleared_state(&parents.prior.db_fingerprint);
+            let mut injected = false;
+            let error = owner
+                .store_with(&completed, |phase| {
+                    if phase == BreakerStorePhase::BeforePublish {
+                        std::fs::rename(&sidecar, &original).unwrap();
+                        match shape {
+                            "regular" => {
+                                std::fs::write(&sidecar, b"foreign outcome evidence").unwrap();
+                                std::fs::set_permissions(
+                                    &sidecar,
+                                    std::fs::Permissions::from_mode(0o400),
+                                )
+                                .unwrap();
+                            }
+                            "hard-link" => std::fs::hard_link(&sentinel, &sidecar).unwrap(),
+                            "symlink" => symlink(&sentinel, &sidecar).unwrap(),
+                            _ => unreachable!(),
+                        }
+                        injected = true;
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(injected);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{shape}");
+            assert_eq!(std::fs::read(&original).unwrap(), prior_bytes);
+            assert_eq!(
+                std::fs::read(&sidecar).unwrap(),
+                b"foreign outcome evidence"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"foreign outcome evidence"
+            );
+            assert_eq!(
+                std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            assert_eq!(
+                breaker_outcome_stages(&parents.active),
+                Vec::<PathBuf>::new()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_breaker_stage_cleanup_preserves_substituted_entries_and_foreign_parents() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for swap_parent in [false, true] {
+            let parents = BreakerOutcomeParents::new(None);
+            let owner = parents.owner();
+            let mut foreign_witness = None;
+            let mut substituted = None;
+            let error = owner
+                .store_with(&cleared_state(&parents.prior.db_fingerprint), |phase| {
+                    if phase == BreakerStorePhase::StageCreated {
+                        let stages = breaker_outcome_stages(&parents.active);
+                        assert_eq!(stages.len(), 1);
+                        let stage = &stages[0];
+                        if swap_parent {
+                            parents.replace();
+                        } else {
+                            std::fs::rename(
+                                stage,
+                                parents.root.path().join("owned-stage-evidence"),
+                            )
+                            .unwrap();
+                        }
+                        std::fs::write(stage, b"foreign stage evidence").unwrap();
+                        std::fs::set_permissions(stage, std::fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                        substituted = Some(stage.clone());
+                        foreign_witness = Some(breaker_outcome_namespace(&parents.active));
+                        return Err(std::io::Error::other(
+                            "interrupt after substituting stage namespace",
+                        ));
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("interrupt after substituting stage namespace")
+            );
+            assert_eq!(
+                breaker_outcome_namespace(&parents.active),
+                foreign_witness.unwrap()
+            );
+            assert_eq!(
+                std::fs::read(substituted.unwrap()).unwrap(),
+                b"foreign stage evidence"
+            );
+            if swap_parent {
+                assert_eq!(
+                    breaker_outcome_stages(&parents.displaced),
+                    Vec::<PathBuf>::new()
+                );
+                parents.restore();
+            }
+            assert_eq!(owner.load().unwrap(), Some(parents.prior));
+        }
     }
 
     #[cfg(unix)]

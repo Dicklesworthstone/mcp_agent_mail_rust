@@ -1564,23 +1564,35 @@ where
     primary_anchor.verify_unchanged(action).map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
-    let _breaker_file_lock =
-        crate::recovery_breaker::try_acquire_file_lock(primary_path).map_err(|error| {
-            let reason = if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-            {
-                "another process owns the durable recovery-breaker election lock"
-            } else {
-                "the durable recovery-breaker election lock could not be acquired"
-            };
-            AutomaticRecoveryRunError::admission(
-                AutomaticRecoveryAdmissionFailureKind::Other,
-                SqlError::Custom(format!(
-                    "{action} for {} was deferred because {reason}: {error}",
-                    primary_path.display()
-                )),
+    let breaker_file_lock = {
+        #[cfg(unix)]
+        {
+            crate::recovery_breaker::try_acquire_file_lock_in_parent(
+                primary_path,
+                &primary_anchor.parent_dir,
             )
-        })?;
+        }
+        #[cfg(not(unix))]
+        {
+            crate::recovery_breaker::try_acquire_file_lock(primary_path)
+        }
+    }
+    .map_err(|error| {
+        let reason = if error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+        {
+            "another process owns the durable recovery-breaker election lock"
+        } else {
+            "the durable recovery-breaker election lock could not be acquired"
+        };
+        AutomaticRecoveryRunError::admission(
+            AutomaticRecoveryAdmissionFailureKind::Other,
+            SqlError::Custom(format!(
+                "{action} for {} was deferred because {reason}: {error}",
+                primary_path.display()
+            )),
+        )
+    })?;
     primary_anchor.verify_unchanged(action).map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
@@ -1593,7 +1605,7 @@ where
     // failures for the same recovery lineage in a sidecar and refuses HERE,
     // before any capture, until the cooldown elapses, completed-attempt content
     // changes, or an operator path runs under RecoveryBreakerBypassGuard.
-    let breaker_prior = match crate::recovery_breaker::load(primary_path) {
+    let breaker_prior = match breaker_file_lock.load() {
         Ok(state) => state,
         Err(error) if breaker_bypass => {
             tracing::warn!(
@@ -1676,7 +1688,7 @@ where
                 error,
             )
         })?;
-        crate::recovery_breaker::store(primary_path, &armed).map_err(|error| {
+        breaker_file_lock.store(&armed).map_err(|error| {
             AutomaticRecoveryRunError::admission(
                 AutomaticRecoveryAdmissionFailureKind::Other,
                 SqlError::Custom(format!(
@@ -1690,6 +1702,21 @@ where
         None
     };
 
+    // Operator bypass only bypasses breaker history, never the election.
+    // Mutation-only admission has no attempt write to perform this check.
+    let revalidate_breaker_election = |context: &str| {
+        breaker_file_lock.revalidate().map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                SqlError::Custom(format!(
+                    "{action} for {} {context} because durable recovery election authority changed: {error}",
+                    primary_path.display()
+                )),
+            )
+        })
+    };
+    revalidate_breaker_election("was refused before execution")?;
+
     let operation_result = if let Some(mut armed) = armed_attempt {
         // Preserve the original panic payload. Retargeting is best effort:
         // if persistence fails (or the process aborts instead of unwinding),
@@ -1700,7 +1727,7 @@ where
                 if primary_anchor.verify_parent_only(action).is_ok() {
                     armed.db_fingerprint = recovery_breaker_fingerprint(primary_path, None);
                     armed.last_failure_unix = now_unix();
-                    if let Err(error) = crate::recovery_breaker::store(primary_path, &armed) {
+                    if let Err(error) = breaker_file_lock.store(&armed) {
                         tracing::error!(
                             path = %primary_path.display(),
                             %error,
@@ -1714,6 +1741,11 @@ where
     } else {
         operation()
     };
+    let terminal_context = match &operation_result {
+        Ok(_) => "completed but its result was refused".to_string(),
+        Err(error) => format!("failed ({error}) and its result was refused"),
+    };
+    revalidate_breaker_election(&terminal_context)?;
     if outcome_policy == RecoveryAdmissionOutcomePolicy::GuardMutationOnly {
         return operation_result.map_err(AutomaticRecoveryRunError::Operation);
     }
@@ -1730,8 +1762,11 @@ where
                 primary_path,
                 None,
             ));
-            if let Err(error) = crate::recovery_breaker::store(primary_path, &cleared) {
+            if let Err(error) = breaker_file_lock.store(&cleared) {
                 if breaker_bypass {
+                    revalidate_breaker_election(
+                        "completed but its outcome could not be published",
+                    )?;
                     tracing::warn!(
                         path = %primary_path.display(),
                         %error,
@@ -1793,7 +1828,7 @@ where
                         prior
                     },
                 );
-                if let Err(store_error) = crate::recovery_breaker::store(primary_path, &restored) {
+                if let Err(store_error) = breaker_file_lock.store(&restored) {
                     tracing::warn!(
                         path = %primary_path.display(),
                         error = %store_error,
@@ -1824,8 +1859,11 @@ where
                     parked. Intervene with `am doctor repair` / `am doctor reconstruct`."
                 );
             }
-            if let Err(store_error) = crate::recovery_breaker::store(primary_path, &failed) {
+            if let Err(store_error) = breaker_file_lock.store(&failed) {
                 if breaker_bypass {
+                    revalidate_breaker_election(&format!(
+                        "failed ({error}) and its outcome could not be published"
+                    ))?;
                     tracing::warn!(
                         path = %primary_path.display(),
                         error = %store_error,
@@ -34118,6 +34156,230 @@ mod tests {
             std::fs::symlink_metadata(&election_path).is_ok_and(|metadata| metadata.is_file()),
             "an allowed attempt must still use the durable cross-process election"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_breaker_election_replacement_preserves_armed_state() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        for terminal in ["success", "failure", "storage", "panic"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("storage.sqlite3");
+            std::fs::write(&db, b"recoverable-content").unwrap();
+            let state_path = crate::recovery_breaker::breaker_sidecar_path(&db);
+            let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+            let mut replacement_owner = None;
+            let mut armed_bytes = None;
+            let clock = std::cell::Cell::new(100_i64);
+
+            recovery_admission().reset();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_recovery_admission_using_clock(
+                    &db,
+                    "recovery with replaced election",
+                    || {
+                        let armed = crate::recovery_breaker::load(&db).unwrap().unwrap();
+                        assert!(armed.attempt_in_progress);
+                        assert_eq!(armed.consecutive_failures, 1);
+                        armed_bytes = Some(std::fs::read(&state_path).unwrap());
+                        std::fs::rename(&election_path, dir.path().join("retired.lock")).unwrap();
+                        let replacement = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&election_path)
+                            .unwrap();
+                        fs2::FileExt::try_lock_exclusive(&replacement)
+                            .expect("replacement inode admits a separate election owner");
+                        replacement_owner = Some(replacement);
+                        match terminal {
+                            "success" => Ok(()),
+                            "failure" => Err(SqlError::Custom("repair failed".to_string())),
+                            "storage" => Err(SqlError::Custom(
+                                "Quota exceeded (os error 122)".to_string(),
+                            )),
+                            "panic" => std::panic::panic_any("interrupted repair"),
+                            _ => unreachable!(),
+                        }
+                    },
+                    || {
+                        let now = clock.get();
+                        clock.set(now + 1);
+                        now
+                    },
+                )
+            }));
+            if terminal == "panic" {
+                assert_eq!(
+                    outcome.unwrap_err().downcast_ref::<&str>(),
+                    Some(&"interrupted repair"),
+                    "retargeting must preserve the original panic"
+                );
+            } else {
+                let error = outcome
+                    .unwrap()
+                    .expect_err("an obsolete election must not publish a terminal outcome");
+                if terminal != "storage" {
+                    assert!(
+                        error.to_string().contains("election authority changed"),
+                        "unexpected {terminal} refusal: {error}"
+                    );
+                } else {
+                    assert!(error.to_string().contains("Quota exceeded"));
+                }
+            }
+            assert_eq!(
+                std::fs::read(&state_path).unwrap(),
+                armed_bytes.expect("operation observed its durable attempt marker"),
+                "{terminal} must leave the unfinished marker under lost election authority"
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), b"recoverable-content");
+            assert!(
+                crate::recovery_breaker::try_acquire_file_lock(&db).is_err(),
+                "terminal handling must not release the replacement owner's lock"
+            );
+
+            drop(replacement_owner);
+            recovery_admission().reset();
+            let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+            with_recovery_admission_using_clock(
+                &db,
+                "repair under replacement election",
+                || Ok(()),
+                || 101,
+            )
+            .expect("a newly acquired valid election can persist an operator recovery outcome");
+            let cleared = crate::recovery_breaker::load(&db).unwrap().unwrap();
+            assert!(!cleared.attempt_in_progress);
+            assert_eq!(cleared.consecutive_failures, 0);
+            recovery_admission().reset();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_breaker_operator_bypass_still_requires_current_election() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"recoverable-content").unwrap();
+        let state_path = crate::recovery_breaker::breaker_sidecar_path(&db);
+        std::fs::write(&state_path, b"malformed history requiring operator bypass").unwrap();
+        let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+        let operation_called = std::cell::Cell::new(false);
+        let mut replacement_owner = None;
+        let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+
+        recovery_admission().reset();
+        let error = with_recovery_admission_using_clock(
+            &db,
+            "operator recovery with replaced election",
+            || {
+                operation_called.set(true);
+                Ok(())
+            },
+            || {
+                // Bypass obtains its start time after the guarded reload. Its
+                // permission to disregard corrupt JSON must not permit it to
+                // execute under an election inode that has since been replaced.
+                assert!(replacement_owner.is_none());
+                std::fs::rename(&election_path, dir.path().join("retired.lock")).unwrap();
+                let replacement = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&election_path)
+                    .unwrap();
+                fs2::FileExt::try_lock_exclusive(&replacement).unwrap();
+                replacement_owner = Some(replacement);
+                100
+            },
+        )
+        .expect_err("operator bypass cannot bypass lost election authority");
+        assert!(
+            error.to_string().contains("election authority changed"),
+            "unexpected bypass refusal: {error}"
+        );
+        assert!(!operation_called.get());
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            b"malformed history requiring operator bypass"
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"recoverable-content");
+        assert!(crate::recovery_breaker::try_acquire_file_lock(&db).is_err());
+
+        drop(replacement_owner);
+        recovery_admission().reset();
+        with_recovery_admission_using_clock(
+            &db,
+            "operator recovery with current election",
+            || Ok(()),
+            || 101,
+        )
+        .expect("valid election still permits operator recovery from malformed history");
+        assert_eq!(
+            crate::recovery_breaker::load(&db)
+                .unwrap()
+                .unwrap()
+                .consecutive_failures,
+            0
+        );
+        recovery_admission().reset();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_breaker_operator_outcomes_refuse_lost_election() {
+        for operation_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("storage.sqlite3");
+            std::fs::write(&db, b"recoverable-content").unwrap();
+            let state = crate::recovery_breaker::record_attempt(
+                None,
+                &crate::recovery_breaker::fingerprint_db(&db),
+                crate::recovery_breaker::config_from_env(),
+                100,
+            );
+            crate::recovery_breaker::store(&db, &state).unwrap();
+            let state_path = crate::recovery_breaker::breaker_sidecar_path(&db);
+            let state_bytes = std::fs::read(&state_path).unwrap();
+            let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+            let mut replacement_owner = None;
+            let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+
+            recovery_admission().reset();
+            let error = with_recovery_admission_using_clock(
+                &db,
+                "operator recovery losing election",
+                || {
+                    std::fs::rename(&election_path, dir.path().join("retired.lock")).unwrap();
+                    replacement_owner =
+                        Some(crate::recovery_breaker::try_acquire_file_lock(&db).unwrap());
+                    if operation_fails {
+                        Err(SqlError::Custom("supervised recovery failed".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || 101,
+            )
+            .expect_err("operator best-effort persistence cannot hide election loss");
+            assert!(error.to_string().contains("election authority changed"));
+            if operation_fails {
+                assert!(error.to_string().contains("supervised recovery failed"));
+            }
+            assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+            assert_eq!(std::fs::read(&db).unwrap(), b"recoverable-content");
+            assert!(crate::recovery_breaker::try_acquire_file_lock(&db).is_err());
+            drop(replacement_owner);
+            let current = crate::recovery_breaker::try_acquire_file_lock(&db).unwrap();
+            assert_eq!(current.load().unwrap(), Some(state));
+            recovery_admission().reset();
+        }
     }
 
     #[test]
