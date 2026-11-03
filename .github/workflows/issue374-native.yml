@@ -88,6 +88,11 @@ jobs:
           set -euo pipefail
           cargo test --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable recovery::message_reconcile::database:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/message-recovery.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/message-recovery.log"
+      - name: Run cancellable message scans and fail-closed publication tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable recovery::message_reconcile::cancellable_tests:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/message-cancellation.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/message-cancellation.log"
       - name: Run native publication admission and cancellation tests
         run: |
           set -euo pipefail

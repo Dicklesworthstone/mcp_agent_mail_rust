@@ -435,6 +435,102 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
     ));
 
     let stop = AtomicBool::new(false);
+    let before_deferral_head = repo.head().unwrap().target();
+    // Force real, durable retry debt before the concurrency phase. A final
+    // empty queue alone cannot prove that deferred work survived a restart.
+    let (mut cursor, initial_retry_len, restored_retry_len) = std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = scope.spawn(move || {
+            mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(30))
+            })
+        });
+        // On every unwind this closure drops release_tx before scope joins
+        // the owner, so an assertion cannot strand the publication fence.
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+        let deferred = reconcile_message_batch(&cx, &pool, &config, &mut cursor, &stop).unwrap();
+        let checkpoints = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(".am-message-reconcile-") && name.ends_with(".json")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checkpoints.len(), 1, "missing durable retry checkpoint");
+        let checkpoint_retry_debt = || {
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&checkpoints[0]).unwrap()).unwrap();
+            saved["retries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|retry| {
+                    (
+                        retry["id"].as_i64().unwrap(),
+                        retry["attempts"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let initial_debt = checkpoint_retry_debt();
+        assert_eq!(initial_debt.len(), deferred.retry_len);
+        assert!(!initial_debt.is_empty(), "no deferred work was persisted");
+
+        cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+        let restored = reconcile_message_batch(&cx, &pool, &config, &mut cursor, &stop).unwrap();
+        let restored_debt = checkpoint_retry_debt();
+        release_tx.send(()).unwrap();
+        assert!(
+            owner.join().unwrap().is_ok(),
+            "publication fence owner timed out"
+        );
+        for report in [&deferred, &restored] {
+            assert_eq!(
+                (
+                    report.repaired,
+                    report.files_created,
+                    report.deferred_conflict
+                ),
+                (0, 0, 0)
+            );
+            assert!(
+                report.deferred_transient > 0 && report.retry_len > 0,
+                "{report:?}"
+            );
+            assert!(!report.interrupted);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert!(report.scanned <= 32 && report.payload_bytes <= 16 * 1024 * 1024);
+        }
+        assert!(restored.checkpoint_restored, "retry debt was not restored");
+        assert_eq!(restored_debt.len(), restored.retry_len);
+        assert!(
+            initial_debt.keys().all(|id| restored_debt.contains_key(id)),
+            "restart discarded deferred IDs: {initial_debt:?} -> {restored_debt:?}"
+        );
+        assert!(
+            initial_debt.iter().any(|(id, attempts)| {
+                restored_debt
+                    .get(id)
+                    .is_some_and(|restored| restored > attempts)
+            }),
+            "restart rediscovered work without retaining its prior retry attempts"
+        );
+        (cursor, deferred.retry_len, restored.retry_len)
+    });
+    assert_eq!(repo.head().unwrap().target(), before_deferral_head);
+    assert_eq!(
+        std::fs::read(repo.path().join("index")).unwrap(),
+        held_index
+    );
+    assert!(repo.path().join("index.lock").is_file());
+    assert_eq!(reconciliation_mailbox_evidence(&cx, &pool), original);
     let start = Barrier::new(4);
     let started = Instant::now();
     let (read_results, ordinary_writes, passes, repairs, final_retry_len) =
@@ -527,7 +623,6 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
                 }
                 writes
             });
-            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
             let deadline = Instant::now() + convergence_budget;
             let mut repairs = 0;
             let mut restarted = false;
@@ -758,6 +853,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
             "messages": message_count, "body_bytes": reconciliation_message_body(FIRST_ID, large_mailbox).len(),
             "database_bytes": database_bytes, "seed_batch_messages": SEED_BATCH_SIZE, "seed_elapsed_ms": seed_elapsed_ms,
             "repairs": repairs, "final_retry_len": final_retry_len,
+            "initial_retry_len": initial_retry_len, "restored_retry_len": restored_retry_len,
             "convergence_budget_secs": convergence_budget.as_secs(),
             "passes": passes, "ordinary_writes": ordinary_writes, "elapsed_ms": started.elapsed().as_millis(),
             "repeat_passes": repeat_passes, "repeat_unchanged": repeated_items,

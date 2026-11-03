@@ -1949,10 +1949,10 @@ mod tests {
         struct Interrupt<'a> {
             conn: &'a DbConn,
             cx: &'a Cx,
-            needle: &'a str,
+            sql: &'a str,
             matches: Cell<usize>,
-            cancel_after: usize,
             queries_after_cancel: Cell<usize>,
+            releases_after_cancel: Cell<usize>,
         }
         impl SyncQuery for Interrupt<'_> {
             fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
@@ -1961,15 +1961,17 @@ mod tests {
                         .set(self.queries_after_cancel.get() + 1);
                 }
                 let rows = self.conn.query_sync(sql, params)?;
-                if sql.contains(self.needle) {
+                if sql == self.sql {
                     self.matches.set(self.matches.get() + 1);
-                    if self.matches.get() == self.cancel_after {
-                        self.cx.set_cancel_requested(true);
-                    }
+                    self.cx.set_cancel_requested(true);
                 }
                 Ok(rows)
             }
             fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+                if self.cx.is_cancel_requested() && sql == "RELEASE SAVEPOINT am_inbox_read" {
+                    self.releases_after_cancel
+                        .set(self.releases_after_cancel.get() + 1);
+                }
                 self.conn.execute_raw(sql)
             }
         }
@@ -1980,15 +1982,45 @@ mod tests {
              VALUES(1,1,'to',0),(599,1,'to',0)",
         )
         .unwrap();
-        for (needle, cancel_after) in [
+        let (first_header_sql, _) = shared_page_query(1, None, 0);
+        let hydration_prefix = "SELECT id, project_id, sender_id, thread_id, topic, subject,";
+        // Keep the receipt-scan cases, then interrupt the newest-first lane at
+        // each read stage, including both reasons to probe eligibility. The
+        // successful control identifies the complete SQL to interrupt, so a
+        // similar query from another stage cannot satisfy the injection.
+        for (needle, unread_only, hint_update) in [
+            (RECIPIENT_NEXT_SQL, true, None),
             (
-                "SELECT message_id, kind, read_ts, ack_ts FROM message_recipients WHERE agent_id",
-                2,
+                "SELECT message_id, project_id FROM project_mailbox_deliveries WHERE message_id IN (",
+                true,
+                None,
             ),
-            ("FROM project_mailbox_deliveries WHERE message_id IN", 1),
-            ("body_md", 1),
+            (hydration_prefix, true, None),
+            (INBOX_STATS_HINT_SQL, false, None),
+            (
+                INBOX_RECEIPT_SIZE_PROBE_SQL,
+                false,
+                Some("DELETE FROM inbox_stats WHERE agent_id = 2"),
+            ),
+            (
+                INBOX_RECEIPT_SIZE_PROBE_SQL,
+                false,
+                Some("UPDATE inbox_stats SET total_count = 64 WHERE agent_id = 2"),
+            ),
+            (first_header_sql.as_str(), false, None),
+            (RECIPIENT_RANGE_SQL, false, None),
+            (hydration_prefix, false, None),
         ] {
-            for caller_transaction in [false, true] {
+            for (body_policy, caller_transaction) in [
+                (InboxBodyPolicy::Full, false),
+                (InboxBodyPolicy::Full, true),
+                (InboxBodyPolicy::MetadataOnly, false),
+                (InboxBodyPolicy::MetadataOnly, true),
+            ] {
+                super::super::rebuild_agent_inbox_stats_sync(&conn, 2).unwrap();
+                if let Some(update) = hint_update {
+                    conn.execute_raw(update).unwrap();
+                }
                 if caller_transaction {
                     conn.execute_raw(
                         "BEGIN; UPDATE messages SET subject='caller write' WHERE id=1",
@@ -1997,18 +2029,34 @@ mod tests {
                 } else {
                     conn.execute_raw("PRAGMA query_only = ON").unwrap();
                 }
+                let filters = InboxFetchOptions {
+                    unread_only,
+                    body_policy,
+                    ..options()
+                };
+                let control = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let expected =
+                    fetch_inbox_rows_from_conn_impl(&control, 1, 2, None, 5, filters).unwrap();
+                assert_eq!(expected.len(), 5, "{needle}");
+                let target_sql = control
+                    .calls
+                    .borrow()
+                    .iter()
+                    .find(|(sql, _, _)| sql.starts_with(needle))
+                    .unwrap_or_else(|| panic!("cancellation stage did not execute: {needle}"))
+                    .0
+                    .clone();
                 let cx = Cx::for_testing();
                 let interrupted = Interrupt {
                     conn: &conn,
                     cx: &cx,
-                    needle,
+                    sql: &target_sql,
                     matches: Cell::new(0),
-                    cancel_after,
                     queries_after_cancel: Cell::new(0),
-                };
-                let filters = InboxFetchOptions {
-                    unread_only: true,
-                    ..options()
+                    releases_after_cancel: Cell::new(0),
                 };
                 assert!(
                     matches!(
@@ -2025,8 +2073,20 @@ mod tests {
                     ),
                     "{needle}"
                 );
-                assert_eq!(interrupted.matches.get(), cancel_after, "{needle}");
+                assert_eq!(interrupted.matches.get(), 1, "{needle}");
                 assert_eq!(interrupted.queries_after_cancel.get(), 0, "{needle}");
+                assert_eq!(interrupted.releases_after_cancel.get(), 1, "{needle}");
+                assert!(
+                    conn.execute_raw("RELEASE SAVEPOINT am_inbox_read").is_err(),
+                    "cancelled read left its savepoint active: {needle}"
+                );
+                let fresh_cx = Cx::for_testing();
+                let Outcome::Ok(reused) = crate::sync::fetch_inbox_filtered_rows_with_cx(
+                    &fresh_cx, &conn, 1, 2, None, 5, filters,
+                ) else {
+                    panic!("connection could not serve a fresh inbox after cancellation: {needle}");
+                };
+                same_rows(&reused, &expected);
                 if caller_transaction {
                     assert_eq!(
                         conn.query_sync("SELECT subject FROM messages WHERE id=1", &[])
