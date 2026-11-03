@@ -744,6 +744,7 @@ fn concurrent_cleanup_and_process_restart_preserve_recovery_evidence() {
     assert_real_procfs_denial(&proc);
     let partial = mailbox.root.join("storage.sqlite3.bak.20000103_000000");
     fs::write(&partial, INCOMPLETE).unwrap();
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
     let test = "concurrent_cleanup_and_process_restart_preserve_recovery_evidence";
     let mut cleaner = spawn_test(test, |command| {
         command
