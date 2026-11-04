@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, File};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -400,6 +400,102 @@ fn assert_real_procfs_denial(proc: &Path) {
     assert_eq!(fs::metadata(proc.join("fd")).unwrap().uid(), 0);
 }
 
+fn assert_posix_reader_lock(path: &Path, held: bool) {
+    let mut probe = TestProcess::spawn(
+        Command::new("python3")
+            .arg("-c")
+            .arg(concat!(
+                "import errno,fcntl,os,sys\n",
+                "fd=os.open(sys.argv[1],os.O_RDWR)\n",
+                "blocked=False\n",
+                "try:\n",
+                " fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB,1,0,os.SEEK_SET)\n",
+                "except OSError as error:\n",
+                " assert error.errno in (errno.EACCES,errno.EAGAIN),error\n",
+                " blocked=True\n",
+                "assert blocked == (sys.argv[2]=='held'), 'unexpected POSIX lock state'\n",
+                "os.close(fd)\n",
+            ))
+            .arg(path)
+            .arg(if held { "held" } else { "free" }),
+    );
+    assert_success(&probe.output());
+}
+
+#[test]
+fn retention_selection_preserves_posix_locks_on_pins_and_rejected_candidates() {
+    use nix::fcntl::{FcntlArg, fcntl};
+
+    let _serial = reader_fixture_guard();
+    for locked_candidate_is_pin in [true, false] {
+        let mailbox = Mailbox::new();
+        let fallback = mailbox.root.join("storage.sqlite3.bak.20261101_000000");
+        if !locked_candidate_is_pin {
+            // Selection tries canonical .bak first, even when metadata names
+            // the exact bytes now preserved in a dated generation. Opening
+            // and rejecting this earlier file used to release its POSIX lock.
+            fs::rename(&mailbox.snapshot, &fallback).unwrap();
+            fs::write(&mailbox.snapshot, INCOMPLETE).unwrap();
+        }
+        let original = fs::read(&mailbox.snapshot).unwrap();
+        // The pool retains this concrete identity-handle type after publish.
+        // Its unlocked descriptor must not hide a lock acquired through the
+        // independent descriptor below or prevent later read-only selection.
+        let identity =
+            same_file::Handle::from_file(File::open(&mailbox.snapshot).unwrap()).unwrap();
+        let reader = File::open(&mailbox.snapshot).unwrap();
+        let lock = nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_RDLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        fcntl(&reader, FcntlArg::F_SETLK(&lock)).unwrap();
+        assert_posix_reader_lock(&mailbox.snapshot, true);
+
+        let selection = SnapshotRetentionGuard::acquire(&mailbox.primary);
+        if locked_candidate_is_pin {
+            let error = selection.err().expect("a reader must refuse pin admission");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        } else {
+            let guard = selection.unwrap();
+            assert!(guard.metadata_occupied());
+            assert_eq!(guard.verified_source_path(), Some(fallback.as_path()));
+            drop(guard);
+        }
+        // Never open/close the locked inode in this process just to inspect
+        // its contents: the independent lock probe is the decisive assertion.
+        assert_posix_reader_lock(&mailbox.snapshot, true);
+        drop(reader);
+        assert_posix_reader_lock(&mailbox.snapshot, false);
+
+        let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
+        assert_eq!(
+            guard.verified_source_path(),
+            Some(if locked_candidate_is_pin {
+                mailbox.snapshot.as_path()
+            } else {
+                fallback.as_path()
+            })
+        );
+        drop(guard);
+        assert_eq!(
+            identity.as_file().metadata().unwrap().ino(),
+            fs::metadata(&mailbox.snapshot).unwrap().ino(),
+        );
+        assert_eq!(fs::read(&mailbox.snapshot).unwrap(), original);
+        assert_eq!(fs::read(&mailbox.primary).unwrap(), mailbox.bytes);
+        assert_eq!(
+            fs::read(snapshot_meta_path(&mailbox.primary)).unwrap(),
+            mailbox.metadata
+        );
+        if !locked_candidate_is_pin {
+            assert_eq!(fs::read(fallback).unwrap(), mailbox.bytes);
+        }
+    }
+}
+
 #[test]
 fn external_descriptors_and_mappings_preserve_backups_until_reader_exit() {
     let _serial = reader_fixture_guard();
@@ -520,7 +616,17 @@ fn inaccessible_same_user_process_does_not_block_eight_backups() {
         false,
     );
     assert_real_procfs_denial(&proc);
+    // SqliteFileWitness keeps a same_file::Handle alive after ordinary pool
+    // publication. Pin verification only reads this inode: its unlocked
+    // identity handle must not strand all eight superseded generations.
+    let mut identity =
+        same_file::Handle::from_file(File::open(&mailbox.snapshot).unwrap()).unwrap();
+    let pinned = identity.as_file().metadata().unwrap();
     let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
+    assert_eq!(
+        guard.verified_source_path(),
+        Some(mailbox.snapshot.as_path())
+    );
     for generation in &generations {
         let inventoried = fs::metadata(generation).unwrap();
         let removed = guard
@@ -533,6 +639,17 @@ fn inaccessible_same_user_process_does_not_block_eight_backups() {
     }
     assert_success(&process.release());
     drop(guard);
+    let mut retained_bytes = Vec::new();
+    identity
+        .as_file_mut()
+        .read_to_end(&mut retained_bytes)
+        .unwrap();
+    assert_eq!(retained_bytes, mailbox.bytes);
+    let still_pinned = fs::metadata(&mailbox.snapshot).unwrap();
+    assert_eq!(
+        (still_pinned.dev(), still_pinned.ino()),
+        (pinned.dev(), pinned.ino()),
+    );
     mailbox.assert_recovery_unchanged();
 }
 

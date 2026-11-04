@@ -1854,7 +1854,11 @@ fn is_valid_project_identifier(slug: &str) -> bool {
 }
 
 fn is_valid_archive_agent_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric())
+    // Keep historical alphanumeric archive names readable, including system
+    // identities. Punctuated IDs use the common portable-name rules, with
+    // exact spelling so this path boundary rejects whitespace aliases.
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()))
+        || mcp_agent_mail_core::models::normalize_agent_name(name).as_deref() == Some(name)
 }
 
 fn is_valid_time_travel_timestamp(timestamp: &str) -> bool {
@@ -2320,13 +2324,25 @@ mod utility_tests {
     }
 
     #[test]
-    fn archive_agent_name_validation_python_parity() {
-        assert!(is_valid_archive_agent_name("Agent123"));
-        assert!(is_valid_archive_agent_name("A"));
+    fn archive_agent_name_validation_accepts_legacy_and_explicit_identities() {
+        for name in [
+            "Agent123",
+            "A",
+            "bluelake",
+            "HumanOverseer",
+            "AirTrafficControl",
+            "agent-name",
+            "Review-API",
+            "db.migrations_2",
+        ] {
+            assert!(is_valid_archive_agent_name(name), "rejected {name:?}");
+        }
         assert!(!is_valid_archive_agent_name(""));
-        assert!(!is_valid_archive_agent_name("agent-name"));
         assert!(!is_valid_archive_agent_name("agent name"));
         assert!(!is_valid_archive_agent_name("agent!"));
+        let maximum = format!("task-{}", "x".repeat(123));
+        assert!(is_valid_archive_agent_name(&maximum));
+        assert!(!is_valid_archive_agent_name(&format!("{maximum}x")));
     }
 
     #[test]
@@ -2597,13 +2613,38 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_time_travel_rejects_bad_agent_name() {
-        // is_valid_archive_agent_name rejects path-traversal and special chars.
-        assert!(!is_valid_archive_agent_name(""));
-        assert!(!is_valid_archive_agent_name("../etc"));
-        assert!(!is_valid_archive_agent_name("agent;DROP"));
-        assert!(!is_valid_archive_agent_name("a b c"));
+        // Explicit task IDs must not weaken the archive path boundary or
+        // introduce platform-specific aliases that registration would refuse.
+        for name in [
+            "",
+            "../etc",
+            "agent/other",
+            "agent\\other",
+            "agent;DROP",
+            "a b c",
+            "agent%2Fother",
+            "agent@project",
+            "project:demo#agent",
+            "agent..other",
+            "agent.work.",
+            "NUL.archive",
+            "COM1.archive",
+            "LPT9.archive",
+            "YOUR_AGENT",
+            "review-placeholder",
+            "codex-cli",
+            "claude-sonnet-4.5",
+            "réview-api",
+            " review-api",
+            "review-api ",
+            "\treview-api\n",
+        ] {
+            assert!(!is_valid_archive_agent_name(name), "accepted {name:?}");
+        }
         assert!(is_valid_archive_agent_name("BlueLake"));
         assert!(is_valid_archive_agent_name("Agent42"));
+        assert!(is_valid_archive_agent_name("review-api"));
+        assert!(is_valid_archive_agent_name("Review.API_2"));
     }
 
     #[test]

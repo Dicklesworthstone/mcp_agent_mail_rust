@@ -46,6 +46,9 @@ pub(crate) use namespace::{
     preflight_superseded_snapshot_readers,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) use namespace::preflight_current_thread_file_locks;
+
 #[cfg(all(test, unix))]
 use namespace::{
     MAX_RECLAIM_MOVE_ATTEMPTS, create_private_reclaim_directory, move_recovery_debris,

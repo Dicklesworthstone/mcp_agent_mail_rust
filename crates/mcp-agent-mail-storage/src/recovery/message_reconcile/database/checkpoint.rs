@@ -289,6 +289,11 @@ struct Snapshot {
     conflicts: Vec<Conflict>,
 }
 
+#[derive(Deserialize)]
+struct SnapshotVersion {
+    version: u32,
+}
+
 fn wait_us(until: Instant, now: Instant) -> u64 {
     u64::try_from(
         until
@@ -555,9 +560,16 @@ fn open_lock(path: &Path, create: bool) -> io::Result<File> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestoreState {
     Absent,
+    LegacyIgnored,
     Restored,
     Merged,
     CapacityBlocked,
+}
+
+enum StoredSnapshot {
+    Absent,
+    Legacy,
+    Current(Snapshot),
 }
 
 /// Merge obligations, not authority or old scan positions. The per-pass flock
@@ -799,7 +811,7 @@ impl Store {
         Ok(())
     }
 
-    fn read_snapshot(&self) -> io::Result<Option<Snapshot>> {
+    fn read_snapshot(&self) -> io::Result<StoredSnapshot> {
         self.check_lock()?;
         check_sidecar(&self.path)?;
         let bytes = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
@@ -807,9 +819,28 @@ impl Store {
             MAX_CHECKPOINT_BYTES,
         ) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(StoredSnapshot::Absent);
+            }
             Err(error) => return Err(io_context("read snapshot", &self.path, error)),
         };
+        // Inspect the version before requiring the current binding's fields.
+        // Version 1 never recorded the logical database generation. Neither a
+        // matching inode nor a recent saved_at timestamp can prove that an
+        // in-place restore did not reuse its row IDs. Discard every legacy
+        // hint; do not synthesize authority from today's generation value.
+        let version: SnapshotVersion = serde_json::from_slice(&bytes).map_err(|error| {
+            io_context(
+                "decode snapshot version",
+                &self.path,
+                io::Error::new(io::ErrorKind::InvalidData, error),
+            )
+        })?;
+        if version.version == 1 {
+            self.check_lock()?;
+            check_sidecar(&self.path)?;
+            return Ok(StoredSnapshot::Legacy);
+        }
         let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(|error| {
             io_context(
                 "decode snapshot",
@@ -822,13 +853,19 @@ impl Store {
         snapshot
             .validate(&snapshot.binding)
             .map_err(|error| io_context("validate snapshot", &self.path, error))?;
-        Ok(Some(snapshot))
+        Ok(StoredSnapshot::Current(snapshot))
     }
 
     #[cfg(test)]
     fn load(&self) -> io::Result<Option<Snapshot>> {
-        let Some(snapshot) = self.read_snapshot()? else {
-            return Ok(None);
+        let snapshot = match self.read_snapshot()? {
+            StoredSnapshot::Absent => return Ok(None),
+            StoredSnapshot::Legacy => {
+                return Err(invalid(
+                    "legacy checkpoint cannot establish the previous database generation",
+                ));
+            }
+            StoredSnapshot::Current(snapshot) => snapshot,
         };
         snapshot
             .validate(&self.binding)
@@ -837,8 +874,16 @@ impl Store {
     }
 
     fn restore(&self, cursor: &mut ReconcileCursor) -> io::Result<RestoreState> {
-        let Some(snapshot) = self.read_snapshot()? else {
-            return Ok(RestoreState::Absent);
+        let snapshot = match self.read_snapshot()? {
+            StoredSnapshot::Absent => return Ok(RestoreState::Absent),
+            StoredSnapshot::Legacy => {
+                // A fresh worker starts from its default bounded scan. If
+                // publishing the replacement fails, leave this process's
+                // independently collected progress intact on the next pass;
+                // repeatedly rewinding it would prevent convergence.
+                return Ok(RestoreState::LegacyIgnored);
+            }
+            StoredSnapshot::Current(snapshot) => snapshot,
         };
         if snapshot.binding != self.binding {
             // A generation can change BETWEEN passes, while the same pool and
@@ -1039,7 +1084,12 @@ pub(super) fn run(
                 source_generation(cx, pool)
             })?;
         scope = pool.sqlite_identity_key();
-        if cursor.source_identity != scope {
+        if cursor.source_identity != scope
+            || cursor
+                .checkpoint_database_generation
+                .as_ref()
+                .is_some_and(|previous| previous != &generation)
+        {
             *cursor = ReconcileCursor {
                 source_identity: scope.clone(),
                 settled_before_us: cursor.settled_before_us,
@@ -1047,6 +1097,7 @@ pub(super) fn run(
                 ..Default::default()
             };
         }
+        cursor.checkpoint_database_generation = Some(generation.clone());
         match Binding::at(
             Path::new(pool.sqlite_path()),
             &config.storage_root,
@@ -1072,6 +1123,14 @@ pub(super) fn run(
         match store.restore(cursor) {
             Ok(RestoreState::Restored | RestoreState::Merged) => restored = true,
             Ok(RestoreState::Absent) => {}
+            Ok(RestoreState::LegacyIgnored) => {
+                tracing::info!(
+                    target: "maintenance", event = "message_archive_checkpoint_legacy_ignored",
+                    version = 1,
+                    reason = "previous database generation cannot be independently established",
+                    "legacy reconciliation hints discarded; bounded reconciliation continues"
+                );
+            }
             Ok(RestoreState::CapacityBlocked) => {
                 // Still run the original bounded repair pass: it may free
                 // enough capacity to merge next time. Neither cursor may
@@ -1651,10 +1710,10 @@ mod tests {
             assert_eq!(std::fs::read(&owner.path).unwrap(), checkpoint);
             drop(owner);
 
-            let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            let report = run_with_slow_first_scan(cx, pool, config, &mut cursor, &stop);
             assert!(report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert_eq!(report.repaired, 1);
             assert!(cursor.retries.is_empty());
             // Uses real committed Git blobs and verifies the source row count
             // and both recipients' read/ACK values, not just created files.
@@ -1672,8 +1731,13 @@ mod tests {
             let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
             assert!(!report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
-            assert_message_committed(cx, pool, config, 940, 40);
+            assert!(
+                (1..=super::super::MAX_REPAIRS_PER_BATCH).contains(&report.repaired),
+                "current-generation repair must make bounded progress: {report:?}"
+            );
+            // The first fresh tail item is the oldest of the newest page.
+            // A loaded runner may exhaust the cooperative turn after it.
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
         });
     }
 
@@ -1837,6 +1901,261 @@ mod tests {
         }
     }
 
+    fn write_legacy_checkpoint(store: &Store, cursor: &ReconcileCursor) -> Vec<u8> {
+        let binding = Binding::at(
+            &store.binding.database,
+            &store.binding.archive,
+            &store.binding.database_generation,
+        )
+        .unwrap();
+        let snapshot = Snapshot::capture(
+            binding,
+            cursor,
+            Instant::now(),
+            mcp_agent_mail_db::now_micros(),
+        );
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy["version"] = serde_json::json!(1);
+        legacy["binding"]
+            .as_object_mut()
+            .unwrap()
+            .remove("database_generation");
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(&store.path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn legacy_checkpoint_cannot_borrow_current_generation_or_rewind_live_progress() {
+        for replacement in ["unchanged", "logical", "physical"] {
+            let (_temp, database, archive) = fixture();
+            let old = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+            let legacy_bytes = write_legacy_checkpoint(&old, &debt(Instant::now()));
+            drop(old);
+            let generation = if replacement == "logical" {
+                "11223344"
+            } else {
+                GENERATION
+            };
+            if replacement == "physical" {
+                std::fs::rename(&database, database.with_extension("retained-source")).unwrap();
+                std::fs::write(&database, b"replacement database").unwrap();
+            }
+            let current =
+                Store::open(Binding::at(&database, &archive, generation).unwrap()).unwrap();
+            let mut cursor = ReconcileCursor::settled_before(999);
+            assert_eq!(
+                current.restore(&mut cursor).unwrap(),
+                RestoreState::LegacyIgnored,
+                "{replacement}"
+            );
+            assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
+            assert!(cursor.retries.is_empty() && cursor.conflict_backoff.is_empty());
+            assert!(!cursor.next_lane_is_history && !cursor.next_lane_is_retry);
+            assert_eq!(std::fs::read(&current.path).unwrap(), legacy_bytes);
+
+            // Model a bounded current-generation pass whose durable write
+            // fails. The next pass must ignore old hints again without losing
+            // the newly observed scan position or retry obligation.
+            cursor.tail_after = Some(12);
+            cursor.backfill_ceiling = Some(70);
+            cursor.defer_transient(7, Instant::now());
+            cursor.checkpoint_dirty = true;
+            assert!(
+                current
+                    .save_with(&cursor, || Err(io::Error::other(
+                        "injected publication failure"
+                    )))
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&current.path).unwrap(), legacy_bytes);
+            assert_eq!(
+                current.restore(&mut cursor).unwrap(),
+                RestoreState::LegacyIgnored
+            );
+            assert_eq!(
+                (cursor.tail_after, cursor.backfill_ceiling),
+                (Some(12), Some(70))
+            );
+            assert_eq!(cursor.retries.len(), 1);
+            assert_eq!(cursor.retries[0].id, 7);
+            current.save(&cursor).unwrap();
+            drop(current);
+
+            let restarted =
+                Store::open(Binding::at(&database, &archive, generation).unwrap()).unwrap();
+            let saved = restarted.load().unwrap().unwrap();
+            assert_eq!(saved.version, SCHEMA_VERSION);
+            assert_eq!(saved.binding.database_generation, generation);
+            assert_eq!(
+                (saved.tail_after, saved.backfill_ceiling),
+                (Some(12), Some(70))
+            );
+            assert_eq!(saved.retries.len(), 1);
+            assert_eq!(saved.retries[0].id, 7);
+        }
+    }
+
+    #[test]
+    fn current_checkpoint_without_generation_is_still_invalid() {
+        let (_temp, database, archive) = fixture();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        let bytes = write_legacy_checkpoint(&store, &debt(Instant::now()));
+        let mut current: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        current["version"] = serde_json::json!(SCHEMA_VERSION);
+        std::fs::write(&store.path, serde_json::to_vec(&current).unwrap()).unwrap();
+        let mut cursor = ReconcileCursor::settled_before(999);
+        let error = store.restore(&mut cursor).unwrap_err();
+        assert!(error.to_string().contains("database_generation"), "{error}");
+        assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
+        assert!(cursor.retries.is_empty());
+    }
+
+    #[test]
+    fn failed_legacy_replacement_cannot_reuse_memory_progress_after_in_place_recovery() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (store, mut cursor) = seed_obsolete_progress(cx, pool, config);
+            let legacy_bytes = write_legacy_checkpoint(&store, &cursor);
+            cursor.checkpoint_database_generation = Some(store.binding.database_generation.clone());
+            cursor.startup_backfill_complete = true;
+            cursor.startup_tail_initialized = true;
+            assert!(
+                store
+                    .save_with(&cursor, || Err(io::Error::other(
+                        "injected publication failure"
+                    )))
+                    .is_err()
+            );
+            cursor.checkpoint_dirty = true;
+            assert_eq!(std::fs::read(&store.path).unwrap(), legacy_bytes);
+            change_logical_generation(cx, pool, &store.binding.database_generation);
+            let current = Binding::capture(cx, pool, config).unwrap();
+            assert_eq!(
+                current.generation, store.binding.generation,
+                "same physical file"
+            );
+            assert_eq!(
+                cursor.source_identity,
+                pool.sqlite_identity_key(),
+                "same live pool"
+            );
+            assert_ne!(
+                cursor.checkpoint_database_generation.as_deref(),
+                Some(current.database_generation.as_str())
+            );
+            drop(store);
+
+            let report =
+                run_with_slow_first_scan(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+            assert!(!report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_eq!(report.repaired, 1);
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
+            assert_eq!(
+                cursor.checkpoint_database_generation.as_deref(),
+                Some(current.database_generation.as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_checkpoint_restarts_bounded_repair_then_resumes_new_progress() {
+        for changed_generation in [false, true] {
+            super::super::tests::retention_fixture(40, |cx, pool, config| {
+                let (store, previous) = seed_obsolete_progress(cx, pool, config);
+                let legacy_bytes = write_legacy_checkpoint(&store, &previous);
+                if changed_generation {
+                    change_logical_generation(cx, pool, &store.binding.database_generation);
+                }
+                let path = store.path.clone();
+                drop(store);
+
+                let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+                let cancelled = run(cx, pool, config, &mut cursor, &AtomicBool::new(true)).unwrap();
+                assert!(cancelled.interrupted);
+                assert_eq!(cancelled.scanned, 0);
+                assert_eq!(std::fs::read(&path).unwrap(), legacy_bytes);
+
+                let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+                assert!(
+                    !report.checkpoint_restored,
+                    "legacy watermarks must be discarded"
+                );
+                assert_eq!(report.checkpoint_saved, Some(true));
+                assert!(
+                    (1..=super::super::MAX_REPAIRS_PER_BATCH).contains(&report.repaired),
+                    "safe restart must make bounded progress: {report:?}"
+                );
+                assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+                assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
+
+                let current = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+                let saved = current.load().unwrap().unwrap();
+                assert_eq!(saved.version, SCHEMA_VERSION);
+                assert_eq!(saved.binding, Binding::capture(cx, pool, config).unwrap());
+                assert_ne!(saved.backfill_ceiling, Some(0));
+                drop(current);
+
+                // Resume the replacement checkpoint through a fresh worker,
+                // then finish successive bounded passes with real Git writes.
+                let mut restarted =
+                    ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+                let mut repaired = report.repaired;
+                for _ in 0..40 {
+                    let report =
+                        run(cx, pool, config, &mut restarted, &AtomicBool::new(false)).unwrap();
+                    assert!(report.checkpoint_restored);
+                    assert_eq!(report.checkpoint_saved, Some(true));
+                    assert!(report.repaired <= super::super::MAX_REPAIRS_PER_BATCH);
+                    assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+                    assert_eq!(report.deferred, 0);
+                    repaired += report.repaired;
+                    if repaired == 40 {
+                        break;
+                    }
+                }
+                assert_eq!(repaired, 40, "all original messages must converge");
+                for id in 901..=940 {
+                    assert_message_committed(cx, pool, config, id, 40);
+                }
+                let repeat =
+                    run(cx, pool, config, &mut restarted, &AtomicBool::new(false)).unwrap();
+                assert_eq!(repeat.repaired, 0, "repeated scans must be idempotent");
+                assert_eq!(repeat.deferred, 0);
+            });
+        }
+    }
+
+    fn run_with_slow_first_scan(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        cursor: &mut ReconcileCursor,
+        stop: &AtomicBool,
+    ) -> ReconcileReport {
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        let scan = super::super::super::cancellable_tests::ObserveScan::new(move |stage| {
+            if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                // Exercise the production cooperative turn limit after one
+                // real item. Source reads, Git authority and publication all
+                // remain native; a loaded runner may yield at this boundary.
+                std::thread::sleep(super::super::MAX_BATCH_TURN);
+            }
+        });
+        let report = super::super::reconcile_message_batch(cx, pool, config, cursor, stop);
+        drop(scan);
+        let report = report.unwrap();
+        assert!(fired.load(Ordering::Acquire), "slow scan was not observed");
+        assert_eq!(report.scanned, 1, "{report:?}");
+        assert_eq!(report.repaired + report.unchanged, 1, "{report:?}");
+        assert_eq!(report.deferred, 0, "{report:?}");
+        assert!(!report.interrupted, "{report:?}");
+        assert!(report.budget_exhausted, "{report:?}");
+        assert!(report.payload_bytes <= super::super::MAX_BATCH_PAYLOAD_BYTES);
+        report
+    }
+
     fn seed_obsolete_progress(cx: &Cx, pool: &DbPool, config: &Config) -> (Store, ReconcileCursor) {
         let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
         cursor.source_identity = pool.sqlite_identity_key();
@@ -1926,16 +2245,18 @@ mod tests {
             );
             drop(store);
             let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let report = run(cx, pool, config, &mut restarted, &AtomicBool::new(false)).unwrap();
+            let report =
+                run_with_slow_first_scan(cx, pool, config, &mut restarted, &AtomicBool::new(false));
             assert!(
                 !report.checkpoint_restored,
                 "old logical-generation hints are invalid"
             );
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert_eq!(report.repaired, 1);
             // A restored tail=940/history=0 cursor would inspect no messages
-            // in this pass, delaying repair until the next history round.
-            assert_message_committed(cx, pool, config, 940, 40);
+            // in this pass. The fresh tail's first item must be committed even
+            // when the cooperative turn ends before history can inspect 940.
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
         });
     }
 
@@ -1951,10 +2272,11 @@ mod tests {
             assert_eq!(std::fs::read(&store.path).unwrap(), before);
             assert!(cursor.source_identity.is_empty(), "next pass must rescan");
             drop(store);
-            let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            let report = run_with_slow_first_scan(cx, pool, config, &mut cursor, &stop);
             assert!(!report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_message_committed(cx, pool, config, 940, 40);
+            assert_eq!(report.repaired, 1);
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
         });
     }
 
@@ -2746,18 +3068,13 @@ mod tests {
             drop(store);
 
             let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let report = super::super::reconcile_message_batch(
-                cx,
-                pool,
-                config,
-                &mut restarted,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let report =
+                run_with_slow_first_scan(cx, pool, config, &mut restarted, &AtomicBool::new(false));
             assert!(report.checkpoint_restored);
             assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert_eq!(report.repaired, 1);
             assert!(restarted.retries.is_empty());
+            assert_message_committed(cx, pool, config, 901, 40);
             let prepared = super::super::prepare_message(cx, pool, 901).unwrap();
             let archive = crate::open_archive(config, "project").unwrap().unwrap();
             let paths = crate::message_paths_for_bundle(
@@ -2809,45 +3126,123 @@ mod tests {
             previous.backfill_ceiling = Some(904);
             previous.next_lane_is_retry = true;
             previous.defer_transient(901, Instant::now());
+            let cooling_until = Instant::now() + MAX_RETRY_BACKOFF;
             previous.retries.push_back(DeferredRetry {
                 id: 902,
                 attempts: 3,
-                ready_at: Instant::now() + MAX_RETRY_BACKOFF,
+                ready_at: cooling_until,
             });
             let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
             store.save(&previous).unwrap();
+            assert!(
+                store
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .retries
+                    .iter()
+                    .any(|retry| retry.id == 902 && retry.attempts == 3 && retry.wait_us > 0)
+            );
             drop(store);
 
+            let repo = git2::Repository::open(&config.storage_root).unwrap();
+            let before = repo.head().unwrap().peel_to_commit().unwrap().id();
+            let expected_repairs = [901, 940, 939, 903];
+            let mut observed_repairs = Vec::new();
+            let mut repaired = 0;
             let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let report = super::super::reconcile_message_batch(
-                cx,
-                pool,
-                config,
-                &mut restarted,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-            assert!(report.checkpoint_restored);
-            assert_eq!(report.checkpoint_saved, Some(true));
-            assert_eq!(report.repaired, 4);
-            assert_eq!(report.deferred, 0);
-            assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
-            assert!(report.payload_bytes <= super::super::MAX_BATCH_PAYLOAD_BYTES);
-            for id in [901, 903, 939, 940] {
+            for pass in 0..16 {
+                // Force the due retry and the first startup orphan into
+                // separate real turns. Later passes may also yield early;
+                // correctness is the repair order, not four repairs/second.
+                let report = if pass < 2 {
+                    run_with_slow_first_scan(
+                        cx,
+                        pool,
+                        config,
+                        &mut restarted,
+                        &AtomicBool::new(false),
+                    )
+                } else {
+                    super::super::reconcile_message_batch(
+                        cx,
+                        pool,
+                        config,
+                        &mut restarted,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap()
+                };
+                assert!(report.checkpoint_restored);
+                assert_eq!(report.checkpoint_saved, Some(true));
+                assert!(!report.interrupted, "{report:?}");
+                assert_eq!(report.deferred, 0, "{report:?}");
+                assert!(report.repaired <= super::super::MAX_REPAIRS_PER_BATCH);
+                assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+                assert!(report.payload_bytes <= super::super::MAX_BATCH_PAYLOAD_BYTES);
+                repaired += report.repaired;
+
+                // Read actual committed repair order. Eventual presence alone
+                // would let an ordinary tail walk hide lost startup priority.
+                observed_repairs.clear();
+                let mut commit = repo.head().unwrap().peel_to_commit().unwrap();
+                while commit.id() != before {
+                    assert!(observed_repairs.len() < expected_repairs.len());
+                    assert_eq!(commit.parent_count(), 1);
+                    let id = commit
+                        .summary()
+                        .unwrap()
+                        .expect("reconciliation commit must have a summary")
+                        .strip_prefix("repair: reconcile message ")
+                        .and_then(|message| message.strip_suffix(" archive"))
+                        .unwrap()
+                        .parse::<i64>()
+                        .unwrap();
+                    observed_repairs.push(id);
+                    commit = commit.parent(0).unwrap();
+                }
+                observed_repairs.reverse();
+                assert_eq!(observed_repairs.len(), repaired);
+                assert!(
+                    expected_repairs.starts_with(&observed_repairs),
+                    "repair priority changed: {observed_repairs:?}"
+                );
+                if pass < 2 {
+                    assert_eq!(observed_repairs, expected_repairs[..=pass]);
+                    assert_eq!(restarted.tail_after, Some(905));
+                    assert_eq!(restarted.backfill_ceiling, Some(904));
+                }
+                assert!(restarted.tail_after.is_some_and(|id| id < 939));
+                assert!(restarted.backfill_ceiling.is_some_and(|id| id <= 904));
+
+                let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+                let saved = store.load().unwrap().unwrap();
+                assert_eq!(saved.tail_after, restarted.tail_after);
+                assert_eq!(saved.backfill_ceiling, restarted.backfill_ceiling);
+                assert!(saved.retries.len() <= 1);
+                if let Some(retry) = saved.retries.first() {
+                    assert_eq!(retry.id, 902);
+                    assert_eq!(retry.attempts, 3);
+                }
+                // The original cooldown must survive while it is live. A
+                // slow native run can legitimately outlast it and verify the
+                // already-committed 902, clearing that retry without a repair.
+                if Instant::now() < cooling_until {
+                    assert_eq!(saved.retries.len(), 1);
+                    assert!(saved.retries[0].wait_us > 0);
+                }
+                if repaired == expected_repairs.len() {
+                    break;
+                }
+            }
+            assert_eq!(observed_repairs, expected_repairs);
+            for id in [901, 902, 903, 939, 940] {
                 assert_message_committed(cx, pool, config, id, 40);
             }
             // Recent coverage must not falsely certify the intervening range
-            // or restart history at its newest ID. The old cooldown survives.
+            // or restart history at its newest ID.
             assert!(restarted.tail_after.is_some_and(|id| id > 905 && id < 939));
             assert!(restarted.backfill_ceiling.is_some_and(|id| id < 904));
-            let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
-            let saved = store.load().unwrap().unwrap();
-            assert_eq!(saved.tail_after, restarted.tail_after);
-            assert_eq!(saved.backfill_ceiling, restarted.backfill_ceiling);
-            assert_eq!(saved.retries.len(), 1);
-            assert_eq!(saved.retries[0].id, 902);
-            assert_eq!(saved.retries[0].attempts, 3);
-            assert!(saved.retries[0].wait_us > 0);
         });
     }
 

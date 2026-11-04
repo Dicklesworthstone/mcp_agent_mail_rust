@@ -94,8 +94,27 @@ release commit in 3fdda50c.
 - **A different procfs PID namespace no longer creates a false self-reader.**
   Cleanup identifies its retained descriptor using the mounted `/proc/self`
   identity. Its current descriptor table is inspected strictly before canonical
-  verification opens a file, protecting same-process SQLite locks without
-  multiplying the scan by the number of worker threads.
+  verification opens a file, protecting same-process SQLite locks.
+- **Live workers with private descriptor tables remain visible to retention.**
+  Every worker's descriptors are inspected even while its leader is alive.
+  Successfully inspected shared mappings are reused within the thread group.
+  The cleaner excludes its retained descriptor only with matching kernel
+  evidence of its exclusive flock; another thread reusing that descriptor
+  number for an independent reader still blocks reclamation.
+- **Verified-pin selection preserves existing same-process reader locks.**
+  Retention performs a no-open lock check before inspecting each possible
+  restore point, including an earlier candidate later rejected by verification.
+  This checks actual current-table POSIX locks, allowing the pool's retained
+  identity handle to coexist with read-only verification. Ordinary publication
+  therefore does not strand cleanup or later exports behind its own witness.
+  Without a verified fallback, a blocked pin refuses admission instead of
+  becoming permission for a repair export.
+  Shared snapshot selection for cooperating restore readers remains supported.
+- **Exporter cleanup remains bound to its retained directory lease.**
+  Preparation, publication and refusal cleanup now carry the actual admission
+  handle. Snapshot authority must capture that same parent inode before file
+  or empty-directory reclamation, so replacing a directory pathname cannot
+  transfer an earlier exporter's cleanup authority to the replacement.
 - **Transient procfs permission denials retry the actual reader inventory.**
   One retry after 5 ms rechecks descriptors, mappings and surviving workers
   within the same scan budget. A retained process-directory descriptor prevents
@@ -125,6 +144,11 @@ release commit in 3fdda50c.
   Deadline deferral does not invent an admission failure or create control files.
   The budget remains cooperative: inventory finishes and an operation already
   underway is not interrupted.
+- **Post-attempt cleanup cannot replenish the repair-export allowance.** The
+  producer keeps its durable one-repair reservation through completion and
+  cleanup, including an unlink whose durability could not be confirmed. Only
+  the next attempt's ordinary retention admission can clear that reservation;
+  a smaller pathname inventory during the current attempt is insufficient.
 
 The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
 preserves the earlier conservative-policy counterexamples and validation,

@@ -70,7 +70,7 @@ impl RepairControl<'_> {
 
     #[track_caller]
     fn begin_at(self, path: &Path) -> crate::Result<crate::ArchiveMutationGuard> {
-        crate::ArchiveMutationGuard::try_begin_repair(path, || self.cancelled())
+        crate::ArchiveMutationGuard::begin_message_repair(path, || self.cancelled())
     }
 }
 
@@ -110,7 +110,7 @@ pub fn reconcile_message_bundle(
 ///
 /// Uses the same validation, no-clobber publication and exact Git verification
 /// as [`reconcile_message_bundle`]. Immutable history is checked before the
-/// non-blocking global publication-fence admission; project mutex/flock
+/// bounded, cancellation-aware global publication-fence admission; project mutex/flock
 /// contention also defers immediately instead of waiting with that fence held.
 /// The worker stop flag and Cx are checked before and after lock admission,
 /// during canonical identity scans, between file publications,

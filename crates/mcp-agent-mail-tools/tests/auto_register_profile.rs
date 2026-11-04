@@ -107,6 +107,192 @@ fn find_agent_profiles(storage_root: &str, agent: &str) -> Vec<PathBuf> {
     found
 }
 
+/// GH#371: explicit task identities retain their first registered spelling,
+/// share case-insensitive uniqueness, and remain one archive component.
+#[test]
+fn explicit_task_identities_keep_canonical_registration_and_archive() {
+    run_with_storage(|cx, storage_root| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project = format!("/tmp/task-identity-{}", unique_suffix());
+        let original_id = register_open_agent(&ctx, &project, "App-X.Refactor_1").await;
+        let updated: Value = serde_json::from_str(
+            &register_agent(
+                &ctx,
+                project.clone(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some("app-x.refactor_1".to_string()),
+                Some("resumed task".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("resume using a differently cased task name"),
+        )
+        .expect("registration JSON");
+        assert_eq!(updated["id"], original_id);
+        assert_eq!(updated["name"], "App-X.Refactor_1");
+        assert_eq!(updated["task_description"], "resumed task");
+
+        for hint in ["worker_42", "WORKER_42"] {
+            let created = mcp_agent_mail_tools::create_agent_identity(
+                &ctx,
+                project.clone(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some(hint.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .await;
+            if hint == "worker_42" {
+                let created: Value = serde_json::from_str(&created.expect("create task identity"))
+                    .expect("creation JSON");
+                assert_eq!(created["name"], "worker_42");
+                assert_eq!(created["registration_token_returned"], false);
+                assert!(created.get("registration_token").is_none());
+            } else {
+                let err = created.expect_err("case variants cannot create a second identity");
+                assert!(err.message.contains("already exists"), "{err:?}");
+            }
+        }
+        assert_eq!(delivery_counts(&cx).await.2, 2);
+
+        mcp_agent_mail_storage::wbq_flush();
+        for name in ["App-X.Refactor_1", "worker_42"] {
+            let profiles = find_agent_profiles(&storage_root, name);
+            assert_eq!(profiles.len(), 1, "{name}: {profiles:?}");
+            let profile: Value = serde_json::from_str(
+                &std::fs::read_to_string(&profiles[0]).expect("read canonical profile"),
+            )
+            .expect("profile JSON");
+            assert_eq!(profile["name"], name);
+        }
+        assert!(find_agent_profiles(&storage_root, "app-x.refactor_1").is_empty());
+        assert!(find_agent_profiles(&storage_root, "WORKER_42").is_empty());
+    });
+}
+
+/// Dots in an explicit identity are literal name characters. Both local and
+/// project-qualified delivery resolve canonical identities through the DB.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn explicit_task_identities_send_ack_and_reply_across_projects() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        for cross_project in [false, true] {
+            let source = format!("/tmp/task-mail-source-{}", unique_suffix());
+            let target = if cross_project {
+                format!("/tmp/task-mail-target-{}", unique_suffix())
+            } else {
+                source.clone()
+            };
+            register_open_agent(&ctx, &source, "App-X.Refactor_1").await;
+            register_open_agent(&ctx, &target, "Review.Worker_2").await;
+            let sender_token = register_for_token(&ctx, &source, "app-x.refactor_1").await;
+            if cross_project {
+                macro_contact_handshake(
+                    &ctx,
+                    source.clone(),
+                    Some("App-X.Refactor_1".to_string()),
+                    Some("Review.Worker_2".to_string()),
+                    None,
+                    None,
+                    Some(target.clone()),
+                    Some("task identity routing".to_string()),
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("approve cross-project contact");
+            }
+            let recipient = if cross_project {
+                format!("review.worker_2@{target}")
+            } else {
+                "review.worker_2".to_string()
+            };
+            let sent: Value = serde_json::from_str(
+                &send_in_plan_thread(
+                    &ctx,
+                    &source,
+                    "app-x.refactor_1",
+                    &recipient,
+                    Some(sender_token),
+                )
+                .await
+                .expect("send using case-insensitive task identities"),
+            )
+            .expect("send JSON");
+            assert_eq!(sent["verified_sender"], true);
+            let payload = &sent["deliveries"][0]["payload"];
+            let message_id = payload["id"].as_i64().expect("message id");
+            assert_eq!(payload["to"], serde_json::json!(["Review.Worker_2"]));
+            let inbox = peek_inbox(&ctx, &target, "REVIEW.WORKER_2").await;
+            assert!(inbox.iter().any(|message| {
+                message["id"] == message_id && message["from"] == "App-X.Refactor_1"
+            }));
+
+            let acked: Value = serde_json::from_str(
+                &acknowledge_message(
+                    &ctx,
+                    target.clone(),
+                    "review.worker_2".to_string(),
+                    message_id,
+                    None,
+                )
+                .await
+                .expect("acknowledge using a task identity"),
+            )
+            .expect("ack JSON");
+            assert_eq!(acked["acknowledged"], true);
+            let reply: Value = serde_json::from_str(
+                &reply_message(
+                    &ctx,
+                    target.clone(),
+                    message_id,
+                    "review.worker_2".to_string(),
+                    "Reviewed.".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("reply to the original task identity"),
+            )
+            .expect("reply JSON");
+            assert_eq!(reply["reply_to"], message_id);
+            assert_eq!(reply["thread_id"], "th-plan");
+            assert_eq!(reply["to"], serde_json::json!(["App-X.Refactor_1"]));
+            let sender_inbox = peek_inbox(&ctx, &source, "APP-X.REFACTOR_1").await;
+            assert!(sender_inbox.iter().any(|message| {
+                message["id"] == reply["id"] && message["from"] == "Review.Worker_2"
+            }));
+        }
+    });
+}
+
 #[test]
 fn auto_registered_recipient_gets_an_archived_profile() {
     run_with_storage(|cx, storage_root| async move {

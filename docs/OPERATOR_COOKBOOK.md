@@ -602,8 +602,36 @@ that the process is unrelated to the backup. Scanning continues: any observable 
 still refuses deletion, as do malformed or unreadable process identity, scan
 exhaustion, and other IO errors. The cleaner's current descriptor table is
 strictly inspected first, before verification opens a candidate, preserving
-same-process SQLite locks. The process leader is also checked; identical shared
-tables and address spaces are not rescanned once per worker thread.
+same-process SQLite locks. Every worker's descriptor table is inspected because
+a worker can unshare its table while its leader remains alive. Shared memory
+mappings are reused only after a successful nonempty inventory. A matching
+exclusive kernel flock identifies the cleaner's own retained descriptor across
+its threads; another reader reusing that descriptor number is still protected.
+
+Retention also performs the no-open current-thread check before selecting its
+verified restore point. That read-only selection checks actual POSIX lock
+records on every matching descriptor in the current descriptor table. It
+permits unlocked identity handles retained by the backup producer, while
+protecting POSIX locks on both the eventual pin and earlier candidates that
+verification would reject. Opening and closing such a candidate just to reject
+it could otherwise release a same-process POSIX lock. Descriptor-specific
+flock and OFD locks are not released by that independent open/close operation.
+Unavailable descriptor inventory, incomplete records or unrecognized lock
+data cause refusal. The full reader and mapping checks before deleting a
+candidate remain unchanged.
+If no verified fallback can be selected after a reader refusal, admission
+fails; the blocked pin does not count as missing verification or authorize a
+repair export.
+The existing shared-authority protocol for cooperating restore readers is
+unchanged.
+
+Automatic-export cleanup carries the retained parent-directory admission
+through preparation, publication and failure handling. Snapshot authority
+compares its captured directory handle with that retained parent before
+selecting a pin, and keeps the binding for later checks. A replaced parent
+pathname refuses cleanup of both backup files and empty rotation directories;
+it cannot lend the displaced directory's lease to a replacement mailbox.
+Standalone rotation acquires and binds its own parent admission.
 
 For a fully verified, superseded periodic snapshot only, this uncertainty need
 not block retention. Under exclusive snapshot and recovery authority, an owned,
@@ -693,8 +721,11 @@ before that later check. A reader or a failed live check can therefore defer
 without spending the allowance. Once export begins, a crash, failed backup
 validation, or failed metadata publication does not replenish that allowance.
 Further over-budget exports remain refused
-until an ordinary admission check observes sufficient retained count and byte
-capacity after cleanup. Existing failed-stage admission is checked first. A
+until the next attempt's ordinary admission check observes sufficient retained
+count and byte capacity after cleanup. Completion and post-attempt cleanup never
+replenish the durable repair allowance: an unlink with unconfirmed durability
+can make a pathname inventory look smaller without confirming reusable capacity.
+Existing failed-stage admission is checked first. A
 refused export still permits independently admitted, bounded reclamation of
 superseded backups, including when interrupted staging or an unavailable
 journal prevents publication, or when the producer refuses disk headroom or
