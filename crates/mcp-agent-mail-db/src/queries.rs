@@ -4788,52 +4788,58 @@ pub async fn get_project_by_slug(
         return Outcome::Ok(cached);
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    // Live inbox wrappers start with a fresh read-cache generation. Scope
+    // queries can encounter transient recovery contention after checkout,
+    // before the inbox's own retry loop; retry the complete idempotent lookup.
+    run_read_with_mvcc_retry(cx, "get_project_by_slug", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
-    let params = [Value::Text(slug.to_string())];
+        let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
+        let params = [Value::Text(slug.to_string())];
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            if let Some(row) = rows.first() {
-                match decode_project_row(row) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+        match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+            Outcome::Ok(rows) => {
+                if let Some(row) = rows.first() {
+                    match decode_project_row(row) {
+                        Ok(row) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Err(e) => Outcome::Err(e),
                     }
-                    Err(e) => Outcome::Err(e),
-                }
-            } else {
-                match find_project_in_inventory(
-                    cx,
-                    &tracked,
-                    is_orphan_placeholder_identifier(slug),
-                    |project| project.slug.eq_ignore_ascii_case(slug),
-                )
-                .await
-                {
-                    Outcome::Ok(Some(row)) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+                } else {
+                    match find_project_in_inventory(
+                        cx,
+                        &tracked,
+                        is_orphan_placeholder_identifier(slug),
+                        |project| project.slug.eq_ignore_ascii_case(slug),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(Some(row)) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
+                        Outcome::Err(e) => Outcome::Err(e),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
                     }
-                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
-                    Outcome::Err(e) => Outcome::Err(e),
-                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => Outcome::Panicked(p),
                 }
             }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    })
+    .await
 }
 
 /// Look up a project by its exact `human_key`, then by the filesystem alias
@@ -4856,52 +4862,56 @@ pub async fn get_project_by_human_key_exact(
         return Outcome::Ok(cached);
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    run_read_with_mvcc_retry(cx, "get_project_by_human_key_exact", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE human_key = ? LIMIT 1";
-    let params = [Value::Text(human_key.to_string())];
+        let sql =
+            "SELECT id, slug, human_key, created_at FROM projects WHERE human_key = ? LIMIT 1";
+        let params = [Value::Text(human_key.to_string())];
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            if let Some(row) = rows.first() {
-                match decode_project_row(row) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+        match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+            Outcome::Ok(rows) => {
+                if let Some(row) = rows.first() {
+                    match decode_project_row(row) {
+                        Ok(row) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Err(e) => Outcome::Err(e),
                     }
-                    Err(e) => Outcome::Err(e),
-                }
-            } else {
-                match find_project_in_inventory(
-                    cx,
-                    &tracked,
-                    is_orphan_placeholder_identifier(human_key),
-                    |project| project_matches_human_key_alias(project, human_key, human_key),
-                )
-                .await
-                {
-                    Outcome::Ok(Some(row)) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+                } else {
+                    match find_project_in_inventory(
+                        cx,
+                        &tracked,
+                        is_orphan_placeholder_identifier(human_key),
+                        |project| project_matches_human_key_alias(project, human_key, human_key),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(Some(row)) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
+                        Outcome::Err(e) => Outcome::Err(e),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
                     }
-                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
-                    Outcome::Err(e) => Outcome::Err(e),
-                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => Outcome::Panicked(p),
                 }
             }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    })
+    .await
 }
 
 /// Look up a project by `human_key`, with the stable-slug fallback.
@@ -6553,45 +6563,49 @@ pub async fn get_agent(
         return Outcome::Ok(cached);
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    run_read_with_mvcc_retry(cx, "get_agent", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
-    // Optimized: filter by name directly in SQL (case-insensitive).
-    //
-    // GH#169: a case-insensitive lookup against a BINARY-unique `agents` table
-    // can match several case-variant rows (e.g. `BlueLake` and `bluelake`,
-    // created by a concurrent multi-pane registration race). `LIMIT 1` with no
-    // `ORDER BY` picks a row non-deterministically, so the same `agent_name`
-    // could resolve to a different `agent_id` over time — leaking file
-    // reservations (release resolves to a different id than grant did). Pin a
-    // stable canonical row: the first-registered (lowest `id`) variant. Grant
-    // and release then always resolve to the same row.
-    let sql = "SELECT id, project_id, name, program, model, task_description, \
+        // Optimized: filter by name directly in SQL (case-insensitive).
+        //
+        // GH#169: a case-insensitive lookup against a BINARY-unique `agents` table
+        // can match several case-variant rows (e.g. `BlueLake` and `bluelake`,
+        // created by a concurrent multi-pane registration race). `LIMIT 1` with no
+        // `ORDER BY` picks a row non-deterministically, so the same `agent_name`
+        // could resolve to a different `agent_id` over time — leaking file
+        // reservations (release resolves to a different id than grant did). Pin a
+        // stable canonical row: the first-registered (lowest `id`) variant. Grant
+        // and release then always resolve to the same row.
+        let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token, retired_at \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
-    let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+        let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}"))),
-            |row| {
-                let agent = decode_agent_row_indexed(row);
-                crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
-                Outcome::Ok(agent)
-            },
-        ),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+        match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+            Outcome::Ok(rows) => rows.first().map_or_else(
+                || Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}"))),
+                |row| {
+                    let agent = decode_agent_row_indexed(row);
+                    crate::cache::read_cache()
+                        .put_agent_scoped(&cache_scope_for_pool(pool), &agent);
+                    Outcome::Ok(agent)
+                },
+            ),
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        }
+    })
+    .await
 }
 
 /// Get agent by id (cache-first).
