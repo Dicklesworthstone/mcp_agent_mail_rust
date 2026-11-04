@@ -45,7 +45,10 @@
     "published_vcs_path": "crates/sqlmodel-pool",
     "upstream_guard_commit": "ee08466f00162ea21c0f9cf05da1f05f04d44758",
     "license_git_blob": "3d414da6ff83defe084707be6030866e8a7fb794",
-    "modified_published_files": ["README.md", "src/lib.rs"],
+    "modified_published_files": [
+      "README.md",
+      "src/lib.rs"
+    ],
     "added_file": "LICENSE",
     "integration": "local crates.io patch; vendored crate excluded from workspace membership",
     "root_lock_package_count": 868,
@@ -53,14 +56,40 @@
     "broader_upstream_deadline_rewrite_imported": false
   },
   "static_checks": [
-    {"check": "workspace cargo fmt --check", "result": "passed"},
-    {"check": "standalone vendor and control rustfmt", "result": "passed"},
-    {"check": "git diff --check", "result": "passed"},
-    {"check": "Cargo manifests, lockfiles, and workflow YAML parse", "result": "passed"},
-    {"check": "locked offline workspace cargo metadata --no-deps", "result": "passed", "scope": "manifest/workspace inspection only"},
-    {"check": "archive checksum, unchanged package files, license blob, root lock delta", "result": "passed"},
-    {"check": "control production unchanged and three regression bodies identical", "result": "passed"},
-    {"check": "independent source and CI invocation review", "result": "passed", "scope": "source review; no native pass implied"}
+    {
+      "check": "workspace cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "check": "standalone vendor and control rustfmt",
+      "result": "passed"
+    },
+    {
+      "check": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "check": "Cargo manifests, lockfiles, and workflow YAML parse",
+      "result": "passed"
+    },
+    {
+      "check": "locked offline workspace cargo metadata --no-deps",
+      "result": "passed",
+      "scope": "manifest/workspace inspection only"
+    },
+    {
+      "check": "archive checksum, unchanged package files, license blob, root lock delta",
+      "result": "passed"
+    },
+    {
+      "check": "control production unchanged and three regression bodies identical",
+      "result": "passed"
+    },
+    {
+      "check": "independent source and CI invocation review",
+      "result": "passed",
+      "scope": "source review; no native pass implied"
+    }
   ],
   "external_results": {
     "source": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/374#issuecomment-6632024968",
@@ -219,9 +248,92 @@
         "crates/mcp-agent-mail-storage/tests/archive.rs",
         "docs/evidence/gh374/VALIDATION.md",
         "docs/evidence/gh374/validation.json"
-      ]
+      ],
+      "published_commit": "aaf8c0e47f70fab1d9e44327909b18df621a964c"
     }
   ],
-  "standalone_pool_ci_command": "cargo test --locked --manifest-path vendor/sqlmodel-pool/Cargo.toml --lib -- --nocapture --test-threads=1",
-  "issue_resolved": false
+  "issue_resolved": false,
+  "historical_standalone_pool_ci_command": "cargo test --locked --manifest-path vendor/sqlmodel-pool/Cargo.toml --lib -- --nocapture --test-threads=1",
+  "continuation": {
+    "base_commit": "1d12d78c26c87afecd08617f0c52d6a44127aa71",
+    "authorization": "user explicitly authorized further direct main commits through GitHub; no pull request",
+    "runtime_pool": {
+      "version": "0.5.1",
+      "source_revision": "c996710674d92c00d23f30fe17ecc5d9644818c7",
+      "vendored_0_5_0_is_selected": false,
+      "audit_class": "source review, not new native execution"
+    },
+    "runtime_query_engine": {
+      "crate": "fsqlite-vdbe",
+      "version": "0.4.13",
+      "verified_published_crate_sha256": "1ebdb969e559db53f5ff2fed49fdfc4cd651a3fd50e6eefc3350ea46a708d125",
+      "vcs_revision": "e4137af304002ac0b57a948c9e0005f9161475d7",
+      "codegen_git_blob": "b9bd72adadd70ecd3a01846a518ad03467a03d08"
+    },
+    "query_change": "typed minimum timestamp range plus deterministic created_ts DESC, id DESC enables reverse composite range seeks",
+    "preserved": [
+      "4096 speculation quota and increasing page work charge",
+      "exact receipt fallback and complete-timestamp cutoff",
+      "snapshot and cancellation boundaries",
+      "archive publication and recovery safety"
+    ],
+    "runtime_pool_ci_command": "cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable pool::tests::cancelled_ -- --nocapture --test-threads=1",
+    "executed_static_validation": {
+      "changed_rust_and_historical_pool_formatting": "pass",
+      "git_diff_check": "pass before executor loss",
+      "workflow_yaml": "pass",
+      "workflow_shell_blocks_checked": 23,
+      "independent_source_review": "pass"
+    },
+    "native_build_attempts": [
+      {
+        "started_at": "2026-11-04T22:31:09.779840+00:00",
+        "command": "cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable gh374_header_pages_seek_with_timestamp_extremes_and_ties -- --nocapture --test-threads=1",
+        "observed_stage": "dependency acquisition",
+        "status": "interrupted",
+        "exit_code": 130,
+        "native_test_result_observed": false
+      },
+      {
+        "started_at": "2026-11-04T22:35:42.899601+00:00",
+        "command": "cargo -Zgit=shallow-deps test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable gh374_header_pages_seek_with_timestamp_extremes_and_ties -- --nocapture --test-threads=1",
+        "observed_stage": "dependency compilation after locked crate downloads",
+        "status": "exec-server transport disconnected; environment unavailable",
+        "configured_build_budget_seconds": 1200,
+        "exit_code": null,
+        "native_test_result_observed": false,
+        "resource_summary": null
+      }
+    ],
+    "required_workspace_gates": {
+      "formatting": "attempt interrupted, exit 130; no completed workspace verdict",
+      "all_targets": "not executed in this continuation before executor loss",
+      "production": "not executed in this continuation before executor loss",
+      "strict_clippy": "not executed in this continuation before executor loss"
+    },
+    "authorized_commit_plan": [
+      {
+        "order": 1,
+        "message": "perf(inbox): seek header pages by timestamp and id (#374)",
+        "published_commit": "145d4286ba453f2b8a3a22e400b082ad844d6cdf",
+        "parent": "1d12d78c26c87afecd08617f0c52d6a44127aa71",
+        "verified_tree": "cc63d2ed471ae0dea76d7a11caae3f1585021619",
+        "files": [
+          "crates/mcp-agent-mail-db/src/sync/inbox.rs",
+          "crates/mcp-agent-mail-db/src/project_mailbox.rs"
+        ]
+      },
+      {
+        "order": 2,
+        "message": "ci(gh374): qualify the selected pool and shared inbox paths",
+        "publication": "verify using GitHub commit and branch receipts",
+        "files": [
+          ".github/workflows/issue374-native.yml",
+          "docs/evidence/gh374/VALIDATION.md",
+          "docs/evidence/gh374/validation.json"
+        ]
+      }
+    ],
+    "production_scale_qualified": false
+  }
 }

@@ -1,15 +1,22 @@
 # Agent Mail #374: recovery and inbox qualification
 
-Date: November 4, 2026. This investigation is based on
+Date: November 4, 2026. The initial investigation is based on
 `4b8ddf30f34a73cc2553bc95db8f906dd95328a6`. Initial preparation made no commit,
 issue comment, pull request, release, or remote branch update. In a subsequent
 instruction, the user authorized the two commits below directly on main through
 GitHub, without a pull request. Publication receipts establish whether that
 authorized update completed; publication does not establish native qualification.
 
+The initial changes were published directly to main as
+`a79b72f5676cab8b5ea2f624b84e4f99632801da` and
+`aaf8c0e47f70fab1d9e44327909b18df621a964c`. The continuation below starts from
+`1d12d78c26c87afecd08617f0c52d6a44127aa71`, which incorporates subsequent
+upstream changes. The user again explicitly authorized direct main commits and
+prohibited pull requests.
+
 ## Status and evidence boundary
 
-The cancellation-accounting fix and additional qualification tests are prepared.
+The initial cancellation-accounting fix and qualification tests are on main.
 Formatting, provenance, configuration parsing, and independent source review
 have passed; those checks are not native execution of the pool, HTTP, or recovery
 paths. Native execution evidence and its limits are recorded below. The
@@ -23,7 +30,116 @@ responsiveness at the base commit. These are prior maintainer results, not new
 results from this investigation. That comment explicitly leaves large-mailbox
 qualification and the pool's pending counter unresolved.
 
-## Implementation changes
+## November 4 continuation: timestamp seeks and current dependency qualification
+
+### Production change and preserved contracts
+
+The shared header query now binds `created_ts >= i64::MIN` and orders by
+`created_ts DESC, id DESC`, retaining the optional inclusive timestamp ceiling,
+128-row limit, and boundary-timestamp offset. The pinned runtime engine recognizes
+this shape as a reverse composite-index range seek. The initial page seeks the
+project prefix; continuations seek the project and timestamp ceiling instead of
+walking newer timestamps again.
+
+This is a source-supported query-plan improvement, not a measured latency win.
+The 4,096-unit speculation quota, increasing page charge, exact receipt fallback,
+complete-timestamp cutoff, snapshots, cancellation checks, and archive publication
+rules are unchanged. Long equal-timestamp runs can still exhaust speculation and
+use the exact fallback; full archive reconciliation still requires scale evidence.
+The timestamp equivalence applies to valid non-null integer timestamps, not every
+possible malformed-database error outcome.
+
+The new native regression checks every candidate page against independent Rust
+ordering at `i64::MIN`, negative, zero, and `i64::MAX` timestamps, with 129-row
+ties and foreign-project witnesses. It checks the generated `SeekLE`/`Prev` path,
+two-field continuation keys, absence of a sorter/history-start instruction,
+complete incumbent row-set equivalence, and query-only transaction cleanup.
+Existing shared-inbox paging and concurrent peer-write hooks were updated to the
+new SQL text so their assertions continue to exercise the intended operations.
+
+The published `fsqlite-vdbe 0.4.13` crate was downloaded and verified against
+Cargo.lock checksum
+`1ebdb969e559db53f5ff2fed49fdfc4cd651a3fd50e6eefc3350ea46a708d125`.
+Its VCS revision is `e4137af304002ac0b57a948c9e0005f9161475d7`; the
+`src/codegen.rs` blob is `b9bd72adadd70ecd3a01846a518ad03467a03d08`.
+The reverse composite-range implementation is therefore in the actual published
+runtime engine, independently of the separate patched Beads 0.3.18 engine.
+
+### Cancellation dependency and CI correction
+
+Current main selects `sqlmodel-pool 0.5.1` and `sqlmodel-core` at immutable Git
+revision `c996710674d92c00d23f30fe17ecc5d9644818c7`. The vendored 0.5.0 copy is
+historical evidence and no longer provides the application's runtime pool.
+Source review confirms the selected pool owns the pending counter through
+`WaiterGuard`, factory reservations through `ActiveSlotGuard`, and connections
+being validated/retired through `ActiveConnectionGuard`. Its outer acquisition
+drops those owned operations before reporting cancellation or timeout. These
+findings identify cleanup mechanisms, not a newly executed no-leak proof.
+
+The CI pool step now runs the two existing native Agent Mail initializer
+cancellation/reuse tests using the application's locked dependency graph and
+records the selected pool's manifest/lock identity. The unchanged HTTP cancellation
+test separately requires queued-request cleanup, dispatch release, metadata/body
+reads after timeout, zero pending counts, reusable capacity, and unchanged receipts.
+The workflow also selects the adjacent shared-inbox tests and requires the storage
+large-fixture JSON witness to say `large_mailbox: true` and `messages: 25100`.
+All existing large-workload, integrity, latency, production, and strict Clippy
+gates remain. Historical vendor formatting is checked directly with rustfmt.
+
+### Continuation validation
+
+| Check | Observed result |
+| --- | --- |
+| Changed Rust files and historical pool rustfmt | Passed |
+| `git diff --check` | Passed before executor loss |
+| Workflow YAML and all 23 shell blocks | Parsed; shell syntax checks passed |
+| Published runtime engine checksum/VCS and independent source reviews | Passed source/provenance checks |
+| Focused native header-seek regression | No test result observed; executor disconnected during dependency compilation |
+| Workspace `cargo fmt --check` | Attempt interrupted, exit 130; no completed formatting verdict |
+| All-target/production workspace checks and strict Clippy | Not executed in this continuation before executor loss |
+| 25,100-message archive and HTTP variants | No new execution result; production-scale qualification remains open |
+
+The standard native attempt started at 22:31:09 UTC and was interrupted during
+dependency acquisition (exit 130). A retry started at 22:35:42 UTC with Cargo's
+`-Zgit=shallow-deps`, the pinned compiler, one build job, no incremental compilation,
+and zero debug information. It downloaded the locked crates and reached dependency
+compilation. Its terminal status and resource summary were lost when the executor
+reported `exec-server transport disconnected`; the environment then became
+unavailable. A configured 1,200-second build budget is not an observed timeout
+result. No native case count, workload latency, Git-lock contention rate,
+reconciliation throughput, or workload resource peak is claimed.
+
+The current application-graph commands are:
+
+```sh
+cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable pool::tests::cancelled_ -- --nocapture --test-threads=1
+cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable gh374_ -- --nocapture --test-threads=1
+cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable project_mailbox::tests::shared_inbox_ -- --nocapture --test-threads=1
+```
+
+The unchanged native HTTP cancellation and opt-in large-workload commands below
+remain required. Workflow configuration is not evidence that those jobs executed.
+
+### Exact continuation commit plan and publication
+
+1. `perf(inbox): seek header pages by timestamp and id (#374)` — published directly
+   to main as `145d4286ba453f2b8a3a22e400b082ad844d6cdf`, parent
+   `1d12d78c26c87afecd08617f0c52d6a44127aa71`. Files:
+   `crates/mcp-agent-mail-db/src/sync/inbox.rs` and
+   `crates/mcp-agent-mail-db/src/project_mailbox.rs`. GitHub tree
+   `cc63d2ed471ae0dea76d7a11caae3f1585021619` exactly matches the reviewed
+   local tree.
+2. `ci(gh374): qualify the selected pool and shared inbox paths` — this evidence
+   update accompanies the CI correction. Files:
+   `.github/workflows/issue374-native.yml`,
+   `docs/evidence/gh374/VALIDATION.md`, and
+   `docs/evidence/gh374/validation.json`. Publish with a checked non-forced
+   fast-forward from the first commit; retain intervening work if main moves.
+
+Neither commit claims issue closure or successful native production-scale
+qualification. No pull request is part of this plan.
+
+## Initial implementation changes
 
 ### 1. Cancel-safe pending-request ownership
 
@@ -263,10 +379,11 @@ status, the emitted JSON, wall time, CPU, and peak RSS separately from builds.
 Do not accept zero selected tests as qualification.
 
 ```sh
-cargo test --locked --manifest-path vendor/sqlmodel-pool/Cargo.toml --lib -- --nocapture --test-threads=1
+cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable pool::tests::cancelled_ -- --nocapture --test-threads=1
 
 cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable gh374_ -- --nocapture --test-threads=1
 cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable sync::inbox::tests:: -- --nocapture --test-threads=1
+cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable project_mailbox::tests::shared_inbox_ -- --nocapture --test-threads=1
 
 cargo test --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable recovery::message_reconcile::database:: -- --nocapture --test-threads=1
 cargo test --locked -p mcp-agent-mail-storage --lib --no-default-features --features portable recovery::message_reconcile::cancellable_tests:: -- --nocapture --test-threads=1
@@ -283,15 +400,15 @@ cargo check --locked --workspace --lib --bins
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
-## Exact authorized main-branch commit plan
+## Initial authorized main-branch commit plan (completed)
 
-The user's follow-up authorizes these two commits directly on main, with no
-pull request. The first commit was published as
-`a79b72f5676cab8b5ea2f624b84e4f99632801da`, with its tree checked against the
-reviewed local files. This record accompanies the second commit. Recheck remote
-main before its update; if it moved, reconcile and revalidate the affected diff.
-Use a checked fast-forward update without force-pushing. Publication does not
-change the validation results or remove the remaining qualification gaps.
+The user's earlier follow-up authorized these two commits directly on main,
+without a pull request. They were published as
+`a79b72f5676cab8b5ea2f624b84e4f99632801da` and
+`aaf8c0e47f70fab1d9e44327909b18df621a964c`, with their trees checked against
+the reviewed local files. The historical plan below records their scope;
+subsequent dependency selection is described in the continuation above.
+Publication does not change validation results or remove qualification gaps.
 
 1. **`fix(pool): reclaim cancelled acquisition waiters (#374)`**
 
