@@ -1,0 +1,31 @@
+--- a/src/async_api.rs
++++ b/src/async_api.rs
+@@ -1937,6 +1937,15 @@
+     env
+ }
+ 
++// Construct and poll the large bootstrap future in a frame that returns before
++// entering the long-lived command loop. This lets later commands reuse its
++// stack storage instead of reserving bootstrap temporaries in the worker's
++// lifetime frame. Returning does not itself decommit resident stack pages.
++#[inline(never)]
++fn open_worker_connection(request: WorkerOpenRequest) -> Result<Connection, FrankenError> {
++    future::block_on(request.open())
++}
++
+ fn spawn_worker_thread(
+     request: WorkerOpenRequest,
+     cmd_rx: CommandReceiver,
+@@ -1957,10 +1966,10 @@
+                 #[cfg(test)]
+                 let open_result = match state.take_forced_open_error() {
+                     Some(error) => Err(error),
+-                    None => future::block_on(request.open()),
++                    None => open_worker_connection(request),
+                 };
+                 #[cfg(not(test))]
+-                let open_result = future::block_on(request.open());
++                let open_result = open_worker_connection(request);
+                 // The returned connection has an independent lifetime root;
+                 // release the caller's opening authority before commands run.
+                 drop(bootstrap_lineage);

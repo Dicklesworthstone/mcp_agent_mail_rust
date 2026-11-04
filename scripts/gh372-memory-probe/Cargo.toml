@@ -1,0 +1,29 @@
+[package]
+name = "gh372-memory-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+production-allocator = ["dep:mimalloc"]
+
+[dependencies]
+fsqlite = { version = "=0.4.13", features = ["async-api"] }
+sqlmodel-frankensqlite = "=0.5.0"
+sqlmodel-core = "=0.5.0"
+futures-lite = "=2.6.1"
+mimalloc = { version = "=0.1.52", optional = true }
+
+[[bin]]
+name = "memory-probe"
+path = "src/main.rs"
+
+[[bin]]
+name = "future-sizes"
+path = "src/bin/future_sizes.rs"
+
+[profile.dev]
+opt-level = 1
+debug = 1

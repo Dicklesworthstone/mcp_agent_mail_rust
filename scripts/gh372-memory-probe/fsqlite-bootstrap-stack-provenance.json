@@ -1,0 +1,25 @@
+{
+  "package": "fsqlite",
+  "version": "0.4.13",
+  "published_archive_url": "https://static.crates.io/crates/fsqlite/fsqlite-0.4.13.crate",
+  "published_archive_sha256": "b78d9653b10492a87f0cba71ae0f74659a759792be0a41e2b4140752bcac93df",
+  "upstream_repository": "https://github.com/Dicklesworthstone/frankensqlite",
+  "upstream_git_revision": "e4137af304002ac0b57a948c9e0005f9161475d7",
+  "upstream_path_in_vcs": "crates/fsqlite",
+  "changed_file": "src/async_api.rs",
+  "published_file_sha256": "ed0a04d0aeddc67ca1a875c6dca11399c5ca583f876b07b9ea62bc20305a2e76",
+  "candidate_file_sha256": "5f8cbe8a67cd5dbe24ffe7c4971be11cd9e8e0aa99123d9450b1c308df68f92a",
+  "patch_file": "fsqlite-bootstrap-stack.patch",
+  "patch_sha256": "1a643d16d81df4228bb8b9aecc343e19fa9cb04e94935f917a52d18d062dbae3",
+  "old_cli": {
+    "version": "0.4.10",
+    "archive_url": "https://github.com/Dicklesworthstone/frankensqlite/releases/download/v0.4.10/fsqlite-0.4.10-linux_amd64.tar.gz",
+    "archive_sha256": "12b8ec599038c74609a3db2c6ed6fb15fd3e3258693ab7dc62830f5dd3d42fc0",
+    "member": "fsqlite",
+    "executable_bytes": 25040632,
+    "executable_sha256": "c8964fdda2c474cdaad60e6c1e2909e2efadb18dfb74cb657ed39111e1ee76ea"
+  },
+  "application": "From the extracted fsqlite-0.4.13 crate root: patch --batch --fuzz=0 -p1 < fsqlite-bootstrap-stack.patch",
+  "purpose": "Isolate async worker connection bootstrap in a non-inlined helper before entering the command loop.",
+  "qualification_status": "Experimental candidate; this provenance records source identity only and makes no runtime-result claims."
+}
