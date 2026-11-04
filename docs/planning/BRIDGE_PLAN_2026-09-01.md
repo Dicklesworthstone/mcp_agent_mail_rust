@@ -62,17 +62,17 @@ Another feature inventory or another release dashboard would not close those gap
   rewrite is independently visible in `core/src/mailbox_durability.rs:990`.
 - Separate production-check requests were refused before Cargo: parked-manifest
   dependency closure (RCH-E413/code103) or live-checkout protection. The first
-  full-workspace request ended at worker admission/queue timeout. The hz4
-  replacement reached linking but became heavily I/O-bound; it was canceled
-  with wrapper exit143, with no native test verdict. A subsequent replacement
-  is compiling on newly available, low-I/O hz3; its terminal result is pending.
+  full-workspace request ended at worker admission/queue timeout. The hz4 and hz3
+  replacements reached linking/integration-test compilation but became heavily
+  I/O-bound; both were canceled with wrapper exit143 and no native test verdict.
   Formatting passed. No fresh full check/production/strict-Clippy pass is claimed.
 - The unchanged paired release smoke uses the signed v0.3.40 candidate and
   signed v0.3.39 control in one invocation. The candidate has already failed the
   default 60-agent send p99 limit: **6.6477 seconds > 5 seconds**, 7,259 samples,
   and one `send_message` RESOURCE_BUSY. It also failed no-read archive convergence:
-  at294.983s,20,178 DB messages versus20,177 canonical messages, missing17208,
-  no remaining uncommitted copies. The final300s sample exhausted its observation
+  at294.983s,20,178 DB messages versus20,177 canonical messages, with exactly
+  one missing message ID:17208. No observed copies remained uncommitted.
+  The final300s sample exhausted its observation
   deadline; its zero counts are unobserved values, not an empty archive. All7,258
   acknowledged swarm sends survived SIGKILL in SQLite, and stopped independent
   integrity passed. The final paired receipt records FAIL for both arms.
@@ -431,13 +431,46 @@ local commits affect assessment/tracker/README metadata. Both requests use
 nextest run --locked --workspace`, with original feature graph and test limits.
 No local compile fallback or gate relaxation was used.
 
-The replacement full current-source workspace nextest and final graph/status
-checks remain pending. No source or release clearance is implied by the
-completed paired executable run or a partially linked build.
-No issue has been closed, no implementation owner changed, and no runtime feature
-credit is claimed by this assessment. It is operator-requested PROCESS; its
-consumer is the operator's completion/prioritization decision. The next runtime
+The replacement reached integration-test compilation, but hz3's full I/O pressure
+rose from negligible admission-time pressure to83.83% over60s/75.88% over300s.
+Earlier process sampling showed real CPU progress; this is not a compiler error
+or proof of a deadlock. At approximately55 minutes, before nextest execution,
+the assessment stopped this exact owned request rather than substituting a
+smaller test selection or changing its bounds. Wrapper exit143 is cancellation,
+not a source test failure or pass. The first `rch jobs cancel` timed out with
+RCH-E504 and left20 scoped remote processes; direct build-ID cancellation was
+refused with an ownership-mismatch JSON envelope despite shell exit0. Retrying
+the exact durable wrapper cancellation returned `status: cancelled`. All these
+different outcomes are retained. A fresh namespace-scoped remote census then
+reported zero remaining owned processes. No shared daemon, peer job, lock or
+source tree was manually cleaned up.
+
+There is no full current-source workspace result. Final graph comparison
+preserves every original ID, status and assignee: exactly
+.81/.82/.83 were added, with2,549 closed,57 open,36 in-progress and3 blocked.
+`br dep cycles` reports zero active cycles; fresh `bv --robot-triage` and
+`--robot-plan` load complete, claim-safe authority (the plan deliberately skips
+some expensive metrics). All3,450 original compile/test input hashes still
+match, and the source/gate/configuration diff against24d83dce is empty.
+No source or release clearance is implied by the completed paired executable
+run or a partially linked build.
+No pre-existing unfinished issue has been closed and no implementation owner
+changed. Only the newly created, verified README correction .82 is closed; no
+runtime feature credit is claimed by this assessment. It is operator-requested
+PROCESS; its consumer is the operator's completion/prioritization decision. The next runtime
 block belongs to the named data-safety/capacity work, not a new audit framework.
+
+The completed honesty inventory is retained at the scratch evidence root. Its
+scope is this assessment's commands, source/gate diffs, selected commit/closure
+samples and prior context, reviewed by the same agent rather than independently
+certified. No source, test, golden, validator or threshold was edited locally;
+the original failed receipts, setup mistakes, skips and infrastructure outcomes
+are retained. One factual draft error was corrected: the golden matrix has35
+cells (7 states by5 surfaces), not21. The first archive inventory assumption also
+proved wrong against the unchanged validators and signed four-member archive;
+that became the bounded README correction, not a relaxed installer contract.
+The installed CASS reports no database or index at its configured archive path,
+so no clean verdict about the entire older conversation history is claimed.
 
 ## Current priority: live workers with unshared reader tables
 
