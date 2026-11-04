@@ -29,15 +29,17 @@ mkdir -p "${GOOD_DIR}/diagnostics" "${GOOD_DIR}/trace" "${GOOD_DIR}/transcript"
 e2e_case_banner "Diagnostic tree preserves names, sizes and byte ordering"
 TREE_DIR="${FIX_ROOT}/tree"
 mkdir -p "${TREE_DIR}/nested" "${TREE_DIR}/empty-directory"
+TREE_PLATFORM="$(python3 -c 'import os; print(os.name)')"
 TREE_BACKSLASH='back\slash.txt'
+if [ "${TREE_PLATFORM}" = "nt" ]; then
+    # Native Windows paths cannot contain a literal backslash in a filename.
+    TREE_BACKSLASH='back-slash.txt'
+fi
 printf 'four' > "${TREE_DIR}/${TREE_BACKSLASH}"
 : > "${TREE_DIR}/empty.txt"
 printf 'abc' > "${TREE_DIR}/nested/space name.txt"
-cat > "${FIX_ROOT}/tree.expected" <<'EOF'
-back\slash.txt (4b)
-empty.txt (0b)
-nested/space name.txt (3b)
-EOF
+printf '%s (4b)\nempty.txt (0b)\nnested/space name.txt (3b)\n' \
+    "${TREE_BACKSLASH}" > "${FIX_ROOT}/tree.expected"
 e2e_tree "${TREE_DIR}" > "${FIX_ROOT}/tree.actual"
 if cmp -s "${FIX_ROOT}/tree.expected" "${FIX_ROOT}/tree.actual"; then
     e2e_pass "diagnostic inventory matches independent names and lengths"
@@ -62,28 +64,34 @@ for BAD_TREE_ROOT in "${FIX_ROOT}/missing-root" "${TREE_DIR}/empty.txt"; do
     fi
 done
 
-e2e_case_banner "Unrepresentable names cannot publish a stale diagnostic tree"
-BAD_TREE_DIR="${FIX_ROOT}/bad-tree-summary"
-mkdir -p "${BAD_TREE_DIR}/diagnostics"
-printf 'previous verified tree\n' > "${BAD_TREE_DIR}/diagnostics/tree.txt"
-: > "${BAD_TREE_DIR}/"$'line\nbreak.txt'
-if e2e_write_diagnostics_files "${BAD_TREE_DIR}" > "${FIX_ROOT}/bad-tree.stdout" 2> "${FIX_ROOT}/bad-tree.stderr"; then
-    e2e_fail "ambiguous newline filename was accepted"
+if [ "${TREE_PLATFORM}" != "nt" ]; then
+    e2e_case_banner "Unrepresentable names cannot publish a stale diagnostic tree"
+    BAD_TREE_DIR="${FIX_ROOT}/bad-tree-summary"
+    mkdir -p "${BAD_TREE_DIR}/diagnostics"
+    printf 'previous verified tree\n' > "${BAD_TREE_DIR}/diagnostics/tree.txt"
+    : > "${BAD_TREE_DIR}/"$'line\nbreak.txt'
+    if e2e_write_diagnostics_files "${BAD_TREE_DIR}" > "${FIX_ROOT}/bad-tree.stdout" 2> "${FIX_ROOT}/bad-tree.stderr"; then
+        e2e_fail "ambiguous newline filename was accepted"
+    else
+        e2e_assert_contains "unrepresentable filename failure is explicit" \
+            "$(cat "${FIX_ROOT}/bad-tree.stderr")" "CR/LF filename"
+    fi
+    e2e_assert_eq "failed enumeration preserves the previous diagnostic" \
+        "previous verified tree" "$(cat "${BAD_TREE_DIR}/diagnostics/tree.txt")"
+    if (
+        E2E_ARTIFACT_DIR="${BAD_TREE_DIR}"
+        _E2E_TRACE_FILE="${BAD_TREE_DIR}/events.jsonl"
+        e2e_summary
+    ) > "${FIX_ROOT}/bad-summary.stdout" 2> "${FIX_ROOT}/bad-summary.stderr"; then
+        e2e_fail "summary swallowed diagnostic metadata failure"
+    else
+        e2e_assert_contains "summary propagates the diagnostic failure" \
+            "$(cat "${FIX_ROOT}/bad-summary.stderr")" "CR/LF filename"
+    fi
 else
-    e2e_assert_contains "unrepresentable filename failure is explicit" \
-        "$(cat "${FIX_ROOT}/bad-tree.stderr")" "CR/LF filename"
-fi
-e2e_assert_eq "failed enumeration preserves the previous diagnostic" \
-    "previous verified tree" "$(cat "${BAD_TREE_DIR}/diagnostics/tree.txt")"
-if (
-    E2E_ARTIFACT_DIR="${BAD_TREE_DIR}"
-    _E2E_TRACE_FILE="${BAD_TREE_DIR}/events.jsonl"
-    e2e_summary
-) > "${FIX_ROOT}/bad-summary.stdout" 2> "${FIX_ROOT}/bad-summary.stderr"; then
-    e2e_fail "summary swallowed diagnostic metadata failure"
-else
-    e2e_assert_contains "summary propagates the diagnostic failure" \
-        "$(cat "${FIX_ROOT}/bad-summary.stderr")" "CR/LF filename"
+    # Do not count a nonexistent Windows filename class as tested or skipped
+    # bundle behavior. All original bundle cases and invalid-root controls run.
+    e2e_log "CR/LF filename control is POSIX-only; Windows cannot create those names"
 fi
 
 # Populate required typed artifacts in the fixture dir.
