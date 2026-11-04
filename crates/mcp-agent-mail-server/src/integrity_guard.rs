@@ -2012,6 +2012,10 @@ mod tests {
         let thread = std::thread::current();
         let name = thread.name().expect("named libtest thread");
         if std::env::var(CHILD).as_deref() == Ok(name) {
+            // Only this dedicated --exact child changes its process mask.
+            // Reader-safe reclamation requires private fixture files and
+            // directories even when the invoking worker uses umask 002.
+            nix::sys::stat::umask(nix::sys::stat::Mode::S_IRWXG | nix::sys::stat::Mode::S_IRWXO);
             return true;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2153,6 +2157,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replaced_parent_blocks_coordinator_and_all_admitted_cleanup() {
+        if !isolated_default_retention_child() {
+            return;
+        }
         for swap_during_producer in [false, true] {
             assert_replaced_parent_coordinator_cleanup(swap_during_producer);
         }
