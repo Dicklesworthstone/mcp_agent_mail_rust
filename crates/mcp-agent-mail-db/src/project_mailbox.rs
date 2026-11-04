@@ -444,25 +444,26 @@ pub fn project_mailbox_inbox_counts_from_conn(
     })
 }
 
-/// Page in the existing project/timestamp index's order. As in the inbox reader,
-/// a single timestamp sort key keeps the pinned engine on its indexed path;
-/// the offset counts only rows already consumed at the boundary timestamp.
+/// Page in the existing project/timestamp index's order. Supply a typed
+/// lower timestamp bound even on the first page so the pinned engine can seek
+/// directly into this project's composite index instead of starting a history
+/// walk. The integer primary key is the deterministic tie break, matching the
+/// index's implicit rowid order. The offset counts only rows already consumed
+/// at the boundary timestamp.
 fn project_mailbox_count_ids(
     conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     floor: &mut Option<i64>,
     skip_at_floor: &mut i64,
 ) -> Result<Vec<i64>, DbError> {
-    let mut sql = "SELECT message_id, delivered_ts FROM project_mailbox_deliveries \
-                   WHERE project_id = ?"
-        .to_string();
-    let mut params = vec![Value::BigInt(project_id)];
-    if let Some(timestamp) = *floor {
-        sql.push_str(" AND delivered_ts >= ?");
-        params.push(Value::BigInt(timestamp));
-    }
-    sql.push_str(" ORDER BY delivered_ts ASC LIMIT 128 OFFSET ?");
-    params.push(Value::BigInt(*skip_at_floor));
+    let sql = "SELECT message_id, delivered_ts FROM project_mailbox_deliveries \
+               WHERE project_id = ? AND delivered_ts >= ? \
+               ORDER BY delivered_ts ASC, message_id ASC LIMIT 128 OFFSET ?";
+    let params = vec![
+        Value::BigInt(project_id),
+        Value::BigInt(floor.unwrap_or(i64::MIN)),
+        Value::BigInt(*skip_at_floor),
+    ];
     let rows = conn
         .query_sync(&sql, &params)
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
@@ -1307,7 +1308,72 @@ mod tests {
              PRAGMA query_only = ON;",
         )
         .unwrap();
-        let counts = project_mailbox_inbox_counts_from_conn(&conn, 1, 2, 150_000).unwrap();
+        struct Observed<'a> {
+            conn: &'a DbConn,
+            pages: std::cell::Cell<usize>,
+        }
+        impl crate::pool::SyncQuery for Observed<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                if sql.starts_with(
+                    "SELECT message_id, delivered_ts FROM project_mailbox_deliveries",
+                ) {
+                    self.pages.set(self.pages.get() + 1);
+                    let program = self.conn.query_sync(&format!("EXPLAIN {sql}"), params)?;
+                    let ops = program
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.get_as::<String>(1).unwrap(),
+                                row.get_as::<i64>(3).unwrap_or(0),
+                                row.get_as::<i64>(4).unwrap_or(0),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let bounded_seek = ops.iter().any(|(op, _, key)| {
+                        op == "SeekGE"
+                            && ops.iter().any(|(producer, fields, output)| {
+                                producer == "MakeRecord" && output == key && *fields >= 2
+                            })
+                    });
+                    assert!(bounded_seek, "{sql} must seek by project/timestamp: {ops:?}");
+                    assert!(
+                        ops.iter().all(|(op, _, _)| {
+                            !matches!(
+                                op.as_str(),
+                                "Rewind"
+                                    | "Last"
+                                    | "OpenEphemeral"
+                                    | "SorterOpen"
+                                    | "SorterInsert"
+                                    | "SorterSort"
+                                    | "Sort"
+                            )
+                        }),
+                        "{sql} must not walk history or sort: {ops:?}"
+                    );
+                }
+                self.conn.query_sync(sql, params)
+            }
+
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.conn.execute_raw(sql)
+            }
+        }
+        let observed = Observed {
+            conn: &conn,
+            pages: std::cell::Cell::new(0),
+        };
+        let counts =
+            project_mailbox_inbox_counts_from_conn(&observed, 1, 2, 150_000).unwrap();
+        assert_eq!(
+            observed.pages.get(),
+            3,
+            "257 deliveries require three bounded pages"
+        );
         assert_eq!(
             counts,
             ProjectMailboxInboxCounts {
