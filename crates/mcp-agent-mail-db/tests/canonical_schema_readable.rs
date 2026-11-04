@@ -189,19 +189,24 @@ fn seed_canonical_legacy_mailbox(conn: &CanonicalDbConn) {
     .expect("canonical recipients, second message and reservation");
 }
 
+/// Rows as values, with every SQLite INTEGER widened to `BigInt`. Canonical
+/// SQLite reports an integer that fits in 32 bits as `Int` while `FrankenSQLite`
+/// reports `BigInt`, so comparing one engine's rows with the other's must
+/// compare integer values, not the adapter's choice of variant.
 fn query_values(conn: &impl SyncQuery, sql: &str) -> Vec<Vec<Value>> {
     conn.query_sync(sql, &[])
         .unwrap_or_else(|error| panic!("{sql}: {error}"))
         .into_iter()
         .map(|row| {
             row.values()
-                .cloned()
                 .map(|value| match value {
                     // Canonical SQLite uses Int for i32-range INTEGERs;
                     // FrankenSQLite always uses BigInt. Compare the exact SQL
                     // integer without coercing text, floats, blobs or NULL.
-                    Value::Int(value) => Value::BigInt(i64::from(value)),
-                    value => value,
+                    Value::TinyInt(n) => Value::BigInt(i64::from(*n)),
+                    Value::SmallInt(n) => Value::BigInt(i64::from(*n)),
+                    Value::Int(n) => Value::BigInt(i64::from(*n)),
+                    other => other.clone(),
                 })
                 .collect()
         })

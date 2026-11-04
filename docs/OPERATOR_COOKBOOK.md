@@ -226,6 +226,29 @@ The reaper itself rechecks eligibility in its write transaction. An identity
 that becomes active or exempt after a sweep selects it is preserved, and the
 sweep reports it in `skipped_changed_count` rather than `reaped_count`.
 
+### Merge two keys of one repository with `am projects adopt`
+
+`am projects adopt SOURCE TARGET` prints a plan and changes nothing. With
+`--apply` it re-keys the source project's agents, messages and file
+reservations to the target, moves its product links, moves the source's archive
+files into the target's archive, and records the source slug in the target's
+`aliases.json`. It refuses when an agent name exists in both projects. Applying
+needs exclusive local mailbox ownership, like the reaper-exemption change
+above.
+
+Both keys must resolve to the same Git common directory: two worktrees of one
+repository, or two directories inside one checkout. The plan's last line says
+which case applies:
+
+- `- Plan status: executable; rerun with --apply to perform it` (exit 0)
+- `- Plan status: refused; nothing was changed` (exit 1, with or without
+  `--apply`)
+
+There is no supported re-key for a project key that is not inside a Git
+repository, such as a plain coordination directory. Keep using the existing
+key. If a new key is needed, register agents under it; the old project's
+messages stay readable under the old key.
+
 ## 4. Triage urgent inbox items and ack backlog [read-only]
 
 **Goal:** See what needs attention first for one operator.
@@ -355,7 +378,19 @@ am robot navigate "resource://file_reservations?project=$PROJECT&active_only=tru
 agent filtering, expiry warnings, conflict detection, and navigation ordering
 remain the same. Reservation attestation identifies `source: "mcp_server"`;
 the database/archive comparison fields are null because no local database was
-read. Without `--server`, the commands retain their direct-read behavior.
+read.
+
+Without `--server`, `am reservations`, `am robot reservations` and
+`am file_reservations list`, `active`, `soon` and `conflicts` first try a
+loopback server whose reported database and storage root match the CLI's own
+configuration. The probe has a 2 s timeout. If such a server answers, the read
+goes through it and its authentication, protocol and identity failures are
+errors. If no server answers, or the server is older and does not report its
+mailbox, or it serves a different mailbox, the command reads the local files
+directly. With `WORKTREES_ENABLED` and a Git `PROJECT_IDENTITY_MODE`, an
+absolute project path always uses the direct read. `am robot navigate` reads
+directly unless `--server` is given. Use `--server` when automation must never
+fall back to the local files.
 
 The endpoint follows the existing client configuration (`AGENT_MAIL_URL`, or
 the configured `HTTP_HOST`, `HTTP_PORT`, and `HTTP_PATH` with existing local

@@ -4778,7 +4778,8 @@ os.close(handle)
         let valid = format!("lock:\t1: FLOCK ADVISORY WRITE 4242 {device} 0 EOF\n");
         assert!(read_descriptor_flock(valid.as_bytes(), &identity, 4242).unwrap());
         assert!(
-            read_descriptor_flock(valid.replace("1:", "7:").as_bytes(), &identity, 4242).unwrap()
+            read_descriptor_flock(valid.replacen("1:", "7:", 1).as_bytes(), &identity, 4242)
+                .unwrap()
         );
         for (before, after) in [
             ("1:", "0:"),
