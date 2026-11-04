@@ -132,7 +132,7 @@ fn test_broadcast_detection() {
 
 #[test]
 fn test_descriptive_name_detection() {
-    for name in ["my-agent", "test_agent", "Agent1"] {
+    for name in ["MyAgent", "TestAgent", "Agent1"] {
         let expected = format!(
             "'{name}' looks like a descriptive role name. Agent names must be randomly generated \
              adjective+noun combinations like 'WhiteMountain' or 'BrownCreek', NOT descriptive of the agent's task. \
@@ -202,8 +202,11 @@ fn test_invalid_format_detection() {
 
         let expected = format!(
             "Invalid agent name format: '{invalid}'. \
-Agent names MUST be randomly generated adjective+noun combinations \
-(e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. \
+Use an adjective+noun name (e.g., 'GreenLake') or a safe task identifier \
+(e.g., 'app-x-refactor', 'worker_42'). Task identifiers must start with an ASCII \
+letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits \
+and those separators (at most 128 characters). Reserved identities, template \
+placeholders, '..', trailing dots and device names are not allowed. \
 Omit the 'name' parameter to auto-generate a valid name."
         );
         assert_message_eq(&expected, &err.message, &invalid);
@@ -212,7 +215,16 @@ Omit the 'name' parameter to auto-generate a valid name."
 
 #[test]
 fn test_valid_names_accepted() {
-    for name in ["BlueLake", "RedStone", "GoldHawk"] {
+    for name in [
+        "BlueLake",
+        "RedStone",
+        "GoldHawk",
+        "app-x-refactor",
+        "worker_42",
+        "my-agent",
+        "test_agent",
+        "App-X.Refactor_1",
+    ] {
         eprintln!("Testing agent name \"{name}\"...");
         assert!(
             detect_agent_name_mistake(name).is_none(),

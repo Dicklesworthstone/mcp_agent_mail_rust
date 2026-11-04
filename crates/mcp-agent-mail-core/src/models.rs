@@ -60,10 +60,12 @@ pub struct ProductProjectLink {
 /// An agent represents a coding assistant or AI model working on a project.
 ///
 /// # Naming Rules
-/// Agent names MUST be adjective+noun combinations (e.g., "`GreenLake`", "`BlueDog`").
-/// - 75 adjectives × 132 nouns = 9,900 valid combinations
+/// Agent names are vocabulary adjective+noun combinations (e.g., "`GreenLake`")
+/// or explicit task IDs (e.g., "`review-api`" or "`db.migrations_2`").
+/// - Automatically generated names always use the adjective+noun vocabulary
+/// - Explicit task IDs preserve spelling; see [`normalize_agent_name`] for their grammar
 /// - Case-insensitive unique per project
-/// - NOT descriptive role names (e.g., "`BackendHarmonizer`" is INVALID)
+/// - Bare role names without a separator (e.g., "`BackendHarmonizer`") remain invalid
 ///
 /// # Constraints
 /// - Unique: `(project_id, name)`
@@ -574,6 +576,55 @@ static VALID_ADJECTIVE_LENGTHS_DESC: LazyLock<Vec<usize>> = LazyLock::new(|| {
 });
 
 const MIN_VALID_AGENT_NAME_LEN: usize = 5;
+const MAX_AGENT_NAME_LEN: usize = 128;
+
+/// Explicit IDs occupy a separate namespace from generated vocabulary names.
+/// Keep them usable as one portable archive component and as an unqualified
+/// recipient; never admit a name that downstream safety guards would refuse.
+fn is_valid_explicit_agent_name(name: &str) -> bool {
+    let Some(first) = name.as_bytes().first() else {
+        return false;
+    };
+    if name.len() > MAX_AGENT_NAME_LEN
+        || !first.is_ascii_alphanumeric()
+        || name.ends_with('.')
+        || name.contains("..")
+        || !name.bytes().any(|byte| matches!(byte, b'.' | b'_' | b'-'))
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    if looks_like_program_name(name)
+        || looks_like_model_name(name)
+        || looks_like_broadcast(name)
+        || is_reserved_operator_agent_name(name)
+    {
+        return false;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    // The tool and CLI resolvers reject these template fragments anywhere in
+    // a name. The other placeholder forms contain characters excluded above.
+    if ["your_agent", "agent_name", "placeholder"]
+        .iter()
+        .any(|placeholder| lower.contains(placeholder))
+    {
+        return false;
+    }
+
+    // Windows reserves these device names even when an extension is present.
+    // A normal prefix such as `console-agent` or `com1-worker` stays valid.
+    let basename = lower.split('.').next().unwrap_or_default();
+    if matches!(basename, "con" | "prn" | "aux" | "nul") {
+        return false;
+    }
+    !basename
+        .strip_prefix("com")
+        .or_else(|| basename.strip_prefix("lpt"))
+        .is_some_and(|port| matches!(port.as_bytes(), [b'1'..=b'9']))
+}
 
 thread_local! {
     /// Zero-allocation cache for frequent agent name lookups.
@@ -581,13 +632,30 @@ thread_local! {
     static NORM_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::with_capacity(32));
 }
 
-/// Normalize a valid agent name to `PascalCase` (e.g. `"bluedog"` -> `"BlueDog"`).
+/// Normalize a vocabulary name or preserve a valid explicit task ID.
 ///
-/// Returns `None` if the name is not a valid adjective+noun combination.
+/// Adjective+noun combinations use `PascalCase` (e.g. `"bluedog"` -> `"BlueDog"`).
+/// Explicit task IDs preserve their trimmed spelling and use 1–128 ASCII
+/// characters: an alphanumeric first character followed by alphanumerics,
+/// `.`, `_`, or `-`, with at least one of those separators. Consecutive dots,
+/// a trailing dot, Windows device basenames, template placeholders, known
+/// program/model names, and reserved system/broadcast identities are refused.
+/// Both forms remain case-insensitive identities within a project.
+///
+/// Returns `None` for names outside these two forms. Automatic generation
+/// continues to draw only from the adjective+noun vocabulary.
 #[must_use]
 pub fn normalize_agent_name(name: &str) -> Option<String> {
     let name = name.trim();
-    if !name.is_ascii() || name.len() < MIN_VALID_AGENT_NAME_LEN {
+    if !name.is_ascii() || name.len() > MAX_AGENT_NAME_LEN {
+        return None;
+    }
+    // Explicit spelling must not go through the lowercase vocabulary cache:
+    // the first caller's casing must never rewrite a later caller's task ID.
+    if is_valid_explicit_agent_name(name) {
+        return Some(name.to_string());
+    }
+    if name.len() < MIN_VALID_AGENT_NAME_LEN {
         return None;
     }
 
@@ -617,11 +685,10 @@ pub fn normalize_agent_name(name: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// Validates that an agent name follows the adjective+noun pattern.
+/// Validate a vocabulary adjective+noun name or a safe explicit task ID.
 ///
-/// Uses a lowercase-once split strategy plus lazy vocabulary lookups, which
-/// avoids scanning every adjective+noun pair on each call while preserving the
-/// same accepted name set.
+/// See [`normalize_agent_name`] for the explicit-ID grammar. Vocabulary names
+/// retain their lowercase-once split strategy and lazy vocabulary lookups.
 ///
 /// # Examples
 /// ```
@@ -629,7 +696,9 @@ pub fn normalize_agent_name(name: &str) -> Option<String> {
 ///
 /// assert!(is_valid_agent_name("GreenLake"));
 /// assert!(is_valid_agent_name("blueDog"));
+/// assert!(is_valid_agent_name("review-api_2"));
 /// assert!(!is_valid_agent_name("BackendHarmonizer"));
+/// assert!(!is_valid_agent_name("../worker"));
 /// ```
 #[must_use]
 pub fn is_valid_agent_name(name: &str) -> bool {
@@ -817,9 +886,13 @@ pub fn looks_like_unix_username(value: &str) -> bool {
 /// Detect common mistakes when agents provide invalid agent names.
 ///
 /// Returns `Some((mistake_type, helpful_message))` or `None` if no obvious
-/// mistake detected. Only the first matching category is returned.
+/// mistake detected. Accepted explicit task IDs are never classified as
+/// descriptive role mistakes. Only the first matching category is returned.
 #[must_use]
 pub fn detect_agent_name_mistake(value: &str) -> Option<(&'static str, String)> {
+    if is_valid_explicit_agent_name(value.trim()) {
+        return None;
+    }
     if looks_like_program_name(value) {
         return Some((
             "PROGRAM_NAME_AS_AGENT",
@@ -1034,6 +1107,170 @@ mod tests {
     }
 
     #[test]
+    fn explicit_agent_names_preserve_case_and_separators() {
+        for name in [
+            "review-api",
+            "db.migrations_2",
+            "integration_worker_2",
+            "Review-API",
+            "review-api",
+            "REVIEW-API",
+            "API.v2-review_01",
+            "1-worker",
+            "a-",
+            "7_",
+            "console-agent",
+            "com1-worker",
+            "lpt1-review",
+            "COM10.task",
+            "LPT10.task",
+        ] {
+            assert!(is_valid_agent_name(name), "{name:?} should be valid");
+            assert_eq!(normalize_agent_name(name), Some(name.to_string()));
+            assert_eq!(
+                normalize_agent_name(&format!("  {name}  ")),
+                Some(name.to_string())
+            );
+        }
+        assert_eq!(
+            normalize_agent_name("GREENLAKE"),
+            Some("GreenLake".to_string()),
+            "explicit IDs must not alter vocabulary normalization"
+        );
+    }
+
+    #[test]
+    fn explicit_agent_name_length_bounds() {
+        let maximum = format!("a-{}", "x".repeat(MAX_AGENT_NAME_LEN - 2));
+        assert_eq!(maximum.len(), 128);
+        assert_eq!(normalize_agent_name(&maximum), Some(maximum.clone()));
+        assert_eq!(normalize_agent_name(&format!("{maximum}x")), None);
+        assert_eq!(
+            normalize_agent_name(&format!("  {maximum}  ")),
+            Some(maximum)
+        );
+        assert_eq!(normalize_agent_name("a"), None);
+        assert_eq!(normalize_agent_name("7"), None);
+    }
+
+    #[test]
+    fn explicit_agent_names_reject_paths_routing_and_control_characters() {
+        for name in [
+            "",
+            "task",
+            "-task",
+            "_task",
+            ".task",
+            ".git",
+            "..",
+            "../task",
+            "task/other",
+            "task\\other",
+            "C:task",
+            "task-1@project",
+            "project:demo#task",
+            "task#1",
+            "task%2F1",
+            "task?.v1",
+            "task*.v1",
+            "task[1]",
+            "task name",
+            "task\nname",
+            "task\rname",
+            "task\tname",
+            "task\0name",
+            "task-1.",
+            "task-1..",
+            "review..api",
+            "réview-api",
+            "__canary_probe_1",
+        ] {
+            assert_eq!(normalize_agent_name(name), None, "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_agent_names_reject_reserved_identities() {
+        for name in KNOWN_PROGRAM_NAMES
+            .iter()
+            .chain(BROADCAST_TOKENS)
+            .chain(RESERVED_OPERATOR_AGENT_NAMES)
+        {
+            assert_eq!(normalize_agent_name(name), None, "accepted {name:?}");
+            assert_eq!(
+                normalize_agent_name(&format!("  {}  ", name.to_ascii_uppercase())),
+                None,
+                "accepted a case variant of {name:?}"
+            );
+        }
+        for name in [
+            "gpt-6.1",
+            "claude-sonnet-4.5",
+            "gemini-2.5-pro",
+            "llama-3.1",
+            "mistral-large",
+            "o1-preview",
+        ] {
+            assert_eq!(normalize_agent_name(name), None, "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_agent_names_reject_placeholder_fragments() {
+        for name in [
+            "YOUR_AGENT",
+            "YOUR_AGENT_NAME",
+            "agent_name",
+            "prefix.your_agent_suffix",
+            "build.AGENT_NAME-v2",
+            "my-placeholder",
+            "review.PLACEHOLDER.2",
+            "<AGENT>",
+            "{AGENT}",
+            "$AGENT",
+        ] {
+            assert_eq!(normalize_agent_name(name), None, "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_agent_names_reject_windows_device_basenames() {
+        for basename in ["CON", "PRN", "AUX", "NUL"] {
+            for name in [format!("{basename}.task"), format!("{basename}.task.v2")] {
+                assert_eq!(normalize_agent_name(&name), None, "accepted {name:?}");
+                assert_eq!(normalize_agent_name(&name.to_ascii_lowercase()), None);
+            }
+        }
+        for number in 1..=9 {
+            for name in [format!("COM{number}.task"), format!("LPT{number}.task")] {
+                assert_eq!(normalize_agent_name(&name), None, "accepted {name:?}");
+                assert_eq!(normalize_agent_name(&name.to_ascii_lowercase()), None);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_agent_names_are_not_reported_as_descriptive_mistakes() {
+        for name in [
+            "my-agent",
+            "test_agent",
+            "worker-1",
+            "dev-tools",
+            "api.review",
+        ] {
+            assert!(
+                detect_agent_name_mistake(name).is_none(),
+                "accepted task ID {name:?} must not be diagnosed as a mistake"
+            );
+        }
+        assert_eq!(
+            detect_agent_name_mistake("BackendEngineer").map(|(category, _)| category),
+            Some("DESCRIPTIVE_NAME"),
+            "bare role names still require an explicit separator"
+        );
+    }
+
+    #[test]
     fn test_all_agent_name_combinations_round_trip() {
         for adjective in VALID_ADJECTIVES {
             for noun in VALID_NOUNS {
@@ -1055,6 +1292,10 @@ mod tests {
         assert!(
             is_valid_agent_name(&name),
             "generated name '{name}' should be valid"
+        );
+        assert!(
+            split_valid_agent_name(&name).is_some(),
+            "automatic generation must stay inside the adjective+noun vocabulary"
         );
     }
 

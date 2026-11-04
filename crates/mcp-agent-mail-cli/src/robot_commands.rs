@@ -12487,7 +12487,7 @@ fn append_malformed_db_agent_diagnostics(
                 reason_code: "malformed_agent_name".to_string(),
                 severity: "warn".to_string(),
                 agent: agent.name.clone(),
-                summary: "Agent name does not match adjective+noun rules".to_string(),
+                summary: "Agent name is not a valid vocabulary name or explicit task ID".to_string(),
                 detail: "The DB row is readable, but the name cannot be normalized by the current agent-name validator.".to_string(),
                 evidence: format!("agent_id={}", agent.id),
                 safe_command: format!(
