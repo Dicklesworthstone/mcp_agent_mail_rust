@@ -33,21 +33,66 @@ their corresponding Bead's evidence; retain it as history rather than a new gate
 - [ ] Current-source runtime qualification and highest-impact repair.
   - [x] Inspect current reconciler/fairness/generation wiring and existing owner notes.
   - [x] Select exact compiled source, lockfile, features, worker and executable pair.
-  - [ ] Reproduce original no-read crash/convergence and mixed-load failures there.
+  - [x] Reproduce original no-read crash/convergence and mixed-load failures there.
   - [ ] Trace the actual remaining queue/fence/reader/engine cause before changing it.
-  - [ ] Claim unowned ready work or coordinate assistance without taking peer closure.
+  - [x] Claim unowned ready work or coordinate assistance without taking peer closure.
   - [ ] Repair the demonstrated cause; preserve content, authority and durability bounds.
   - [ ] Re-execute positive and consequential negative paths at final source.
+- [x] br-kp1in.84: protect cold inbox scope lookups with the existing read retry.
+  - [x] Preserve three actual inbox BusyRecovery failures across two exact-source probes.
+  - [x] Trace pre-query project/agent lookups; distinguish the unprotected class from a named getter.
+  - [x] Create/claim the bounded bug, reserve queries.rs and inform the existing integration owner.
+  - [x] Prepare an isolated baseline matching all3,899 records of executed control02bb1b82.
+  - [x] Manually wire the existing helper around three cache-miss lookups; acquire inside each attempt.
+  - [x] Preserve SQL, ordering, aliases, caches, cancellation, budgets and hard-error classification.
+  - [x] Formatting passes; raw UBS0critical/3,835warning/631info, no findings in changed functions.
+  - [x] Complete fresh all-target, separate production, strict Clippy and existing query tests.
+  - [x] Complete optimized build; verify actual worker/delivered/retained executable identities.
+  - [x] Re-execute canonical identity/reserve/send/inbox/ack/reply and refusal/archive controls (33/33).
+  - [x] Observe a real named scope retry during actual native consumer load (13:10:14UTC, human-key lookup).
+  - [x] Complete the successful inbox workload and paired verdict; no individual RPC correlation is claimed.
+  - [x] Execute the unchanged native harness against declared source control02bb1b82.
+  - [x] Verify zero inbox BusyRecovery and intact integrity/crash/archive results; retain other failures.
+  - [x] Fresh solo acceptance review and bounded closure onb32be5b9; capacity/release parents remain open.
 - [ ] Reconcile both candidate histories under br-bx73n's existing prerequisites.
   - [x] Fresh fetch; preserve55local/18remote commits and verify0incoming file deletions.
   - [x] Resolve the two conflicted paths in an isolated worktree, preserving both histories.
   - [x] Retain all67 distinct namespace tests and both full historical evidence continuations.
   - [x] Bring the validated golden repair into combined candidate dd698266.
-  - [ ] Correct observed Result/Option test API mismatch and two visibility lint errors.
-  - [ ] Review the exact UBS test-helper false positive; preserve raw failure and disclose any waiver.
-  - [ ] Re-run all-target/production/Clippy/fmt plus real namespace/reader tests on corrected source.
+  - [x] Correct observed Result/Option test API mismatch and visibility/lint errors.
+  - [x] Review exact UBS test-helper false positives; retain raw failures and four narrow waivers.
+  - [ ] Verify the corrected combined source without hiding failed or unexecuted cases.
+    - [x] All-target check, separate production check, strict workspace Clippy and formatting.
+    - [x] Optimized portable build; verify worker/delivered/retained executable hashes.
+    - [x] Actual HTTP task-identity flow:33/33, including exact archive and refusal effects.
+    - [x] Preserve each missing-runner, duplicate-option, transport-timeout and SSH failure.
+    - [x] Execute complete selected DB namespace/public-reader/snapshot/recovery/inbox families (red).
+    - [x] Execute archive writer/reader concurrency and HTTP/rotation/producer families (red before qualification).
+    - [x] Retain nonzero terminal counts, failed assertions, skips and source identities.
   - [ ] Exercise original current-source runtime and strict full-workspace/native prerequisites.
   - [ ] Advance primary only after meaningful combined-source checks, preserving dirty peer base JSONL.
+- [ ] br-kp1in.85: repair deterministic namespace and Git concurrency fixture setup.
+  - [x] Retain FLOCK positive-control failure on device8:1 and archive duplicate-slug failure.
+  - [x] Limit serial/negative-field replacement to the intended first occurrence.
+  - [x] Initialize archive root before pool, then project archive after explicit identity seed.
+  - [x] Retain HTTP pre-behavior failure reading an absent Git index; initialize it before writer lock.
+  - [x] Preserve every original behavior, malformed-record, content, concurrency and deadline assertion.
+  - [x] Formatting passes; source frozen for remote original-case tests and mandatory compiler gates.
+  - [x] Original FLOCK parser controls pass on real worker filesystem identity.
+  - [x] Original archive writer/inbox-reader test reaches and passes its full behavior (96 messages, local UID1000, retained remote-compiled image).
+  - [x] Correct HTTP raw seeds to the same explicit no-parent metadata real sends persist; legacy-NULL refusal stays intact.
+  - [ ] Original HTTP responsiveness test reaches and passes its full behavior.
+  - [x] All-target/production/Clippy gates pass on the frozen fixture-repair source.
+  - [ ] Fresh bounded acceptance before closure; zero-case setup failures earn no credit.
+- [ ] Diagnose remaining combined-source failures without weakening their gates.
+  - [ ] Strict UID1000 reader inventory: protected same-UID systemd fd table remains a refusal.
+  - [ ] Three snapshot retention cases: verify fixture/producer permissions before any repair.
+  - [ ] Inbox cancellation: distinguish balanced nested snapshot releases from a leaked scope.
+  - [ ] HTTP cancellation: identify retained waiter/dispatch metric after the original cleanup bound.
+  - [ ] Rotation backlog: preserve original240s timeout; no deadline increase or workload reduction.
+  - [ ] Hourly producer: account for unreclaimed historical payloads/directories at hour0.
+  - [x] External stdio: retain17pass/1fail/0skip during live paired load and the unchanged quiet repeat. Quiet run emits the correct parse-error response but still exceeds the five-second bound during shutdown; neither run passes.
+  - [ ] Diagnose and repair the demonstrated stdio shutdown delay without raising its five-second gate.
 - [ ] Continue ready backlog in dependency order, informed by each terminal result.
   - [ ] Reader-safe recovery: original br-5nr0m/private-worker criteria and deadlines.
   - [ ] Capacity: original latency/error bounds, fixed offered-rate windows and real control.
@@ -121,6 +166,66 @@ the proper retry must bind its actual am and enable the existing strict native
 harness flags. br-bx73n's claim was correctly refused while its named blockers
 remain open; it remains open/unassigned with assistance notes, no bypass. Both
 private worktrees and failed canonical-root/cross-device attempts are retained.
+
+Latest November4 execution evidence: the pre-integration native run at
+`tests/artifacts/release_smoke/20261104_085930/` completed in2,410,622ms and its
+full artifact bundle revalidated. Candidate/control both53pass2fail. Candidate
+send p99=5.986977577s exceeds5s, with two inbox RESOURCE_BUSY errors. Its named
+no-client-read archive criterion passed at292.539s:24,937 DB/canonical messages
+and86,155 committed required copies, with every mismatch list empty. Earlier
+265.849s still had two uncommitted IDs. br-kp1in.35's owner/status stay unchanged;
+neither capacity nor whole-release acceptance closes on this bounded result.
+
+The six-file combined-source correction now passes all required compiler/lint/
+format checks. Optimized build30094688589447187/hz4 is terminal0 with receipt
+`c67b639f0bcfcd73acdb223fb6f84685434fbbe93736b60f970c8775b24cff2f`.
+Worker/delivered/retained executable SHA is
+`02bb1b821789f0d87f49b87e20ac74201a5cf749d8bb128bdb6f0da123bd6631`.
+The actual HTTP task-identity probe passed33/33: resume preserves canonical IDs,
+reservation/send/inbox/ack/reply work, exact canonical profiles and all committed
+copies agree, and traversal/duplicate/broadcast controls refuse without forbidden
+mail. The same final probe rejects the old f230d26c executable at registration.
+Retained scratch-probe failures exposed a wrong two-row assumption (default auto
+contact policy adds an approval) and an unhandled JSON-RPC error envelope. Its
+corrected oracle requires the exact three legitimate rows and typed rejection;
+the failed runs remain. This validates upstream's completed identity feature,
+not authorship of it, sustained capacity or release readiness.
+
+Three first corrected Nextest commands still died before cases at the actual
+1,800s SSH cap: only the build timeout had been overridden. All are recovered
+and acknowledged137, retaining earlier daemon130. Explicit build AND test
+timeouts7200 were then verified in the integration checkout. Its UID1000 reader
+retry lost SSH before compilation and recovered255; a private hash-verified
+Nextest0.9.143 now enables an alternative UID1000 worker. No shared tool/config
+or per-case limit changed. Corrected reader, live-Git archive and real HTTP plus
+rotation/producer runs are pending on frozen source. The unchanged paired native
+probe is running at `tests/artifacts/release_smoke/20261104_110607/`. Fresh
+origin3803436f adds four reviewed commits after8a107d96; no file is deleted and
+those changes remain outside this frozen candidate until its jobs finish.
+
+The complete02bb1b82/public-GNU run is now terminal1 in1,950,378ms, zero skipped
+suites; fresh full-bundle validation passes. Candidate sends4,823, p99=15.333835s,
+one142ms inbox BusyRecovery, zero dispatch timeouts. All4,823 acknowledgements
+survive; the no-client-read archive reaches8,573 DB/canonical messages and30,543
+committed copies in34.815s, every mismatch list empty. Control is also FAIL
+(send p99=30.839409s,119 send timeouts, reservation p99 failures and tool errors).
+This is not a capacity or performance win; closed-loop offered counts and load
+differ. Full raw receipt SHA256 is
+`8df9d112b9d88661727eb45636a10f9610ea7357553be5b59ea390b83a785d68`.
+Use the full `archive_convergence.jsonl` records for exact archive evidence;
+human check details are intentionally truncated and are not complete JSON.
+
+New br-kp1in.84 is in progress under EmeraldEagle, with queries.rs lease597.
+Its separate checkout first matched every one of the control's3,899 input
+records, then changed only queries.rs. It reuses run_read_with_mvcc_retry for
+get_project_by_slug, get_project_by_human_key_exact and get_agent cache misses;
+the existing inbox retry and every gate remain untouched. Required fresh checks,
+query tests and optimized build are active on that frozen source. The initial
+explicit hz4 build request refused103 on queue timeout before compilation;
+normal worker selection with build parallelism1 is admitted. No shared fleet
+configuration changed. Its source-matched before/after native run must exercise
+a named scope retry before this bounded task can close. No result is claimed
+for pending jobs, and neither private correction has been promoted to main.
 
 ## November 3, 2026 comprehensive reality check (November 4 UTC)
 
