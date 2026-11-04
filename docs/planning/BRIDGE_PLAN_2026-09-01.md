@@ -113,7 +113,7 @@ their corresponding Bead's evidence; retain it as history rather than a new gate
     - [x] Notify integrity/disk/archive-maintenance sleepers before the first operator join; retain every join and flush.
     - [x] Add a real held-operator-mutex regression: other services must exit before that mutex is released.
     - [x] Execute the new regression against the old ordering as a consequential negative control; ordinary same-worker replay reaches the held-lock assertion (7.65s, exit101), distinct from earlier seed timeouts.
-    - [ ] Execute final positive regression and unchanged lifecycle/cleanup/cancellation families.
+    - [x] Execute final positive regression and unchanged lifecycle/cleanup/cancellation families: real held-lock1.684s and retention1.576s pass; broader269-case run is262pass/7fail, not a green suite.
     - [x] Repeat required compiler/production/Clippy/fmt/UBS for the notification change; corrected visibility has all3 workspace gates0.
     - [ ] Build/hash the notification candidate and repeat original quiet/loaded stdio plus actual mail/durability.
   - [ ] Fresh solo acceptance before closure; no release/performance claim from a partial repair.
@@ -136,6 +136,7 @@ their corresponding Bead's evidence; retain it as history rather than a new gate
     - [ ] Capture failure-only fresh-acquire duration, actual pool state and opened-connection state without changing assertions or budgets.
     - [x] Explain a reproduced ordinary timeout: real fsqlite-worker is blocked in filesystem journal/page waits for about15s while the caller waits; the original10s cooperative acquisition deadline then correctly reports timeout. This is not a retroactive stack claim for run249.
     - [ ] Re-execute the original case on final source without weakening storage durability or its deadline; retain the failed runs and environment limits.
+    - [ ] Diagnose original pool warmup0/5 failure at10.823s in the final broad run; do not silently attribute its cause to the separately captured initializer stall.
   - [x] Build/hash c996 executable b666309b and exercise actual mail/durability effects; 33/33 task flow and original full paired native correctness pass, capacity gate fails in both arms. This predates the separate .86 notification patch.
   - [ ] Fresh bounded acceptance before closure; stdio, capacity and release stay independently gated.
 
@@ -298,6 +299,37 @@ replay measured the whole test including teardown, not acquisition latency;
 the initial commentary inference was explicitly corrected. Final failure-only
 duration/state logging is test-only in run260. Both .87 and .86 remain open
 until their final original behavioral acceptance is assessed.
+
+18:46UTC: broad run260 is terminal100,262passed/7failed/11,076excluded in
+361.349s. Its strict source receipt is clean:
+`2c47de06f206a3305654d26bed38c2736f522ac356402d8dc78c167f1d2286d8`;
+all3,899 records freshly match. Main's manifests, notification implementation,
+and all four fixture files match the executed source byte-for-byte. The private
+DB test differs only by failure logging; original assertions/budgets remain.
+Real early-notification held-lock regression passes1.684s; the ordinary old-order
+image fails at the intended assertion101/7.65s. All five retention workers join
+in1.576s. Original HTTP cancellation31.332s and responsiveness2.501s pass, as
+does the original lazy-initializer case4.881s. This does not erase earlier reds.
+
+Seven actual failures remain: `pool_warmup_opens_connections` returns0rather
+than5after10.823s; the six integrity cases are
+`active_snapshot_reader_defers_repair_without_spending_export_allowance`,
+`default_retention_repairs_large_backlogs_without_verification_authority`,
+`refused_automatic_admission_reclaims_safe_backlog_without_export`,
+`repeated_hourly_real_publication_keeps_verified_recovery_and_disk_usage_bounded`,
+`replaced_parent_blocks_coordinator_and_all_admitted_cleanup`, and
+`unpublished_automatic_attempts_reclaim_below_quota_and_preserve_verified_recovery`.
+They report retained image/history limits, a bounded-pass progress assertion,
+or the real private/non-shared/single-link namespace refusal. They remain part
+of the broader reader/retention qualification; no guard was loosened.
+Two progress comments incorrectly inferred whole-module success from recent
+PASS lines; the complete failure inventory above explicitly corrects that.
+
+Dependency adoption is preserved as `ac255f04`; notifications/retention join as
+`27507bed`. Both tasks remain open for their remaining original criteria.
+Formatting is freshly0. All corrected-main compiler gates remain valid for
+the same executable source. Build the actual optimized notification candidate
+and execute the original5s external stdio plus mail/crash/archive controls.
 
 - [ ] Continue ready backlog in dependency order, informed by each terminal result.
   - [ ] Reader-safe recovery: original br-5nr0m/private-worker criteria and deadlines.
