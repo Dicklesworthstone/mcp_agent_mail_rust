@@ -27817,15 +27817,27 @@ fn handle_projects_adopt_with_conn(
     );
 
     if !same_repo {
+        // GH#366: a refused plan is not an executable plan. Mark it next to
+        // the plan and exit nonzero, so a script cannot read a refusal as a
+        // planned or applied move.
+        ftui_runtime::ftui_println!("- Plan status: refused; nothing was changed");
         ftui_runtime::ftui_eprintln!(
             "Refusing to adopt: projects do not appear to belong to the same repository."
         );
-        return Ok(());
+        if source_common.is_none() || target_common.is_none() {
+            ftui_runtime::ftui_eprintln!(
+                "adopt only merges projects whose keys are checkouts of one Git repository \
+                 (same git-common-dir). A project key outside a Git repository cannot be \
+                 re-keyed; keep using its existing key."
+            );
+        }
+        return Err(CliError::ExitCode(1));
     }
 
     // Safety contract: adoption is dry-run by default; --apply is required to mutate.
     let effective_dry_run = !apply;
     if effective_dry_run {
+        ftui_runtime::ftui_println!("- Plan status: executable; rerun with --apply to perform it");
         return Ok(());
     }
 

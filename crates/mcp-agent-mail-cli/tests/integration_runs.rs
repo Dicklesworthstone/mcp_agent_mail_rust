@@ -3473,6 +3473,10 @@ fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
         stdout
     );
     assert!(
+        stdout.contains("- Plan status: executable; rerun with --apply to perform it"),
+        "expected executable plan status in stdout:\n{stdout}"
+    );
+    assert!(
         source_archive_file.exists(),
         "dry-run should not move source artifacts"
     );
@@ -3677,19 +3681,27 @@ fn projects_adopt_apply_cross_repo_refuses_and_keeps_source_artifacts() {
         &["projects", "adopt", &source_key, &target_key, "--apply"],
         None,
     );
-    if !out.status.success() {
+    // GH#366: a refused --apply must not exit 0, or a script would read the
+    // refusal as a completed move.
+    if out.status.code() != Some(1) {
         write_artifact(
             "projects_adopt_apply_cross_repo_refusal",
             &["projects", "adopt", &source_key, &target_key, "--apply"],
             &out,
         );
         panic!(
-            "expected success with refusal semantics\nstdout:\n{}\nstderr:\n{}",
+            "expected exit 1 for a refused adopt, got {:?}\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
 
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("- Plan status: refused; nothing was changed"),
+        "expected refused plan status in stdout:\n{stdout}"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(
@@ -3711,6 +3723,78 @@ fn projects_adopt_apply_cross_repo_refuses_and_keeps_source_artifacts() {
     assert!(
         !target_archive_file.exists(),
         "cross-repo refusal should not create target artifacts"
+    );
+}
+
+#[test]
+fn projects_adopt_refuses_non_git_keys_in_dry_run_and_apply() {
+    // GH#366: two registered keys that are plain directories, not checkouts.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let source_dir = tmp_root.join("plain_source");
+    let target_dir = tmp_root.join("plain_target");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+    let source_key = source_dir.display().to_string();
+    let target_key = target_dir.display().to_string();
+    insert_project(&conn, 1, "plain-source", &source_key);
+    insert_project(&conn, 2, "plain-target", &target_key);
+    drop(conn);
+
+    // Keep Git discovery inside the temp root, so a checkout that happens to
+    // enclose the test's temp directory cannot make the keys look related.
+    let mut env_vars = env.base_env();
+    env_vars.push((
+        "GIT_CEILING_DIRECTORIES".to_string(),
+        tmp_root.display().to_string(),
+    ));
+    for args in [
+        vec![
+            "projects",
+            "adopt",
+            source_key.as_str(),
+            target_key.as_str(),
+        ],
+        vec![
+            "projects",
+            "adopt",
+            source_key.as_str(),
+            target_key.as_str(),
+            "--apply",
+        ],
+    ] {
+        let out = run_am(&env_vars, Some(&tmp_root), &args, None);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "args={args:?}: a refused plan must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("- Same repo (git-common-dir): no"),
+            "args={args:?}: stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("- Plan status: refused; nothing was changed")
+                && !stdout.contains("Plan status: executable"),
+            "args={args:?}: stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("A project key outside a Git repository cannot be re-keyed"),
+            "args={args:?}: stderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !env.storage_root
+            .join("projects")
+            .join("plain-target")
+            .join("aliases.json")
+            .exists(),
+        "a refused adopt must not write aliases.json"
     );
 }
 

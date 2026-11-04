@@ -226,6 +226,29 @@ The reaper itself rechecks eligibility in its write transaction. An identity
 that becomes active or exempt after a sweep selects it is preserved, and the
 sweep reports it in `skipped_changed_count` rather than `reaped_count`.
 
+### Merge two keys of one repository with `am projects adopt`
+
+`am projects adopt SOURCE TARGET` prints a plan and changes nothing. With
+`--apply` it re-keys the source project's agents, messages and file
+reservations to the target, moves its product links, moves the source's archive
+files into the target's archive, and records the source slug in the target's
+`aliases.json`. It refuses when an agent name exists in both projects. Applying
+needs exclusive local mailbox ownership, like the reaper-exemption change
+above.
+
+Both keys must resolve to the same Git common directory: two worktrees of one
+repository, or two directories inside one checkout. The plan's last line says
+which case applies:
+
+- `- Plan status: executable; rerun with --apply to perform it` (exit 0)
+- `- Plan status: refused; nothing was changed` (exit 1, with or without
+  `--apply`)
+
+There is no supported re-key for a project key that is not inside a Git
+repository, such as a plain coordination directory. Keep using the existing
+key. If a new key is needed, register agents under it; the old project's
+messages stay readable under the old key.
+
 ## 4. Triage urgent inbox items and ack backlog [read-only]
 
 **Goal:** See what needs attention first for one operator.

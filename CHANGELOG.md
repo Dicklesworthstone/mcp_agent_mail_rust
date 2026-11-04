@@ -154,6 +154,17 @@ The [GH373 validation record](docs/evidence/gh373/retention-validation.md)
 preserves the earlier conservative-policy counterexamples and validation,
 alongside the current unlink policy and its real-process and retention tests.
 
+### Project adoption status and exit code (GH#366)
+
+- **A refused `am projects adopt` now exits 1.** The plan ends with
+  `- Plan status: refused; nothing was changed` or
+  `- Plan status: executable; rerun with --apply to perform it`. Previously a
+  refusal printed the same plan and exited 0, with or without `--apply`, so a
+  script could not tell it from a planned or completed move. When either key is
+  outside a Git repository, stderr also says that such a key cannot be re-keyed.
+  The [operator cookbook](docs/OPERATOR_COOKBOOK.md) documents the
+  same-repository requirement.
+
 ### Other changes on main
 
 - **Reservation reads stay available while a writer holds the lock.** Reservation and mail-activity
