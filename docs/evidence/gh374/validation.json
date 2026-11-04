@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-04",
+  "repository": "Dicklesworthstone/mcp_agent_mail_rust",
+  "issue": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/374",
+  "base_commit": "4b8ddf30f34a73cc2553bc95db8f906dd95328a6",
+  "report": "docs/evidence/gh374/VALIDATION.md",
+  "authorization": {
+    "initial_preparation": "local changes only; no commits or publication",
+    "followup": "user authorized two commits directly to main through GitHub",
+    "pull_request": "prohibited",
+    "publication_result": "recorded separately by GitHub commit and branch-update receipts",
+    "qualification_is_independent_of_publication": true
+  },
+  "environment": {
+    "os": "Ubuntu 24.04.3 LTS",
+    "kernel": "Linux 6.18.57",
+    "architecture": "x86_64",
+    "cpu_max": "800000 100000",
+    "cpu_quota": 8,
+    "memory_max_bytes": 8589934592,
+    "swap_available": false,
+    "toolchain": "nightly-2026-08-31",
+    "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+    "rustc_commit": "90850177249efe0321573c569aec5d12b257f8d6",
+    "host": "x86_64-unknown-linux-gnu",
+    "llvm": "23.1.0",
+    "cargo_build_jobs": 1,
+    "incremental": false,
+    "dev_debug": 0,
+    "test_debug": 0,
+    "test_threads": 1,
+    "limitations": [
+      "Shared cgroup reached its memory ceiling and recorded OOM events during builds.",
+      "Executor became unavailable and subsequently recovered.",
+      "Build resource observations do not measure Agent Mail workload consumption.",
+      "Reliable aggregate process-tree RSS sampling was unavailable."
+    ]
+  },
+  "dependency_provenance": {
+    "package": "sqlmodel-pool",
+    "version": "0.5.0",
+    "registry_archive_sha256": "d090572646f14c79363c6a78fe073afdb2213b77421b1815b31a6761e1f3ffa2",
+    "published_vcs_commit": "12d490b22ce3a82533591b5b39d2318b21da1f0f",
+    "published_vcs_path": "crates/sqlmodel-pool",
+    "upstream_guard_commit": "ee08466f00162ea21c0f9cf05da1f05f04d44758",
+    "license_git_blob": "3d414da6ff83defe084707be6030866e8a7fb794",
+    "modified_published_files": ["README.md", "src/lib.rs"],
+    "added_file": "LICENSE",
+    "integration": "local crates.io patch; vendored crate excluded from workspace membership",
+    "root_lock_package_count": 868,
+    "root_lock_delta": "only sqlmodel-pool source and checksum removed; versions and dependency edges unchanged",
+    "broader_upstream_deadline_rewrite_imported": false
+  },
+  "static_checks": [
+    {"check": "workspace cargo fmt --check", "result": "passed"},
+    {"check": "standalone vendor and control rustfmt", "result": "passed"},
+    {"check": "git diff --check", "result": "passed"},
+    {"check": "Cargo manifests, lockfiles, and workflow YAML parse", "result": "passed"},
+    {"check": "locked offline workspace cargo metadata --no-deps", "result": "passed", "scope": "manifest/workspace inspection only"},
+    {"check": "archive checksum, unchanged package files, license blob, root lock delta", "result": "passed"},
+    {"check": "control production unchanged and three regression bodies identical", "result": "passed"},
+    {"check": "independent source and CI invocation review", "result": "passed", "scope": "source review; no native pass implied"}
+  ],
+  "external_results": {
+    "source": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/374#issuecomment-6632024968",
+    "attribution": "prior maintainer report, not execution in this investigation",
+    "commit": "4b8ddf30f34a73cc2553bc95db8f906dd95328a6",
+    "reported_passes": [
+      "four database regressions",
+      "96-message archive reconciliation with live Git writer",
+      "600-message HTTP responsiveness during reconciliation"
+    ],
+    "reported_cancellation": "HTTP dispatch released; underlying pool pending count remained 1",
+    "large_variants_executed": false
+  },
+  "build_resource_scope": "kernel maximum single-process RSS of reaped children, not summed process-tree peak; build-only CPU and wall time",
+  "native_qualification": {
+    "pool_control_tests": "not_executed",
+    "pool_candidate_tests": "not_executed",
+    "agent_mail_regressions": "not_executed",
+    "large_mailbox_archive_and_http": "not_executed",
+    "candidate_type_check": "unknown_after_executor_loss",
+    "workspace_checks_and_clippy": "not_completed",
+    "current_native_attempts_pending": false,
+    "production_scale_qualified": false
+  },
+  "native_attempts": [
+    {
+      "label": "pool-control",
+      "command": "cargo test --locked --offline --lib gh374_ -- --nocapture --test-threads=1",
+      "source": "unpatched published 0.5.0 plus three regression tests",
+      "started_at_utc": "2026-11-04T17:39:06.414296+00:00",
+      "status": "dependency_fetch_failed",
+      "reason": "package-cache lock waits; aes 0.9.3 unavailable in offline cache",
+      "wall_seconds": 293.52243770099994,
+      "exit_code": 101,
+      "timed_out": false,
+      "max_single_process_rss_kib": 37120,
+      "user_cpu_seconds": 0.19835999999999998,
+      "system_cpu_seconds": 0.34594199999999997,
+      "tests_executed": 0
+    },
+    {
+      "label": "pool-control-isolated",
+      "command": "cargo test --locked --lib gh374_ -- --nocapture --test-threads=1",
+      "source": "unpatched published 0.5.0 plus three regression tests",
+      "started_at_utc": "2026-11-04T17:41:51.146465+00:00",
+      "status": "timed_out_during_dependency_compilation",
+      "wall_seconds": 600.9527610499999,
+      "exit_code": -15,
+      "timed_out": true,
+      "max_single_process_rss_kib": 384016,
+      "user_cpu_seconds": 123.186669,
+      "system_cpu_seconds": 77.125665,
+      "tests_executed": 0
+    },
+    {
+      "label": "pool-control-warm",
+      "command": "cargo test --locked --offline --lib gh374_ -- --nocapture --test-threads=1",
+      "source": "unpatched published 0.5.0 plus three regression tests",
+      "started_at_utc": "2026-11-04T17:53:21.007793+00:00",
+      "status": "timed_out_during_dependency_compilation",
+      "wall_seconds": 1200.4672598969996,
+      "exit_code": -15,
+      "timed_out": true,
+      "max_single_process_rss_kib": 301876,
+      "user_cpu_seconds": 109.833389,
+      "system_cpu_seconds": 379.805415,
+      "tests_executed": 0
+    },
+    {
+      "label": "pool-candidate-check",
+      "command": "cargo check --locked --offline --lib --tests",
+      "source": "patched 0.5.0 candidate",
+      "status": "outcome_unknown_after_executor_loss",
+      "evidence": "recovered log is empty; no metrics or exit receipt exists",
+      "requested_timeout_seconds": 300,
+      "exit_code": null,
+      "wall_seconds": null,
+      "tests_executed": 0
+    },
+    {
+      "label": "pool-control-recovered",
+      "command": "cargo test --locked --offline --lib gh374_ -- --nocapture --test-threads=1",
+      "source": "unpatched published 0.5.0 plus three regression tests",
+      "started_at_utc": "2026-11-04T21:36:44.083412+00:00",
+      "status": "timed_out_during_dependency_compilation",
+      "wall_seconds": 300.190311139002,
+      "exit_code": -15,
+      "timed_out": true,
+      "max_single_process_rss_kib": 327764,
+      "user_cpu_seconds": 42.965938,
+      "system_cpu_seconds": 14.483035,
+      "tests_executed": 0
+    }
+  ],
+  "runtime_measurements": {
+    "large_archive_convergence_seconds": null,
+    "large_archive_progress_rate": null,
+    "git_lock_contention": null,
+    "inbox_latency_ms": null,
+    "workload_peak_rss_bytes": null,
+    "workload_cpu_seconds": null,
+    "workload_io_bytes": null,
+    "reason": "native Agent Mail and opt-in large-mailbox workloads have not executed"
+  },
+  "source_findings": {
+    "pending_counter": "dropped acquire future bypasses manual waiter_count decrement; RAII guard owns and releases that increment",
+    "secondary_effect": "stale pending can keep Agent Mail backpressure from considering the pool idle; effect is source-supported, not reproduced",
+    "capacity_audit": "existing creation, validation, and retirement guards found; no additional hard-drop capacity leak identified by source review",
+    "deadline_limit": "uncooperative factory/ping independent deadlines remain outside this narrow patch",
+    "identity_scan_model": {
+      "classification": "source-derived analytical estimate, not an observed workload measurement",
+      "assumptions": "initially empty archive; 25100 successful one-message repairs; no retries",
+      "messages": 25100,
+      "formula": "N * (N - 1) / 2",
+      "prior_message_visits_per_identity_scan_mechanism": 314992450,
+      "logical_git_body_bytes_at_3072_bytes_each": 967656806400,
+      "physical_io_measured": false
+    }
+  },
+  "unverified_acceptance": [
+    "full 25100-message archive convergence with live Git contention",
+    "HTTP inbox latency and resource consumption at production scale",
+    "late-stage HTTP latency during full convergence",
+    "intermittently reacquired Git lock on fully populated large index",
+    "whole-daemon crash/restart and sustained message-arrival workloads",
+    "native Agent Mail database, storage, and HTTP regression suites",
+    "workspace type checks and strict Clippy"
+  ],
+  "authorized_commit_plan": [
+    {
+      "order": 1,
+      "message": "fix(pool): reclaim cancelled acquisition waiters (#374)",
+      "published_commit": "a79b72f5676cab8b5ea2f624b84e4f99632801da",
+      "files": [
+        ".gitignore",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".github/workflows/issue374-native.yml",
+        "vendor/sqlmodel-pool/.cargo_vcs_info.json",
+        "vendor/sqlmodel-pool/Cargo.lock",
+        "vendor/sqlmodel-pool/Cargo.toml",
+        "vendor/sqlmodel-pool/Cargo.toml.orig",
+        "vendor/sqlmodel-pool/LICENSE",
+        "vendor/sqlmodel-pool/README.md",
+        "vendor/sqlmodel-pool/src/lib.rs",
+        "vendor/sqlmodel-pool/src/replica.rs",
+        "vendor/sqlmodel-pool/src/sharding.rs"
+      ]
+    },
+    {
+      "order": 2,
+      "message": "test(gh374): strengthen large-mailbox recovery qualification",
+      "files": [
+        "crates/mcp-agent-mail-db/src/sync/inbox.rs",
+        "crates/mcp-agent-mail-server/src/tests/issue374_http.rs",
+        "crates/mcp-agent-mail-storage/tests/archive.rs",
+        "docs/evidence/gh374/VALIDATION.md",
+        "docs/evidence/gh374/validation.json"
+      ]
+    }
+  ],
+  "standalone_pool_ci_command": "cargo test --locked --manifest-path vendor/sqlmodel-pool/Cargo.toml --lib -- --nocapture --test-threads=1",
+  "issue_resolved": false
+}

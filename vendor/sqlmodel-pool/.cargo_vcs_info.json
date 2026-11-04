@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "12d490b22ce3a82533591b5b39d2318b21da1f0f"
+  },
+  "path_in_vcs": "crates/sqlmodel-pool"
+}
