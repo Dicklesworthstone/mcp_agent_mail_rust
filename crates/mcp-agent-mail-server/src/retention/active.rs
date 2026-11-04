@@ -59,6 +59,13 @@ pub(super) fn start(config: &Config) {
     }
 }
 
+pub(super) fn request_shutdown() {
+    let _worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
 pub(super) fn shutdown() {
     let mut worker = WORKER
         .lock()

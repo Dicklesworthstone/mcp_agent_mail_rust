@@ -1033,6 +1033,7 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     integrity_guard::request_shutdown();
     disk_monitor::request_shutdown();
     maintenance::request_shutdown();
+    retention::request_shutdown();
     stop_atc_operator_runtime();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
@@ -19976,10 +19977,19 @@ mod tests {
                         return None;
                     }
                     let name = name.expect("read server thread name");
-                    ["integrity-guard", "disk-monitor", "archive-mainten"]
-                        .iter()
-                        .any(|prefix| name.starts_with(prefix))
-                        .then(|| entry.file_name().into_string().expect("numeric thread ID"))
+                    [
+                        "integrity-guard",
+                        "disk-monitor",
+                        "archive-mainten",
+                        "retention-quota",
+                        "active-lease",
+                        "degraded-acknow",
+                        "degraded-releas",
+                        "degraded-replay",
+                    ]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    .then(|| entry.file_name().into_string().expect("numeric thread ID"))
                 })
                 .collect()
         }
@@ -19999,11 +20009,12 @@ mod tests {
         integrity_guard::start(&config);
         disk_monitor::start(&config);
         maintenance::start(&config);
+        retention::start(&config);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while live_services().len() != 3 {
+        while live_services().len() != 8 {
             assert!(
                 Instant::now() < deadline,
-                "all three real services must start"
+                "all eight real service workers must start"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
