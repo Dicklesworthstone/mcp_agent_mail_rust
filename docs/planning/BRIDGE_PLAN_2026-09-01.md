@@ -2,6 +2,39 @@
 
 ## Current priority: live workers with unshared reader tables
 
+- [x] Test the inbox retry hypothesis against real kernel WAL locks using
+  retained CLIbf35 and the unchanged HTTP harness. Original README flow19
+  passes. A recovery-byte control returns the unchanged inbox; blocked reader
+  slots return it after release. With documented cache capacity1 and an evicted
+  agent lookup, a five-second reader-slot fence still succeeds with unchanged
+  populated content. No original four-BUSY reproduction, cause or repair is
+  inferred; do not increase retry budgets or patch lookup code speculatively.
+- [x] Attribute the reproducible 16,641-directory timeout on actual server
+  image84588f86 in the existing UID65534/umask002/full-proc role. Preserve a
+  30-second instrumented early-stop diagnostic: 1,036,222 syscalls, 40 unlinks,
+  245,769 reads and 210,357 openat calls. This is debugging, not acceptance
+  timing or a performance baseline. Preserve all evidence directories.
+- [x] Read the separate CPU sample: 2,342 samples, no lost samples. The largest
+  named user-space leaf is the repeated VmSize line walk (8.11%); UID parsing
+  is 2.75%, with prefix comparison and whitespace iteration also visible.
+  These sampled diagnostic shares are not an application speedup claim.
+- [x] Draft one measured change: collect status fields in one line walk,
+  preserving first-occurrence/error precedence, full bounded input reads,
+  late VmSize evidence, valid zero threads and all existing reader policy.
+  Add a malformed-first-field/duplicate/order/late-mapping unit control.
+  Main and both validation copies match e3df3a49. Formatting passes; UBS
+  retains one unchanged critical, with all 22 added-line findings confined
+  to the new test and none critical. Validation remains pending.
+- [x] Preserve the optional source-receipt requests' pre-Cargo failures:
+  native namespace initialization is killed/refused; the compiler request
+  rejects path dependencies of the excluded dashboard-WASM manifest. No
+  Cargo tests/checks execute in those attempts. Normal strict RCH retries
+  are admitted on hz4/vmi1152480; each actual live process matches 3,896
+  present inputs plus the same six historical JSON omissions. Freeze both
+  source trees while they compile. Original 141 cases plus the new control
+  yield 142 selected cases, with original workloads and deadlines unchanged.
+- [ ] Complete new-source compiler/native verification and the original
+  large-directory gate before claiming its performance acceptance.
 - [x] Restore the live mailbox's write outage discovered at handoff. The
   corruption breaker refuses reservation release; stock SQLite independently
   reports orphaned pages149-155. Gracefully quit the exact original TUI via
