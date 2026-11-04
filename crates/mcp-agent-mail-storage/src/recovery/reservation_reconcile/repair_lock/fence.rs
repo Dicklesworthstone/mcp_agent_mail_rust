@@ -5,11 +5,14 @@
 //! publisher. Refuse contention before opening the archive or advancing either
 //! mutation epoch. Successful admission returns the ordinary guard, including
 //! its persisted epoch edges, reentrant depth, diagnostics and unwind cleanup.
+//! Message maintenance additionally has a short cancellable polling admission;
+//! it retains no fence or project lock while allowing background publishers to
+//! give it an execution turn. Terminal reservation repair remains nonblocking.
 
 use std::path::Path;
 use std::sync::TryLockError;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 
@@ -30,6 +33,33 @@ impl ArchiveMutationGuard {
     #[track_caller]
     pub(crate) fn try_begin_repair(path: &Path, cancelled: impl FnMut() -> bool) -> Result<Self> {
         try_begin_checked(path, cancelled)
+    }
+
+    /// Give a deferred message a short, cancellation-aware chance to enter the
+    /// native fence. Every attempt remains a try-lock; no project lock, fence,
+    /// epoch or SQLite connection is held while waiting. Background publishers
+    /// observe the waiter and yield their usual bounded admission window.
+    #[track_caller]
+    pub(crate) fn begin_message_repair(
+        path: &Path,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Self> {
+        const BUDGET: Duration = Duration::from_millis(50);
+        const PAUSE: Duration = Duration::from_millis(1);
+        let deadline = Instant::now() + BUDGET;
+        let mut waiting = None;
+        loop {
+            let contention = match try_begin_checked(path, &mut cancelled) {
+                Err(error @ StorageError::LockContention { .. }) => error,
+                result => return result,
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(contention);
+            }
+            waiting.get_or_insert_with(crate::RepairFenceWaiter::register);
+            std::thread::sleep(remaining.min(PAUSE));
+        }
     }
 }
 
@@ -211,6 +241,248 @@ mod tests {
         assert_eq!(tracking().0, 1, "refusal did not leak a reentrant depth");
         drop(window);
         assert_eq!(tracking().0, 0);
+    }
+
+    #[test]
+    fn message_repair_admission_is_bounded_and_cancellation_releases_its_turn() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let before = tracking();
+        let stamp = token(root.path());
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            crate::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5))
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        let deferred = ArchiveMutationGuard::begin_message_repair(root.path(), || false);
+        let waited = started.elapsed();
+        assert!(matches!(deferred, Err(StorageError::LockContention { .. })));
+        assert!(waited >= Duration::from_millis(50));
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        let cancelled = ArchiveMutationGuard::begin_message_repair(root.path(), || {
+            crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0
+        });
+        assert!(matches!(cancelled, Err(StorageError::Io(ref error))
+            if error.kind() == std::io::ErrorKind::Interrupted));
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        assert_eq!(tracking(), before);
+        assert_eq!(token(root.path()), stamp);
+        assert!(crate::archive_publication_fence_holder().is_some());
+        release_tx.send(()).unwrap();
+        owner.join().unwrap().unwrap();
+        drop(ArchiveMutationGuard::begin_message_repair(root.path(), || false).unwrap());
+        assert_eq!(tracking().0, 0);
+        assert_eq!(crate::archive_mutations_active(), 0);
+    }
+
+    #[test]
+    fn back_to_back_publishers_give_a_waiting_message_repair_an_execution_turn() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let writer_root = root.path().to_path_buf();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mutation = ArchiveMutationGuard::begin_at(&writer_root);
+            ready_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "repair never requested admission"
+                );
+                std::thread::yield_now();
+            }
+            drop(mutation);
+            // This is the WBQ/coalescer's actual native reacquisition path.
+            // Its bounded give-way window lets the polling repair enter.
+            drop(ArchiveMutationGuard::begin_at(&writer_root));
+            finished_tx.send(()).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let repair = ArchiveMutationGuard::begin_message_repair(root.path(), || false)
+            .expect("background reacquisition must admit bounded message repair");
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        assert_eq!(tracking().0, 1);
+        drop(repair);
+        // A repair owns no permanent turn: ordinary publication must complete
+        // promptly once that one native mutation window releases.
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.join().unwrap();
+        assert_eq!(crate::archive_mutations_active(), 0);
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn back_to_back_direct_publishers_give_a_waiting_repair_an_execution_turn() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let writer_root = root.path().to_path_buf();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let admit = || {
+                crate::admit_direct_publication(
+                    &writer_root,
+                    Instant::now() + Duration::from_secs(1),
+                    &mut || false,
+                )
+                .unwrap()
+            };
+            let first = admit();
+            ready_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "repair never requested admission"
+                );
+                std::thread::yield_now();
+            }
+            drop(first);
+            // The direct request's actual acquisition path must yield too.
+            // Hold its second acquisition until the repair has reported, so
+            // barging here cannot accidentally pass after a later release.
+            let second = admit();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(second);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let repair = ArchiveMutationGuard::begin_message_repair(root.path(), || false);
+        let admitted = repair.is_ok();
+        drop(repair);
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(
+            admitted,
+            "the repair must run before the second direct publication"
+        );
+        assert_eq!(crate::archive_mutations_active(), 0);
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        assert_eq!(crate::DIRECT_FENCE_WAITERS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn direct_repair_give_way_is_bounded_cancellable_and_respects_request_deadline() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let waiter = crate::RepairFenceWaiter::register();
+        // A repair thread that makes no progress cannot reserve the fence:
+        // an ordinary request still obtains the real native guard promptly.
+        let started = Instant::now();
+        drop(
+            crate::admit_direct_publication(
+                root.path(),
+                started + Duration::from_secs(1),
+                &mut || false,
+            )
+            .unwrap(),
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed >= crate::DIRECT_WAITER_GIVE_WAY);
+        assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            crate::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = tracking();
+        let stamp = token(root.path());
+        let started = Instant::now();
+        let refused = crate::admit_direct_publication(
+            root.path(),
+            started + Duration::from_millis(1),
+            &mut || false,
+        );
+        assert!(matches!(refused, Err(StorageError::LockContention { .. })));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let mut checks = 0;
+        let cancelled = crate::admit_direct_publication(
+            root.path(),
+            Instant::now() + Duration::from_secs(1),
+            &mut || {
+                checks += 1;
+                checks > 1
+            },
+        );
+        assert!(matches!(cancelled, Err(StorageError::Io(ref error))
+            if error.kind() == std::io::ErrorKind::Interrupted));
+        assert_eq!(tracking(), before);
+        assert_eq!(token(root.path()), stamp);
+        assert_eq!(crate::DIRECT_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        drop(waiter);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn queued_direct_publishers_keep_the_repair_opening_until_the_fence_releases() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let waiter = crate::RepairFenceWaiter::register();
+        let owner = FenceLease::acquire();
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..3)
+                .map(|_| {
+                    let path = root.path();
+                    scope.spawn(move || {
+                        let guard = crate::admit_direct_publication(
+                            path,
+                            Instant::now() + Duration::from_secs(5),
+                            &mut || false,
+                        )
+                        .unwrap();
+                        let admitted = Instant::now();
+                        drop(guard);
+                        admitted
+                    })
+                })
+                .collect();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::DIRECT_FENCE_WAITERS.load(Ordering::Acquire) != writers.len() {
+                assert!(
+                    Instant::now() < deadline,
+                    "direct requests did not begin waiting"
+                );
+                std::thread::yield_now();
+            }
+            // A long unrelated hold must not spend all queued requests'
+            // one-time repair openings before an actual release is possible.
+            std::thread::sleep(crate::DIRECT_WAITER_GIVE_WAY * 2);
+            let released = Instant::now();
+            drop(owner);
+            for writer in writers {
+                let waited = writer.join().unwrap().duration_since(released);
+                assert!(waited >= crate::DIRECT_WAITER_GIVE_WAY, "{waited:?}");
+                assert!(waited < Duration::from_secs(1), "{waited:?}");
+            }
+        });
+        drop(waiter);
+        assert_eq!(crate::DIRECT_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        assert_eq!(crate::archive_mutations_active(), 0);
     }
 
     #[test]

@@ -22,8 +22,8 @@
 //! version 3 instead of overlooking this bound; version 1 and 2 records remain
 //! readable without forgiving any outstanding retry debt.
 
-use super::BACKUP_MAX_AGE_SECS;
 use super::schedule::{BACKUP_RETRY_INITIAL, BACKUP_RETRY_MAX, BackupCompletion, BackupKind};
+use super::{BACKUP_MAX_AGE_SECS, BackupParentAdmission};
 use sha2::{Digest as _, Sha256};
 use std::ffi::OsString;
 use std::fs::File;
@@ -216,16 +216,69 @@ pub(super) struct AutomaticBackupLease {
 }
 
 impl AutomaticBackupLease {
-    pub(super) fn try_begin(sqlite_path: &Path, requested: BackupKind) -> io::Result<Option<Self>> {
-        Self::try_begin_at(sqlite_path, requested, unix_seconds()?)
+    pub(super) fn try_begin(
+        sqlite_path: &Path,
+        requested: BackupKind,
+        admission: &BackupParentAdmission,
+    ) -> io::Result<Option<Self>> {
+        Self::try_begin_admitted_at(
+            sqlite_path,
+            requested,
+            admission,
+            unix_seconds()?,
+            || {},
+            || {},
+        )
     }
 
+    fn try_begin_admitted_at(
+        sqlite_path: &Path,
+        requested: BackupKind,
+        admission: &BackupParentAdmission,
+        now: u64,
+        after_token_check: impl FnOnce(),
+        after_parent_open: impl FnOnce(),
+    ) -> io::Result<Option<Self>> {
+        admission.revalidate_for(sqlite_path)?;
+        after_token_check();
+        // Preserve the journal's no-follow walk and regular-primary check.
+        // Another real directory can occupy the pathname after token validation,
+        // so bind the captured inode before creating or updating any journal.
+        let observed_parent = open_parent(sqlite_path)?;
+        after_parent_open();
+        let parent = admission.retained_parent().try_clone()?;
+        let expected = parent.metadata()?;
+        let observed = observed_parent.metadata()?;
+        if !expected.is_dir()
+            || !observed.is_dir()
+            || expected.dev() != observed.dev()
+            || expected.ino() != observed.ino()
+        {
+            return Err(invalid(
+                "automatic backup journal parent differs from exporter admission",
+            ));
+        }
+        // All control I/O and both durability syncs use this retained admission
+        // directory, even if the configured pathname is replaced again.
+        Self::try_begin_in_parent(sqlite_path, requested, now, parent)
+    }
+
+    #[cfg(test)]
     pub(super) fn try_begin_at(
         sqlite_path: &Path,
         requested: BackupKind,
         now: u64,
     ) -> io::Result<Option<Self>> {
         let parent = open_parent(sqlite_path)?;
+        Self::try_begin_in_parent(sqlite_path, requested, now, parent)
+    }
+
+    fn try_begin_in_parent(
+        sqlite_path: &Path,
+        requested: BackupKind,
+        now: u64,
+        parent: File,
+    ) -> io::Result<Option<Self>> {
         let mut leaf = sqlite_path
             .file_name()
             .ok_or_else(|| invalid("mailbox has no filename"))?
@@ -507,6 +560,197 @@ mod tests {
         AutomaticBackupLease::try_begin_at(database, kind, now)
             .expect("admission IO")
             .expect("eligible admission")
+    }
+
+    struct JournalParents {
+        _root: tempfile::TempDir,
+        active: PathBuf,
+        original: PathBuf,
+        replacement: PathBuf,
+        primary: PathBuf,
+    }
+
+    impl JournalParents {
+        fn new(existing_foreign_journal: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let physical_root = root.path().canonicalize().unwrap();
+            let active = physical_root.join("active");
+            let replacement = physical_root.join("replacement");
+            fs::create_dir(&active).unwrap();
+            fs::create_dir(&replacement).unwrap();
+            let primary = active.join("storage.sqlite3");
+            let foreign = replacement.join("storage.sqlite3");
+            fs::write(&primary, b"admitted mailbox").unwrap();
+            fs::write(&foreign, b"foreign mailbox").unwrap();
+            if existing_foreign_journal {
+                begin(&foreign, BackupKind::Verified, NOW)
+                    .finish_at(BackupCompletion::Published, NOW)
+                    .unwrap();
+            }
+            Self {
+                _root: root,
+                active,
+                original: physical_root.join("original"),
+                replacement,
+                primary,
+            }
+        }
+
+        fn replace(&self) {
+            fs::rename(&self.active, &self.original).unwrap();
+            fs::rename(&self.replacement, &self.active).unwrap();
+        }
+
+        fn restore(&self) {
+            fs::rename(&self.active, &self.replacement).unwrap();
+            fs::rename(&self.original, &self.active).unwrap();
+        }
+    }
+
+    fn journal_namespace_bytes(root: &Path) -> std::collections::BTreeMap<OsString, Vec<u8>> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn admitted_journal_refuses_replaced_and_restored_captured_parents() {
+        for existing_foreign_journal in [false, true] {
+            for restore_before_compare in [false, true] {
+                let parents = JournalParents::new(existing_foreign_journal);
+                let foreign = journal_namespace_bytes(&parents.replacement);
+                super::super::backup_budget::with_admission(&parents.primary, |admission| {
+                    let admission = admission.unwrap();
+                    let error = AutomaticBackupLease::try_begin_admitted_at(
+                        &parents.primary,
+                        BackupKind::Verified,
+                        admission,
+                        NOW + 1,
+                        || parents.replace(),
+                        || {
+                            if restore_before_compare {
+                                parents.restore();
+                                // The spelling is valid again, but the journal
+                                // walk captured the foreign directory in between.
+                                admission.revalidate_for(&parents.primary).unwrap();
+                            }
+                        },
+                    )
+                    .err()
+                    .expect("journal acquisition must compare the captured parent inode");
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("parent differs from exporter admission")
+                    );
+                    if !restore_before_compare {
+                        assert_eq!(journal_namespace_bytes(&parents.active), foreign);
+                        parents.restore();
+                    }
+                    assert_eq!(journal_namespace_bytes(&parents.replacement), foreign);
+                    assert_eq!(fs::read_dir(&parents.active).unwrap().count(), 1);
+                    assert!(!journal_path(&parents.primary).exists());
+
+                    // A restored, genuinely admitted directory can still reserve
+                    // one durable repair; reopening it must retain that debt.
+                    let mut lease = AutomaticBackupLease::try_begin(
+                        &parents.primary,
+                        BackupKind::Verified,
+                        admission,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    lease.reserve_retention_repair().unwrap();
+                    lease.finish(BackupCompletion::Published).unwrap();
+                    let mut restarted = AutomaticBackupLease::try_begin(
+                        &parents.primary,
+                        BackupKind::Verified,
+                        admission,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert!(restarted.retention_repair_spent());
+                    assert!(restarted.reserve_retention_repair().is_err());
+                    assert_eq!(journal_namespace_bytes(&parents.replacement), foreign);
+                    assert_eq!(fs::read(&parents.primary).unwrap(), b"admitted mailbox");
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_journal_completion_keeps_repair_state_in_original_parent() {
+        let parents = JournalParents::new(true);
+        let foreign = journal_namespace_bytes(&parents.replacement);
+        super::super::backup_budget::with_admission(&parents.primary, |admission| {
+            let admission = admission.unwrap();
+            let mut lease =
+                AutomaticBackupLease::try_begin(&parents.primary, BackupKind::Verified, admission)
+                    .unwrap()
+                    .unwrap();
+            lease.reserve_retention_repair().unwrap();
+            parents.replace();
+            assert!(admission.revalidate_for(&parents.primary).is_err());
+            lease.finish(BackupCompletion::Published).unwrap();
+            assert_eq!(journal_namespace_bytes(&parents.active), foreign);
+            parents.restore();
+            let mut restarted =
+                AutomaticBackupLease::try_begin(&parents.primary, BackupKind::Verified, admission)
+                    .unwrap()
+                    .unwrap();
+            assert!(restarted.retention_repair_spent());
+            assert!(restarted.reserve_retention_repair().is_err());
+            assert_eq!(journal_namespace_bytes(&parents.replacement), foreign);
+            assert_eq!(fs::read(&parents.primary).unwrap(), b"admitted mailbox");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn admitted_journal_preserves_no_follow_ancestor_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let physical_root = root.path().canonicalize().unwrap();
+        let real = physical_root.join("real");
+        let parent = real.join("mailbox");
+        fs::create_dir_all(&parent).unwrap();
+        let primary = parent.join("storage.sqlite3");
+        fs::write(&primary, b"mailbox behind a real directory").unwrap();
+        let alias = physical_root.join("alias");
+        symlink(&real, &alias).unwrap();
+        let aliased_primary = alias.join("mailbox/storage.sqlite3");
+        super::super::backup_budget::with_admission(&aliased_primary, |admission| {
+            let admission = admission.unwrap();
+            admission.revalidate_for(&aliased_primary).unwrap();
+            assert!(
+                AutomaticBackupLease::try_begin(&aliased_primary, BackupKind::Verified, admission,)
+                    .is_err()
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        assert!(!journal_path(&primary).exists());
+        super::super::backup_budget::with_admission(&primary, |admission| {
+            AutomaticBackupLease::try_begin(&primary, BackupKind::Verified, admission.unwrap())
+                .unwrap()
+                .unwrap()
+                .finish(BackupCompletion::Published)
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read(&primary).unwrap(),
+            b"mailbox behind a real directory"
+        );
     }
 
     fn legacy_record(state: State) -> [u8; SLOT_BYTES] {

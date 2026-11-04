@@ -41601,9 +41601,9 @@ fn normalize_cli_macro_agent_name_value(name: &str) -> CliResult<String> {
     let message = mcp_agent_mail_core::models::detect_agent_name_mistake(name).map_or_else(
         || {
             format!(
-                "Invalid agent name format: '{name}'. Agent names MUST be randomly generated \
-                     adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive \
-                     names. Omit --agent-name to auto-generate a valid name."
+                "Invalid agent name format: '{name}'. Use an adjective+noun name \
+                     (e.g., 'GreenLake') or a safe task identifier (e.g., 'app-x-refactor', \
+                     'worker_42'). Omit --agent-name to auto-generate a valid name."
             )
         },
         |(_, message)| message,

@@ -824,6 +824,27 @@ Keys recorded before the normalized path-set fingerprint update can return
 `IDEMPOTENCY_KEY_CONFLICT` after an upgrade, even within their retention window.
 The original grants remain unchanged; inspect them before making a new attempt.
 
+### Agent identities
+
+Omit `name` from `register_agent` (or `name_hint` from `create_agent_identity`)
+to get an automatically generated adjective+noun name such as `GreenLake`.
+For a stable task identity, supply a name such as `app-x-refactor`, `worker_42`,
+or `api.review`.
+
+Explicit task identifiers start with an ASCII letter or digit, contain at
+least one `.`, `_`, or `-`, and use only ASCII letters, digits, and those
+separators, up to 128 characters. They preserve their spelling. Vocabulary
+names still normalize to PascalCase. Both forms are unique within a project
+without regard to case: registering `APP-X-REFACTOR` after `app-x-refactor`
+updates the same identity and returns its original canonical spelling.
+`create_agent_identity` instead rejects a name that is already in use.
+
+Path separators, address delimiters, consecutive or trailing dots, template
+placeholders, Windows device names, and reserved program/model/operator
+identities are rejected. Broadcast tokens remain unsupported. A dot inside
+an identity is part of its name; cross-project recipients still use
+`Name@project` or `project:project#Name` and require the usual contact approval.
+
 ### 25 MCP Resources
 
 Read-only resources span environment/config inspection, project and agent discovery, inbox and thread views, reservation views, and tooling diagnostics. They are there so agents can fetch state cheaply without mutating anything.

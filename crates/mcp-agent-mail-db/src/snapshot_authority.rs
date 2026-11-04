@@ -34,6 +34,7 @@ pub(super) struct SnapshotAuthority {
 #[must_use]
 pub struct SnapshotRetentionGuard {
     authority: SnapshotAuthority,
+    expected_parent: Option<File>,
     primary: PathBuf,
     metadata_path: PathBuf,
     metadata: RetentionMetadata,
@@ -74,27 +75,77 @@ impl SnapshotRetentionGuard {
     /// Refuses recovery, live readers/publishers, pending recovery intents,
     /// unsafe lock paths, or changed authority.
     pub fn acquire(primary: &Path) -> io::Result<Self> {
+        Self::acquire_with_parent(primary, None)
+    }
+
+    /// Bind retention to the directory already held by an exporter admission.
+    /// The retained directory identity, rather than its reusable pathname,
+    /// determines which snapshot authority may authorize cleanup.
+    ///
+    /// # Errors
+    /// Refuses an already replaced parent before acquiring control files, a captured
+    /// snapshot authority in another directory, and every refusal of
+    /// [`Self::acquire`]. Concurrent namespace changes remain a refusal.
+    pub fn acquire_for_parent(primary: &Path, expected_parent: &File) -> io::Result<Self> {
+        Self::acquire_with_parent(primary, Some(expected_parent))
+    }
+
+    fn acquire_with_parent(primary: &Path, expected_parent: Option<&File>) -> io::Result<Self> {
         let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
+        let expected_parent = expected_parent.map(File::try_clone).transpose()?;
         // Recovery owns this election before selecting a snapshot. Use the
-        // same ordering, and never acquire recovery's outcome/backoff state.
-        let recovery = crate::recovery_breaker::try_acquire_file_lock(&primary)?;
-        let authority = SnapshotAuthority::acquire(&primary, true)?;
+        // same ordering and one retained parent for both controls, including
+        // standalone retention without a borrowed exporter admission.
+        let (recovery, authority) =
+            acquire_retention_controls_with(&primary, expected_parent.as_ref(), || {}, || {})?;
         ensure_no_recovery_references(&primary)?;
         let metadata_path = super::snapshot_meta_path(&primary);
         let metadata = retention_metadata(&metadata_path);
+        #[cfg(target_os = "linux")]
+        let mut reader_refusal = None;
         let selected = if matches!(metadata, RetentionMetadata::Bytes(_)) {
             // Already exclusive: reacquiring the public selector's shared lock
             // would reject our own admission and discard a valid pin.
-            super::select_verified_snapshot_inner(&primary)
+            super::select_verified_snapshot_inner(&primary, |candidate, inventoried| {
+                #[cfg(target_os = "linux")]
+                {
+                    match crate::recovery_retention::preflight_current_thread_file_locks(
+                        candidate,
+                        inventoried,
+                    ) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            let refusal = io::Error::new(error.kind(), error.to_string());
+                            reader_refusal.get_or_insert(error);
+                            Err(refusal)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (candidate, inventoried);
+                    Ok(())
+                }
+            })
         } else {
             None
         };
+        // A verified fallback may bypass a busy earlier candidate. Without
+        // that fallback, preserve the admission refusal: treating a blocked
+        // pin as missing verification could authorize a repair export.
+        #[cfg(target_os = "linux")]
+        if selected.is_none()
+            && let Some(error) = reader_refusal
+        {
+            return Err(error);
+        }
         let selected_identity = selected
             .as_ref()
             .map(|selected| selected.source.metadata())
             .transpose()?;
         let guard = Self {
             authority,
+            expected_parent,
             primary,
             metadata_path,
             metadata,
@@ -285,6 +336,9 @@ impl SnapshotRetentionGuard {
     /// Participating writers are excluded; changed external evidence refuses
     /// further work rather than allowing a stale pin to authorize eviction.
     pub fn revalidate(&self) -> io::Result<()> {
+        if let Some(expected) = &self.expected_parent {
+            self.authority.ensure_parent(expected)?;
+        }
         self.recovery.revalidate()?;
         self.authority.revalidate()?;
         ensure_no_recovery_references(&self.primary)?;
@@ -404,6 +458,48 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+fn ensure_same_directory(captured: &File, expected: &File) -> io::Result<()> {
+    let captured = captured.metadata()?;
+    let expected = expected.metadata()?;
+    if !captured.is_dir()
+        || !expected.is_dir()
+        || captured.dev() != expected.dev()
+        || captured.ino() != expected.ino()
+    {
+        return Err(invalid(
+            "snapshot retention parent differs from exporter admission",
+        ));
+    }
+    Ok(())
+}
+
+fn acquire_retention_controls_with(
+    primary: &Path,
+    expected_parent: Option<&File>,
+    after_parent_capture: impl FnOnce(),
+    after_recovery: impl FnOnce(),
+) -> io::Result<(
+    crate::recovery_breaker::RecoveryBreakerFileLock,
+    SnapshotAuthority,
+)> {
+    let parent_path = primary
+        .parent()
+        .ok_or_else(|| invalid("snapshot primary has no parent"))?;
+    let parent = open_directory(parent_path)?;
+    if let Some(expected) = expected_parent {
+        ensure_same_directory(&parent, expected)?;
+    }
+    after_parent_capture();
+    // No outcome/backoff state is read or changed by this election. Both
+    // constructors validate the pathname, then operate only on this inode.
+    let recovery = crate::recovery_breaker::try_acquire_file_lock_in_parent(primary, &parent)?;
+    after_recovery();
+    let authority = SnapshotAuthority::acquire_in_parent(primary, true, &parent)?;
+    recovery.revalidate()?;
+    authority.revalidate()?;
+    Ok((recovery, authority))
+}
+
 fn open_directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(invalid("snapshot authority requires an absolute parent"));
@@ -427,17 +523,49 @@ fn open_directory(path: &Path) -> io::Result<File> {
 }
 
 impl SnapshotAuthority {
+    fn ensure_parent(&self, expected: &File) -> io::Result<()> {
+        ensure_same_directory(&self.parent, expected)
+    }
+
     pub(super) fn acquire(primary: &Path, exclusive: bool) -> io::Result<Self> {
+        let parent_path = primary
+            .parent()
+            .ok_or_else(|| invalid("snapshot primary has no parent"))?;
+        let parent = open_directory(parent_path)?;
+        Self::acquire_in_parent(primary, exclusive, &parent)
+    }
+
+    fn acquire_in_parent(
+        primary: &Path,
+        exclusive: bool,
+        expected_parent: &File,
+    ) -> io::Result<Self> {
+        Self::acquire_in_parent_with(primary, exclusive, expected_parent, || {}, || {})
+    }
+
+    fn acquire_in_parent_with(
+        primary: &Path,
+        exclusive: bool,
+        expected_parent: &File,
+        after_parent_open: impl FnOnce(),
+        after_parent_bound: impl FnOnce(),
+    ) -> io::Result<Self> {
         let parent_path = primary
             .parent()
             .ok_or_else(|| invalid("snapshot primary has no parent"))?
             .to_path_buf();
+        let observed_parent = open_directory(&parent_path)?;
+        after_parent_open();
+        ensure_same_directory(&observed_parent, expected_parent)?;
+        // Capture the caller's directory authority before any control-file
+        // operation. A later pathname replacement cannot redirect creation.
+        let parent = expected_parent.try_clone()?;
+        after_parent_bound();
         let mut name = primary
             .file_name()
             .ok_or_else(|| invalid("snapshot primary has no leaf"))?
             .to_os_string();
         name.push(".bak.authority.lock");
-        let parent = open_directory(&parent_path)?;
         // Readers of an existing snapshot need no write permission. A legacy
         // snapshot first acquires its persistent lock via create-only admission.
         let access = if exclusive {
@@ -531,6 +659,240 @@ impl SnapshotAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct ControlParents {
+        _root: tempfile::TempDir,
+        active: PathBuf,
+        original: PathBuf,
+        replacement: PathBuf,
+        primary: PathBuf,
+        retained: File,
+    }
+
+    impl ControlParents {
+        fn new(existing_controls: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let physical_root = root.path().canonicalize().unwrap();
+            let active = physical_root.join("active");
+            let replacement = physical_root.join("replacement");
+            std::fs::create_dir(&active).unwrap();
+            std::fs::create_dir(&replacement).unwrap();
+            let primary = active.join("mail.sqlite3");
+            std::fs::write(&primary, b"admitted mailbox").unwrap();
+            std::fs::write(replacement.join("mail.sqlite3"), b"foreign mailbox").unwrap();
+            if existing_controls {
+                let breaker = replacement.join("mail.sqlite3.am-recovery-breaker.lock");
+                std::fs::write(&breaker, b"foreign election evidence").unwrap();
+                std::fs::set_permissions(&breaker, std::fs::Permissions::from_mode(0o666)).unwrap();
+                let snapshot = replacement.join("mail.sqlite3.bak.authority.lock");
+                std::fs::write(&snapshot, b"").unwrap();
+                std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            let retained = open_directory(&active).unwrap();
+            Self {
+                _root: root,
+                active,
+                original: physical_root.join("original"),
+                replacement,
+                primary,
+                retained,
+            }
+        }
+
+        fn replace(&self) {
+            std::fs::rename(&self.active, &self.original).unwrap();
+            std::fs::rename(&self.replacement, &self.active).unwrap();
+        }
+
+        fn restore(&self) {
+            std::fs::rename(&self.active, &self.replacement).unwrap();
+            std::fs::rename(&self.original, &self.active).unwrap();
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ControlEntryWitness {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        links: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+        bytes: Vec<u8>,
+    }
+
+    fn control_namespace_witness(
+        parent: &Path,
+    ) -> std::collections::BTreeMap<OsString, ControlEntryWitness> {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                assert!(metadata.is_file());
+                (
+                    entry.file_name(),
+                    ControlEntryWitness {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        mode: metadata.mode(),
+                        links: metadata.nlink(),
+                        modified: (metadata.mtime(), metadata.mtime_nsec()),
+                        changed: (metadata.ctime(), metadata.ctime_nsec()),
+                        bytes: std::fs::read(entry.path()).unwrap(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_control_refuses_a_captured_foreign_parent_even_after_restoration() {
+        for existing_controls in [false, true] {
+            for restore_before_compare in [false, true] {
+                let parents = ControlParents::new(existing_controls);
+                let foreign = control_namespace_witness(&parents.replacement);
+                parents.replace();
+                let error = SnapshotAuthority::acquire_in_parent_with(
+                    &parents.primary,
+                    true,
+                    &parents.retained,
+                    || {
+                        if restore_before_compare {
+                            parents.restore();
+                            ensure_same_directory(
+                                &open_directory(&parents.active).unwrap(),
+                                &parents.retained,
+                            )
+                            .unwrap();
+                        }
+                    },
+                    || {},
+                )
+                .err()
+                .expect("a restored spelling must not transfer captured directory authority");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                if !restore_before_compare {
+                    assert_eq!(control_namespace_witness(&parents.active), foreign);
+                    parents.restore();
+                }
+                assert_eq!(control_namespace_witness(&parents.replacement), foreign);
+                assert_eq!(std::fs::read_dir(&parents.active).unwrap().count(), 1);
+                let authority =
+                    SnapshotAuthority::acquire_in_parent(&parents.primary, true, &parents.retained)
+                        .unwrap();
+                authority.revalidate().unwrap();
+                assert_eq!(
+                    std::fs::read(&parents.primary).unwrap(),
+                    b"admitted mailbox"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_control_creation_stays_in_the_bound_parent_after_a_late_swap() {
+        for existing_controls in [false, true] {
+            let parents = ControlParents::new(existing_controls);
+            let foreign = control_namespace_witness(&parents.replacement);
+            let error = SnapshotAuthority::acquire_in_parent_with(
+                &parents.primary,
+                true,
+                &parents.retained,
+                || {},
+                || parents.replace(),
+            )
+            .err()
+            .expect("a displaced namespace must refuse admission");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(control_namespace_witness(&parents.active), foreign);
+            let original_control = parents.original.join("mail.sqlite3.bak.authority.lock");
+            let metadata = std::fs::symlink_metadata(&original_control).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.len(), 0);
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            parents.restore();
+            let authority =
+                SnapshotAuthority::acquire_in_parent(&parents.primary, true, &parents.retained)
+                    .unwrap();
+            assert_eq!(authority.file.metadata().unwrap().ino(), metadata.ino());
+            authority.revalidate().unwrap();
+            assert_eq!(control_namespace_witness(&parents.replacement), foreign);
+        }
+    }
+
+    #[test]
+    fn retention_control_pair_refuses_replacement_between_each_acquisition() {
+        for existing_controls in [false, true] {
+            for with_expected_parent in [false, true] {
+                for replace_after_recovery in [false, true] {
+                    let parents = ControlParents::new(existing_controls);
+                    let foreign = control_namespace_witness(&parents.replacement);
+                    let expected = with_expected_parent.then_some(&parents.retained);
+                    let error = acquire_retention_controls_with(
+                        &parents.primary,
+                        expected,
+                        || {
+                            if !replace_after_recovery {
+                                parents.replace();
+                            }
+                        },
+                        || {
+                            if replace_after_recovery {
+                                parents.replace();
+                            }
+                        },
+                    )
+                    .err()
+                    .expect("both election controls must belong to one captured parent");
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                    assert_eq!(control_namespace_witness(&parents.active), foreign);
+                    assert_eq!(
+                        std::fs::read_dir(&parents.original).unwrap().count(),
+                        if replace_after_recovery { 2 } else { 1 }
+                    );
+                    assert!(
+                        !parents
+                            .original
+                            .join("mail.sqlite3.bak.authority.lock")
+                            .exists()
+                    );
+                    assert!(
+                        !parents
+                            .original
+                            .join("mail.sqlite3.am-recovery-breaker.json")
+                            .exists()
+                    );
+                    parents.restore();
+                    let (recovery, snapshot) =
+                        acquire_retention_controls_with(&parents.primary, expected, || {}, || {})
+                            .unwrap();
+                    recovery.revalidate().unwrap();
+                    snapshot.revalidate().unwrap();
+                    let contended = crate::recovery_breaker::try_acquire_file_lock_in_parent(
+                        &parents.primary,
+                        &parents.retained,
+                    )
+                    .err()
+                    .unwrap();
+                    assert_eq!(contended.kind(), io::ErrorKind::WouldBlock);
+                    assert!(SnapshotAuthority::acquire(&parents.primary, false).is_err());
+                    drop(snapshot);
+                    drop(recovery);
+                    acquire_retention_controls_with(&parents.primary, expected, || {}, || {})
+                        .unwrap();
+                    assert_eq!(control_namespace_witness(&parents.replacement), foreign);
+                    assert_eq!(
+                        std::fs::read(&parents.primary).unwrap(),
+                        b"admitted mailbox"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn shared_readers_coexist_and_exclude_publishers_without_unlinking() {
@@ -635,6 +997,80 @@ mod tests {
                 .exists()
         );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retention_parent_binding_refuses_replacement_before_control_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let directory = root.join("mailbox");
+        let original = root.join("original");
+        let replacement = root.join("replacement");
+        std::fs::create_dir(&directory).unwrap();
+        let primary = directory.join("mail.sqlite3");
+        let expected = open_directory(&directory).unwrap();
+        std::fs::rename(&directory, &original).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let sentinel = directory.join("unrelated-owner");
+        std::fs::write(&sentinel, b"replacement directory evidence").unwrap();
+
+        let error = SnapshotRetentionGuard::acquire_for_parent(&primary, &expected)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"replacement directory evidence"
+        );
+
+        std::fs::rename(&directory, &replacement).unwrap();
+        std::fs::rename(&original, &directory).unwrap();
+        let guard = SnapshotRetentionGuard::acquire_for_parent(&primary, &expected).unwrap();
+        // The guard retains the admission identity after the caller drops its
+        // handle, and still refuses a later replacement of the pathname.
+        drop(expected);
+        guard.revalidate().unwrap();
+        std::fs::rename(&directory, &original).unwrap();
+        std::fs::rename(&replacement, &directory).unwrap();
+        assert!(guard.revalidate().is_err());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"replacement directory evidence"
+        );
+    }
+
+    #[test]
+    fn retention_parent_binding_compares_captured_descriptors_after_path_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let directory = root.join("mailbox");
+        let original = root.join("original");
+        let replacement = root.join("replacement");
+        std::fs::create_dir(&directory).unwrap();
+        let expected = open_directory(&directory).unwrap();
+        let primary = directory.join("mail.sqlite3");
+        std::fs::rename(&directory, &original).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let captured = SnapshotAuthority::acquire(&primary, true).unwrap();
+        captured.revalidate().unwrap();
+        assert!(captured.ensure_parent(&expected).is_err());
+
+        std::fs::rename(&directory, &replacement).unwrap();
+        std::fs::rename(&original, &directory).unwrap();
+        ensure_same_directory(&open_directory(&directory).unwrap(), &expected).unwrap();
+        assert!(captured.ensure_parent(&expected).is_err());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        assert!(
+            replacement
+                .join("mail.sqlite3.bak.authority.lock")
+                .is_file()
+        );
+
+        let ordinary = File::create(directory.join("ordinary-file")).unwrap();
+        assert!(ensure_same_directory(&ordinary, &ordinary).is_err());
     }
 
     #[test]

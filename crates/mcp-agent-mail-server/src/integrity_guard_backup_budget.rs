@@ -15,7 +15,7 @@
 use std::fs::Metadata;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mcp_agent_mail_db::recovery_retention::staging::{
     STAGING_REMEDIATION, assess_automatic_backup_staging,
@@ -25,27 +25,28 @@ use mcp_agent_mail_db::recovery_retention::staging::{
 /// Keeping this value alive serializes automatic exporters sharing a parent.
 /// Dropping it releases the OS lease, including unwinding and process exit;
 /// there is no stale PID/timestamp record to clear after a crash.
-struct Admission {
-    _lease: File,
+pub struct Admission {
+    lease: File,
+    parent: PathBuf,
 }
 
 /// Run a producer only after successful admission. The lease spans the entire
 /// producer, including its validation, publication, and failed-stage retention.
 /// Refusal is an incomplete backup attempt, never a clean integrity verdict.
-pub(super) fn with_admission<T>(
+pub fn with_admission<T>(
     primary: &Path,
-    produce: impl FnOnce() -> Result<T, String>,
+    produce: impl FnOnce(Option<&Admission>) -> Result<T, String>,
 ) -> Result<T, String> {
     if primary.as_os_str() == ":memory:" {
-        return produce();
+        return produce(None);
     }
-    let _admission = Admission::acquire(primary).map_err(|error| {
+    let admission = Admission::acquire(primary).map_err(|error| {
         format!(
             "automatic backup staging admission refused for {}: {error}; no export was started and existing evidence is unchanged",
             primary.display()
         )
     })?;
-    produce()
+    produce(Some(&admission))
 }
 
 impl Admission {
@@ -72,7 +73,31 @@ impl Admission {
             )
         })?;
         validate_parent_lease(parent, &lease)?;
-        Ok(Self { _lease: lease })
+        Ok(Self {
+            lease,
+            parent: parent.to_path_buf(),
+        })
+    }
+
+    /// Reuse admission only for the directory whose lease is still retained.
+    /// A pathname replacement cannot transfer that lease to another mailbox.
+    pub(crate) fn revalidate_for(&self, primary: &Path) -> io::Result<()> {
+        let primary = if primary.is_absolute() {
+            primary.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(primary)
+        };
+        if primary.parent() != Some(self.parent.as_path()) {
+            return Err(invalid("backup admission belongs to a different parent"));
+        }
+        validate_parent_lease(&self.parent, &self.lease)
+    }
+
+    /// Bind snapshot admission to the held directory inode, not a claim that
+    /// some pathname was locked earlier in the attempt.
+    #[cfg(unix)]
+    pub(crate) const fn retained_parent(&self) -> &File {
+        &self.lease
     }
 }
 
@@ -302,7 +327,7 @@ mod tests {
         let primary = primary(&root);
         let calls = Cell::new(0);
         for _ in 0..20 {
-            let _ = with_admission(&primary, || -> Result<(), String> {
+            let _ = with_admission(&primary, |_| -> Result<(), String> {
                 let ordinal = calls.get();
                 stage(&root, ordinal, b"preserved failed export");
                 calls.set(ordinal + 1);
@@ -341,11 +366,11 @@ mod tests {
                 bytes: 20,
             }
         );
-        assert_eq!(with_admission(&primary, || Ok(17)).unwrap(), 17);
+        assert_eq!(with_admission(&primary, |_| Ok(17)).unwrap(), 17);
 
         let interrupted = root.join(".snapshot-inspect-interrupted.sqlite3");
         fs::write(&interrupted, b"partial inspection").unwrap();
-        let error = with_admission(&primary, || -> Result<(), String> {
+        let error = with_admission(&primary, |_| -> Result<(), String> {
             panic!("mixed retained stages must refuse before the producer")
         })
         .unwrap_err();
@@ -372,7 +397,7 @@ mod tests {
             .unwrap()
             .set_len(STAGING_BYTES_FLOOR)
             .unwrap();
-        let error = with_admission(&primary, || -> Result<(), String> {
+        let error = with_admission(&primary, |_| -> Result<(), String> {
             panic!("legacy bytes must spend the automatic staging budget")
         })
         .unwrap_err();
@@ -388,7 +413,7 @@ mod tests {
         let primary = primary(&root);
         let calls = Cell::new(0);
         for _ in 0..20 {
-            let _ = with_admission(&primary, || -> Result<(), String> {
+            let _ = with_admission(&primary, |_| -> Result<(), String> {
                 let ordinal = calls.get();
                 fs::write(
                     root.join(format!(".snapshot-inspect-{ordinal:06}.sqlite3")),
@@ -415,7 +440,7 @@ mod tests {
             let primary = primary(&root);
             let evidence = root.join(name);
             fs::write(&evidence, b"unclassified evidence").unwrap();
-            let error = with_admission(&primary, || -> Result<(), String> {
+            let error = with_admission(&primary, |_| -> Result<(), String> {
                 panic!("unclassified inspection evidence must refuse admission")
             })
             .unwrap_err();
@@ -427,7 +452,7 @@ mod tests {
         let unexpected = root.join(".snapshot-inspect-directory.sqlite3");
         fs::create_dir(&unexpected).unwrap();
         fs::write(unexpected.join("evidence"), b"unknown directory").unwrap();
-        assert!(with_admission(&primary, || Ok(())).is_err());
+        assert!(with_admission(&primary, |_| Ok(())).is_err());
         assert_eq!(
             fs::read(unexpected.join("evidence")).unwrap(),
             b"unknown directory"
@@ -444,7 +469,7 @@ mod tests {
         fs::write(&evidence, b"external database").unwrap();
         let alias = root.join(".snapshot-inspect-link.sqlite3");
         std::os::unix::fs::symlink(&evidence, &alias).unwrap();
-        let error = with_admission(&primary, || -> Result<(), String> {
+        let error = with_admission(&primary, |_| -> Result<(), String> {
             panic!("legacy aliases must refuse admission")
         })
         .unwrap_err();
@@ -485,6 +510,58 @@ mod tests {
         drop((first, second));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn borrowed_admission_keeps_its_parent_identity_after_path_replacement() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = fixture();
+        let active = root.join("active");
+        let replacement = root.join("replacement");
+        let displaced = root.join("displaced");
+        fs::create_dir(&active).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let database = primary(&active);
+        let other = primary(&replacement);
+        fs::write(&other, b"replacement mailbox remains untouched").unwrap();
+        with_admission(&database, |admission| {
+            let admission = admission.expect("a filesystem producer borrows its admission");
+            admission.revalidate_for(&database).unwrap();
+            assert!(admission.revalidate_for(&other).is_err());
+            let retained = admission.retained_parent().metadata().unwrap();
+            fs::rename(&active, &displaced).unwrap();
+            fs::rename(&replacement, &active).unwrap();
+            let error = admission.revalidate_for(&database).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let moved = fs::metadata(&displaced).unwrap();
+            assert_eq!((retained.dev(), retained.ino()), (moved.dev(), moved.ino()));
+            // The old lock does not cover this replacement inode. Only a
+            // genuinely new admission can claim its separate exporter lease.
+            with_admission(&database, |replacement_admission| {
+                let replacement_admission = replacement_admission.unwrap();
+                replacement_admission.revalidate_for(&database).unwrap();
+                let current = replacement_admission.retained_parent().metadata().unwrap();
+                assert_ne!(
+                    (retained.dev(), retained.ino()),
+                    (current.dev(), current.ino())
+                );
+                Ok(())
+            })?;
+            fs::rename(&active, &replacement).unwrap();
+            fs::rename(&displaced, &active).unwrap();
+            admission.revalidate_for(&database).unwrap();
+            assert!(with_admission(&database, |_| Ok(())).is_err());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(database).unwrap(), b"mailbox fixture");
+        assert_eq!(
+            fs::read(other).unwrap(),
+            b"replacement mailbox remains untouched"
+        );
+        assert!(with_admission(&active.join("mail.sqlite3"), |_| Ok(())).is_ok());
+    }
+
     #[test]
     fn retained_byte_budget_refuses_before_the_producer_runs() {
         let root = fixture();
@@ -498,7 +575,7 @@ mod tests {
             .unwrap()
             .set_len(STAGING_BYTES_FLOOR)
             .unwrap();
-        let error = with_admission(&primary, || -> Result<(), String> {
+        let error = with_admission(&primary, |_| -> Result<(), String> {
             panic!("a full staging budget must not call the producer")
         })
         .unwrap_err();
@@ -517,11 +594,11 @@ mod tests {
     fn unavailable_primary_or_wal_never_means_an_empty_generation() {
         let root = fixture();
         let missing = root.join("missing.sqlite3");
-        assert!(with_admission(&missing, || Ok(())).is_err());
+        assert!(with_admission(&missing, |_| Ok(())).is_err());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         let primary = primary(&root);
         fs::create_dir(root.join("mail.sqlite3-wal")).unwrap();
-        assert!(with_admission(&primary, || Ok(())).is_err());
+        assert!(with_admission(&primary, |_| Ok(())).is_err());
         assert_eq!(fs::read(primary).unwrap(), b"mailbox fixture");
     }
 
@@ -550,7 +627,7 @@ mod tests {
         fs::write(outside.join("sentinel"), b"outside evidence").unwrap();
         let kept = stage(&root, 0, b"preserved");
         std::os::unix::fs::symlink(&outside, kept.join("linked")).unwrap();
-        let error = with_admission(&primary, || Ok(())).unwrap_err();
+        let error = with_admission(&primary, |_| Ok(())).unwrap_err();
         assert!(error.contains("symlink or special file"));
         assert_eq!(
             fs::read(outside.join("sentinel")).unwrap(),
@@ -563,18 +640,22 @@ mod tests {
         let root = fixture();
         let primary = primary(&root);
         let result = std::panic::catch_unwind(|| {
-            let _ = with_admission(&primary, || -> Result<(), String> {
+            let _ = with_admission(&primary, |_| -> Result<(), String> {
                 panic!("producer panic")
             });
         });
         assert!(result.is_err());
-        assert!(with_admission(&primary, || Ok(())).is_ok());
+        assert!(with_admission(&primary, |_| Ok(())).is_ok());
     }
 
     #[test]
     fn memory_backup_never_inspects_a_filesystem_parent() {
         assert_eq!(
-            with_admission(Path::new(":memory:"), || Ok(17)).unwrap(),
+            with_admission(Path::new(":memory:"), |admission| {
+                assert!(admission.is_none());
+                Ok(17)
+            })
+            .unwrap(),
             17
         );
     }
@@ -587,11 +668,11 @@ mod tests {
         for ordinal in 0..MAX_RETAINED_STAGES {
             retained.push(stage(&root, ordinal, b"evidence"));
         }
-        assert!(with_admission(&primary, || Ok(())).is_err());
+        assert!(with_admission(&primary, |_| Ok(())).is_err());
         // Model an explicit operator action, not automatic deletion/reclaim.
         let archived = root.join("operator-retained-evidence");
         fs::rename(&retained[0], &archived).unwrap();
-        assert!(with_admission(&primary, || Ok(())).is_ok());
+        assert!(with_admission(&primary, |_| Ok(())).is_ok());
         assert_eq!(
             fs::read(archived.join("snapshot.sqlite3")).unwrap(),
             b"evidence"
@@ -604,7 +685,7 @@ mod tests {
         let primary = primary(&root);
         let unexpected = root.join(".mcp-agent-mail-proactive-backup-unexpected");
         fs::write(&unexpected, b"unclassified evidence").unwrap();
-        assert!(with_admission(&primary, || Ok(())).is_err());
+        assert!(with_admission(&primary, |_| Ok(())).is_err());
         assert_eq!(fs::read(unexpected).unwrap(), b"unclassified evidence");
         // The shared staging module tests the real bounded directory walk,
         // including parent and nested entries, rather than a counter alone.

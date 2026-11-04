@@ -27,6 +27,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, info, warn};
 
+use crate::integrity_guard::BackupParentAdmission;
+
 #[cfg(unix)]
 use mcp_agent_mail_db::recovery_retention::{
     CompletedReclaimMove, ReclaimDirectory as RotationQuarantine,
@@ -1113,6 +1115,22 @@ fn revalidate_historical_directory(primary: &Path, file: &Path) -> std::io::Resu
 }
 
 #[cfg(unix)]
+enum RotationParent<'a> {
+    Exporter(&'a BackupParentAdmission),
+    Retained(fs::File),
+}
+
+#[cfg(unix)]
+impl RotationParent<'_> {
+    const fn directory(&self) -> &fs::File {
+        match self {
+            Self::Exporter(admission) => admission.retained_parent(),
+            Self::Retained(directory) => directory,
+        }
+    }
+}
+
+#[cfg(unix)]
 fn acquire_rotation_parent(parent: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::MetadataExt as _;
     let before = fs::symlink_metadata(parent)?;
@@ -1293,7 +1311,7 @@ pub fn rotate_storage_backups_within(
         database_path,
         keep_per_kind,
         stage_backup_noreplace,
-        false,
+        None,
         Instant::now().checked_add(budget),
     )
 }
@@ -1305,13 +1323,14 @@ pub(crate) fn rotate_storage_backups_with_exporter_lease(
     storage_root: &Path,
     database_path: &Path,
     keep_per_kind: usize,
+    admission: &BackupParentAdmission,
 ) -> std::io::Result<RotateReport> {
     rotate_storage_backups_impl(
         storage_root,
         database_path,
         keep_per_kind,
         stage_backup_noreplace,
-        true,
+        Some(admission),
         None,
     )
 }
@@ -1330,7 +1349,7 @@ where
         database_path,
         keep_per_kind,
         stage,
-        false,
+        None,
         None,
     )
 }
@@ -1340,7 +1359,7 @@ fn rotate_storage_backups_impl<F>(
     database_path: &Path,
     keep_per_kind: usize,
     mut stage: F,
-    caller_holds_parent_lease: bool,
+    exporter_admission: Option<&BackupParentAdmission>,
     deadline: Option<Instant>,
 ) -> std::io::Result<RotateReport>
 where
@@ -1382,14 +1401,30 @@ where
     // cannot make byte accounting or source witnesses stale between the scan
     // and admission. On refusal, still collect the observable retained bytes.
     #[cfg(not(unix))]
-    let _ = (caller_holds_parent_lease, deadline);
+    let _ = deadline;
+    #[cfg(not(unix))]
+    if let Some(admission) = exporter_admission {
+        admission.revalidate_for(&database_path)?;
+    }
     #[cfg(unix)]
-    let parent_admission = if caller_holds_parent_lease {
-        Ok(None)
-    } else {
-        acquire_rotation_parent(database_parent).map(Some)
-    };
+    let parent_admission = exporter_admission.map_or_else(
+        || acquire_rotation_parent(database_parent).map(RotationParent::Retained),
+        |admission| {
+            admission
+                .revalidate_for(&database_path)
+                .map(|()| RotationParent::Exporter(admission))
+        },
+    );
     let mut report = RotateReport::default();
+    #[cfg(unix)]
+    if exporter_admission.is_some()
+        && let Err(error) = &parent_admission
+    {
+        report.admission_refused = true;
+        report
+            .failures
+            .push(RotationFailure::from_error(database_parent, error));
+    }
     #[cfg(unix)]
     let mut empty_directory_budget = MAX_RECLAIM_DIRECTORIES_PER_PASS;
     #[cfg(unix)]
@@ -1404,9 +1439,13 @@ where
             &mut report,
             || {
                 if early_snapshot_guard.is_none() {
+                    let parent = parent_admission
+                        .as_ref()
+                        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
                     early_snapshot_guard = Some(
-                        mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(
+                        mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent(
                             snapshot_primary,
+                            parent.directory(),
                         )?,
                     );
                 }
@@ -1636,7 +1675,12 @@ where
     let (_retained_parent, snapshot_guard) = match parent_admission.and_then(|parent| {
         early_snapshot_guard
             .map_or_else(
-                || mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(snapshot_primary),
+                || {
+                    mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent(
+                        snapshot_primary,
+                        parent.directory(),
+                    )
+                },
                 Ok,
             )
             .map(|guard| (parent, guard))
@@ -2104,6 +2148,91 @@ mod tests {
             })
             .collect();
         (primary, images)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exporter_cleanup_cannot_adopt_a_replaced_database_parent() {
+        let tree = |root: &Path| {
+            walkdir::WalkDir::new(root)
+                .min_depth(1)
+                .into_iter()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let path = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                    let bytes = entry
+                        .file_type()
+                        .is_file()
+                        .then(|| fs::read(entry.path()).unwrap());
+                    (path, bytes)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        for has_empty_directory in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let active = root.join("active");
+            let replacement = root.join("replacement");
+            let displaced = root.join("displaced");
+            fs::create_dir(&active).unwrap();
+            // Build the replacement at its eventual configured spelling so
+            // its metadata is genuinely valid there. Foreign-path metadata
+            // would mask the old lease bug by refusing selection on its own.
+            let primary = mailbox_with_backlog(&active);
+            fs::write(active.join("parent-sentinel"), b"replacement parent").unwrap();
+            let empty = active.join("doctor/reclaimable/rotation-19991231T235959Z");
+            if has_empty_directory {
+                fs::create_dir_all(&empty).unwrap();
+            }
+            let replacement_before = tree(&active);
+            fs::rename(&active, &replacement).unwrap();
+            fs::create_dir(&active).unwrap();
+            assert_eq!(mailbox_with_backlog(&active), primary);
+            fs::write(active.join("parent-sentinel"), b"admitted parent").unwrap();
+            if has_empty_directory {
+                fs::create_dir_all(&empty).unwrap();
+            }
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "1")],
+                || {
+                    crate::integrity_guard::with_backup_parent_admission(&primary, |admission| {
+                        let admission = admission.unwrap();
+                        fs::rename(&active, &displaced).unwrap();
+                        fs::rename(&replacement, &active).unwrap();
+                        let refused = rotate_storage_backups_with_exporter_lease(
+                            &active, &primary, 3, admission,
+                        )
+                        .unwrap();
+                        assert!(refused.admission_refused, "{refused:?}");
+                        assert_eq!(refused.deleted, 0);
+                        assert_eq!(refused.empty_directories_deleted, 0);
+                        assert_eq!(refused.kept, 10);
+                        assert_eq!(tree(&active), replacement_before);
+
+                        fs::rename(&active, &replacement).unwrap();
+                        fs::rename(&displaced, &active).unwrap();
+                        let resumed = rotate_storage_backups_with_exporter_lease(
+                            &active, &primary, 3, admission,
+                        )
+                        .unwrap();
+                        assert!(!resumed.admission_refused, "{resumed:?}");
+                        assert_eq!(resumed.deleted, 7, "{resumed:?}");
+                        assert_eq!(
+                            resumed.empty_directories_deleted,
+                            usize::from(has_empty_directory)
+                        );
+                        assert_eq!(resumed.kept, 3);
+                        Ok(())
+                    })
+                    .unwrap();
+                },
+            );
+            assert_eq!(tree(&replacement), replacement_before);
+            assert_eq!(
+                fs::read(active.join("parent-sentinel")).unwrap(),
+                b"admitted parent"
+            );
+        }
     }
 
     #[cfg(unix)]
