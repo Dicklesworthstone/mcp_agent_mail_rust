@@ -206,6 +206,12 @@ pub(super) fn fetch_direct_with_policy(
 /// Direct inboxes that span more than one receipt page (`PAGE_SIZE`) may try
 /// the newest-first walk (br-kp1in.40).
 const NEWEST_FIRST_MIN_INBOX: i64 = 256;
+/// Bound speculation independently of the cached receipt count. The increasing
+/// page charge in `newest_first_window` permits at most eight 128-header pages
+/// with this budget before exact receipt fallback. This leaves room for
+/// moderately interleaved mail without letting an inflated hint justify
+/// walking the whole project's history.
+const NEWEST_FIRST_MAX_WORK: i64 = 4096;
 pub const INBOX_STATS_HINT_SQL: &str = "SELECT total_count FROM inbox_stats WHERE agent_id = ?";
 const INBOX_RECEIPT_SIZE_PROBE_SQL: &str =
     "SELECT message_id FROM message_recipients WHERE agent_id = ? LIMIT 256";
@@ -214,13 +220,15 @@ const INBOX_RECEIPT_SIZE_PROBE_SQL: &str =
 /// header per inbox row, so its cost grows with the whole inbox. Walking the
 /// project's newest headers costs the same per row read but can stop once
 /// the window is complete, which pays when the agent receives a good share
-/// of the project's recent mail. `inbox_stats` only chooses the plan and caps
-/// the walk at a quarter of the receipt count; both plans are exact, so a
-/// stale count costs time, never rows. Missing or understated counts must not
-/// make an unfiltered five-message read scan a large inbox (GH#374): a bounded
-/// receipt probe can establish eligibility without rebuilding the hint or
-/// counting history. Read/ACK-state filters keep the receipt scan: it skips
-/// their header lookups, while their rows can sit anywhere in history.
+/// of the project's recent mail. `inbox_stats` only chooses the plan and limits
+/// the walk to a quarter of its receipt-count hint, subject to an independent
+/// work ceiling. Both plans are exact; an overstated count can waste only
+/// bounded speculation before the receipt scan. Missing or understated
+/// counts must not make an unfiltered five-message read scan a large inbox
+/// (GH#374): a bounded receipt probe can establish eligibility without
+/// rebuilding the hint or counting history. Read/ACK-state filters keep the
+/// receipt scan: it skips their header lookups, while their rows can sit
+/// anywhere in history.
 fn newest_first_budget(
     conn: &impl SyncQuery,
     agent_id: i64,
@@ -244,7 +252,7 @@ fn newest_first_budget(
         if wanted.saturating_mul(4) > total {
             return Ok(None);
         }
-        return Ok(usize::try_from(total / 4).ok());
+        return Ok(usize::try_from((total / 4).min(NEWEST_FIRST_MAX_WORK)).ok());
     }
     // The probe proves only a lower bound of PAGE_SIZE receipts. Restrict its
     // use to small windows, keeping the existing quarter-inbox work budget.
@@ -1625,7 +1633,8 @@ mod tests {
             assert_eq!(len, limit);
             assert_eq!((pages, receipt_pages > 0), (1, true), "limit {limit}");
         }
-        // An overstated count lets the walk read the whole project history.
+        // An overstated count still allows this moderately interleaved window
+        // to finish within the independent speculation ceiling.
         conn.execute_raw("UPDATE inbox_stats SET total_count = 100000 WHERE agent_id = 2")
             .unwrap();
         let (len, (pages, receipt_pages, _)) = run(20, options());
@@ -1656,6 +1665,98 @@ mod tests {
         conn.execute_raw("DROP TABLE inbox_stats").unwrap();
         let (_, (pages, _, _)) = run(20, options());
         assert_eq!(pages, 0);
+    }
+
+    #[test]
+    fn inflated_stats_bound_speculation_without_truncating_the_inbox() {
+        let conn = walk_conn();
+        // Only five receipts belong to GreenStone; the other project mail
+        // must not become its scan budget merely because the hint is inflated.
+        seed_walk(
+            &conn,
+            (1, 4096),
+            4096,
+            |id| 1_000_000 + id * 1000,
+            mixed_importance,
+        );
+        conn.execute_raw(
+            "UPDATE message_recipients SET agent_id = 2 WHERE message_id IN (1,2,3,4); \
+             UPDATE inbox_stats SET total_count = 9223372036854775807 WHERE agent_id = 2; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+
+        let run = |case: &str, since, limit, filters, expected_ids: &[i64]| {
+            let recording = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let rows =
+                fetch_inbox_rows_from_conn_impl(&recording, 1, 2, since, limit, filters).unwrap();
+            same_rows(&rows, &newest_reference(&conn, since, limit, filters));
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                expected_ids,
+                "{case}",
+            );
+            let calls = recording.calls.borrow();
+            let (header_pages, receipt_pages, _) = query_counts(&calls);
+            assert!(
+                (1..=8).contains(&header_pages),
+                "{case}: inflated stats caused {header_pages} speculative header pages",
+            );
+            assert_eq!(
+                receipt_pages, 1,
+                "{case}: the exact fallback must read the five-receipt inbox",
+            );
+        };
+
+        // The speculative window contains only the newest receipt. The
+        // fallback must recover the older messages rather than return it.
+        run("unfiltered", None, 5, options(), &[4096, 4, 3, 2, 1]);
+        run("cutoff", Some(1_003_000), 5, options(), &[4096, 4]);
+        run(
+            "urgent",
+            None,
+            5,
+            InboxFetchOptions {
+                urgent_only: true,
+                ..options()
+            },
+            &[4, 3, 2],
+        );
+        run(
+            "topic",
+            None,
+            5,
+            InboxFetchOptions {
+                topic: Some("HANDOFFS"),
+                ..options()
+            },
+            &[4096, 4],
+        );
+
+        // A filled window is still provisional while its boundary timestamp
+        // continues across pages. Exhausting the budget must use the exact
+        // fallback to preserve the message-ID tie break.
+        conn.execute_raw(
+            "PRAGMA query_only = OFF; \
+             UPDATE messages SET created_ts = 1000000; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        run("timestamp boundary", None, 1, options(), &[4096]);
+        assert_eq!(
+            conn.query_sync(INBOX_STATS_HINT_SQL, &[Value::BigInt(2)])
+                .unwrap()[0]
+                .get_named::<i64>("total_count")
+                .unwrap(),
+            i64::MAX,
+            "a read must not repair or otherwise mutate the cached hint",
+        );
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
     }
 
     #[test]
