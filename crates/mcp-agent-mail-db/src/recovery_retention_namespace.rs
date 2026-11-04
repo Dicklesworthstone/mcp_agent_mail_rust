@@ -1398,11 +1398,7 @@ impl ProcessStatusSummary {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_status_id_quad(status: &[u8], prefix: &[u8], label: &str) -> io::Result<[u32; 4]> {
-    let line = status
-        .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(prefix))
-        .ok_or_else(|| invalid(format!("open-reader process status has no {label} record")))?;
+fn parse_status_id_quad(line: &[u8], label: &str) -> io::Result<[u32; 4]> {
     let mut values = std::str::from_utf8(line)
         .map_err(io::Error::other)?
         .split_whitespace();
@@ -1436,21 +1432,34 @@ fn read_process_status_summary(process: &Path) -> io::Result<ProcessStatusSummar
             "open-reader process status exceeded its bounded scan",
         ));
     }
-    let state = status
-        .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"State:"))
+    // Every candidate performs a fresh reader census. Collect the kernel
+    // fields in one line walk instead of rescanning each status five times.
+    // Keep the first occurrence, including an invalid value, so a later
+    // duplicate cannot replace malformed identity or liveness evidence.
+    let mut state = None;
+    let mut fd_size = None;
+    let mut threads = None;
+    let mut uids = None;
+    let mut has_vm_size = false;
+    for line in status.split(|byte| *byte == b'\n') {
+        match line.first() {
+            Some(b'S') if state.is_none() => state = line.strip_prefix(b"State:"),
+            Some(b'F') if fd_size.is_none() => fd_size = line.strip_prefix(b"FDSize:"),
+            Some(b'T') if threads.is_none() => threads = line.strip_prefix(b"Threads:"),
+            Some(b'U') if uids.is_none() => uids = line.strip_prefix(b"Uid:"),
+            Some(b'V') => has_vm_size |= line.starts_with(b"VmSize:"),
+            _ => {}
+        }
+    }
+    let state = state
         .and_then(|line| std::str::from_utf8(line).ok())
         .and_then(|line| line.trim_start().chars().next())
         .ok_or_else(|| invalid("open-reader process status has no state"))?;
-    let fd_size = status
-        .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"FDSize:"))
+    let fd_size = fd_size
         .and_then(|line| std::str::from_utf8(line).ok())
         .and_then(|line| line.trim().parse::<u64>().ok())
         .ok_or_else(|| invalid("open-reader process status has no descriptor-table size"))?;
-    let threads = status
-        .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"Threads:"))
+    let threads = threads
         .and_then(|line| std::str::from_utf8(line).ok())
         .and_then(|line| line.trim().parse::<u32>().ok())
         .ok_or_else(|| invalid("open-reader process status has no valid thread count"))?;
@@ -1458,10 +1467,10 @@ fn read_process_status_summary(process: &Path) -> io::Result<ProcessStatusSummar
     // even in a record whose earlier State field still says running. Zero
     // is a valid count, not evidence that its thread group has no readers:
     // the terminal-state predicate and surviving-worker scan remain strict.
-    let has_vm_size = status
-        .split(|byte| *byte == b'\n')
-        .any(|line| line.starts_with(b"VmSize:"));
-    let uids = parse_status_id_quad(&status, b"Uid:", "UID")?;
+    let uids = parse_status_id_quad(
+        uids.ok_or_else(|| invalid("open-reader process status has no UID record"))?,
+        "UID",
+    )?;
     Ok(ProcessStatusSummary {
         state,
         has_vm_size,
@@ -3113,6 +3122,47 @@ mapping.close()
                 &uncertain, &terminal, 1000
             ));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_summary_preserves_first_fields_and_late_mapping_evidence() {
+        let root = fixture();
+        // Unrelated non-UTF8 bytes and field order do not invalidate kernel
+        // fields. Later duplicates must not replace the first observations.
+        std::fs::write(
+            root.join("status"),
+            b"Name:\t\xff\nUid:\t1 2 3 4\nThreads:\t0\nFDSize:\t64\nState:\tR (running)\n\
+              State:\tZ (zombie)\nFDSize:\t0\nThreads:\t1\nUid:\t9 9 9 9\n\
+              VmPeak:\t128 kB\nVmSize:\t64 kB\n",
+        )
+        .unwrap();
+        let summary = read_process_status_summary(&root).unwrap();
+        assert_eq!(summary.state, 'R');
+        assert_eq!(summary.fd_size, 64);
+        assert_eq!(summary.threads, 0);
+        assert_eq!(summary.uids, [1, 2, 3, 4]);
+        assert!(summary.has_vm_size);
+        assert!(!summary.is_exited_without_files_or_address_space());
+
+        let valid = b"State:\tZ (zombie)\nFDSize:\t0\nThreads:\t0\nUid:\t1 2 3 4\n";
+        for (first, expected_error) in [
+            (b"State:\t\xff\n".as_slice(), "no state"),
+            (b"FDSize:\tinvalid\n".as_slice(), "no descriptor-table size"),
+            (b"Threads:\t-1\n".as_slice(), "no valid thread count"),
+            (b"Uid:\t1 2 3\n".as_slice(), "UID record is incomplete"),
+            (b"Uid:\t1 2 3 4 5\n".as_slice(), "UID record is ambiguous"),
+        ] {
+            let mut status = first.to_vec();
+            status.extend_from_slice(valid);
+            std::fs::write(root.join("status"), status).unwrap();
+            let error = read_process_status_summary(&root).err().unwrap();
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
+        std::fs::write(root.join("status"), valid).unwrap();
+        let summary = read_process_status_summary(&root).unwrap();
+        assert!(!summary.has_vm_size);
+        assert!(summary.is_exited_without_files_or_address_space());
     }
 
     #[cfg(target_os = "linux")]
