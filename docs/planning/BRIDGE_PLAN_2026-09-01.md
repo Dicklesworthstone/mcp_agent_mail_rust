@@ -269,7 +269,44 @@ are source-present. Trusted-local auth and sanitized browser replay stay within
 their documented boundaries. No broad claims are upgraded by download hashes,
 small HTTP/stdio success, a shared-contract golden or a Linux PTY transcript.
 
-Final refinement, terminal receipts and graph validation remain pending.
+**Refinement pass5 — convergence review.** Re-read both new complete descriptions,
+their acceptance/notes and the affected release/reconciler/budget dependencies.
+Every supported goal has an implementation/proof owner; no further task,
+dependency or acceptance change was needed. `br dep cycles` reports zero active
+cycles. `bv --robot-triage` and `--robot-plan` load a claim-safe complete authority;
+the plan intentionally skips some expensive metrics, so it is not an independent
+all-metrics graph certificate. Its stale high-priority workflow titles do not
+override newer source and owner notes. At this pre-implementation checkpoint:
+57 open,36 in-progress,3 blocked,96 unfinished (two additions). Existing peer
+statuses and assignments are intact. All3,450 tracked compile/test input hashes
+in the pre-edit witness still match; shared commits during the assessment have
+changed planning/tracker metadata only. The native/source jobs remain bound to
+their original subjects. Terminal test results and the small docs fix follow.
+
+### Direct answers to the five assessment questions
+
+1. **Working now:** the tested real two-agent mail/ack/reply/retry, lease/conflict/
+   release, lexical search, web inspection and robot/doctor JSON flows, plus
+   signed-release stdio and bounded interactive terminal launch/navigation.
+   These sit on substantial real Rust implementations, not a facade of TODOs.
+2. **Not delivered completely:** the signed current release fails the default
+   high-concurrency latency/error and no-read archive-convergence gates. Broad
+   current-source, native-platform, large-mailbox, recovery/retention, optional
+   dependency quality and full operator action proofs remain incomplete.
+3. **Blocking completion:** actual archive/engine/reader/capacity defects and
+   incomplete decisive qualification. The unconditional golden writer and
+   current strict-build admission/cache problems additionally obstruct honest
+   verification; report generation does not repair them.
+4. **Would every old open/in-progress bead suffice?** Only partially before
+   this check, because two concrete gaps were untracked. With .81/.82 and the
+   refined existing acceptance actually met, the supported present vision is
+   covered. Closing records alone cannot supply missing runtime evidence.
+5. **Previously uncovered goals:** goal22's retained golden independence and
+   goal24's active archive-member wording. Both now have specific tasks; the
+   rest maps to existing owners. Deferred live browser parity and out-of-scope
+   hostile multi-tenant isolation are not newly invented missing features.
+
+Terminal receipts and final graph validation remain pending.
 No issue has been closed, no implementation owner changed, and no runtime feature
 credit is claimed by this assessment. It is operator-requested PROCESS; its
 consumer is the operator's completion/prioritization decision. The next runtime
