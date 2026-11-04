@@ -341,9 +341,10 @@ fn page_receipts(
 /// The newest window from the project's headers, newest first, or `None` once
 /// `budget` rows have been read without completing it. Only header filters
 /// apply here; [`newest_first_budget`] keeps read/ACK-state filters off it.
-/// A page below a timestamp ceiling costs its position, not its size: the
-/// pinned engine seeks the project's newest header and steps back past every
-/// newer one before the first row it returns, so page `k` is charged `k` pages.
+/// Keep the conservative increasing page charge: page `k` costs `k` pages.
+/// Timestamp-range seeks avoid revisiting newer timestamps, but a long run
+/// of equal timestamps still incurs the boundary OFFSET. This retains the
+/// existing speculation ceiling and exact fallback policy.
 fn newest_first_window(
     conn: &impl SyncQuery,
     project_id: i64,
@@ -430,7 +431,7 @@ fn newest_first_window(
             }
         }
         // Finish the boundary timestamp even after collecting `limit` rows.
-        // Otherwise a later page could contain a larger ID at the same time.
+        // Retain the conservative complete-timestamp cutoff for this window.
         let window_complete = newest.len() == limit
             && newest
                 .first_key_value()
@@ -744,23 +745,25 @@ pub(super) fn hydrate_priority_rows(
 const SHARED_PAGE_SIZE: usize = 128;
 
 /// Page authoritative message timestamps, not the denormalized delivery time.
-/// Ordering on a second column disables the pinned engine's timestamp index.
-/// Within the same read snapshot, skip only the already visited part of the
-/// boundary timestamp's index run. Never assume IDs track creation time or
-/// that equal-timestamp rows arrive in any particular ID order.
+/// The pinned engine's reverse composite seek needs a timestamp range and
+/// the explicit ID tie break. A typed i64 minimum includes the entire valid
+/// timestamp domain and enables that seek even on the first page. Within
+/// the same read snapshot, skip only the already visited part of the
+/// boundary timestamp's index run. Never assume IDs track creation time.
 #[must_use]
 pub fn shared_page_query(
     project_id: i64,
     ceiling: Option<i64>,
     skip_at_ceiling: i64,
 ) -> (String, Vec<Value>) {
-    let mut sql = format!("SELECT {HEADER_COLUMNS} FROM messages WHERE project_id = ?");
-    let mut params = vec![Value::BigInt(project_id)];
+    let mut sql =
+        format!("SELECT {HEADER_COLUMNS} FROM messages WHERE project_id = ? AND created_ts >= ?");
+    let mut params = vec![Value::BigInt(project_id), Value::BigInt(i64::MIN)];
     if let Some(ts) = ceiling {
         sql.push_str(" AND created_ts <= ?");
         params.push(Value::BigInt(ts));
     }
-    sql.push_str(" ORDER BY created_ts DESC LIMIT 128 OFFSET ?");
+    sql.push_str(" ORDER BY created_ts DESC, id DESC LIMIT 128 OFFSET ?");
     params.push(Value::BigInt(skip_at_ceiling));
     (sql, params)
 }
@@ -1000,7 +1003,7 @@ pub fn fetch_shared_with_policy(
             }
         }
         // Finish the boundary timestamp even after collecting `limit` rows.
-        // Otherwise a later page could contain a larger ID at the same time.
+        // Retain the conservative complete-timestamp cutoff for this window.
         let window_complete = newest.len() == limit
             && newest
                 .first_key_value()
@@ -1525,10 +1528,155 @@ mod tests {
         let count =
             |wanted: &dyn Fn(&str) -> bool| calls.iter().filter(|(sql, _, _)| wanted(sql)).count();
         (
-            count(&|sql| sql.contains("ORDER BY created_ts DESC LIMIT 128")),
+            count(&|sql| sql.contains("ORDER BY created_ts DESC, id DESC LIMIT 128")),
             count(&|sql| sql == RECIPIENT_PAGE_SQL || sql == RECIPIENT_NEXT_SQL),
             count(&|sql| sql.contains("FROM message_recipients WHERE message_id IN (")),
         )
+    }
+
+    #[test]
+    fn gh374_header_pages_seek_with_timestamp_extremes_and_ties() {
+        fn timestamp(id: i64) -> i64 {
+            match id % 4 {
+                0 => i64::MIN,
+                1 => -1,
+                2 => 0,
+                _ => i64::MAX,
+            }
+        }
+
+        // Freeze the incumbent query for a complete-walk comparison. Its
+        // timestamp-only ordering does not define the ID order inside a tie.
+        fn incumbent_page_query(
+            ceiling: Option<i64>,
+            skip_at_ceiling: i64,
+        ) -> (String, Vec<Value>) {
+            let mut sql = format!("SELECT {HEADER_COLUMNS} FROM messages WHERE project_id = ?");
+            let mut params = vec![Value::BigInt(1)];
+            if let Some(ts) = ceiling {
+                sql.push_str(" AND created_ts <= ?");
+                params.push(Value::BigInt(ts));
+            }
+            sql.push_str(" ORDER BY created_ts DESC LIMIT 128 OFFSET ?");
+            params.push(Value::BigInt(skip_at_ceiling));
+            (sql, params)
+        }
+
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 520), 1, timestamp, |_| "normal");
+        // Leave 129 rows at each timestamp in project 1, plus a foreign
+        // project witness at each timestamp. Every tie exceeds one page.
+        conn.execute_raw(
+            "UPDATE messages SET project_id = 2 WHERE id > 516; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let mut expected = (1_i64..=516)
+            .map(|id| (timestamp(id), id))
+            .collect::<Vec<_>>();
+        expected.sort_unstable_by(|left, right| right.cmp(left));
+
+        with_snapshot(&conn, || {
+            for (ceiling, skip) in [
+                (None, 0),
+                (Some(i64::MAX), 0),
+                (Some(i64::MAX), 128),
+                (Some(0), 127),
+                (Some(-1), 126),
+                (Some(i64::MIN), 125),
+                (Some(i64::MIN), 129),
+            ] {
+                let (sql, params) = shared_page_query(1, ceiling, skip);
+                let actual = query(&conn, &sql, &params)?
+                    .into_iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<i64>("created_ts").unwrap(),
+                            row.get_named::<i64>("id").unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let expected_page = expected
+                    .iter()
+                    .copied()
+                    .filter(|(created, _)| ceiling.is_none_or(|upper| *created <= upper))
+                    .skip(usize::try_from(skip).unwrap())
+                    .take(SHARED_PAGE_SIZE)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected_page, "ceiling={ceiling:?}, skip={skip}");
+
+                // Relate the seek key to its producing record; do not pin
+                // cursor IDs, register numbers, or the number of seek ops.
+                // Continuations must anchor on both project and timestamp.
+                let ops = explain_ops(&conn, &sql, &params);
+                let required_fields = if ceiling.is_some() { 2 } else { 1 };
+                let reverse_seek = ops.iter().any(|(op, _, key)| {
+                    op == "SeekLE"
+                        && ops.iter().any(|(producer, fields, output)| {
+                            producer == "MakeRecord" && output == key && *fields >= required_fields
+                        })
+                });
+                assert!(
+                    reverse_seek && ops.iter().any(|(op, _, _)| op == "Prev"),
+                    "{sql} must use a bounded reverse index seek: {ops:?}",
+                );
+                assert!(
+                    ops.iter().all(|(op, _, _)| {
+                        !matches!(
+                            op.as_str(),
+                            "Rewind"
+                                | "Last"
+                                | "OpenEphemeral"
+                                | "SorterOpen"
+                                | "SorterInsert"
+                                | "SorterSort"
+                                | "Sort"
+                        )
+                    }),
+                    "{sql} must not sort or start a history walk: {ops:?}",
+                );
+            }
+
+            let mut incumbent = Vec::new();
+            let mut ceiling = None;
+            let mut skip_at_ceiling = 0_i64;
+            // Bound the test loop so a broken cursor cannot hang the suite.
+            for _ in 0..=expected.len().div_ceil(SHARED_PAGE_SIZE) {
+                let (sql, params) = incumbent_page_query(ceiling, skip_at_ceiling);
+                let rows = query(&conn, &sql, &params)?;
+                assert!(rows.len() <= SHARED_PAGE_SIZE);
+                let finished = rows.len() < SHARED_PAGE_SIZE;
+                for row in rows {
+                    let created = row.get_named::<i64>("created_ts").unwrap();
+                    let id = row.get_named::<i64>("id").unwrap();
+                    if ceiling == Some(created) {
+                        skip_at_ceiling += 1;
+                    } else {
+                        ceiling = Some(created);
+                        skip_at_ceiling = 1;
+                    }
+                    incumbent.push((created, id));
+                }
+                if finished {
+                    break;
+                }
+            }
+            incumbent.sort_unstable_by(|left, right| right.cmp(left));
+            assert_eq!(
+                incumbent, expected,
+                "incumbent walk changed the message set"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1,
+        );
     }
 
     #[test]
