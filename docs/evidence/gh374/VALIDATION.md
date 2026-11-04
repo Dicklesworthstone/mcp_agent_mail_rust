@@ -9,6 +9,21 @@ authorized update completed; publication does not establish native qualification
 
 ## Status and evidence boundary
 
+### Integration on main after the November 4 merge
+
+The investigation below records its original 0.5.0 backport and build attempts.
+Merged main instead retains the application's public SQLModel 0.5.1 dependency
+family, with pool and core pinned to
+`c996710674d92c00d23f30fe17ecc5d9644818c7`. The `vendor/sqlmodel-pool` tree is
+preserved provenance and is not selected by the root manifest or lockfile.
+The native workflow now derives the pool manifest from `cargo metadata
+--locked` and runs that selected source's unit tests and formatting check.
+Those dependency unit tests use the dependency's development graph; the
+separate real HTTP cancellation test exercises Agent Mail's consumer graph.
+The workflow refuses an ambiguous pool selection and still requires a nonzero
+passing test count. This wiring correction does not itself establish a
+successful hosted run, large-mailbox qualification, or issue closure.
+
 The cancellation-accounting fix and additional qualification tests are prepared.
 Formatting, provenance, configuration parsing, and independent source review
 have passed; those checks are not native execution of the pool, HTTP, or recovery
@@ -53,12 +68,13 @@ original root lockfile. The published VCS commit is
 `12d490b22ce3a82533591b5b39d2318b21da1f0f`; the original license blob is
 `3d414da6ff83defe084707be6030866e8a7fb794`.
 
-All published files other than `src/lib.rs` and the extended README are
-byte-identical. The upstream license is included unchanged. Root Cargo uses a
-local `[patch.crates-io]` for this one crate. Among the root lockfile's 868
+In the original backport, all published files other than `src/lib.rs` and the
+extended README are byte-identical. The upstream license is included unchanged.
+Its proposed root Cargo used a local `[patch.crates-io]` for this one crate.
+Among that root lockfile's 868
 packages, only the pool's registry source/checksum are removed; package versions
-and dependency edges are unchanged. The vendor package is excluded from
-workspace membership and has explicit standalone test and formatting gates.
+and dependency edges are unchanged. That proposed dependency selection was
+superseded at integration as described above; it is not merged main's graph.
 
 ### 2. Regressions distinguish accounting from capacity
 

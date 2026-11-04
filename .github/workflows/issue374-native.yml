@@ -90,7 +90,12 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           set -euo pipefail
-          cargo test --locked --manifest-path vendor/sqlmodel-pool/Cargo.toml --lib -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/pool.log"
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/gh374-inbox/dependencies.json"
+          pool_manifest=$(python3 -c 'import json,sys; packages=[p for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "sqlmodel-pool"]; assert len(packages) == 1, "qualification requires exactly one resolved sqlmodel-pool"; print(packages[0]["manifest_path"])' "$RUNNER_TEMP/gh374-inbox/dependencies.json")
+          # Test the source Cargo actually selected. The retained 0.5.0 vendor
+          # backport is historical evidence; current main selects public 0.5.1.
+          # A dependency's unit tests require its own workspace/dev dependencies.
+          cargo test --locked --manifest-path "$pool_manifest" --lib -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/pool.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-inbox/pool.log"
       - name: Compare exact large inbox results with the incumbent reader
         run: |
@@ -238,7 +243,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --check 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/format.log"
-          cargo fmt --manifest-path vendor/sqlmodel-pool/Cargo.toml --check 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/pool-format.log"
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/gh374-workspace/dependencies.json"
+          pool_manifest=$(python3 -c 'import json,sys; packages=[p for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "sqlmodel-pool"]; assert len(packages) == 1, "qualification requires exactly one resolved sqlmodel-pool"; print(packages[0]["manifest_path"])' "$RUNNER_TEMP/gh374-workspace/dependencies.json")
+          cargo fmt --manifest-path "$pool_manifest" --check 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/pool-format.log"
       - name: Check all workspace targets
         if: always()
         run: |
