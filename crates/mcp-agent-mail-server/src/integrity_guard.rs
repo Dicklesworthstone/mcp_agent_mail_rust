@@ -3246,6 +3246,16 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        // The current slot and these two resident generations fill keep=3.
+        // Each older historical image below must therefore be outside the
+        // shared window before the test requires its payload to be reclaimed.
+        for generation in ["20010101_000000", "20010102_000000"] {
+            std::fs::copy(
+                &primary,
+                root.join(format!("mail.sqlite3.bak.{generation}")),
+            )
+            .unwrap();
+        }
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.request_verified();
         let mut last_verified_us = 0;
