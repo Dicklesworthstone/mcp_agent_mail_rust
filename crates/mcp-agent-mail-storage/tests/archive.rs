@@ -205,10 +205,13 @@ impl Drop for StopConcurrentReaders<'_> {
 fn archive_test_outcome<T, E: std::fmt::Debug>(value: asupersync::Outcome<T, E>) -> T {
     match value {
         asupersync::Outcome::Ok(value) => value,
+        // ubs:ignore -- Test assertion: a real database error must fail this fixture.
         asupersync::Outcome::Err(error) => panic!("database operation failed: {error:?}"),
         asupersync::Outcome::Cancelled(reason) => {
+            // ubs:ignore -- Test assertion: unexpected cancellation must fail this fixture.
             panic!("database operation cancelled: {reason:?}")
         }
+        // ubs:ignore -- Test assertion: a database panic must fail this fixture.
         asupersync::Outcome::Panicked(error) => panic!("database operation panicked: {error}"),
     }
 }
@@ -774,7 +777,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
     let mut canonical_count = 0;
     head.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         if root.starts_with("projects/gh374/messages/")
-            && entry.name().is_some_and(|name| name.ends_with(".md"))
+            && entry.name().is_ok_and(|name| name.ends_with(".md"))
         {
             canonical_count += 1;
         }

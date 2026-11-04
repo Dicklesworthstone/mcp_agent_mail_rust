@@ -34221,13 +34221,13 @@ mod tests {
                 let error = outcome
                     .unwrap()
                     .expect_err("an obsolete election must not publish a terminal outcome");
-                if terminal != "storage" {
+                if terminal == "storage" {
+                    assert!(error.to_string().contains("Quota exceeded"));
+                } else {
                     assert!(
                         error.to_string().contains("election authority changed"),
                         "unexpected {terminal} refusal: {error}"
                     );
-                } else {
-                    assert!(error.to_string().contains("Quota exceeded"));
                 }
             }
             assert_eq!(

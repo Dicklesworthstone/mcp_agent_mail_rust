@@ -1,5 +1,127 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 4 execution TODO — EmeraldEagle
+
+The operator explicitly requested implementation, systematic Beads execution and
+a granular TODO. This section is the execution checklist; Beads remains the task
+authority. Check an item only on its cited result. Unmet acceptance remains open.
+No new readiness framework or reduced release gate is part of this work.
+Retire this execution checklist when its items are completed or handed off with
+their corresponding Bead's evidence; retain it as history rather than a new gate.
+
+- [x] Refresh checkout/graph/ownership; preserve unrelated base JSONL and history.
+- [x] Run live mailbox health before coordination (healthy on this pass).
+- [x] Claim br-kp1in.81 and reserve its code plus the next bounded edit surfaces.
+- [x] br-kp1in.81: restore independent, read-only durability golden verification.
+  - [x] Read retained35-cell fixture; preserve every field and policy invariant.
+  - [x] Make ordinary verification compare retained expectations and fail clearly.
+  - [x] Exercise wrong consequential field, missing and malformed fixture controls.
+  - [x] Re-run correct expectation with read-only fixture; witness hash/size/mtime/mode.
+  - [x] Retain nonzero case counts, exact source/build identity and first failures.
+  - [x] Execute required all-target/production/Clippy/fmt and appropriate tests.
+  - [x] Freshly recheck original acceptance; close only if all required proof passes.
+- [x] br-kp1in.83: finish diagnostic enumeration within the original native budget.
+  - [x] Claim the bead before editing its helper/tests.
+  - [x] Replace per-file subprocesses with deterministic bounded-process metadata.
+  - [x] Preserve relative names, exact sizes, complete inventory and visible errors.
+  - [x] Test empty files, nested/spaced/backslash names, ordering and metadata errors.
+  - [x] Exercise the retained330,984-file run; record count/time/process cost.
+  - [x] Run existing artifact schema/negative controls without weakening validation.
+  - [x] Re-run the unchanged paired native command with its original3600s budget.
+  - [x] Keep runtime FAIL/FAIL separate from successful artifact collection.
+  - [x] Freshly recheck original acceptance; close only on the named populated probe.
+- [ ] Current-source runtime qualification and highest-impact repair.
+  - [x] Inspect current reconciler/fairness/generation wiring and existing owner notes.
+  - [x] Select exact compiled source, lockfile, features, worker and executable pair.
+  - [ ] Reproduce original no-read crash/convergence and mixed-load failures there.
+  - [ ] Trace the actual remaining queue/fence/reader/engine cause before changing it.
+  - [ ] Claim unowned ready work or coordinate assistance without taking peer closure.
+  - [ ] Repair the demonstrated cause; preserve content, authority and durability bounds.
+  - [ ] Re-execute positive and consequential negative paths at final source.
+- [ ] Reconcile both candidate histories under br-bx73n's existing prerequisites.
+  - [x] Fresh fetch; preserve55local/18remote commits and verify0incoming file deletions.
+  - [x] Resolve the two conflicted paths in an isolated worktree, preserving both histories.
+  - [x] Retain all67 distinct namespace tests and both full historical evidence continuations.
+  - [x] Bring the validated golden repair into combined candidate dd698266.
+  - [ ] Correct observed Result/Option test API mismatch and two visibility lint errors.
+  - [ ] Review the exact UBS test-helper false positive; preserve raw failure and disclose any waiver.
+  - [ ] Re-run all-target/production/Clippy/fmt plus real namespace/reader tests on corrected source.
+  - [ ] Exercise original current-source runtime and strict full-workspace/native prerequisites.
+  - [ ] Advance primary only after meaningful combined-source checks, preserving dirty peer base JSONL.
+- [ ] Continue ready backlog in dependency order, informed by each terminal result.
+  - [ ] Reader-safe recovery: original br-5nr0m/private-worker criteria and deadlines.
+  - [ ] Capacity: original latency/error bounds, fixed offered-rate windows and real control.
+  - [ ] Large-mailbox consumer memory/engine probes for br-kp1in.44/.46.
+  - [ ] Real contended TUI action/effect proof under br-kp1in.2.
+  - [ ] Reconcile unique local/remote candidate changes without losing either history.
+  - [ ] Qualify combined candidate, native installers/platforms and real optional paths.
+- [ ] End each work block with evidence-bound Beads updates and a fresh self-review.
+- [ ] Flush JSONL; verify empty cycles; commit only owned useful changes.
+- [ ] Push only with preserved history; record any integration hold truthfully.
+- [ ] Release owned reservations and confirm no assessment-owned orphan processes.
+
+Execution evidence through08:14UTC: diagnostic helper commit7f963ce5 completed
+the unchanged native paired probe in2,636,852ms; complete bundle revalidation
+passed. Runtime remains FAIL/FAIL (candidate53/2, control49/6); this is no
+runtime win. Filename fixtures now respect Windows API constraints; Linux
+native artifact-schema recheck passed in4,463ms, zero skipped suites. No native
+Windows qualification is claimed. The unchanged330,984-file tree matched an
+independent inventory in10.99s with9 total execve calls including shell setup.
+Golden repair's frozen14-case nextest and nine retained ordinary-test controls
+passed; the first postbarrier failure caused by concurrent local edits remains
+failed. Required production/all-target checks passed Cargo/source proof (the
+latter required supported terminal-delivery recovery); Clippy rejected one new
+test-only chunks_exact lint. It is fixed with as_chunks, without suppression;
+final-source gates must run again before closure. Current-source optimized
+build hit its original1,800s SSH build timeout and was verified stopped. The
+supported per-invocation RCH_BUILD_TIMEOUT_SEC=7200 override is verified by the
+installed client's config reflection; this affects build transport only, not
+the original runtime, latency, recovery or native-suite acceptance limits.
+
+09:04UTC progress: br-kp1in.81 is fixed in0d9927f2 and closed after final strict
+source-content focused14/14, all-target, separate production and strict workspace
+Clippy commands all exited0; fmt0. The final executed test binary is
+`da43bd159a8f3f655531bebbbf82d08d10730b41e8387ebf85cb34b64ad78760`.
+A fresh committed-source pass reran nine private ordinary-test controls: two
+correct expectations pass; seven wrong/missing/malformed/structurally invalid
+expectations fail, exactly one test each. Hash/size/mtime/mode stay unchanged.
+This is a shared contract-matrix check, not mounted-surface or release clearance.
+br-kp1in.83 is closed on7f963ce5/b5dbf32e and the original populated native probe;
+fresh committed-code artifact-schema recheck passed in4,564ms with zero skips.
+
+Current-source optimized Linux build30093240094949551 onhz4 now has a valid
+terminal0 source-content receipt, root
+`628d0d37f4f96fbab3e2be4fbd60942f1e146e2ff65f39e1f607375ff72cf7fc`.
+Cargo finished in35m05s (2,217.1s end-to-end), using the declared build-only
+7,200s transport budget; the original1,800s failure remains failed. The portable
+feature graph, release profile and unchanged Cargo.lock select runtime0.4.13.
+The actual GNU x86_64 `am` SHA is
+`f230d26cf398de71ff6d69a56753ed4f3643d9d6970018b77fb9e04c2342a4e2`.
+The unchanged original native3600s/300s/60-agent/480s/5s probe is running at
+`tests/artifacts/release_smoke/20261104_085930/`, paired with authenticated
+public0.3.40 GNU control009ee7b7. Its initial crash phase passed386 acknowledged
+IDs surviving SIGKILL plus no-client-read archive convergence. Soak/swarm and
+final wrapper verdict remain pending. This Linux host build is not a claim of
+distribution ABI-floor, other-platform, optional-model or release qualification.
+
+Combined candidate dd698266 preserves origin8a107d96 and local unique history
+in private branches. The primary checkout has not advanced to it. Initial
+integration production check passed, but all-target caught an incoming archive
+test using Option::is_some_and on git2's Result; Clippy caught two redundant
+pub(crate) declarations inside private modules. The live reader tests are still
+compiling; keep that source frozen until their terminal source receipt. UBS
+also reported one critical at a test-only fixed Python `-c` POSIX-lock probe;
+review the exact constant program/argv boundary and publish any narrowly
+justified false-positive waiver, never silently call the raw scan clean.
+
+The first broad workspace run was canceled before tests after discovering its
+worker lacked age and had a different installed am. It earns no pass. Verified
+private age1.3.2/age-keygen tools are staged outside source and shared config;
+the proper retry must bind its actual am and enable the existing strict native
+harness flags. br-bx73n's claim was correctly refused while its named blockers
+remain open; it remains open/unassigned with assistance notes, no bypass. Both
+private worktrees and failed canonical-root/cross-device attempts are retained.
+
 ## November 3, 2026 comprehensive reality check (November 4 UTC)
 
 This assessment supersedes older current-status statements below. The historical

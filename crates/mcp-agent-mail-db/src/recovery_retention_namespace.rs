@@ -617,7 +617,7 @@ pub fn preflight_superseded_snapshot_readers(
 /// description can release POSIX locks owned by this files_struct, so inspect
 /// every matching descriptor, including locks acquired through another open.
 #[cfg(target_os = "linux")]
-pub(crate) fn preflight_current_thread_file_locks(
+pub fn preflight_current_thread_file_locks(
     source: &Path,
     inventoried: &Metadata,
 ) -> io::Result<()> {
@@ -5123,6 +5123,7 @@ elif handle is not None:
                     // A separate process must still observe this SQLite-style
                     // lock. Merely seeing our own descriptor does not prove
                     // that preflight avoided opening/closing a second handle.
+                    // ubs:ignore -- Fixed test-only Python; path is argv[1], never shell or interpolated source.
                     let probe = std::process::Command::new("python3")
                         .args([
                             "-c",

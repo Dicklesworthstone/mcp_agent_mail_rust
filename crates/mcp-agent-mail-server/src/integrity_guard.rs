@@ -20,9 +20,9 @@ mod pool_admission;
 #[path = "integrity_guard_schedule.rs"]
 mod schedule;
 
-pub(crate) use backup_budget::Admission as BackupParentAdmission;
+pub use backup_budget::Admission as BackupParentAdmission;
 #[cfg(all(test, unix))]
-pub(crate) use backup_budget::with_admission as with_backup_parent_admission;
+pub use backup_budget::with_admission as with_backup_parent_admission;
 use schedule::{AutomaticBackupSchedule, BackupCompletion, BackupKind, FullVerificationGate};
 
 use mcp_agent_mail_core::Config;
