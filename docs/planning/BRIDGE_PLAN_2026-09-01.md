@@ -70,8 +70,8 @@ their corresponding Bead's evidence; retain it as history rather than a new gate
     - [x] Execute archive writer/reader concurrency and HTTP/rotation/producer families (red before qualification).
     - [x] Retain nonzero terminal counts, failed assertions, skips and source identities.
   - [ ] Exercise original current-source runtime and strict full-workspace/native prerequisites.
-  - [ ] Advance primary only after meaningful combined-source checks, preserving dirty peer base JSONL.
-- [ ] br-kp1in.85: repair deterministic namespace and Git concurrency fixture setup.
+  - [x] Advance primary after meaningful combined-source checks, preserving dirty peer base JSONL; broader red qualification remains open.
+- [x] br-kp1in.85: repair deterministic namespace and Git concurrency fixture setup.
   - [x] Retain FLOCK positive-control failure on device8:1 and archive duplicate-slug failure.
   - [x] Limit serial/negative-field replacement to the intended first occurrence.
   - [x] Initialize archive root before pool, then project archive after explicit identity seed.
@@ -81,18 +81,224 @@ their corresponding Bead's evidence; retain it as history rather than a new gate
   - [x] Original FLOCK parser controls pass on real worker filesystem identity.
   - [x] Original archive writer/inbox-reader test reaches and passes its full behavior (96 messages, local UID1000, retained remote-compiled image).
   - [x] Correct HTTP raw seeds to the same explicit no-parent metadata real sends persist; legacy-NULL refusal stays intact.
-  - [ ] Original HTTP responsiveness test reaches and passes its full behavior.
+  - [x] Original HTTP responsiveness test reaches and passes its full behavior (qualified integration receipt d6ff5fc3; repeated current-candidate raw PASS8.001s).
   - [x] All-target/production/Clippy gates pass on the frozen fixture-repair source.
-  - [ ] Fresh bounded acceptance before closure; zero-case setup failures earn no credit.
+  - [x] Trace the current35-case post-source failure to a startup fixture opening the shared default mailbox.
+  - [x] Isolate both generic and stdio startup fixture paths in a preserved exact-source checkout; retain every original probe/assertion.
+  - [x] Repeat required production/all-target/strictClippy gates there; all3,899 source records match.
+  - [x] Finish the original36-case rerun with a clean post-source barrier; 35pass/1separate initializer timeout, all original fixture cases pass. Preserve both failures.
+  - [x] Resolve three reviewed pre-existing filename-nonce scanner false positives narrowly, retaining the raw scan and unchanged code behavior.
+  - [x] Fresh bounded acceptance before closure: original five fixture paths pass under clean receipt5e534ff5, all four final files match mandatory compiler receipts; separate initializer timeout remains open under .87. Zero-case setup failures earn no credit.
 - [ ] Diagnose remaining combined-source failures without weakening their gates.
   - [ ] Strict UID1000 reader inventory: protected same-UID systemd fd table remains a refusal.
   - [ ] Three snapshot retention cases: verify fixture/producer permissions before any repair.
   - [ ] Inbox cancellation: distinguish balanced nested snapshot releases from a leaked scope.
-  - [ ] HTTP cancellation: identify retained waiter/dispatch metric after the original cleanup bound.
+  - [x] HTTP cancellation: identify retained waiter/dispatch metric after the original cleanup bound; upstream SQLModel waiter guard is tracked in br-kp1in.87.
   - [ ] Rotation backlog: preserve original240s timeout; no deadline increase or workload reduction.
   - [ ] Hourly producer: account for unreclaimed historical payloads/directories at hour0.
   - [x] External stdio: retain17pass/1fail/0skip during live paired load and the unchanged quiet repeat. Quiet run emits the correct parse-error response but still exceeds the five-second bound during shutdown; neither run passes.
   - [ ] Diagnose and repair the demonstrated stdio shutdown delay without raising its five-second gate.
+- [ ] br-kp1in.86: join all stdio maintenance workers and satisfy the original fatal-frame bound.
+  - [x] Retain loaded and quiet external stdio17pass/1fail/0skip; quiet response is correct but exit times out.
+  - [x] Identify omitted retention shutdown in the shared hook; keep latency attribution unclaimed.
+  - [x] Claim task and reserve lib.rs; wire the existing join before WBQ/SQLite closeout.
+  - [x] Add isolated real-worker regression: observe all five OS threads (including the replay supervisor), invoke common shutdown, require them gone.
+  - [x] Formatting, UBS and required all-target/production/Clippy gates at frozen source; lib.rs scan0critical, many warnings disclosed.
+  - [x] Run meaningful lifecycle, cleanup, pending replay and cancellation controls with nonzero cases (35/35 raw; separate source-barrier failure remains).
+  - [ ] Build/hash final executable; replay original stdio without changing its five-second gate.
+  - [ ] Preserve acknowledged mail and crash/replay/archive behavior; no early exit or missing flush.
+  - [ ] Diagnose and fix any remaining delay; keep this task open if the original stdio gate still fails.
+    - [x] Preserve b666309b original quiet17pass/1fail/0skip: exact parse error, timeout143 at5,239ms.
+    - [x] Trace a natural exit with real procfs workers: independent sleepers stop in serial join order.
+    - [x] Notify integrity/disk/archive-maintenance sleepers before the first operator join; retain every join and flush.
+    - [x] Add a real held-operator-mutex regression: other services must exit before that mutex is released.
+    - [x] Execute the new regression against the old ordering as a consequential negative control; ordinary same-worker replay reaches the held-lock assertion (7.65s, exit101), distinct from earlier seed timeouts.
+    - [ ] Execute final positive regression and unchanged lifecycle/cleanup/cancellation families.
+    - [x] Repeat required compiler/production/Clippy/fmt/UBS for the notification change; corrected visibility has all3 workspace gates0.
+    - [ ] Build/hash the notification candidate and repeat original quiet/loaded stdio plus actual mail/durability.
+  - [ ] Fresh solo acceptance before closure; no release/performance claim from a partial repair.
+- [ ] br-kp1in.87: adopt the finished upstream pool cancellation repair.
+  - [x] Reproduce unchanged real HTTP cancellation failure as ordinary UID1000.
+  - [x] Capture real post-cancellation worker stacks; do not infer a surviving dispatch worker from stale accounting.
+  - [x] Identify manual waiter decrement after an await; hard future drop skips it.
+  - [x] Inspect published0.5.1: it still lacks the upstream waiter guard.
+  - [x] Review immutable ee08466f pool production diff; all18 core source files match published0.5.1.
+  - [x] Pin coherent0.5.1 family and immutable pool/core source, without a sibling dependency.
+  - [x] Reject incomplete first ee08466 pin after native test-build failure; review completed c9967106 retirement/deadline follow-up and its corrected native controls.
+  - [x] Regenerate lock with Cargo: only nine SQLModel package identities change; every other lock record is byte-equivalent and runtime engine/runtime pins remain unchanged.
+  - [x] Mandatory all-target/production/Clippy/fmt/UBS at frozen source; raw scanner warning counts remain disclosed.
+  - [x] Run original HTTP cancellation and real pool/reuse/cleanup controls; keep original deadlines (35/35 raw, then fresh original HTTP1/1; clean-source rerun pending under .85).
+  - [ ] Diagnose the original fresh initializer timeout in the strict source rerun; do not close on successful repeats alone.
+    - [x] Preserve strict249 result35pass/1fail, clean sourcebarrier and original10s acquire bound.
+    - [x] Verify cancellation really released total/active/pending counts before the failed fresh acquire.
+    - [x] Replay exact retained DB image on the same worker: original case passes0.82s.
+    - [x] Replay under a timeout-branch debugger breakpoint: case passes6.87s, no timeout-branch hit; diagnostic only.
+    - [ ] Capture failure-only fresh-acquire duration, actual pool state and opened-connection state without changing assertions or budgets.
+    - [x] Explain a reproduced ordinary timeout: real fsqlite-worker is blocked in filesystem journal/page waits for about15s while the caller waits; the original10s cooperative acquisition deadline then correctly reports timeout. This is not a retroactive stack claim for run249.
+    - [ ] Re-execute the original case on final source without weakening storage durability or its deadline; retain the failed runs and environment limits.
+  - [x] Build/hash c996 executable b666309b and exercise actual mail/durability effects; 33/33 task flow and original full paired native correctness pass, capacity gate fails in both arms. This predates the separate .86 notification patch.
+  - [ ] Fresh bounded acceptance before closure; stdio, capacity and release stay independently gated.
+
+14:35UTC: merged the five new upstream commits through4b8ddf30 as2a879886,
+preserving both histories. The one cross-engine test conflict retains exact
+integer normalization for TinyInt/SmallInt/Int and leaves other types distinct.
+Upstream's source diff also corrects the fixture defects; this is source
+corroboration, not independent execution or review. The original pool
+cancellation case still failed before the pool repair. Main keeps a real pre-existing Git index in the HTTP fixture,
+so its unchanged-byte assertion cannot pass by observing an absent index.
+Main source is now frozen for the pool/shutdown qualification commands; do not
+edit this plan or other tracked inputs until their terminal source barriers.
+
+15:12UTC: the first ee08466 pool pin is superseded before acceptance. Its
+production/all-target/Clippy/fmt gates passed, but upstream unit tests failed
+to compile an obsolete guarded-Wait constructor. Reviewing its successor also
+found the completed retirement deadline repair. Main now selects immutable
+`c996710674d92c00d23f30fe17ecc5d9644818c7`; core changes only documentation.
+The old consumer build/test commands were cancelled through their owning
+wrappers, recovered terminal143/acknowledged, and earn no behavior credit.
+All compiler and real behavior gates must run on c996 before acceptance.
+The isolated old-source test-only correction is retained as a diagnostic
+overlay; it is not shipped or described as an unmodified upstream pass.
+Cargo's second update attempted unrelated broad-range dependency changes.
+Those intermediate lockfiles are retained privately. Restore the previously
+Cargo-generated lock (SHA a1bff40a, verified against its worker receipt), then
+change only pool/core immutable source identities and validate with locked
+Cargo metadata. The accepted graph must still differ only in nine SQLModel
+packages. Locked full Cargo metadata now passes with exactly that delta.
+Main is frozen again for the final c996 consumer gates; do not edit tracked
+inputs until every active source-content command reaches its terminal barrier.
+
+16:53UTC: current c996 production/all-target/strictClippy gates all passed
+with receipts cf5ed89a/91bfdee1/d16abaf8; formatting0. Optimized portable build
+238/vmi1153651 finished0 in5,318,631ms; receipt
+`8f96e49cd92254548ffa376121625c55af0787f4481408a81bfe85de4037ad5b`.
+All5,952 input records freshly match. Worker, delivered and retained CLI hashes
+are identical:
+`b666309b78426e06dc55d86d1dae4bffd0acaa2e2a130cb8857232476761080d`.
+This unfreezes main; the isolated startup qualification checkout remains frozen.
+
+Current35-case Nextest ran35passed/11,309excluded in83.775s. Original HTTP
+cancellation passed30.790s: actual30,001ms timeout, waiter and dispatch permit
+drained before releasing the held read connection, subsequent both inbox body
+modes/8rows and receipt effects intact. Original HTTP responsiveness8.001s,
+archive96messages8.218s, real five-worker retention join1.632s all passed.
+However the strict source barrier FAILED on four shared SQLite sidecars;
+recovering actual commandexit0/acktrue does not turn that receipt green.
+The stdio startup fixture used default relative paths. A private preserved
+checkout cd6620d4 now isolates it and the equivalent generic startup fixture,
+without changing the probes/assertions. Its required production/all-target/
+strictClippy gates all pass0 with receipts15a401ac/3ae530a8/919d16b5; all3,899
+records freshly match. Original36-case rerun is pending. The first isolated
+rerun had the wrong effective transport variable (1800s); it was canceled
+before that timeout and restarted with verified RCH_TEST_TIMEOUT_SEC=7200 on
+the same compilation cache. Runtime/per-test bounds are unchanged.
+
+Fresh localUID1000 execution of the retained server958cd0df passes original
+HTTP cancellation1/1 in33.87s and the new five-worker join1/1 in3.82s. These
+are solo reruns, not independent review. Supplemental upstream mock pool
+tests: unmodified c996 image39d0b972 passes99ordinary cases, but one original
+fresh-process Nextest fixture assertion still fails/hangs because its clock
+cannot backdate before epoch0. Two existing virtual-clock fixture corrections
+in private c88ce7f preserve every retirement/drain assertion, add explicit age
+preconditions, and pass99/99 Nextest plus strict packageClippy/fmt. Production
+bytes and the application's public c996 pin remain unchanged. No full
+upstream-workspace pass is claimed.
+
+The first external stdio launch failed before assertions after my cross-device
+hard-link setup error triggered an unwanted remote build. The exact wrapper
+was canceled/recovered (actual exit1, terminalacktrue); native suite exit143
+is a setup failure, not a behavior verdict. The prebuilt path now has exact
+b666309b bytes and the original quiet stdio suite is running. Original5s and
+all mail/crash/archive gates remain unchanged; .85/.86/.87 stay open pending
+their remaining original criteria. UBS startup raw1 has3pre-existing
+nonsecret filename-nonce classifications (production create_new plus2test
+paths),495warnings/276info; no clean scan or blanket waiver is claimed.
+
+17:36UTC: the b666309b full paired native run20261104_165607 is terminal1
+in2,169,628ms, zero skipped suites. Both candidate and control have54passed/
+1failed original checks. The single failure is the unchanged send p99<=5s
+gate: candidate16.687659s over5,745samples, control17.904987s over3,212.
+Different closed-loop populations and shared-host load preclude a comparative
+performance claim. Candidate has0tool/connection/timeout errors outside the
+declared kill window,0zombies and0stalled windows; all5,745 acknowledged swarm
+sends and the120 earlier crash sends survive SIGKILL. All5,690 swarm inbox
+calls succeed. Its10,563DB/canonical messages and37,434 committed copies
+converge without client reads in33.288s; every mismatch/missing/duplicate list
+is empty, independent stopped CSQLite integrity is ok and shutdown is clean.
+The control also passes these correctness checks. Full bundle revalidation0;
+receipt SHA eaa07f29b96eeb082256e50434784aadee06db0ba64e609aed3c35047fad50a9.
+Harness04210cb8 and helperafbe29ac still match the compiled-source receipt.
+This is bounded correctness evidence for b666, not a capacity/release pass
+or behavior credit for the later notification patch.
+
+The original quiet stdio5s failure is still real. The next patch notifies the
+three independent integrity/disk/archive-maintenance sleepers before waiting
+for the operator runtime, while keeping every original join/flush/SQLite
+closeout. Its held-operator-mutex regression uses real workers and requires
+them gone before releasing that actual first lock. fmt0 and five-file UBS0
+report0critical/4,868warning/2,370info, statusok/failed_modules[]; three
+existing filename-nonce classifications have narrow justified comments and
+the raw3critical scan remains retained. Mandatory production254 and all-target
+253 checks pass0, all5,952 records match, receipts414493e8/a1155bd7.
+StrictClippy252 correctly fails101 on two pub(super) declarations in private
+modules, receipt72e7a50. Changed those two declarations to pub as requested;
+the containing modules remain private and effective external API is unchanged.
+No lint allowance. Optimized255 was canceled/recovered143/terminalacktrue
+before completing this known-lint-red source. This avoidable early build cost
+earns no delivery credit. Re-run required gates at the corrected source;
+start another optimized build only after strictClippy and the original
+old-order negative/new-order positive regression are qualified.
+
+18:00UTC: all corrected-source mandatory workspace gates pass0:
+production `1d78cfbddbbf24a72ce621b8f24246bdf62d39d1f9faa4ba497c27e82516c247`,
+all-target `d4d76560ef31c27c91ea65e96befa63325071849e527eedacc25a0023b036f4b`,
+strictClippy `f1fdad43ab7d85597c64abd33fe9ce7242bb2f2edb7ba074385a7e10410095ad`.
+All5,952 records matched before this plan update; fmt0. The two corrected
+files' final UBS is0critical/834warning/242info, statusok/failed_modules[].
+Main is unfrozen; the isolated old-order negative-control build259 remains
+frozen. Do not credit it until it actually fails at the intended held-lock
+assertion and the same test then passes with the real notifications.
+
+The strict isolated36-case rerun249 has a clean source barrier but RED100
+behavior:35passed/1failed/11,308excluded in123.673s, receipt
+`5e534ff5eb06bfdb8672bf8092478eb82e7716d5d6a1ac54bc2eb84613734eb1`;
+all3,899 records match. All three original fixture cases pass (FLOCK0.011s,
+HTTP2.898s, archive22.756s), original HTTP cancellation32.857s and five-worker
+join1.603s also pass. The failure is the original cancelled lazy initializer
+case: cancellation returns every slot/count correctly, then a fresh caller
+times out acquiring after the initializer owner is released. Total15.502s.
+No larger deadline or ignored test. Exact retained DB image
+`7b6a4eff51087805e0e19bb1befa142113ca5b4afbb94f7545fc5b772342a69b`
+passes a fresh same-worker replay0.82s and a debugger replay6.87s with no hit
+at the actual timeout branch. These do not explain or erase the first failure;
+.87 stays open for diagnosis. b666 doctor selftest6/6 and serialized real
+MCP decode/schema/write/read selftest5/5 pass in separate private fixtures,
+not as a replacement for the already-executed live HTTP flow.
+
+18:33UTC: fresh bounded fixture acceptance is complete; .85 is closed and its
+four source files committed as `4d38cda7`. Their final hashes match all three
+corrected-main compiler receipts. Runtime249 differs in startup_checks only by
+the three reviewed scanner comments; all five original fixture paths passed.
+The encompassing35/1 verdict is still red, not reclassified as a suite pass.
+
+The old-order notification regression also reaches its intended held-lock
+assertion in an ordinary untraced execution, exit101/7.65s. Earlier seed-timeout
+runs remain separate failures. Positive broad run260/hz4 is compiling against
+the real notifications, original lifecycle/cancellation families and all tests
+in the three changed service modules. Its isolated checkout remains frozen.
+
+A bounded procfs monitor of the exact retained DB image captured a fresh real
+initializer failure,101/15.64s: from0.102s the fsqlite-worker is D-state in
+`jbd2_log_wait_commit`, then from5.281s until14.972s in
+`folio_wait_bit_common`. The test thread waits on its completion. This explains
+that reproduced timeout as filesystem journal/page blocking, without proving
+the earlier249 stack or a lost runtime wake. No fsync, durability mode, pool
+deadline, assertion or workload was weakened. A9.07s successful ordinary
+replay measured the whole test including teardown, not acquisition latency;
+the initial commentary inference was explicitly corrected. Final failure-only
+duration/state logging is test-only in run260. Both .87 and .86 remain open
+until their final original behavioral acceptance is assessed.
+
 - [ ] Continue ready backlog in dependency order, informed by each terminal result.
   - [ ] Reader-safe recovery: original br-5nr0m/private-worker criteria and deadlines.
   - [ ] Capacity: original latency/error bounds, fixed offered-rate windows and real control.
