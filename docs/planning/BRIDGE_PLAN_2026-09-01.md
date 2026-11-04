@@ -105,7 +105,7 @@ their corresponding Bead's evidence; retain it as history rather than a new gate
   - [x] Add isolated real-worker regression: observe all five OS threads (including the replay supervisor), invoke common shutdown, require them gone.
   - [x] Formatting, UBS and required all-target/production/Clippy gates at frozen source; lib.rs scan0critical, many warnings disclosed.
   - [x] Run meaningful lifecycle, cleanup, pending replay and cancellation controls with nonzero cases (35/35 raw; separate source-barrier failure remains).
-  - [ ] Build/hash final executable; replay original stdio without changing its five-second gate.
+  - [x] Build/hash first notification executable: optimized263/ovh-a0, receipt22a7c7fe, three-way image7ebb32c2; unchanged quiet stdio is17pass/1fail/0skip at5,277ms, so .86 remains open.
   - [ ] Preserve acknowledged mail and crash/replay/archive behavior; no early exit or missing flush.
   - [ ] Diagnose and fix any remaining delay; keep this task open if the original stdio gate still fails.
     - [x] Preserve b666309b original quiet17pass/1fail/0skip: exact parse error, timeout143 at5,239ms.
@@ -115,8 +115,19 @@ their corresponding Bead's evidence; retain it as history rather than a new gate
     - [x] Execute the new regression against the old ordering as a consequential negative control; ordinary same-worker replay reaches the held-lock assertion (7.65s, exit101), distinct from earlier seed timeouts.
     - [x] Execute final positive regression and unchanged lifecycle/cleanup/cancellation families: real held-lock1.684s and retention1.576s pass; broader269-case run is262pass/7fail, not a green suite.
     - [x] Repeat required compiler/production/Clippy/fmt/UBS for the notification change; corrected visibility has all3 workspace gates0.
-    - [ ] Build/hash the notification candidate and repeat original quiet/loaded stdio plus actual mail/durability.
+    - [x] Repeat original quiet stdio and actual mail on7ebb32c2: quiet17/1/0 remainsred, actual task/identity/archive/refusal33/33 passes. Do not spend another full load run on this superseded known-red candidate; the follow-up still needs original loaded/durability acceptance.
   - [ ] Fresh solo acceptance before closure; no release/performance claim from a partial repair.
+  - [ ] Finish the remaining retention notification order after the7ebb32c2 quiet stdio failure.
+    - [x] Preserve unchanged native quiet17pass/1fail/0skip, timeout5,277ms, correct -32700 parse error; task stays open.
+    - [x] Inspect real worker timeline and existing lifecycle: active repair joined before replay is signaled, quota signaled last.
+    - [x] Reserve all five retention lifecycle files; add nonjoining stop requests under their existing lifecycle mutexes.
+    - [x] Notify every retention worker before common operator shutdown; retain all joins, independent lane cancellation, journal/flush/SQLite closeout.
+    - [x] Extend the real held-operator-mutex regression to observe all8service workers; keep the original5s bound and release-before-assert cleanup.
+    - [x] Preserve full candidate in private586d6f61 and prepare a control omitting only the new early-retention call; no source/threshold mock.
+    - [x] Run that exact consequential negative (intended held-lock failure6.271s,6f05e9d0), then positive1.401s, retention join1.276s and real HTTP/replay/cleanup/cancellation controls. Shared-worker whole selection remains32pass/4reader-cleanup failures, not green.
+    - [x] Fresh required all-target/production/strictClippy checks pass on the frozen follow-up; all5,952 records match each. UBS0critical/4,122warning/2,015info, no module failure. Three test-indent lines were manually corrected only after all source barriers; standalone fmt then passes0.
+    - [x] Commit the source-qualified notification repair as3c17ebde; every existing join/flush remains. Final combined source passes all three required compiler graphs, fmt and focused scanner.
+    - [ ] Build/hash the optimized follow-up and re-run original quiet/loaded stdio plus real mail/crash/archive effects; .86 remains open until its named acceptance passes.
 - [ ] br-kp1in.87: adopt the finished upstream pool cancellation repair.
   - [x] Reproduce unchanged real HTTP cancellation failure as ordinary UID1000.
   - [x] Capture real post-cancellation worker stacks; do not infer a surviving dispatch worker from stale accounting.
@@ -330,6 +341,154 @@ Dependency adoption is preserved as `ac255f04`; notifications/retention join as
 Formatting is freshly0. All corrected-main compiler gates remain valid for
 the same executable source. Build the actual optimized notification candidate
 and execute the original5s external stdio plus mail/crash/archive controls.
+
+19:31UTC: optimized main build263/ovh-a is terminal0,30m24s Cargo/1,877.3s
+end-to-end. Clean receipt
+`22a7c7feade36f00025dc328f185452e8a0ab908f1012d5fd45c8f4dff635d91`;
+all5,952 records freshly match main2f3819ba. Worker/delivered/retained image:
+`7ebb32c2cba05496f6171653fb522cb19882a44929dc4a202f998fecd8e1277e`,
+126,093,408bytes. Retained binary is
+`/data/tmp/am-ee-shutdown-final.08TPPT/debug/am`. Main is unfrozen; .88's
+isolated checkout remains frozen for its own source-bound compiler/tests.
+The original native quiet stdio suite is now running, with an existing exact
+prebuilt path and remote-required fallback protection. No own concurrent mail
+load is running. No result or original5s pass is claimed before completion.
+
+- [x] br-kp1in.88: make dedicated retention fixture children private under worker umask002 (f3302f26; bounded closure).
+  - [x] Preserve broad269-case result262/7 and all six original retention failures.
+  - [x] Exact old image4710c5ce under private077: parent-swap, active-reader and unpublished-attempt cases pass; three others remain red at deeper payload/directory assertions.
+  - [x] Use a previously unused numeric UID61425 with private0700 HOME/TMP and no account creation to test the complete-reader prerequisite.
+  - [x] Original large-backlog and refused-admission cases pass111.432/160.157s; hourly still fails1.93s. Independent5,320 fd/maps observations find0unobservable owned processes. This is a2/3result, not three passes.
+  - [x] Trace existing empty-directory cleanup: it is already wired and intentionally refuses incomplete reader inventory.
+  - [x] Patch only the existing exact-child branch with the existing safe nix umask API; route parent-swap through that helper. Parent process and production code are unchanged.
+  - [x] Fresh fmt0 and targeted scanner0critical/717warning/233info, statusok/failed_modules[]; no new allowance.
+  - [x] Verify parent002/child077 process-state witnesses on matching a6904332 server image: parent mask only0002, dedicated child0077, original parent-swap1/1 in10.03s, caller still002 before restore.
+  - [x] Complete required workspace all-target, separate production and strictClippy checks on frozen source: receipts29a1d180/9bb24f35/17e8aa9c, all3,899 records match each.
+  - [x] Execute final original family plus shared-file/hardlink/foreign-owner/live-reader negatives:275run274pass/1hourlyfail,11,070excluded,224.141s, clean receiptce072f54 and3,899 matching records. Foreign-UID tables supplement real filesystem/reader tests, not OS isolation qualification.
+  - [x] Fresh solo scoped acceptance and closure onf3302f26; the exact fixture file matches native and all three compiler receipts. Hourly .89, release and reader parents remain open.
+- [x] br-kp1in.89: fill the real keep window before the hourly reclamation assertion (3a789778; .88 prerequisite closed).
+  - [x] Preserve original shared-worker and private-UID hour0 failures and retained payload.
+  - [x] Establish canonical policy: cookbook614-626 and source1618+ rank resident and eligible historical images together; the current slot counts toward keep3.
+  - [x] Independent existing keep-count control passes1/1 in3.56s on exact4710c5ce; raising the window retains all historical bytes and lowering it reclaims exactly3.
+  - [x] Identify missing fixture precondition: slot+one historical image is inside keep3, not an eligible eviction. The720-cycle test was read as corroborating source only, never claimed executed.
+  - [x] After terminal source barriers, seed two real prior resident generations newer than historical2000 before the24hour loop; source diff confirmed the exact intended test, no unrelated fixture change.
+  - [x] Preserve every original scheduling/publication/count/bytes/blocks/empty-directory/live-content/verification assertion and budget.
+  - [x] Publish the precise corrected-oracle win/lose split: out-of-window historical images now exercise eviction; current-window, busy/unverified authority, operator/WAL, symlink and hardlink preservation remain required. Exact finala88image passes12/12 real original/control cases under qualified execution identity, including all24hour cycles51.684s.
+  - [x] Retain first observer-red12-pass run with3unclassified denials; demonstrate real OS zombie/live-readable/live-protected controls before correcting the observer. Fresh run reports8,455readable samples,2explicitZ/FD0/Threads1/noVM raw denials,0unresolved live/unknown denials,0monitorerrors; no retroclassification or production guard change.
+  - [x] Required final all-target/production/strictClippy/fmt/scanner gates pass; every5,952source record matches each compiler receipt. Fresh solo scoped review closes only .89 on3a789778. Broader reader/pool/stdio/capacity/release acceptance stays open.
+
+RCH holds are explicit: .88's initial cached namespace setup was killed before
+Cargo, the cache/clean-overlay planners inspected excluded fuzz dependencies,
+and one fixture test request was refused under critical disk/I/O pressure on
+hz4. These are zero-case refusals, not product failures or passes. No local
+compilation fallback, missing-sibling smuggling, pressure override or guard
+weakening was used. Full-source native qualification is executing on a verified
+Nextest0.9.143 VMI worker; all-target/production checks and an automatically
+admitted Clippy replacement have passed. Both first build
+refusals for main263 were retained and acknowledged actualexit1 after recovery.
+
+20:35UTC: the first notification binary7ebb32c2 passes the real33-step
+identity/reservation/mail/ack/reply/archive/refusal probe in9.949s, but original
+quiet stdio remains17pass/1fail/0skip at5,277ms. Correct -32700 output does not
+satisfy the original five-second process-exit bound. The newer retention
+notification patch preserves all joins/flushes and extends the held-operator
+lock regression to eight real service workers. Its old-order control is still
+compiling; no causal or external-stdio pass is claimed yet.
+
+Follow-up required compiler gates are now all terminal0: all-target271/hz3
+receipt`f4335d03016d60af1ed7f8dfca8e620cd2fca622c319148558cb3f5ffb8b01ea`,
+production274/hz2
+`7cf68b4b162596a5200c8fb5260a0c1914e401349c23e3ac261b022b34f7d774`,
+strictClippy272/hz4
+`c60c6a1557b398d285614c3dd8df4033c5fd17e866ab4e327a74ae4c30947a6f`.
+All5,952 files were freshly rehashed with0mismatches against each receipt before
+unfreezing main. A shell reporting mistake had masked fmt1 with a later diff
+check0. That claim was retracted in Bead3994; three test-chain indent lines
+were then manually fixed after all barriers, and standalone fmt passes0.
+The compiler receipts precede only that whitespace correction and this report.
+
+The natural-exit diagnostic's old elapsed_s includes binary hashing after
+process exit;7.62s/8.79s are observer totals, not exact exit latency. Worker
+disappearance timestamps remain valid. Its updated probe captures exit time
+before hashing; a retained-clone retry failed before execution because the
+old harness work directory no longer exists. That failure earns zero credit.
+
+.88's final275-case selection is executing, with11,070excluded. The original
+initializer/warmup and selected intentional reader refusals pass so far; the
+hourly case still fails at the known unfilled-window assertion. This is not a
+terminal aggregate result, and neither earlier pool failure is erased.
+
+20:42UTC: .88's selection is terminal100:274pass/1hourlyfail,11,070excluded,
+224.141s. Receipt`ce072f54b5c0e947fbe4f327f504ab4051a310b67f937e6dc75ce7030893b706`
+has all3,899 inputs matching before subsequent .89 edits. Final server image
+`a69043325e595ca7ffe7ebb4e5c9ed902ef54b765d472842aa1e9f9bbb27bf96`,
+2,145,506,848bytes, is retained at
+`/data/tmp/am-ee-private-child-final-images.j6OdSpLt/server-tests` with matching
+worker/local hashes. Its actual original parent-swap test passes1/1 in10.03s
+while procfs witnesses parent0002/child0077. Fresh scoped review closes only .88
+onf3302f26. The one remaining hourly failure is .89, with the two missing real
+resident generations now manually seeded and every original assertion intact.
+Fresh fixture fmt0 and UBS0critical/719warning/234info, statusok/failed_modules[].
+
+The VMI worker reached ENOSPC during the later physical image-copy attempt,
+after the native terminal receipt. Preserve that failed partial file; no worker
+cleanup or pressure override was used. The completed source image was instead
+copied to local storage. Upcoming combined-source compiler gates must use
+admissible workers; no shared-fleet mutation is authorized by this task.
+Main is frozen again for combined retention-notification/hourly-fixture gates;
+the separate old-order control checkout remains frozen until its own terminal
+source barrier. Pending execution and source checks earn no pass credit.
+
+21:25UTC: the combined source now passes all required workspace graphs:
+all-target275/hz4
+`4199a35b9e460d0410404bf33e6b2e3a2594ea5db267385a5d5d0192f9a0543d`,
+separate production278/hz2
+`c0495c3b940d8ccb52c2d5f4f574fdbaba4382271f8902be598ae32434832c9c`,
+strictClippy277/hz3
+`eaa1b938de4da2d513b9663f8b7240be6764ff95d0916f6c3388688b6732ffa7`.
+All5,952 inputs freshly match each receipt before this report update. Fmt0;
+seven changed-server files UBS0critical/4,841warning/2,245info, statusok with
+no failed modules. The fixture and lifecycle repairs are committed separately
+as3a789778 and3c17ebde; .89 is closed, .86 is still open.
+
+Consequential old-order8-worker control reaches its intended held-operator-lock
+assertion6.271s, clean6f05e9d0 receipt and3,899matching files. Its exactcf06d23e
+image is physically retained before rebuilding. Positive source279 has clean
+receipt`476170324d18a778ab9342d0bc42fe9efd4ca18217abe58dbc4aae5da0af1572`,
+all3,899records matching and no crate/Cargo/config mismatch against main.
+Actual8-worker positive1.401s,5-worker join1.276s, HTTPcancel30.431s and
+HTTPresponsiveness1.607s pass. The whole sharedUID1000 selection is32pass/4fail,
+5,464excluded,403.683s; keep-window,large-backlog,refused-admission and hourly
+cleanup failures stay red. The window case directly reports protected
+`/proc/251356/fd` PermissionDenied. No whole-suite or five-second stdio pass
+is inferred from these results.
+
+Exact final server image
+`a88e6950f9ba2173aef13ddd29f2943b072e82bf3c39274fb11fe32ab06bc750`,
+2,146,156,104bytes, is retained at
+`/data/tmp/am-ee-retention-qualified-final.R5uheQ0U/server-tests`, matching its
+worker hash. All six original retention cases plus six independent preservation
+controls pass12/12 under previously-unused numericUID61425, private0700 HOME/
+TMP/XDG/work, no extra groups/no-new-privs, no account creation. Every original
+assertion,24-hour cycle and240s per-case runner cap remains. The first observer
+is nevertheless RED:7,820readable samples and3unclassified raw fd denials.
+Those old events are not retroactively promoted.
+
+Independent real OS controls show a same-UID zombie withZ/FD0/Threads1/noVM
+returns fdEACCES, while a live nondumpable process also returnsEACCES with
+S/FD64/liveVM; an ordinary live process is readable. The corrected diagnostic
+records before/after evidence and still refuses live/unknown denials. A fresh
+complete12-case replay passes0 with8,455readable samples,2raw denials explicitly
+Z/FD0/Threads1/noVM both before and after,0live/unknown denials and0monitorerrors.
+No production reader guard changed; every UID61425 test process is gone.
+This is gate maintenance, not a retention performance win. The first dynamic
+diagnostic launch was refused by dcg before execution; explicit static child
+programs completed safely without allowlisting or bypass.
+
+Next: build/hash the optimized3c17ebde executable, keep original external5s and
+all actual mail/crash/archive acceptance, then update .86 from terminal results.
+Both quiet and loaded scope remain visible; no release or comparative
+performance claim follows from the scoped source/fixture repairs.
 
 - [ ] Continue ready backlog in dependency order, informed by each terminal result.
   - [ ] Reader-safe recovery: original br-5nr0m/private-worker criteria and deadlines.
@@ -567,7 +726,7 @@ No status represents whole-product release clearance.
 | 1 | 45 tools, 25 resources, stdio/HTTP (§Tools, §Modes) | Real FastMCP router, tools/resources modules; fresh HTTP inventory and stdio E2E | WORKING inventory/transports; full behavior/current-source compatibility remains br-bx73n, br-kp1in.2 |
 | 2 | Durable messages, replies, acknowledgements, retry safety (§Write Path, §Inbox Cursors) | `tools/messaging.rs`, DB queries/events, canonical archive; fresh exact-key replay/conflict and two-agent flow | WORKING small fixture; mixed/restart/history acceptance br-kp1in.1/.2/.9/.10, br-8j6cb |
 | 3 | Broadcast always refused (AGENTS rule2) | Hard BROADCAST_DISABLED branch, verified with real transport | WORKING; preserve the refusal |
-| 4 | DB-first acceptance eventually reaches committed Git (§Consistency) | Async WBQ/coalescer and `storage/recovery/message_reconcile`; no-read crash convergence passed in the candidate's small phase | PARTIAL; br-kp1in.13/.35, br-8j6cb, br-kp1in.19. A green message count does not prove every artifact/lease field |
+| 4 | DB-first acceptance eventually reaches committed Git (§Consistency) | Async WBQ/coalescer and `storage/recovery/message_reconcile`; captured b666309b native run converges10,563 DB/canonical messages and37,434 committed copies without client reads in33.288s, all mismatch lists empty | WORKING for that bounded source/run; broader PARTIAL br-kp1in.13/.35, br-8j6cb, br-kp1in.19. Every artifact/lease field and newer binary still need their own qualification |
 | 5 | Concurrent/restarted service loses no accepted data (§Footguns, §Recovery) | Real engine/pool, WAL and reconstruction guards; crash tests exist | PARTIAL; br-0flbu, br-htobc, br-kp1in.33, br-rhmqn. No fresh engine-corruption fix inferred from a successful recovery |
 | 6 | Safe backup/import/restore authority (§Diagnostics, §Recovery) | `db/snapshot*`, stable handles, CLI recovery election and verifier; latest private-worker preflight is source-present | PARTIAL; br-5nr0m, br-kp1in.63/.75/.76, br-xzgcj, br-8asz3, br-cdsge, br-3p187, br-hb3mk, br-oyget, br-cxsgx, br-yfzgx, br-dbt24, br-lkhxw |
 | 7 | Bounded memory, connections, disk and background work (§Config, §Performance) | Bounds/backpressure and FrankenSQLite0.4.13 index fix exist; upstream executable evidence is narrower than consumer qualification | PARTIAL; br-kp1in.44/.46, br-eru3j, br-v0ucm, br-qbhs0, br-asldx, br-oiok2. Ten-day/large-mailbox bounds not proved by a short empty-fixture smoke |
@@ -579,14 +738,14 @@ No status represents whole-product release clearance.
 | 13 | Responsive, usable 16-screen terminal console (§TUI) | All16 registry entries have real screens; poller, shared state, rendering and actions exist | PARTIAL; br-bdo5g, br-drvoq, br-l4fk6, br-kp1in.2, br-bx73n. Action-menu tool calls explicitly block the UI loop; .2 now explicitly owns a real contended-action PTY/liveness/effect probe. This is a proof gap, not a reproduced freeze |
 | 14 | Web inspection, share/export/full snapshot and real crypto (§Web, §CLI) | Real `/mail` routes; share snapshot/bundle/crypto pipeline, staged no-clobber publication | WORKING four GET routes only; broader PARTIAL/UNPROVEN br-kp1in.49/.52/.77, br-r1say, br-bx73n. Runtime metadata retention and Windows crash semantics need their own actual probes |
 | 15 | Truthful scalable robot/health/doctor output (§Robot, §Doctor) | Real robot and65-FM installed registry,27 auto-fixable; JSON smoke passed | PARTIAL; br-kp1in.12/.18/.19, br-am-health-endpoint-slow-false-fail-45e0e, br-valyz. Cheap health cannot certify every DB/archive semantic invariant |
-| 16 | Reversible scoped doctor repair/undo (§Doctor) | Detector→mutate chokepoint, backups/hash witnesses, election and quarantine | UNPROVEN fresh repair/undo at this source; br-kp1in.2, stable-authority/recovery tasks in#6. Shared live state was deliberately not a repair fixture |
+| 16 | Reversible scoped doctor repair/undo (§Doctor) | Detector→mutate chokepoint, backups/hash witnesses, election and quarantine; captured b666309b real selftest6/6 includes byte-identical undo, serialized MCP/write-read selftest5/5 | PARTIAL; these small real-path checks do not qualify every FM, live HTTP or newer source. br-kp1in.2 and stable-authority/recovery tasks in#6 stay open. Shared live state was not a repair fixture |
 | 17 | Useful lexical search and truthful optional hybrid (§Search) | Portable local TantivyBridge real; FrankenSearch hybrid optional compile feature plus runtime opt-in | WORKING basic lexical query; PARTIAL/UNPROVEN models/ranking/reader concurrency br-kp1in.7/.8/.18, br-ku0kl (current pin is already immutable, not a missing sibling) |
 | 18 | Useful LLM summaries and real TOON (§Tools, §Robot) | Real providers/fallback code plus explicitly substituted test lanes | UNPROVEN decisive real-model/encoder quality here; br-kp1in.7/.8. Stub success is not compensation |
 | 19 | Quiet, bounded, private ATC (§ATC) | Actual policy/effect/data-minimization modules and dedicated sidecar | PARTIAL; br-au76r, br-hwney, br-kp1in.1/.2. Dense policy tests do not prove no ordinary-mail spam during real idle/restart workflows |
 | 20 | Signed, transactional native install/update/container (§Installation) | Real six-platform release assets, signed manifests, staged-pair installers and built-in update verifier | PARTIAL; br-nq2kb, br-bx73n, br-kp1in.22/.45/.77, br-ah0au, br-r1say, br-quq4r, br-54v1u, br-p9zor, br-s1ejh, br-8n66x. Public artifacts are not proof that all candidate gates passed |
 | 21 | Intentional legacy migration and cutover (§CLI, transition plan) | Legacy import/recovery code exists, namespace and stable-authority fixes ongoing | PARTIAL; br-dbt24, br-lkhxw, br-hb3mk, br-yfzgx; product decisions br-ajiq8/br-95spu. No unauthorized repo migration or crates.io publication |
 | 22 | Fresh correctness gates actually detect defects (§Development) | Large consolidated nextest topology and source witnesses exist | PARTIAL; br-kp1in.3/.4/.28/.75/.81/.83, br-sox5q, br-ra7jp, br-qpacg. Golden independence and the late observed diagnostic-tree timeout were uncovered and now have populated acceptance tasks |
-| 23 | Honest operational performance (§Benchmarking) | Real native bench, load/soak/swarm harness and default budget gates | PARTIAL: fresh signed candidate breaches5s send p99 and emits RESOURCE_BUSY; br-kp1in.5/.6, br-v0ucm, br-qbhs0, br-bx73n. Historical Rust/Python tables were not revalidated |
+| 23 | Honest operational performance (§Benchmarking) | Real native bench, load/soak/swarm harness and unchanged default budgets; captured b666309b/public control each54pass/1fail, zero skipped suites | PARTIAL: candidate sendp99=16.687659s fails5s despite passing its correctness/error checks; no comparative win from different closed-loop populations/shared load. br-kp1in.5/.6, br-v0ucm, br-qbhs0, br-bx73n stay open; newer binary and historical Rust/Python tables are unqualified |
 | 24 | Accurate active operator/developer documentation (§Documentation) | Extensive contracts and current notes supersede many historical proposals | UNPROVEN full current-docs gate; the uncovered archive-member contradiction was corrected in both active README paragraphs under br-kp1in.82, with validator/artifact comparison and clean diff. No full-documentation or installer qualification follows from that small correction |
 | 25 | Privacy-safe public browser WASM replay (current browser work) | Dashboard WASM shares registry; sanitized deterministic replay and limited aggregate export are implemented | PARTIAL/UNPROVEN fresh native/WASM/privacy/artifact gates br-f9avw/.10, br-mq9q1. This is not the deferred live `/web-dashboard` mirror or permission to export mailbox content |
 
