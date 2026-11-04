@@ -7941,8 +7941,6 @@ dependencies = [
 [[package]]
 name = "sqlmodel-pool"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d090572646f14c79363c6a78fe073afdb2213b77421b1815b31a6761e1f3ffa2"
 dependencies = [
  "asupersync 0.5.0",
  "sqlmodel-core",

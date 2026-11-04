@@ -202,6 +202,11 @@ vendor/*
 !vendor/uring-fs/
 !vendor/uring-fs/**
 
+# GH#374: reproducible sqlmodel-pool 0.5.0 cancellation-accounting backport.
+!vendor/sqlmodel-pool/
+!vendor/sqlmodel-pool/**
+vendor/sqlmodel-pool/target/
+
 # Share viewer assets are bundled into the offline export viewer.
 !crates/mcp-agent-mail-share/viewer_assets/vendor/
 !crates/mcp-agent-mail-share/viewer_assets/vendor/**

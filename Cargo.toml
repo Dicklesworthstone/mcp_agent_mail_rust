@@ -14,7 +14,11 @@ members = [
   "crates/mcp-agent-mail-search-core",
   "crates/mcp-agent-mail-test-helpers",
 ]
-exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
+exclude = [
+  "experimental/*",
+  "crates/mcp-agent-mail-dashboard-wasm",
+  "vendor/sqlmodel-pool",
+]
 
 [workspace.package]
 version = "0.3.40"
@@ -203,6 +207,11 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
+# GH#374: backport the upstream pending-waiter Drop guard to the exact
+# registry 0.5.0 source. Keep the rest of SQLModel and the runtime graph pinned;
+# vendor/sqlmodel-pool/README.md records provenance and the scoped delta.
+sqlmodel-pool = { path = "vendor/sqlmodel-pool" }
+
 # beads_rust 0.6.0 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
 # The mailbox uses registry FrankenSQLite 0.4.13 (no patch).
@@ -226,8 +235,9 @@ fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", re
 fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# registry FrankenSQLite 0.4.13 and registry FastMCP 0.13.0.
+# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0 (with
+# only the pool's GH#374 waiter-accounting backport above), registry
+# FrankenSQLite 0.4.13 and registry FastMCP 0.13.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
 # Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus
 # the short-record decoder fix for rows made short by ADD COLUMN (br-2hpuk).
