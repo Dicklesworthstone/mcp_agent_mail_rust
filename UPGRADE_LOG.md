@@ -1,5 +1,105 @@
 # Dependency Upgrade Log
 
+## November 4, 2026 — Bound allocator amplification during mailbox reads (GH#372)
+
+The workspace keeps `mimalloc 0.1.52` / `libmimalloc-sys 0.1.49` and enables
+the supported `no_thp` feature. Both shipped binaries inherit this allocator
+configuration. On Linux and Android, the feature removes mimalloc's optional
+`MADV_HUGEPAGE` advice. It does not change host policy or guarantee small pages
+when the host enables THP unconditionally (`always`). FrankenSQLite 0.4.13,
+SQLModel, pager policy, schema, reader/writer coordination, crash recovery,
+and the explicit offline-only, backed-up VACUUM procedure are unchanged.
+
+### Native evidence and the regression contract
+
+Fresh Linux x86_64 processes reproduced the original system-allocator failure:
+one connection grew by 36,704 KiB and five by 53,304 KiB, measured as final
+`VmHWM` minus baseline `VmRSS`. Initial HWM equaled baseline RSS. The final
+five-connection RSS equaled HWM and the `smaps_rollup` RSS snapshot; this was
+real residency, not an earlier peak or a transient accounting discrepancy.
+About 24 MiB of the growth was executable-backed paging. The executable was
+on tmpfs, so Linux counted those mappings under `RssShmem`, not `RssFile`.
+No database-family mappings were present. The writer cached 500 pages and
+each reader five; cache capacity was not an allocated database image.
+
+The production allocator exposed an additional, larger amplification. The
+host's THP policy was `madvise`; mimalloc-backed sparse arenas acquired tens
+of MiB of anonymous huge pages. A same-executable `MIMALLOC_ALLOW_THP=0`
+control identified the mechanism, then a separate compiled-feature comparison
+verified the supported correction without that environment override.
+
+| Healthy 4,096-message fixture | One connection, KiB growth | Five connections, KiB growth | Conservative added-four-reader growth, KiB |
+|---|---:|---:|---:|
+| Original mimalloc, three repetitions | 51,984–52,240 | 89,696–90,016 | 38,032 |
+| Compiled `no_thp`, three repetitions | 42,984–43,308 | 55,016–55,144 | 12,160 |
+
+The last column is maximum five-connection growth minus minimum
+one-connection growth. Default and candidate ran together in each invocation.
+Across 24 paired healthy, sparse-index, dense-equivalent, and doubled-body
+processes, all writes, reads, schema/content witnesses, canonical integrity
+checks, and foreign-key checks passed. All 12 compiled-feature processes had
+zero observed `AnonHugePages`; default processes had 30–78 MiB. Cargo's
+201-package native artifact records differed only by `no_thp` on mimalloc and
+libmimalloc-sys. The C allocator used `MI_DEBUG=0`; its debug fill was not the
+cause. Exact run records, executable hashes, feature comparison, oracle
+results, and remaining limits are in the
+[measurement receipt](docs/evidence/gh372/20261104-connection-memory.json).
+The exact standalone [probe sources and lockfile](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/9725a4a2283d080a32a75dd2bc0ad77bd17c8101/scripts/gh372-memory-probe)
+match the source hashes in the native build receipts; the accepted comparison
+adds `mimalloc/no_thp` to `production-allocator`, without applying that snapshot's
+experimental bootstrap patch.
+
+The original **32 MiB total cold-process limit still fails**. The regression
+now preserves that raw metric for two fresh children, using separate copies
+of one pristine mailbox and equal query counts. Each child must stay within
+64 MiB of total growth, and four additional readers must add at most 32 MiB.
+Both absolute checks prevent a shared startup spike from disappearing in the
+comparison. The fixture contains 17.5 MiB of bodies, so four further complete
+resident body copies would add 70 MiB and fail the incremental bound.
+The measured original mimalloc fails both revised limits; compiled `no_thp`
+passes both. The system-allocator control is intentionally admitted because
+the original 32 MiB total budget also rejected one connection and a tiny
+five-connection mailbox. This is a calibrated contract for the fixed fixture,
+not a universal bound for arbitrary mailbox sizes. In particular, the doubled
+fixture reached 65,148 KiB with `no_thp`, close to the 65,536 KiB absolute cap.
+
+The default integration lane still uses the system allocator. The opt-in
+`test-mimalloc` feature uses the production allocator in the existing `it`
+binary, without adding another large integration target. Qualify both with
+the exact test filter `startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory`:
+
+```bash
+cargo test --locked -p mcp-agent-mail-db --no-default-features --test it \
+  startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory \
+  -- --exact --nocapture --test-threads=1
+cargo test --locked -p mcp-agent-mail-db --no-default-features \
+  --features test-mimalloc --test it \
+  startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory \
+  -- --exact --nocapture --test-threads=1
+```
+
+### Preservation checks and remaining qualification
+
+Both native allocator variants passed two focused preservation tests: four
+concurrent readers retained the prior committed overflow payload during
+uncommitted writes and observed all 16 commits; SIGKILL preserved an
+acknowledged commit and discarded the staged uncommitted update. Native and
+canonical SQLite content/integrity oracles passed. These are process-crash
+checks, not power-loss qualification. A proposed worker-bootstrap helper was
+rejected after native disassembly and repeated controls showed worker-stack
+RSS increased from 668 to 688 KiB without fixing the budget failure.
+
+The executed native diagnostic used the real SQLModel adapter and published
+FrankenSQLite 0.4.13, nightly-2026-08-31, Rust opt-level 1, debug info 0,
+debug assertions enabled, and 16 codegen units. It is not execution of the
+amended workspace integration binary: the workspace adds Asupersync TLS and
+`test-internals` features. The full working disk and remaining memory in the
+8 GiB build container prevented that larger build. Workspace compiler/Clippy
+gates, the two integration allocator lanes above, adjacent application
+regressions, release opt-level 3/LTO, sustained load/latency, THP `always`,
+and other operating systems/architectures remain unqualified by this work.
+No release is qualified and GH#372 remains open pending those results.
+
 ## November 1, 2026 — FrankenSQLite 0.4.13 (GH#372)
 
 The runtime mailbox engine uses the published `fsqlite =0.4.13` and

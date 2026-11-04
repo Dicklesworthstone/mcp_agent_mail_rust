@@ -61,7 +61,10 @@ beads_rust = { version = "=0.6.0", default-features = false }
 toon = { version = "0.2.4", package = "tru" }
 # GH#161: global allocator for the long-running serve-http daemon to avoid
 # glibc per-thread arena fragmentation (multi-GB retained RSS under load).
-mimalloc = "0.1"
+# GH#372: do not request transparent huge pages for sparsely touched allocator
+# arenas. On Linux with THP=madvise, five small database connections otherwise
+# fault in tens of MiB of extra 2 MiB pages. This leaves host THP policy alone.
+mimalloc = { version = "0.1", features = ["no_thp"] }
 
 # Internal workspace crates
 mcp-agent-mail-core = { path = "crates/mcp-agent-mail-core" }

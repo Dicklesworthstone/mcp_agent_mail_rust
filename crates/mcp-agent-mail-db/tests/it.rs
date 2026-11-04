@@ -12,6 +12,12 @@
 // compiler recursion budget as the tools integration target.
 #![recursion_limit = "256"]
 
+// Opt in to the same allocator and workspace features as the shipped binaries
+// without creating another integration-test binary or changing the default lane.
+#[cfg(feature = "test-mimalloc")]
+#[global_allocator]
+static TEST_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Shared helpers (tests/common/mod.rs); use them as `crate::common`.
 mod common;
 

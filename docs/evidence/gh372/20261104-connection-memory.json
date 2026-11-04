@@ -1,0 +1,1016 @@
+{
+  "title": "GH372 native allocator correction evidence",
+  "created_utc": "2026-11-04T20:11:05.759387+00:00",
+  "application_revision": "4b8ddf30f34a73cc2553bc95db8f906dd95328a6",
+  "decision": {
+    "verified_correction": "Enable supported mimalloc/no_thp feature for production allocator; original published FrankenSQLite0.4.13 remains unchanged.",
+    "mechanism": "On the observed madvise host, default mimalloc explicitly advises transparent huge pages, amplifying resident anonymous memory. Compiledno_thp removes allocator advice and zeroes observed AnonHugePages in all12 candidate processes.",
+    "original_32_mib_cold_gate": "FAIL; all24 final paired runs remain above32768KiB. This is a separate unresolved/measurement-qualification requirement.",
+    "rejected_candidate": "FrankenSQLite non-inlined bootstrap helper failed the gate and increased worker stack RSS668\u2192688KiB; not proposed for integration.",
+    "proposed_permanent_regression": {
+      "absolute_cold_growth_limit_kib": 65536,
+      "additional_four_reader_growth_limit_kib": 32768,
+      "metric": "Keep each fresh child's VmHWM after work minus baseline VmRSS, then compare five-connection and one-connection growth.",
+      "scope": "Fixed 4096-message fixture containing 17.5 MiB of bodies, with separate byte-identical copies and five query pairs per child.",
+      "workspace_test_executed": false,
+      "qualification": "This is an explicitly recalibrated permanent test contract. Native A/B evidence supports it, but the amended workspace integration binary remains unexecuted."
+    }
+  },
+  "metric": {
+    "definition": "max(0, subsequent VmHWM minus baseline VmRSS)",
+    "unit": "KiB",
+    "budget_kib": 32768,
+    "fresh_process_per_case": true,
+    "fixture_rows_and_body_bytes_are_verified": true,
+    "runtime_allocator_overrides": "MALLOC_CONF,_RJEM_MALLOC_CONF,MALLOC_ARENA_MAX,MIMALLOC_ALLOW_THP removed for final compiled-feature A/B.",
+    "pairing": "Default and candidate run in the same matrix invocation; order alternates by repetition."
+  },
+  "final_ab_groups": [
+    {
+      "variant": "mimalloc_default",
+      "fixture": "dense",
+      "connections": 1,
+      "repetitions": 1,
+      "growth_kib_min": 58320,
+      "growth_kib_max": 58320,
+      "anon_huge_pages_kib_min": 36864,
+      "anon_huge_pages_kib_max": 36864
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "dense",
+      "connections": 5,
+      "repetitions": 1,
+      "growth_kib_min": 101984,
+      "growth_kib_max": 101984,
+      "anon_huge_pages_kib_min": 79872,
+      "anon_huge_pages_kib_max": 79872
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "double",
+      "connections": 1,
+      "repetitions": 1,
+      "growth_kib_min": 64464,
+      "growth_kib_max": 64464,
+      "anon_huge_pages_kib_min": 43008,
+      "anon_huge_pages_kib_max": 43008
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "double",
+      "connections": 5,
+      "repetitions": 1,
+      "growth_kib_min": 87576,
+      "growth_kib_max": 87576,
+      "anon_huge_pages_kib_min": 63488,
+      "anon_huge_pages_kib_max": 63488
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 1,
+      "repetitions": 3,
+      "growth_kib_min": 51984,
+      "growth_kib_max": 52240,
+      "anon_huge_pages_kib_min": 30720,
+      "anon_huge_pages_kib_max": 30720
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 5,
+      "repetitions": 3,
+      "growth_kib_min": 89696,
+      "growth_kib_max": 90016,
+      "anon_huge_pages_kib_min": 65536,
+      "anon_huge_pages_kib_max": 65536
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "sparse",
+      "connections": 1,
+      "repetitions": 1,
+      "growth_kib_min": 58128,
+      "growth_kib_max": 58128,
+      "anon_huge_pages_kib_min": 36864,
+      "anon_huge_pages_kib_max": 36864
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "sparse",
+      "connections": 5,
+      "repetitions": 1,
+      "growth_kib_min": 95964,
+      "growth_kib_max": 95964,
+      "anon_huge_pages_kib_min": 71680,
+      "anon_huge_pages_kib_max": 71680
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "dense",
+      "connections": 1,
+      "repetitions": 1,
+      "growth_kib_min": 45492,
+      "growth_kib_max": 45492,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "dense",
+      "connections": 5,
+      "repetitions": 1,
+      "growth_kib_min": 58412,
+      "growth_kib_max": 58412,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "double",
+      "connections": 1,
+      "repetitions": 1,
+      "growth_kib_min": 53372,
+      "growth_kib_max": 53372,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "double",
+      "connections": 5,
+      "repetitions": 1,
+      "growth_kib_min": 65148,
+      "growth_kib_max": 65148,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 1,
+      "repetitions": 3,
+      "growth_kib_min": 42984,
+      "growth_kib_max": 43308,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 5,
+      "repetitions": 3,
+      "growth_kib_min": 55016,
+      "growth_kib_max": 55144,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "sparse",
+      "connections": 1,
+      "repetitions": 1,
+      "growth_kib_min": 47800,
+      "growth_kib_max": 47800,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "sparse",
+      "connections": 5,
+      "repetitions": 1,
+      "growth_kib_min": 61224,
+      "growth_kib_max": 61224,
+      "anon_huge_pages_kib_min": 0,
+      "anon_huge_pages_kib_max": 0
+    }
+  ],
+  "final_ab_runs": [
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 8772,
+      "initial_peak_kib": 8772,
+      "final_rss_kib": 61012,
+      "peak_kib": 61012,
+      "growth_kib": 52240,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 30720,
+      "smaps_samples": 46,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_default-healthy-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 4988,
+      "initial_peak_kib": 4988,
+      "final_rss_kib": 48296,
+      "peak_kib": 48296,
+      "growth_kib": 43308,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 49,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_no_thp-healthy-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 8836,
+      "initial_peak_kib": 8836,
+      "final_rss_kib": 98852,
+      "peak_kib": 98852,
+      "growth_kib": 90016,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 65536,
+      "smaps_samples": 58,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_default-healthy-adapter-5-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 4860,
+      "initial_peak_kib": 4860,
+      "final_rss_kib": 60004,
+      "peak_kib": 60004,
+      "growth_kib": 55144,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 62,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_no_thp-healthy-adapter-5-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 1,
+      "repeat": 1,
+      "baseline_kib": 4988,
+      "initial_peak_kib": 4988,
+      "final_rss_kib": 47972,
+      "peak_kib": 47972,
+      "growth_kib": 42984,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 57,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_no_thp-healthy-adapter-1-1.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 1,
+      "repeat": 1,
+      "baseline_kib": 8840,
+      "initial_peak_kib": 8840,
+      "final_rss_kib": 60824,
+      "peak_kib": 60824,
+      "growth_kib": 51984,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 30720,
+      "smaps_samples": 56,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_default-healthy-adapter-1-1.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 5,
+      "repeat": 1,
+      "baseline_kib": 4924,
+      "initial_peak_kib": 4924,
+      "final_rss_kib": 59940,
+      "peak_kib": 59940,
+      "growth_kib": 55016,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 59,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_no_thp-healthy-adapter-5-1.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 5,
+      "repeat": 1,
+      "baseline_kib": 8968,
+      "initial_peak_kib": 8968,
+      "final_rss_kib": 98664,
+      "peak_kib": 98664,
+      "growth_kib": 89696,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 65536,
+      "smaps_samples": 59,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_default-healthy-adapter-5-1.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 1,
+      "repeat": 2,
+      "baseline_kib": 8772,
+      "initial_peak_kib": 8772,
+      "final_rss_kib": 60884,
+      "peak_kib": 60884,
+      "growth_kib": 52112,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 30720,
+      "smaps_samples": 51,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_default-healthy-adapter-1-2.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 1,
+      "repeat": 2,
+      "baseline_kib": 5116,
+      "initial_peak_kib": 5116,
+      "final_rss_kib": 48424,
+      "peak_kib": 48424,
+      "growth_kib": 43308,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 52,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_no_thp-healthy-adapter-1-2.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "healthy",
+      "connections": 5,
+      "repeat": 2,
+      "baseline_kib": 8840,
+      "initial_peak_kib": 8840,
+      "final_rss_kib": 98536,
+      "peak_kib": 98536,
+      "growth_kib": 89696,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 65536,
+      "smaps_samples": 53,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_default-healthy-adapter-5-2.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "healthy",
+      "connections": 5,
+      "repeat": 2,
+      "baseline_kib": 5116,
+      "initial_peak_kib": 5116,
+      "final_rss_kib": 60196,
+      "peak_kib": 60196,
+      "growth_kib": 55080,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 62,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 19718144,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-healthy/mimalloc_no_thp-healthy-adapter-5-2.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "sparse",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 8812,
+      "initial_peak_kib": 8812,
+      "final_rss_kib": 66940,
+      "peak_kib": 66940,
+      "growth_kib": 58128,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 36864,
+      "smaps_samples": 94,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 46215168,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_default-sparse-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "sparse",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 4860,
+      "initial_peak_kib": 4860,
+      "final_rss_kib": 52660,
+      "peak_kib": 52660,
+      "growth_kib": 47800,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 88,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 46215168,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_no_thp-sparse-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "sparse",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 8708,
+      "initial_peak_kib": 8708,
+      "final_rss_kib": 104672,
+      "peak_kib": 104672,
+      "growth_kib": 95964,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 71680,
+      "smaps_samples": 110,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 46215168,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_default-sparse-adapter-5-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "sparse",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 4988,
+      "initial_peak_kib": 4988,
+      "final_rss_kib": 66212,
+      "peak_kib": 66212,
+      "growth_kib": 61224,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 99,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 46215168,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_no_thp-sparse-adapter-5-0.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "dense",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 8840,
+      "initial_peak_kib": 8840,
+      "final_rss_kib": 67160,
+      "peak_kib": 67160,
+      "growth_kib": 58320,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 36864,
+      "smaps_samples": 67,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 21839872,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_default-dense-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "dense",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 4988,
+      "initial_peak_kib": 4988,
+      "final_rss_kib": 50480,
+      "peak_kib": 50480,
+      "growth_kib": 45492,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 68,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 21839872,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_no_thp-dense-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "dense",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 8964,
+      "initial_peak_kib": 8964,
+      "final_rss_kib": 110948,
+      "peak_kib": 110948,
+      "growth_kib": 101984,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 79872,
+      "smaps_samples": 81,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 21839872,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_default-dense-adapter-5-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "dense",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 4928,
+      "initial_peak_kib": 4928,
+      "final_rss_kib": 63340,
+      "peak_kib": 63340,
+      "growth_kib": 58412,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 77,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 520,
+      "fixture_file_bytes": 21839872,
+      "rows_body_bytes": [
+        4096,
+        18350080
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_no_thp-dense-adapter-5-0.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "double",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 8776,
+      "initial_peak_kib": 8776,
+      "final_rss_kib": 73240,
+      "peak_kib": 73240,
+      "growth_kib": 64464,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 43008,
+      "smaps_samples": 85,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 39153664,
+      "rows_body_bytes": [
+        8192,
+        36700160
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_default-double-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "double",
+      "connections": 1,
+      "repeat": 0,
+      "baseline_kib": 4864,
+      "initial_peak_kib": 4864,
+      "final_rss_kib": 58236,
+      "peak_kib": 58236,
+      "growth_kib": 53372,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 110,
+      "worker_stack_rss_kib": 668,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 500,
+      "fixture_file_bytes": 39153664,
+      "rows_body_bytes": [
+        8192,
+        36700160
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_no_thp-double-adapter-1-0.log"
+    },
+    {
+      "variant": "mimalloc_default",
+      "fixture": "double",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 8776,
+      "initial_peak_kib": 8776,
+      "final_rss_kib": 96352,
+      "peak_kib": 96352,
+      "growth_kib": 87576,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 63488,
+      "smaps_samples": 88,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 524,
+      "fixture_file_bytes": 39153664,
+      "rows_body_bytes": [
+        8192,
+        36700160
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_default-double-adapter-5-0.log"
+    },
+    {
+      "variant": "mimalloc_no_thp",
+      "fixture": "double",
+      "connections": 5,
+      "repeat": 0,
+      "baseline_kib": 4860,
+      "initial_peak_kib": 4860,
+      "final_rss_kib": 70008,
+      "peak_kib": 70008,
+      "growth_kib": 65148,
+      "within_original_32_mib": false,
+      "observed_anon_huge_pages_max_kib": 0,
+      "smaps_samples": 88,
+      "worker_stack_rss_kib": 3340,
+      "worker_stack_coverage_complete": true,
+      "cached_pages": 524,
+      "fixture_file_bytes": 39153664,
+      "rows_body_bytes": [
+        8192,
+        36700160
+      ],
+      "log": "mimalloc-feature-size-density/mimalloc_no_thp-double-adapter-5-0.log"
+    }
+  ],
+  "oracles": {
+    "native_successful_processes": 24,
+    "candidate_processes": 12,
+    "stock_sqlite_integrity_check": "ok for24/24",
+    "foreign_key_check": "empty for24/24",
+    "schema_and_all_table_content_witness": "matched expected pristine seed plus only requested subject update for24/24",
+    "committed_write_and_parameterized_body_read": "native assertions passed for24/24",
+    "details": "run_matrix.py emits a result row only after these native and independent canonical checks pass; complete witnesses are retained in the two results.json files."
+  },
+  "source_graph_control": {
+    "packages": 201,
+    "feature_changes": [
+      {
+        "package_id": "registry+https://github.com/rust-lang/crates.io-index#libmimalloc-sys@0.1.49",
+        "before_feature_contexts": [
+          []
+        ],
+        "after_feature_contexts": [
+          [
+            "no_thp"
+          ]
+        ]
+      },
+      {
+        "package_id": "registry+https://github.com/rust-lang/crates.io-index#mimalloc@0.1.52",
+        "before_feature_contexts": [
+          [
+            "default"
+          ]
+        ],
+        "after_feature_contexts": [
+          [
+            "default",
+            "no_thp"
+          ]
+        ]
+      }
+    ],
+    "lock_sha256": "c5bbb485e59379e6e40b862b304e356a145e4205e869cf7b8302f48e6973c29d",
+    "manifest_sha256": "ec38c17f1ccf69e8ca03559d6978b7aab00c8d3c080704b7d3e140ff56c4d7dd",
+    "native_build_script": {
+      "path": "/workspace/scratch/c295f6f2eef5/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libmimalloc-sys-0.1.49/build.rs",
+      "sha256": "4917ec3e9a59e216b1b568ce37ea5cb97ba0ba1b9c50789a29d1cd429de9119f",
+      "observed_environment_receipt": "mimalloc-no-thp-native-build-settings.json",
+      "source_definition": "if target_os is linux/android and CARGO_FEATURE_NO_THP present, build.define(MI_NO_THP, 1); observed DEBUG=false and no debug feature select MI_DEBUG=0, MI_BUILD_RELEASE, NDEBUG"
+    },
+    "source_change": "none; Cargo feature forwarding only"
+  },
+  "compiler": {
+    "rustc_version": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+    "target_platform": {
+      "system": "Linux",
+      "node": "5fdcf93c5bcf",
+      "release": "6.18.57",
+      "version": "#1 SMP Tue Oct 20 21:56:04 UTC 2026",
+      "machine": "x86_64",
+      "processor": "x86_64"
+    },
+    "settings": {
+      "CARGO_HOME": "/dev/shm/gh372-native-rif7_gjb/cargo",
+      "CARGO_TARGET_DIR": "/dev/shm/gh372-native-rif7_gjb/target",
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_OPT_LEVEL": "1",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_OPT_LEVEL": "1",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "RUSTFLAGS": "-Zunstable-options --jobs-backend=1 --jobs-frontend=1",
+      "MALLOC_CONF": "dirty_decay_ms:0,muzzy_decay_ms:0,narenas:1",
+      "_RJEM_MALLOC_CONF": "dirty_decay_ms:0,muzzy_decay_ms:0,narenas:1",
+      "RUSTC_WRAPPER": "/dev/shm/gh372-native-rif7_gjb/compiler_probe.py",
+      "TMPDIR": "/dev/shm/gh372-native-rif7_gjb/tmp"
+    },
+    "allocator_c_mode": "Native build-script observation: Linux,CARGO_FEATURE_NO_THP=1,DEBUG=false,OPT_LEVEL=1; exact locked build.rs defines MI_NO_THP=1, MI_DEBUG=0, MI_BUILD_RELEASE,NDEBUG."
+  },
+  "preservation": [
+    {
+      "variant": "mimalloc-default",
+      "passed": true,
+      "tests_passed": 2,
+      "tests_failed": 0,
+      "tests_ignored": 1,
+      "filtered_out": 0,
+      "timeout_seconds": 600,
+      "timed_out": false,
+      "elapsed_seconds": 0.11469824199957657,
+      "binary": "/dev/shm/gh372-native-rif7_gjb/evidence/bin/registry-mimalloc-default-preservation",
+      "sha256": "fe30504f019941149fbe573883bddfdea67d9f5015aafc83f92dc29f6881b6cd",
+      "checks": [
+        "four concurrent readers with16commits and uncommitted overflow-payload isolation",
+        "SIGKILL preserves acknowledged committedrevision1 and discards staged uncommittedrevision2",
+        "native and independent stock-SQLite integrity/content oracles"
+      ]
+    },
+    {
+      "variant": "mimalloc-no-thp",
+      "passed": true,
+      "tests_passed": 2,
+      "tests_failed": 0,
+      "tests_ignored": 1,
+      "filtered_out": 0,
+      "timeout_seconds": 600,
+      "timed_out": false,
+      "elapsed_seconds": 0.16471503600041615,
+      "binary": "/dev/shm/gh372-native-rif7_gjb/evidence/bin/registry-mimalloc-no-thp-preservation",
+      "sha256": "4bc80df7010cccd40b1308cd829b7ef697de775f696c5c94563900542ffc83c3",
+      "checks": [
+        "four concurrent readers with16commits and uncommitted overflow-payload isolation",
+        "SIGKILL preserves acknowledged committedrevision1 and discards staged uncommittedrevision2",
+        "native and independent stock-SQLite integrity/content oracles"
+      ]
+    }
+  ],
+  "artifacts": {
+    "original_system": {
+      "path": "/dev/shm/gh372-native-rif7_gjb/evidence/bin/registry-baseline-system-memory-probe",
+      "bytes": 66755584,
+      "sha256": "400b5b76583a775d68e909111790d7b22ab2d0b3256fe7dfad67b86305f6e68d"
+    },
+    "default_mimalloc": {
+      "path": "/dev/shm/gh372-native-rif7_gjb/evidence/bin/registry-mimalloc-memory-probe",
+      "bytes": 66903360,
+      "sha256": "12c72578e841295207b1738e30fb398619a995d390b5a30b48a4871fa46c5c03"
+    },
+    "compiled_no_thp": {
+      "path": "/dev/shm/gh372-native-rif7_gjb/evidence/bin/registry-mimalloc-no-thp-memory-probe",
+      "bytes": 66903280,
+      "sha256": "7d9b928e979ac1e5b4586c7df4606cfab21d87e07288025a53d473c9a45b191f"
+    },
+    "preservation_mimalloc-default": {
+      "path": "/dev/shm/gh372-native-rif7_gjb/evidence/bin/registry-mimalloc-default-preservation",
+      "bytes": 62838984,
+      "sha256": "fe30504f019941149fbe573883bddfdea67d9f5015aafc83f92dc29f6881b6cd"
+    },
+    "preservation_mimalloc-no-thp": {
+      "path": "/dev/shm/gh372-native-rif7_gjb/evidence/bin/registry-mimalloc-no-thp-preservation",
+      "bytes": 62838864,
+      "sha256": "4bc80df7010cccd40b1308cd829b7ef697de775f696c5c94563900542ffc83c3"
+    }
+  },
+  "evidence_sources": [
+    {
+      "path": "mimalloc-feature-healthy/results.json",
+      "bytes": 241474,
+      "sha256": "6ae24374ead615525b33c2ffebfb2a5f8cfc919c13eb10a9d7bc0ee9b84d9fd4"
+    },
+    {
+      "path": "mimalloc-feature-healthy/attribution.json",
+      "bytes": 33003,
+      "sha256": "04d9397bac85e24b501881f98db87c2dbb667932e2a6bb2ebcf27b7bf82fe990"
+    },
+    {
+      "path": "mimalloc-feature-healthy-smaps-summary.json",
+      "bytes": 4407,
+      "sha256": "cbd209cdeb45cd96b86b68a00427db91ebc6fcab9b87767f42e468cc413472c2"
+    },
+    {
+      "path": "mimalloc-feature-healthy-invocation.json",
+      "bytes": 1195,
+      "sha256": "1f76195928354f7f35a9560f01f03b6803c7767f02997408b8be753e3701ccb1"
+    },
+    {
+      "path": "mimalloc-feature-size-density/results.json",
+      "bytes": 251561,
+      "sha256": "a536b4de52da1867608e1bd3aaea1bd72eb6c368e2e9e87b2e9504ed91430349"
+    },
+    {
+      "path": "mimalloc-feature-size-density/attribution.json",
+      "bytes": 33031,
+      "sha256": "6c72a446d10697f6138886567bac358d7cb0b2bc866f5118d8314acf470ebc5b"
+    },
+    {
+      "path": "mimalloc-feature-size-density-smaps-summary.json",
+      "bytes": 4455,
+      "sha256": "2b1768e3452c1d7fd448e8665487e5a38abf157a47cb010ee2ca71a1081a4682"
+    },
+    {
+      "path": "mimalloc-feature-size-density-invocation.json",
+      "bytes": 1443,
+      "sha256": "7b0d86d824b3a83f0233d49e302e700dc85fe0ba7635bc815d7674e26f562189"
+    }
+  ],
+  "prior_checkpoint": {
+    "path": "/dev/shm/gh372-native-rif7_gjb/native-memory-evidence-checkpoint.zip",
+    "bytes": 1278412,
+    "sha256": "0ec7a72e64f4bc8c1e46c820a1eaa976b5ea547a489d31cb2ba941775e27f632",
+    "verified_files": 264,
+    "note": "Prior immutable checkpoint predates these two summary files; contains all referenced final A/B and preservation evidence, excludes large binaries and synthetic database copies."
+  },
+  "limitations": [
+    "The standalone native A/B measurements retained the original 32 MiB cold-process threshold and VmHWM-minus-baseline-VmRSS metric; all 24 final runs fail it. The proposed permanent test changes that contract to separate 64 MiB absolute and 32 MiB incremental bounds, and has not yet executed in the workspace integration binary.",
+    "Rust diagnostic profile is opt-level1, debug-info0, debug assertions on, default16codegen units, incremental off, serial frontend/backend. This is not optimized-release/LTO qualification.",
+    "Standalone201-package graph lacks full Agent Mail workspace Asupersync TLS and test-internals feature unification; the original workspace integration test has not been run under that full graph here.",
+    "Native runtime verification is Linux x86_64 only on a THP madvise host. no_thp suppresses mimalloc MADV_HUGEPAGE advice; it does not guarantee absence of automatic THP on an always-policy host.",
+    "Executables and fresh synthetic copies reside on tmpfs due the full overlay; executable-backed RSS appears under RssShmem. The original total RSS/HWM metric still includes it.",
+    "Smaps AnonHugePages was sampled externally after exact executable and owned-fixture argv validation. These are observations, not a replacement peak-memory oracle.",
+    "Preservation tests cover process SIGKILL, not power loss or storage-device durability. Long-running production load/latency, other architectures and other operating systems remain unqualified."
+  ],
+  "current_resource_status": {
+    "captured_utc": "2026-11-04T20:11:05.759222+00:00",
+    "cgroup_limit_bytes": 8589934592,
+    "cgroup_current_bytes": 8526553088,
+    "cgroup_stat_bytes": {
+      "anon": 163004416,
+      "file": 7230029824,
+      "shmem": 4027383808,
+      "kernel": 1127649280,
+      "slab_reclaimable": 1115595376,
+      "slab_unreclaimable": 7461576,
+      "file_dirty": 106496,
+      "file_writeback": 0
+    },
+    "optimistic_anonymous_build_headroom_bytes": 4387492464,
+    "headroom_definition": "Limit minus current anonymous memory, tmpfs/shmem, and kernel memory excluding reclaimable slab; assumes ordinary file cache and reclaimable slab can be reclaimed. Not a guarantee.",
+    "cgroup_events": "low 0\nhigh 0\nmax 15851272\noom 102\noom_kill 24\noom_group_kill 0\n",
+    "overlay_bytes": {
+      "total": 67586535424,
+      "used": 67569758208,
+      "free": 0
+    },
+    "tmpfs_bytes": {
+      "total": 5225713664,
+      "used": 4027383808,
+      "free": 1198329856
+    },
+    "owned_native_jobs": "All completed; no new heavy build started.",
+    "old_generated_overlay_build_directory": "/workspace/scratch/c295f6f2eef5/diagnostics/memory-probe/target/debug/build",
+    "old_generated_overlay_allocated_bytes": 1652252672,
+    "deletion_performed": false,
+    "previous_native_asupersync_peak_kib": 7495728,
+    "previous_metadata_asupersync_peak_kib": 6891040,
+    "compile_feasibility": "Reclaiming the identified overlay directory would recover about1.54GiB of disk, not the3.64GiB occupied by live tmpfs evidence/targets/fixtures. Small cached builds, rustfmt or metadata inspection are feasible. A fresh workspace Asupersync build with TLS/test-internals is not presently feasible within the optimistic~4.2GiB anonymous headroom: earlier narrower native and metadata attempts required~7.15GiB and~6.57GiB respectively. Full workspace target disk demand is also unmeasured and may exceed recovered space. No deletion or further heavy compilation was attempted.",
+    "swap": {
+      "cgroup_swap_max": "max",
+      "cgroup_swap_current_bytes": 0,
+      "host_swap_total_kib": 0,
+      "host_swap_free_kib": 0,
+      "proc_swaps": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n",
+      "interpretation": "No host swap is configured, so tmpfs/shmem cannot be reclaimed by swapping."
+    }
+  },
+  "original_system_probe": {
+    "source": "registry-healthy-initial/results.json",
+    "source_sha256": "4614e0370bc7ad4e1113c4efe16d5d58bba1bddb1695a8f4f461854a9fca7a72",
+    "runs": [
+      {
+        "connections": 1,
+        "measured": {
+          "baseline_kib": 4644,
+          "initial_peak_kib": 4644,
+          "final_rss_kib": 41308,
+          "peak_kib": 41348,
+          "delta_kib": 36704,
+          "live_delta_kib": 36664
+        },
+        "within_original_32_mib": false
+      },
+      {
+        "connections": 5,
+        "measured": {
+          "baseline_kib": 4516,
+          "initial_peak_kib": 4516,
+          "final_rss_kib": 57820,
+          "peak_kib": 57820,
+          "delta_kib": 53304,
+          "live_delta_kib": 53304
+        },
+        "within_original_32_mib": false
+      }
+    ],
+    "qualification": "Standalone reproduction through the original published adapter/engine; full workspace integration test graph remains unverified."
+  }
+}
