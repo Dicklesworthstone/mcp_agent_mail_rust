@@ -1965,6 +1965,180 @@ mod tests {
     }
 
     #[test]
+    fn gh374_recently_inactive_large_inbox_uses_exact_fallback() {
+        let conn = walk_conn();
+        // A large but recently inactive inbox is different from the dense
+        // newest-page fixtures: none of the next 1,024 project messages is
+        // addressed to GreenStone. Bounded speculation must not hide its
+        // older mail or imply that the complete read has constant work.
+        seed_walk(
+            &conn,
+            (1, 25_100),
+            1,
+            |id| 1_000_000 + id * 1000,
+            |_| "normal",
+        );
+        seed_walk(
+            &conn,
+            (25_101, 26_124),
+            i64::MAX,
+            |id| 1_000_000 + id * 1000,
+            |_| "normal",
+        );
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        let filters = InboxFetchOptions {
+            body_policy: InboxBodyPolicy::MetadataOnly,
+            ..options()
+        };
+        let reference = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let started = std::time::Instant::now();
+        let expected = with_snapshot(&reference, || {
+            let newest = receipt_window(&reference, 1, 2, None, 5, filters)?;
+            hydrate(&reference, 1, newest, filters.body_policy, false)
+        })
+        .unwrap();
+        let reference_us = started.elapsed().as_micros();
+        let (_, reference_receipt_pages, _) = query_counts(&reference.calls.borrow());
+        assert_eq!(reference_receipt_pages, 25_100_usize.div_ceil(PAGE_SIZE));
+        assert_eq!(
+            expected
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            [25100, 25099, 25098, 25097, 25096],
+        );
+        for (hint, update, expected_header_pages) in [
+            ("accurate", None, 8),
+            (
+                "understated",
+                Some("UPDATE inbox_stats SET total_count = 64 WHERE agent_id = 2"),
+                1,
+            ),
+            (
+                "missing",
+                Some("DELETE FROM inbox_stats WHERE agent_id = 2"),
+                1,
+            ),
+        ] {
+            if let Some(update) = update {
+                conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+                conn.execute_raw(update).unwrap();
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            }
+            let recording = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let started = std::time::Instant::now();
+            let actual =
+                fetch_inbox_rows_from_conn_impl(&recording, 1, 2, None, 5, filters).unwrap();
+            let candidate_us = started.elapsed().as_micros();
+            same_rows(&actual, &expected);
+            assert!(actual.iter().all(|row| row.message.body_md.is_empty()));
+            let calls = recording.calls.borrow();
+            let (header_pages, receipt_pages, _) = query_counts(&calls);
+            let receipt_rows: usize = calls
+                .iter()
+                .filter(|(sql, _, _)| sql == RECIPIENT_PAGE_SQL || sql == RECIPIENT_NEXT_SQL)
+                .map(|(_, _, rows)| *rows)
+                .sum();
+            assert_eq!(header_pages, expected_header_pages, "{hint}");
+            assert_eq!(receipt_pages, reference_receipt_pages, "{hint}");
+            assert_eq!(receipt_rows, 25_100, "{hint}: exact history fallback");
+            assert!(
+                calls
+                    .iter()
+                    .all(|(_, binds, rows)| { *binds <= PAGE_SIZE && *rows <= PAGE_SIZE })
+            );
+            conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+            println!(
+                "{}",
+                serde_json::json!({"case":"gh374_recently_inactive_large_inbox",
+                    "hint":hint, "project_messages":26_124, "recipient_messages":25_100,
+                    "recent_other_recipient_messages":1024, "limit":5, "include_bodies":false,
+                    "speculative_header_pages":header_pages, "fallback_receipt_pages":receipt_pages,
+                    "fallback_receipt_rows":receipt_rows, "reference_receipt_pages":reference_receipt_pages,
+                    "candidate_sql_queries":calls.len(), "reference_us":reference_us,
+                    "candidate_us":candidate_us}),
+            );
+        }
+
+        // Cancellation during the exact fallback still releases the read
+        // scope and publishes no partial window, even on this larger history.
+        struct InterruptFallback<'a> {
+            conn: &'a DbConn,
+            cx: &'a Cx,
+            interrupted: Cell<bool>,
+            queries_after_cancel: Cell<usize>,
+        }
+        impl SyncQuery for InterruptFallback<'_> {
+            fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
+                if self.cx.is_cancel_requested() {
+                    self.queries_after_cancel
+                        .set(self.queries_after_cancel.get() + 1);
+                }
+                let rows = self.conn.query_sync(sql, params)?;
+                if sql == RECIPIENT_NEXT_SQL {
+                    self.interrupted.set(true);
+                    self.cx.set_cancel_requested(true);
+                }
+                Ok(rows)
+            }
+
+            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+                self.conn.execute_raw(sql)
+            }
+        }
+        let cx = Cx::for_testing();
+        let interrupted = InterruptFallback {
+            conn: &conn,
+            cx: &cx,
+            interrupted: Cell::new(false),
+            queries_after_cancel: Cell::new(0),
+        };
+        assert!(matches!(
+            crate::sync::fetch_inbox_filtered_rows_with_cx(
+                &cx,
+                &interrupted,
+                1,
+                2,
+                None,
+                5,
+                filters,
+            ),
+            Outcome::Cancelled(_)
+        ));
+        assert!(interrupted.interrupted.get());
+        assert_eq!(interrupted.queries_after_cancel.get(), 0);
+        assert!(conn.execute_raw("RELEASE SAVEPOINT am_inbox_read").is_err());
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+        let fresh_cx = Cx::for_testing();
+        let Outcome::Ok(reused) = crate::sync::fetch_inbox_filtered_rows_with_cx(
+            &fresh_cx, &conn, 1, 2, None, 5, filters,
+        ) else {
+            panic!("recently inactive inbox could not be read after cancellation");
+        };
+        same_rows(&reused, &expected);
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1,
+        );
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            26_124,
+        );
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+    }
+
+    #[test]
     fn gh374_shared_merge_bound_preserves_ties_filters_and_partial_windows() {
         let conn = walk_conn();
         conn.execute_raw(

@@ -202,6 +202,50 @@ impl Drop for StopConcurrentReaders<'_> {
     }
 }
 
+/// Keep latency evidence bounded even during the 45-minute qualification run.
+/// Buckets round up to milliseconds, so reported quantiles never round down.
+#[derive(Default)]
+struct InboxLatencyMeasurements {
+    count: usize,
+    maximum: std::time::Duration,
+    millis: std::collections::BTreeMap<u128, usize>,
+}
+
+impl InboxLatencyMeasurements {
+    fn observe(&mut self, elapsed: std::time::Duration) {
+        self.count += 1;
+        self.maximum = self.maximum.max(elapsed);
+        *self
+            .millis
+            .entry(elapsed.as_nanos().div_ceil(1_000_000))
+            .or_default() += 1;
+    }
+
+    fn percentile_ms(&self, percentile: usize) -> Option<u128> {
+        let rank = self.count.checked_mul(percentile)?.div_ceil(100);
+        if rank == 0 {
+            return None;
+        }
+        let mut observations = 0;
+        self.millis.iter().find_map(|(millis, count)| {
+            observations += count;
+            (observations >= rank).then_some(*millis)
+        })
+    }
+}
+
+#[derive(Default)]
+struct ReconciliationMeasurements {
+    scanned: usize,
+    unchanged: usize,
+    deferred_transient: usize,
+    peak_retry_len: usize,
+    budget_exhausted_batches: usize,
+    live_git_lock_checks: usize,
+    maximum_batch: std::time::Duration,
+    first_repair_ms: Option<u128>,
+}
+
 fn archive_test_outcome<T, E: std::fmt::Debug>(value: asupersync::Outcome<T, E>) -> T {
     match value {
         asupersync::Outcome::Ok(value) => value,
@@ -298,6 +342,9 @@ fn gh374_reconciliation_converges_with_live_git_writer_and_inbox_readers() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture"])
             .env(CHILD, name)
+            // Progress must remain observable before a large child finishes.
+            // Keep stdout captured to retain the exact-test execution check.
+            .stderr(std::process::Stdio::inherit())
             .output()
             .expect("run isolated real-concurrency test");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -399,6 +446,12 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
         .get_as::<i64>(0)
         .unwrap();
     let database_bytes = page_count.checked_mul(page_size).unwrap();
+    eprintln!(
+        "{}",
+        serde_json::json!({"case":"gh374_archive_progress", "phase":"seeded",
+            "messages":message_count, "database_bytes":database_bytes,
+            "seed_elapsed_ms":seed_elapsed_ms})
+    );
     drop(conn);
     let archive = ensure_archive(&config, "gh374").unwrap();
     let original = reconciliation_mailbox_evidence(&cx, &pool);
@@ -536,7 +589,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
     assert_eq!(reconciliation_mailbox_evidence(&cx, &pool), original);
     let start = Barrier::new(4);
     let started = Instant::now();
-    let (read_results, ordinary_writes, passes, repairs, final_retry_len) =
+    let (read_results, ordinary_writes, passes, repairs, final_retry_len, measurements) =
         std::thread::scope(|scope| {
             let _stop_on_unwind = StopConcurrentReaders(&stop);
             let mut readers = Vec::new();
@@ -550,8 +603,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
                     let _stop_on_exit = StopConcurrentReaders(stop);
                     let cx = Cx::for_testing();
                     let runtime = RuntimeBuilder::current_thread().build().unwrap();
-                    let mut count = 0;
-                    let mut slowest = Duration::ZERO;
+                    let mut latencies = InboxLatencyMeasurements::default();
                     start.wait();
                     while !stop.load(Ordering::Acquire) {
                         let read_started = Instant::now();
@@ -563,7 +615,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
                             elapsed < Duration::from_secs(30),
                             "inbox exceeded dispatch deadline: {elapsed:?}"
                         );
-                        slowest = slowest.max(elapsed);
+                        latencies.observe(elapsed);
                         assert_eq!(
                             inbox
                                 .iter()
@@ -583,10 +635,9 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
                             );
                             assert_eq!(row.kind, if agent_id == 102 { "to" } else { "bcc" });
                         }
-                        count += 1;
                         std::thread::sleep(Duration::from_millis(2));
                     }
-                    (count, slowest)
+                    latencies
                 }));
             }
             let writer = scope.spawn(|| {
@@ -632,14 +683,27 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
             let mut verify_restart = false;
             let mut passes = 0;
             let mut final_retry_len = None;
+            let mut measurements = ReconciliationMeasurements::default();
+            let mut last_progress = Instant::now();
             start.wait();
             for pass in 0..pass_limit {
                 assert!(
                     Instant::now() < deadline,
                     "reconciliation did not converge after {passes} passes / {repairs} repairs"
                 );
+                let batch_started = Instant::now();
                 let report =
                     reconcile_message_batch(&cx, &pool, &config, &mut cursor, &stop).unwrap();
+                measurements.maximum_batch =
+                    measurements.maximum_batch.max(batch_started.elapsed());
+                measurements.scanned += report.scanned;
+                measurements.unchanged += report.unchanged;
+                measurements.deferred_transient += report.deferred_transient;
+                measurements.peak_retry_len = measurements.peak_retry_len.max(report.retry_len);
+                measurements.budget_exhausted_batches += usize::from(report.budget_exhausted);
+                if report.repaired > 0 && measurements.first_repair_ms.is_none() {
+                    measurements.first_repair_ms = Some(started.elapsed().as_millis());
+                }
                 passes = pass + 1;
                 assert!(
                     report.scanned <= 32 && report.repaired <= 4,
@@ -661,6 +725,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
                     repo.path().join("index.lock").is_file(),
                     "repair broke active Git ownership"
                 );
+                measurements.live_git_lock_checks += 1;
                 assert_eq!(
                     std::fs::read(repo.path().join("index")).unwrap(),
                     held_index
@@ -676,6 +741,18 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
                 }
                 if repairs == message_count && report.retry_len == 0 && !verify_restart {
                     break;
+                }
+                if last_progress.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"case":"gh374_archive_progress", "phase":"reconciling",
+                            "elapsed_ms":started.elapsed().as_millis(), "passes":passes,
+                            "repairs":repairs, "messages":message_count,
+                            "scanned":measurements.scanned, "retry_len":report.retry_len,
+                            "deferred_transient":measurements.deferred_transient,
+                            "max_batch_ms":measurements.maximum_batch.as_millis()})
+                    );
+                    last_progress = Instant::now();
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -693,12 +770,27 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
                 "deferred repair debt did not drain"
             );
             assert!(
-                reads.iter().all(|(count, _)| *count >= 2),
-                "competing readers did not run: {reads:?}"
+                reads.iter().all(|latencies| latencies.count >= 2),
+                "competing readers did not run at least twice"
             );
             assert!(writes >= 2, "ordinary DB/archive writes did not run");
-            (reads, writes, passes, repairs, final_retry_len.unwrap())
+            (
+                reads,
+                writes,
+                passes,
+                repairs,
+                final_retry_len.unwrap(),
+                measurements,
+            )
         });
+    let reconciliation_elapsed_ms = started.elapsed().as_millis();
+    eprintln!(
+        "{}",
+        serde_json::json!({"case":"gh374_archive_progress", "phase":"converged",
+            "elapsed_ms":reconciliation_elapsed_ms, "passes":passes, "repairs":repairs,
+            "final_retry_len":final_retry_len})
+    );
+    let verification_started = Instant::now();
 
     // Quiesce the server's background sync before releasing the real writer,
     // so observing that writer's release cannot race a new, legitimate lock.
@@ -859,9 +951,22 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
             "initial_retry_len": initial_retry_len, "restored_retry_len": restored_retry_len,
             "convergence_budget_secs": convergence_budget.as_secs(),
             "passes": passes, "ordinary_writes": ordinary_writes, "elapsed_ms": started.elapsed().as_millis(),
+            "reconciliation_elapsed_ms": reconciliation_elapsed_ms,
+            "verification_elapsed_ms": verification_started.elapsed().as_millis(),
+            "scanned": measurements.scanned, "unchanged": measurements.unchanged,
+            "deferred_transient": measurements.deferred_transient,
+            "peak_retry_len": measurements.peak_retry_len,
+            "budget_exhausted_batches": measurements.budget_exhausted_batches,
+            "live_git_lock_checks": measurements.live_git_lock_checks,
+            "first_repair_ms": measurements.first_repair_ms,
+            "max_batch_ms": measurements.maximum_batch.as_millis(),
             "repeat_passes": repeat_passes, "repeat_unchanged": repeated_items,
-            "reader_counts": read_results.iter().map(|(count, _)| count).collect::<Vec<_>>(),
-            "max_read_ms": read_results.iter().map(|(_, latency)| latency.as_millis()).max(),
+            "reader_counts": read_results.iter().map(|latencies| latencies.count).collect::<Vec<_>>(),
+            "max_read_ms": read_results.iter().map(|latencies| latencies.maximum.as_millis()).max(),
+            "reader_latency_ms": read_results.iter().map(|latencies| serde_json::json!({
+                "p50":latencies.percentile_ms(50), "p95":latencies.percentile_ms(95),
+                "p99":latencies.percentile_ms(99), "max":latencies.maximum.as_nanos().div_ceil(1_000_000),
+            })).collect::<Vec<_>>(),
         })
     );
 }

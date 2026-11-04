@@ -15,6 +15,7 @@ use std::process::{Child, Command, Stdio};
 
 const HTTP_BOUND: Duration = Duration::from_secs(40);
 const WAIT_BOUND: Duration = Duration::from_secs(5);
+const MIN_READ_SAMPLES: u64 = 32;
 
 struct NativeServer {
     runtime: Runtime,
@@ -341,6 +342,42 @@ fn large_projection_overlaps(
     })
 }
 
+fn read_latency_summary(
+    samples: &[(&str, bool, Instant, Instant)],
+    agent: &str,
+    bodies: bool,
+    repair_windows: Option<&[(Instant, Instant)]>,
+) -> Value {
+    let mut durations = samples
+        .iter()
+        .filter(|(sample_agent, included, read_start, read_end)| {
+            *sample_agent == agent
+                && *included == bodies
+                && repair_windows.is_none_or(|windows| {
+                    windows.iter().any(|(repair_start, repair_end)| {
+                        read_start < repair_end && repair_start < read_end
+                    })
+                })
+        })
+        .map(|(_, _, start, end)| (*end - *start).as_micros())
+        .collect::<Vec<_>>();
+    durations.sort_unstable();
+    if repair_windows.is_none() {
+        assert!(
+            durations.len() >= 8,
+            "insufficient {agent} bodies={bodies} samples"
+        );
+    }
+    // A variant without a repair-overlapping request has no latency evidence.
+    // Serialize that absence as null, never as a fabricated zero-duration read.
+    let percentile = |percent: usize| {
+        (!durations.is_empty()).then(|| durations[(durations.len() * percent).div_ceil(100) - 1])
+    };
+    json!({"agent":agent, "include_bodies":bodies, "samples":durations.len(),
+        "p50_us":percentile(50), "p95_us":percentile(95), "p99_us":percentile(99),
+        "max_us":durations.last().copied()})
+}
+
 #[test]
 fn gh374_http_inbox_stays_responsive_during_reconciliation() {
     if run_prepared_http_test_in_child(
@@ -369,9 +406,11 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
             let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
             let mut repairs = 0;
             let mut repair_windows = Vec::new();
+            let mut maximum_batch = Duration::ZERO;
             let samples = Mutex::new(Vec::new());
             let mut passes = 0;
-            let wall_deadline = Instant::now() + Duration::from_secs(5 * 60);
+            let started = Instant::now();
+            let wall_deadline = started + Duration::from_secs(5 * 60);
             std::thread::scope(|scope| {
                 let reader = scope.spawn(|| {
                     let _stop_on_exit = StopReader(&stop);
@@ -407,6 +446,7 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
                     let report = reconcile_message_batch(&cx, &pool, &config, &mut cursor, &stop)
                         .expect("real reconciliation batch");
                     let end = Instant::now();
+                    maximum_batch = maximum_batch.max(end - start);
                     passes = pass + 1;
                     assert!(
                         !report.interrupted && report.deferred_conflict == 0,
@@ -418,6 +458,13 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
                     if report.repaired > 0 {
                         repair_windows.push((start, end));
                     }
+                    println!(
+                        "{}",
+                        json!({"case":"gh374_native_http_reconciliation_progress",
+                            "messages":count, "pass":passes, "elapsed_ms":started.elapsed().as_millis(),
+                            "batch_ms":(end-start).as_millis(), "total_repairs":repairs,
+                            "reads":reads.load(Ordering::Acquire), "report":report})
+                    );
                     let deadline = (Instant::now() + HTTP_BOUND).min(wall_deadline);
                     while reads.load(Ordering::Acquire) <= prior {
                         assert!(!stop.load(Ordering::Acquire), "HTTP reader failed");
@@ -439,7 +486,7 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
                         &repair_windows,
                     );
                     if passes >= 8
-                        && reads.load(Ordering::Acquire) >= 8
+                        && reads.load(Ordering::Acquire) >= MIN_READ_SAMPLES
                         && repairs > 0
                         && overlaps.iter().all(|count| *count > 0)
                     {
@@ -458,7 +505,9 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
             let large_overlaps = overlaps.iter().sum::<usize>();
             assert!((8..=64).contains(&passes));
             assert!(
-                repairs > 0 && reads.load(Ordering::Acquire) >= 8 && large_overlaps > 0,
+                repairs > 0
+                    && reads.load(Ordering::Acquire) >= MIN_READ_SAMPLES
+                    && large_overlaps > 0,
                 "missing concurrent native read/repair evidence"
             );
             for (bodies, overlap_count) in [(false, overlaps[0]), (true, overlaps[1])] {
@@ -492,12 +541,31 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
             assert_receipts_unchanged(&pool, count);
             wait_for_dispatch_drain();
             server.stop().expect("graceful HTTP shutdown");
+            let latencies = ["GreenStone", "RedFox"]
+                .into_iter()
+                .flat_map(|agent| {
+                    [false, true].map(|bodies| read_latency_summary(&samples, agent, bodies, None))
+                })
+                .collect::<Vec<_>>();
+            let overlapping_latencies = ["GreenStone", "RedFox"]
+                .into_iter()
+                .flat_map(|agent| {
+                    [false, true].map(|bodies| {
+                        read_latency_summary(&samples, agent, bodies, Some(&repair_windows))
+                    })
+                })
+                .collect::<Vec<_>>();
             println!(
                 "{}",
                 json!({"case":"gh374_native_http_reconciliation", "messages":count,
                 "large_mailbox":large, "reads":samples.len(), "overlapping_large_reads":large_overlaps,
                 "overlapping_large_metadata_reads":overlaps[0], "overlapping_large_body_reads":overlaps[1],
-                "repairs":repairs, "passes":passes, "max_read_ms":samples.iter()
+                "repairs":repairs, "passes":passes, "full_convergence_checked":false,
+                "elapsed_ms":started.elapsed().as_millis(), "read_latencies":latencies,
+                "overlapping_read_latencies":overlapping_latencies,
+                "max_batch_ms":maximum_batch.as_millis(),
+                "max_repair_batch_ms":repair_windows.iter().map(|(start,end)| (*end-*start).as_millis()).max(),
+                "max_read_ms":samples.iter()
                     .map(|(_,_,start,end)| (*end-*start).as_millis()).max().unwrap()})
             );
         },
@@ -601,31 +669,17 @@ fn gh374_http_cancelled_inbox_releases_waiter_and_dispatch_permit() {
                         ) || detail.contains("no connections available"))),
                 "unexpected failure: {response:#}"
             );
-            let deadline = Instant::now() + WAIT_BOUND;
-            loop {
-                read_pool.sample_pool_stats_now();
-                if mcp_agent_mail_core::global_metrics()
-                    .db
-                    .pool_pending_requests
-                    .load()
-                    == 0
-                    && DISPATCH_INFLIGHT.load(Ordering::Acquire) == 0
-                    && DISPATCH_ZOMBIES.load(Ordering::Acquire) == 0
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "cancelled worker retained waiter or permit: pending={} inflight={} zombies={}",
-                    mcp_agent_mail_core::global_metrics()
-                        .db
-                        .pool_pending_requests
-                        .load(),
-                    DISPATCH_INFLIGHT.load(Ordering::Acquire),
-                    DISPATCH_ZOMBIES.load(Ordering::Acquire),
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            // Prove worker/permit drain independently of the advisory wait
+            // counter. A leaked statistic must not hide whether the actual
+            // one-connection pool can serve the next request. Both remain
+            // strict assertions, but the accounting assertion runs after the
+            // post-timeout usability evidence has been collected.
+            wait_for_dispatch_drain();
+            read_pool.sample_pool_stats_now();
+            let pending_before_release = mcp_agent_mail_core::global_metrics()
+                .db
+                .pool_pending_requests
+                .load();
             assert_eq!(
                 mcp_agent_mail_core::global_metrics()
                     .db
@@ -633,18 +687,49 @@ fn gh374_http_cancelled_inbox_releases_waiter_and_dispatch_permit() {
                     .load(),
                 1
             );
-            drop(lease); // Drain must be proven while the contended connection is still held.
+            // Dispatch drain was proven while this contended lease was held.
+            drop(lease);
+            let mut followup_ms = Vec::new();
             for bodies in [false, true] {
-                let (response, _, _) = read_inbox(server.port, "GreenStone", bodies);
+                let (response, read_start, read_end) =
+                    read_inbox(server.port, "GreenStone", bodies);
                 assert_inbox(&response, "GreenStone", bodies, 8);
+                assert!(
+                    read_end - read_start < Duration::from_secs(30),
+                    "post-timeout inbox read exceeded dispatch deadline"
+                );
+                followup_ms.push((read_end - read_start).as_millis());
             }
-            assert_receipts_unchanged(&pool, 8);
             wait_for_dispatch_drain();
+            read_pool.sample_pool_stats_now();
+            let metrics = &mcp_agent_mail_core::global_metrics().db;
+            let pending_after_followup = metrics.pool_pending_requests.load();
+            let total_after_followup = metrics.pool_total_connections.load();
+            let active_after_followup = metrics.pool_active_connections.load();
+            let idle_after_followup = metrics.pool_idle_connections.load();
+            assert_receipts_unchanged(&pool, 8);
             server.stop().expect("graceful HTTP shutdown");
             println!(
                 "{}",
                 json!({"case":"gh374_native_http_cancel", "timeout_ms":(end-start).as_millis(),
-                "error":error, "waiter_drained_before_release":true, "permit_drained_before_release":true})
+                "error":error, "pending_before_release":pending_before_release,
+                "pending_after_followup":pending_after_followup, "total_after_followup":total_after_followup,
+                "active_after_followup":active_after_followup, "idle_after_followup":idle_after_followup,
+                "followup_read_ms":followup_ms, "permit_drained_before_release":true})
+            );
+            assert_eq!(
+                (
+                    total_after_followup,
+                    active_after_followup,
+                    idle_after_followup
+                ),
+                (1, 0, 1),
+                "cancelled request leaked pool capacity"
+            );
+            assert_eq!(
+                (pending_before_release, pending_after_followup),
+                (0, 0),
+                "pool was reusable but cancellation leaked pending-request accounting"
             );
         },
     );
