@@ -1028,9 +1028,15 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
 
 fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     tracing::info!("server transport exited; performing graceful shutdown of background services");
+    // Let independent sleepers stop while earlier services drain. Keep every
+    // join and the mailbox flushes below, in their existing ownership order.
+    integrity_guard::request_shutdown();
+    disk_monitor::request_shutdown();
+    maintenance::request_shutdown();
     stop_atc_operator_runtime();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    retention::shutdown();
     maintenance::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
@@ -19950,6 +19956,149 @@ mod tests {
             "got: {message}"
         );
         assert!(message.contains("run repair"), "got: {message}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdio_shutdown_notifies_sleeping_services_before_waiting_for_operator_lock() {
+        const TEST: &str =
+            "tests::stdio_shutdown_notifies_sleeping_services_before_waiting_for_operator_lock";
+        fn live_services() -> std::collections::BTreeSet<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("inspect real server threads")
+                .filter_map(|entry| {
+                    let entry = entry.expect("read server thread entry");
+                    let name = std::fs::read_to_string(entry.path().join("comm"));
+                    if name
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return None;
+                    }
+                    let name = name.expect("read server thread name");
+                    ["integrity-guard", "disk-monitor", "archive-mainten"]
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                        .then(|| entry.file_name().into_string().expect("numeric thread ID"))
+                })
+                .collect()
+        }
+
+        struct StopServices<'a>(&'a mcp_agent_mail_core::Config);
+        impl Drop for StopServices<'_> {
+            fn drop(&mut self) {
+                shutdown_runtime_services(self.0);
+            }
+        }
+
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let _cleanup = StopServices(&config);
+        integrity_guard::start(&config);
+        disk_monitor::start(&config);
+        maintenance::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_services().len() != 3 {
+            assert!(
+                Instant::now() < deadline,
+                "all three real services must start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        std::thread::scope(|scope| {
+            // Hold the actual first shutdown lock. Without early notifications,
+            // the other services keep sleeping until this lock is released.
+            let operator = lock_mutex(&ATC_OPERATOR_RUNTIME);
+            let shutdown = scope.spawn(|| shutdown_runtime_services(&config));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !live_services().is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let stopped_before_release = live_services().is_empty();
+            let waiting_for_operator = !shutdown.is_finished();
+            // Release before joining or asserting, including on a failed control.
+            drop(operator);
+            shutdown.join().expect("join shared shutdown");
+            assert!(
+                waiting_for_operator,
+                "shared shutdown must wait for its owner"
+            );
+            assert!(
+                stopped_before_release,
+                "sleeping services did not stop while the operator lock was held"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdio_shutdown_joins_all_retention_workers_before_closing_mailbox() {
+        const TEST: &str =
+            "tests::stdio_shutdown_joins_all_retention_workers_before_closing_mailbox";
+        fn live_retention_workers() -> std::collections::BTreeSet<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("inspect real server threads")
+                .filter_map(|entry| {
+                    let entry = entry.expect("read server thread entry");
+                    let name = std::fs::read_to_string(entry.path().join("comm"));
+                    if name
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return None;
+                    }
+                    let name = name.expect("read server thread name");
+                    [
+                        "retention-quota",
+                        "active-lease",
+                        "degraded-ack",
+                        "degraded-releas",
+                        "degraded-replay",
+                    ]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    .then(|| entry.file_name().into_string().expect("numeric thread ID"))
+                })
+                .collect()
+        }
+
+        struct StopRetention;
+        impl Drop for StopRetention {
+            fn drop(&mut self) {
+                retention::shutdown();
+            }
+        }
+
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        assert!(live_retention_workers().is_empty());
+        let _cleanup = StopRetention;
+        retention::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_retention_workers().len() != 5 {
+            assert!(
+                Instant::now() < deadline,
+                "all five real workers must start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        shutdown_runtime_services(&config);
+        // A joined thread's procfs entry may briefly outlive its user code.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !live_retention_workers().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "shared shutdown left retention workers alive: {:?}",
+                live_retention_workers()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

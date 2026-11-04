@@ -378,6 +378,15 @@ pub fn start(config: &Config) {
     drop(worker);
 }
 
+/// Stop resource sampling while earlier services finish their joins.
+/// The watchdog remains live until shutdown joins the resource worker.
+pub fn request_shutdown() {
+    let _worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
 pub fn shutdown() {
     let mut worker = WORKER
         .lock()
