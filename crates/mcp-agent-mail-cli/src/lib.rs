@@ -95891,6 +95891,60 @@ fn collect_prunable_reservation_archives(storage_root: &Path, retention_days: u6
     out
 }
 
+/// GH#362: the reservation archive reconciler republishes the release
+/// artifact of every released row that is still in the database. A prune
+/// therefore lasts only when the server's own retention deletes those rows at
+/// the same horizon or sooner. Returns an operator warning unless this
+/// process's configuration shows that.
+fn reservation_prune_republish_warning(config: &Config, retention_days: u64) -> Option<String> {
+    let db_prunes_rows = config.file_reservations_cleanup_enabled
+        && config.file_reservations_retention_days > 0
+        && config.file_reservations_retention_days <= retention_days;
+    (!db_prunes_rows).then(|| {
+        format!(
+            "released reservation rows stay in the database unless the server runs with \
+             FILE_RESERVATIONS_CLEANUP_ENABLED=true and FILE_RESERVATIONS_RETENTION_DAYS of \
+             {retention_days} or less; while a pruned artifact's row remains, the reservation \
+             archive reconciler republishes that artifact"
+        )
+    })
+}
+
+#[cfg(test)]
+mod reservation_prune_republish_warning_tests {
+    use super::{Config, reservation_prune_republish_warning};
+
+    fn config(cleanup_enabled: bool, db_retention_days: u64) -> Config {
+        Config {
+            file_reservations_cleanup_enabled: cleanup_enabled,
+            file_reservations_retention_days: db_retention_days,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn warns_whenever_the_database_keeps_pruned_rows() {
+        // Default configuration: database retention never runs.
+        let warning = reservation_prune_republish_warning(&config(false, 30), 30)
+            .expect("cleanup disabled keeps every released row");
+        assert!(
+            warning.contains("FILE_RESERVATIONS_CLEANUP_ENABLED=true"),
+            "{warning}"
+        );
+        assert!(warning.contains("of 30 or less"), "{warning}");
+        // Database retention longer than the prune horizon.
+        assert!(reservation_prune_republish_warning(&config(true, 30), 3).is_some());
+        // Database retention disabled by a zero horizon.
+        assert!(reservation_prune_republish_warning(&config(true, 0), 3).is_some());
+    }
+
+    #[test]
+    fn stays_quiet_when_database_retention_removes_the_rows_first() {
+        assert!(reservation_prune_republish_warning(&config(true, 30), 30).is_none());
+        assert!(reservation_prune_republish_warning(&config(true, 3), 30).is_none());
+    }
+}
+
 #[cfg(test)]
 mod reservation_archive_prune_tests {
     use super::reservation_archive_json_is_prunable;
@@ -95981,6 +96035,9 @@ fn handle_doctor_archive_normalize(
                  the retention horizon defaults to FILE_RESERVATIONS_RETENTION_DAYS"
                     .to_string(),
             ));
+        }
+        if let Some(warning) = reservation_prune_republish_warning(&config, retention_days) {
+            output::warn(&warning);
         }
         let candidates = collect_prunable_reservation_archives(&storage_root, retention_days);
         if !candidates.is_empty() {

@@ -165,6 +165,15 @@ alongside the current unlink policy and its real-process and retention tests.
   The [operator cookbook](docs/OPERATOR_COOKBOOK.md) documents the
   same-repository requirement.
 
+### Released-reservation prune warning (GH#362)
+
+- **`am doctor archive-normalize --prune-released-reservations` warns when the
+  prune will not last.** The reservation release reconciler republishes the
+  release artifact of every released row still in the database. Unless the
+  CLI's configuration has `FILE_RESERVATIONS_CLEANUP_ENABLED=true` and a
+  non-zero `FILE_RESERVATIONS_RETENTION_DAYS` no larger than the prune horizon,
+  the command now says on stderr that pruned artifacts will come back.
+
 ### Other changes on main
 
 - **Reservation reads stay available while a writer holds the lock.** Reservation and mail-activity
