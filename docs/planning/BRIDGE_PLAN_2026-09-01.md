@@ -22,9 +22,24 @@ Another feature inventory or another release dashboard would not close those gap
   `.beads/beads.base.jsonl` was tracked-dirty; it is preserved. The checkout is
   44 commits ahead and 18 behind its cached remote; no pull, reset or history
   reconciliation was performed. Assessment/graph edits do not change runtime code.
+- A fresh fetch later confirmed18 remote-only commits ending
+  `8a107d96e6744b25d18ca29c30e07179b6c834b3`; remote main and its compatibility
+  mirror agree there. They include GH374 inbox/recovery qualification, recovery
+  authority changes and stable task identifiers. Local history also contains
+  unique runtime fixes and new assessment commits. The two trees differ in45
+  files with extensive overlapping source edits; neither a blind fast-forward
+  nor a force push is valid. Incoming source is inspected as an integration
+  boundary, not merged or qualified by the local run. Preserve both histories,
+  choose/reconcile one candidate, then qualify that combined source under the
+  existing br-bx73n acceptance. Stable task identifiers advertised only by the
+  incoming README are not claimed as tested in the local adjective+noun flow.
 - Installed pair: `/home/ubuntu/.local/bin/{am,mcp-agent-mail}`, version 0.3.38.
   Public latest release: v0.3.40, published November 1 at 03:27:13 UTC. These
   are three different evidence subjects, not interchangeable candidate identities.
+  The release tag7d94ecf pins FrankenSQLite0.4.10; the inspected source pins
+  0.4.13. The same displayed Agent Mail version therefore does not identify the
+  same runtime graph, and the packaged failures do not qualify or falsify the
+  newer source's engine fixes.
 - Downloaded v0.3.40 and v0.3.39 musl pairs were authenticated with the pinned
   Minisign key and each signed SHA256SUMS manifest before private extraction.
   Candidate `am` SHA256:
@@ -47,8 +62,10 @@ Another feature inventory or another release dashboard would not close those gap
   rewrite is independently visible in `core/src/mailbox_durability.rs:990`.
 - Separate production-check requests were refused before Cargo: parked-manifest
   dependency closure (RCH-E413/code103) or live-checkout protection. The first
-  full-workspace request ended at worker admission/queue timeout. A replacement
-  full workspace nextest is compiling on hz4; its terminal result is pending.
+  full-workspace request ended at worker admission/queue timeout. The hz4
+  replacement reached linking but became heavily I/O-bound; it was canceled
+  with wrapper exit143, with no native test verdict. A subsequent replacement
+  is compiling on newly available, low-I/O hz3; its terminal result is pending.
   Formatting passed. No fresh full check/production/strict-Clippy pass is claimed.
 - The unchanged paired release smoke uses the signed v0.3.40 candidate and
   signed v0.3.39 control in one invocation. The candidate has already failed the
@@ -58,7 +75,7 @@ Another feature inventory or another release dashboard would not close those gap
   no remaining uncommitted copies. The final300s sample exhausted its observation
   deadline; its zero counts are unobserved values, not an empty archive. All7,258
   acknowledged swarm sends survived SIGKILL in SQLite, and stopped independent
-  integrity passed. The control and final paired receipt remain pending.
+  integrity passed. The final paired receipt records FAIL for both arms.
   Earlier candidate phases preserved all 336 acknowledged IDs after
   SIGKILL, converged the archive without helpful client reads, passed independent
   stopped-server integrity, and passed the five-minute mixed soak. Those passes
@@ -94,7 +111,7 @@ No status represents whole-product release clearance.
 | 10 | Product bus, macros and build slots (§Cross-Repo Workflows) | Actual products/macros/build_slots modules; not placeholder functions | UNPROVEN complete fresh workflow; br-kp1in.1/.2 and br-bx73n; disabled build-slot coordination must be explicit, not a performance claim |
 | 11 | Safe bare-am launch and explicit setup (§Quick Start, §Setup) | Real CLI launcher/server/TUI; setup is opt-in, healthy-owner attach defaults safe | PARTIAL fresh interactive/platform proof; br-bx73n, br-17tyc. Do not resurrect the historical auto-rewrite/kill-on-port proposal |
 | 12 | Credentials and config writes preserve authority (§Config, §Threat Model) | Token handles, no-follow/stable directory mechanisms and private writes | PARTIAL; br-3cqr4, br-x2jf5, br-yfzgx, br-x0aie. Local trusted collaboration is not hostile multi-tenant isolation |
-| 13 | Responsive, usable 16-screen terminal console (§TUI) | All16 registry entries have real screens; poller, shared state, rendering and actions exist | PARTIAL; br-bdo5g, br-drvoq, br-l4fk6, br-bx73n. Action-menu tool calls explicitly block the UI loop; responsiveness during real contention needs proof before calling this a reproduced freeze |
+| 13 | Responsive, usable 16-screen terminal console (§TUI) | All16 registry entries have real screens; poller, shared state, rendering and actions exist | PARTIAL; br-bdo5g, br-drvoq, br-l4fk6, br-kp1in.2, br-bx73n. Action-menu tool calls explicitly block the UI loop; .2 now explicitly owns a real contended-action PTY/liveness/effect probe. This is a proof gap, not a reproduced freeze |
 | 14 | Web inspection, share/export/full snapshot and real crypto (§Web, §CLI) | Real `/mail` routes; share snapshot/bundle/crypto pipeline, staged no-clobber publication | WORKING four GET routes only; broader PARTIAL/UNPROVEN br-kp1in.49/.52/.77, br-r1say, br-bx73n. Runtime metadata retention and Windows crash semantics need their own actual probes |
 | 15 | Truthful scalable robot/health/doctor output (§Robot, §Doctor) | Real robot and65-FM installed registry,27 auto-fixable; JSON smoke passed | PARTIAL; br-kp1in.12/.18/.19, br-am-health-endpoint-slow-false-fail-45e0e, br-valyz. Cheap health cannot certify every DB/archive semantic invariant |
 | 16 | Reversible scoped doctor repair/undo (§Doctor) | Detector→mutate chokepoint, backups/hash witnesses, election and quarantine | UNPROVEN fresh repair/undo at this source; br-kp1in.2, stable-authority/recovery tasks in#6. Shared live state was deliberately not a repair fixture |
@@ -103,9 +120,9 @@ No status represents whole-product release clearance.
 | 19 | Quiet, bounded, private ATC (§ATC) | Actual policy/effect/data-minimization modules and dedicated sidecar | PARTIAL; br-au76r, br-hwney, br-kp1in.1/.2. Dense policy tests do not prove no ordinary-mail spam during real idle/restart workflows |
 | 20 | Signed, transactional native install/update/container (§Installation) | Real six-platform release assets, signed manifests, staged-pair installers and built-in update verifier | PARTIAL; br-nq2kb, br-bx73n, br-kp1in.22/.45/.77, br-ah0au, br-r1say, br-quq4r, br-54v1u, br-p9zor, br-s1ejh, br-8n66x. Public artifacts are not proof that all candidate gates passed |
 | 21 | Intentional legacy migration and cutover (§CLI, transition plan) | Legacy import/recovery code exists, namespace and stable-authority fixes ongoing | PARTIAL; br-dbt24, br-lkhxw, br-hb3mk, br-yfzgx; product decisions br-ajiq8/br-95spu. No unauthorized repo migration or crates.io publication |
-| 22 | Fresh correctness gates actually detect defects (§Development) | Large consolidated nextest topology and source witnesses exist | PARTIAL; br-kp1in.3/.4/.28/.75, br-sox5q, br-ra7jp, br-qpacg. Newly found unconditional golden writer has NO matching unfinished bead before this assessment |
+| 22 | Fresh correctness gates actually detect defects (§Development) | Large consolidated nextest topology and source witnesses exist | PARTIAL; br-kp1in.3/.4/.28/.75/.81/.83, br-sox5q, br-ra7jp, br-qpacg. Golden independence and the late observed diagnostic-tree timeout were uncovered and now have populated acceptance tasks |
 | 23 | Honest operational performance (§Benchmarking) | Real native bench, load/soak/swarm harness and default budget gates | PARTIAL: fresh signed candidate breaches5s send p99 and emits RESOURCE_BUSY; br-kp1in.5/.6, br-v0ucm, br-qbhs0, br-bx73n. Historical Rust/Python tables were not revalidated |
-| 24 | Accurate active operator/developer documentation (§Documentation) | Extensive contracts and current notes supersede many historical proposals | PARTIAL: README says archives contain exactly two members, while real signed musl archive and Bash validator allow README/LICENSE too. This specific contradiction lacks an unfinished bead |
+| 24 | Accurate active operator/developer documentation (§Documentation) | Extensive contracts and current notes supersede many historical proposals | UNPROVEN full current-docs gate; the uncovered archive-member contradiction was corrected in both active README paragraphs under br-kp1in.82, with validator/artifact comparison and clean diff. No full-documentation or installer qualification follows from that small correction |
 | 25 | Privacy-safe public browser WASM replay (current browser work) | Dashboard WASM shares registry; sanitized deterministic replay and limited aggregate export are implemented | PARTIAL/UNPROVEN fresh native/WASM/privacy/artifact gates br-f9avw/.10, br-mq9q1. This is not the deferred live `/web-dashboard` mirror or permission to export mailbox content |
 
 The frozen lockfile contains runtime FrankenSQLite0.4.13 and the distinct patched
@@ -135,7 +152,8 @@ uncovered gaps are golden mutation and the active archive-member documentation.
 only partially: major families are covered, but the two concrete uncovered
 defects and current-source proof remain. With the deduplicated additions and
 the existing full acceptance criteria executed successfully, the graph covers
-the present supported vision. Marking every issue closed without those probes
+  the present supported vision, including the late .83 artifact-stage finding
+  below. Marking every issue closed without those probes
 would not establish it. Deferred live browser parity, hostile multi-tenant
 isolation, federation and unauthorized publication are not silently added scope.
 
@@ -298,15 +316,124 @@ their original subjects. Terminal test results and the small docs fix follow.
    current strict-build admission/cache problems additionally obstruct honest
    verification; report generation does not repair them.
 4. **Would every old open/in-progress bead suffice?** Only partially before
-   this check, because two concrete gaps were untracked. With .81/.82 and the
+   this check, because concrete gaps were untracked. With .81/.82, the late .83
+   finding below and the
    refined existing acceptance actually met, the supported present vision is
    covered. Closing records alone cannot supply missing runtime evidence.
 5. **Previously uncovered goals:** goal22's retained golden independence and
-   goal24's active archive-member wording. Both now have specific tasks; the
+   bounded diagnostic artifact generation, and goal24's active archive-member
+   wording. These three concrete gaps now have specific tasks; the
    rest maps to existing owners. Deferred live browser parity and out-of-scope
    hostile multi-tenant isolation are not newly invented missing features.
 
-Terminal receipts and final graph validation remain pending.
+### Bounded implementation and process audit
+
+After the five refinement passes and graph checks, .82 was claimed and its two
+README paragraphs corrected manually. Both actual validators and the signed
+four-member musl archive were compared; Windows's every-entry non-empty rule
+remains explicit. `git diff --check` passed. Only this small documentation task
+was closed, with evidence and no installer/platform/runtime credit. .81 and every
+pre-existing unfinished issue retain their acceptance and status. The current
+unfinished count is95 (56 open,36 in-progress,3 blocked).
+
+The anti-ceremony review sampled the actual last12 commits and separately the
+eight most recent issue closures. The commit sample has10 PROCESS entries and2
+unqualified retention ENABLER candidates; it does not demonstrate a newly shipped
+runtime improvement. The separate closure sample has7 concrete USER-purpose
+fixes and1 test ENABLER, with scoped cited receipts rather than a whole-project
+clearance. Thus it would be wrong to call the entire project report-only, and
+equally wrong to label this report-heavy recent commit stream feature progress.
+Verdict for that commit window: DRIFTING if treated as delivery. This explicit
+operator-requested assessment is bounded PROCESS. Finish it; the next runtime
+block belongs to the original reader-safety/convergence/capacity probes and their
+actual repairs. The full filled worksheet is retained in the scratch evidence
+root, with no new framework or proposed governance program.
+
+### Completed paired executable gate
+
+The unchanged harness finished both arms at05:23:51 UTC on thinkstation1, with
+the default300s soak/300s convergence/60-agent480s swarm and5s tool p99 limit.
+`release_smoke/release_smoke_receipt.json` under the native artifact root records
+candidate FAIL and control FAIL. Its SHA256 is
+`5f188d20ae4af08b37f9d2a8665617215af968b4930eb8b976fddd6b9063a3f2`;
+harness SHA256 is
+`04210cb8d6f92e73319890cda0393462624dfea432cf2e324a855918ac59df2d`.
+Both observed server executable hashes equal their respective authenticated
+candidate/control binary hashes. CPU governor was powersave; load averages were
+2.72/2.91/3.36 at start and5.02/7.13/8.22 at finish. These identify this run's
+conditions, not an all-host performance claim.
+
+| Phase | v0.3.40 candidate | v0.3.39 control |
+|---|---|---|
+| Basic flow / cross-project safe handling /16-client storm | PASS | PASS |
+| Crash / independent stopped integrity | PASS | PASS |
+| Five-minute mixed soak | PASS | FAIL: WBQ progress windows and health-stall agreement |
+|60-agent swarm | FAIL: send p99,1 RESOURCE_BUSY, archive convergence | FAIL: three tool p99s,28,570 send connection errors, WBQ progress, archive convergence |
+| Individual checks |52 pass /3 fail |47 pass /8 fail |
+| Acknowledged swarm sends retained after crash |7,258/7,258 |3,052/3,052 |
+
+Candidate send p99 is6.6477s, control10.4283s; control reservation/release p99s
+are23.3042s/24.1595s. The original absolute failures stand. Neither a relative
+timing difference nor a higher completed-send count qualifies a performance win
+when these functional/SLO gates fail. Unobserved control health windows are
+reported separately from observed stalls. The last populated candidate archive
+comparison and final deadline failure are retained separately above. There is
+no acknowledged-ID loss in the observed DB checks; this is not a power-loss or
+long-uptime corruption proof.
+
+**Late terminal finding — diagnostic machinery exhausted the native budget.**
+The original native command ended FAIL at3,600,021ms, suite exit124 (runner
+exit1), after both executable arms and their final receipt had completed.
+The330,984-file retained artifact tree has summary/meta/metrics and redacted
+environment output, but no completed `diagnostics/tree.txt`. Source and the
+observed remaining sort/bash process tree locate the unfinished stage at
+`e2e_write_diagnostics_files`→`e2e_tree`, which still starts a separate stat
+command substitution for every file. The later bundle-manifest path already
+batches hashing/stat; its existing optimization must not be rediscovered as
+new work. No test or artifact process survived the native timeout in the owned
+process-tree check.
+
+Filed br-kp1in.83 after deduplicating the full graph. It is a bounded repair to
+the existing diagnostic enumeration, with real same-scale inventory/error and
+end-to-end original-command proof, deterministic output, preserved artifact
+enforcement and no deadline/workload reduction. A repair cannot turn the paired
+runtime FAIL/FAIL into PASS. The issue was reviewed for scope, negatives,
+dependency direction, portability and its process-only benefit; no extra report
+framework or implementation-only closure task was added. br-bx73n now depends on
+both .81 and .83's populated probes. The final additions are two open gate bugs
+(.81/.83) and one completed small documentation correction (.82):96 unfinished,
+57 open,36 in-progress,3 blocked. This late observation extends goal22's existing
+proof work; it does not reopen the completed ambition/refinement cycle or imply
+new runtime capability.
+
+### Current-source gate execution boundary
+
+The hz4 full-workspace attempt30093240094949508 genuinely compiled and reached
+multiple test linkers, but after about an hour had not started nextest execution.
+A read-only10s process sample showed no linker CPU advancement, with full I/O
+pressure73.30% over60s/80.55% over300s and127GB available RAM. This is observed
+worker I/O pressure, not a source compiler/test failure. Once fleet capacity
+changed, hz3 had free slots,87GB disk and negligible sampled I/O pressure.
+Only the exact owned hz4 wrapper was canceled through `rch jobs cancel`.
+That RPC reported RCH-E504, but the original wrapper subsequently exited143;
+a fresh namespace-scoped process census found no remaining Cargo/Rustc/linker
+processes. A proposed pidfd signal was not executed because the wrapper had
+already exited. No shared daemon restart, lock removal, peer cancellation or
+source cleanup was performed. All original logs and the contradictory RPC
+outcome are retained.
+
+The replacement strict invocation is30093240094949522 on hz3, source-content
+root `source-content-30093240094949522-2bd17251505109a1/mcp_agent_mail_rust`,
+build label `1d8973dc5bc9b7a6a7eb1313870646b022c86b14-dirty`. Its runtime/test
+input bytes remain the same3,450-file witness as initial24d83dce; intervening
+local commits affect assessment/tracker/README metadata. Both requests use
+`RCH_REQUIRE_REMOTE=1 rch exec --worker <worker> --source-content-receipt -- cargo
+nextest run --locked --workspace`, with original feature graph and test limits.
+No local compile fallback or gate relaxation was used.
+
+The replacement full current-source workspace nextest and final graph/status
+checks remain pending. No source or release clearance is implied by the
+completed paired executable run or a partially linked build.
 No issue has been closed, no implementation owner changed, and no runtime feature
 credit is claimed by this assessment. It is operator-requested PROCESS; its
 consumer is the operator's completion/prioritization decision. The next runtime
