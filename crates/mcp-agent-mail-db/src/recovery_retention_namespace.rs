@@ -441,6 +441,8 @@ where
         .ok_or_else(|| invalid("reclaim directory has no name"))?;
     let parent = open_directory(parent_path, false)?;
     fs2::FileExt::try_lock_exclusive(&parent)?;
+    #[cfg(target_os = "linux")]
+    preflight_own_file_readers(&source, inventoried)?;
     let directory = File::from(rustix::fs::openat(
         &parent,
         name,
@@ -540,6 +542,8 @@ where
         .file_name()
         .ok_or_else(|| invalid("backup has no name"))?;
     let parent = open_directory(parent_path, false)?;
+    #[cfg(target_os = "linux")]
+    preflight_own_file_readers(&source, inventoried)?;
     let file = File::from(rustix::fs::openat(
         &parent,
         name,
@@ -616,7 +620,15 @@ fn inspect_snapshot_file_readers(
     inventoried: &Metadata,
     excluded_descriptor: Option<i32>,
 ) -> io::Result<SnapshotReaderEvidence> {
-    inspect_file_readers(source, inventoried, excluded_descriptor, true)
+    inspect_file_readers(source, inventoried, excluded_descriptor, true, false)
+}
+
+/// The final inventory must exclude our verifier, which is also visible in
+/// shared worker tables. Inspect private worker tables before opening it;
+/// excluding the same descriptor number there could hide an unrelated reader.
+#[cfg(target_os = "linux")]
+fn preflight_own_file_readers(source: &Path, inventoried: &Metadata) -> io::Result<()> {
+    inspect_file_readers(source, inventoried, None, false, true).map(|_| ())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -661,7 +673,7 @@ fn ensure_no_file_readers(
     retained_identity: &Metadata,
     excluded_descriptor: Option<i32>,
 ) -> io::Result<()> {
-    inspect_file_readers(source, retained_identity, excluded_descriptor, false).map(|_| ())
+    inspect_file_readers(source, retained_identity, excluded_descriptor, false, false).map(|_| ())
 }
 
 /// An actual, persistent procfs denial with readable kernel identity evidence
@@ -694,6 +706,7 @@ fn inspect_file_readers(
     retained_identity: &Metadata,
     excluded_descriptor: Option<i32>,
     superseded_snapshot: bool,
+    own_process_only: bool,
 ) -> io::Result<SnapshotReaderEvidence> {
     const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
     let canonical_source = source.canonicalize()?;
@@ -734,6 +747,18 @@ fn inspect_file_readers(
     // repeating their shared mappings. Before verification opens a handle,
     // this also covers our own workers with unshared descriptor tables.
     let mut evidence = SnapshotReaderEvidence::default();
+    if own_process_only {
+        inspect_process_reader_inventory(
+            &Path::new("/proc").join(own_process),
+            own_pid,
+            &self_status,
+            retained_identity,
+            &canonical_source,
+            None,
+            &mut charge,
+        )?;
+        return Ok(evidence);
+    }
     for entry in std::fs::read_dir("/proc")? {
         charge()?;
         let entry = match entry {
@@ -1874,6 +1899,192 @@ mod tests {
         drop(reader);
         delete_empty_reclaim_directory(&path, &inventoried).unwrap();
         assert!(!path.exists());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        not(target_feature = "crt-static")
+    ))]
+    #[test]
+    fn reclamation_preserves_our_workers_private_descriptor_tables() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        const ROLE: &str = "AM_RETENTION_OWN_WORKER_ROLE";
+        const ROOT: &str = "AM_RETENTION_OWN_WORKER_ROOT";
+        let wait_for = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(Instant::now() < deadline, "worker did not publish {path:?}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        if let Some(role) = std::env::var_os(ROLE) {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let source = root.join("candidate");
+            let is_directory = role == "directory";
+            if is_directory {
+                std::fs::create_dir(&source).unwrap();
+            } else {
+                assert_eq!(role, "file");
+                std::fs::write(&source, b"retained recovery evidence").unwrap();
+            }
+            let identity = std::fs::metadata(&source).unwrap();
+            wait_for(&root.join("ready"));
+            let witness = std::fs::read_to_string(root.join("ready")).unwrap();
+            let witness: Vec<u64> = witness
+                .split_whitespace()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            assert_eq!(witness.len(), 4);
+            assert_eq!(witness[0], u64::from(std::process::id()));
+            assert_ne!(witness[1], witness[0], "reader must be a worker thread");
+            assert_eq!((witness[2], witness[3]), (identity.dev(), identity.ino()));
+            let reclaim = || {
+                if is_directory {
+                    delete_empty_reclaim_directory(&source, &identity)
+                } else {
+                    delete_inventoried_file(&source, &identity).map(|_| ())
+                }
+            };
+            let refused = reclaim();
+            // Always release the private worker, even when testing an old,
+            // broken executable. Its closed witness records the held inode.
+            let preserved = source.exists();
+            std::fs::write(root.join("release"), b"close reader").unwrap();
+            wait_for(&root.join("closed"));
+            let links: u64 = std::fs::read_to_string(root.join("closed"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert!(preserved, "candidate removed with private reader held");
+            assert!(links > 0, "private reader observed an unlinked inode");
+            if !is_directory {
+                assert_eq!(
+                    std::fs::read(&source).unwrap(),
+                    b"retained recovery evidence"
+                );
+            }
+            reclaim().unwrap();
+            assert!(
+                !source.exists(),
+                "cleanup must resume after the reader closes"
+            );
+            return;
+        }
+
+        let root = fixture();
+        let source = root.join("worker.c");
+        let library = root.join("worker.so");
+        // Real pthread + CLONE_FILES separation in the actual Rust test
+        // process, without unsafe Rust or the deprecated unsound unshare API.
+        // The constructor never waits while holding the dynamic loader lock.
+        std::fs::write(
+            &source,
+            r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static void publish(const char *root, const char *name, const char *text) {
+    char temporary[PATH_MAX], target[PATH_MAX];
+    if (snprintf(temporary, sizeof temporary, "%s/%s.tmp", root, name) >= PATH_MAX ||
+        snprintf(target, sizeof target, "%s/%s", root, name) >= PATH_MAX) _exit(91);
+    int out = open(temporary, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW, 0600);
+    if (out < 0 || dprintf(out, "%s", text) < 0 || close(out) || rename(temporary, target)) _exit(92);
+}
+static void *reader(void *unused) {
+    (void)unused;
+    const char *root = getenv("AM_RETENTION_OWN_WORKER_ROOT");
+    char candidate[PATH_MAX], release[PATH_MAX], text[160];
+    if (unshare(CLONE_FILES) ||
+        snprintf(candidate, sizeof candidate, "%s/candidate", root) >= PATH_MAX ||
+        snprintf(release, sizeof release, "%s/release", root) >= PATH_MAX) _exit(93);
+    int fd = -1;
+    for (int n = 0; n < 10000; ++n) {
+        fd = open(candidate, O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+        if (fd >= 0) break;
+        if (errno != ENOENT) _exit(94);
+        usleep(1000);
+    }
+    struct stat identity;
+    if (fd < 0 || fstat(fd, &identity)) _exit(95);
+    snprintf(text, sizeof text, "%ld %ld %llu %llu\n", (long)getpid(),
+             (long)syscall(SYS_gettid), (unsigned long long)identity.st_dev,
+             (unsigned long long)identity.st_ino);
+    publish(root, "ready", text);
+    int released = 0;
+    for (int n = 0; n < 10000; ++n) {
+        if (!access(release, F_OK)) { released = 1; break; }
+        usleep(1000);
+    }
+    if (!released || fstat(fd, &identity) || close(fd)) _exit(96);
+    snprintf(text, sizeof text, "%llu\n", (unsigned long long)identity.st_nlink);
+    publish(root, "closed", text);
+    return NULL;
+}
+__attribute__((constructor)) static void start(void) {
+    if (!getenv("AM_RETENTION_OWN_WORKER_ROLE")) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, reader, NULL) || pthread_detach(thread)) _exit(97);
+}
+"#,
+        )
+        .unwrap();
+        let compiled = Command::new("cc")
+            .args([
+                "-std=c11",
+                "-O2",
+                "-fPIC",
+                "-shared",
+                "-pthread",
+                "-Wl,-z,now",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "worker compile failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for role in ["directory", "file"] {
+            let case_root = root.join(role);
+            std::fs::create_dir(&case_root).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "recovery_retention::namespace::tests::",
+                        "reclamation_preserves_our_workers_private_descriptor_tables"
+                    ),
+                    "--nocapture",
+                ])
+                .env(ROLE, role)
+                .env(ROOT, &case_root)
+                .env("LD_PRELOAD", &library)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{role} worker failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        }
     }
 
     #[test]
