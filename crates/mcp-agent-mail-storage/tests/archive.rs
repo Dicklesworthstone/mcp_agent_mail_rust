@@ -342,7 +342,9 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
         database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&temp.path().join("mail.db")),
         ..Config::default()
     };
-    let archive = ensure_archive(&config, "gh374").unwrap();
+    // Create the project's archive directory only after seeding: opening the
+    // pool registers any project it finds there, and the seed needs id 101.
+    std::fs::create_dir_all(&config.storage_root).unwrap();
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
         storage_root: Some(config.storage_root.clone()),
@@ -398,6 +400,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
         .unwrap();
     let database_bytes = page_count.checked_mul(page_size).unwrap();
     drop(conn);
+    let archive = ensure_archive(&config, "gh374").unwrap();
     let original = reconciliation_mailbox_evidence(&cx, &pool);
     assert_eq!(
         original["messages"].as_array().unwrap().len(),
@@ -774,7 +777,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
     let mut canonical_count = 0;
     head.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         if root.starts_with("projects/gh374/messages/")
-            && entry.name().is_some_and(|name| name.ends_with(".md"))
+            && entry.name().is_ok_and(|name| name.ends_with(".md"))
         {
             canonical_count += 1;
         }

@@ -75,12 +75,14 @@ fn seed_mailbox(count: i64) -> (Config, DbPool) {
          (1,1,'BlueLake','test','test',1,1),(2,1,'GreenStone','test','test',1,1), \
          (3,1,'RedFox','test','test',1,1)",
     ).expect("seed identities");
+    // Repair refuses a threaded row with no surviving bundle unless its archive
+    // metadata is recorded, so record the empty metadata of a fresh send.
     for first in (1..=count).step_by(128) {
         let end = (first + 127).min(count);
         let messages = (first..=end)
             .map(|id| {
                 format!(
-                    "({id},1,1,'gh374','subject-{id}','{}','high',1,{},'[]')",
+                    "({id},1,1,'gh374','subject-{id}','{}','high',1,{},'[]','{{}}')",
                     message_body(id),
                     1_700_000_000_000_000_i64 + id * 1_000,
                 )
@@ -97,7 +99,8 @@ fn seed_mailbox(count: i64) -> (Config, DbPool) {
         );
         conn.execute_raw(&format!(
             "BEGIN; INSERT INTO messages(id,project_id,sender_id,thread_id,subject,body_md, \
-             importance,ack_required,created_ts,attachments) VALUES {messages}; \
+             importance,ack_required,created_ts,attachments,archive_metadata_json) \
+             VALUES {messages}; \
              INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) VALUES {}; COMMIT",
             receipts.join(","),
         )).expect("seed bounded message batch");
@@ -356,7 +359,9 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
             let head_before = repo.head().unwrap().target();
             let blob = repo.blob(b"ordinary operator staging\n").unwrap();
             let mut git = GitWriter::start(&config.storage_root);
-            let held_index = std::fs::read(repo.path().join("index")).unwrap();
+            // A fresh archive has no index file until the deferred sync writes
+            // one. Git's lock keeps it absent or unchanged either way.
+            let held_index = std::fs::read(repo.path().join("index")).ok();
             let mut server = NativeServer::start(config.clone());
             let stop = AtomicBool::new(false);
             let reads = AtomicU64::new(0);
@@ -424,10 +429,7 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
                         "Git writer exited during repair"
                     );
                     assert!(repo.path().join("index.lock").is_file());
-                    assert_eq!(
-                        std::fs::read(repo.path().join("index")).unwrap(),
-                        held_index
-                    );
+                    assert_eq!(std::fs::read(repo.path().join("index")).ok(), held_index);
                     assert!(
                         Instant::now() < wall_deadline,
                         "HTTP/repair evidence exceeded five minutes after {passes} passes"
@@ -614,7 +616,13 @@ fn gh374_http_cancelled_inbox_releases_waiter_and_dispatch_permit() {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "cancelled worker retained waiter or permit"
+                    "cancelled worker retained waiter or permit: pending={} inflight={} zombies={}",
+                    mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load(),
+                    DISPATCH_INFLIGHT.load(Ordering::Acquire),
+                    DISPATCH_ZOMBIES.load(Ordering::Acquire),
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
