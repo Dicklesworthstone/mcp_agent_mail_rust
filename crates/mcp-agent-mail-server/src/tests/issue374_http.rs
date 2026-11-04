@@ -358,10 +358,11 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
             let repo = git2::Repository::open(&config.storage_root).unwrap();
             let head_before = repo.head().unwrap().target();
             let blob = repo.blob(b"ordinary operator staging\n").unwrap();
+            // Archive commits do not require an on-disk index. Establish the
+            // pre-existing operator index before the writer takes its lock.
+            repo.index().unwrap().write().unwrap();
             let mut git = GitWriter::start(&config.storage_root);
-            // A fresh archive has no index file until the deferred sync writes
-            // one. Git's lock keeps it absent or unchanged either way.
-            let held_index = std::fs::read(repo.path().join("index")).ok();
+            let held_index = std::fs::read(repo.path().join("index")).unwrap();
             let mut server = NativeServer::start(config.clone());
             let stop = AtomicBool::new(false);
             let reads = AtomicU64::new(0);
@@ -429,7 +430,10 @@ fn gh374_http_inbox_stays_responsive_during_reconciliation() {
                         "Git writer exited during repair"
                     );
                     assert!(repo.path().join("index.lock").is_file());
-                    assert_eq!(std::fs::read(repo.path().join("index")).ok(), held_index);
+                    assert_eq!(
+                        std::fs::read(repo.path().join("index")).unwrap(),
+                        held_index
+                    );
                     assert!(
                         Instant::now() < wall_deadline,
                         "HTTP/repair evidence exceeded five minutes after {passes} passes"

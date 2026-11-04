@@ -2333,7 +2333,7 @@ fn probe_storage_root(config: &Config) -> ProbeResult {
     }
 
     // Check writability via a unique, create_new probe to avoid clobbering files.
-    let probe_nonce = std::time::SystemTime::now()
+    let probe_nonce = std::time::SystemTime::now() // ubs:ignore -- Nonsecret filename; create_new below refuses collisions.
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
@@ -3708,7 +3708,7 @@ mod tests {
     #[test]
     fn sqlite_url_with_missing_parent_and_query_fails() {
         let mut config = default_config();
-        let nonce = std::time::SystemTime::now()
+        let nonce = std::time::SystemTime::now() // ubs:ignore -- Test-only missing-path fixture name.
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
@@ -3814,7 +3814,7 @@ mod tests {
 
     #[test]
     fn storage_probe_does_not_clobber_existing_probe_file() {
-        let nonce = std::time::SystemTime::now()
+        let nonce = std::time::SystemTime::now() // ubs:ignore -- Test-only directory fixture name.
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
@@ -3937,7 +3937,10 @@ mod tests {
 
     #[test]
     fn run_startup_probes_returns_results() {
-        let config = default_config();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
         let report = run_startup_probes(&config);
         // When an existing Agent Mail server is detected on the default port, the
         // preflight defers db-lock + integrity probes (6 results). Otherwise all 8
@@ -3951,7 +3954,11 @@ mod tests {
 
     #[test]
     fn run_stdio_startup_probes_omits_http_only_checks() {
-        let config = default_config();
+        // These probes open the real mailbox; never touch the shared default paths.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
         let report = run_stdio_startup_probes(&config);
         assert_eq!(report.results.len(), 5);
         assert!(!report.results.iter().any(|result| matches!(

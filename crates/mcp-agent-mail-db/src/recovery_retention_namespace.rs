@@ -4794,7 +4794,7 @@ os.close(handle)
             ("0 EOF", "0 4096"),
             ("EOF", "EOF extra"),
         ] {
-            let malformed = valid.replace(before, after);
+            let malformed = valid.replacen(before, after, 1);
             assert!(
                 !read_descriptor_flock(malformed.as_bytes(), &identity, 4242).unwrap(),
                 "{malformed}"

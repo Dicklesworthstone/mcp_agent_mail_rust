@@ -345,9 +345,9 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
         database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&temp.path().join("mail.db")),
         ..Config::default()
     };
-    // Create the project's archive directory only after seeding: opening the
-    // pool registers any project it finds there, and the seed needs id 101.
-    std::fs::create_dir_all(&config.storage_root).unwrap();
+    // Initialize Git without a project directory: pool startup imports any
+    // existing project archives, while this fixture seeds explicit identities.
+    mcp_agent_mail_storage::ensure_archive_root(&config).unwrap();
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
         storage_root: Some(config.storage_root.clone()),
@@ -366,6 +366,7 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
          (102,101,'GreenStone','test','test','',1,1),(103,101,'RedFox','test','test','',1,1); \
          INSERT INTO db_identity(singleton,generation_id) VALUES(0,'aabbccddeeff0011')",
     ).unwrap();
+    let archive = ensure_archive(&config, "gh374").unwrap();
     for first in (FIRST_ID..end_id).step_by(SEED_BATCH_SIZE) {
         let end = (first + i64::try_from(SEED_BATCH_SIZE).unwrap()).min(end_id);
         let messages = (first..end)
@@ -403,7 +404,6 @@ fn run_reconciliation_with_live_git_writer_and_inbox_readers() {
         .unwrap();
     let database_bytes = page_count.checked_mul(page_size).unwrap();
     drop(conn);
-    let archive = ensure_archive(&config, "gh374").unwrap();
     let original = reconciliation_mailbox_evidence(&cx, &pool);
     assert_eq!(
         original["messages"].as_array().unwrap().len(),
