@@ -5,9 +5,10 @@
 - [x] Test the inbox retry hypothesis against real kernel WAL locks using
   retained CLIbf35 and the unchanged HTTP harness. Original README flow19
   passes. A recovery-byte control returns the unchanged inbox; blocked reader
-  slots return it after release. With documented cache capacity1 and an evicted
-  agent lookup, a five-second reader-slot fence still succeeds with unchanged
-  populated content. No original four-BUSY reproduction, cause or repair is
+  slots return it after release. With documented cache capacity1 and a fresh
+  agent insertion, a five-second reader-slot fence still succeeds with unchanged
+  populated content. No cache-miss or per-call stage trace was captured, so
+  eviction/cold-lookup execution is not established. No original four-BUSY reproduction, cause or repair is
   inferred; do not increase retry budgets or patch lookup code speculatively.
 - [x] Attribute the reproducible 16,641-directory timeout on actual server
   image84588f86 in the existing UID65534/umask002/full-proc role. Preserve a
@@ -35,6 +36,80 @@
   yield 142 selected cases, with original workloads and deadlines unchanged.
 - [ ] Complete new-source compiler/native verification and the original
   large-directory gate before claiming its performance acceptance.
+  - [x] Preserve both first normal RCH jobs' 1,800-second transport timeouts
+    during dependency compilation: no tests executed. Recover only their
+    exact owned wrappers; both acknowledge remote exit137 with no replay.
+  - [x] Set per-invocation RCH build/test command ceilings to 14,400 seconds
+    for the cold compilation; preserve Nextest's original per-case deadlines,
+    all 142 selected cases, workloads, reader policy and admission gates.
+  - [x] Complete the new all-targets check on vmi1152480: remote compile
+    1,196.6 seconds, outer RCH exit0 in 1,224.0 seconds. The live source
+    witness has 3,896 matching present inputs and six historical omissions.
+  - [x] Preserve hz4's normal queue timeout and hz3's missing-Nextest failure,
+    each before compilation. Install the exact existing Nextest0.9.143 image
+    on hz3 without overwriting a file; local/hz4/hz3 SHA256 agree. Its retry
+    starts through normal strict RCH; live Nextest/Cargo source witnesses
+    again have 3,896 matches, six omissions and no changed present input.
+  - [x] Run formatting directly again; exit0.
+  - [x] Finish the separate production-feature check: remote compile692.7s,
+    outer RCH exit0 in712.2s. Strict workspace Clippy with warnings denied
+    also exits0. Preserve the initial empty Clippy source observation; the
+    admitted-process retry has3,896 matching inputs, six historical omissions
+    and no changed present files. All four required static gates pass.
+  - [ ] Finish the native 142-case run and retain the actual executed images;
+    compare ordinary-worker and consistent-role results separately. The hz3
+    client loses SSH at01:56 UTC while compiling dependencies; completion is
+    unconfirmed and all three actual-image collectors finish with zero records.
+    Original Nextest/Cargo later disappear. Preserve attach/recovery refusals:
+    the daemon retains this exact job's claim and recovery cannot obtain its
+    source locks. Supported cancellation records exit130 as an intent, with
+    terminal acknowledgement false; it is not an observed native exit code.
+    A separate normal strict RCH validation starts on vmi1152480 using the
+    identical frozen compiler checkout, all142 cases and original deadlines.
+    Its live Nextest/Cargo inputs again match3,896 present files with six
+    historical omissions and no changed present input. Local profile-env
+    requests are absent from the remote Cargo environment; do not claim those
+    settings were applied or change the running compilation's profile.
+  - [ ] Recheck the real five-mode reader guard and original 16,641-directory
+    gate using the new actual image, populations and 240-second deadline.
+  - [ ] Preserve terminal evidence durably on trj, update the original Beads,
+    and release only this block's owned file reservations. No performance
+    acceptance, original five-criterion closure or release clearance yet.
+- [x] Finish the authorized coordinator relocation of the inactive 18,617 MiB
+  se525 benchmark-artifact subtree. The larger 28,387 MiB parent fails the
+  external-hardlink guard and stays intact. The selected whole subtree passes
+  the complete six-hour/protection/Git/mount/hardlink/open/cwd guard. Preserve
+  the safety hook's three refused archive/stream forms; plain rsync copies to
+  a new private trj destination. Verify all contents/modes/owners/link targets,
+  archive and fsync there, then repeat the full source manifest and guard
+  before any cutover. The complete20,855-entry source/copy/archive manifests
+  match; the canonical original stream and archive share SHA256f3008daf8f42.
+  Archive size19,617,935,360 bytes; manifest SHA25612721e8f7a57. Preserve the
+  two SSH255 resets while remote verification/archive workers continued;
+  full data checks establish completion without inventing their exit codes.
+  Fresh source content and complete guards pass with unchanged mtime/ctime
+  maxima. Authorized cutover at2026-11-04T02:35:26Z raises root headroom
+  from495 to19,112MiB: measured net18,617MiB. The owned0775 restore stub
+  is synced and names full hashes. Fourteen exact operator receipts, the
+  authorization/command/UTC record and directory chain are verified/synced
+  on trj; the archive is protected. Earlier external headroom jumps are not
+  credited to this move. Active peer caches and the hard-linked parent stay.
+- [x] Run the retained CLIbf35 under a bounded mapper debugger observer with
+  all six original phases,60 agents/480 seconds,300-second soak/convergence
+  and unchanged deadlines. A real NOT_FOUND control proves each breakpoint;
+  no global ptrace-policy change. Flow/cross/storm/crash/soak pass. Swarm
+  reports zero tool errors and all10,298 acknowledged sends survive SIGKILL;
+  stock integrity passes. Send p99=5.410s and live archive convergence fail
+  under instrumentation, so no release/performance verdict is inferred.
+  Two non-control mapper calls name send's contact-evidence collection;
+  their error kind is not decoded. The original four inbox BUSY errors are
+  not reproduced or explained. All private servers and six debuggers stop.
+- [ ] Test the potential own-worker reader gap with the same retained native
+  image and real shared/unshared file-table controls before a Rust change.
+  The excluded-verifier path skips own workers assuming a no-open preflight;
+  generic empty-directory reclamation has none. Keep this a hypothesis until
+  a real held-inode witness proves the public behavior. Do not call unsafe
+  Rustix unshare or its unsound deprecated facade to evade the crate policy.
 - [x] Restore the live mailbox's write outage discovered at handoff. The
   corruption breaker refuses reservation release; stock SQLite independently
   reports orphaned pages149-155. Gracefully quit the exact original TUI via
