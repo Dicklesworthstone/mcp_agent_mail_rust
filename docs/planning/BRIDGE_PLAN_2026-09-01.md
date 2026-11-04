@@ -101,7 +101,7 @@ No status represents whole-product release clearance.
 | 17 | Useful lexical search and truthful optional hybrid (§Search) | Portable local TantivyBridge real; FrankenSearch hybrid optional compile feature plus runtime opt-in | WORKING basic lexical query; PARTIAL/UNPROVEN models/ranking/reader concurrency br-kp1in.7/.8/.18, br-ku0kl (current pin is already immutable, not a missing sibling) |
 | 18 | Useful LLM summaries and real TOON (§Tools, §Robot) | Real providers/fallback code plus explicitly substituted test lanes | UNPROVEN decisive real-model/encoder quality here; br-kp1in.7/.8. Stub success is not compensation |
 | 19 | Quiet, bounded, private ATC (§ATC) | Actual policy/effect/data-minimization modules and dedicated sidecar | PARTIAL; br-au76r, br-hwney, br-kp1in.1/.2. Dense policy tests do not prove no ordinary-mail spam during real idle/restart workflows |
-| 20 | Signed, transactional native install/update/container (§Installation) | Real six-platform release assets, signed manifests, staged-pair installers and built-in update verifier | PARTIAL; br-nq2kb, br-bx73n, br-kp1in.22/.45, br-r1say, br-quq4r, br-54v1u, br-p9zor, br-s1ejh, br-8n66x. Public artifacts are not proof that all candidate gates passed |
+| 20 | Signed, transactional native install/update/container (§Installation) | Real six-platform release assets, signed manifests, staged-pair installers and built-in update verifier | PARTIAL; br-nq2kb, br-bx73n, br-kp1in.22/.45/.77, br-ah0au, br-r1say, br-quq4r, br-54v1u, br-p9zor, br-s1ejh, br-8n66x. Public artifacts are not proof that all candidate gates passed |
 | 21 | Intentional legacy migration and cutover (§CLI, transition plan) | Legacy import/recovery code exists, namespace and stable-authority fixes ongoing | PARTIAL; br-dbt24, br-lkhxw, br-hb3mk, br-yfzgx; product decisions br-ajiq8/br-95spu. No unauthorized repo migration or crates.io publication |
 | 22 | Fresh correctness gates actually detect defects (§Development) | Large consolidated nextest topology and source witnesses exist | PARTIAL; br-kp1in.3/.4/.28/.75, br-sox5q, br-ra7jp, br-qpacg. Newly found unconditional golden writer has NO matching unfinished bead before this assessment |
 | 23 | Honest operational performance (§Benchmarking) | Real native bench, load/soak/swarm harness and default budget gates | PARTIAL: fresh signed candidate breaches5s send p99 and emits RESOURCE_BUSY; br-kp1in.5/.6, br-v0ucm, br-qbhs0, br-bx73n. Historical Rust/Python tables were not revalidated |
@@ -242,8 +242,34 @@ correction does not serialize runtime repair. Parent links, existing assignees
 and statuses are preserved, and the active cycle count remains zero. This is
 the only new blocking edge, rather than a new layer of release orchestration.
 
-Further refinement passes, final terminal receipts and graph validation remain
-pending.
+**Refinement pass3 — decisive negatives and claim boundaries.** The golden task
+must execute the ordinary comparison against a retained private wrong fixture,
+not a test that asserts the comparison helper exists. Preserve complete cells
+and fields, reject missing/malformed expectations and never swallow an error.
+Fixture content and mtime witnesses catch identical-byte regeneration; access
+time is excluded. For convergence, keep the latest populated comparison and
+the deadline result separate; a later heal cannot retroactively pass300s, and
+one missing archive copy is not evidence of SQLite message loss or permanent
+deadlock. For runtime capacity, errors/cancellations remain in the report. The
+documentation-only task needs validator/artifact comparison and diff checks,
+not invented Rust tests. Detailed logs are retained without real credentials.
+
+**Refinement pass4 — shipped/source/platform scope and actual deployment.**
+Rechecked accepted DSR task scope and the existing br-bx73n prerequisites; no new
+release venue decision is needed. The failure above belongs to the authenticated
+packaged0.3.40 executable;24d83dce identifies the inspected runtime/harness tree,
+not the release binary's build commit. The unreleased private-worker reader
+repair is not tested by that shipped executable. The signed binary also survived
+a real PTY launch, all16 jump inputs, help/palette/theme/resize inputs and clean
+quit with alternate-screen restoration. That observation lacks the pyte visible
+screen oracle (not installed here), semantic/action-under-contention and native
+platform gates; it is not full TUI acceptance. Preserve macOS native test/lint
+and Windows publication/owner-handle requirements, even where cross-build fixes
+are source-present. Trusted-local auth and sanitized browser replay stay within
+their documented boundaries. No broad claims are upgraded by download hashes,
+small HTTP/stdio success, a shared-contract golden or a Linux PTY transcript.
+
+Final refinement, terminal receipts and graph validation remain pending.
 No issue has been closed, no implementation owner changed, and no runtime feature
 credit is claimed by this assessment. It is operator-requested PROCESS; its
 consumer is the operator's completion/prioritization decision. The next runtime
