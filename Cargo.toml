@@ -41,14 +41,14 @@ asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
 fsqlite = "=0.4.13"
 fsqlite-types = "=0.4.13"
 
-sqlmodel = "=0.5.0"
-sqlmodel-core = "=0.5.0"
-sqlmodel-query = "=0.5.0"
-sqlmodel-schema = "=0.5.0"
-sqlmodel-session = "=0.5.0"
-sqlmodel-pool = "=0.5.0"
-sqlmodel-frankensqlite = "=0.5.0"
-sqlmodel-sqlite = "=0.5.0"
+sqlmodel = "=0.5.1"
+sqlmodel-core = "=0.5.1"
+sqlmodel-query = "=0.5.1"
+sqlmodel-schema = "=0.5.1"
+sqlmodel-session = "=0.5.1"
+sqlmodel-pool = "=0.5.1"
+sqlmodel-frankensqlite = "=0.5.1"
+sqlmodel-sqlite = "=0.5.1"
 
 ftui = { version = "0.7.0", default-features = false, features = ["runtime", "extras"] }
 ftui-runtime = { version = "0.7.0" }
@@ -203,6 +203,13 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
+# br-kp1in.87: published 0.5.1 still leaks pending-request accounting when
+# an acquisition future is dropped. Pin upstream's waiter guard and full
+# acquisition deadline fix. Patch core too so the pool's workspace dependency
+# and registry drivers share one Connection trait. Core's only source change
+# from registry 0.5.1 documents interrupted retirement; the API is unchanged.
+sqlmodel-pool = { git = "https://github.com/Dicklesworthstone/sqlmodel_rust", rev = "c996710674d92c00d23f30fe17ecc5d9644818c7" }
+sqlmodel-core = { git = "https://github.com/Dicklesworthstone/sqlmodel_rust", rev = "c996710674d92c00d23f30fe17ecc5d9644818c7" }
 # beads_rust 0.6.0 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
 # The mailbox uses registry FrankenSQLite 0.4.13 (no patch).
@@ -226,7 +233,8 @@ fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", re
 fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
+# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.1
+# (pool/core pinned above for cancellation cleanup),
 # registry FrankenSQLite 0.4.13 and registry FastMCP 0.13.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
 # Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus

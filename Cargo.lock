@@ -7882,9 +7882,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "147556a247057924a80e8e1be91f3593524208ec994bb2151be98a983c0479f7"
+checksum = "8a9ec8c77e03f8737bfa865e319c535d8ff1aba8e3a69707ccbbc0d14a8ce0ae"
 dependencies = [
  "asupersync 0.5.0",
  "serde",
@@ -7899,9 +7899,8 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-core"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebd4107cf2b888fbbcc9e8a967320d606dcf131ef2d0a065861276ce5a8cf330"
+version = "0.5.1"
+source = "git+https://github.com/Dicklesworthstone/sqlmodel_rust?rev=c996710674d92c00d23f30fe17ecc5d9644818c7#c996710674d92c00d23f30fe17ecc5d9644818c7"
 dependencies = [
  "asupersync 0.5.0",
  "regex",
@@ -7912,9 +7911,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-frankensqlite"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae972c7984b901a618d61e7b548dde65f135e9344343b7d3abbe7ea73e73ad52"
+checksum = "038e6863a5ebb58c420afe8d29334217f7dbd6b51c207cd6c7cfcd3a4b27261c"
 dependencies = [
  "asupersync 0.5.0",
  "fsqlite 0.4.13",
@@ -7928,9 +7927,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-macros"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51befb90af4eafe07cf3d6cd741db97d0912a07a9da9e0f892ffc5e77a2d1ae5"
+checksum = "7f5eaed7ca4332a6f5abfb081edcebe8aa1f4e29802c07edbf0e4e7ed8938f5d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7940,9 +7939,8 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-pool"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d090572646f14c79363c6a78fe073afdb2213b77421b1815b31a6761e1f3ffa2"
+version = "0.5.1"
+source = "git+https://github.com/Dicklesworthstone/sqlmodel_rust?rev=c996710674d92c00d23f30fe17ecc5d9644818c7#c996710674d92c00d23f30fe17ecc5d9644818c7"
 dependencies = [
  "asupersync 0.5.0",
  "sqlmodel-core",
@@ -7951,9 +7949,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-query"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9c2c6a610f463f3ac71e3012aa4bed116baa4aced69ea39eb03799419c86c82"
+checksum = "d8ee25733814e69944efb8ce5c55e97e3f8ad9c8acc445d5fa3c97c5b117693c"
 dependencies = [
  "asupersync 0.5.0",
  "serde",
@@ -7963,9 +7961,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-schema"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9684e458e90c493b3726db7e546521af392394db6f942ba693b937113094f901"
+checksum = "d3a8d6c1c4f0e198aff594184d1876d594eabd8085cb68bc6dadab4737da63cd"
 dependencies = [
  "asupersync 0.5.0",
  "serde",
@@ -7976,9 +7974,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-session"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "599cad01a26e1db00bcecf0fa87da1ad68ea9eace97bd4b056b716f13b1b1e2e"
+checksum = "c8bfe4c5096346a756664c31b20cc90cbd957ca984a3137a757d142d9c849db8"
 dependencies = [
  "asupersync 0.5.0",
  "serde",
@@ -7990,9 +7988,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-sqlite"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "126c42a9d23f24b80ac184c8c50281751632e313d18fd3f85883f360d69f2ee1"
+checksum = "692168afb94eb74790aaa128e0aa6687747210e24f42fbfd5efc4c6d95b54ea7"
 dependencies = [
  "asupersync 0.5.0",
  "libsqlite3-sys",
