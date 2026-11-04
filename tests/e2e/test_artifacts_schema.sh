@@ -26,6 +26,66 @@ GOOD_DIR="${FIX_ROOT}/good"
 
 mkdir -p "${GOOD_DIR}/diagnostics" "${GOOD_DIR}/trace" "${GOOD_DIR}/transcript"
 
+e2e_case_banner "Diagnostic tree preserves names, sizes and byte ordering"
+TREE_DIR="${FIX_ROOT}/tree"
+mkdir -p "${TREE_DIR}/nested" "${TREE_DIR}/empty-directory"
+TREE_BACKSLASH='back\slash.txt'
+printf 'four' > "${TREE_DIR}/${TREE_BACKSLASH}"
+: > "${TREE_DIR}/empty.txt"
+printf 'abc' > "${TREE_DIR}/nested/space name.txt"
+cat > "${FIX_ROOT}/tree.expected" <<'EOF'
+back\slash.txt (4b)
+empty.txt (0b)
+nested/space name.txt (3b)
+EOF
+e2e_tree "${TREE_DIR}" > "${FIX_ROOT}/tree.actual"
+if cmp -s "${FIX_ROOT}/tree.expected" "${FIX_ROOT}/tree.actual"; then
+    e2e_pass "diagnostic inventory matches independent names and lengths"
+else
+    diff -u "${FIX_ROOT}/tree.expected" "${FIX_ROOT}/tree.actual" || true
+    e2e_fail "diagnostic inventory changed names, sizes or order"
+fi
+e2e_tree "${TREE_DIR}" > "${FIX_ROOT}/tree.repeated"
+if cmp -s "${FIX_ROOT}/tree.actual" "${FIX_ROOT}/tree.repeated"; then
+    e2e_pass "repeated diagnostic inventory is deterministic"
+else
+    e2e_fail "diagnostic inventory is nondeterministic"
+fi
+
+e2e_case_banner "Diagnostic metadata errors fail visibly"
+for BAD_TREE_ROOT in "${FIX_ROOT}/missing-root" "${TREE_DIR}/empty.txt"; do
+    if e2e_tree "${BAD_TREE_ROOT}" > "${FIX_ROOT}/tree.error.stdout" 2> "${FIX_ROOT}/tree.error.stderr"; then
+        e2e_fail "invalid diagnostic root was accepted: ${BAD_TREE_ROOT}"
+    else
+        e2e_assert_contains "metadata failure identifies diagnostic helper" \
+            "$(cat "${FIX_ROOT}/tree.error.stderr")" "e2e_tree:"
+    fi
+done
+
+e2e_case_banner "Unrepresentable names cannot publish a stale diagnostic tree"
+BAD_TREE_DIR="${FIX_ROOT}/bad-tree-summary"
+mkdir -p "${BAD_TREE_DIR}/diagnostics"
+printf 'previous verified tree\n' > "${BAD_TREE_DIR}/diagnostics/tree.txt"
+: > "${BAD_TREE_DIR}/"$'line\nbreak.txt'
+if e2e_write_diagnostics_files "${BAD_TREE_DIR}" > "${FIX_ROOT}/bad-tree.stdout" 2> "${FIX_ROOT}/bad-tree.stderr"; then
+    e2e_fail "ambiguous newline filename was accepted"
+else
+    e2e_assert_contains "unrepresentable filename failure is explicit" \
+        "$(cat "${FIX_ROOT}/bad-tree.stderr")" "CR/LF filename"
+fi
+e2e_assert_eq "failed enumeration preserves the previous diagnostic" \
+    "previous verified tree" "$(cat "${BAD_TREE_DIR}/diagnostics/tree.txt")"
+if (
+    E2E_ARTIFACT_DIR="${BAD_TREE_DIR}"
+    _E2E_TRACE_FILE="${BAD_TREE_DIR}/events.jsonl"
+    e2e_summary
+) > "${FIX_ROOT}/bad-summary.stdout" 2> "${FIX_ROOT}/bad-summary.stderr"; then
+    e2e_fail "summary swallowed diagnostic metadata failure"
+else
+    e2e_assert_contains "summary propagates the diagnostic failure" \
+        "$(cat "${FIX_ROOT}/bad-summary.stderr")" "CR/LF filename"
+fi
+
 # Populate required typed artifacts in the fixture dir.
 E2E_RUN_ENDED_AT="$(_e2e_now_rfc3339)"
 E2E_RUN_END_EPOCH_S="$(date +%s)"
