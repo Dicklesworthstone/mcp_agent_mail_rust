@@ -45,7 +45,7 @@ fn db_error(error: impl std::fmt::Display) -> DbError {
 /// Cancellation belongs to each request, not to a process-global read gate.
 /// Keep cleanup executable after cancellation so no read snapshot is left on
 /// a reused connection. Each query is a bounded page or primary-key lookup.
-pub(crate) struct CancellableRead<'a, C> {
+pub struct CancellableRead<'a, C> {
     connection: &'a C,
     cx: &'a Cx,
     interrupted: Cell<bool>,
@@ -2179,8 +2179,8 @@ mod tests {
         for topic in [Some("HANDOFFS"), Some("other"), Some("absent")] {
             for ack_overdue_before in [None, Some(100), Some(121)] {
                 let filters = InboxFetchOptions {
-                    topic,
                     ack_overdue_before,
+                    topic,
                     ..options()
                 };
                 for limit in [1, 3, 6] {

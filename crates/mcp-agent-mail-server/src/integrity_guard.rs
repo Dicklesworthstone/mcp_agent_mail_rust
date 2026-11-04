@@ -20,9 +20,9 @@ mod pool_admission;
 #[path = "integrity_guard_schedule.rs"]
 mod schedule;
 
-pub(crate) use backup_budget::Admission as BackupParentAdmission;
+pub use backup_budget::Admission as BackupParentAdmission;
 #[cfg(all(test, unix))]
-pub(crate) use backup_budget::with_admission as with_backup_parent_admission;
+pub use backup_budget::with_admission as with_backup_parent_admission;
 use schedule::{AutomaticBackupSchedule, BackupCompletion, BackupKind, FullVerificationGate};
 
 use mcp_agent_mail_core::Config;
@@ -271,11 +271,19 @@ pub fn start(config: &Config) {
     drop(worker);
 }
 
-pub fn shutdown() {
+/// Notify the sleeper before another service's join can delay shutdown.
+pub fn request_shutdown() {
+    let _worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     SHUTDOWN.store(true, Ordering::Release);
+}
+
+pub fn shutdown() {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SHUTDOWN.store(true, Ordering::Release);
     if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
@@ -882,6 +890,7 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
     if !report.failures.is_empty()
         || report.admission_refused
         || report.inventory_incomplete
+        || report.unlinks_with_unobserved_readers > 0
         || report.unconfirmed_moves > 0
         || report.unconfirmed_deletions > 0
     {
@@ -2003,6 +2012,10 @@ mod tests {
         let thread = std::thread::current();
         let name = thread.name().expect("named libtest thread");
         if std::env::var(CHILD).as_deref() == Ok(name) {
+            // Only this dedicated --exact child changes its process mask.
+            // Reader-safe reclamation requires private fixture files and
+            // directories even when the invoking worker uses umask 002.
+            nix::sys::stat::umask(nix::sys::stat::Mode::S_IRWXG | nix::sys::stat::Mode::S_IRWXO);
             return true;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2144,6 +2157,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replaced_parent_blocks_coordinator_and_all_admitted_cleanup() {
+        if !isolated_default_retention_child() {
+            return;
+        }
         for swap_during_producer in [false, true] {
             assert_replaced_parent_coordinator_cleanup(swap_during_producer);
         }
@@ -2328,6 +2344,41 @@ mod tests {
             "{warnings:?}"
         );
         assert!(warnings[0].contains("shortened pass"), "{warnings:?}");
+    }
+
+    #[test]
+    fn opaque_reader_inventory_is_reported_at_the_default_warning_level() {
+        let ordinary = crate::backup_rotation::RotateReport {
+            deleted: 1,
+            bytes_deleted: 4096,
+            bytes_reclaimed: 4096,
+            ..Default::default()
+        };
+        let opaque = crate::backup_rotation::RotateReport {
+            deleted: 1,
+            bytes_deleted: 4096,
+            unlinks_with_unobserved_readers: 1,
+            bytes_unlinked_with_unobserved_readers: 4096,
+            ..Default::default()
+        };
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            report_backup_rotation(&ordinary, "observable pass");
+            report_backup_rotation(&opaque, "opaque pass");
+        });
+        let warnings = capture.0.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("unlinks_with_unobserved_readers=1"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("bytes_unlinked_with_unobserved_readers=4096"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("bytes_reclaimed=0"), "{warnings:?}");
+        assert!(warnings[0].contains("bytes_deleted=4096"), "{warnings:?}");
+        assert!(warnings[0].contains("opaque pass"), "{warnings:?}");
     }
 
     /// A pass with refusals must keep backups moving, and it may spend the
@@ -3195,6 +3246,16 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        // The current slot and these two resident generations fill keep=3.
+        // Each older historical image below must therefore be outside the
+        // shared window before the test requires its payload to be reclaimed.
+        for generation in ["20010101_000000", "20010102_000000"] {
+            std::fs::copy(
+                &primary,
+                root.join(format!("mail.sqlite3.bak.{generation}")),
+            )
+            .unwrap();
+        }
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.request_verified();
         let mut last_verified_us = 0;

@@ -168,6 +168,7 @@ impl Mailbox {
             .keep()
             .canonicalize()
             .unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let primary = root.join("storage.sqlite3");
         {
             let connection = CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
@@ -192,6 +193,7 @@ impl Mailbox {
                 )
                 .unwrap();
         }
+        fs::set_permissions(&primary, fs::Permissions::from_mode(0o600)).unwrap();
         let snapshot = snapshot_bak_path(&primary);
         fs::copy(&primary, &snapshot).unwrap();
         let created = chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z")
@@ -246,8 +248,11 @@ mode, source, ready, opaque, name, remove_alias = sys.argv[1:]
 libc = ctypes.CDLL(None, use_errno=True)
 libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
 dead_leader = mode.startswith('dead-')
+live_unshared = mode.startswith('live-')
 if dead_leader:
     mode = mode.removeprefix('dead-')
+elif live_unshared:
+    mode = mode.removeprefix('live-')
 acquired = threading.Event()
 
 def hold_reader():
@@ -295,6 +300,7 @@ def hold_reader():
     record = {
         'proc_pid': int(os.readlink('/proc/self')),
         'task_path': os.readlink('/proc/thread-self'),
+        'reader_descriptor': handle,
     }
     with open(ready + '.tmp', 'w', encoding='utf-8') as output:
         json.dump(record, output)
@@ -318,6 +324,8 @@ def hold_reader():
 
 def worker_main():
     try:
+        if live_unshared:
+            assert libc.unshare(0x400) == 0, ctypes.get_errno()
         hold_reader()
     except BaseException:
         # An unhandled Python thread exception alone does not make the process
@@ -325,14 +333,18 @@ def worker_main():
         traceback.print_exc()
         os._exit(1)
 
-if dead_leader:
-    threading.Thread(target=worker_main).start()
+if dead_leader or live_unshared:
+    worker = threading.Thread(target=worker_main)
+    worker.start()
     assert acquired.wait(10), 'worker did not acquire its reader'
     # CDLL releases the GIL around this call. The main Linux thread exits while
     # the Python worker remains alive with the real descriptor or mapping.
-    libc.pthread_exit.argtypes = [ctypes.c_void_p]
-    libc.pthread_exit.restype = None
-    libc.pthread_exit(None)
+    if dead_leader:
+        libc.pthread_exit.argtypes = [ctypes.c_void_p]
+        libc.pthread_exit.restype = None
+        libc.pthread_exit(None)
+    else:
+        worker.join()
 else:
     hold_reader()
 ";
@@ -649,7 +661,7 @@ fn visible_reader_still_refuses_deletion_amid_inaccessible_processes() {
     ) {
         return;
     }
-    for mode in ["fd", "opath", "mmap"] {
+    for mode in ["fd", "opath", "mmap", "live-fd", "live-opath"] {
         let mailbox = Mailbox::new();
         let generation = mailbox.generation(1);
         let opaque_root = mailbox.root.join("opaque");
@@ -667,7 +679,7 @@ fn visible_reader_still_refuses_deletion_amid_inaccessible_processes() {
             false,
         );
         assert_real_procfs_denial(&proc);
-        let (visible, _) = reader(
+        let (visible, visible_proc) = reader(
             &visible_root,
             &generation,
             mode,
@@ -676,6 +688,33 @@ fn visible_reader_still_refuses_deletion_amid_inaccessible_processes() {
             false,
         );
         let inventoried = fs::metadata(&generation).unwrap();
+        if mode.starts_with("live-") {
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(visible_root.join("reader-ready.json")).unwrap())
+                    .unwrap();
+            let descriptor = record["reader_descriptor"].as_i64().unwrap().to_string();
+            let task = Path::new("/proc").join(record["task_path"].as_str().unwrap());
+            assert_ne!(
+                task.file_name().unwrap(),
+                visible_proc.file_name().unwrap(),
+                "the reader must be a worker, with its leader still alive"
+            );
+            assert!(
+                fs::read_to_string(visible_proc.join("status"))
+                    .unwrap()
+                    .lines()
+                    .any(|line| line.starts_with("VmSize:"))
+            );
+            let worker_reader = fs::metadata(task.join("fd").join(&descriptor)).unwrap();
+            let identity = (inventoried.dev(), inventoried.ino());
+            assert_eq!((worker_reader.dev(), worker_reader.ino()), identity);
+            match fs::metadata(visible_proc.join("fd").join(descriptor)) {
+                Ok(leader_entry) => {
+                    assert_ne!((leader_entry.dev(), leader_entry.ino()), identity);
+                }
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}"),
+            }
+        }
         let guard = SnapshotRetentionGuard::acquire(&mailbox.primary).unwrap();
         let error = guard
             .delete_superseded_generation(&mailbox.primary, &generation, &inventoried)
@@ -859,6 +898,7 @@ fn concurrent_cleanup_and_process_restart_preserve_recovery_evidence() {
     assert_real_procfs_denial(&proc);
     let partial = mailbox.root.join("storage.sqlite3.bak.20000103_000000");
     fs::write(&partial, INCOMPLETE).unwrap();
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
     let test = "concurrent_cleanup_and_process_restart_preserve_recovery_evidence";
     let mut cleaner = spawn_test(test, |command| {
         command

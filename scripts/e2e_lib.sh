@@ -1484,7 +1484,7 @@ e2e_write_diagnostics_files() {
     local tree_file="${diag_dir}/tree.txt"
     local td
     td="$(e2e_mktemp "e2e_tree")"
-    e2e_tree "$artifact_dir" > "${td}/tree.txt"
+    e2e_tree "$artifact_dir" > "${td}/tree.txt" || return $?
     cp "${td}/tree.txt" "$tree_file"
 }
 
@@ -2263,15 +2263,50 @@ e2e_validate_bundle_tree() {
 # File tree and hashing helpers
 # ---------------------------------------------------------------------------
 
-# Dump a directory tree (sorted, deterministic)
+# Dump regular files in byte-sorted relative-path order. This diagnostic format
+# preserves spaces/backslashes, but cannot represent CR/LF in a filename on one
+# line; reject those names visibly rather than publishing an ambiguous inventory.
 e2e_tree() {
     local dir="$1"
-    find "$dir" -type f | sort | while read -r f; do
-        local rel="${f#"$dir"/}"
-        local sz
-        sz=$(stat --format='%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null || echo "?")
-        echo "${rel} (${sz}b)"
-    done
+    local py="python3"
+    if ! command -v "$py" >/dev/null 2>&1; then
+        py="python"
+    fi
+    if ! command -v "$py" >/dev/null 2>&1; then
+        e2e_log "ERROR: Python is required for complete diagnostic metadata"
+        return 1
+    fi
+    # One metadata process for the whole tree: no per-file shell/stat children
+    # and no payload reads. Collect before printing so metadata errors cannot
+    # masquerade as a complete inventory. Symlinks are excluded, as with find -type f.
+    "$py" - "$dir" <<'PY'
+import os
+import stat
+import sys
+
+def traversal_error(error):
+    raise error
+
+try:
+    root = os.path.abspath(sys.argv[1])
+    rows = []
+    for parent, _, names in os.walk(root, onerror=traversal_error, followlinks=False):
+        for name in names:
+            path = os.path.join(parent, name)
+            metadata = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            relative = os.path.relpath(path, root).replace(os.sep, "/")
+            if "\n" in relative or "\r" in relative:
+                raise ValueError(f"CR/LF filename is not representable in diagnostic tree: {relative!r}")
+            rows.append((relative, metadata.st_size))
+    rows.sort(key=lambda row: os.fsencode(row[0]))
+    for relative, size in rows:
+        print(f"{relative} ({size}b)")
+except (OSError, ValueError) as error:
+    print(f"e2e_tree: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 # Stable SHA256 of a file
@@ -3894,7 +3929,10 @@ e2e_summary() {
         e2e_write_summary_json
         e2e_write_meta_json
         e2e_write_metrics_json
-        e2e_write_diagnostics_files
+        if ! e2e_write_diagnostics_files; then
+            e2e_log "Diagnostic inventory failed"
+            return 1
+        fi
         e2e_write_transcript_summary
         e2e_write_repro_files
         e2e_write_forensic_indexes

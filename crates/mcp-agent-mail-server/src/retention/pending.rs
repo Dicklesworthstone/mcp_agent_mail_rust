@@ -429,6 +429,15 @@ pub(super) fn start(config: &Config) {
     }
 }
 
+pub(super) fn request_shutdown() {
+    let workers = WORKERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(service) = workers.as_ref() {
+        service.request_shutdown();
+    }
+}
+
 pub(super) fn shutdown() {
     // Serialize the entire stop/start boundary. Neither worker takes this mutex.
     let mut workers = WORKERS

@@ -25,7 +25,15 @@ pub fn start(config: &mcp_agent_mail_core::Config) {
 
 /// Stop and join all maintenance workers before closing the mailbox.
 pub fn shutdown() {
+    request_shutdown();
     active::shutdown();
     pending::shutdown();
     archive::shutdown();
+}
+
+/// Signal every independent maintenance worker before waiting for any join.
+pub(super) fn request_shutdown() {
+    active::request_shutdown();
+    pending::request_shutdown();
+    archive::request_shutdown();
 }

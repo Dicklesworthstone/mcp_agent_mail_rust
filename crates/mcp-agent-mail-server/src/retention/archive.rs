@@ -189,12 +189,20 @@ pub fn start(config: &Config) {
     drop(worker);
 }
 
-/// Signal the worker to stop.
-pub fn shutdown() {
+/// Signal the worker without waiting for its current operation to complete.
+pub fn request_shutdown() {
+    let _worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     SHUTDOWN.store(true, Ordering::Release);
+}
+
+/// Stop and join the worker before closing the mailbox.
+pub fn shutdown() {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SHUTDOWN.store(true, Ordering::Release);
     if let Some(handle) = worker.take() {
         let _ = handle.join();
     }

@@ -175,8 +175,14 @@ fn explicit_task_identities_keep_canonical_registration_and_archive() {
             .expect("profile JSON");
             assert_eq!(profile["name"], name);
         }
-        assert!(find_agent_profiles(&storage_root, "app-x.refactor_1").is_empty());
-        assert!(find_agent_profiles(&storage_root, "WORKER_42").is_empty());
+        assert_eq!(
+            find_agent_profiles(&storage_root, "app-x.refactor_1"),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            find_agent_profiles(&storage_root, "WORKER_42"),
+            Vec::<PathBuf>::new()
+        );
     });
 }
 

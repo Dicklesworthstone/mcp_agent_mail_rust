@@ -1918,7 +1918,6 @@ fn default_mcp_config_candidates() -> Vec<PathBuf> {
     v.extend(
         mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default()
             .into_iter()
-            .filter(|location| location.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
             .map(|location| location.config_path),
     );
     let mut seen = std::collections::HashSet::new();
@@ -4066,7 +4065,7 @@ pub fn handle_undo(
     Ok(())
 }
 
-/// Compute the canonical write_scopes for `am doctor fix`.
+/// Compute the canonical write_scopes for `am doctor fix` and `undo`.
 ///
 /// These match `analysis/safety_envelope.md` (Phase 3 synthesis).
 pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
@@ -4075,6 +4074,10 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
         v.push(home.join(".config").join("mcp-agent-mail"));
         v.push(home.join(".codex"));
         v.push(home.join(".claude"));
+        // Claude Code's primary config is a file beside `.claude`, not
+        // inside it. Match the detector's explicit input without granting
+        // write authority over the rest of HOME.
+        v.push(home.join(".claude.json"));
         v.push(home.join(".gemini"));
         v.push(home.join(".cursor"));
         v.push(home.join(".windsurf"));
@@ -4102,7 +4105,31 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
     v.push(PathBuf::from(".doctor"));
     v.push(PathBuf::from(".git/hooks"));
     v.push(PathBuf::from(".gitignore"));
+    if let Ok(project) = std::env::current_dir() {
+        // Per-FM fix already authorizes its project root, but undo uses
+        // these defaults. Admit the same supported project config files
+        // without granting undo authority over arbitrary project contents.
+        v.extend(project_config_write_scopes(
+            &project,
+            default_mcp_config_candidates(),
+        ));
+    }
     v
+}
+
+fn project_config_write_scopes(
+    project: &Path,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    let Ok(canonical_project) = project.canonicalize() else {
+        return Vec::new();
+    };
+    candidates
+        .into_iter()
+        .filter(|path| path.starts_with(project))
+        .filter_map(|path| mutate::canonicalize_existing_or_parent(&path).ok())
+        .filter(|path| path.starts_with(&canonical_project))
+        .collect()
 }
 
 #[cfg(test)]
@@ -4899,6 +4926,143 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with(".omp/mcp.json")),
             "doctor MCP failure modes must inspect OMP's project-native config"
+        );
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_include_non_omp_project_paths() {
+        let project = std::env::current_dir().expect("current project directory");
+        let candidates = default_mcp_config_candidates();
+        for relative in [
+            ".claude/settings.local.json",
+            ".codex/config.toml",
+            "codex.mcp.json",
+            "cursor.mcp.json",
+            "gemini.mcp.json",
+            ".vscode/mcp.json",
+            "windsurf.mcp.json",
+            "cline.mcp.json",
+            "opencode.json",
+            "factory.mcp.json",
+        ] {
+            assert!(
+                candidates.contains(&project.join(relative)),
+                "per-FM fixers must inspect the shared mutable project config {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_exclude_read_only_omp_fallbacks() {
+        let project = std::env::current_dir().expect("current project directory");
+        let candidates = default_mcp_config_candidates();
+        for relative in [".mcp.json", "mcp.json", ".omp/.mcp.json"] {
+            assert!(
+                !candidates.contains(&project.join(relative)),
+                "read-only OMP compatibility source must stay outside mutation authority: {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_home_config_scope_is_file_bounded() {
+        let home = dirs::home_dir().expect("private test home directory");
+        let config = home.join(".claude.json");
+        assert!(default_mcp_config_candidates().contains(&config));
+        let caps = mutate::Capabilities {
+            write_scopes: default_write_scopes(),
+        };
+        assert!(mutate::ensure_in_scope(&caps, &config).is_ok());
+        for outside in [
+            home.clone(),
+            home.join(".claude.json.bak"),
+            home.join("other.json"),
+        ] {
+            assert!(
+                matches!(
+                    mutate::ensure_in_scope(&caps, &outside),
+                    Err(mutate::MutateError::OutOfScope(_))
+                ),
+                "adding the supported Claude config must not authorize {}",
+                outside.display()
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_project_scopes_are_file_bounded() {
+        let project = std::env::current_dir().expect("current project directory");
+        let caps = mutate::Capabilities {
+            write_scopes: default_write_scopes(),
+        };
+        for relative in [
+            "cline.mcp.json",
+            "cursor.mcp.json",
+            ".claude/settings.local.json",
+            ".codex/config.toml",
+            ".vscode/mcp.json",
+        ] {
+            assert!(
+                mutate::ensure_in_scope(&caps, &project.join(relative)).is_ok(),
+                "undo must admit the supported project config {relative}"
+            );
+        }
+        for outside in [
+            project.clone(),
+            project.join("operator-note.json"),
+            project.join("cursor.mcp.json.bak"),
+            project.join(".vscode/other.json"),
+            project.join(".mcp.json"),
+            project.join("mcp.json"),
+            project.join(".omp/.mcp.json"),
+            project
+                .parent()
+                .expect("project parent")
+                .join("unrelated-project/cursor.mcp.json"),
+        ] {
+            assert!(
+                matches!(
+                    mutate::ensure_in_scope(&caps, &outside),
+                    Err(mutate::MutateError::OutOfScope(_))
+                ),
+                "project config scopes must not authorize {}",
+                outside.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_mcp_config_candidates_project_scopes_reject_parent_symlink_escape() {
+        let root = tempfile::tempdir().expect("private project scope fixture");
+        let project = root.path().join("project");
+        let outside = root.path().join("outside");
+        fs::create_dir(&project).expect("project directory");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("mcp.json"), b"outside bytes").expect("outside config");
+        std::os::unix::fs::symlink(&outside, project.join(".vscode"))
+            .expect("escaped config parent");
+        let supported = project.join("cursor.mcp.json");
+        let caps = mutate::Capabilities {
+            write_scopes: project_config_write_scopes(
+                &project,
+                [supported.clone(), project.join(".vscode/mcp.json")],
+            ),
+        };
+        assert!(mutate::ensure_in_scope(&caps, &supported).is_ok());
+        for path in [outside.join("mcp.json"), project.join(".vscode/mcp.json")] {
+            assert!(
+                matches!(
+                    mutate::ensure_in_scope(&caps, &path),
+                    Err(mutate::MutateError::OutOfScope(_))
+                ),
+                "an escaped config parent must not authorize {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            fs::read(outside.join("mcp.json")).unwrap(),
+            b"outside bytes"
         );
     }
 

@@ -53,6 +53,12 @@ impl Service {
         self.supervisor = Some(Supervisor::spawn(&self.config, ReplayWorker::spawn)?);
         Ok(())
     }
+
+    pub(super) fn request_shutdown(&self) {
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.shutdown.store(true, Ordering::Release);
+        }
+    }
 }
 
 struct Supervisor {

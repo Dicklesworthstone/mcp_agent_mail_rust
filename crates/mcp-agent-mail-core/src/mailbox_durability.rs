@@ -821,7 +821,8 @@ mod tests {
     /// Every surface MUST derive the same values from the authoritative
     /// `MailboxDurabilityContract`.  If any surface ever needs to diverge,
     /// it must be captured as an explicit exception with a rationale.
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct SurfaceSnapshot {
         surface: String,
         state: String,
@@ -989,26 +990,153 @@ mod tests {
     }
 
     #[test]
-    fn golden_snapshot_write_file_on_update() {
-        // Emit the golden snapshot matrix to a well-known path for CI diffing.
-        // This test always passes — it just writes the current truth.
-        let mut matrix: Vec<SurfaceSnapshot> = Vec::new();
-        for &state in MAILBOX_DURABILITY_STATES {
-            for surface in SURFACES {
-                matrix.push(surface_snapshot(surface, state));
+    fn golden_snapshot_matches_retained_fixture() {
+        // The test-only override lets negative controls execute this exact test
+        // against private fixtures, without rewriting the retained expectation.
+        let golden_path = std::env::var_os("AM_TEST_DURABILITY_GOLDEN_PATH").map_or_else(
+            || {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/golden_snapshots/durability_surface_matrix.json")
+            },
+            std::path::PathBuf::from,
+        );
+        let bytes = std::fs::read(&golden_path).unwrap_or_else(|err| {
+            panic!(
+                "read retained durability golden {}: {err}",
+                golden_path.display()
+            )
+        });
+        let expected: Vec<SurfaceSnapshot> = serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            panic!(
+                "parse retained durability golden {}: {err}",
+                golden_path.display()
+            )
+        });
+        assert_eq!(
+            expected.len(),
+            MAILBOX_DURABILITY_STATES.len() * SURFACES.len(),
+            "golden matrix length mismatch: {}",
+            golden_path.display()
+        );
+        for (&state, expected_rows) in MAILBOX_DURABILITY_STATES
+            .iter()
+            .zip(expected.as_chunks::<{ SURFACES.len() }>().0)
+        {
+            // Ordering is part of the retained serialization contract as well.
+            for (&surface, expected_row) in SURFACES.iter().zip(expected_rows) {
+                let actual = surface_snapshot(surface, state);
+                assert_eq!(
+                    actual,
+                    *expected_row,
+                    "snapshot mismatch for {state}/{surface} in {}",
+                    golden_path.display()
+                );
             }
         }
-        let json = serde_json::to_string_pretty(&matrix).expect("serialize");
-        let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn golden_snapshot_private_fixture_controls() {
+        const TEST: &str = "mailbox_durability::tests::golden_snapshot_matches_retained_fixture";
+        let original_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/golden_snapshots/durability_surface_matrix.json");
-        if let Some(parent) = golden_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(&golden_path, json.as_bytes()).unwrap_or_else(|err| {
+        let original = std::fs::read(&original_path).expect("read retained fixture");
+        let original_metadata = std::fs::metadata(&original_path).expect("fixture metadata");
+        let dir = tempfile::tempdir().expect("private golden fixtures");
+        let good = dir.path().join("read-only.json");
+        std::fs::write(&good, &original).expect("copy private golden");
+        let permissions = std::fs::metadata(&good)
+            .expect("private metadata")
+            .permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&good, read_only).expect("make private fixture read-only");
+        let before = std::fs::metadata(&good).expect("read-only metadata");
+
+        let verify = |path: &std::path::Path, expected_failure: Option<&str>| {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", TEST, "--nocapture"])
+                .env("AM_TEST_DURABILITY_GOLDEN_PATH", path)
+                .output()
+                .expect("execute ordinary golden comparison");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!(
-                "warning: could not write golden snapshot to {}: {err}",
-                golden_path.display()
+                "golden fixture control: {} status={} expected_failure={expected_failure:?}\n{stdout}\n{stderr}",
+                path.display(),
+                output.status
             );
-        });
+            assert!(
+                stdout.contains("running 1 test"),
+                "zero-run control: {stdout}\n{stderr}"
+            );
+            if let Some(message) = expected_failure {
+                assert!(
+                    !output.status.success(),
+                    "wrong expectation passed: {stdout}\n{stderr}"
+                );
+                assert!(
+                    stderr.contains(message),
+                    "wrong failure: {stdout}\n{stderr}"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "correct expectation failed: {stdout}\n{stderr}"
+                );
+            }
+        };
+        verify(&good, None);
+
+        let wrong = dir.path().join("wrong-policy.json");
+        let mut matrix: serde_json::Value =
+            serde_json::from_slice(&original).expect("fixture JSON");
+        let cell = matrix
+            .as_array_mut()
+            .expect("matrix")
+            .iter_mut()
+            .find(|cell| cell["state"] == "recovering" && cell["surface"] == "cli")
+            .expect("recovering/cli cell");
+        cell["writes_must_stop"] = serde_json::json!(false);
+        std::fs::write(&wrong, serde_json::to_vec(&matrix).expect("wrong JSON"))
+            .expect("write wrong private expectation");
+        verify(&wrong, Some("snapshot mismatch for recovering/cli"));
+        for (name, bytes, message) in [
+            ("malformed.json", "{", "parse retained durability golden"),
+            ("empty.json", "[]", "golden matrix length mismatch"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write invalid private fixture");
+            verify(&path, Some(message));
+        }
+        verify(
+            &dir.path().join("missing.json"),
+            Some("read retained durability golden"),
+        );
+        verify(&good, None);
+
+        let after = std::fs::metadata(&good).expect("final private metadata");
+        assert_eq!(std::fs::read(&good).expect("private bytes"), original);
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after.modified().expect("mtime"),
+            before.modified().expect("mtime")
+        );
+        assert_eq!(after.permissions(), before.permissions());
+        let retained_after = std::fs::metadata(&original_path).expect("final retained metadata");
+        assert_eq!(
+            std::fs::read(&original_path).expect("retained bytes"),
+            original
+        );
+        assert_eq!(retained_after.len(), original_metadata.len());
+        assert_eq!(
+            retained_after.modified().expect("mtime"),
+            original_metadata.modified().expect("mtime")
+        );
+        assert_eq!(
+            retained_after.permissions(),
+            original_metadata.permissions()
+        );
+        std::fs::set_permissions(&good, permissions).expect("restore private permissions");
     }
 }

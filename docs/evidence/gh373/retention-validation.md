@@ -383,6 +383,209 @@ cargo test --locked -p mcp-agent-mail-server --no-default-features \
   --features portable --lib backup_rotation::tests:: -- --test-threads=1
 ```
 
+## 2026-11-03 fleet qualification follow-up
+
+The following are separate source-bound runs, not a combined green suite.
+They use actual workspace test binaries and real SQLite files, processes,
+descriptor tables, mappings and snapshot authority. Compiler work uses normal
+remote-only RCH admission, the pinned toolchain and unchanged lockfile. Worker
+pressure, source-ownership and queue refusals are retained as pre-test failures;
+no worker capacity, source-ownership policy or test deadline is overridden.
+
+| Source and actual image | Executed result | Qualification limit |
+| --- | --- | --- |
+| Published `159e9bb5`, DB library `dd4dea95` and integration `cda0281f` | Initial 63-case run: 41 pass, 22 fail. A later complete same-image run as UID 65534 with a readable controller and child umask 077: 63 pass, zero fail. | The ordinary UID 1000 run with secure fixtures still has 13 strict census failures. The role-specific pass precedes later source edits. |
+| Private-fixture/reporting source, DB library `c2c71a07` and integration `90210e68` | 49 pass, 14 fail of 63 in 80.629 seconds; six of seven public Linux cases pass. | Thirteen strict census refusals remain. The restart case fails on a corrupt fixture's inherited shared mode before its intended verification refusal. |
+| Private-fixture/reporting source, server `89d9fae6` | Ordinary worker: 61 pass, six fail, one original 240-second timeout of 68. Complete same-image UID 65534 replay with umask 002: 67 pass, one timeout. | Both added real-opaque-reader and default-warning controls pass. The 16,641-directory workload still exceeds 240 seconds. The 720-cycle case passes in 77.696 seconds in the replay role; its original worker timeout remains red. |
+
+The private-fixture changes follow discriminating same-image controls, not
+weakened production admission. Three original cases each fail under umask 002
+and pass under 077. Test roots and historical directories are made mode 0700,
+and owned source images mode 0600. Unsafe-mode, owner, alias, replacement,
+known-reader and interrupted-operation assertions remain. The replacement
+fixture itself is private, so its inode-refusal control is independent of an
+accidental permission refusal.
+
+The final restart-fixture counterexample receives its own paired control:
+unchanged image `90210e68` fails under umask 002 and passes under 077 in one
+invocation, with identical hashes before and after both runs. Commit `c004204a`
+sets only the deliberately incomplete snapshot to mode 0600. Its original
+bytes, full-verification refusal, completed-unlink checks and real
+SIGKILL/restart assertions stay unchanged. This paired control diagnoses the
+fixture; it does not execute the subsequent source edit.
+
+Maintainer follow-up `09b362e0` is merged with the local changes at `f0a835cc`,
+preserving both histories. Reports use the maintainer's single count-and-byte
+vocabulary. The local actual-reader test now checks aggregate and per-kind
+logical bytes as well as zero allocation credit; the shared startup and
+automatic-cleanup renderer warns at the default level for opaque-reader
+unlinks. No new reader-admission exception is added by this reporting repair.
+
+Strict workspace Clippy, all-targets and the separate production library/binary
+check pass on `f0a835cc` in 1,915.9, 266.3 and 351.1 seconds. After the one-line
+fixture edit, they pass again on `c004204a` in 34.9, 40.2 and 37.5 seconds;
+formatting passes too. The earlier live witnesses match all 3,896 present
+tracked inputs and preserve six omitted historical performance JSON files,
+with zero changed present inputs. The fast final reruns have no separate live
+observer claim. These are compiler results, not runtime or release clearance.
+The broader merged-source native run and final public-guard follow-up remain
+pending at this checkpoint.
+
+UBS remains red on four unchanged fixture patterns: three intentional panic
+guards and a fixed Python program passed as an argument without a shell or
+untrusted interpolation. The merged four-file scan has 2,243 warnings and 783
+informational findings; none of the 70 changed-line findings is critical.
+The last one-line edit adds only a test-setup unwrap finding. No scanner
+suppression, failure guard or deadline is removed.
+
+Evidence is preserved on trj under
+`/bulk/worker-relocated-20261102-am-reservation-read/`:
+
+| Bundle | SHA-256 | Preserved scope |
+| --- | --- | --- |
+| `retention159-native-boundaries-1110/retention159-native-boundaries-20261103.tar` | `b320068b609df8e9dc49748b811e6ed9b212061a4f5e4bf5a2579b92576ec299` | 680,468,480 bytes, 479 verified members: earlier actual images, source witnesses, raw failures and role-specific replays. |
+| `retention159-private-native-recovery-1200/executables-1706466-retention159-private-db-library.tar` | `37557a2058026bf3ea275496956d7891c6d3a006f36a8515230d6a5807086adf` | Actual retained `c2c71a07` image, independently recovered after the collector failure below. |
+| `retention159-private-native-recovery-1200/executables-1706466-retention159-private-db-integration.tar` | `3b8d98699492c1eb49617dfb6312cd9facb267ed495981b8066af58761192a48` | Actual retained `90210e68` image and the complete FAIL002/PASS077 control outputs and receipt. |
+
+Archive contents, full hashes, manifests, receipts and containing directories
+are verified and fsynced. Copy-only proof preservation removes no source data
+and receives no disk-reclaim credit. Two original collectors copied live
+executable FDs but lost their final local receipts because stdout redirection
+prematurely created their exclusive receipt paths. Both tracebacks and the
+independent whole-image recovery hashes are preserved. Those recoveries are
+not intact original live-FD receipts. Later collectors use separate stdout
+and helper-owned receipt paths.
+
+None of these receipts closes br-5nr0m's original five acceptance items. The
+load-20, 16,641-directory bound, namespace-hidden-reader negative, doctor/metric
+surface, inventory-bound behavior and macOS work remain open. Role-specific
+timings are not incumbent comparisons or performance wins. Windows and full
+workspace/release qualification are not established by this selected evidence.
+
+### Newly confirmed live-worker counterexample
+
+A further actual-kernel check finds an observable reader missed while its
+leader remains alive: a worker uses `unshare(CLONE_FILES)` and opens the
+generation in its private descriptor table. The leader has no matching FD
+and still has VmSize, so the old survivor scan returns before visiting the
+worker. This is a counterexample in the pre-follow-up `90210e68` image too;
+it is not attributed to the later maintainer commit.
+
+One paired invocation executes the unchanged actual public test
+`visible_reader_still_refuses_deletion_amid_inaccessible_processes` and binary.
+The ordinary leader case passes in 27.66 seconds. The identical Python reader
+program `b3592c84` running in a live unshared worker fails in 1.117 seconds:
+the original `unwrap_err` receives successful `ReclaimedFileBytes`, proving
+admitted unlink. The experimental wrapper changes only fixture execution and
+delays its ready-file publication until an independent kernel witness proves
+the worker-only inode reference and live leader; it does not substitute the
+production scanner or its original oracle. Image hashes remain identical.
+
+Checkpoint `11d262da` adds pinned FD-only inspection of live workers, retaining
+full inspection for dead-leader survivors and strict own-process preflight.
+It does not assume shared descriptor tables. Live thread groups share their
+address space, so the leader's mapping inventory is not repeated per worker;
+Linux enforces those thread-group/VM constraints in
+[`copy_process` and `check_unshare_flags`](https://raw.githubusercontent.com/torvalds/linux/v6.18/kernel/fork.c).
+The [kernel unshare documentation](https://docs.kernel.org/userspace-api/unshare.html)
+describes descriptor-table separation. The scan budget and original timeouts
+are unchanged; descriptor work remains bounded and no performance win is claimed.
+
+The existing public negative gains actual live FD and O_PATH worker cases,
+with explicit inode, leader-liveness and descriptor-table witnesses. All its
+original cases and refusal/byte-preservation/accounting assertions remain.
+Formatting, all-targets checking (237 seconds) and strict workspace Clippy
+(385.5 seconds) pass on this repair. The separate production library/binary
+check also passes through normal hz2 execution in 1,712.5 seconds; its live
+source witness matches all 3,896 present inputs, retaining the six historical
+JSON omissions and zero changed present inputs. Earlier namespace refusals
+and queue timeouts do not execute Cargo; exact owned-job recovery acknowledges
+remote exit 1 without replay. A separate-checkout hz4 native build is compiling,
+with executable collectors already running before test execution.
+
+The original f0 native run finishes with 112 passes, 21 failures and one
+240-second timeout across 134 cases. A later canonical run with the repaired
+source transferred reports a fresh build in 0.45 seconds and again 112/21/1.
+Its panic points at namespace line 2028, the f0 preflight line, while the
+corresponding 11d262da line is 2094. This repeats the known br-kp1in.75 stale
+cache defect. The later run receives no repaired-source runtime credit, even
+though its live namespace matches all 3,896 present inputs; six historical
+performance JSON omissions remain explicit. No assertion or deadline is
+weakened to make these runs green.
+
+The counterexample wrapper, kernel witnesses, original failing output and
+paired receipt are independently verified and fsynced on trj in
+`retention-live-worker-counterexample-1311/` under the preservation root above.
+Its nine-member, 20,480-byte archive has SHA-256
+`2f18abf4c51b3d1423ccd5812bc22ed5037ee437b3023204fe5b0126ce8b63f9`.
+The actual counterexample image is retained separately in the earlier
+private-native recovery bundle. This copy-only preservation receives no
+reclaim credit. Neither older compiler passes nor the stale native run
+qualifies the new production change.
+
+The original f0 executable images and terminal/source receipts are also
+independently verified and fsynced in `retention09-canonical-native-1350/`:
+
+| Archive | SHA-256 | Scope |
+| --- | --- | --- |
+| `executables-3432534-retention09-canonical-db-library.tar` | `c18b5048bb3c1b87e0415e6d2451bd7594a36456c706c09f26381a3ae5af88f6` | 146,831,360 bytes; actual DB image `3c9a5087`. |
+| `executables-3432534-retention09-canonical-server.tar` | `4711222a35a905222ddb70f968ff2b49921fa4d8d2f846c65afb48850d12c7f3` | 477,347,840 bytes; actual integration `3449a7ba` and server `9d309750` images. |
+| `retention09-terminal-source-receipts-1355.tar` | `6cb8b21af7de4c8127172d80955a351a57c853985c13060b082cd5daf809f8c7` | Eight verified members: original terminal logs, source witnesses and all collector receipts, including the generic collector's raw copy errors. |
+
+The clean server collector establishes the integration image identity without
+hiding those independent generic-collector errors. All originals remain on
+the source worker; this preservation has zero root-disk reclaim credit.
+
+### Repaired live-worker case executes on the new image
+
+The separate-checkout 11d262da hz4 build finishes compilation in 111 minutes
+and starts all 134 selected cases. Its original five-mode public negative,
+including real live FD and O_PATH workers, passes in 21.864 seconds. The
+restart/corrupt-evidence fixture, dead-leader, ordinary FD and mapping
+protections pass too. The captured integration image is 125,984,704 bytes,
+SHA-256 `74eee95c3f030c24da9cc7e7747b3d49e3780945c074d9b8b2ca043f540c6a09`;
+independent inspection confirms both new mode strings and reader_descriptor.
+The live execution namespace again matches all 3,896 present tracked inputs,
+with six historical JSON omissions and no changed present inputs.
+
+The DB unit image is `ab40be3025d34502a49f7dea85e41f9065f0f0447214c3c17b264c79efb42735`
+(146,831,704 bytes), and the server image is
+`78b45d5a78766dda66858a9176faf9d629d07f6614a5993f5b6c5484c13fb0ea`
+(351,390,544 bytes). Successful image records retain stable whole-file hashes
+and fsynced copies. The server collector also records one raced process-exit
+capture error, preserved verbatim; it is not reported as error-free.
+
+The frozen run finishes with 113 passes, 20 failures and one timeout across
+134 cases in 1,043.433 seconds; 10,461 cases are outside selection. The
+720-cycle case reaches its configured 240-second deadline, with 260.186
+seconds recorded including process termination. The large directory case
+fails on protected-process inventory refusal in 157.030 seconds. A separate
+lossless archival transfer runs concurrently from 15:25 UTC; these ambient
+timings are not performance qualification or an incumbent comparison.
+
+The later shared-checkout merge 9d38fd84 changes rotation/guard code and adds five
+tests; none of this frozen-source server evidence qualifies those new edits.
+Formatting and a two-file scanner review pass for that merged source, while
+its compiler/native checks remain pending. br-5nr0m stays in progress.
+
+The same actual 11d database images also execute all 63 original database cases
+in one consistent coordinator role: UID/GID 65534, CapEff zero, dumpable and
+independently readable controller, umask 002 and full host procfs. All 63 pass;
+each invocation must report exactly one populated passing test, and image
+hashes match before and after the run. This is additional real-path coverage
+for the strict namespace/mutation cases, not a replacement for the ordinary
+worker's failed run or qualification of the new server code.
+
+The first role harness records 28 passes and 35 failures because its outer
+parent is UID1000/mode0711: the unprivileged directory walk cannot open that
+parent RDONLY. Both actual failed outputs and the original directory remain.
+A direct kernel open probe returns EACCES there and succeeds on the new
+UID65534/mode0700 parent. The second run retains identical controller bytes,
+case names, executable hashes and assertions; only the harness root/ownership
+precondition changes. No directory enforcement, procfs inventory, deadline,
+test population or production code is weakened. Do not sum these two role
+results or combine them with the ordinary 134-case run into a green total.
+
 ## 2026-11-03 continuation: ordering, durability and startup admission
 
 Starting from `09b362e0c4f7b041fc12f76ce77c849f01851660`, a second review
@@ -503,6 +706,323 @@ native namespace evidence above still applies to its unchanged source; the
 passing compile/lint results in this continuation do not replace the outstanding
 runtime validation. No issue closure or release qualification is inferred.
 
+## November 3: durable 11d proof and normal merged-source admission
+
+The completed 11d run remains **113 pass, 20 fail and one timeout**. Its three
+actual images are independently rehashed inside their preserved archives on
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/retention-live-worker-11d-native-1705/`:
+
+| Preserved payload | Archive SHA-256 |
+| --- | --- |
+| DB library image | `5480e87ea91bae7f3b9841c20b86fe6732ca4e563b41ff248555e00d3ac4786d` |
+| Integration and server images | `85733b8dedd7f924899dcb57b8138a01286286d528ba1b3e1cddce1add07e65e` |
+| Terminal/source records and both role contexts, 1,002 members | `f889551737ef03e2cd29755fc3fff3e1a091ec0667ff2cea2cd1250a720ffece` |
+
+The terminal bundle retains the ordinary-worker failures, raced live collector
+error, initial 28/35 parent-permission harness result, corrected 63/0 role
+result, original case listings, controller, configuration and per-case output.
+All member contents and archived ownership/modes are verified; payloads,
+manifests and directories are synced. Proof sources remain intact and protected;
+these copies claim zero reclaimed bytes. The corrected role result remains
+separate from the ordinary-worker run and does not qualify the merged server.
+
+The user authorized operator remediation with: "you do it!!! use
+$system-performance-remediation !!! and move stuff to /bulk on trj". Following
+full preservation and fresh source checks, the provided relocation helper cut
+over hz4's idle, non-Git `/data/projects/fastmcp_rust_batchverify` at
+**2026-11-03 17:10:24 UTC**. All 78,193 entries are preserved in the independently
+verified and synced 14,378,229,760-byte archive under
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/hz4-fastmcp-batch-1524/`.
+Its SHA-256 is `3aafa0e4bebb594b12908858c7570330de3945eedf2f06dd3bda3c0e1af6e8d2`;
+source/archive/fresh-source manifest SHA-256 is
+`ab1b5240860292603572c3470b0ebe2401cbc382e89cf38fb40719f7f82a2d7f`.
+The measured root gain is **13,492 MiB**, from 19,557 to 33,049 MiB available
+at cutover. Owner1000:1000/mode0775 and a synced restore pointer remain.
+The 17-member operator archive preserves the exact authorization, executed
+command, UTC time, full guards, source manifests and restore-stub verification;
+its SHA-256 is `88364a233196e35f45fbac10dd7ea6f19ad29dbd84d159d64c7ea6230fe98b98`.
+Active/protected trees were excluded. Current free space can fall as other jobs
+write; this is neither a persistent-headroom guarantee nor a NAS repair claim.
+
+Normal RCH admission then started the frozen 9d38fd84 139-case native rerun on
+hz4 and the required compiler gates on vmi1152480. Live source witnesses match
+3,896 present inputs, with the same six historical performance JSON omissions
+and no changed present input. All-targets passes in 3,937.2 seconds; Cargo also
+reports an existing third-party future-compatibility notice. The following
+production request refuses before Cargo starts. That worker reaches zero root
+headroom during unrelated batch builds, whose sessions subsequently exit; none
+is signalled. The remaining production request is admitted
+normally on vmi1149989, with the same live input witness. It finishes with
+Cargo exit0 in 103m07s, remote exit0 in 6,200.579 seconds and terminal RCH
+client exit0. The old Clippy follow-up does not run. No source identity,
+worker capacity, deadline or product policy
+override is used.
+
+The merged native run compiles in 92 minutes 42 seconds, then executes every
+selected case: **117 pass, 22 fail, no timeout**, in 535.602 seconds, with
+10,461 cases outside selection. All five added ordering/durability/deadline
+regressions pass. The five-mode public visible-reader negative passes in
+8.043 seconds. Every failure remains retained. The original 720-cycle case
+fails after 110.882 seconds because a worker's proc status has no valid thread
+count; transient teardown is a hypothesis, not an independently reproduced
+kernel explanation. The opaque-unlink accounting case and ample-time empty
+directory cleanup also fail and need diagnosis. No faster-runtime or
+whole-suite conclusion follows from this changed failure split.
+
+Both collectors retain the actual complete images with no copy errors. DB
+library ab40be30 and integration 74eee95c match the unchanged 11d source;
+their bit identity is not a cache-freshness repair claim. The changed server's
+SHA-256 is `6e0b047411b67b75b38c49f3c5968e9a1029f7a50d5cb3d68e9d976aaaeee5c9`,
+351,912,336 bytes. All three images are independently checked inside their
+verified, synced archives under `trj:/bulk/worker-relocated-20261102-am-reservation-read/retention-merged-9d38-native-1854/`.
+The library archive SHA-256 is
+`84bc98091c0e2d26d1d6caa9a966d81693d91dc6bb094bf52e0db36b980cf54f`;
+integration/server archive SHA-256 is
+`53ccc5aea4ae68d3f53f9975052fe1eeaae188c3beebd4a258707ff9dbf6a3e7`.
+Sources remain protected and intact; proof copies claim zero reclaimed bytes.
+
+A separate replay of all 76 server cases finishes in the established
+coordinator UID/GID65534, CapEff-zero, readable-controller, umask002 role,
+with full host procfs, unchanged executable/assertions and original 240-second
+deadlines: **75 pass, one timeout**. The 16,641-directory backlog times out at
+240.005 seconds; the 720-cycle case passes in 150.274 seconds and ample-time
+empty-directory cleanup passes in 2.027 seconds. This shows success in that
+role and host; it does not isolate which environment difference caused the
+ordinary failure or rule out an intermittent defect. It does not qualify the
+load-20 performance acceptance. The first staging attempt preceded completion of the image transfer;
+its 345,984,000-byte partial copy is preserved. Staging was corrected with the
+complete hash-verified image before execution. Automatic review rejected a
+combined driver with an opaque constructed subprocess argument list; no driver
+code ran. Explicit, statically reviewable move/install/hash/runner commands
+completed staging without a review bypass. No role result replaces the
+ordinary-worker 117/22 result, and no independent or release clearance is claimed.
+
+The complete ordinary-run terminal record, source witnesses, clean live capture
+receipts, all 76 role-case outputs and the kernel probe below are independently
+verified and synced in a 178-member, 2,846,720-byte archive alongside the actual
+images on trj. Its SHA-256 is
+`d067585d462906d155d5c1c2024b5a8ef132b8acb69b0c4328670e164d776ed7`.
+The partial diagnostic install is an independently hashed exact prefix of the
+preserved full server image; it remains locally protected and never executed.
+No unrelated live mailbox configuration or database is included.
+
+### Valid zero-thread status: a separate parser repair
+
+The affected worker's real `7.0.0-31-generic` procfs emitted a pinned worker
+status with `Threads: 0`, `State: R`, `FDSize: 0`, no `VmSize`, and its leader
+still present. The first bounded attempt observes this after 25 status reads;
+the entire raw record, probe and six ESRCH observations are retained. This is
+not the exact status of the PID from the earlier failing test. The separate
+probe establishes a valid kernel input that the current positive-only count
+parser rejects. Upstream [Linux 6.8 procfs source](https://raw.githubusercontent.com/torvalds/linux/v6.8/fs/proc/array.c)
+also explicitly initializes this output to zero when the signal-handler lock
+cannot be obtained; that older implementation is a mechanism reference, not
+proof of the exact timing in the earlier test.
+
+The new draft removes only the positive-value filter after unsigned parsing.
+Zero does not satisfy the existing terminal-state or foreign-UID predicates,
+and it does not bypass group enumeration. Two added unit cases retain refusal
+of missing/malformed/negative/overflow counts and plant a surviving reader
+behind both live and dead zero-count leaders, alongside an empty-group control.
+These parser/proc-shaped fixtures are R3; the real kernel observation and
+existing real-public-reader path are separate evidence. The change admits
+syntactically valid unsigned zero counts previously refused by the parser;
+all other reader exclusions remain. No test is disabled, deadline widened or
+count bound changed.
+
+The namespace draft SHA-256 is
+`27e569dd96b5da2bd080e3662ff0182773d98b67a796a2f87a1f5854216cc58d`.
+It is reproduced manually in a separate validation worktree at clean base
+05d2bc1b plus an explicit source overlay, SHA-256
+`ea33ba6a97b802aaf58db009b3f3c6009e089c5d37f9041e980c4fc139b417be`.
+The remote 9d checkout remained frozen through its completed production gate.
+The original local producer was deliberately advanced at 20:24 UTC to 05d2bc1b plus
+the identical manual parser overlay. All 3,902 producer inputs match the
+separate compiler checkout. Before/after live input witnesses confirm the old
+remote production compiler still sees the 9d inputs, including after that
+local advance. Its local sequential Python controller alone is paused to
+prevent an obsolete Clippy follow-up; the RCH client and remote compiler are
+uninterrupted. At 20:36:01 UTC, after verifying the child's original start
+identity, zombie state and exit0, send SIGTERM then SIGCONT only to the stopped
+Python controller. Both processes are confirmed gone; the outer driver exits
+143 from this deliberate cleanup. An independent receipt binds the old
+production log hash, Cargo completion, remote exit0 and RCH child exit0.
+The unfinished original driver state cannot substitute for that receipt.
+The shared checkout records the parser change in b2a29afa. Formatting passes.
+The one-file UBS scan remains red: one unchanged critical fixed Python lock
+fixture, 581 warnings and 458 informational findings. All 47 added-line findings
+are reviewed; none is critical or in production code. Nothing is suppressed.
+The new all-targets check passes under normal vmi1152480 admission:
+Cargo99m24s, remote exit0 in 5,968.364 seconds, outer RCH exit0 in 5,993.7
+seconds. Its live witness matches 3,896 present inputs plus the same six
+historical JSON omissions. The production check passes with Cargo20m59s,
+remote exit0 in 1,268.014 seconds and outer RCH exit0 in 1,303.0 seconds. Its
+live source witness again matches all 3,896 present inputs with the same six
+omissions. Strict workspace Clippy with -D warnings also passes:
+Cargo15m33s, remote exit0 in 938.201 seconds and outer RCH exit0 in 970.8
+seconds. Its live witness has the same matches and omissions. The complete
+three-gate controller exits0 at 21:38:46 UTC. A fresh formatting check also
+passes. The initial 141-case native
+request refuses before Cargo because hz4
+has no admitted slots. At 20:24:52 UTC a retry from the original producer path
+is admitted normally on hz4, using its protected 357d41b1 target. Both live
+native processes match all 3,896 present inputs and the same six historical
+JSON omissions. Whole-executable collectors are active before tests begin;
+the execution-time source witness repeats those matches and omissions.
+
+The native run is terminal red: **120 pass, 20 fail, one timeout**, all 141
+selected cases executed, 10,461 outside selection, 479.674 seconds after a
+122m58s build. RCH returns100. Both new zero-thread controls pass, as does the
+real five-mode public reader guard in 6.385 seconds. Opaque-unlink accounting
+passes in 5.450 seconds; the exact cause of its earlier failure remains
+unproved. Ordinary strict reader-census refusals remain. The 720-cycle case
+times out at its unchanged 240-second limit (240.100 seconds observed), and
+the large-directory case fails in 36.274 seconds. These outcomes do not
+establish a speed improvement or complete the original retention acceptance.
+
+The actual new images are DB unit
+`76c51a9c2b13db54be4fc2f7e923dba17f11cc96edf492f3b988bb38e5e842e8`
+(146,843,168 bytes), integration
+`48e35f92938960b63f72aba1b3a77ff51ed578a3e7bedb9f75404beb7b57732f`
+(125,985,208 bytes), and server
+`84588f861c3fdfa3cc6fb19c434f72be96940f55eb0aa958f9ab292ecfcf921c`
+(351,914,432 bytes). Complete held-descriptor hashes match their retained
+copies. One raced `/proc/1035138/exe` capture error remains in the original
+collector receipt; the successful complete captures are not reconstructed
+from that failed attempt. All three files are hash-verified and synced on trj
+beside the compiler archive below. No cache-policy fix is claimed.
+
+A second execution of the exact same 141 names, using those same three images,
+finishes in one consistent coordinator role: UID/GID65534, CapEff0,
+dumpable/readable controller, umask002 and full host procfs. **140 pass, one
+timeout, zero other failures**; the original 16,641-directory case reaches
+240.005 seconds. The 720-cycle case passes in 152.652 seconds. Image hashes
+remain stable before/after and the case population matches the ordinary run
+exactly. Both host and role differ, so this does not isolate a causal
+environment difference. It neither replaces ordinary120/20/1 nor establishes
+load-20 performance, platform, release or whole-project clearance. The
+original five-item Bead remains in progress.
+
+The entire stopped role tree, including its three images, controller, case
+outputs and timed-out fixture, is verified and synced on trj beside the
+compiler evidence: 15,356 entries, 202,067,520 compressed bytes, SHA-256
+`726dc631dd15baae76211f14d91d4030c1ff7fdb90e18dacda0323f420217dc3`.
+Its source and archive manifests match
+`61261a45f0c06f9af196b0ba303a1d994ece83e54887b5c5c6a7309ba8054731`.
+All content, modes, owners and symlinks are checked; files and directory
+chain are synced. Sources remain intact and reclaimed-byte credit is zero.
+
+The separate terminal/source/collector bundle is also verified and synced:
+25 members, 1,474,560 bytes, SHA-256
+`423f10864a83ef5f3e36f785095415b14c4ed0a1249dce33f56eb24062400958`.
+It retains the ordinary failures, execution-time source witness, original
+collector race, real kernel probe and bounded process audit. The compiler
+and complete role archives remain separate; no passing claim is reconstructed
+from an unsuccessful capture.
+
+A separate native arm64 Mac probe exercises the exact production
+`lsof -n -P -Fpf -- <candidate>` invocation on Darwin25.2.0/macOS26.2 with
+lsof4.91. Three samples each cover clear-before, one real FD, two real FDs,
+clear-after-close, a real mmap with its FD closed (`trackfd=False`), and
+clear-after-unmap. All 18 raw results independently match the expected
+process/descriptor fields: clean empty inventories return1, reader inventories
+return0, and the mapping is reported as `ftxt`. Stderr is empty throughout and
+candidate bytes remain unchanged. Per-mode medians range 0.191–0.313 seconds.
+The raw receipt and separate field-by-field review are retained; this is
+native dependency-boundary evidence only. No Rust retention execution,
+scan-cost improvement, paired incumbent performance or macOS acceptance
+closure follows. The configured Windows endpoint still times out on SSH.
+
+The completed compiler logs, all source witnesses, explicit overlay, both UBS
+and formatting records, old production terminal/cleanup receipts, and Mac
+probe/review are preserved in a 26-member, 5,406,720-byte archive under
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/retention-zero-thread-native-2144/`.
+SHA-256 is `b39aff5111a61558576c17b3d90c01fb08867a217c317472a18b250143e81c47`.
+Every member hash and metadata field, plus the complete archive hash, is
+verified on trj; the archive, control records and directory chain are synced.
+This is a copy-only preservation of completed bounded evidence. No native
+execution, release clearance, source removal or reclaimed bytes are inferred.
+
+### Separate retained-CLI reliability diagnostic
+
+The existing, unmodified release-smoke harness04210cb8 executes the retained
+production-feature CLIbf35a95b (290,327,568 bytes), bound to the older
+9513cc33 plus doctor811 source manifest. This is not the current parser
+candidate or a release-mode qualification. Original thresholds remain:
+300-second soak/convergence, 60 agents for 480 seconds and unchanged latency
+and progress gates. The run lasts 21:58:13–22:17:54 UTC and exits1 with clean
+shutdown. README flow, cross-project checks, 240-send storm, crash recovery
+and all nine mixed-soak checks pass. The swarm fails on four inbox
+RESOURCE_BUSY responses among 10,265 calls and failure to complete live Git
+archive convergence within 300 seconds. Error detail is `database is busy
+(recovery in progress)`. All 10,319 acknowledged swarm sends survive SIGKILL;
+full stock SQLite integrity passes after both crash phases.
+
+At 296.174 seconds the last completed live observation has 22,989 DB and
+archive messages, no missing/extra/duplicate/mismatched IDs, but 12 reported
+uncommitted copies and an advancing Git head. The terminal observation hits
+its deadline at 300.001 seconds; its zero counters are unobserved values,
+not proof of an empty database. After shutdown, the unchanged observer passes
+in 15.168 seconds: all 22,989 messages and 79,287 required copies are
+committed and consistent. That later result never replaces the live failure.
+The harness and gate remain unchanged; the original frozen-drain phenotype
+is not reproduced in the observed progress windows, and no root cause or
+closure is inferred. The inherited Git observer discards child stderr;
+those missing diagnostics cannot be recovered from this run. That limitation
+does not turn the failed live gate into a pass.
+
+The complete fixture, exact CLI, harness, source manifest and full retained
+logs are verified and synced under
+`trj:/bulk/worker-relocated-20261102-am-reservation-read/retained-bf35-reliability-2240/`.
+All 353,969 entries match content, modes, owners and symlinks. The
+2,586,600,289-byte gzip has SHA-256
+`3ffc3aa56188d66b481f4b8393de45c7a98aa3f76d2e91f09b098961d9303adf`;
+source/archive manifest SHA-256 is
+`6ee96138d5a0003bbf2f0220c291b87f06d0ade79123f1d9efef1af0990943be`.
+Files and the directory chain are synced. Sources remain intact, with zero
+reclaimed bytes. Fresh solo verification is not independent review. The
+bounded process audit remains DRIFTING because repeated bookkeeping and
+speculative analysis exceeded their value; the next work should repair an
+observed runtime blocker while preserving these original failed gates.
+
+### Live mailbox incident discovered during handoff
+
+At 23:24–23:25 UTC, both attempts to release the eleven owned reservations
+queue real deferred intents: the live corruption breaker refuses writes
+after reporting page149 never used. Independent stock SQLite full integrity
+finds seven orphaned pages149–155, not a healthy database or an observed
+lost-row/index corruption. The supported vacuum plan classifies the database
+as leaked-pages-only; its count of one is one multiline result, not seven
+independently counted pages.
+
+The original installed TUI is gracefully stopped with its documented two
+Ctrl-C confirmations through only native mux pane42. Its executable hash,
+PID/foreground identity and original shell/cwd are checked; no force signal,
+takeover or mux restart occurs. Drain confirms safe-to-mutate. The complete
+quiesced database family is copied, whole-file hashes verified and synced.
+The full-family rehearsal correctly refuses the copied namespace generation
+without changing rows. A separate primary/WAL/SHM copy establishes its own
+generation and passes the same retained CLIbf35a95b supported vacuum.
+
+The live operation then passes at 23:30:29 UTC, with its verified pre-vacuum
+backup retained. All 23 original non-statistics tables preserve identical
+schema and canonical typed rows, full stock integrity returns `ok` and
+foreign-key checks return no violations. Restart the same installed binary
+171713fa in the original pane/shell/environment: PID189418. Live MCP health
+reports green with a successful full integrity check; the first deferred
+release intent replays eleven IDs and its duplicate is a zero-row no-op.
+Read-only SQL independently confirms all eleven released timestamps and
+full integrity remains `ok`. CLI doctor health still exits1 for the existing,
+unrelated reservation346 thread-provenance drift. This recovery neither
+proves an engine root cause nor changes the open br-htobc acceptance.
+
+All bounded incident evidence is verified and synced in the same trj evidence
+directory: `live-breaker-2328.tar`, 64 entries, 4,229,120 bytes, SHA-256
+`723efcc8ce5e32581c01a36229ce868e184cdd3b280ea69c06047b6c73be75fe`.
+Content, modes, owners and symlinks match source/archive manifest
+`f33a261f89d4dcc4569485ad470731deeb1d2171ceeed9e5ef3d78c8e3dd13f4`.
+The archive, controls and directory chain are synced. All sources remain
+preserved; this proof copy credits zero reclaimed bytes.
 ## 2026-11-03 producer follow-through: preserve the durable repair allowance
 
 Review of the caller above rotation found a second path around the completed
