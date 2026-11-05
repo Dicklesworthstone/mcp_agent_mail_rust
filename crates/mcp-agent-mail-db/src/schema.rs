@@ -656,14 +656,42 @@ pub(crate) const PROJECT_EVENT_SCOPE_STATEMENTS: &[&str] = &[
      END",
 ];
 
+const V28_AGENT_DEREGISTRATION_BACKFILL: &str = "v28_backfill_agent_deregistrations";
+
+// This definition has already been recorded in migration ledgers. Keep its
+// exact bytes so existing mailboxes still pass checksum validation. The
+// compatibility execution below fixes LIKE's case folding for pending upgrades
+// without rewriting any already-applied ledger or deregistration evidence.
+const V28_AGENT_DEREGISTRATION_BACKFILL_SQL: &str = "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+     SELECT id, last_active_ts FROM agents \
+     WHERE task_description LIKE '[DEREGISTERED %'";
+
+const V28_AGENT_DEREGISTRATION_BACKFILL_EXACT_SQL: &str = "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+     SELECT id, last_active_ts FROM agents \
+     WHERE substr(task_description, 1, 14) = '[DEREGISTERED ' COLLATE BINARY";
+
+fn migration_execution_sql(migration: &Migration) -> &str {
+    // Restrict compatibility execution to the exact historical definition;
+    // an unrelated or edited migration must retain ordinary drift detection.
+    if migration.id == V28_AGENT_DEREGISTRATION_BACKFILL
+        && migration.up == V28_AGENT_DEREGISTRATION_BACKFILL_SQL
+    {
+        V28_AGENT_DEREGISTRATION_BACKFILL_EXACT_SQL
+    } else {
+        &migration.up
+    }
+}
+
 /// Physical statements of an authored migration. The project-event table
 /// rebuild must run as a unit; its complete SQL is still covered by the
-/// migration checksum. Callers own the surrounding migration transaction.
+/// migration checksum. The frozen v28 backfill uses the same exact-prefix
+/// compatibility execution for runtime upgrades and canonical reconstruction.
+/// Callers own the surrounding migration transaction.
 pub(crate) fn migration_sql_statements(migration: &Migration) -> Vec<&str> {
     if migration.id == PROJECT_EVENT_SCOPE_MIGRATION {
         PROJECT_EVENT_SCOPE_STATEMENTS.to_vec()
     } else {
-        vec![migration.up.as_str()]
+        vec![migration_execution_sql(migration)]
     }
 }
 
@@ -2562,12 +2590,9 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
     migrations.push(Migration::new(
-        "v28_backfill_agent_deregistrations".to_string(),
+        V28_AGENT_DEREGISTRATION_BACKFILL.to_string(),
         "GH#255: recognize Python deregistration tombstones during upgrade".to_string(),
-        "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
-         SELECT id, last_active_ts FROM agents \
-         WHERE task_description LIKE '[DEREGISTERED %'"
-            .to_string(),
+        V28_AGENT_DEREGISTRATION_BACKFILL_SQL.to_string(),
         String::new(),
     ));
 
@@ -4750,7 +4775,10 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                 } else if migration.id == PROJECT_EVENT_SCOPE_MIGRATION {
                     execute_project_event_scope_migration(cx, conn, migration).await
                 } else {
-                    match conn.execute(cx, &migration.up, &[]).await {
+                    match conn
+                        .execute(cx, migration_execution_sql(migration), &[])
+                        .await
+                    {
                         Outcome::Ok(_) => Outcome::Ok(()),
                         Outcome::Err(err) => Outcome::Err(err),
                         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
@@ -7692,7 +7720,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
                 project_id INTEGER NOT NULL,\
                 name TEXT NOT NULL,\
-                task_description TEXT NOT NULL,\
+                task_description TEXT COLLATE NOCASE NOT NULL,\
                 last_active_ts INTEGER NOT NULL\
             )",
         )
@@ -7701,9 +7729,34 @@ mod tests {
             "INSERT INTO agents \
              (project_id, name, task_description, last_active_ts) VALUES \
              (7, 'BlueLake', '[DEREGISTERED 2026-08-24T03:22:36Z] completed', 424242),\
-             (7, 'GreenCastle', 'active', 434343)",
+             (7, 'GreenCastle', 'active', 434343),\
+             (7, 'LowerCase', '[deregistered note] ordinary work', 444444),\
+             (7, 'MixedCase', '[Deregistered deployment] ordinary work', 454545),\
+             (7, 'LeadingSpace', ' [DEREGISTERED 2026-08-24T03:22:36Z] quoted', 464646),\
+             (7, 'NoSeparator', '[DEREGISTERED] ordinary work', 474747),\
+             (7, 'PythonAt', '[DEREGISTERED at 2026-08-24T03:22:36Z] completed', 484848),\
+             (7, 'NamespaceOnly', '[DEREGISTERED ', 494949),\
+             (7, 'EmbeddedMarker', 'note [DEREGISTERED 2026-08-24T03:22:36Z] quoted', 505050),\
+             (7, 'TabSeparator', '[DEREGISTERED\t2026-08-24T03:22:36Z] ordinary work', 515151)",
         )
         .expect("insert legacy lifecycle witnesses");
+        conn.execute_raw(
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY REFERENCES agents(id), deregistered_at INTEGER NOT NULL); \
+             INSERT INTO agent_deregistrations VALUES (2, 999999); \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER REFERENCES agents(id), body_md TEXT); \
+             INSERT INTO messages VALUES (41, 3, 'Retain historical mail'); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             INSERT INTO message_recipients VALUES (41, 2, 12, 13);",
+        )
+        .expect("seed independent lifecycle and message history");
+        let source_sql =
+            "SELECT id, project_id, name, task_description, last_active_ts FROM agents ORDER BY id";
+        let source_before = conn
+            .query_sync(source_sql, &[])
+            .unwrap()
+            .into_iter()
+            .map(|row| row.values().cloned().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
 
         block_on({
             let conn = &conn;
@@ -7721,6 +7774,17 @@ mod tests {
                         .into_result()
                         .expect("apply lifecycle migration");
                 }
+                let lifecycle = schema_migrations_base()
+                    .into_iter()
+                    .filter(|migration| migration.id.starts_with("v28_"))
+                    .collect();
+                assert!(
+                    run_specific_migrations(&cx, conn, lifecycle)
+                        .await
+                        .into_result()
+                        .expect("already-applied lifecycle migrations remain compatible")
+                        .is_empty()
+                );
             }
         });
 
@@ -7745,12 +7809,174 @@ mod tests {
             ledger[0].get_named::<i64>("deregistered_at").unwrap(),
             424_242
         );
+        let all_ledger = conn
+            .query_sync(
+                "SELECT agent_id, deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get_as::<i64>(0).unwrap(), row.get_as::<i64>(1).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_ledger,
+            [(1, 424_242), (2, 999_999), (7, 484_848), (8, 494_949)]
+        );
+        assert_eq!(
+            conn.query_sync(source_sql, &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().cloned().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            source_before,
+            "migration must not rewrite agent descriptions or activity"
+        );
+        let history = conn.query_sync(
+            "SELECT m.sender_id, m.body_md, r.agent_id, r.read_ts, r.ack_ts FROM messages m JOIN message_recipients r ON r.message_id = m.id WHERE m.id = 41",
+            &[],
+        ).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].get_as::<i64>(0).unwrap(), 3);
+        assert_eq!(
+            history[0].get_as::<String>(1).unwrap(),
+            "Retain historical mail"
+        );
+        assert_eq!(history[0].get_as::<i64>(2).unwrap(), 2);
+        assert_eq!(history[0].get_as::<i64>(3).unwrap(), 12);
+        assert_eq!(history[0].get_as::<i64>(4).unwrap(), 13);
         let indexes = conn
             .query_sync("PRAGMA index_list(agents)", &[])
             .expect("inspect agent indexes");
         assert!(indexes.iter().any(|row| {
             row.get_named::<String>("name").ok().as_deref() == Some("idx_agents_project_active")
         }));
+    }
+
+    #[test]
+    fn lifecycle_backfill_preserves_applied_checksums_and_refuses_drift() {
+        // Independently calculated from the exact historical v28 statement,
+        // before adding its case-sensitive compatibility execution.
+        const OLD_CHECKSUM: &str = "59728dee81d3969a";
+        let conn = crate::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, task_description TEXT, last_active_ts INTEGER); \
+             INSERT INTO agents VALUES (1, '[DEREGISTERED at 2026-08-24T03:22:36Z] completed', 100), \
+                                       (2, '[deregistered note] ordinary work', 200); \
+             CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER); \
+             INSERT INTO agent_deregistrations VALUES (1, 100), (2, 200);",
+        )
+        .unwrap();
+        block_on(|cx| async move {
+            init_migrations_table(&cx, &conn)
+                .await
+                .into_result()
+                .unwrap();
+            let migration = schema_migrations_base()
+                .into_iter()
+                .find(|migration| migration.id == V28_AGENT_DEREGISTRATION_BACKFILL)
+                .unwrap();
+            assert_eq!(migration.checksum(), OLD_CHECKSUM);
+            conn.execute_sync(
+                &format!("INSERT INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at, checksum) VALUES (?, 'historical lifecycle upgrade', 123, ?)"),
+                &[Value::Text(migration.id.clone()), Value::Text(OLD_CHECKSUM.into())],
+            ).unwrap();
+            assert!(
+                run_specific_migrations(&cx, &conn, vec![migration.clone()])
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                migration_set_is_complete(&cx, &conn, std::slice::from_ref(&migration))
+                    .await
+                    .into_result()
+                    .unwrap()
+            );
+            let history = conn
+                .query_sync(
+                    &format!(
+                        "SELECT description, applied_at, checksum FROM {MIGRATIONS_TABLE_NAME}"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(
+                history[0].get_as::<String>(0).unwrap(),
+                "historical lifecycle upgrade"
+            );
+            assert_eq!(history[0].get_as::<i64>(1).unwrap(), 123);
+            assert_eq!(history[0].get_as::<String>(2).unwrap(), OLD_CHECKSUM);
+            // Existing ledger entries cannot be attributed safely to a past
+            // LIKE backfill. Preserve even this ambiguous historical witness.
+            let ledger = conn
+                .query_sync(
+                    "SELECT agent_id, deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                ledger
+                    .iter()
+                    .map(|row| (row.get_as::<i64>(0).unwrap(), row.get_as::<i64>(1).unwrap()))
+                    .collect::<Vec<_>>(),
+                [(1, 100), (2, 200)]
+            );
+
+            conn.execute_raw(&format!(
+                "UPDATE {MIGRATIONS_TABLE_NAME} SET checksum = 'unexpected-checksum'"
+            ))
+            .unwrap();
+            let pending = Migration::new(
+                "pending-after-v28",
+                "must not run",
+                "CREATE TABLE forbidden_lifecycle_upgrade (id INTEGER)",
+                "",
+            );
+            let error = run_specific_migrations(&cx, &conn, vec![pending, migration])
+                .await
+                .into_result()
+                .expect_err("historical compatibility must not accept arbitrary checksum drift");
+            assert!(error.to_string().contains("changed after application"));
+            assert!(
+                conn.query_sync(
+                    "SELECT name FROM sqlite_master WHERE name = 'forbidden_lifecycle_upgrade'",
+                    &[]
+                )
+                .unwrap()
+                .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn lifecycle_backfill_reconstruction_uses_exact_tombstones() {
+        let conn = crate::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, task_description TEXT COLLATE NOCASE, last_active_ts INTEGER); \
+             INSERT INTO agents VALUES (1, '[DEREGISTERED at 2026-08-24T03:22:36Z] completed', 100), \
+                                       (2, '[deregistered note] ordinary work', 200), \
+                                       (3, '[Deregistered deployment] ordinary work', 300); \
+             CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER);",
+        )
+        .unwrap();
+        let migration = schema_migrations_base()
+            .into_iter()
+            .find(|migration| migration.id == V28_AGENT_DEREGISTRATION_BACKFILL)
+            .unwrap();
+        for sql in migration_sql_statements(&migration) {
+            conn.execute_raw(sql).unwrap();
+        }
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id, deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 1);
+        assert_eq!(rows[0].get_as::<i64>(1).unwrap(), 100);
     }
 
     #[test]
