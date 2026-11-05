@@ -936,7 +936,7 @@ fn existing_mailbox_reads_remain_bounded_with_larger_unread_bodies() {
         .tempdir()
         .expect("private archive-size fixture directory");
     let root = std::fs::canonicalize(dir.path()).unwrap();
-    let mut deltas_kib = Vec::new();
+    let mut measurements = Vec::new();
     let mut failed_scales = Vec::new();
     for unread_body_scale in [1, 4] {
         eprintln!("GH372 archive_case unread_body_scale={unread_body_scale} outcome=started");
@@ -981,19 +981,14 @@ fn existing_mailbox_reads_remain_bounded_with_larger_unread_bodies() {
             assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
             delta_kib
         });
-        match outcome {
-            Ok(delta_kib) => {
-                eprintln!(
-                    "GH372 archive_case unread_body_scale={unread_body_scale} outcome=passed delta_kib={delta_kib}"
-                );
-                deltas_kib.push(delta_kib);
-            }
-            Err(_) => {
-                failed_scales.push(unread_body_scale);
-                eprintln!(
-                    "GH372 archive_case unread_body_scale={unread_body_scale} outcome=failed"
-                );
-            }
+        if let Ok(delta_kib) = outcome {
+            eprintln!(
+                "GH372 archive_case unread_body_scale={unread_body_scale} outcome=passed delta_kib={delta_kib}"
+            );
+            measurements.push(delta_kib);
+        } else {
+            failed_scales.push(unread_body_scale);
+            eprintln!("GH372 archive_case unread_body_scale={unread_body_scale} outcome=failed");
         }
     }
     assert!(
@@ -1002,8 +997,25 @@ fn existing_mailbox_reads_remain_bounded_with_larger_unread_bodies() {
     );
     eprintln!(
         "GH372 unread_body_scale=4 small_delta_kib={} large_delta_kib={}",
-        deltas_kib[0], deltas_kib[1]
+        measurements[0], measurements[1]
     );
+}
+
+/// Read the real fixture row for each native snapshot and writer observation.
+fn read_snapshot_message(conn: &DbConn) -> (String, String) {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    let rows = conn
+        .query_sync(
+            "SELECT subject, body_md FROM messages WHERE id = ?",
+            &[Value::BigInt(1)],
+        )
+        .expect("read message through native connection");
+    assert_eq!(rows.len(), 1);
+    (
+        rows[0].get_as::<String>(0).unwrap(),
+        rows[0].get_as::<String>(1).unwrap(),
+    )
 }
 
 /// GH#372: reducing connection memory must preserve an active reader's snapshot,
@@ -1030,27 +1042,14 @@ fn existing_mailbox_readers_preserve_snapshots_and_durable_writes() {
     );
     let snapshot_reader = DbConn::open_file(path_str).expect("open snapshot reader");
     let current_reader = DbConn::open_file(path_str).expect("open autocommit reader");
-    let read_message = |conn: &DbConn| {
-        let rows = conn
-            .query_sync(
-                "SELECT subject, body_md FROM messages WHERE id = ?",
-                &[Value::BigInt(1)],
-            )
-            .expect("read message through native connection");
-        assert_eq!(rows.len(), 1);
-        (
-            rows[0].get_as::<String>(0).unwrap(),
-            rows[0].get_as::<String>(1).unwrap(),
-        )
-    };
     let committed = ("committed subject".to_owned(), "committed body".to_owned());
     let aborted = ("aborted subject".to_owned(), "aborted body".to_owned());
 
     snapshot_reader
         .execute_raw("BEGIN DEFERRED")
         .expect("begin reader snapshot");
-    assert_eq!(read_message(&snapshot_reader), original);
-    assert_eq!(read_message(&current_reader), original);
+    assert_eq!(read_snapshot_message(&snapshot_reader), original);
+    assert_eq!(read_snapshot_message(&current_reader), original);
     writer
         .execute_raw("BEGIN IMMEDIATE")
         .expect("begin concurrent writer");
@@ -1069,12 +1068,12 @@ fn existing_mailbox_readers_preserve_snapshots_and_durable_writes() {
 
     // Both readers predate the write. Only the explicit transaction retains
     // the old view; sharing a mutable image between them would violate this.
-    assert_eq!(read_message(&snapshot_reader), original);
-    assert_eq!(read_message(&current_reader), committed);
+    assert_eq!(read_snapshot_message(&snapshot_reader), original);
+    assert_eq!(read_snapshot_message(&current_reader), committed);
     snapshot_reader
         .execute_raw("COMMIT")
         .expect("end reader snapshot");
-    assert_eq!(read_message(&snapshot_reader), committed);
+    assert_eq!(read_snapshot_message(&snapshot_reader), committed);
 
     writer
         .execute_raw("BEGIN IMMEDIATE")
@@ -1088,15 +1087,15 @@ fn existing_mailbox_readers_preserve_snapshots_and_durable_writes() {
             ],
         )
         .expect("stage uncommitted message");
-    assert_eq!(read_message(&writer), aborted);
-    assert_eq!(read_message(&snapshot_reader), committed);
-    assert_eq!(read_message(&current_reader), committed);
+    assert_eq!(read_snapshot_message(&writer), aborted);
+    assert_eq!(read_snapshot_message(&snapshot_reader), committed);
+    assert_eq!(read_snapshot_message(&current_reader), committed);
     writer
         .execute_raw("ROLLBACK")
         .expect("roll back staged write");
-    assert_eq!(read_message(&writer), committed);
-    assert_eq!(read_message(&snapshot_reader), committed);
-    assert_eq!(read_message(&current_reader), committed);
+    assert_eq!(read_snapshot_message(&writer), committed);
+    assert_eq!(read_snapshot_message(&snapshot_reader), committed);
+    assert_eq!(read_snapshot_message(&current_reader), committed);
     snapshot_reader.close_sync().expect("close snapshot reader");
     current_reader
         .close_sync()

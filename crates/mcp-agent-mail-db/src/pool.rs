@@ -25594,10 +25594,36 @@ mod tests {
     fn pool_warmup_opens_connections() {
         use asupersync::runtime::RuntimeBuilder;
 
+        const CHILD_ENV: &str = "AM_TEST_POOL_WARMUP_ISOLATED_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let unrelated_dir = tempfile::tempdir().unwrap();
+            let unrelated_archive = unrelated_dir.path().join("unrelated-archive-file");
+            let sentinel = b"unrelated operator archive authority\n";
+            std::fs::write(&unrelated_archive, sentinel).unwrap();
+            // Configure only the child: process-wide overrides would also be
+            // visible to unrelated tests running concurrently in this binary.
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pool_impl::tests::pool_warmup_opens_connections",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("STORAGE_ROOT", &unrelated_archive)
+                .output()
+                .expect("run warmup with an unrelated inherited archive");
+            assert!(child.status.success(), "isolated warmup failed: {child:?}");
+            assert_eq!(std::fs::read(&unrelated_archive).unwrap(), sentinel);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("warmup_test.db");
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
+            // A fresh database fixture must own its archive too. Custom
+            // inherited roots are intentionally not ephemeral-rerouted.
+            storage_root: Some(dir.path().join("archive")),
             min_connections: 10,
             max_connections: 20,
             warmup_connections: 5,
