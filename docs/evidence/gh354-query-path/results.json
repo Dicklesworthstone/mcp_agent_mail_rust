@@ -1,0 +1,322 @@
+{
+  "schema_version": 1,
+  "measured_date": "2026-11-05",
+  "scope": "Complementary native FrankenSQLite CLI query evidence on a synthetic mailbox; not the sqlmodel facade or a running Agent Mail server",
+  "source_base_commit": "8239ae081b0f6c5432cc27ee4a9c381e943b4f0e",
+  "source_change_identity": "Working-tree explicit-projection queries identified by the four extracted SQL hashes below",
+  "incoming_main_fixes": {
+    "reservation": "3455c62c53365ddf51d269973979cf00e40e3ca1",
+    "message_and_deliveries": "f4c3cdf5339bcc885cfa4ad4209353aba6a399f3",
+    "followup_scope": "Shared reservation source helper, explicit projections, and expanded regressions/evidence; preserves incoming narrowing fixes"
+  },
+  "engine": {
+    "version": "fsqlite 0.4.13",
+    "asset_url": "https://github.com/Dicklesworthstone/frankensqlite/releases/download/v0.4.13/fsqlite-0.4.13-linux_amd64.tar.gz",
+    "archive_sha256": "c0be5ff014ba34e4173a69b315e5514d5935125bcd6e398d2fcf4d1830d22784",
+    "binary_sha256": "85ca242fb6d84dcdac9cd53759496f50f0753499dbbea679e41e96d5a954014c",
+    "parameter_binding": "Numeric decimal literals substituted for ?1, ?2 and ?3; the documented CLI commands expose no parameter binding",
+    "max_address_space_bytes": 1073741824,
+    "successful_probe_cpu_limit_s": 25,
+    "successful_probe_wall_timeout_s": 30
+  },
+  "fixture": {
+    "schema_sha256": "fc84ee863094973a1985eeb8a968404a3b57cff8d531bc673503849cb64edf7b",
+    "schema_source": "CREATE_TABLES_SQL before the -- FTS5 virtual table comment, matching init_schema_sql_base",
+    "constructor": "Python sqlite3; canonical SQLite 3.53.1",
+    "sqlite_source_id": "2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9",
+    "file_bytes": 17760256,
+    "counts": {
+      "projects": 5,
+      "agents": 82,
+      "messages": 8241,
+      "message_recipients": 24723,
+      "project_mailbox_deliveries": 1177,
+      "file_reservations": 9482,
+      "file_reservation_releases": 7112
+    },
+    "body_unit": "Mailbox-scale body with a UTF-8 λ and durable source metadata. ",
+    "body_repeats": 20,
+    "body_characters": 1260,
+    "body_utf8_bytes": 1280,
+    "generation_id": "aabbccdd",
+    "canonical_construction_comparison_ids": {
+      "reservation": [1, 2, 3, 4, 82, 4741, 9482, 9483, -1],
+      "message": [1, 4121, 8241, 8242, -1]
+    }
+  },
+  "sql_sha256": {
+    "reservation_legacy": "a0e10bedb113379d98120d586eb4c5936d9871fea5340bbf96feaf16a66bc7b1",
+    "reservation_candidate": "1e678a7c6ccba69081a11b9a43318b974699c359dd95da2c644ff93e07d25833",
+    "message_legacy": "0bd1163a18a5953f61b00ada238c685893a21ed85b82f8a3c698f317c21e33aa",
+    "message_candidate": "c7274a368908ddf5135db3bdcf9e8ffdaf9e488efd25fc6ae7b198584eaceb4e"
+  },
+  "sql_hash_encoding": "UTF-8 of Python ast.literal_eval of the source string, plus literal LIMIT 1026 for message queries, before numeric substitution or the final semicolon. Continuation indentation is retained as SQL whitespace.",
+  "protocol": {
+    "native_connection": "One CLI process/connection per successful timing run, with both variants in that invocation",
+    "measured_source_queries_per_variant": 6,
+    "warmup_source_queries_per_variant": 1,
+    "source_queries_per_timing_run": 14,
+    "diagnostic_marker_selects_per_timing_run": 28,
+    "measured_order": ["legacy,candidate", "candidate,legacy", "legacy,candidate", "candidate,legacy", "legacy,candidate", "candidate,legacy"],
+    "cpu_measurement": "CLI .timer user + sys for the source statement; startup and diagnostic marker statements excluded",
+    "output_comparison": "Every completed warm-up and measured source result matched native legacy/candidate CSV headers and every CSV cell, and matched the canonical SQLite projection",
+    "csv_limitation": "CSV cannot distinguish NULL from empty text or scalar values with identical text representations; no typed Rust-row claim",
+    "csv_projection_hash_encoding": "SHA-256 of UTF-8 json.dumps(header_and_rows, ensure_ascii=False, separators=(',', ':'))"
+  },
+  "reservation": {
+    "parameters_before_literal_substitution": [4741, 32768],
+    "row_count": 1,
+    "column_count": 14,
+    "matching_csv_projection_sha256": "57be360730b38d4dad467dd17081ddf974a17fd01c33e094b96cd21e6f5290a5",
+    "columns": ["id", "project_id", "agent_id", "path_pattern", "exclusive", "reason", "created_ts", "expires_ts", "hot_release", "ledger_release", "slug", "human_key", "name", "generation_id"],
+    "probe_returncode": 0,
+    "probe_stderr": "",
+    "whole_probe_wall_s": 1.498730888000182,
+    "legacy": {
+      "warmup": {"real_s": 0.304, "user_s": 0.063070, "sys_s": 0.127549},
+      "samples": [
+        {"sample": 0, "real_s": 0.141, "user_s": 0.067024, "sys_s": 0.073300},
+        {"sample": 1, "real_s": 0.138, "user_s": 0.054661, "sys_s": 0.080750},
+        {"sample": 2, "real_s": 0.164, "user_s": 0.082050, "sys_s": 0.069365},
+        {"sample": 3, "real_s": 0.151, "user_s": 0.058503, "sys_s": 0.088175},
+        {"sample": 4, "real_s": 0.137, "user_s": 0.076437, "sys_s": 0.060534},
+        {"sample": 5, "real_s": 0.151, "user_s": 0.107247, "sys_s": 0.043085}
+      ],
+      "measured_cpu_s_total": 0.861131,
+      "measured_wall_s_total": 0.882,
+      "median_cpu_ms": 143.501,
+      "median_wall_ms": 146.0
+    },
+    "candidate": {
+      "warmup": {"real_s": 0.003, "user_s": 0.000000, "sys_s": 0.003234},
+      "samples": [
+        {"sample": 0, "real_s": 0.002, "user_s": 0.000000, "sys_s": 0.001936},
+        {"sample": 1, "real_s": 0.003, "user_s": 0.002767, "sys_s": 0.000000},
+        {"sample": 2, "real_s": 0.003, "user_s": 0.002803, "sys_s": 0.000000},
+        {"sample": 3, "real_s": 0.003, "user_s": 0.001598, "sys_s": 0.001019},
+        {"sample": 4, "real_s": 0.003, "user_s": 0.000000, "sys_s": 0.003304},
+        {"sample": 5, "real_s": 0.002, "user_s": 0.002302, "sys_s": 0.000000}
+      ],
+      "measured_cpu_s_total": 0.015729,
+      "measured_wall_s_total": 0.016,
+      "median_cpu_ms": 2.692,
+      "median_wall_ms": 3.0
+    },
+    "median_cpu_ratio_legacy_over_candidate": 53.306463595839524
+  },
+  "message": {
+    "parameters_before_literal_substitution": [4121, 4194304, 1024],
+    "row_count": 4,
+    "column_count": 24,
+    "matching_csv_projection_sha256": "de9153736d671881737a01e718d64026faee373cc8586b2d940b7a20ed303277",
+    "columns": ["row_kind", "id", "project_id", "subject", "body_md", "thread_id", "topic", "importance", "ack_required", "created_ts", "recipients_json", "attachments", "archive_metadata_json", "project_slug", "project_key", "sender", "recipient_id", "recipient_project_id", "recipient_name", "recipient_kind", "sender_id", "sender_project_id", "recipient_read_ts", "recipient_ack_ts"],
+    "probe_returncode": 0,
+    "probe_stderr": "",
+    "whole_probe_wall_s": 17.31074122799987,
+    "legacy": {
+      "warmup": {"real_s": 0.586, "user_s": 0.124965, "sys_s": 0.071995},
+      "samples": [
+        {"sample": 0, "real_s": 0.738, "user_s": 0.145730, "sys_s": 0.055972},
+        {"sample": 1, "real_s": 0.795, "user_s": 0.172323, "sys_s": 0.106185},
+        {"sample": 2, "real_s": 0.789, "user_s": 0.168093, "sys_s": 0.124845},
+        {"sample": 3, "real_s": 0.849, "user_s": 0.130160, "sys_s": 0.145069},
+        {"sample": 4, "real_s": 1.019, "user_s": 0.145278, "sys_s": 0.126532},
+        {"sample": 5, "real_s": 1.069, "user_s": 0.133585, "sys_s": 0.152350}
+      ],
+      "measured_cpu_s_total": 1.606122,
+      "measured_wall_s_total": 5.259,
+      "median_cpu_ms": 276.8685,
+      "median_wall_ms": 822.0
+    },
+    "candidate": {
+      "warmup": {"real_s": 0.033, "user_s": 0.008786, "sys_s": 0.000596},
+      "samples": [
+        {"sample": 0, "real_s": 0.059, "user_s": 0.008571, "sys_s": 0.002282},
+        {"sample": 1, "real_s": 0.012, "user_s": 0.004019, "sys_s": 0.003998},
+        {"sample": 2, "real_s": 0.018, "user_s": 0.008653, "sys_s": 0.000000},
+        {"sample": 3, "real_s": 0.025, "user_s": 0.009710, "sys_s": 0.000000},
+        {"sample": 4, "real_s": 0.038, "user_s": 0.004463, "sys_s": 0.004919},
+        {"sample": 5, "real_s": 0.045, "user_s": 0.008083, "sys_s": 0.000685}
+      ],
+      "measured_cpu_s_total": 0.055383,
+      "measured_wall_s_total": 0.197,
+      "median_cpu_ms": 9.075,
+      "median_wall_ms": 31.5
+    },
+    "median_cpu_ratio_legacy_over_candidate": 30.508925619834713
+  },
+  "full_native_eqp": {
+    "probe_returncode": 0,
+    "probe_stderr": "",
+    "source_plan_statements": 4,
+    "diagnostic_marker_selects": 8,
+    "whole_probe_wall_s": 0.26097238100010145,
+    "reservation_legacy": [["QUERY PLAN"], ["`--SCAN file_reservations"]],
+    "reservation_candidate": [["QUERY PLAN"], ["`--SCAN file_reservations"]],
+    "message_legacy": [["QUERY PLAN"], ["`--SCAN messages"]],
+    "message_candidate": [["QUERY PLAN"], ["`--SCAN messages"]],
+    "interpretation": "The CLI emits identical coarse SCAN labels; these plans do not establish the executed lookup path or certify the CPU improvement"
+  },
+  "isolated_point_programs": {
+    "artifact": "point-lookup-explain-4741.txt",
+    "literal_id": 4741,
+    "queries": [
+      "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE id = 4741",
+      "SELECT reservation_id, released_ts FROM file_reservation_releases WHERE reservation_id = 4741"
+    ],
+    "observed": "Each program has OpenRead cursor 0 with P4 naming its source table, SeekRowid on that cursor, and no Rewind",
+    "scope": "Isolated literal point SELECTs only; no full joined-query or Rust-binding claim"
+  },
+  "isolated_negative_controls": {
+    "scope": "Five single-statement correctness checks on the same fixture and candidate SQL hashes, each in a separate native CLI process; not additional performance samples",
+    "protocol": {
+      "source_queries_per_process": 1,
+      "diagnostic_sql_queries_per_process": 0,
+      "source_queries_total": 5,
+      "warmup_queries": 0,
+      "wall_timeout_s": 10,
+      "cpu_limit_s": 25,
+      "max_address_space_bytes": 1073741824,
+      "parameter_binding": "Numeric literals, as in the original experiment",
+      "process_cpu_measurement": "Differences in Python resource.getrusage(RUSAGE_CHILDREN) user/system totals around each sequential child",
+      "query_cpu_measurement": "Native CLI .timer user/system totals for the single source statement",
+      "comparison": "Complete native CSV projection compared with canonical SQLite; columns are the matching reservation/message columns already recorded above",
+      "interpretation": "Timing retained as bounded-completion diagnostic context only; no new benchmark ratio or explanation of earlier timeouts"
+    },
+    "cases": [
+      {
+        "case": "reservation_missing_id",
+        "sql_hash_key": "reservation_candidate",
+        "parameters_before_literal_substitution": [9483, 32768],
+        "source_queries_requested": 1,
+        "source_queries_completed": 1,
+        "returncode": 0,
+        "timed_out": false,
+        "stderr": "",
+        "stdout": "Run Time: real 0.084 user 0.000000 sys 0.044545\n",
+        "process_wall_s": 0.28542462099994736,
+        "process_user_s": 0.003545,
+        "process_sys_s": 0.10942299999999999,
+        "statement_timer": {"real_s": 0.084, "user_s": 0.000000, "sys_s": 0.044545},
+        "column_count": 14,
+        "row_count": 0,
+        "native_full_csv_projection": [],
+        "canonical_full_csv_projection": [],
+        "matches_canonical": true
+      },
+      {
+        "case": "reservation_negative_id",
+        "sql_hash_key": "reservation_candidate",
+        "parameters_before_literal_substitution": [-1, 32768],
+        "source_queries_requested": 1,
+        "source_queries_completed": 1,
+        "returncode": 0,
+        "timed_out": false,
+        "stderr": "",
+        "stdout": "Run Time: real 0.180 user 0.004125 sys 0.023914\n",
+        "process_wall_s": 3.6508908910000173,
+        "process_user_s": 0.021729,
+        "process_sys_s": 0.94092,
+        "statement_timer": {"real_s": 0.180, "user_s": 0.004125, "sys_s": 0.023914},
+        "column_count": 14,
+        "row_count": 0,
+        "native_full_csv_projection": [],
+        "canonical_full_csv_projection": [],
+        "matches_canonical": true
+      },
+      {
+        "case": "reservation_byte_refusal",
+        "sql_hash_key": "reservation_candidate",
+        "parameters_before_literal_substitution": [4741, 0],
+        "source_queries_requested": 1,
+        "source_queries_completed": 1,
+        "returncode": 0,
+        "timed_out": false,
+        "stderr": "",
+        "stdout": "Run Time: real 0.803 user 0.011157 sys 0.239045\n",
+        "process_wall_s": 3.9482840149998992,
+        "process_user_s": 0.027079,
+        "process_sys_s": 1.0003019999999998,
+        "statement_timer": {"real_s": 0.803, "user_s": 0.011157, "sys_s": 0.239045},
+        "column_count": 14,
+        "row_count": 0,
+        "native_full_csv_projection": [],
+        "canonical_full_csv_projection": [],
+        "matches_canonical": true
+      },
+      {
+        "case": "message_missing_id",
+        "sql_hash_key": "message_candidate",
+        "parameters_before_literal_substitution": [8242, 4194304, 1024],
+        "literal_limit": 1026,
+        "source_queries_requested": 1,
+        "source_queries_completed": 1,
+        "returncode": 0,
+        "timed_out": false,
+        "stderr": "",
+        "stdout": "Run Time: real 0.026 user 0.002857 sys 0.006262\n",
+        "process_wall_s": 0.04245020899998053,
+        "process_user_s": 0.011531,
+        "process_sys_s": 0.009642,
+        "statement_timer": {"real_s": 0.026, "user_s": 0.002857, "sys_s": 0.006262},
+        "column_count": 24,
+        "row_count": 0,
+        "native_full_csv_projection": [],
+        "canonical_full_csv_projection": [],
+        "matches_canonical": true
+      },
+      {
+        "case": "message_payload_refusal",
+        "sql_hash_key": "message_candidate",
+        "parameters_before_literal_substitution": [4121, 0, 1024],
+        "literal_limit": 1026,
+        "source_queries_requested": 1,
+        "source_queries_completed": 1,
+        "returncode": 0,
+        "timed_out": false,
+        "stderr": "",
+        "stdout": "row_kind,id,project_id,subject,body_md,thread_id,topic,importance,ack_required,created_ts,recipients_json,attachments,archive_metadata_json,project_slug,project_key,sender,recipient_id,recipient_project_id,recipient_name,recipient_kind,sender_id,sender_project_id,recipient_read_ts,recipient_ack_ts\n1,4121,,,,,,,,,,,,,,,26,1,Agent026,to,,,7,11\n1,4121,,,,,,,,,,,,,,,31,1,Agent031,cc,,,7,11\n1,4121,,,,,,,,,,,,,,,36,1,Agent036,bcc,,,7,11\nRun Time: real 0.008 user 0.004121 sys 0.004121\n",
+        "process_wall_s": 0.037581199999749515,
+        "process_user_s": 0.010821,
+        "process_sys_s": 0.008903,
+        "statement_timer": {"real_s": 0.008, "user_s": 0.004121, "sys_s": 0.004121},
+        "column_count": 24,
+        "row_count": 3,
+        "message_header_rows": 0,
+        "native_full_csv_projection": [
+          ["1", "4121", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "26", "1", "Agent026", "to", "", "", "7", "11"],
+          ["1", "4121", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "31", "1", "Agent031", "cc", "", "", "7", "11"],
+          ["1", "4121", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "36", "1", "Agent036", "bcc", "", "", "7", "11"]
+        ],
+        "canonical_full_csv_projection": [
+          ["1", "4121", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "26", "1", "Agent026", "to", "", "", "7", "11"],
+          ["1", "4121", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "31", "1", "Agent031", "cc", "", "", "7", "11"],
+          ["1", "4121", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "36", "1", "Agent036", "bcc", "", "", "7", "11"]
+        ],
+        "matches_canonical": true
+      }
+    ]
+  },
+  "unsuccessful_attempts": [
+    {
+      "attempt": "Combined equivalence, timing and plan probe before splitting runs",
+      "requested_source_or_plan_statements": 86,
+      "timeout_s": 60,
+      "outcome": "Timed out; uncaught Python TimeoutExpired prevented retention of partial stdout",
+      "credited": false,
+      "source_script_retained_in_session": "paired-probe.sql"
+    },
+    {
+      "attempt": "Separate reservation ID/byte-refusal matrix",
+      "requested_source_statements": 18,
+      "timeout_s": 30,
+      "observed_wall_s": 30.311441457,
+      "completed_source_outputs_captured": 0,
+      "stderr": "",
+      "outcome": "Timed out; raw files/status retained; zero captured outputs does not prove zero queries executed",
+      "credited": false
+    }
+  ],
+  "native_rust_validation": {"status": "not recorded in this CLI evidence dataset"},
+  "running_server_validation": {"status": "not measured; no extrapolated server CPU savings or issue-closure claim"}
+}

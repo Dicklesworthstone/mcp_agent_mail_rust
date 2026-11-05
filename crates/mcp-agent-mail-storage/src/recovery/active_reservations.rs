@@ -371,31 +371,10 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, Repair
     result
 }
 
-const SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
-                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
-         FROM (SELECT * FROM file_reservations WHERE id = ?1) fr \
-         JOIN projects p ON p.id = fr.project_id \
-         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
-         LEFT JOIN (SELECT * FROM file_reservation_releases WHERE reservation_id = ?1) rr \
-                ON rr.reservation_id = fr.id \
-         LEFT JOIN db_identity d ON d.singleton = 0 \
-         WHERE length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
-               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
-               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
-               length(CAST(fr.\"exclusive\" AS BLOB)) + \
-               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?2";
-
 fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, RepairFailure> {
     // One SQL snapshot supplies the holder, generation and both release stores.
-    // Filter each reservation table before joining: the runtime cannot push an
-    // ID predicate through the cross-table byte bound, so an outer ID filter
-    // would repeatedly build the full reservation history (GH#354). Keep the
-    // byte bound in SQL so oversized strings never reach the source projection.
-    let rows = conn
-        .query_sync(SOURCE_SQL, &[id.into(), SOURCE_BYTES.into()])
+    // The size predicate bounds materialized strings, not the SQL engine's work.
+    let rows = super::query_reservation_source(conn, id, SOURCE_BYTES)
         .map_err(RepairFailure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
@@ -1046,6 +1025,7 @@ pub fn reconcile_active_reservations(
 
 #[cfg(test)]
 mod tests {
+    use super::super::RESERVATION_SOURCE_SQL as SOURCE_SQL;
     use super::*;
     use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
     use std::sync::mpsc;
@@ -1449,6 +1429,66 @@ mod tests {
                     .contains("malformed reservation release ledger")
             );
             assert!(!config.storage_root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn mailbox_scale_active_repair_converges_with_bounded_source_queries() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            super::super::tests::seed_reservation_history(&conn, 71, 81, 401);
+            let active = [401, 1024, 2048, 3072, 4096, 5120, 6144, 8192, 9482];
+            let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET expires_ts={expires} \
+                 WHERE id IN (1024,2048,3072,4096,5120,6144,8192,9482)"
+            ))
+            .unwrap();
+            drop(conn);
+            let mut cursor = ActiveReservationCursor::default();
+            for round in 0..2 {
+                super::super::tests::reset_reservation_source_queries();
+                let started = Instant::now();
+                let (mut passes, mut scanned, mut repaired, mut unchanged) = (0, 0, 0, 0);
+                loop {
+                    let report = reconcile_active_reservations(
+                        cx,
+                        pool,
+                        config,
+                        &mut cursor,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    passes += 1;
+                    scanned += report.scanned;
+                    repaired += report.repaired;
+                    unchanged += report.unchanged;
+                    assert_eq!((report.deferred, report.retry_len), (0, 0), "{report:?}");
+                    assert!(report.scanned <= IDS_PER_PASS as usize);
+                    assert!(report.attempted <= WRITES_PER_PASS);
+                    assert!(passes <= 80, "finite discovery round did not converge");
+                    if !report.more {
+                        break;
+                    }
+                }
+                let queries = super::super::tests::reservation_source_queries();
+                assert_eq!(scanned, active.len());
+                assert_eq!(repaired, if round == 0 { active.len() } else { 0 });
+                assert_eq!(unchanged, if round == 0 { 0 } else { active.len() });
+                // Initial observation plus two fresh publication rechecks for
+                // repairs; already committed rows need only the first recheck.
+                // Expired history must never cause a source payload lookup.
+                assert_eq!(queries, active.len() * if round == 0 { 3 } else { 2 });
+                eprintln!(
+                    "GH354 active round={round} reservations=9482 passes={passes} \
+                     source_queries={queries} repaired={repaired} unchanged={unchanged} \
+                     wall_us={}",
+                    started.elapsed().as_micros()
+                );
+                for id in active {
+                    assert_committed(cx, pool, config, id);
+                }
+            }
         });
     }
 

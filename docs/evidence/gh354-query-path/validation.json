@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-05T22:13:52.393395+00:00",
+  "issue": 354,
+  "status": "native_application_qualification_blocked",
+  "native_rust_tests_executed": 0,
+  "native_integration_tests_executed": 0,
+  "changed_storage_typecheck_verdict": "unavailable: compiler killed in upstream dependency before changed storage sources",
+  "environment": {
+    "toolchain": "nightly-2026-08-31",
+    "rustc": "1.100.0-nightly (908501772 2026-08-30)",
+    "cargo": "1.100.0-nightly (e8cb624d5 2026-08-22)",
+    "working_directory": "/workspace/agent-mail-gh354",
+    "RUSTUP_HOME": "/workspace/agent-mail-gh354-tools/rustup",
+    "CARGO_HOME": "/workspace/agent-mail-gh354-tools/cargo",
+    "CARGO_TARGET_DIR": "/workspace/agent-mail-gh354-tools/target",
+    "CARGO_BUILD_JOBS": 1,
+    "CARGO_PROFILE_DEV_DEBUG": 0,
+    "CARGO_PROFILE_TEST_DEBUG": 0,
+    "CARGO_INCREMENTAL": 0,
+    "CARGO_NET_GIT_FETCH_WITH_CLI": false,
+    "cargo_unstable_flag": "-Zgit=shallow-deps",
+    "storage_features": "--no-default-features",
+    "locked": true,
+    "original_dev_optimization": 1,
+    "shared_cgroup_memory_limit_bytes": 8589934592,
+    "memory_attribution": "SIGKILL coincided with saturated shared memory and increasing shared oom_kill counters. Counters include unrelated processes; no independent kernel attribution of each victim PID. RSS observations are samples, not peaks."
+  },
+  "source_scope": {
+    "local_checkout_base": "8239ae081b0f6c5432cc27ee4a9c381e943b4f0e",
+    "incoming_query_commits_integrated": [
+      "3455c62c53365ddf51d269973979cf00e40e3ca1",
+      "f4c3cdf5339bcc885cfa4ad4209353aba6a399f3"
+    ],
+    "later_main_reviewed_by_integrator": "283245fe318a2011669f9088d186a7fc2a3fa7fe",
+    "final_main_workspace_compiled": false,
+    "final_main_workspace_format_checked": false,
+    "qualification": "Hashes identify the local source snapshot; none of the changed storage sources received a compiler verdict. Later non-overlapping main changes are outside the earlier full-workspace formatting scope.",
+    "reviewed_rust_sha256": {
+      "crates/mcp-agent-mail-db/src/queries.rs": "25c2f732d683bb8263967e221f3bc1c64e382d42574e6cc9e3b27a981282a8b6",
+      "crates/mcp-agent-mail-storage/src/recovery.rs": "f5ae9ff71eec78d1feaedf9d69c98afa8259701a369a9bc6bda4d4e714555dae",
+      "crates/mcp-agent-mail-storage/src/recovery/active_reservations.rs": "7492cce02d9eaf27b6200aa6757062bdd5992f3100f3a7cb306e5c303f940b41",
+      "crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs": "a8b907c6ca2e0f8c842e073a4b6071fca88ea341f14004a493465405ad24284f",
+      "crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/source.rs": "3f1d4fba09dc71c2b2fdea0889fe75593713d8d7b7129c4404dc28bc7648c860"
+    }
+  },
+  "unchanged_dependency_inputs": {
+    "Cargo.toml_sha256": "c1222f49e7b0f4c7e448b9e9db08014bd0d3aa52c4733a7dd28b138d89a17099",
+    "Cargo.lock_sha256": "d8e26c83677cbe7d008e360d92641d8a123350f0cccb5637b34c54fbb0641335",
+    "dependency_revisions_modified": false,
+    "feature_flags_modified_between_attempts": false,
+    "test_assertions_timeouts_or_ignore_states_modified_to_obtain_results": false
+  },
+  "attempts": [
+    {
+      "id": 1,
+      "recorded_utc": "2026-11-05T21:57:17.154456+00:00",
+      "command": "CARGO_NET_GIT_FETCH_WITH_CLI=false cargo -Zgit=shallow-deps test -p mcp-agent-mail-storage --no-default-features --lib --no-run --locked",
+      "exit_code": 101,
+      "failed_package": "asupersync 0.5.0",
+      "termination": "rustc signal 9 (SIGKILL)",
+      "rustc_emit": "dep-info,metadata,link",
+      "asupersync_opt_level": 1,
+      "reached_changed_storage_crate": false,
+      "tests_executed": 0,
+      "shared_oom_kill_observed_before": 19,
+      "shared_oom_kill_observed_after": 20,
+      "memory_current_bytes_at_recording": 8589684736,
+      "disk_free_bytes_at_recording": 8291368960,
+      "log_path": "/workspace/agent-mail-gh354-tools/storage-setup-shallow-build.log",
+      "log_sha256": "db15f16f284385b58dccb38c189ba5fc81134134e04a169bbc670f9618d62e36"
+    },
+    {
+      "id": 2,
+      "started_recorded_utc": "2026-11-05T21:58:12.413894+00:00",
+      "finished_recorded_utc": "2026-11-05T22:00:17.621650+00:00",
+      "command": "CARGO_NET_GIT_FETCH_WITH_CLI=false cargo -Zgit=shallow-deps --config profile.dev.package.asupersync.opt-level=0 --config profile.test.package.asupersync.opt-level=0 test -p mcp-agent-mail-storage --no-default-features --lib --no-run --locked",
+      "exit_code": 101,
+      "failed_package": "asupersync 0.5.0",
+      "termination": "rustc signal 9 (SIGKILL)",
+      "rustc_emit": "dep-info,metadata,link",
+      "asupersync_opt_level": 0,
+      "temporary_override": "Only Asupersync package dev/test optimization. All other package optimizations and source/dependency/feature/test-gate inputs unchanged. This is a failed capacity experiment, not the acceptance profile.",
+      "configuration_metadata_exit_code": 0,
+      "effective_configuration_observation": "Owned rustc invocation omitted opt-level, confirming rustc default optimization 0.",
+      "reached_changed_storage_crate": false,
+      "tests_executed": 0,
+      "observed_rustc_rss_kib_before_failure": 2179288,
+      "shared_oom_kill_observed_before": 20,
+      "shared_oom_kill_observed_after": 23,
+      "disk_free_bytes_after": 7928791040,
+      "log_path": "/workspace/agent-mail-gh354-tools/storage-asupersync-opt0-build.log",
+      "log_sha256": "04b7c6181f53ca14e18048a273abf1d782970210fd03310952d1d5d43cdd6ad7"
+    },
+    {
+      "id": 3,
+      "finished_recorded_utc": "2026-11-05T22:13:52.393395+00:00",
+      "command": "CARGO_NET_GIT_FETCH_WITH_CLI=false cargo -Zgit=shallow-deps check -p mcp-agent-mail-storage --no-default-features --all-targets --locked",
+      "exit_code": 101,
+      "failed_package": "asupersync 0.5.0",
+      "termination": "rustc signal 9 (SIGKILL)",
+      "rustc_emit": "dep-info,metadata",
+      "asupersync_opt_level": 1,
+      "llvm_codegen_requested": false,
+      "reached_changed_storage_crate": false,
+      "tests_executed": 0,
+      "observed_rustc_rss_kib_before_failure": 3623920,
+      "shared_oom_kill_observed_before": 23,
+      "shared_oom_kill_observed_after": 29,
+      "memory_current_bytes_at_recording": 8589754368,
+      "disk_free_bytes_after": 6946783232,
+      "log_path": "/workspace/agent-mail-gh354-tools/storage-check-all-targets.log",
+      "log_sha256": "cf010fda096472855704bf808ac4b2911a711bd44a49d6db0b247ce07c8b925d"
+    }
+  ],
+  "formatting": {
+    "initial_local_workspace": {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "scope": "Local workspace before final small source integrations; not final merged main.",
+      "log_path": "/workspace/agent-mail-gh354-tools/workspace-fmt-check.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "final_owned_rust_files": {
+      "status": "passed_as_reported_by_integrator",
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/mcp-agent-mail-db/src/queries.rs crates/mcp-agent-mail-storage/src/recovery.rs crates/mcp-agent-mail-storage/src/recovery/active_reservations.rs crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/source.rs",
+      "exit_code": 0,
+      "scope": "Five changed Rust files listed in source_scope.reviewed_rust_sha256. No full final-main workspace claim."
+    },
+    "integrator_git_diff_check_exit_code": 0
+  },
+  "outstanding_gates": {
+    "focused_storage_tests": "not executed; 16 exact tests enumerated in validation.md",
+    "existing_authority_concurrency_and_fence_tests": "not executed; exact commands in validation.md",
+    "db_retention_tests": "not executed; preserve all mutation cases and finite-round assertions",
+    "gh374_live_writer_integration": "not executed; default 96 messages, AM_TEST_GH374_LARGE_MAILBOX unset, unchanged 120-second deadline",
+    "workspace_check_all_targets": "not passed; not separately retried after narrower common-dependency compiler failure",
+    "workspace_check_lib_bins": "not passed; not separately retried after narrower common-dependency compiler failure",
+    "workspace_clippy_all_targets": "not passed; not separately retried after narrower common-dependency compiler failure",
+    "final_merged_workspace_fmt": "not claimed; earlier local workspace and final owned-file checks have narrower scope",
+    "running_server_idle_cpu_and_query_frequency": "not measured by native application tests or the separate CLI experiment"
+  },
+  "reproduction_document": "validation.md",
+  "full_executor_logs_committed": false,
+  "issue_and_broad_acceptance_beads_closed": false,
+  "claim_limits": [
+    "No changed-storage compiler/typecheck verdict.",
+    "No native Rust unit or integration test execution.",
+    "Metadata-only SIGKILL prevents attributing the blocker solely to LLVM optimization or code generation.",
+    "Shared OOM counters do not independently identify the killed process.",
+    "Separate native-engine CLI SQL measurements do not qualify Rust bindings, typed rows, native snapshots, repair convergence, publication, retention, or server idle CPU.",
+    "Contributor-projected CPU savings are not measured server savings from this work."
+  ]
+}

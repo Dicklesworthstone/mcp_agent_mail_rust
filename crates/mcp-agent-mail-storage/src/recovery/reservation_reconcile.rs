@@ -388,33 +388,13 @@ fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<ReleaseSource
     })
 }
 
-const SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
-                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
-         FROM (SELECT * FROM file_reservations WHERE id = ?1) fr \
-         JOIN projects p ON p.id = fr.project_id \
-         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
-         LEFT JOIN (SELECT * FROM file_reservation_releases WHERE reservation_id = ?1) rr \
-                ON rr.reservation_id = fr.id \
-         LEFT JOIN db_identity d ON d.singleton = 0 \
-         WHERE length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
-               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
-               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
-               length(CAST(fr.\"exclusive\" AS BLOB)) + \
-               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?2";
-
 fn read_source_connection_inner(
     conn: &DbConn,
     id: i64,
 ) -> Result<Option<ReleaseSource>, ReleaseFailure> {
     // Identity, effective release and generation belong to one SQL snapshot.
-    // Filter both reservation tables before the joins; an outer ID predicate
-    // beside this cross-table byte bound defeats runtime pushdown (GH#354).
     // Bound raw strings before materializing them; never seed a generation.
-    let rows = conn
-        .query_sync(SOURCE_SQL, &[id.into(), MAX_SOURCE_BYTES.into()])
+    let rows = super::query_reservation_source(conn, id, MAX_SOURCE_BYTES)
         .map_err(ReleaseFailure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
@@ -920,6 +900,7 @@ pub fn reconcile_reservation_releases(
 
 #[cfg(test)]
 mod tests {
+    use super::super::RESERVATION_SOURCE_SQL as SOURCE_SQL;
     use super::*;
     use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
 
@@ -1925,6 +1906,50 @@ mod tests {
         .into_iter()
         .next()
         .expect("fixture reservation")
+    }
+
+    #[test]
+    fn mailbox_scale_targeted_release_queries_remain_bounded_and_idempotent() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            super::super::tests::seed_reservation_history(&conn, 71, 81, 401);
+            conn.execute_raw(
+                "INSERT INTO file_reservation_releases(reservation_id, released_ts) \
+                 VALUES(9482, 6000000)",
+            )
+            .unwrap();
+            drop(conn);
+            let captured = captured_row(cx, pool, 9482);
+            let path = config
+                .storage_root
+                .join("projects/project/file_reservations/id-9482-gaabb.json");
+            for round in 0..2 {
+                super::super::tests::reset_reservation_source_queries();
+                let started = std::time::Instant::now();
+                let repaired =
+                    reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap();
+                let queries = super::super::tests::reservation_source_queries();
+                assert_eq!(repaired, round == 0);
+                assert_eq!(queries, if round == 0 { 3 } else { 2 });
+                let artifact = read_artifact(&path).unwrap().unwrap();
+                assert_eq!(timestamp(&artifact.value["released_ts"]), Some(6_000_000));
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let tree = head_tree(&repo).unwrap().unwrap();
+                let committed = committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-9482-gaabb.json",
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(committed.bytes, artifact.bytes);
+                eprintln!(
+                    "GH354 release round={round} reservations=9482 source_queries={queries} \
+                     repaired={repaired} wall_us={}",
+                    started.elapsed().as_micros()
+                );
+            }
+        });
     }
 
     #[test]

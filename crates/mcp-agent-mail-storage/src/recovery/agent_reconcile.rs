@@ -31,6 +31,28 @@ const IDS_PER_BATCH: i64 = 32;
 const MAX_REPAIRS_PER_BATCH: usize = 4;
 const MAX_PROFILE_BYTES: usize = 128 * 1024;
 
+// Restrict both identity sources before their joins. The complete byte bound
+// spans agent/project fields and can prevent the runtime engine from pushing
+// an outer ID predicate down through the join. Keep duplicate-name authority
+// in this same statement, and never materialize registration_token in the
+// derived source even though the final projection would omit it.
+const SOURCE_SQL: &str = "SELECT a.id, a.name, a.program, a.model, a.task_description, \
+                a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+                a.reaper_exempt, a.retired_at, d.deregistered_at, \
+                p.slug AS project_slug, p.human_key AS project_key \
+         FROM (SELECT id, project_id, name, program, model, task_description, \
+                      inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                      reaper_exempt, retired_at FROM agents WHERE id = ?1) a \
+         JOIN projects p ON p.id = a.project_id \
+         LEFT JOIN (SELECT agent_id, deregistered_at FROM agent_deregistrations \
+                    WHERE agent_id = ?1) d ON d.agent_id = a.id \
+         WHERE length(CAST(a.name AS BLOB)) + length(CAST(a.program AS BLOB)) + \
+               length(CAST(a.model AS BLOB)) + length(CAST(a.task_description AS BLOB)) + \
+               length(CAST(a.attachments_policy AS BLOB)) + length(CAST(a.contact_policy AS BLOB)) + \
+               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) <= ?2 \
+               AND NOT EXISTS (SELECT 1 FROM agents other WHERE other.project_id = a.project_id \
+                   AND other.id != a.id AND other.name = a.name COLLATE NOCASE)";
+
 /// A finite round prevents continuously registered identities from starving
 /// old lifecycle changes. Restarting or changing the live pool starts a new
 /// round; cursors never authorize a write or a deletion. Transient failures
@@ -250,22 +272,9 @@ fn read_source_connection_inner(conn: &DbConn, id: i64) -> Result<AgentSource, F
     // One statement observes identity, lifecycle ledger and project together.
     // Do not select registration_token, even temporarily. The raw text bound
     // precedes materialization; serialization has its own bound below.
-    let rows = conn.query_sync(
-        "SELECT a.id, a.name, a.program, a.model, a.task_description, \
-                a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
-                a.reaper_exempt, a.retired_at, d.deregistered_at, \
-                p.slug AS project_slug, p.human_key AS project_key \
-         FROM agents a JOIN projects p ON p.id = a.project_id \
-         LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
-         WHERE a.id = ? AND \
-               length(CAST(a.name AS BLOB)) + length(CAST(a.program AS BLOB)) + \
-               length(CAST(a.model AS BLOB)) + length(CAST(a.task_description AS BLOB)) + \
-               length(CAST(a.attachments_policy AS BLOB)) + length(CAST(a.contact_policy AS BLOB)) + \
-               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) <= ? \
-               AND NOT EXISTS (SELECT 1 FROM agents other WHERE other.project_id = a.project_id \
-                   AND other.id != a.id AND other.name = a.name COLLATE NOCASE)",
-        &[id.into(), (MAX_PROFILE_BYTES as i64).into()],
-    ).map_err(Failure::source_unavailable)?;
+    let rows = conn
+        .query_sync(SOURCE_SQL, &[id.into(), (MAX_PROFILE_BYTES as i64).into()])
+        .map_err(Failure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
             "agent missing, oversized, or lacking unambiguous project/name authority".into(),
@@ -828,6 +837,39 @@ pub fn reconcile_agent_batch(
 mod tests {
     use super::*;
 
+    // The previous production statement is an equivalence oracle on the real
+    // runtime engine. Independent expected fields/refusals below also guard
+    // against both statements accidentally accepting incomplete authority.
+    const PREVIOUS_SOURCE_SQL: &str = "SELECT a.id, a.name, a.program, a.model, a.task_description, \
+                a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+                a.reaper_exempt, a.retired_at, d.deregistered_at, \
+                p.slug AS project_slug, p.human_key AS project_key \
+         FROM agents a JOIN projects p ON p.id = a.project_id \
+         LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+         WHERE a.id = ? AND \
+               length(CAST(a.name AS BLOB)) + length(CAST(a.program AS BLOB)) + \
+               length(CAST(a.model AS BLOB)) + length(CAST(a.task_description AS BLOB)) + \
+               length(CAST(a.attachments_policy AS BLOB)) + length(CAST(a.contact_policy AS BLOB)) + \
+               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) <= ? \
+               AND NOT EXISTS (SELECT 1 FROM agents other WHERE other.project_id = a.project_id \
+                   AND other.id != a.id AND other.name = a.name COLLATE NOCASE)";
+
+    fn assert_source_projection_unchanged(
+        conn: &DbConn,
+        id: i64,
+        byte_limit: usize,
+    ) -> Vec<mcp_agent_mail_db::sqlmodel_core::Row> {
+        let params = [id.into(), i64::try_from(byte_limit).unwrap().into()];
+        let actual = conn.query_sync(SOURCE_SQL, &params).unwrap();
+        let previous = conn.query_sync(PREVIOUS_SOURCE_SQL, &params).unwrap();
+        assert_eq!(actual.len(), previous.len(), "source {id}");
+        for (actual, previous) in actual.iter().zip(&previous) {
+            assert_eq!(actual.values(), previous.values(), "source {id}");
+            assert_eq!(actual.values().len(), 14);
+        }
+        actual
+    }
+
     type ProfileObservationHook = Box<dyn FnOnce(&DbConn)>;
 
     std::thread_local! {
@@ -1015,6 +1057,178 @@ mod tests {
             .unwrap();
         assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
         value
+    }
+
+    #[test]
+    fn agent_source_point_lookup_preserves_projection_with_unrelated_roster() {
+        with_mailbox(|cx, pool, config, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(102, 'other', '/other', 1)").unwrap();
+            // The same name in another project does not make this identity
+            // ambiguous, and its independent tombstone must not leak across.
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(102, 102, 'BlueLake', 'other', 'other', 3000000, 4000000)").unwrap();
+            conn.execute_raw(
+                "UPDATE agents SET reaper_exempt = 1, retired_at = 123456789 WHERE id = 101",
+            )
+            .unwrap();
+            conn.execute_raw("INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(101, 234567891), (102, 345678912)").unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            for start in (1_000..5_096).step_by(128) {
+                let agents = (start..start + 128)
+                    .map(|id| {
+                        let project = if id % 2 == 0 { 101 } else { 102 };
+                        format!("({id},{project},'History{id}','test','test',1000000,2000000,'unrelated-secret')")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts,registration_token) VALUES {agents}"
+                )).unwrap();
+                let tombstones = (start..start + 128)
+                    .step_by(2)
+                    .map(|id| format!("({id},456789123)"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO agent_deregistrations(agent_id,deregistered_at) VALUES {tombstones}"
+                )).unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+
+            for id in [101, 102, 1_000, 1_001, 5_095, 9_999] {
+                assert_source_projection_unchanged(&conn, id, MAX_PROFILE_BYTES);
+            }
+            let source = read_source_connection(&conn, 101).unwrap();
+            assert_eq!(source.id, 101);
+            assert_eq!(source.project_slug, "project");
+            assert_eq!(source.project_key, "/project");
+            assert_eq!(
+                source.profile,
+                json!({
+                    "name": "BlueLake", "program": "test", "model": "test",
+                    "task_description": "coordination",
+                    "inception_ts": timestamp(1_000_000).unwrap(),
+                    "last_active_ts": timestamp(2_000_000).unwrap(),
+                    "attachments_policy": "auto", "contact_policy": "auto",
+                    "reaper_exempt": true,
+                    "retired_at": timestamp(123_456_789).unwrap(),
+                    "deregistered_at": timestamp(234_567_891).unwrap(),
+                })
+            );
+            let other = read_source_connection(&conn, 102).unwrap();
+            assert_eq!(other.project_slug, "other");
+            assert_eq!(
+                other.profile["deregistered_at"],
+                timestamp(345_678_912).unwrap()
+            );
+            drop(conn);
+
+            // Exercise the actual bounded selection and publication path for
+            // this identity, not just direct execution of the projection.
+            let mut cursor = AgentReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                after: 100,
+                ceiling: Some(101),
+                ..Default::default()
+            };
+            let report =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                (report.scanned, report.repaired, report.deferred),
+                (1, 1, 0)
+            );
+            assert_eq!(assert_profile_committed(config), source.profile);
+            assert!(!config.storage_root.join("projects/other").exists());
+            assert_eq!(read_source(cx, pool, 101).unwrap(), source);
+        });
+    }
+
+    #[test]
+    fn agent_source_point_lookup_preserves_ambiguity_lifecycle_and_byte_bounds() {
+        with_mailbox(|cx, pool, config, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(102, 'other', '/other', 1)").unwrap();
+            // The schema permits case-distinct names. Recovery must still
+            // refuse an identity ambiguous under its NOCASE name authority.
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(102, 101, 'bluelake', 'test', 'test', 1000000, 2000000)").unwrap();
+            assert!(assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES).is_empty());
+            assert!(!read_source_connection(&conn, 101).unwrap_err().transient);
+            conn.execute_raw("UPDATE agents SET project_id = 102 WHERE id = 102")
+                .unwrap();
+            conn.execute_raw("INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(102, 345678912)").unwrap();
+            assert_eq!(
+                assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES).len(),
+                1
+            );
+            assert!(
+                read_source_connection(&conn, 101).unwrap().profile["deregistered_at"].is_null()
+            );
+            conn.execute_raw("INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(101, 234567891)").unwrap();
+            assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES);
+            assert_eq!(
+                read_source_connection(&conn, 101).unwrap().profile["deregistered_at"],
+                timestamp(234_567_891).unwrap()
+            );
+            conn.execute_raw("UPDATE agent_deregistrations SET deregistered_at = 'not-a-timestamp' WHERE agent_id = 101").unwrap();
+            assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES);
+            assert!(!read_source_connection(&conn, 101).unwrap_err().transient);
+            conn.execute_raw(
+                "UPDATE agent_deregistrations SET deregistered_at = 234567891 WHERE agent_id = 101",
+            )
+            .unwrap();
+            conn.execute_raw("UPDATE projects SET human_key = 'relative-project' WHERE id = 101")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES);
+            assert!(
+                read_source_connection(&conn, 101)
+                    .unwrap_err()
+                    .detail
+                    .contains("must be absolute")
+            );
+            conn.execute_raw("UPDATE projects SET human_key = '/project' WHERE id = 101")
+                .unwrap();
+
+            conn.execute_raw("UPDATE agents SET program = 'pi', model = '模型', task_description = 'λ' WHERE id = 101").unwrap();
+            let fields = [
+                "BlueLake", "pi", "模型", "λ", "auto", "auto", "project", "/project",
+            ];
+            let raw_bytes = fields.into_iter().map(str::len).sum::<usize>();
+            assert_eq!(
+                assert_source_projection_unchanged(&conn, 101, raw_bytes).len(),
+                1,
+                "the raw byte limit is inclusive"
+            );
+            assert!(assert_source_projection_unchanged(&conn, 101, raw_bytes - 1).is_empty());
+            let fixed_bytes = raw_bytes - "λ".len();
+            let mut task = format!(
+                "λ{}",
+                "x".repeat(MAX_PROFILE_BYTES - fixed_bytes - "λ".len())
+            );
+            conn.execute_sync(
+                "UPDATE agents SET task_description = ? WHERE id = 101",
+                &[task.clone().into()],
+            )
+            .unwrap();
+            assert_eq!(
+                assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES).len(),
+                1
+            );
+            let serialized = read_source_connection(&conn, 101).unwrap_err();
+            assert!(!serialized.transient);
+            assert!(serialized.detail.contains("serialized agent profile"));
+            task.push('x');
+            conn.execute_sync(
+                "UPDATE agents SET task_description = ? WHERE id = 101",
+                &[task.into()],
+            )
+            .unwrap();
+            assert!(assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES).is_empty());
+            assert!(!read_source_connection(&conn, 101).unwrap_err().transient);
+            assert!(assert_source_projection_unchanged(&conn, 9_999, MAX_PROFILE_BYTES).is_empty());
+            assert!(!read_source_connection(&conn, 9_999).unwrap_err().transient);
+            assert!(!config.storage_root.join(".git").exists());
+        });
     }
 
     fn exercise_failed_discovery(panic: bool) {
