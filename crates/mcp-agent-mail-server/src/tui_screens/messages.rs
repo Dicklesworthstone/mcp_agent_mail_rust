@@ -5,7 +5,7 @@
 //! keyboard-first navigation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +33,7 @@ use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListStat
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_core::Value;
+use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 use serde::Deserialize;
 
@@ -886,6 +886,151 @@ struct ComposePayload {
     ack_required: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeAgentStatus {
+    Active,
+    Retired,
+    Deregistered,
+}
+
+#[derive(Debug)]
+struct ComposeAgent {
+    id: i64,
+    name: String,
+    status: ComposeAgentStatus,
+}
+
+impl ComposeAgent {
+    fn require_active(&self) -> Result<(), String> {
+        match self.status {
+            ComposeAgentStatus::Active => Ok(()),
+            ComposeAgentStatus::Retired => Err(format!(
+                "Agent '{}' is retired. Unretire this agent before sending new messages.",
+                self.name
+            )),
+            ComposeAgentStatus::Deregistered => Err(format!(
+                "Agent '{}' is deregistered and cannot send or receive new messages. Choose an active agent.",
+                self.name
+            )),
+        }
+    }
+}
+
+/// Resolve names like the backend: the first registered case-insensitive
+/// identity wins, even when a newer spelling is still active. Observe its
+/// lifecycle ledger in the same statement as the profile. Read-only legacy
+/// snapshots may predate the ledger and retirement column, so retain their
+/// task-description tombstones without attempting a migration here.
+fn query_compose_agents(
+    mut query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
+    project_slug: &str,
+    name: Option<&str>,
+) -> Result<Vec<ComposeAgent>, String> {
+    let query_error = |error| format!("Failed to load agents for compose: {error}");
+    let columns: HashSet<String> = query("PRAGMA table_info(agents)", &[])
+        .map_err(query_error)?
+        .iter()
+        .map(|row| row.get_named::<String>("name"))
+        .collect::<Result<_, _>>()
+        .map_err(query_error)?;
+    let has_ledger = !query(
+        "SELECT 1 AS present FROM sqlite_master \
+         WHERE type = 'table' AND name = 'agent_deregistrations' LIMIT 1",
+        &[],
+    )
+    .map_err(query_error)?
+    .is_empty();
+    let mut source_columns = vec!["id", "name"];
+    let retired = if columns.contains("retired_at") {
+        source_columns.push("retired_at");
+        "a.retired_at"
+    } else {
+        "NULL"
+    };
+    let task = if columns.contains("task_description") {
+        source_columns.push("task_description");
+        "COALESCE(a.task_description, '')"
+    } else {
+        "''"
+    };
+    let (ledger_join, deregistered) = if has_ledger {
+        (
+            "LEFT JOIN agent_deregistrations d ON d.agent_id = a.id",
+            "d.agent_id",
+        )
+    } else {
+        ("", "NULL")
+    };
+    let (project, mut params) = synthetic_project_id(project_slug).map_or_else(
+        || {
+            (
+                "(SELECT id FROM projects WHERE slug = ? LIMIT 1)",
+                vec![Value::Text(project_slug.to_string())],
+            )
+        },
+        |project_id| ("?", vec![Value::BigInt(project_id)]),
+    );
+    let name_filter = if let Some(name) = name {
+        params.push(Value::Text(name.to_string()));
+        " AND name = ? COLLATE NOCASE"
+    } else {
+        ""
+    };
+    let source_projection = source_columns.join(", ");
+    let sql = format!(
+        "SELECT a.id AS id, a.name AS name, {retired} AS retired_at, \
+         {deregistered} AS deregistered_id, {task} AS task_description \
+         FROM (SELECT {source_projection} FROM agents \
+               WHERE project_id = {project}{name_filter}) a \
+         {ledger_join} ORDER BY a.id ASC"
+    );
+    let rows = query(&sql, &params).map_err(query_error)?;
+    let mut seen_names = HashSet::new();
+    let mut agents = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name = row.get_named::<String>("name").map_err(query_error)?;
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        let task = row
+            .get_named::<String>("task_description")
+            .map_err(query_error)?;
+        let status = if row.get_by_name("deregistered_id") != Some(&Value::Null)
+            || mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(&task)
+        {
+            ComposeAgentStatus::Deregistered
+        } else if row.get_by_name("retired_at") != Some(&Value::Null) {
+            ComposeAgentStatus::Retired
+        } else {
+            ComposeAgentStatus::Active
+        };
+        agents.push(ComposeAgent {
+            id: row.get_named("id").map_err(query_error)?,
+            name,
+            status,
+        });
+    }
+    Ok(agents)
+}
+
+fn active_compose_agent_names(agents: &[ComposeAgent]) -> Vec<String> {
+    let mut names: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.status == ComposeAgentStatus::Active)
+        .map(|agent| agent.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+fn require_active_compose_recipient(agents: &[ComposeAgent], name: &str) -> Result<(), String> {
+    agents
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("Unknown recipient: {name}"))?
+        .require_active()
+}
+
 #[derive(Debug, Clone)]
 struct ComposeFormState {
     project_slug: String,
@@ -1394,30 +1539,33 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             return Err("Database connection unavailable".to_string());
         };
-        let (sql, params) = synthetic_project_id(project_slug).map_or_else(
-            || {
-                (
-                    "SELECT a.name AS name \
-                 FROM agents a \
-                 WHERE a.project_id = (SELECT id FROM projects WHERE slug = ? LIMIT 1) \
-                 ORDER BY a.name",
-                    vec![Value::Text(project_slug.to_string())],
-                )
-            },
-            |project_id| {
-                (
-                    "SELECT name FROM agents WHERE project_id = ? ORDER BY name",
-                    vec![Value::BigInt(project_id)],
-                )
-            },
-        );
-        conn.query_sync(sql, &params)
-            .map_err(|err| format!("Failed to load agents for compose: {err}"))
-            .map(|rows| {
-                rows.into_iter()
-                    .filter_map(|row| row.get_named::<String>("name").ok())
-                    .collect()
-            })
+        query_compose_agents(
+            |sql, params| conn.query_sync(sql, params),
+            project_slug,
+            None,
+        )
+        .map(|agents| active_compose_agent_names(&agents))
+    }
+
+    fn live_compose_agents(
+        project_slug: &str,
+        name: Option<&str>,
+        state: Option<&TuiSharedState>,
+    ) -> Result<Vec<ComposeAgent>, String> {
+        let config = Self::runtime_config_from_state(state);
+        let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
+            .ok_or_else(|| "Database connection unavailable".to_string())?;
+        let conn = crate::open_read_only_sync_db_connection_with_busy_timeout(
+            sqlite_path.to_string_lossy().as_ref(),
+            crate::INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS,
+            "message recipient lifecycle",
+        )
+        .map_err(|error| format!("Cannot verify current agent lifecycle: {error}"))?;
+        query_compose_agents(
+            |sql, params| conn.query_sync(sql, params),
+            project_slug,
+            name,
+        )
     }
 
     fn open_compose_error_form(
@@ -1480,7 +1628,7 @@ impl MessageBrowserScreen {
         let mut form = ComposeFormState::new(project_slug, prefill_to, agents);
         if form.available_agents.is_empty() {
             form.errors.general = Some(
-                "No registered agents found in this project. Register agents before composing."
+                "No active agents found in this project. Register or unretire an agent before composing."
                     .to_string(),
             );
         }
@@ -1555,9 +1703,18 @@ impl MessageBrowserScreen {
     }
 
     fn open_quick_reply_modal_for_entry(&mut self, entry: &MessageEntry) -> Result<(), String> {
-        let Some(form) = QuickReplyFormState::from_entry(entry) else {
+        let Some(mut form) = QuickReplyFormState::from_entry(entry) else {
             return Err("Selected message is missing required reply context".to_string());
         };
+        if let Some(conn) = &self.db_conn {
+            form.errors.general = query_compose_agents(
+                |sql, params| conn.query_sync(sql, params),
+                &form.context.project_slug,
+                Some(&form.context.to_agent),
+            )
+            .and_then(|agents| require_active_compose_recipient(&agents, &form.context.to_agent))
+            .err();
+        }
         self.quick_reply_form = Some(form);
         self.compose_form = None;
         Ok(())
@@ -1602,50 +1759,53 @@ impl MessageBrowserScreen {
                 .ok_or_else(|| format!("Project not found: {project_slug}"))?
         };
 
-        let existing_sender = conn
-            .query_sync(
-                "SELECT id, inception_ts FROM agents WHERE project_id = ? AND name = ? LIMIT 1",
-                &[
-                    Value::BigInt(project_id),
-                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
-                ],
-            )
-            .map_err(|e| format!("Failed to check compose sender: {e}"))?
-            .into_iter()
-            .next();
+        let existing_sender = query_compose_agents(
+            |sql, params| conn.query_sync(sql, params),
+            project_slug,
+            Some(COMPOSE_SENDER_NAME),
+        )?
+        .into_iter()
+        .next();
         let now = unix_epoch_micros_now().unwrap_or(0);
-        let inception_ts = if let Some(row) = existing_sender {
-            let existing_inception = row.get_named::<i64>("inception_ts").unwrap_or(now);
-            conn.execute_sync(
-                "UPDATE agents SET last_active_ts = ? WHERE project_id = ? AND name = ?",
-                &[
-                    Value::BigInt(now),
-                    Value::BigInt(project_id),
-                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
-                ],
-            )
-            .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
-            existing_inception
-        } else {
-            conn.execute_sync(
-                "INSERT INTO agents \
-                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    Value::BigInt(project_id),
-                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
-                    Value::Text("am-tui".to_string()),
-                    Value::Text("human".to_string()),
-                    Value::Text("Human operator composing messages in TUI".to_string()),
-                    Value::BigInt(now),
-                    Value::BigInt(now),
-                    Value::Text("auto".to_string()),
-                    Value::Text("auto".to_string()),
-                ],
-            )
-            .map_err(|e| format!("Failed to create compose sender: {e}"))?;
-            now
-        };
+        if let Some(sender) = existing_sender {
+            sender.require_active()?;
+            let changed = conn
+                .execute_sync(
+                    "UPDATE agents SET last_active_ts = ? WHERE id = ? \
+                     AND retired_at IS NULL \
+                     AND id NOT IN (SELECT agent_id FROM agent_deregistrations) \
+                     AND substr(COALESCE(task_description, ''), 1, 14) <> '[DEREGISTERED '",
+                    &[Value::BigInt(now), Value::BigInt(sender.id)],
+                )
+                .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "Agent '{}' changed lifecycle while composing. Refresh its status before sending.",
+                    sender.name
+                ));
+            }
+            // A heartbeat owns no profile fields. Replacing an existing
+            // profile here erased lifecycle state, operator settings and
+            // extensions even when the subsequent send was refused.
+            return Ok(());
+        }
+        conn.execute_sync(
+            "INSERT INTO agents \
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                Value::Text("am-tui".to_string()),
+                Value::Text("human".to_string()),
+                Value::Text("Human operator composing messages in TUI".to_string()),
+                Value::BigInt(now),
+                Value::BigInt(now),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .map_err(|e| format!("Failed to create compose sender: {e}"))?;
 
         let config = Self::runtime_config_from_state(state);
         if let Ok(Some(archive)) = mcp_agent_mail_storage::open_archive(&config, project_slug) {
@@ -1654,9 +1814,13 @@ impl MessageBrowserScreen {
                 "program": "am-tui",
                 "model": "human",
                 "task_description": "Human operator composing messages in TUI",
-                "inception_ts": micros_to_iso(inception_ts),
+                "inception_ts": micros_to_iso(now),
                 "last_active_ts": micros_to_iso(now),
                 "attachments_policy": "auto",
+                "contact_policy": "auto",
+                "reaper_exempt": false,
+                "retired_at": null,
+                "deregistered_at": null,
             });
             let _ = mcp_agent_mail_storage::write_agent_profile_with_config(
                 &archive,
@@ -1668,6 +1832,38 @@ impl MessageBrowserScreen {
     }
 
     fn submit_compose_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
+        let Some(project_slug) = self
+            .compose_form
+            .as_ref()
+            .map(|form| form.project_slug.clone())
+        else {
+            return Cmd::None;
+        };
+        // The browser can be showing a retained archive snapshot. New mail
+        // must consult the live mailbox before creating or touching its sender.
+        let refreshed = Self::live_compose_agents(&project_slug, None, state).and_then(|agents| {
+            let Some(form) = self.compose_form.as_mut() else {
+                return Ok(());
+            };
+            form.available_agents = active_compose_agent_names(&agents);
+            form.refresh_suggestions();
+            for name in parse_recipient_list(form.to_input.value())
+                .into_iter()
+                .chain(parse_recipient_list(form.cc_input.value()))
+            {
+                require_active_compose_recipient(&agents, &name)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = refreshed {
+            if let Some(form) = self.compose_form.as_mut() {
+                form.errors.general = Some(error.clone());
+            }
+            return Cmd::msg(MailScreenMsg::ActionExecute(
+                "compose_result:error".to_string(),
+                error,
+            ));
+        }
         let (payload, errors) = match self.compose_form.as_ref() {
             Some(form) => match validate_compose_form(form) {
                 Ok(payload) => (Some(payload), ComposeValidationErrors::default()),
@@ -1862,7 +2058,11 @@ impl MessageBrowserScreen {
         };
 
         self.ensure_modal_db_conn(state);
-        if let Err(err) = self.ensure_compose_sender(&context.project_slug, state) {
+        let admission =
+            Self::live_compose_agents(&context.project_slug, Some(&context.to_agent), state)
+                .and_then(|agents| require_active_compose_recipient(&agents, &context.to_agent))
+                .and_then(|()| self.ensure_compose_sender(&context.project_slug, state));
+        if let Err(err) = admission {
             if let Some(form) = self.quick_reply_form.as_mut() {
                 form.errors.general = Some(err.clone());
             }
@@ -6032,7 +6232,10 @@ fn parse_recipient_list(raw: &str) -> Vec<String> {
         if name.is_empty() {
             continue;
         }
-        if out.iter().all(|existing| existing != name) {
+        if out
+            .iter()
+            .all(|existing: &String| !existing.eq_ignore_ascii_case(name))
+        {
             out.push(name.to_string());
         }
     }
@@ -6073,14 +6276,23 @@ fn validate_compose_form(
     let mut errors = ComposeValidationErrors::default();
     let to = parse_recipient_list(form.to_input.value());
     let cc = parse_recipient_list(form.cc_input.value());
-    let known_agents: std::collections::HashSet<&str> =
-        form.available_agents.iter().map(String::as_str).collect();
+    let known_agents: HashSet<String> = form
+        .available_agents
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     if to.is_empty() {
         errors.to = Some("At least one recipient is required.".to_string());
-    } else if let Some(invalid) = to.iter().find(|name| !known_agents.contains(name.as_str())) {
+    } else if let Some(invalid) = to
+        .iter()
+        .find(|name| !known_agents.contains(&name.to_ascii_lowercase()))
+    {
         errors.to = Some(format!("Unknown recipient: {invalid}"));
     }
-    if let Some(invalid) = cc.iter().find(|name| !known_agents.contains(name.as_str())) {
+    if let Some(invalid) = cc
+        .iter()
+        .find(|name| !known_agents.contains(&name.to_ascii_lowercase()))
+    {
         errors.cc = Some(format!("Unknown CC recipient: {invalid}"));
     }
 
@@ -8159,6 +8371,410 @@ first body
             .load_agent_names_for_project("proj")
             .expect_err("expected missing-connection error");
         assert_eq!(err, "Database connection unavailable");
+    }
+
+    fn compose_lifecycle_fixture() -> (tempfile::TempDir, mcp_agent_mail_core::Config, DbConn) {
+        let dir = tempdir().expect("fixture directory");
+        let db_path = dir.path().join("compose-lifecycle.sqlite3");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: dir.path().join("archive"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.storage_root).expect("archive directory");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("real database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("mailbox schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (77, 'proj', '/proj', 1), (88, 'other', '/other', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 77, 'BlueLake', 'test', 'test', 1, 1), \
+                    (2, 77, 'GreenStone', 'test', 'test', 1, 1), \
+                    (3, 77, 'bluelake', 'test', 'test', 2, 2), \
+                    (4, 88, 'BlueLake', 'test', 'test', 1, 1), \
+                    (5, 77, 'OldPine', 'test', 'test', 1, 1); \
+             UPDATE agents SET task_description = '[DEREGISTERED at 2026-08-24T00:00:00Z] legacy' \
+             WHERE id = 5; \
+             INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+             VALUES (41, 77, 1, 'history-41', 'Original subject', 'Original historical body', 1); \
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) \
+             VALUES (41, 2, 10, 11);",
+        )
+        .expect("populated lifecycle fixture");
+        (dir, config, conn)
+    }
+
+    fn compose_history_values(conn: &DbConn) -> Vec<Vec<Value>> {
+        [
+            "SELECT * FROM messages ORDER BY id",
+            "SELECT * FROM message_recipients ORDER BY message_id, agent_id",
+        ]
+        .into_iter()
+        .flat_map(|sql| conn.query_sync(sql, &[]).expect("retained transcript"))
+        .map(|row| row.values().cloned().collect())
+        .collect()
+    }
+
+    #[test]
+    fn compose_roster_canonicalizes_before_lifecycle_filtering_and_preserves_history() {
+        let (_dir, _config, conn) = compose_lifecycle_fixture();
+        let history = compose_history_values(&conn);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let names = |screen: &MessageBrowserScreen, project| {
+            screen
+                .load_agent_names_for_project(project)
+                .expect("roster")
+        };
+        assert_eq!(names(&screen, "proj"), ["BlueLake", "GreenStone"]);
+        assert_eq!(names(&screen, "other"), ["BlueLake"]);
+
+        for (change, expected) in [
+            (
+                "UPDATE agents SET retired_at = 20 WHERE id = 1",
+                vec!["GreenStone"],
+            ),
+            (
+                "UPDATE agents SET retired_at = NULL WHERE id = 1",
+                vec!["BlueLake", "GreenStone"],
+            ),
+            (
+                "INSERT INTO agent_deregistrations VALUES (1, 30)",
+                vec!["GreenStone"],
+            ),
+        ] {
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .execute_raw(change)
+                .expect("lifecycle transition");
+            assert_eq!(names(&screen, "proj"), expected);
+            assert_eq!(names(&screen, "other"), ["BlueLake"], "project boundary");
+            assert_eq!(
+                compose_history_values(screen.db_conn.as_ref().unwrap()),
+                history
+            );
+        }
+
+        let conn = screen.db_conn.as_ref().unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = OFF; DELETE FROM projects WHERE id = 77;")
+            .expect("orphaned imported project");
+        assert_eq!(names(&screen, "proj"), Vec::<String>::new());
+        assert_eq!(names(&screen, "[unknown-project-77]"), ["GreenStone"]);
+        let historical = screen
+            .fetch_message_entry_by_id(41, None)
+            .expect("historical message");
+        assert_eq!(historical.from_agent, "BlueLake");
+        assert_eq!(historical.body_md, "Original historical body");
+    }
+
+    #[test]
+    fn compose_roster_respects_legacy_deregistration_without_modifying_schema() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-compose.sqlite3");
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT); \
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, task_description TEXT); \
+             INSERT INTO projects VALUES (1, 'legacy'); \
+             INSERT INTO agents VALUES (1, 1, 'OldPine', '[DEREGISTERED at 2026-08-24T00:00:00Z] old'), \
+                                       (2, 1, 'BlueLake', 'active task');",
+        ).unwrap();
+        let agents =
+            query_compose_agents(|sql, params| conn.query_sync(sql, params), "legacy", None)
+                .expect("legacy roster");
+        assert_eq!(active_compose_agent_names(&agents), ["BlueLake"]);
+        assert!(
+            require_active_compose_recipient(&agents, "OldPine")
+                .unwrap_err()
+                .contains("deregistered")
+        );
+        assert!(
+            conn.query_sync("SELECT * FROM agent_deregistrations", &[])
+                .is_err()
+        );
+        assert!(
+            conn.query_sync("SELECT retired_at FROM agents", &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compose_submit_rechecks_live_lifecycle_and_preserves_draft_on_refusal_or_read_failure() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let state = TuiSharedState::new(&config);
+        let history = compose_history_values(&conn);
+        let mut screen = MessageBrowserScreen::new();
+        let (stale_dir, _stale_config, stale_conn) = compose_lifecycle_fixture();
+        screen.db_conn = Some(stale_conn);
+        screen._db_snapshot_dir = Some(stale_dir);
+        let mut form = ComposeFormState::new(
+            "proj".into(),
+            Some("BlueLake".into()),
+            vec!["BlueLake".into()],
+        );
+        form.cc_input.set_value("GreenStone");
+        form.subject_input.set_value("Keep this subject");
+        form.thread_id_input.set_value("draft-thread");
+        form.body_input
+            .set_text("Keep this complete\nmultiline draft.");
+        form.importance_idx = 2;
+        form.ack_required = true;
+        screen.compose_form = Some(form);
+        conn.execute_raw("UPDATE agents SET retired_at = 20 WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            screen.load_agent_names_for_project("proj").unwrap(),
+            ["BlueLake", "GreenStone"]
+        );
+
+        let _ = screen.submit_compose_form(Some(&state));
+        let form = screen
+            .compose_form
+            .as_ref()
+            .expect("draft survives retirement");
+        assert!(form.errors.general.as_deref().unwrap().contains("retired"));
+        assert_eq!(form.available_agents, ["GreenStone"]);
+        assert_eq!(form.to_input.value(), "BlueLake");
+        assert_eq!(form.cc_input.value(), "GreenStone");
+        assert_eq!(form.subject_input.value(), "Keep this subject");
+        assert_eq!(form.thread_id_input.value(), "draft-thread");
+        assert_eq!(
+            form.body_input.text(),
+            "Keep this complete\nmultiline draft."
+        );
+        assert_eq!(form.importance(), "urgent");
+        assert!(form.ack_required);
+
+        conn.execute_raw(
+            "ALTER TABLE agent_deregistrations RENAME TO preserved_deregistrations; \
+             CREATE TABLE agent_deregistrations (unexpected TEXT);",
+        )
+        .unwrap();
+        let _ = screen.submit_compose_form(Some(&state));
+        let form = screen
+            .compose_form
+            .as_ref()
+            .expect("draft survives unavailable lifecycle");
+        assert!(
+            form.errors
+                .general
+                .as_deref()
+                .unwrap()
+                .contains("Failed to load agents")
+        );
+        assert_eq!(
+            form.body_input.text(),
+            "Keep this complete\nmultiline draft."
+        );
+        assert_eq!(form.available_agents, ["GreenStone"]);
+        assert_eq!(compose_history_values(&conn), history);
+        assert!(
+            conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quick_reply_refuses_deregistered_live_recipient_without_losing_transcript_or_draft() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let state = TuiSharedState::new(&config);
+        let history = compose_history_values(&conn);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
+        screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+        screen
+            .quick_reply_form
+            .as_mut()
+            .unwrap()
+            .body_input
+            .set_text("Keep my reply.");
+        screen
+            .db_conn
+            .as_ref()
+            .unwrap()
+            .execute_raw("INSERT INTO agent_deregistrations VALUES (1, 30)")
+            .unwrap();
+
+        let _ = screen.submit_quick_reply_form(Some(&state));
+        let form = screen
+            .quick_reply_form
+            .as_ref()
+            .expect("reply draft retained");
+        assert!(
+            form.errors
+                .general
+                .as_deref()
+                .unwrap()
+                .contains("deregistered")
+        );
+        assert_eq!(form.body_input.text(), "Keep my reply.");
+        assert_eq!(form.context.to_agent, "BlueLake");
+        assert_eq!(form.context.original_from_agent, "BlueLake");
+        assert_eq!(form.context.original_body_md, "Original historical body");
+        assert_eq!(form.context.thread_id.as_deref(), Some("history-41"));
+        assert_eq!(
+            compose_history_values(screen.db_conn.as_ref().unwrap()),
+            history
+        );
+        assert!(
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn commit_compose_profile_fixture(
+        repo: &git2::Repository,
+        relative: &Path,
+        bytes: &[u8],
+    ) -> git2::Oid {
+        let path = repo.workdir().unwrap().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(relative).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents: Vec<_> = parent.iter().collect();
+        let signature =
+            git2::Signature::now("Lifecycle fixture", "fixture@example.invalid").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "retained operator profile",
+            &tree,
+            &parents,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compose_sender_heartbeat_preserves_committed_profile_and_refuses_inactive_identity() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let token = "synthetic-operator-registration-secret";
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts, contact_policy, reaper_exempt, registration_token) \
+             VALUES (10, 77, 'HumanOverseer', 'retained-program', 'retained-model', \
+                     '[deregistered note] ordinary operator task', 1, 1, 'contacts_only', 1, ?)",
+            &[Value::Text(token.into())],
+        )
+        .unwrap();
+        let state = TuiSharedState::new(&config);
+        let screen = MessageBrowserScreen::new();
+        let repo = git2::Repository::init(&config.storage_root).unwrap();
+        let relative = Path::new("projects/proj/agents/HumanOverseer/profile.json");
+        let mut profile = serde_json::json!({
+            "name": "HumanOverseer",
+            "program": "retained-program",
+            "model": "retained-model",
+            "task_description": "[deregistered note] ordinary operator task",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-02T00:00:00Z",
+            "contact_policy": "contacts_only",
+            "reaper_exempt": true,
+            "extensions": {"keep": ["all", "operator", "metadata"]}
+        });
+        for (transition, retired, deregistered, refusal) in [
+            (None, false, false, None),
+            (
+                Some("UPDATE agents SET retired_at = 20 WHERE id = 10"),
+                true,
+                false,
+                Some("retired"),
+            ),
+            (
+                Some("UPDATE agents SET retired_at = NULL WHERE id = 10"),
+                false,
+                false,
+                None,
+            ),
+            (
+                Some("INSERT INTO agent_deregistrations VALUES (10, 30)"),
+                false,
+                true,
+                Some("deregistered"),
+            ),
+        ] {
+            if let Some(sql) = transition {
+                conn.execute_raw(sql).unwrap();
+            }
+            profile["retired_at"] = if retired {
+                serde_json::json!("2026-01-03T00:00:00Z")
+            } else {
+                serde_json::Value::Null
+            };
+            profile["deregistered_at"] = if deregistered {
+                serde_json::json!("2026-01-04T00:00:00Z")
+            } else {
+                serde_json::Value::Null
+            };
+            let bytes = serde_json::to_vec_pretty(&profile).unwrap();
+            let head = commit_compose_profile_fixture(&repo, relative, &bytes);
+            let profile_sql = "SELECT id, project_id, name, program, model, task_description, inception_ts, \
+                               attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at \
+                               FROM agents WHERE id = 10";
+            let before: Vec<_> = conn.query_sync(profile_sql, &[]).unwrap()[0]
+                .values()
+                .cloned()
+                .collect();
+            let previous_activity = conn
+                .query_sync("SELECT last_active_ts FROM agents WHERE id = 10", &[])
+                .unwrap()[0]
+                .get_named::<i64>("last_active_ts")
+                .unwrap();
+            let result = screen.ensure_compose_sender("proj", Some(&state));
+            if let Some(reason) = refusal {
+                assert!(result.unwrap_err().contains(reason));
+                assert_eq!(
+                    conn.query_sync("SELECT last_active_ts FROM agents WHERE id = 10", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("last_active_ts")
+                        .unwrap(),
+                    previous_activity
+                );
+            } else {
+                result.expect("active operator heartbeat");
+                assert!(
+                    conn.query_sync("SELECT last_active_ts FROM agents WHERE id = 10", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("last_active_ts")
+                        .unwrap()
+                        >= previous_activity
+                );
+            }
+            let after: Vec<_> = conn.query_sync(profile_sql, &[]).unwrap()[0]
+                .values()
+                .cloned()
+                .collect();
+            assert_eq!(before, after, "heartbeat owns only last_active_ts");
+            assert_eq!(
+                std::fs::read(config.storage_root.join(relative)).unwrap(),
+                bytes
+            );
+            assert_eq!(repo.head().unwrap().target(), Some(head));
+            let committed = repo
+                .find_commit(head)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(relative)
+                .unwrap()
+                .id();
+            assert_eq!(repo.find_blob(committed).unwrap().content(), bytes);
+            assert!(!String::from_utf8(bytes).unwrap().contains(token));
+        }
     }
 
     #[test]
