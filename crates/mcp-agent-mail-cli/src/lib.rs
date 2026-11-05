@@ -27485,11 +27485,12 @@ fn resolve_deploy_tooling_repo_root(bundle_dir: &Path) -> CliResult<PathBuf> {
 fn git_common_dir(path: &Path) -> Option<PathBuf> {
     let value = git_output_text(path, &["rev-parse", "--git-common-dir"])?;
     let common = PathBuf::from(value);
+    // Git prints a relative common dir against the directory it ran in
+    // (`../.git` from a subdirectory), not against the repository root.
     let resolved = if common.is_absolute() {
         common
     } else {
-        let root = git_repo_root(path).unwrap_or_else(|| path.to_path_buf());
-        root.join(common)
+        path.join(common)
     };
     std::fs::canonicalize(&resolved).ok().or(Some(resolved))
 }

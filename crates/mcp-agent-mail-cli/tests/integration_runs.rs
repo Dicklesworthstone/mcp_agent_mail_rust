@@ -3799,6 +3799,93 @@ fn projects_adopt_refuses_non_git_keys_in_dry_run_and_apply() {
 }
 
 #[test]
+fn projects_adopt_accepts_keys_at_different_depths_of_one_checkout() {
+    // `git rev-parse --git-common-dir` is relative to the directory it ran in,
+    // so keys at different depths print different relative paths.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let repo_root = tmp_root.join("checkout");
+    init_git_repo(&repo_root);
+    let nested = repo_root.join("crates").join("app");
+    std::fs::create_dir_all(&nested).expect("create nested dir");
+    let source_key = repo_root.display().to_string();
+    let target_key = nested.display().to_string();
+    insert_project(&conn, 1, "checkout-root", &source_key);
+    insert_project(&conn, 2, "checkout-nested", &target_key);
+    drop(conn);
+
+    let args = [
+        "projects",
+        "adopt",
+        source_key.as_str(),
+        target_key.as_str(),
+    ];
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &args, None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "two directories of one checkout must merge\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Same repo (git-common-dir): yes")
+            && stdout.contains("- Plan status: executable; rerun with --apply to perform it"),
+        "expected an executable same-repo plan:\n{stdout}"
+    );
+}
+
+#[test]
+fn projects_adopt_refuses_separate_repositories_nested_in_a_parent_repository() {
+    // Keys one level below two different repositories print the same `../.git`.
+    // Resolved against the repository root, both landed on the parent's `.git`
+    // and an unrelated pair looked like one repository.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let parent = tmp_root.join("parent");
+    init_git_repo(&parent);
+    let first_repo = parent.join("first");
+    let second_repo = parent.join("second");
+    init_git_repo(&first_repo);
+    init_git_repo(&second_repo);
+    let source_dir = first_repo.join("src");
+    let target_dir = second_repo.join("src");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+    let source_key = source_dir.display().to_string();
+    let target_key = target_dir.display().to_string();
+    insert_project(&conn, 1, "first-src", &source_key);
+    insert_project(&conn, 2, "second-src", &target_key);
+    drop(conn);
+
+    let args = [
+        "projects",
+        "adopt",
+        source_key.as_str(),
+        target_key.as_str(),
+    ];
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &args, None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "separate repositories must not merge\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Same repo (git-common-dir): no")
+            && stdout.contains("- Plan status: refused; nothing was changed"),
+        "expected a refused plan:\n{stdout}"
+    );
+}
+
+#[test]
 fn projects_adopt_missing_source_exits_nonzero() {
     let env = TestEnv::new();
     let (_source_slug, _target_slug, _source_key, target_key) = seed_projects_for_adopt(&env, true);

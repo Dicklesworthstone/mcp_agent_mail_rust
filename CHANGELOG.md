@@ -164,6 +164,11 @@ alongside the current unlink policy and its real-process and retention tests.
   outside a Git repository, stderr also says that such a key cannot be re-keyed.
   The [operator cookbook](docs/OPERATOR_COOKBOOK.md) documents the
   same-repository requirement.
+- **`am projects adopt` now resolves each key's Git common directory correctly.**
+  Git prints that path relative to the key, but adopt resolved it against the
+  repository root. Two directories at different depths of one checkout were
+  refused, and keys one level below two repositories nested in a parent
+  repository were treated as one repository.
 
 ### Released-reservation prune warning (GH#362)
 
