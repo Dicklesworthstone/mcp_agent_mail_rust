@@ -194,6 +194,10 @@ pub struct ReconcileCursor {
     // A legacy/unwritable checkpoint cannot detect an in-place generation
     // change for the process, so bind its in-memory progress as well.
     checkpoint_database_generation: Option<String>,
+    // Pool cache generations can change without changing the mailbox. Only
+    // this independently captured live binding can authorize carrying hints
+    // across that change; a checkpoint cannot supply this process-local proof.
+    checkpoint_source_binding: Option<checkpoint::Binding>,
 }
 
 impl ReconcileCursor {

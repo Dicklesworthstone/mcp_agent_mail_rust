@@ -33,9 +33,9 @@ const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024;
 const CHECKPOINT_OWNED: &str =
     "message reconciliation deferred: checkpoint is owned by another worker";
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Binding {
+pub(super) struct Binding {
     database: PathBuf,
     archive: PathBuf,
     // The file identity, not its length/mtime: ordinary commits must not
@@ -1084,11 +1084,30 @@ pub(super) fn run(
                 source_generation(cx, pool)
             })?;
         scope = pool.sqlite_identity_key();
+        let binding = Binding::at(
+            Path::new(pool.sqlite_path()),
+            &config.storage_root,
+            &generation,
+        );
+        let same_binding = binding
+            .as_ref()
+            .is_ok_and(|current| cursor.checkpoint_source_binding.as_ref() == Some(current));
+        let binding_changed = cursor
+            .checkpoint_source_binding
+            .as_ref()
+            .is_some_and(|previous| binding.as_ref().is_ok_and(|current| previous != current));
+        if cursor.source_identity != scope && !cursor.source_identity.is_empty() && same_binding {
+            // A new pool is not a new mailbox. Keep unsaved retry debt and
+            // its dirty flag so Store::restore can merge the other owner's
+            // checkpoint instead of replacing this worker's obligations.
+            cursor.source_identity.clone_from(&scope);
+        }
         if cursor.source_identity != scope
             || cursor
                 .checkpoint_database_generation
                 .as_ref()
                 .is_some_and(|previous| previous != &generation)
+            || binding_changed
         {
             *cursor = ReconcileCursor {
                 source_identity: scope.clone(),
@@ -1097,14 +1116,9 @@ pub(super) fn run(
                 ..Default::default()
             };
         }
-        cursor.checkpoint_database_generation = Some(generation.clone());
-        match Binding::at(
-            Path::new(pool.sqlite_path()),
-            &config.storage_root,
-            &generation,
-        )
-        .and_then(Store::open)
-        {
+        cursor.checkpoint_database_generation = Some(generation);
+        cursor.checkpoint_source_binding = binding.as_ref().ok().cloned();
+        match binding.and_then(Store::open) {
             Ok(store) => Some(store),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 return Err(
@@ -1461,6 +1475,229 @@ mod tests {
                 assert_eq!(row.get_named::<i64>("read_ts").unwrap(), 2_000_000);
                 assert_eq!(row.get_named::<i64>("ack_ts").unwrap(), 2_500_000);
             }
+        });
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PoolReopen {
+        Keep,
+        CachedFactory,
+        NewPool,
+    }
+
+    fn exercise_unsaved_debt_pool_reopen(reopen: PoolReopen) {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let now = Instant::now();
+            let binding = Binding::capture(cx, pool, config).unwrap();
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let stop = AtomicBool::new(false);
+            {
+                let _fence = crate::ARCHIVE_PUBLICATION_FENCE
+                    .try_lock()
+                    .expect("isolated fixture owns the publication fence");
+                let initial = run(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(initial.repaired, 0);
+                assert!(initial.deferred > 0);
+            }
+            assert_eq!(cursor.source_identity, pool.sqlite_identity_key());
+            assert_eq!(
+                cursor.checkpoint_database_generation.as_deref(),
+                Some(binding.database_generation.as_str()),
+            );
+            cursor.retries.clear();
+            cursor.conflict_backoff.clear();
+            cursor.tail_after = Some(940);
+            cursor.backfill_ceiling = Some(0);
+            cursor.startup_tail = None;
+            cursor.startup_tail_initialized = true;
+            cursor.defer_transient(901, now);
+            let first = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            first.save(&cursor).unwrap();
+            let original = std::fs::read(&first.path).unwrap();
+
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let prepared = super::super::prepare_message(cx, pool, 903).unwrap();
+            let failure = {
+                let _fence = crate::ARCHIVE_PUBLICATION_FENCE
+                    .try_lock()
+                    .expect("isolated fixture owns the publication fence");
+                super::super::reconcile_prepared_inner(
+                    config,
+                    &prepared,
+                    Some(super::super::RepairControl { cx, stop: &stop }),
+                    true,
+                )
+                .unwrap_err()
+            };
+            assert!(
+                failure.transient,
+                "the real fence refusal must remain retryable"
+            );
+            assert!(failure.detail.contains("publication fence busy"));
+            super::super::record_failure(
+                903,
+                failure,
+                &mut cursor,
+                &mut ReconcileReport::default(),
+                now,
+            );
+
+            // Force a real checkpoint I/O refusal without deleting any evidence.
+            let saved_path = first.path.with_extension("json.before-failed-save");
+            let blocker_path = first.path.with_extension("json.blocked-directory");
+            std::fs::rename(&first.path, &saved_path).unwrap();
+            std::fs::create_dir(&first.path).unwrap();
+            assert!(first.save(&cursor).is_err());
+            std::fs::rename(&first.path, &blocker_path).unwrap();
+            std::fs::rename(&saved_path, &first.path).unwrap();
+            assert_eq!(std::fs::read(&first.path).unwrap(), original);
+            cursor.checkpoint_dirty = true;
+            drop(first);
+
+            let second = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            let mut other = ReconcileCursor {
+                tail_after: Some(940),
+                backfill_ceiling: Some(0),
+                ..ReconcileCursor::default()
+            };
+            other.defer_transient(902, now);
+            second.save(&other).unwrap();
+            drop(second);
+
+            let pool_config = mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            };
+            let reopened = match reopen {
+                PoolReopen::Keep => None,
+                PoolReopen::CachedFactory => {
+                    Some(mcp_agent_mail_db::create_pool(&pool_config).unwrap())
+                }
+                PoolReopen::NewPool => Some(mcp_agent_mail_db::DbPool::new(&pool_config).unwrap()),
+            };
+            let source = reopened.as_ref().unwrap_or(pool);
+            assert_eq!(Binding::capture(cx, source, config).unwrap(), binding);
+            assert_eq!(
+                source.sqlite_identity_key() != pool.sqlite_identity_key(),
+                matches!(reopen, PoolReopen::NewPool),
+            );
+            let report = run(cx, source, config, &mut cursor, &stop).unwrap();
+            let retained = cursor.retries.iter().any(|retry| retry.id == 903);
+            let committed = super::super::verify_retention_archive(&archive, &prepared, &mut 0)
+                .is_ok_and(|verified| verified.is_some());
+            eprintln!(
+                "pool_reopen_debt mode={reopen:?} retained={retained} committed={committed} scanned={} repaired={}",
+                report.scanned, report.repaired,
+            );
+            assert!(
+                retained || committed,
+                "same-source pool recreation discarded unsaved retry 903 before repair"
+            );
+            for _ in 0..4 {
+                if !cursor
+                    .retries
+                    .iter()
+                    .any(|retry| matches!(retry.id, 901..=903))
+                {
+                    break;
+                }
+                run(cx, source, config, &mut cursor, &stop).unwrap();
+            }
+            for id in [901, 902, 903] {
+                assert_message_committed(cx, source, config, id, 40);
+            }
+        });
+    }
+
+    #[test]
+    fn pool_reopen_unsaved_debt_control() {
+        exercise_unsaved_debt_pool_reopen(PoolReopen::Keep);
+    }
+
+    #[test]
+    fn pool_reopen_unsaved_debt_cached_factory_control() {
+        exercise_unsaved_debt_pool_reopen(PoolReopen::CachedFactory);
+    }
+
+    #[test]
+    fn pool_reopen_unsaved_debt_preserved() {
+        exercise_unsaved_debt_pool_reopen(PoolReopen::NewPool);
+    }
+
+    #[test]
+    fn pool_reopen_changed_generation_discards_unsaved_debt() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let stop = AtomicBool::new(false);
+            {
+                let _fence = crate::ARCHIVE_PUBLICATION_FENCE
+                    .try_lock()
+                    .expect("isolated fixture owns the publication fence");
+                let initial = run(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(initial.repaired, 0);
+                assert!(initial.deferred > 0);
+            }
+            let binding = Binding::capture(cx, pool, config).unwrap();
+            cursor.tail_after = Some(940);
+            cursor.backfill_ceiling = Some(0);
+            cursor.startup_tail = None;
+            cursor.startup_tail_initialized = true;
+            cursor.retries.clear();
+            cursor.conflict_backoff.clear();
+            let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            store.save(&cursor).unwrap();
+            drop(store);
+            cursor.defer_transient(903, Instant::now());
+            cursor.checkpoint_dirty = true;
+
+            change_logical_generation(cx, pool, &binding.database_generation);
+            let reopened = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            let current = Binding::capture(cx, &reopened, config).unwrap();
+            assert_eq!(binding.generation, current.generation);
+            assert_ne!(binding.database_generation, current.database_generation);
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+
+            let report = run_with_slow_first_scan(cx, &reopened, config, &mut cursor, &stop);
+            assert!(!report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert!(!cursor.retries.iter().any(|retry| retry.id == 903));
+            assert_message_committed(cx, &reopened, config, 941 - super::super::IDS_PER_LANE, 40);
+            let prepared = super::super::prepare_message(cx, &reopened, 903).unwrap();
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &prepared.message,
+                &prepared.sender,
+                &prepared.recipients,
+            )
+            .unwrap()
+            .0;
+            let canonical_path = std::fs::canonicalize(paths.canonical.parent().unwrap())
+                .unwrap()
+                .join(paths.canonical.file_name().unwrap());
+            assert!(
+                std::fs::symlink_metadata(&canonical_path)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                "the previous generation's retry must not create an artifact"
+            );
+            let root = std::fs::canonicalize(&config.storage_root).unwrap();
+            let repo = git2::Repository::open(&root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            assert!(
+                tree.get_path(canonical_path.strip_prefix(&root).unwrap())
+                    .is_err_and(|error| error.code() == git2::ErrorCode::NotFound),
+                "the previous generation's retry must not enter the committed tree"
+            );
         });
     }
 
