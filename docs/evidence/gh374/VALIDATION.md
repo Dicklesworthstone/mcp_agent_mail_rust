@@ -146,26 +146,225 @@ separate real-consumer cancellation pass does not erase the earlier initializer
 failure, the untraced warmup assertion (zero of five requested connections), or
 the large archive failure.
 
-The optimized portable CLI build reached its 7,200-second build transport
+The first optimized portable CLI build reached its 7,200-second build transport
 deadline. RCH verified that the remote process group was killed; supported
 recovery acknowledged terminal exit 137. It produced no completed CLI or runtime
 qualification. A new normal-cache attempt was refused before compilation by
 the excluded dashboard's sibling-path containment check (exit 103, zero cases).
 An explicit isolated-target retry uses two build jobs and a 14,400-second
 build-only deadline; release optimization and runtime acceptance limits are
-unchanged. Its verdict and the original full end-to-end rerun remain pending.
-The intended control is the actual published GNU v0.3.40 executable, SHA-256
+unchanged. That retry completed successfully on `vmi1293453`: Cargo 119 minutes
+26 seconds, wrapper 7,220.3 seconds. Receipt
+`478754ebf17bdbac203ea8ed6f8ac7a5515b3a77f56651f5cf6dbf22c4aaa462`
+freshly matches all 3,910 frozen inputs. Worker, delivered and retained CLI
+images agree: 126,099,488 bytes, SHA-256
+`cfd9c443f37d79f76feaac1e6eb9ba01f15ee0070e13d72724a40b7fd03b087e`.
+The retained `/data/tmp/am-ee-current-query-cli.nsof9nu7/debug/am` is a standard
+optimized portable release image; the `debug` directory only stages runner
+lookup. This source is `9f3bc1b5` plus the previously described cleanup, injected
+as a dirty build source, with production inputs matching merged `6e70244c`.
+
+The unchanged real mail probe passes 33 of 33 checks in 6.787 seconds, including
+the executing process's image hash, identity/reservation/send/inbox/ack/reply,
+exact committed archive content, invalid/duplicate identity and broadcast
+refusals, and independent stopped C SQLite integrity. Doctor selftest passes
+six of six private-directory primitive mutation/backup/byte-identical-undo
+checks in 274 ms. Its stderr explicitly says the inline run is legacy/unsealed;
+this does not qualify sealed chain-of-custody verification, all seven operations
+or the complete failure-mode registry.
+
+Current quiet stdio bundle `tests/artifacts/stdio/20261105_065650` passes
+18 assertions with zero failures/skips (48,780 ms wrapper). The whole named
+malformed-frame case takes 3,752 ms, within its original 5,000 ms bound; its
+response has error code -32700 and omits the request ID. This quiet result does
+not qualify the stricter loaded deadline or erase the earlier 5,135 ms case.
+
+The original clean public-control-first workload started at 07:24 UTC as
+`tests/artifacts/release_smoke/20261105_072447`. Its original 300-second soak,
+300-second convergence, 60 agents, 480-second swarm and 3,600-second total
+budget are unchanged. No extra owned local stress is run during this pair.
+The wrapper is terminal exit 1; complete-bundle validation exits zero. Receipt
+SHA-256 is `3b0bfe73c9d71aa2a1ca587977de3611f2efa1ae3d0a1d37ccf902862ddbfe24`.
+Each arm has 53 passing and two failing checks, with different failed conditions:
+
+| Arm | Send p99 | Other failed condition | Acknowledged swarm sends preserved |
+| --- | --- | --- | --- |
+| Current candidate | 5.620801 s / 10,518 samples | Archive does not converge within 300 s | 10,518 / 10,518 |
+| Published control | 6.619425 s / 7,292 samples | Two `RESOURCE_BUSY` tool errors | 7,290 / 7,290 |
+
+Both send latencies exceed the unchanged five-second gate. Candidate tool,
+30-second dispatch timeout and connection-error counts outside the declared
+kill window are zero. Its 241 earlier acknowledged sends also survive SIGKILL;
+both arms pass independent stopped C SQLite integrity and graceful shutdown.
+The candidate's last complete archive sample at 287.440 seconds has 22,485 DB
+messages, 22,483 canonical archive messages, missing IDs 17819/17820, and 16
+uncommitted copies across IDs 17812/17815/17816/17821. At 300.036 seconds the
+last scan times out partway through; its 2,594 partial records are not the
+actual total archive size, and its empty difference arrays do not prove parity.
+The public control converges 18,839 messages and 63,808 committed copies in
+267.211 seconds. These different closed-loop populations on a shared host
+establish neither a comparative speed win nor a source-isolated regression.
+
+Earlier exact-ID log entries record publication-fence contention and one
+identity-change retry. Their causal connection to the final gap is unproved.
+The checkpoint was read after the probe and its final restart; its embedded
+`saved_at_us` is 08:02:45.698 UTC, before that restart at 08:02:57. Its saved
+tail/backfill hints are 872/7419 with 102 retry IDs, excluding the six message
+IDs above. This is a retained scheduling snapshot, not a live stack or proof of
+how retry debt was lost. The existing archive task keeps
+its original acceptance and owner; its evidence comment and direct owner
+message preserve this failure without changing the bound.
+The actual published GNU v0.3.40 control executable has SHA-256
 `009ee7b746daafc26ec5f1ffe7627b38a942a031710c0076de4075323de115b4`.
 Fresh release metadata, signed manifest, pinned-key Minisign verification and
 streaming archive-member equality were rechecked. Earlier private read-retry
 control results remain labeled as that separate subject. The bounded HTTP pass
 above establishes neither complete 25,100-message archive qualification nor
-release clearance.
+release clearance. The CLI image also predates the separate test-only warmup
+fixture continuation; those later test bytes cannot be attributed to this image.
+The separate loaded-stdio repeat was initially deferred after host disk headroom
+fell from 45 GB to 12 GB. When it recovered to 59 GB without cleanup by this
+assessment, a separate candidate-only native diagnostic began as
+`tests/artifacts/release_smoke/20261105_082849`. Its original 60-agent registration
+was observed at 08:35:31 UTC; unchanged stdio started at 08:37:02, more than a
+minute later during the 480-second swarm. Bundle
+`tests/artifacts/stdio/20261105_083702` passes 18 assertions, zero failures/skips,
+wrapper exit zero in 62,194 ms, with complete-bundle validation zero. Its whole
+named malformed-frame case takes 4,397 ms, transport 4,120 ms, at the original
+5,000 ms limit with no forced timeout. This is a strict passing observation;
+the earlier 5,135 ms result remains recorded. Shutdown/maintenance/integrity/
+disk/retention source files are byte-identical between `0783de81` and upstream
+`a318493a`, preserving the earlier real-worker ordering regressions. The separate
+diagnostic is terminal exit 1 with 54 passing checks and one failure: the original
+300-second live archive-convergence bound. All 11,606 swarm and 394 earlier
+acknowledgements survive; stopped independent integrity and clean shutdown pass.
+Its last complete sample at 278.939 seconds has 25,520 DB messages, 25,514 canonical
+messages, six missing IDs and 12 uncommitted copies. The final scan again times
+out partway through. Receipt SHA-256 is
+`6a9e85ee2e50332be9ba74ba534ab51650dd700e7cb891596ac3942bd16ea7fb`;
+complete-bundle validation exits zero. Added stdio and one read-only procfs
+observation are declared diagnostic interference, precluding a comparative
+performance claim. The completed clean pair's failures stand.
+
+Fresh solo review closes only `br-kp1in.86`: the original quiet and loaded
+whole-case deadlines now pass, while the retained old-order/new-order real-worker
+controls establish the shutdown wiring change and every join/flush remains.
+The current mail, cancellation, acknowledged-data, independent integrity and stop
+controls are cited above. The archive failure occurs during the live quiet period,
+before shutdown, and remains on the pre-existing archive task with its original
+acceptance. Neither that task, the pool-timeout task, capacity nor release is
+closed by the bounded shutdown result.
 
 The existing manual native workflow dispatch was accepted for published source
 `6e70244c` as run `41957916399`, but the latest read still reports `queued` with
 no jobs. Cancellation returned HTTP 409, "not been queued yet," despite that
 status. No hosted test executed or passed, and no cancellation is claimed.
+This dispatch was a mistake: `docs/RELEASE_CHECKLIST.md` and
+`docs/ROLLOUT_PLAYBOOK.md` explicitly prohibit enabling or dispatching Actions.
+The supported force-cancel endpoint repeatedly returns HTTP 409 with the same
+reason; a fresh read at 10:30 UTC still has zero jobs. No setting was enabled,
+release published, or Actions evidence used for qualification. Stop this path;
+the canonical DSR/strict-RCH policy remains in force. Retain both the erroneous
+dispatch and failed withdrawal attempts rather than describing them as progress.
+
+### Separate warmup fixture isolation
+
+`br-kp1in.92` addresses a reproduced fixture defect, not the untraced original
+ten-second pool timeout. The old warmup test sets a private DB URL but leaves
+its archive inherited. With the retained old executable and an unrelated private
+regular-file `STORAGE_ROOT`, its original exact case fails at pool creation in
+0.43 seconds (zero passed, one failed), leaving the sentinel unchanged.
+
+The corrected fixture explicitly owns its archive and runs that foreign-root
+control in a child process. It adds 26 test-only lines; the parent's environment,
+production authority checks, min/max pool sizes, five requested connections,
+ten-second budget and original pool-stat assertions remain unchanged. An earlier
+proposed process-wide override was rejected during review and was never landed.
+The corrected original native case passes one case, zero failures/ignored,
+3,556 filtered, in 2.13 seconds. Receipt
+`9a773c10c0bbd38fa3f936d1ffe8034959e4934cf0851fd12aec584ddff8b319`
+freshly matches all 3,910 inputs. Producer descriptor, retained worker image and
+local copy agree at 128,110,616 bytes, SHA-256
+`bbb60aed2b4f8ccb9f1d44e26cb855a3b86630b2af48c1bfe61993930d36ad17`.
+An additional exact leaf replay with the real OS environment supplied at process
+entry passes in 2.870 seconds and preserves sentinel inode, mode, size and bytes.
+Those image comparisons describe the original collection. At 10:48 UTC both
+recorded warmup image paths are absent; a fresh local invocation exits 127
+before running a test, and the bounded worker lookup also fails. The cause is
+unknown. Original terminal logs, identities and the separate leaf replay remain
+retained. No new warmup execution or presently available image is claimed, and
+no cold rebuild is launched merely to replace this missing artifact.
+
+Five incoming upstream files do not enter this DB-library test target: CLI
+adoption implementation/tests, the standalone DB integration test, its workflow,
+and changelog. DB/core/test-helper sources, root/DB manifests, lockfile, toolchain
+and Cargo config are byte-identical from native base `3a184ce5` to combined base
+`a318493a`; Cargo artifact records contain no CLI package and only the DB test
+target. The full raw receipt arrays are consequently not claimed identical
+across those two repository snapshots. Combined-source workspace all-target and
+separate production checks pass with 3,911 freshly matched inputs each, receipts
+`45b5b98c49eff8254b9ef41966a92159f08ab0b454dbcdfae703eae9a1143112`
+and `7fd19b5515f83c3f19960947af80d70afaa0beccfe8562abcad1bf7a08623fe5`.
+Strict Clippy on that combined snapshot failed with exit 101, receipt
+`93d2bf96f77f88838e735a6b064e717a9436da601e186185ba0d9994cd062e80`:
+four lints in the incoming GH372 integration test. Separate task
+`br-kp1in.93` renames an ambiguous measurement vector, uses the required
+`if let`, and extracts the existing real SQL snapshot read into one helper.
+All eleven observations and their assertions remain. No lint allowance,
+workload, memory bound or acceptance threshold changes. Its frozen source is
+being checked independently; earlier gates are not final-source evidence.
+The new production lib/bin check completed exit zero and supported RCH recovery
+acknowledged that result after collection failed. Receipt
+`8a5d0bf95ab342bc4c6eaab719064667f64afc9bd42c9bf29ba92d20d2838bca`
+freshly matches 3,911 source records with zero mismatches. Final strict Clippy
+also passes, receipt
+`ef9145caddd5567f45a7d4b7bb335bbeebf1bc4bfb270b849f7d3eb03c21bf57`.
+The original real snapshot integration case passes one case, zero failures or
+ignored, 817 filtered, in 0.69 seconds, receipt
+`23d904831d79e0c9a2889aa1704e7999d9076498030687e69202cbfeac627a53`.
+Both receipts freshly match 3,911 inputs with zero mismatches. Both initial
+clients failed during collection; exact recovery acknowledges terminal zero.
+The native producer descriptor, worker copy and local retained image agree:
+106,990,160 bytes, SHA-256
+`85f5c703128e30133ce36097771af85e07558676593da051cc46afbabc50b327`.
+This is transaction/snapshot/durable-write evidence, not the larger memory
+gate. Final all-target also passes, receipt
+`56650b97655955da9590d96f7971587320fabc92e693900031e388740ceede9b`,
+3,911 freshly matched inputs, zero mismatches. Its initial collection failure
+was recovered as terminal zero too. The manually integrated two-file diff is
+byte-identical to the frozen qualified source and formatting passes on main.
+
+Formatting passes; the pool-file static scan reports zero critical,
+4,819 warning and 2,305 informational findings with no failed module. The changed
+test's 15 findings are retained test assertions/unwrap, private scratch I/O and
+literal-argument self-execution, without suppressions. Commit `751138c8`
+contains the two qualified test repairs. Fresh solo acceptance (not independent
+verification) closes lint task `.93` before dependent fixture task `.92`.
+The snapshot replay passes one case, zero failures/ignored, in 1.88 seconds.
+Warmup acceptance cites the original native and separate leaf replay on the
+identical pool source; its later missing-image limitation remains above.
+No runtime performance, original pool-timeout, large-memory or release repair
+is claimed from this fixture work.
+
+The separate GH372-file scan exits nonzero with two critical findings at
+unchanged, deliberate test panics: rejecting a non-index B-tree page and refusing
+an absent `/proc/self/status` measurement. Both remain intact. Raw totals are
+two critical, 249 warning and 70 informational findings, without a failed module;
+this is a reviewed result, not a clean scan.
+
+### Retry debt across pool recreation: unqualified probe
+
+`br-kp1in.94` investigates a concrete source path: archive workers recreate a
+pool after a source error, and the new pool's cache identity resets the cursor
+before dirty checkpoint debt can merge. Its causal connection to the failed
+full workload is unproved. A private test-only control uses a real mailbox,
+publication-fence refusal, checkpoint I/O refusal and a second checkpoint owner;
+it compares retaining the pool against reopening the same physical mailbox.
+Production code is unchanged. No intended negative or successful repair has
+executed yet. Disk admission refusals and a stopped attempt are zero-case
+evidence. Review also corrected an invalid test-only `Binding::clone` call
+before the intended negative was run. Keep this task and the existing archive
+convergence task open.
 
 The initial cancellation-accounting fix and qualification tests are on main.
 Formatting, provenance, configuration parsing, and independent source review
