@@ -170,7 +170,7 @@
       "archive_gap_cause": "unproved; earlier exact-ID publication contention retained",
       "separate_loaded_stdio": "initially deferred at12GB; resumed in separate diagnostic after headroom recovered59GB; current strict4397ms pass, no change to this clean pair"
     },
-    "hosted_native_run": {"id": 41957916399, "head_sha": "6e70244c19d826db3fabb04442cd1c11fe37e1ca", "latest_status": "queued", "jobs": [], "cancel_response": "409 not been queued yet", "force_cancel_response": "409 not been queued yet", "fresh_zero_job_read_utc": "2026-11-05T10:30Z", "native_execution_claimed": false, "cancellation_claimed": false, "dispatch_was_documented_policy_violation": true, "correction": "retain the error and failed withdrawal attempts; no further dispatch or setting change; canonical DSR/strict-RCH policy remains in force"},
+    "hosted_native_run": {"id": 41957916399, "head_sha": "6e70244c19d826db3fabb04442cd1c11fe37e1ca", "latest_status": "queued", "jobs": [], "cancel_response": "409 not been queued yet", "force_cancel_response": "409 not been queued yet", "fresh_zero_job_read_utc": "2026-11-05T14:49Z", "native_execution_claimed": false, "cancellation_claimed": false, "dispatch_was_documented_policy_violation": true, "correction": "retain the error and failed withdrawal attempts; no further dispatch or setting change; canonical DSR/strict-RCH policy remains in force"},
     "intended_real_public_control_sha256": "009ee7b746daafc26ec5f1ffe7627b38a942a031710c0076de4075323de115b4",
     "measured_performance_win": false,
     "initializer_task_closed": false,
@@ -209,11 +209,39 @@
     "original_pool_timeouts_or_archive_release_acceptance_closed": false
   },
   "pool_reopen_retry_debt_2026_11_05": {
-    "bead": "br-kp1in.94", "production_changed": false,
-    "status": "private test-only probe admitted on vmi1153651; no intended negative result yet",
+    "bead": "br-kp1in.94", "main_production_changed": true, "private_production_draft": false,
+    "status": "implemented in b600735b; original negative reproduced; final native, compiler and fresh solo acceptance pass",
+    "committed_source": "b600735b", "exact_two_file_integration": true,
+    "retained_artifact_root": "/data/tmp/am-reality-preserved-20261105.AnVT1Bbf",
+    "evidence_copy": {"regular_files_compared": 5540, "mismatches": 0, "protected_executable_hashes_verified": 6, "original_retained": true, "old_honesty_worksheet_preserved_separately": true},
+    "honesty_audit_disposition": "CAPTURED on excessive rebuild/wait/report cost; one narrow real repair qualified; solo review only",
+    "first_probe_setup_failure": {"exit_code": 101, "terminal_acknowledged": true, "passed": 1, "failed": 1, "ignored": 0, "filtered_out": 1039, "seconds": 4.75, "intended_negative": false, "failure": "factory reuses still-live cached pool; different-key prerequisite fails before debt assertion", "receipt": "d4851d48b65960a9f15052a7bb58d1a402f476f4f92069e50f761d3d0359ffac", "fresh_source_records": 3911, "fresh_source_mismatches": 0, "image_bytes": 98096200, "producer_retained_delivered_sha256": "ca1a30a304c8e81e9bfd3fe6347c735a89af4a5db73a94fd800587be66fcad41"},
+    "corrected_probe_predeclared": {"selected_cases": 3, "expected_positive_controls": 2, "expected_intended_failures": 1, "new_pool_constructor": "DbPool::new", "new_pool_key_must_differ": true, "cached_factory_control_added": true},
+    "intended_original_negative": {"exit_code": 101, "terminal_acknowledged": true, "passed": 2, "failed": 1, "ignored": 0, "filtered_out": 1039, "seconds": 8.61, "new_pool_binding_equal": true, "new_pool_cache_key_different": true, "retry903_retained": false, "retry903_committed": false, "scanned": 1, "repaired": 1, "receipt": "dca9d75bdae67c21d91c76e3c9378e0b1898d5b6aa4b9942174aa05a703de79f", "fresh_source_records": 3911, "fresh_source_mismatches": 0, "image_bytes": 98096904, "producer_retained_delivered_sha256": "c27748e31099a0c4859a82ed424089c84ce237554f3b7684520b4552eaa98de9"},
+    "original_image_fresh_local_replay": {"exit_code": 101, "passed": 2, "failed": 1, "ignored": 0, "seconds": 8.94, "same_intended_failure": true},
+    "first_repaired_family": {"exit_code": 101, "passed": 50, "failed": 1, "ignored": 0, "filtered_out": 992, "seconds": 60.04, "receipt": "78f629b15b3835bc6d02cb4001ff367c7d451f358a6536361abf4aebef339b87", "fresh_source_records": 3911, "fresh_source_mismatches": 0, "original_three_pool_cases_passed": true, "failure": "new absence oracle unwraps expected missing-Git-entry error", "image_bytes": 98126376, "producer_retained_delivered_sha256": "c95370e5b390295eeabcfd5a27ce5daf4c909e5df8d90273b90bd55fdce17d5b"},
+    "final_source": {
+      "base": "751138c8", "original_three_probe_bodies_byte_identical": true,
+      "production_unchanged_from_first_repaired_family": true, "expected_checkpoint_cases": 51,
+      "oracle": "independent filesystem NotFound and typed Git NotFound", "format_exit_code": 0,
+      "parent_static_scan": {"critical": 0, "warning": 698, "info": 96, "failed_modules": []},
+      "child_static_scan": {"critical": 0, "warning": 844, "info": 209, "failed_modules": []},
+      "native": {
+        "cargo_exit_code": 0, "collection_client_exit_code": 1, "recovered_exit_code": 0,
+        "terminal_acknowledged": true, "passed": 51, "failed": 0, "ignored": 0,
+        "filtered_out": 992, "seconds": 53.34,
+        "receipt": "7093617b807d2fd3699ed319ca8549eeb48afcd3393a1cbaaa9eb6a6cb8d6719",
+        "fresh_source_records": 3911, "fresh_source_mismatches": 0, "image_bytes": 98129568,
+        "producer_retained_delivered_sha256": "fb613ab342f58c1b7d511a72a2d7bdaeaf5b5a733684a493bcab94dfb2a8cdc7"
+      },
+      "fresh_solo_acceptance": {"exit_code": 0, "passed": 4, "failed": 0, "ignored": 0, "filtered_out": 1039, "seconds": 12.87, "independent_verification": false},
+      "production_lib_bins": {"cargo_exit_code": 0, "collection_client_exit_code": 1, "recovered_exit_code": 0, "terminal_acknowledged": true, "receipt": "1e0056760e4012c699e801fce9cac2d2c5c77ace9184ee1e7666043cc9a89e2a", "fresh_source_records": 3911, "fresh_source_mismatches": 0},
+      "strict_clippy": {"cargo_exit_code": 0, "collection_client_exit_code": 1, "recovered_exit_code": 0, "terminal_acknowledged": true, "receipt": "aaa4cab235a987212e18ee2a955c9561433008f5a2c1c6acd34692ca64f1cc4d", "fresh_source_records": 3911, "fresh_source_mismatches": 0, "warnings_denied": true},
+      "all_targets": {"cargo_exit_code": 0, "collection_client_exit_code": 1, "recovered_exit_code": 0, "terminal_acknowledged": true, "receipt": "53b05e500bd83562b55327957bc775472f7d4d2df45da2fbe5cd4245f4299d96", "fresh_source_records": 3911, "fresh_source_mismatches": 0, "mode": "isolated fallback after actual normal-mode source-authority-lock failure"}
+    },
     "original_archive_failure_cause_established": false,
     "real_control_dependencies": ["mailbox pool", "publication fence", "checkpoint filesystem refusal", "second checkpoint owner"],
-    "admission_refusals_are_zero_case_evidence": true, "bead_closed": false
+    "admission_refusals_are_zero_case_evidence": true, "bead_closed": true
   },
   "environment": {
     "os": "Ubuntu 24.04.3 LTS",

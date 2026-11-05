@@ -262,7 +262,7 @@ status. No hosted test executed or passed, and no cancellation is claimed.
 This dispatch was a mistake: `docs/RELEASE_CHECKLIST.md` and
 `docs/ROLLOUT_PLAYBOOK.md` explicitly prohibit enabling or dispatching Actions.
 The supported force-cancel endpoint repeatedly returns HTTP 409 with the same
-reason; a fresh read at 10:30 UTC still has zero jobs. No setting was enabled,
+reason; a fresh read at 14:49 UTC still has zero jobs. No setting was enabled,
 release published, or Actions evidence used for qualification. Stop this path;
 the canonical DSR/strict-RCH policy remains in force. Retain both the erroneous
 dispatch and failed withdrawal attempts rather than describing them as progress.
@@ -352,7 +352,7 @@ an absent `/proc/self/status` measurement. Both remain intact. Raw totals are
 two critical, 249 warning and 70 informational findings, without a failed module;
 this is a reviewed result, not a clean scan.
 
-### Retry debt across pool recreation: unqualified probe
+### Unsaved retry debt survives same-mailbox pool recreation
 
 `br-kp1in.94` investigates a concrete source path: archive workers recreate a
 pool after a source error, and the new pool's cache identity resets the cursor
@@ -360,11 +360,93 @@ before dirty checkpoint debt can merge. Its causal connection to the failed
 full workload is unproved. A private test-only control uses a real mailbox,
 publication-fence refusal, checkpoint I/O refusal and a second checkpoint owner;
 it compares retaining the pool against reopening the same physical mailbox.
-Production code is unchanged. No intended negative or successful repair has
-executed yet. Disk admission refusals and a stopped attempt are zero-case
-evidence. Review also corrected an invalid test-only `Binding::clone` call
-before the intended negative was run. Keep this task and the existing archive
-convergence task open.
+The first probe changes only tests. It runs two cases:
+one passes and one fails, zero ignored, 1,039 filtered, in 4.75 seconds. It fails
+before the intended debt assertion: `create_pool` reuses the still-live weak-cache
+entry held by the fixture, so its key does not change. This is an invalid setup,
+not proof of lost debt. Receipt
+`d4851d48b65960a9f15052a7bb58d1a402f476f4f92069e50f761d3d0359ffac`
+freshly matches 3,911 inputs. The 98,096,200-byte failed-setup image is retained,
+SHA-256 `ca1a30a304c8e81e9bfd3fe6347c735a89af4a5db73a94fd800587be66fcad41`.
+
+The corrected probe separates kept, cached-factory and genuinely new `DbPool::new`
+handles, retaining the different-key prerequisite for the new-pool case. Its
+predeclared original-code set is three cases: two positive controls and the
+intended failure only if unsaved retry 903 is neither retained nor committed.
+The corrected original-code run executes exactly that set: two passed, one
+failed, zero ignored, 1,039 filtered, in 8.61 seconds. The new-pool case verifies
+equal source binding and a different cache key, then reports retry 903 neither
+retained nor committed (one scanned/repaired row) and fails at the intended
+assertion. Receipt
+`dca9d75bdae67c21d91c76e3c9378e0b1898d5b6aa4b9942174aa05a703de79f`
+freshly matches all 3,911 inputs. Its 98,096,904-byte producer/retained/delivered
+image hashes agree:
+`c27748e31099a0c4859a82ed424089c84ce237554f3b7684520b4552eaa98de9`.
+A fresh local replay of this identified worker image reproduces the same two
+passes and exact debt-loss failure in 8.94 seconds. This establishes the narrow
+cursor defect, not the cause of the original full workload's archive gap.
+
+The repair retains an independently captured, process-local
+full `Binding` on the cursor. A changed pool key can preserve memory only when
+that binding matches; changed physical/logical/archive identity still resets,
+and an explicitly cleared source identity remains invalid. Nothing restores
+this proof from checkpoint JSON. Existing live-source/no-clobber checks, dirty
+debt merge, bounds, cancellation and checkpoint schema remain intact.
+
+The first repaired-source family runs all 51 selected cases: 50 pass and one
+fails, zero ignored, 992 filtered, in 60.04 seconds, receipt
+`78f629b15b3835bc6d02cb4001ff367c7d451f358a6536361abf4aebef339b87`
+(3,911 freshly matched inputs). All original pool controls pass. The new
+changed-generation control reaches the fresh-row commit, excludes old retry
+903, then fails because its oracle incorrectly unwraps a missing Git entry as
+success. Its identified 98,126,376-byte image is retained as
+`c95370e5b390295eeabcfd5a27ce5daf4c909e5df8d90273b90bd55fdce17d5b`.
+This is a failed family, not completed qualification.
+
+The corrected oracle independently requires both filesystem `NotFound` and Git
+`ErrorCode::NotFound`; arbitrary verification errors cannot pass. Production
+code and all three original probe bodies are unchanged from that first repaired
+run. Formatting passes; final scans report zero critical findings, 698/96
+warning/info on the parent and 844/209 on the child, with no failed module or
+new suppression. The corrected final family passes all 51 selected cases,
+zero failed or ignored, 992 filtered, in 53.34 seconds. Receipt
+`7093617b807d2fd3699ed319ca8549eeb48afcd3393a1cbaaa9eb6a6cb8d6719`
+freshly matches all 3,911 inputs. Cargo exits zero; the collection-only client
+failure recovers zero with terminal acknowledgement. The producer, retained
+worker and protected local 98,129,568-byte image all hash
+`fb613ab342f58c1b7d511a72a2d7bdaeaf5b5a733684a493bcab94dfb2a8cdc7`.
+The all-target workspace check finishes zero in 26m56s; collection recovers zero
+with terminal acknowledgement. Receipt
+`53b05e500bd83562b55327957bc775472f7d4d2df45da2fbe5cd4245f4299d96`
+freshly matches 3,911 inputs. A fresh solo replay of the protected final image
+passes all four pool-reopen cases, zero failed or ignored, 1,039 filtered, in
+12.87 seconds. This is not independent verification. The separate production
+lib/bin check finishes zero in 38m00s, receipt
+`1e0056760e4012c699e801fce9cac2d2c5c77ace9184ee1e7666043cc9a89e2a`.
+Strict workspace Clippy with `-D warnings` finishes zero in 52m18s, receipt
+`aaa4cab235a987212e18ee2a955c9561433008f5a2c1c6acd34692ca64f1cc4d`.
+Both collection-only failures recover zero with terminal acknowledgement;
+each freshly matches 3,911 inputs. All four final receipt input tables agree.
+The initial
+all-target source-authority-lock failure recovers 120 with acknowledgement;
+superseded production/Clippy clients stop at 143 and recover 120/137 respectively,
+all acknowledged and none counted as passes. A documented isolated all-target
+retry preserves the same source and compiler gate. Earlier disk refusals,
+stopped attempts, the invalid Binding clone and the avoidable constructor
+assumption remain retained. The two changed source files match the qualified
+candidate byte for byte; formatting on main also passes. Source commit
+`b600735b` implements the repair, and `.94` is closed after the fresh solo
+acceptance pass. The original archive task `.35`, pool-timeout investigation
+`.87`, capacity and release gates remain open. No full-workload causal fix or
+comparative performance win is established by this repair.
+
+All owned native/compiler wrappers are terminal and acknowledged. The retained
+evidence copy is `/data/tmp/am-reality-preserved-20261105.AnVT1Bbf`; comparison
+of 5,540 regular source/copy files finds zero mismatches. Six protected
+CLI/snapshot/checkpoint executable hashes are freshly verified. The original
+evidence remains, and the older honesty worksheet is preserved separately.
+The final honesty audit records excessive rebuild/report overhead and the
+avoidable setup/oracle errors; it gives credit only to the narrow real repair.
 
 The initial cancellation-accounting fix and qualification tests are on main.
 Formatting, provenance, configuration parsing, and independent source review
