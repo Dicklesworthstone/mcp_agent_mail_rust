@@ -36,6 +36,35 @@
     "release_clearance": false,
     "raw_evidence_prefix": "/tmp/am-reality-20261103-nSlwbq/merged-gh374-"
   },
+  "late_obligation_query_qualification_2026_11_05": {
+    "source_commit": "9f3bc1b5fe6a0c4a8942f473ad88ab5604893543",
+    "local_overlay": "one redundant-borrow cleanup and three test-format corrections in project_mailbox.rs",
+    "historical_environment_and_native_attempts_scope": "initial backport investigation; current remote workers are identified by the following receipts",
+    "identical_source_records_across_four_receipts": 3910,
+    "fresh_source_mismatches": 0,
+    "native_portable_module_family": {
+      "exit_code": 0, "passed": 32, "failed": 0, "ignored_scaling_benchmark": 1, "filtered_out": 3524, "seconds": 43.06,
+      "receipt": "ac2b9c8d904f8d2e8aeabc9f079c6282ed95572327c32262bae682e8df8f156b",
+      "worker": "vmi1152480", "executable_bytes": 128102944,
+      "executable_sha256": "73cf03e378e2ebc11ea76574826528899b18a6c6bd06946881aec5c8137ea730",
+      "original_257_delivery_regression_executed": true
+    },
+    "all_targets": {"exit_code": 0, "receipt": "2a4c6603a35cc42ff0e8b257bf9d3b3a144c480643d71df5b122dcac761ce67d"},
+    "production_lib_bins": {"exit_code": 0, "receipt": "80013ac7d3b666bf567d5a93f18c5017d60f4a1b618d6bf61a34cbc6ef4924a4"},
+    "strict_clippy": {"exit_code": 0, "receipt": "5a8417c325fe7baa5da38cb280a7fca122147157c701a3c6ba8bf013cf64efa8"},
+    "format_exit_code": 0,
+    "first_native_before_format_receipt": "fbf01c6d3b52a7ca96f5d2e6bc72eff6f536d4157fdc234c1e1236f87a9cdf54",
+    "ci_exact_obligation_regression_required_passes": 1,
+    "workflow_shell_blocks_parsed": 24,
+    "static_scan": {"critical": 0, "warning": 303, "info": 44, "failed_modules": []},
+    "optimized_cli_and_full_end_to_end": "pending on this source snapshot",
+    "intended_real_public_control_sha256": "009ee7b746daafc26ec5f1ffe7627b38a942a031710c0076de4075323de115b4",
+    "measured_performance_win": false,
+    "initializer_task_closed": false,
+    "large_25100_archive_and_http_qualified": false,
+    "release_clearance": false,
+    "raw_evidence_prefix": "/tmp/am-reality-20261103-nSlwbq/latest-obligations-"
+  },
   "environment": {
     "os": "Ubuntu 24.04.3 LTS",
     "kernel": "Linux 6.18.57",

@@ -133,12 +133,16 @@ jobs:
           # This adjacent suite has three deliberately opt-in benchmarks. The
           # GH374 step above separately requires every regression to execute.
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored;' "$RUNNER_TEMP/gh374-inbox/inbox-suite.log"
-      - name: Preserve shared inbox paging and concurrent snapshot semantics
+      - name: Preserve shared inbox paging, obligation counts, and snapshots
         run: |
           set -euo pipefail
           cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable project_mailbox::tests::shared_inbox_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/shared-inbox.log"
           # This family also contains an explicitly ignored scaling benchmark.
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored;' "$RUNNER_TEMP/gh374-inbox/shared-inbox.log"
+          # The obligation-count seek regression is outside shared_inbox_.
+          # Require its original 257-delivery paging/count/receipt assertions.
+          cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable project_mailbox::tests::project_mailbox_inbox_counts_cross_pages_without_mutating_receipts -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/shared-obligations.log"
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-inbox/shared-obligations.log"
       - name: Preserve inbox evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

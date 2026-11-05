@@ -67,6 +67,50 @@ qualification. No 25,100-message HTTP/archive result or release clearance is
 claimed here. Raw terminal logs and receipts are retained under
 `/tmp/am-reality-20261103-nSlwbq/merged-gh374-*`.
 
+### November 5: shared-obligation continuation
+
+Upstream `9f3bc1b5fe6a0c4a8942f473ad88ab5604893543` also gives the obligation
+count pager a typed `i64::MIN` lower bound and a deterministic message-ID tie
+break. The original 257-delivery regression now checks three bounded native
+`SeekGE` pages, exact counts, and unchanged receipts/activity. The local source
+adds only a redundant-borrow cleanup and three manual test-format corrections.
+The first native run passed 32 cases before those formatting corrections; its
+receipt `fbf01c6d3b52a7ca96f5d2e6bc72eff6f536d4157fdc234c1e1236f87a9cdf54`
+remains evidence for that earlier byte snapshot.
+
+Final formatted-source qualification completed independently:
+
+| Check | Result | Source receipt |
+| --- | --- | --- |
+| Native portable `project_mailbox::tests::` family | 32 passed, 0 failed, 1 deliberately ignored scaling benchmark; 3,524 filtered; 43.06 seconds | `ac2b9c8d904f8d2e8aeabc9f079c6282ed95572327c32262bae682e8df8f156b` |
+| Workspace all-target check | Exit 0 | `2a4c6603a35cc42ff0e8b257bf9d3b3a144c480643d71df5b122dcac761ce67d` |
+| Separate production lib/bin check | Exit 0 | `80013ac7d3b666bf567d5a93f18c5017d60f4a1b618d6bf61a34cbc6ef4924a4` |
+| Strict workspace all-target Clippy | Exit 0 | `5a8417c325fe7baa5da38cb280a7fca122147157c701a3c6ba8bf013cf64efa8` |
+| Final workspace formatting | Exit 0 | Retained local format log |
+
+All four remote receipts contain the same 3,910 source records, freshly rehashed
+with zero mismatches. The native executable on `vmi1152480` is 128,102,944 bytes,
+SHA-256 `73cf03e378e2ebc11ea76574826528899b18a6c6bd06946881aec5c8137ea730`.
+The scan of the changed Rust file reported zero critical, 303 warning and 44
+informational findings, with no failed module; it is not a warning-free audit.
+
+The workflow's `shared_inbox_` filter did not select the obligation regression.
+It now also executes that original fully qualified case with `--exact` and
+requires exactly one pass with zero ignored cases. All 24 workflow shell blocks
+parse. This is CI wiring and native query qualification, not a measured latency
+win or a successful hosted workflow result. Worker admission/source-packing
+refusals and the initial formatting failure remain retained zero-case/red
+attempts. The initializer failure above still keeps its separate task open.
+
+An optimized portable CLI build and the original full end-to-end workload are
+being rerun for this query snapshot. Their verdict is pending. The intended
+control is the actual published GNU v0.3.40 executable, SHA-256
+`009ee7b746daafc26ec5f1ffe7627b38a942a031710c0076de4075323de115b4`.
+Fresh release metadata, signed manifest, pinned-key Minisign verification and
+streaming archive-member equality were rechecked. Earlier private read-retry
+control results remain labeled as that separate subject. No release clearance
+or 25,100-message archive/HTTP qualification is claimed.
+
 The initial cancellation-accounting fix and qualification tests are on main.
 Formatting, provenance, configuration parsing, and independent source review
 have passed; those checks are not native execution of the pool, HTTP, or recovery
