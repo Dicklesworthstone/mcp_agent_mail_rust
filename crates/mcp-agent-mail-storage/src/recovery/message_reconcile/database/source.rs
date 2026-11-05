@@ -955,6 +955,161 @@ mod tests {
     }
 
     #[test]
+    fn source_statement_selects_one_message_from_populated_delivery_tables() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            // Enough unrelated deliveries to fill the observation's limit if
+            // any UNION arm loses the message-ID binding. The foreign sender
+            // of 901 is intentional and must still be accepted.
+            for id in 1000..2200 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES({id}, 201, 201, 'unrelated', 'not the selected body', 1); \
+                     INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES({id}, 202, 'to', 19, 23); \
+                     INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) \
+                     VALUES({id}, 201, 'cc', 1)"
+                ))
+                .unwrap();
+            }
+            conn.execute_raw(
+                "INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) \
+                 VALUES(901, 101, 'cc', 1); COMMIT; PRAGMA query_only=ON",
+            )
+            .unwrap();
+            let sql = format!("{SOURCE_SQL} LIMIT {}", MAX_RECIPIENTS + 2);
+            let params = [
+                901_i64.into(),
+                MAX_DB_PAYLOAD_BYTES.into(),
+                MAX_RECIPIENT_NAME_BYTES.into(),
+            ];
+            let rows = conn.query_sync(&sql, &params).unwrap();
+            assert_eq!(rows.len(), 5);
+            assert!(
+                rows.iter()
+                    .all(|row| row.get_named::<i64>("id").unwrap() == 901)
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.get_named::<i64>("row_kind").unwrap())
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 1, 1, 2]
+            );
+            assert_eq!(rows[0].get_named::<i64>("sender_id").unwrap(), 201);
+            assert_eq!(rows[0].get_named::<i64>("sender_project_id").unwrap(), 201);
+            assert_eq!(rows[1].get_named::<i64>("recipient_read_ts").unwrap(), 7);
+            assert_eq!(rows[1].get_named::<i64>("recipient_ack_ts").unwrap(), 11);
+            assert_eq!(
+                rows[4].get_named::<i64>("recipient_project_id").unwrap(),
+                101
+            );
+            let prepared = prepare_source_rows(901, &rows).unwrap();
+            assert_eq!(prepared.sender, "OrangeHill");
+            assert_eq!(prepared.project_slug, "project");
+            assert_eq!(prepared.body, "Keep this body.");
+            assert_eq!(prepared.message["subject"], "Contact handoff");
+            assert_eq!(prepared.message["to"], json!(["GreenStone"]));
+            assert_eq!(
+                prepared.message["cc"],
+                json!(["GoldLeaf", "project:project"])
+            );
+            assert_eq!(prepared.message["bcc"], json!(["RedFox"]));
+            assert_eq!(
+                prepared.recipients,
+                vec!["GoldLeaf", "GreenStone", "RedFox"]
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter_map(|row| row.get_named::<Option<String>>("body_md").unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["Keep this body."]
+            );
+            let mut absent = params;
+            absent[0] = 999_i64.into();
+            assert!(conn.query_sync(&sql, &absent).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn source_statement_preserves_byte_bounds_after_message_selection() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET body_md = 'λ', thread_id = 'thread-λ', topic = '部署', \
+                 archive_metadata_json = '{}' WHERE id = 901; PRAGMA query_only=ON",
+            )
+            .unwrap();
+            // Count UTF-8 bytes independently of SQL. A character-count cap
+            // would wrongly admit the one-byte-over control below.
+            let source_bytes: usize = [
+                "λ",
+                "Contact handoff",
+                "{}",
+                "[]",
+                "normal",
+                "project",
+                "/project",
+                "OrangeHill",
+                "thread-λ",
+                "部署",
+                "{}",
+            ]
+            .into_iter()
+            .map(str::len)
+            .sum();
+            let sql = format!("{SOURCE_SQL} LIMIT {}", MAX_RECIPIENTS + 2);
+            let mut params = [
+                901_i64.into(),
+                i64::try_from(source_bytes).unwrap().into(),
+                MAX_RECIPIENT_NAME_BYTES.into(),
+            ];
+            let rows = conn.query_sync(&sql, &params).unwrap();
+            let exact = prepare_source_rows(901, &rows).unwrap();
+            assert_eq!(exact.body, "λ");
+            assert_eq!(exact.message["thread_id"], "thread-λ");
+            assert_eq!(exact.message["topic"], "部署");
+            assert!(exact.archive_metadata_known);
+
+            params[1] = i64::try_from(source_bytes - 1).unwrap().into();
+            let oversized = conn.query_sync(&sql, &params).unwrap();
+            assert_eq!(oversized.len(), 3, "delivery witnesses remain visible");
+            assert!(
+                oversized
+                    .iter()
+                    .all(|row| row.get_named::<i64>("row_kind").unwrap() == 1)
+            );
+            assert!(
+                prepare_source_rows(901, &oversized)
+                    .err()
+                    .unwrap()
+                    .contains("oversized")
+            );
+
+            params[1] = i64::try_from(source_bytes).unwrap().into();
+            params[2] = 9_i64.into(); // GreenStone is ten bytes.
+            let oversized_name = conn.query_sync(&sql, &params).unwrap();
+            assert_eq!(
+                oversized_name.len(),
+                4,
+                "an invalid identity is not dropped by the join"
+            );
+            assert!(
+                oversized_name[1]
+                    .get_named::<Option<String>>("recipient_name")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                prepare_source_rows(901, &oversized_name)
+                    .err()
+                    .unwrap()
+                    .contains("missing or oversized")
+            );
+        });
+    }
+
+    #[test]
     fn conflicting_populated_routing_never_publishes_or_changes_delivery_receipts() {
         fixture(|cx, pool, config| {
             for cached in [

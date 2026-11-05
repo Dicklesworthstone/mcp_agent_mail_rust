@@ -13627,6 +13627,10 @@ pub const MESSAGE_PRUNE_MAX_CANDIDATES: usize = 32;
 /// named by its `project:<slug>` address, with no recipient id or receipts.
 /// Callers bind message ID, payload-byte limit, and recipient-name-byte limit,
 /// then append the fixed recipient limit plus two rows as an overflow witness.
+/// Filter each source table before joining identities: the runtime engine
+/// cannot push the message ID through the cross-table payload-byte predicate.
+/// Leaving that filter outside the join makes each recovery observation join
+/// unrelated mailbox history, even though it returns only one message (GH#354).
 pub const MESSAGE_ARCHIVE_SOURCE_SQL: &str = "\
 SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
        m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
@@ -13636,10 +13640,10 @@ SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.t
        NULL AS recipient_name, NULL AS recipient_kind, \
        m.sender_id, a.project_id AS sender_project_id, \
        NULL AS recipient_read_ts, NULL AS recipient_ack_ts \
-FROM messages m JOIN projects p ON p.id = m.project_id \
+FROM (SELECT * FROM messages WHERE id = ?1) m \
+JOIN projects p ON p.id = m.project_id \
 JOIN agents a ON a.id = m.sender_id \
-WHERE m.id = ?1 AND \
-      length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
+WHERE length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
       length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
       length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
       length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
@@ -13656,16 +13660,16 @@ SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, N
             THEN mr.read_ts ELSE 'invalid_receipt' END, \
        CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
             THEN mr.ack_ts ELSE 'invalid_receipt' END \
-FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
-WHERE mr.message_id = ?1 \
+FROM (SELECT * FROM message_recipients WHERE message_id = ?1) mr \
+LEFT JOIN agents a ON a.id = mr.agent_id \
 UNION ALL \
 SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
        NULL, NULL, NULL, NULL, d.project_id, \
        CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
        CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
        NULL, NULL, NULL, NULL \
-FROM project_mailbox_deliveries d LEFT JOIN projects p ON p.id = d.project_id \
-WHERE d.message_id = ?1 \
+FROM (SELECT * FROM project_mailbox_deliveries WHERE message_id = ?1) d \
+LEFT JOIN projects p ON p.id = d.project_id \
 ORDER BY row_kind, recipient_id";
 
 const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 24;
