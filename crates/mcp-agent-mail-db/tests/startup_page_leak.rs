@@ -625,7 +625,13 @@ fn process_memory_kib(field: &str) -> u64 {
 fn log_connection_memory(stage: &str, connection: usize) {
     let rss_kib = process_memory_kib("VmRSS:");
     let peak_kib = process_memory_kib("VmHWM:");
-    eprintln!("GH372 stage={stage} connection={connection} rss_kib={rss_kib} peak_kib={peak_kib}");
+    let rss_anon_kib = process_memory_kib("RssAnon:");
+    let rss_file_kib = process_memory_kib("RssFile:");
+    let rss_shmem_kib = process_memory_kib("RssShmem:");
+    eprintln!(
+        "GH372 stage={stage} connection={connection} rss_kib={rss_kib} peak_kib={peak_kib} \
+         rss_anon_kib={rss_anon_kib} rss_file_kib={rss_file_kib} rss_shmem_kib={rss_shmem_kib}"
+    );
 }
 
 fn seed_legacy_memory_mailbox(path: &Path, message_count: i64) -> String {

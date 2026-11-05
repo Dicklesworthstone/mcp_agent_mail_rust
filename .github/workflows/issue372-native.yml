@@ -16,6 +16,12 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Exact 40-character lowercase commit SHA in this repository; blank uses the workflow commit'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -47,9 +53,31 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Validate the immutable source before checkout
+        id: source
+        timeout-minutes: 1
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          tested_sha=${REQUESTED_SOURCE_SHA:-$GITHUB_SHA}
+          if [[ ! "$tested_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'source_sha must be exactly 40 lowercase hexadecimal characters or blank.\n' >&2
+            exit 1
+          fi
+          printf 'sha=%s\n' "$tested_sha" >> "$GITHUB_OUTPUT"
+          printf 'TESTED_SOURCE_SHA=%s\n' "$tested_sha" >> "$GITHUB_ENV"
+          mkdir -p "$EVIDENCE_DIR"
+          printf '%s\n' "$GITHUB_SHA" > "$EVIDENCE_DIR/workflow.sha"
+          printf '%s\n' "$tested_sha" > "$EVIDENCE_DIR/tested-source.sha"
+          {
+            printf '### Issue 372 source qualification\n\n'
+            printf -- '- Workflow commit: `%s`\n- Tested commit: `%s`\n\n' "$GITHUB_SHA" "$tested_sha"
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.sha }}
+          repository: ${{ github.repository }}
+          ref: ${{ steps.source.outputs.sha }}
           persist-credentials: false
           fetch-depth: 1
       - name: Record exact source and install its pinned compiler
@@ -58,7 +86,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
           git rev-parse HEAD | tee "$EVIDENCE_DIR/source.sha"
-          test "$(cat "$EVIDENCE_DIR/source.sha")" = "$GITHUB_SHA"
+          test "$(cat "$EVIDENCE_DIR/source.sha")" = "$TESTED_SOURCE_SHA"
           git status --porcelain --untracked-files=no > "$EVIDENCE_DIR/source-before.txt"
           test ! -s "$EVIDENCE_DIR/source-before.txt"
           cp Cargo.lock "$EVIDENCE_DIR/Cargo.lock"
