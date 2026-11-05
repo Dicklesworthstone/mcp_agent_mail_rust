@@ -41,6 +41,23 @@ pub(super) struct State {
     memory_only: bool,
 }
 
+impl State {
+    // The caller holds writable-source admission. Only independently retained
+    // process memory can prove that a new pool still represents this mailbox;
+    // a sidecar snapshot cannot authorize carrying live debt across a rebind.
+    pub(super) fn matches_live_source(
+        &self,
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+    ) -> Result<bool, String> {
+        let Some(binding) = self.binding.as_ref().filter(|_| self.enabled) else {
+            return Ok(false);
+        };
+        Ok(Binding::capture(cx, pool, config)? == *binding)
+    }
+}
+
 impl ReservationReconcileCursor {
     /// Reconcile a bounded pass with restart-safe scan and retry hints.
     ///
@@ -777,6 +794,310 @@ mod tests {
         );
         cursor.retries.checkpoint = state;
         result
+    }
+
+    fn uncached_pool(config: &Config) -> DbPool {
+        DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn same_source_pool_recreation_preserves_unsaved_release_debt_and_current_authority() {
+        release_tests::fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let rows = (402..=480)
+                .map(|id| {
+                    format!("({id},71,81,'history/{id}.rs',1,'history',1000000,9000000,NULL)")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!("INSERT INTO file_reservations(id,project_id,agent_id,path_pattern,\"exclusive\",reason,created_ts,expires_ts,released_ts) VALUES {rows}")).unwrap();
+            drop(conn);
+            let (mut cursor, binding, previous) = persisted_retry(cx, pool, config);
+            assert_eq!(
+                (cursor.history.after, cursor.history.ceiling),
+                (432, Some(480))
+            );
+            let old: Snapshot = serde_json::from_slice(&previous).unwrap();
+            assert_eq!(
+                old.retries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+                [401]
+            );
+
+            // A release below the saved history watermark is discovered in a
+            // later real finite round. Its refused publication must become new
+            // debt even while the checkpoint destination is unavailable.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id,released_ts) VALUES(402,5000000)").unwrap();
+            drop(conn);
+            let source = super::super::super::read_source(cx, pool, 402)
+                .unwrap()
+                .unwrap();
+            let (artifact_path, active_bytes) =
+                release_tests::seed_artifact(config, &source, "aabb", false);
+            let path = binding.path().unwrap();
+            let saved_path = path.with_extension("json.before-failed-save");
+            let blocked_path = path.with_extension("json.retained-directory");
+            std::fs::rename(&path, &saved_path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let process = crate::archive_process_lock(&archive).unwrap();
+            let held = process.lock().unwrap();
+            let stop = AtomicBool::new(false);
+            cursor.retries.pending[0].ready_at = Instant::now() + MAX_BACKOFF;
+            for (after, deferred) in [(464, 0), (480, 0), (432, 1)] {
+                let report = cursor
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap();
+                assert_eq!((report.repaired, report.deferred_transient), (0, deferred));
+                assert_eq!(cursor.history.after, after);
+            }
+            drop(held);
+            assert_eq!(std::fs::read(&artifact_path).unwrap(), active_bytes);
+            assert_eq!(std::fs::read(&saved_path).unwrap(), previous);
+            assert_eq!(
+                cursor
+                    .retries
+                    .pending
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                [401, 402]
+            );
+            let error = save_pending(cx, pool, config, &mut cursor, &stop).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("checkpoint path is not a regular file")
+            );
+            std::fs::rename(&path, &blocked_path).unwrap();
+            std::fs::rename(&saved_path, &path).unwrap();
+
+            let reopened = uncached_pool(config);
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            assert_eq!(Binding::capture(cx, &reopened, config).unwrap(), binding);
+            let ready_at = Instant::now() + MAX_BACKOFF;
+            for entry in &mut cursor.retries.pending {
+                entry.ready_at = ready_at;
+            }
+            let debt = cursor
+                .retries
+                .pending
+                .iter()
+                .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                .collect::<Vec<_>>();
+            let priority = (cursor.priority.after, cursor.priority.ceiling);
+            let resumed = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!((resumed.repaired, resumed.retry_len), (0, 2));
+            assert_eq!(cursor.source_identity, reopened.sqlite_identity_key());
+            assert_eq!((cursor.priority.after, cursor.priority.ceiling), priority);
+            assert_eq!(
+                (cursor.history.after, cursor.history.ceiling),
+                (464, Some(480))
+            );
+            assert_eq!(
+                cursor
+                    .retries
+                    .pending
+                    .iter()
+                    .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                    .collect::<Vec<_>>(),
+                debt
+            );
+            assert!(contended(&Store::open(binding.clone()).unwrap_err()));
+            let saved = cursor
+                .retries
+                .checkpoint
+                .store
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved
+                    .retries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                [401, 402]
+            );
+            assert_eq!(saved.history.after, 464);
+
+            // Retention carries IDs only. The eventual repair must use the
+            // newer release timestamp and preserve surviving archive fields.
+            let conn = outcome(block_on(reopened.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET reason='fresh after pool turnover' WHERE id=402",
+            )
+            .unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservation_releases SET released_ts=6000000 WHERE reservation_id=402",
+            )
+            .unwrap();
+            drop(conn);
+            let fresh = super::super::super::read_source(cx, &reopened, 402)
+                .unwrap()
+                .unwrap();
+            cursor
+                .retries
+                .pending
+                .iter_mut()
+                .find(|entry| entry.id == 402)
+                .unwrap()
+                .ready_at = Instant::now();
+            let repaired = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!((repaired.repaired, repaired.retry_len), (1, 1));
+            assert!(!cursor.retries.contains(402));
+            let bytes = std::fs::read(&artifact_path).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                super::super::super::timestamp(&value["released_ts"]),
+                Some(6_000_000)
+            );
+            assert_eq!(value["reason"], "fresh after pool turnover");
+            assert_eq!(value["operator_note"], "preserve this note");
+            assert_eq!(value["db_generation"], "aabb");
+            let repo = git2::Repository::open(&config.storage_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            let entry = tree
+                .get_path(Path::new(
+                    "projects/project/file_reservations/id-402-gaabb.json",
+                ))
+                .unwrap();
+            assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+            assert_eq!(
+                super::super::super::read_source(cx, &reopened, 402)
+                    .unwrap()
+                    .unwrap(),
+                fresh
+            );
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_source_pool_recreation_keeps_the_terminal_checkpoint_lock_open() {
+        release_tests::fixture(|cx, pool, config| {
+            let (mut cursor, binding, _) = persisted_retry(cx, pool, config);
+            // The duplicate owns the same flock. An accidental drop/reopen of
+            // Store would contend with it instead of hiding a brief lock gap.
+            let _retained = cursor
+                .retries
+                .checkpoint
+                .store
+                .as_ref()
+                .unwrap()
+                .lock
+                .try_clone()
+                .unwrap();
+            let reopened = uncached_pool(config);
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            assert_eq!(Binding::capture(cx, &reopened, config).unwrap(), binding);
+            cursor.retries.pending[0].ready_at = Instant::now() + MAX_BACKOFF;
+            let report = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!((report.repaired, report.retry_len), (0, 1));
+            assert!(contended(&Store::open(binding).unwrap_err()));
+        });
+    }
+
+    #[test]
+    fn pool_recreation_without_a_retained_terminal_binding_starts_fresh() {
+        release_tests::fixture(|cx, pool, config| {
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let process = crate::archive_process_lock(&archive).unwrap();
+            let held = process.lock().unwrap();
+            let stop = AtomicBool::new(false);
+            let mut cursor = ReservationReconcileCursor::default();
+            let deferred = super::super::super::reconcile_reservation_releases(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &stop,
+            )
+            .unwrap();
+            drop(held);
+            assert_eq!((deferred.deferred_transient, deferred.retry_len), (1, 1));
+            assert!(cursor.retries.checkpoint.binding.is_none());
+            let reopened = uncached_pool(config);
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            Binding::capture(cx, &reopened, config).unwrap();
+            cursor.retries.pending[0].ready_at = Instant::now() + MAX_BACKOFF;
+            let report = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!((report.repaired, report.retry_len), (1, 0));
+            assert_eq!(cursor.source_identity, reopened.sqlite_identity_key());
+        });
+    }
+
+    #[test]
+    fn pool_recreation_with_a_changed_terminal_generation_discards_old_debt() {
+        release_tests::fixture(|cx, pool, config| {
+            let (mut cursor, binding, _) = persisted_retry(cx, pool, config);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0")
+                .unwrap();
+            drop(conn);
+            let reopened = uncached_pool(config);
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            assert_ne!(Binding::capture(cx, &reopened, config).unwrap(), binding);
+            cursor.retries.pending[0].ready_at = Instant::now() + MAX_BACKOFF;
+            let report = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!((report.repaired, report.retry_len), (1, 0));
+            let old_path = Path::new("projects/project/file_reservations/id-401-gaabb.json");
+            assert_eq!(
+                std::fs::read(config.storage_root.join(old_path))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::NotFound
+            );
+            let relative = Path::new("projects/project/file_reservations/id-401-gccdd.json");
+            let bytes = std::fs::read(config.storage_root.join(relative)).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["db_generation"], "ccdd");
+            let repo = git2::Repository::open(&config.storage_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            match tree.get_path(old_path) {
+                Ok(_) => panic!("old-generation release must not be published"),
+                Err(error) => assert_eq!(error.code(), git2::ErrorCode::NotFound),
+            }
+            assert_eq!(
+                repo.find_blob(tree.get_path(relative).unwrap().id())
+                    .unwrap()
+                    .content(),
+                bytes
+            );
+            let saved = cursor
+                .retries
+                .checkpoint
+                .store
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.binding.generation.as_deref(), Some("ccdd"));
+            assert!(saved.retries.is_empty());
+        });
     }
 
     #[test]

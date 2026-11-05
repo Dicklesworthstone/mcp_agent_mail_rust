@@ -368,12 +368,25 @@ pub(super) fn run(
         read_discovery(cx, pool, require_writable)?;
         let identity = pool.sqlite_identity_key();
         if identity != cursor.source_identity {
-            let checkpoint_enabled = cursor.retries.checkpoint.enabled;
-            *cursor = ReservationReconcileCursor {
-                source_identity: identity,
-                ..Default::default()
-            };
-            cursor.retries.checkpoint.enabled = checkpoint_enabled;
+            // Pool turnover alone must not release checkpoint ownership or
+            // discard unsaved retry debt. An empty key is explicit source
+            // invalidation, while unknown/changed bindings still require the
+            // ordinary reset before any retained ID can be attempted.
+            if !cursor.source_identity.is_empty()
+                && cursor
+                    .retries
+                    .checkpoint
+                    .matches_live_source(cx, pool, config)?
+            {
+                cursor.source_identity = identity;
+            } else {
+                let checkpoint_enabled = cursor.retries.checkpoint.enabled;
+                *cursor = ReservationReconcileCursor {
+                    source_identity: identity,
+                    ..Default::default()
+                };
+                cursor.retries.checkpoint.enabled = checkpoint_enabled;
+            }
         }
     }
     // Checkpoint staging, decision logging and the gaps between items retain
