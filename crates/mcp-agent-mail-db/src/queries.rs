@@ -13627,10 +13627,11 @@ pub const MESSAGE_PRUNE_MAX_CANDIDATES: usize = 32;
 /// named by its `project:<slug>` address, with no recipient id or receipts.
 /// Callers bind message ID, payload-byte limit, and recipient-name-byte limit,
 /// then append the fixed recipient limit plus two rows as an overflow witness.
-/// Filter each source table before joining identities: the runtime engine
-/// cannot push the message ID through the cross-table payload-byte predicate.
-/// Leaving that filter outside the join makes each recovery observation join
-/// unrelated mailbox history, even though it returns only one message (GH#354).
+/// Each source is narrowed before joining identities. In the pinned runtime,
+/// combining the message ID with the cross-table byte bound in an outer WHERE
+/// prevents the primary-key lookup and repeatedly scans unrelated mailbox rows
+/// (GH#354). The derived tables retain one statement/snapshot and leave the
+/// complete byte bound, missing-identity witnesses, and retention projection intact.
 pub const MESSAGE_ARCHIVE_SOURCE_SQL: &str = "\
 SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
        m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
@@ -13640,7 +13641,9 @@ SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.t
        NULL AS recipient_name, NULL AS recipient_kind, \
        m.sender_id, a.project_id AS sender_project_id, \
        NULL AS recipient_read_ts, NULL AS recipient_ack_ts \
-FROM (SELECT * FROM messages WHERE id = ?1) m \
+FROM (SELECT id, project_id, sender_id, subject, body_md, thread_id, topic, \
+             importance, ack_required, created_ts, recipients_json, attachments, \
+             archive_metadata_json FROM messages WHERE id = ?1) m \
 JOIN projects p ON p.id = m.project_id \
 JOIN agents a ON a.id = m.sender_id \
 WHERE length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
@@ -13660,7 +13663,8 @@ SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, N
             THEN mr.read_ts ELSE 'invalid_receipt' END, \
        CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
             THEN mr.ack_ts ELSE 'invalid_receipt' END \
-FROM (SELECT * FROM message_recipients WHERE message_id = ?1) mr \
+FROM (SELECT message_id, agent_id, kind, read_ts, ack_ts \
+      FROM message_recipients WHERE message_id = ?1) mr \
 LEFT JOIN agents a ON a.id = mr.agent_id \
 UNION ALL \
 SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
@@ -13668,7 +13672,8 @@ SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NU
        CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
        CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
        NULL, NULL, NULL, NULL \
-FROM (SELECT * FROM project_mailbox_deliveries WHERE message_id = ?1) d \
+FROM (SELECT message_id, project_id, kind \
+      FROM project_mailbox_deliveries WHERE message_id = ?1) d \
 LEFT JOIN projects p ON p.id = d.project_id \
 ORDER BY row_kind, recipient_id";
 

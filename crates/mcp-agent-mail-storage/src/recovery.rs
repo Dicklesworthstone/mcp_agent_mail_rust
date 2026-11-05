@@ -34,6 +34,48 @@ use std::path::Path;
 
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 
+/// A reservation and both release authorities from one database snapshot.
+///
+/// Keep the point lookups inside their own SELECTs. In FrankenSQLite 0.4.13,
+/// the cross-table byte predicate prevents the outer WHERE from narrowing a
+/// joined table, making an otherwise single-ID read scan reservation history
+/// (GH #354). Both growing tables must be narrowed before joining identities.
+/// The outer predicate still rejects oversized source values before they cross
+/// the connection boundary; neither the byte limit nor release authority is
+/// inferred from a separately observed row.
+pub(super) const RESERVATION_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+            fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
+            rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+     FROM (SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
+                  created_ts, expires_ts, released_ts \
+           FROM file_reservations WHERE id = ?1) fr \
+     JOIN projects p ON p.id = fr.project_id \
+     JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
+     LEFT JOIN (SELECT reservation_id, released_ts \
+                FROM file_reservation_releases WHERE reservation_id = ?1) rr \
+       ON rr.reservation_id = fr.id \
+     LEFT JOIN db_identity d ON d.singleton = 0 \
+     WHERE length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
+           length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+           length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
+           length(CAST(fr.\"exclusive\" AS BLOB)) + \
+           COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
+           COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
+           COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?2";
+
+fn query_reservation_source(
+    conn: &mcp_agent_mail_db::DbConn,
+    id: i64,
+    max_source_bytes: i64,
+) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, mcp_agent_mail_db::sqlmodel_core::Error> {
+    #[cfg(test)]
+    tests::record_reservation_source_query();
+    conn.query_sync(
+        RESERVATION_SOURCE_SQL,
+        &[id.into(), max_source_bytes.into()],
+    )
+}
+
 /// A ref that cannot be followed because its target object is missing
 /// from the repository's object database.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -304,7 +346,720 @@ impl DetectionSummary {
 mod tests {
     use super::*;
     use git2::Signature;
+    use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
+    use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    thread_local! {
+        static RESERVATION_SOURCE_QUERIES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_reservation_source_query() {
+        RESERVATION_SOURCE_QUERIES.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn reset_reservation_source_queries() {
+        RESERVATION_SOURCE_QUERIES.with(|count| count.set(0));
+    }
+
+    pub(super) fn reservation_source_queries() -> usize {
+        RESERVATION_SOURCE_QUERIES.with(Cell::get)
+    }
+
+    /// Fill a real repair fixture with expired, unreleased history. The caller
+    /// retains its existing sentinel and selects the few actual repair debts.
+    pub(super) fn seed_reservation_history(
+        conn: &DbConn,
+        project_id: i64,
+        agent_id: i64,
+        skip_id: i64,
+    ) {
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        let header = "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
+                      \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES ";
+        let mut rows = Vec::with_capacity(128);
+        for id in (1..=9_482).filter(|id| *id != skip_id) {
+            rows.push(format!(
+                "({id}, {project_id}, {agent_id}, 'history/file-{id}.rs', 1, \
+                 'mailbox-scale reservation source regression with realistic historical metadata', \
+                 1000000, 9000000, NULL)"
+            ));
+            if rows.len() == 128 {
+                conn.execute_raw(&format!("{header}{}", rows.join(",")))
+                    .unwrap();
+                rows.clear();
+            }
+        }
+        if !rows.is_empty() {
+            conn.execute_raw(&format!("{header}{}", rows.join(",")))
+                .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+    }
+
+    // Retain the actual pre-GH354 query as the independent oracle and benchmark
+    // incumbent. Do not derive it by transforming the candidate SQL.
+    const LEGACY_RESERVATION_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
+                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+         FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
+         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
+         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+         LEFT JOIN db_identity d ON d.singleton = 0 \
+         WHERE fr.id = ?1 AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
+               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
+               length(CAST(fr.\"exclusive\" AS BLOB)) + \
+               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?2";
+
+    const RESERVATION_FIXTURE_BYTES: i64 = 32 * 1024;
+
+    fn seed_rows(conn: &CanonicalDbConn, header: &str, values: impl Iterator<Item = String>) {
+        let mut batch = Vec::with_capacity(128);
+        for value in values {
+            batch.push(value);
+            if batch.len() == 128 {
+                conn.execute_raw(&format!("{header}{}", batch.join(",")))
+                    .unwrap();
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            conn.execute_raw(&format!("{header}{}", batch.join(",")))
+                .unwrap();
+        }
+    }
+
+    fn reservation_source_mailbox(reservations: i64, messages: i64) -> (TempDir, DbConn) {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("mail.sqlite3");
+        // Canonical SQLite only constructs the offline fixture. All measured
+        // reads, plans, mutations and snapshot assertions use runtime DbConn.
+        let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+        seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        seed.execute_raw("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE")
+            .unwrap();
+        seed_rows(
+            &seed,
+            "INSERT INTO projects(id, slug, human_key, created_at) VALUES ",
+            (1..=5).map(|id| {
+                format!("({id}, 'project-{id}', '/mailbox-scale/project-{id}', 1000000)")
+            }),
+        );
+        seed_rows(
+            &seed,
+            "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES ",
+            (1..=82).map(|id| {
+                let project = (id - 1) % 5 + 1;
+                format!("({id}, {project}, 'Agent{id:03}', 'test', 'test', 1000000, 1000000)")
+            }),
+        );
+        seed.execute_raw("INSERT INTO db_identity(singleton, generation_id) VALUES(0, 'aabbccdd')")
+            .unwrap();
+        seed_rows(
+            &seed,
+            "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
+             \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES ",
+            (1..=reservations).map(|id| {
+                let agent = (id - 1) % 82 + 1;
+                let project = (agent - 1) % 5 + 1;
+                let hot = if id % 4 == 0 {
+                    (1_700_000_001_000_000_i64 + id).to_string()
+                } else {
+                    "NULL".to_owned()
+                };
+                format!(
+                    "({id}, {project}, {agent}, 'src/project-{project}/file-{id}.rs', {}, \
+                     'reservation {id}: retain the holder, release authority and historical repair metadata', \
+                     1700000000000000, 1700003600000000, {hot})",
+                    id % 2
+                )
+            }),
+        );
+        seed_rows(
+            &seed,
+            "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES ",
+            (1..=reservations)
+                .filter(|id| id % 4 != 3)
+                .map(|id| format!("({id}, {})", 1_700_000_002_000_000_i64 + id)),
+        );
+        let body = "A realistic historical mailbox message with source metadata. ".repeat(20);
+        seed_rows(
+            &seed,
+            "INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts) VALUES ",
+            (1..=messages).map(|id| {
+                let agent = (id - 1) % 82 + 1;
+                let project = (agent - 1) % 5 + 1;
+                format!(
+                    "({id}, {project}, {agent}, 'Historical message {id}', '{body}', {})",
+                    1_700_000_000_000_000_i64 + id
+                )
+            }),
+        );
+        seed_rows(
+            &seed,
+            "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES ",
+            (1..=messages).map(|id| {
+                let sender = (id - 1) % 82 + 1;
+                let recipient = if sender + 5 <= 82 {
+                    sender + 5
+                } else {
+                    sender - 5
+                };
+                format!("({id}, {recipient}, 'to')")
+            }),
+        );
+        seed.execute_raw("COMMIT").unwrap();
+        drop(seed);
+        let native = DbConn::open_file(path.to_str().unwrap()).unwrap();
+        (temp, native)
+    }
+
+    fn assert_source_rows_equal(actual: &[Row], expected: &[Row]) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "source row cardinality changed"
+        );
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(
+                actual.column_names().collect::<Vec<_>>(),
+                expected.column_names().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                actual.values().collect::<Vec<_>>(),
+                expected.values().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn compare_reservation_sources(conn: &DbConn, id: i64, byte_limit: i64) -> Vec<Row> {
+        let legacy = conn
+            .query_sync(
+                LEGACY_RESERVATION_SOURCE_SQL,
+                &[id.into(), byte_limit.into()],
+            )
+            .unwrap();
+        let current = query_reservation_source(conn, id, byte_limit).unwrap();
+        assert_source_rows_equal(&current, &legacy);
+        current
+    }
+
+    fn reservation_source_plan(conn: &DbConn, sql: &str) -> Vec<String> {
+        conn.query_sync(
+            &format!("EXPLAIN QUERY PLAN {sql}"),
+            &[4_741.into(), RESERVATION_FIXTURE_BYTES.into()],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get_as::<String>(3).unwrap())
+        .collect()
+    }
+
+    fn assert_primary_key_source_seek(conn: &DbConn, table: &str, sql: &str) -> Vec<String> {
+        let program = conn
+            .query_sync(&format!("EXPLAIN {sql}"), &[4_741.into()])
+            .unwrap();
+        let opened = program
+            .iter()
+            .find(|row| {
+                row.get_as::<String>(1).unwrap() == "OpenRead"
+                    && row
+                        .get_as::<String>(5)
+                        .is_ok_and(|name| name.eq_ignore_ascii_case(table))
+            })
+            .unwrap_or_else(|| panic!("no OpenRead for {table}: {program:?}"))
+            .get_as::<i64>(2)
+            .unwrap();
+        assert!(
+            program.iter().any(|row| {
+                matches!(
+                    row.get_as::<String>(1).unwrap().as_str(),
+                    "SeekRowid" | "NotExists"
+                ) && row.get_as::<i64>(2).unwrap() == opened
+            }),
+            "{table} point lookup has no primary-key seek: {program:?}"
+        );
+        assert!(
+            !program.iter().any(|row| {
+                row.get_as::<String>(1).unwrap() == "Rewind"
+                    && row.get_as::<i64>(2).unwrap() == opened
+            }),
+            "{table} point lookup rewinds reservation history: {program:?}"
+        );
+        program.iter().map(|row| format!("{row:?}")).collect()
+    }
+
+    #[test]
+    fn reservation_source_mailbox_scale_matches_legacy_and_seeks() {
+        let (_temp, conn) = reservation_source_mailbox(9_482, 8_241);
+        for (table, expected) in [
+            ("projects", 5),
+            ("agents", 82),
+            ("messages", 8_241),
+            ("file_reservations", 9_482),
+        ] {
+            assert_eq!(
+                conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                expected
+            );
+        }
+        reset_reservation_source_queries();
+        // All four release shapes, different holders/projects, the history
+        // tail and absent IDs must preserve every column, not just row counts.
+        for id in [1, 2, 3, 4, 81, 82, 401, 4_741, 9_481, 9_482, -1, 9_483] {
+            let rows = compare_reservation_sources(&conn, id, RESERVATION_FIXTURE_BYTES);
+            assert_eq!(rows.len(), usize::from((1..=9_482).contains(&id)));
+        }
+        assert!(compare_reservation_sources(&conn, 1, 0).is_empty());
+        assert_eq!(reservation_source_queries(), 13);
+
+        // Native EQP is retained verbatim: its JOIN labels are not always the
+        // executed access path. Check the emitted programs of the two isolated
+        // lookups as well, then measure the complete SQL in the CPU regression.
+        let legacy = reservation_source_plan(&conn, LEGACY_RESERVATION_SOURCE_SQL);
+        let candidate = reservation_source_plan(&conn, RESERVATION_SOURCE_SQL);
+        let reservation_program = assert_primary_key_source_seek(
+            &conn,
+            "file_reservations",
+            "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
+                    created_ts, expires_ts, released_ts FROM file_reservations WHERE id = ?1",
+        );
+        let release_program = assert_primary_key_source_seek(
+            &conn,
+            "file_reservation_releases",
+            "SELECT reservation_id, released_ts FROM file_reservation_releases WHERE reservation_id = ?1",
+        );
+        println!(
+            "GH354_RESERVATION_PLANS {}",
+            serde_json::json!({
+                "backend": std::any::type_name::<DbConn>(),
+                "projects": 5, "agents": 82, "messages": 8241, "reservations": 9482,
+                "legacy": legacy, "candidate": candidate,
+                "reservation_program": reservation_program, "release_program": release_program,
+            })
+        );
+        conn.close_sync().unwrap();
+    }
+
+    fn projected_source_bytes(row: &Row) -> usize {
+        // An independent byte oracle for the actual projected values. IDs do
+        // not belong to the existing text bound; every other source field does.
+        row.values()
+            .skip(3)
+            .map(|value| match value {
+                Value::Null => 0,
+                Value::Text(text) => text.len(),
+                Value::Int(value) => value.to_string().len(),
+                Value::BigInt(value) => value.to_string().len(),
+                other => panic!("unexpected source value in fixture: {other:?}"),
+            })
+            .sum()
+    }
+
+    #[test]
+    fn reservation_source_byte_limit_counts_utf8_and_every_authority() {
+        let (_temp, conn) = reservation_source_mailbox(4, 4);
+        conn.execute_raw(
+            "UPDATE file_reservations SET reason = '', released_ts = 1000000 WHERE id = 1",
+        )
+        .unwrap();
+        let fixed = compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES)
+            .pop()
+            .unwrap();
+        let remaining =
+            usize::try_from(RESERVATION_FIXTURE_BYTES).unwrap() - projected_source_bytes(&fixed);
+        let reason = format!("{}{}", "é".repeat(remaining / 2), "x".repeat(remaining % 2));
+        assert_eq!(reason.len(), remaining);
+        assert!(reason.chars().count() < reason.len());
+        conn.execute_sync(
+            "UPDATE file_reservations SET reason = ?1 WHERE id = 1",
+            &[Value::Text(reason)],
+        )
+        .unwrap();
+        let exact = compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES)
+            .pop()
+            .unwrap();
+        assert_eq!(projected_source_bytes(&exact), 32_768);
+        assert!(compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES - 1).is_empty());
+
+        // Grow each counted field by exactly one encoded byte. This catches a
+        // dropped JOIN contribution as well as a weakened per-table substitute
+        // for the combined limit, including both release stores and generation.
+        for (column, update) in [
+            (
+                3,
+                "UPDATE file_reservations SET path_pattern = ?1 WHERE id = 1",
+            ),
+            (
+                4,
+                "UPDATE file_reservations SET \"exclusive\" = ?1 WHERE id = 1",
+            ),
+            (5, "UPDATE file_reservations SET reason = ?1 WHERE id = 1"),
+            (
+                6,
+                "UPDATE file_reservations SET created_ts = ?1 WHERE id = 1",
+            ),
+            (
+                7,
+                "UPDATE file_reservations SET expires_ts = ?1 WHERE id = 1",
+            ),
+            (
+                8,
+                "UPDATE file_reservations SET released_ts = ?1 WHERE id = 1",
+            ),
+            (
+                9,
+                "UPDATE file_reservation_releases SET released_ts = ?1 WHERE reservation_id = 1",
+            ),
+            (10, "UPDATE projects SET slug = ?1 WHERE id = 1"),
+            (11, "UPDATE projects SET human_key = ?1 WHERE id = 1"),
+            (12, "UPDATE agents SET name = ?1 WHERE id = 1"),
+            (
+                13,
+                "UPDATE db_identity SET generation_id = ?1 WHERE singleton = 0",
+            ),
+        ] {
+            let previous = exact.values().nth(column).unwrap().clone();
+            let larger = match &previous {
+                Value::Text(text) => Value::Text(format!("{text}a")),
+                Value::Int(value) => Value::Int(value.checked_mul(10).unwrap()),
+                Value::BigInt(value) => Value::BigInt(value.checked_mul(10).unwrap()),
+                other => panic!("unexpected boundary value: {other:?}"),
+            };
+            conn.execute_sync(update, &[larger]).unwrap();
+            assert!(
+                compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES).is_empty(),
+                "field {column} bypassed the combined source-byte limit"
+            );
+            let admitted = compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES + 1);
+            assert_eq!(admitted.len(), 1, "field {column} changed row authority");
+            assert_eq!(projected_source_bytes(&admitted[0]), 32_769);
+            conn.execute_sync(update, &[previous]).unwrap();
+        }
+        assert_source_rows_equal(
+            &compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES),
+            &[exact],
+        );
+        conn.close_sync().unwrap();
+    }
+
+    #[test]
+    fn reservation_source_preserves_missing_and_malformed_authority() {
+        let (_temp, conn) = reservation_source_mailbox(4, 4);
+        // Deliberately model a damaged/foreign holder; neither query can
+        // manufacture authority by joining only on an agent ID.
+        conn.execute_raw("PRAGMA foreign_keys = OFF").unwrap();
+        for change in [
+            "UPDATE file_reservations SET project_id = 999 WHERE id = 1",
+            "UPDATE file_reservations SET project_id = 2 WHERE id = 1",
+            "UPDATE file_reservations SET project_id = 1, agent_id = 2 WHERE id = 1",
+            "UPDATE file_reservations SET agent_id = 999 WHERE id = 1",
+        ] {
+            conn.execute_raw(change).unwrap();
+            assert!(compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES).is_empty());
+        }
+        conn.execute_raw("UPDATE file_reservations SET project_id = 1, agent_id = 1 WHERE id = 1")
+            .unwrap();
+        // SQL must preserve malformed release/generation evidence for the
+        // active/terminal decoders; silently converting it to absence is unsafe.
+        conn.execute_raw(
+            "UPDATE file_reservations SET released_ts = 'malformed' WHERE id = 1; \
+             UPDATE file_reservation_releases SET released_ts = 0 WHERE reservation_id = 1; \
+             UPDATE db_identity SET generation_id = '' WHERE singleton = 0",
+        )
+        .unwrap();
+        let malformed = compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(
+            malformed[0].get_named::<String>("hot_release").unwrap(),
+            "malformed"
+        );
+        assert_eq!(malformed[0].get_named::<i64>("ledger_release").unwrap(), 0);
+        assert_eq!(
+            malformed[0].get_named::<String>("generation_id").unwrap(),
+            ""
+        );
+        conn.execute_raw("DELETE FROM db_identity; DELETE FROM file_reservation_releases WHERE reservation_id = 1")
+            .unwrap();
+        let absent = compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES);
+        assert_eq!(absent.len(), 1);
+        assert_eq!(
+            absent[0]
+                .get_named::<Option<String>>("generation_id")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            absent[0]
+                .get_named::<Option<i64>>("ledger_release")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            absent[0].get_named::<String>("hot_release").unwrap(),
+            "malformed"
+        );
+        assert!(compare_reservation_sources(&conn, 0, RESERVATION_FIXTURE_BYTES).is_empty());
+        conn.close_sync().unwrap();
+    }
+
+    #[test]
+    fn reservation_source_observations_follow_native_snapshot_boundaries() {
+        let (temp, current) = reservation_source_mailbox(4, 4);
+        let path = temp.path().join("mail.sqlite3");
+        let mode = current
+            .query_sync("PRAGMA journal_mode = WAL", &[])
+            .unwrap();
+        assert_eq!(
+            mode[0].get_as::<String>(0).unwrap().to_ascii_lowercase(),
+            "wal"
+        );
+        let pinned = DbConn::open_file(path.to_str().unwrap()).unwrap();
+        let writer = DbConn::open_file(path.to_str().unwrap()).unwrap();
+        pinned.execute_raw("BEGIN DEFERRED").unwrap();
+        let original = query_reservation_source(&pinned, 1, RESERVATION_FIXTURE_BYTES).unwrap();
+        assert_eq!(original.len(), 1);
+        assert_source_rows_equal(
+            &query_reservation_source(&current, 1, RESERVATION_FIXTURE_BYTES).unwrap(),
+            &original,
+        );
+        writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+        writer.execute_raw(
+            "UPDATE file_reservations SET path_pattern = 'src/after.rs', reason = 'committed', \
+                 released_ts = 1700000003000000 WHERE id = 1; \
+             UPDATE projects SET slug = 'after-project', human_key = '/mailbox-scale/after' WHERE id = 1; \
+             UPDATE agents SET name = 'AfterAgent' WHERE id = 1; \
+             UPDATE file_reservation_releases SET released_ts = 1700000004000000 WHERE reservation_id = 1; \
+             UPDATE db_identity SET generation_id = '00112233' WHERE singleton = 0",
+        )
+        .unwrap();
+        // An in-flight writer cannot expose an intermediate mix of any of the
+        // five tables, even to the autocommit observation used by publication.
+        assert_source_rows_equal(
+            &query_reservation_source(&current, 1, RESERVATION_FIXTURE_BYTES).unwrap(),
+            &original,
+        );
+        writer.execute_raw("COMMIT").unwrap();
+        let mut values = original[0].values().cloned().collect::<Vec<_>>();
+        values[3] = Value::Text("src/after.rs".into());
+        values[5] = Value::Text("committed".into());
+        values[8] = Value::Text("1700000003000000".into());
+        values[9] = Value::BigInt(1_700_000_004_000_000);
+        values[10] = Value::Text("after-project".into());
+        values[11] = Value::Text("/mailbox-scale/after".into());
+        values[12] = Value::Text("AfterAgent".into());
+        values[13] = Value::Text("00112233".into());
+        let committed = vec![Row::new(
+            original[0].column_names().map(str::to_owned).collect(),
+            values,
+        )];
+        assert_source_rows_equal(
+            &query_reservation_source(&pinned, 1, RESERVATION_FIXTURE_BYTES).unwrap(),
+            &original,
+        );
+        assert_source_rows_equal(
+            &query_reservation_source(&current, 1, RESERVATION_FIXTURE_BYTES).unwrap(),
+            &committed,
+        );
+        pinned.execute_raw("COMMIT").unwrap();
+        assert_source_rows_equal(
+            &query_reservation_source(&pinned, 1, RESERVATION_FIXTURE_BYTES).unwrap(),
+            &committed,
+        );
+        writer
+            .execute_raw(
+                "BEGIN IMMEDIATE; \
+             UPDATE file_reservations SET reason = 'rolled back' WHERE id = 1; \
+             UPDATE db_identity SET generation_id = 'ffffffff' WHERE singleton = 0",
+            )
+            .unwrap();
+        assert_source_rows_equal(
+            &query_reservation_source(&current, 1, RESERVATION_FIXTURE_BYTES).unwrap(),
+            &committed,
+        );
+        writer.execute_raw("ROLLBACK").unwrap();
+        assert_source_rows_equal(
+            &query_reservation_source(&current, 1, RESERVATION_FIXTURE_BYTES).unwrap(),
+            &committed,
+        );
+        writer.close_sync().unwrap();
+        pinned.close_sync().unwrap();
+        current.close_sync().unwrap();
+    }
+
+    fn proc_cpu_ticks(path: &Path) -> Option<(String, u64)> {
+        let stat = std::fs::read_to_string(path).ok()?;
+        let (prefix, fields) = stat.rsplit_once(") ")?;
+        let name = prefix.split_once('(')?.1.to_owned();
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let user = fields.get(11)?.parse::<u64>().ok()?;
+        let system = fields.get(12)?.parse::<u64>().ok()?;
+        Some((name, user.checked_add(system)?))
+    }
+
+    fn reservation_cpu_sample() -> Option<(u64, u64, usize)> {
+        let (_, process) = proc_cpu_ticks(Path::new("/proc/self/stat"))?;
+        let mut worker_ticks = 0_u64;
+        let mut workers = 0;
+        for task in std::fs::read_dir("/proc/self/task").ok()? {
+            let task = task.ok()?;
+            let Some((name, ticks)) = proc_cpu_ticks(&task.path().join("stat")) else {
+                continue;
+            };
+            if name == "fsqlite-worker" {
+                workers += 1;
+                worker_ticks = worker_ticks.checked_add(ticks)?;
+            }
+        }
+        Some((process, worker_ticks, workers))
+    }
+
+    fn run_reservation_cpu_child() -> bool {
+        const CHILD_ENV: &str = "AM_GH354_RESERVATION_CPU_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return false;
+        }
+        // CPU includes the actual connection worker, so measure in a separate
+        // process rather than attributing other parallel tests to this query.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "recovery::tests::reservation_source_mailbox_scale_cpu",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut expired = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                expired = true;
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !expired && output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "native reservation CPU comparison failed (timeout={expired}): {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        true
+    }
+
+    #[test]
+    fn reservation_source_mailbox_scale_cpu() {
+        if run_reservation_cpu_child() {
+            return;
+        }
+        let (temp, conn) = reservation_source_mailbox(9_482, 8_241);
+        let clock_ticks_per_second = std::process::Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|output| output.trim().parse::<u64>().ok());
+        // Warm both implementations on the same connection and mailbox before
+        // alternating their order. Fixture generation and warmup are excluded.
+        assert_eq!(
+            compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES).len(),
+            1
+        );
+        reset_reservation_source_queries();
+        let mut samples = Vec::new();
+        let mut wall_us = [0_u64; 2];
+        let mut process_ticks = [0_u64; 2];
+        let mut worker_ticks = [0_u64; 2];
+        let mut cpu_samples = [0_usize; 2];
+        for round in 0..16 {
+            let id = [1, 401, 4_741, 9_482][round % 4];
+            let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+            let mut results = [None, None];
+            for lane in order {
+                let before = reservation_cpu_sample();
+                let start = Instant::now();
+                let rows = if lane == 0 {
+                    conn.query_sync(
+                        LEGACY_RESERVATION_SOURCE_SQL,
+                        &[id.into(), RESERVATION_FIXTURE_BYTES.into()],
+                    )
+                    .unwrap()
+                } else {
+                    query_reservation_source(&conn, id, RESERVATION_FIXTURE_BYTES).unwrap()
+                };
+                let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap();
+                let after = reservation_cpu_sample();
+                let cpu = before.zip(after).and_then(|(before, after)| {
+                    if before.2 != after.2 || after.2 == 0 {
+                        return None;
+                    }
+                    Some((
+                        after.0.checked_sub(before.0)?,
+                        after.1.checked_sub(before.1)?,
+                    ))
+                });
+                wall_us[lane] += elapsed_us;
+                if let Some((process, worker)) = cpu {
+                    process_ticks[lane] += process;
+                    worker_ticks[lane] += worker;
+                    cpu_samples[lane] += 1;
+                }
+                samples.push(serde_json::json!({
+                    "round": round, "id": id,
+                    "query": if lane == 0 { "legacy" } else { "candidate" },
+                    "wall_us": elapsed_us,
+                    "process_cpu_ticks": cpu.map(|sample| sample.0),
+                    "fsqlite_worker_cpu_ticks": cpu.map(|sample| sample.1),
+                    "worker_threads": after.map(|sample| sample.2),
+                    "rows": rows.len(),
+                }));
+                results[lane] = Some(rows);
+            }
+            assert_source_rows_equal(results[1].as_ref().unwrap(), results[0].as_ref().unwrap());
+            assert_eq!(results[1].as_ref().unwrap().len(), 1);
+        }
+        assert_eq!(reservation_source_queries(), 16);
+        println!(
+            "GH354_RESERVATION_CPU {}",
+            serde_json::json!({
+                "scope": "isolated native query comparison; not a running-server idle-CPU measurement",
+                "backend": std::any::type_name::<DbConn>(),
+                "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+                "projects": 5, "agents": 82, "messages": 8241, "reservations": 9482,
+                "database_bytes": std::fs::metadata(temp.path().join("mail.sqlite3")).unwrap().len(),
+                "queries_per_variant": 16, "candidate_helper_calls": reservation_source_queries(),
+                "clock_ticks_per_second": clock_ticks_per_second,
+                "legacy_wall_us": wall_us[0], "candidate_wall_us": wall_us[1],
+                "legacy_process_cpu_ticks": process_ticks[0],
+                "candidate_process_cpu_ticks": process_ticks[1],
+                "legacy_worker_cpu_ticks": worker_ticks[0],
+                "candidate_worker_cpu_ticks": worker_ticks[1],
+                "cpu_samples_per_variant": cpu_samples, "samples": samples,
+            })
+        );
+        // CPU and elapsed timings are retained evidence, not flaky CI gates.
+        // Row equality, byte bounds, native seeks and publication convergence
+        // are enforced separately on the same production lookup.
+        conn.close_sync().unwrap();
+    }
 
     fn init_repo_with_commit(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
