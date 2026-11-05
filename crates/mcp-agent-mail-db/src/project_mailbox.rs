@@ -2616,7 +2616,7 @@ mod tests {
             && *rows <= 128));
         let pages: Vec<_> = calls
             .iter()
-            .filter(|(sql, _, _)| sql.contains("ORDER BY created_ts DESC LIMIT 128"))
+            .filter(|(sql, _, _)| sql.contains("ORDER BY created_ts DESC, id DESC LIMIT 128"))
             .collect();
         assert_eq!(
             pages.len(),
@@ -2717,7 +2717,7 @@ mod tests {
                 params: &[Value],
             ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
                 let rows = self.reader.query_sync(sql, params)?;
-                if sql.contains("ORDER BY created_ts DESC LIMIT 128")
+                if sql.contains("ORDER BY created_ts DESC, id DESC LIMIT 128")
                     && !self.committed.replace(true)
                 {
                     self.writer.execute_raw("BEGIN IMMEDIATE;

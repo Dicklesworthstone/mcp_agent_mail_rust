@@ -85,7 +85,7 @@ jobs:
           toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal
           rustc -vV | tee "$RUNNER_TEMP/gh374-inbox/compiler.log"
-      - name: Require cancellation-safe pool accounting and capacity reuse
+      - name: Require cancellation-safe selected pool source
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
@@ -95,8 +95,32 @@ jobs:
           # Test the source Cargo actually selected. The retained 0.5.0 vendor
           # backport is historical evidence; current main selects public 0.5.1.
           # A dependency's unit tests require its own workspace/dev dependencies.
-          cargo test --locked --manifest-path "$pool_manifest" --lib -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/pool.log"
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-inbox/pool.log"
+          cargo test --locked --manifest-path "$pool_manifest" --lib -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/pool-unit.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-inbox/pool-unit.log"
+      - name: Require cancellation-safe initialization on the runtime pool
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "$RUNNER_TEMP/gh374-inbox/pool-source.json"
+          import json, tomllib
+          with open("Cargo.toml", "rb") as source:
+              manifest = tomllib.load(source)
+          with open("Cargo.lock", "rb") as source:
+              packages = tomllib.load(source)["package"]
+          pools = [package for package in packages if package["name"] == "sqlmodel-pool"]
+          if len(pools) != 1:
+              raise SystemExit("expected one locked runtime pool; resolve dependency attribution explicitly")
+          print(json.dumps({
+              "workspace_requirement": manifest["workspace"]["dependencies"]["sqlmodel-pool"],
+              "patch": manifest.get("patch", {}).get("crates-io", {}).get("sqlmodel-pool"),
+              "locked_package": {key: pools[0].get(key) for key in ("name", "version", "source", "checksum")},
+              "scope": "Agent Mail DB and HTTP cancellation tests use this locked graph; vendor/sqlmodel-pool is historical evidence"
+          }, indent=2))
+          PY
+          # Use the selected workspace dependency graph. The historical
+          # vendor/sqlmodel-pool copy is no longer the runtime pool. Queued
+          # acquisition/dispatch cancellation is also required by the HTTP job.
+          cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable pool_impl::tests::cancelled_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/pool.log"
+          grep -Eq 'test result: ok\. 2 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-inbox/pool.log"
       - name: Compare exact large inbox results with the incumbent reader
         run: |
           set -euo pipefail
@@ -109,6 +133,12 @@ jobs:
           # This adjacent suite has three deliberately opt-in benchmarks. The
           # GH374 step above separately requires every regression to execute.
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored;' "$RUNNER_TEMP/gh374-inbox/inbox-suite.log"
+      - name: Preserve shared inbox paging and concurrent snapshot semantics
+        run: |
+          set -euo pipefail
+          cargo test --locked -p mcp-agent-mail-db --lib --no-default-features --features portable project_mailbox::tests::shared_inbox_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-inbox/shared-inbox.log"
+          # This family also contains an explicitly ignored scaling benchmark.
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored;' "$RUNNER_TEMP/gh374-inbox/shared-inbox.log"
       - name: Preserve inbox evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -172,6 +202,7 @@ jobs:
           set -euo pipefail
           cargo test --locked -p mcp-agent-mail-storage --test it --no-default-features --features portable archive::gh374_reconciliation_converges_with_live_git_writer_and_inbox_readers -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh374-reconciliation/concurrent-25100.log"
           grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh374-reconciliation/concurrent-25100.log"
+          grep -F '"case":"gh374_real_git_writer_and_inbox_readers"' "$RUNNER_TEMP/gh374-reconciliation/concurrent-25100.log" | grep -F '"large_mailbox":true' | grep -F '"messages":25100'
       - name: Preserve reconciliation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -245,7 +276,9 @@ jobs:
           cargo fmt --check 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/format.log"
           cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/gh374-workspace/dependencies.json"
           pool_manifest=$(python3 -c 'import json,sys; packages=[p for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "sqlmodel-pool"]; assert len(packages) == 1, "qualification requires exactly one resolved sqlmodel-pool"; print(packages[0]["manifest_path"])' "$RUNNER_TEMP/gh374-workspace/dependencies.json")
-          cargo fmt --manifest-path "$pool_manifest" --check 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/pool-format.log"
+          cargo fmt --manifest-path "$pool_manifest" --check 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/selected-pool-format.log"
+          # Retained historical source; this is not the selected runtime pool.
+          rustfmt --edition 2024 --check vendor/sqlmodel-pool/src/lib.rs 2>&1 | tee "$RUNNER_TEMP/gh374-workspace/pool-format.log"
       - name: Check all workspace targets
         if: always()
         run: |
