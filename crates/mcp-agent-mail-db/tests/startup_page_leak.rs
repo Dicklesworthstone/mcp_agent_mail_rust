@@ -601,6 +601,14 @@ fn descending_metrics_insertions_keep_index_pages_dense() {
 }
 
 #[cfg(target_os = "linux")]
+const MEMORY_CHILD_ENV: &str = "AM_GH372_MEMORY_FIXTURE";
+#[cfg(target_os = "linux")]
+const MEMORY_CHILD_TEST: &str =
+    "startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory";
+#[cfg(target_os = "linux")]
+const MEMORY_CHILD_ACK: &str = "gh372-memory-probe-complete";
+
+#[cfg(target_os = "linux")]
 fn process_memory_kib(field: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .expect("Linux memory accounting is required for the memory regression")
@@ -614,9 +622,24 @@ fn process_memory_kib(field: &str) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+fn log_connection_memory(stage: &str, connection: usize) {
+    let rss_kib = process_memory_kib("VmRSS:");
+    let peak_kib = process_memory_kib("VmHWM:");
+    eprintln!("GH372 stage={stage} connection={connection} rss_kib={rss_kib} peak_kib={peak_kib}");
+}
+
 fn seed_legacy_memory_mailbox(path: &Path, message_count: i64) -> String {
+    seed_legacy_memory_mailbox_with_body_scale(path, message_count, 1)
+}
+
+fn seed_legacy_memory_mailbox_with_body_scale(
+    path: &Path,
+    message_count: i64,
+    unread_body_scale: usize,
+) -> String {
     use mcp_agent_mail_db::sqlmodel::Value;
 
+    assert!(unread_body_scale > 0);
     let seed = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
     seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("seed the unchanged mailbox schema using canonical SQLite");
@@ -627,13 +650,18 @@ fn seed_legacy_memory_mailbox(path: &Path, message_count: i64) -> String {
     )
     .unwrap();
     let body = "retained body ".repeat(320);
+    let unread_body = body.repeat(unread_body_scale);
     for id in 1..=message_count {
         seed.execute_sync(
             "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
              VALUES (?, 1, 1, 'before upgrade', ?, ?)",
             &[
                 Value::BigInt(id),
-                Value::Text(body.clone()),
+                Value::Text(if id == 1 {
+                    body.clone()
+                } else {
+                    unread_body.clone()
+                }),
                 Value::BigInt(id),
             ],
         )
@@ -641,6 +669,50 @@ fn seed_legacy_memory_mailbox(path: &Path, message_count: i64) -> String {
     }
     seed.execute_raw("COMMIT").unwrap();
     body
+}
+
+#[cfg(target_os = "linux")]
+fn run_bounded_connection_memory_child(path: &Path) -> u64 {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            MEMORY_CHILD_TEST,
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MEMORY_CHILD_ENV, path)
+        .output()
+        .expect("run isolated memory measurement");
+    std::io::stdout().write_all(&output.stdout).unwrap();
+    std::io::stderr().write_all(&output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "memory child failed: {}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| *line == MEMORY_CHILD_ACK)
+            .count(),
+        1,
+        "a zero-test child filter is not a successful memory regression"
+    );
+    let mut summaries = stderr
+        .lines()
+        .filter(|line| line.starts_with("GH372 baseline_kib="));
+    let summary = summaries.next().expect("memory child must report its peak");
+    assert!(
+        summaries.next().is_none(),
+        "expected exactly one memory measurement"
+    );
+    summary
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("delta_kib="))
+        .expect("memory measurement must include its pre-open baseline delta")
+        .parse()
+        .expect("memory delta must be a number of KiB")
 }
 
 /// GH#372 / br-kp1in.46: 0.4.10 multiplied each mailbox's logical image by
@@ -651,12 +723,8 @@ fn seed_legacy_memory_mailbox(path: &Path, message_count: i64) -> String {
 fn existing_mailbox_reads_have_bounded_connection_memory() {
     use mcp_agent_mail_db::sqlmodel::Value;
 
-    const CHILD_ENV: &str = "AM_GH372_MEMORY_FIXTURE";
-    const CHILD_TEST: &str =
-        "startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory";
-    const ACK: &str = "gh372-memory-probe-complete";
     const MESSAGE_COUNT: i64 = 4096;
-    if let Some(path) = std::env::var_os(CHILD_ENV) {
+    if let Some(path) = std::env::var_os(MEMORY_CHILD_ENV) {
         let path = PathBuf::from(path);
         assert!(path.is_absolute());
         assert_eq!(std::fs::canonicalize(&path).unwrap(), path);
@@ -667,31 +735,43 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
                 .is_some_and(|name| name.starts_with("am-gh372-memory-"))
         );
         let baseline_kib = process_memory_kib("VmRSS:");
+        log_connection_memory("baseline", 0);
         let writer = DbConn::open_file(path.to_str().unwrap()).expect("open existing mailbox");
+        log_connection_memory("writer_open", 0);
         let readers: Vec<_> = (0..4)
-            .map(|_| DbConn::open_file(path.to_str().unwrap()).expect("open runtime reader"))
+            .map(|index| {
+                let reader =
+                    DbConn::open_file(path.to_str().unwrap()).expect("open runtime reader");
+                log_connection_memory("reader_open", index + 1);
+                reader
+            })
             .collect();
         writer
             .execute_raw("UPDATE messages SET subject = 'post-upgrade write' WHERE id = 1")
             .expect("upgraded writer must preserve the existing mailbox format");
-        for reader in &readers {
+        log_connection_memory("writer_commit", 0);
+        for (index, reader) in readers.iter().enumerate() {
             assert_eq!(
                 reader.query_sync("SELECT 1", &[]).unwrap()[0]
                     .get_as::<i64>(0)
                     .unwrap(),
                 1
             );
+            log_connection_memory("constant_read", index + 1);
             let row = reader
                 .query_sync(
                     "SELECT subject, body_md FROM messages WHERE id = ?",
                     &[Value::BigInt(1)],
                 )
                 .expect("read committed message through another connection");
+            assert_eq!(row.len(), 1, "point lookup must return exactly one message");
             assert_eq!(row[0].get_as::<String>(0).unwrap(), "post-upgrade write");
             assert_eq!(
                 row[0].get_as::<String>(1).unwrap(),
                 "retained body ".repeat(320)
             );
+            drop(row);
+            log_connection_memory("point_read_complete", index + 1);
         }
         let peak_kib = process_memory_kib("VmHWM:");
         let delta_kib = peak_kib.saturating_sub(baseline_kib);
@@ -703,10 +783,12 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
             "small reads amplified mailbox RSS by {delta_kib} KiB"
         );
         drop(readers);
+        log_connection_memory("readers_dropped", 0);
         writer
             .close_sync()
             .expect("close and flush bounded-memory fixture");
-        eprintln!("{ACK}");
+        log_connection_memory("writer_closed", 0);
+        eprintln!("{MEMORY_CHILD_ACK}");
         return;
     }
 
@@ -719,26 +801,7 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
         .join("storage.sqlite3");
     let body = seed_legacy_memory_mailbox(&path, MESSAGE_COUNT);
     assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD_ENV, &path)
-        .output()
-        .expect("run isolated memory measurement");
-    std::io::stdout().write_all(&output.stdout).unwrap();
-    std::io::stderr().write_all(&output.stderr).unwrap();
-    assert!(
-        output.status.success(),
-        "memory child failed: {}",
-        output.status
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .filter(|line| *line == ACK)
-            .count(),
-        1,
-        "a zero-test child filter is not a successful memory regression"
-    );
+    run_bounded_connection_memory_child(&path);
     let canonical = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
     let rows = canonical
         .query_sync("SELECT COUNT(*), SUM(length(body_md)) FROM messages", &[])
@@ -747,5 +810,182 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
     assert_eq!(
         rows[0].get_as::<i64>(1).unwrap(),
         MESSAGE_COUNT * i64::try_from(body.len()).unwrap()
+    );
+}
+
+/// GH#372: grow only unread message bodies so index-entry counts, index keys,
+/// connection counts and point-read results stay fixed. Both isolated children
+/// must meet the original 32 MiB bound, including first-open integrity work.
+#[cfg(target_os = "linux")]
+#[test]
+fn existing_mailbox_reads_remain_bounded_with_larger_unread_bodies() {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    const MESSAGE_COUNT: i64 = 4096;
+    let dir = tempfile::Builder::new()
+        .prefix("am-gh372-memory-")
+        .tempdir()
+        .expect("private archive-size fixture directory");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut deltas_kib = Vec::new();
+    for unread_body_scale in [1, 4] {
+        let path = root.join(format!("body-scale-{unread_body_scale}.sqlite3"));
+        let body =
+            seed_legacy_memory_mailbox_with_body_scale(&path, MESSAGE_COUNT, unread_body_scale);
+        let body_bytes = i64::try_from(body.len()).unwrap();
+        let expected_body_bytes =
+            body_bytes * (1 + (MESSAGE_COUNT - 1) * i64::try_from(unread_body_scale).unwrap());
+        assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+        if unread_body_scale == 4 {
+            assert!(expected_body_bytes > 64 * 1024 * 1024);
+        }
+        deltas_kib.push(run_bounded_connection_memory_child(&path));
+
+        let canonical = CanonicalDbConn::open_file(path.to_str().unwrap())
+            .expect("reopen measured mailbox with canonical SQLite");
+        let totals = canonical
+            .query_sync("SELECT COUNT(*), SUM(length(body_md)) FROM messages", &[])
+            .expect("verify measured mailbox row and payload counts");
+        assert_eq!(totals[0].get_as::<i64>(0).unwrap(), MESSAGE_COUNT);
+        assert_eq!(totals[0].get_as::<i64>(1).unwrap(), expected_body_bytes);
+        let matching_bodies = canonical
+            .query_sync(
+                "SELECT COUNT(*) FROM messages \
+                 WHERE body_md = CASE WHEN id = 1 THEN ? ELSE ? END",
+                &[
+                    Value::Text(body.clone()),
+                    Value::Text(body.repeat(unread_body_scale)),
+                ],
+            )
+            .expect("verify every unread body survived native opens and the point update");
+        assert_eq!(matching_bodies[0].get_as::<i64>(0).unwrap(), MESSAGE_COUNT);
+        let integrity = canonical
+            .query_sync("PRAGMA integrity_check", &[])
+            .expect("verify measured mailbox integrity with canonical SQLite");
+        assert_eq!(integrity.len(), 1);
+        assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+    }
+    eprintln!(
+        "GH372 unread_body_scale=4 small_delta_kib={} large_delta_kib={}",
+        deltas_kib[0], deltas_kib[1]
+    );
+}
+
+/// GH#372: reducing connection memory must preserve an active reader's snapshot,
+/// refresh it after the transaction ends, and keep aborted writes invisible.
+#[test]
+fn existing_mailbox_readers_preserve_snapshots_and_durable_writes() {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    let dir = tempfile::tempdir().expect("snapshot fixture directory");
+    let path = dir.path().join("snapshot-mailbox.sqlite3");
+    let path_str = path.to_str().unwrap();
+    let original = (
+        "before upgrade".to_owned(),
+        seed_legacy_memory_mailbox(&path, 1),
+    );
+
+    let writer = DbConn::open_file(path_str).expect("open native writer");
+    let journal = writer
+        .query_sync("PRAGMA journal_mode = WAL", &[])
+        .expect("enable concurrent WAL readers");
+    assert_eq!(
+        journal[0].get_as::<String>(0).unwrap().to_ascii_lowercase(),
+        "wal"
+    );
+    let snapshot_reader = DbConn::open_file(path_str).expect("open snapshot reader");
+    let current_reader = DbConn::open_file(path_str).expect("open autocommit reader");
+    let read_message = |conn: &DbConn| {
+        let rows = conn
+            .query_sync(
+                "SELECT subject, body_md FROM messages WHERE id = ?",
+                &[Value::BigInt(1)],
+            )
+            .expect("read message through native connection");
+        assert_eq!(rows.len(), 1);
+        (
+            rows[0].get_as::<String>(0).unwrap(),
+            rows[0].get_as::<String>(1).unwrap(),
+        )
+    };
+    let committed = ("committed subject".to_owned(), "committed body".to_owned());
+    let aborted = ("aborted subject".to_owned(), "aborted body".to_owned());
+
+    snapshot_reader
+        .execute_raw("BEGIN DEFERRED")
+        .expect("begin reader snapshot");
+    assert_eq!(read_message(&snapshot_reader), original);
+    assert_eq!(read_message(&current_reader), original);
+    writer
+        .execute_raw("BEGIN IMMEDIATE")
+        .expect("begin concurrent writer");
+    writer
+        .execute_sync(
+            "UPDATE messages SET subject = ?, body_md = ? WHERE id = 1",
+            &[
+                Value::Text(committed.0.clone()),
+                Value::Text(committed.1.clone()),
+            ],
+        )
+        .expect("update message while reader holds snapshot");
+    writer
+        .execute_raw("COMMIT")
+        .expect("commit updated message");
+
+    // Both readers predate the write. Only the explicit transaction retains
+    // the old view; sharing a mutable image between them would violate this.
+    assert_eq!(read_message(&snapshot_reader), original);
+    assert_eq!(read_message(&current_reader), committed);
+    snapshot_reader
+        .execute_raw("COMMIT")
+        .expect("end reader snapshot");
+    assert_eq!(read_message(&snapshot_reader), committed);
+
+    writer
+        .execute_raw("BEGIN IMMEDIATE")
+        .expect("begin write that will be rolled back");
+    writer
+        .execute_sync(
+            "UPDATE messages SET subject = ?, body_md = ? WHERE id = 1",
+            &[
+                Value::Text(aborted.0.clone()),
+                Value::Text(aborted.1.clone()),
+            ],
+        )
+        .expect("stage uncommitted message");
+    assert_eq!(read_message(&writer), aborted);
+    assert_eq!(read_message(&snapshot_reader), committed);
+    assert_eq!(read_message(&current_reader), committed);
+    writer
+        .execute_raw("ROLLBACK")
+        .expect("roll back staged write");
+    assert_eq!(read_message(&writer), committed);
+    assert_eq!(read_message(&snapshot_reader), committed);
+    assert_eq!(read_message(&current_reader), committed);
+    snapshot_reader.close_sync().expect("close snapshot reader");
+    current_reader
+        .close_sync()
+        .expect("close autocommit reader");
+    writer.close_sync().expect("flush and close writer");
+
+    // A different engine verifies the persisted values only after every native
+    // connection has closed, so an in-process cache cannot satisfy the oracle.
+    let canonical = CanonicalDbConn::open_file(path_str).expect("reopen with canonical SQLite");
+    let rows = canonical
+        .query_sync("SELECT subject, body_md FROM messages ORDER BY id", &[])
+        .expect("read durable message with canonical SQLite");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_as::<String>(0).unwrap(), committed.0);
+    assert_eq!(rows[0].get_as::<String>(1).unwrap(), committed.1);
+    let integrity = canonical
+        .query_sync("PRAGMA integrity_check", &[])
+        .expect("check canonical mailbox integrity");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+    assert!(
+        canonical
+            .query_sync("PRAGMA foreign_key_check", &[])
+            .expect("check canonical mailbox foreign keys")
+            .is_empty()
     );
 }

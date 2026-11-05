@@ -1,0 +1,213 @@
+name: Issue 372 native connection memory qualification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/issue372-native.yml'
+      - '.cargo/**'
+      - 'crates/mcp-agent-mail-core/**'
+      - 'crates/mcp-agent-mail-db/**'
+      - 'crates/mcp-agent-mail-server/**'
+      - 'crates/mcp-agent-mail-storage/**'
+      - 'crates/mcp-agent-mail-test-helpers/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue372-native-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '1'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_PROFILE_DEV_OPT_LEVEL: '1'
+  CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+  CARGO_TERM_COLOR: never
+  RUST_TEST_THREADS: '1'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  native:
+    name: Existing mailbox memory and integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      EVIDENCE_DIR: ${{ runner.temp }}/gh372-native
+      CARGO_TARGET_DIR: ${{ runner.temp }}/gh372-target
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Record exact source and install its pinned compiler
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/source.sha"
+          test "$(cat "$EVIDENCE_DIR/source.sha")" = "$GITHUB_SHA"
+          git status --porcelain --untracked-files=no > "$EVIDENCE_DIR/source-before.txt"
+          test ! -s "$EVIDENCE_DIR/source-before.txt"
+          cp Cargo.lock "$EVIDENCE_DIR/Cargo.lock"
+          cp Cargo.toml "$EVIDENCE_DIR/Cargo.toml"
+          cp rust-toolchain.toml "$EVIDENCE_DIR/rust-toolchain.toml"
+          sha256sum Cargo.lock Cargo.toml rust-toolchain.toml .cargo/config.toml > "$EVIDENCE_DIR/build-inputs.sha256"
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          printf 'rustup toolchain install %q --profile minimal\n' "$toolchain" > "$EVIDENCE_DIR/compiler.command"
+          rustup toolchain install "$toolchain" --profile minimal 2>&1 | tee "$EVIDENCE_DIR/compiler-install.log"
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+          {
+            uname -a
+            id
+            rustc +"$toolchain" -vV
+            cargo +"$toolchain" -vV
+            cat /proc/meminfo
+            if [[ -r /sys/fs/cgroup/memory.max ]]; then
+              printf 'cgroup_memory_max='
+              cat /sys/fs/cgroup/memory.max
+            fi
+            printf 'CARGO_BUILD_JOBS=%s\nCARGO_INCREMENTAL=%s\n' "$CARGO_BUILD_JOBS" "$CARGO_INCREMENTAL"
+            printf 'CARGO_PROFILE_DEV_DEBUG=%s\nCARGO_PROFILE_TEST_DEBUG=%s\n' "$CARGO_PROFILE_DEV_DEBUG" "$CARGO_PROFILE_TEST_DEBUG"
+            printf 'CARGO_PROFILE_DEV_OPT_LEVEL=%s\nCARGO_PROFILE_TEST_OPT_LEVEL=%s\n' "$CARGO_PROFILE_DEV_OPT_LEVEL" "$CARGO_PROFILE_TEST_OPT_LEVEL"
+            printf 'RUSTFLAGS=%s\nCARGO_ENCODED_RUSTFLAGS=%s\n' "${RUSTFLAGS-}" "${CARGO_ENCODED_RUSTFLAGS-}"
+          } | tee "$EVIDENCE_DIR/environment.log"
+          cat > "$EVIDENCE_DIR/run-gate.sh" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          gate=$1
+          test_name=$2
+          # A stuck gate must not prevent the remaining exact tests from running.
+          command=(timeout --signal=TERM --kill-after=30s 6m "$TEST_EXECUTABLE" "$test_name" --exact --nocapture --test-threads=1)
+          printf '%q ' "${command[@]}" > "$EVIDENCE_DIR/$gate.command"
+          printf '\n' >> "$EVIDENCE_DIR/$gate.command"
+          set +e
+          "${command[@]}" 2>&1 | tee "$EVIDENCE_DIR/$gate.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          # Memory fixtures print child summaries. Only the final parent summary
+          # can establish that the requested exact test ran and was not ignored.
+          awk '/^test result:/ { result = $0 } END { print result }' "$EVIDENCE_DIR/$gate.log" > "$EVIDENCE_DIR/$gate.result"
+          awk 'match($0, /GH372 /) { print substr($0, RSTART) }' "$EVIDENCE_DIR/$gate.log" > "$EVIDENCE_DIR/$gate.measurements.log"
+          summary_exit=0
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$EVIDENCE_DIR/$gate.result" || summary_exit=$?
+          printf 'command_exit=%s\nlog_exit=%s\nsummary_exit=%s\n' "${statuses[0]}" "${statuses[1]}" "$summary_exit" > "$EVIDENCE_DIR/$gate.status"
+          if (( statuses[0] != 0 || statuses[1] != 0 || summary_exit != 0 )); then
+            exit 1
+          fi
+          BASH
+      - name: Build the native database integration executable once
+        id: build
+        timeout-minutes: 130
+        run: |
+          set -euo pipefail
+          command=(cargo test --locked -p mcp-agent-mail-db --no-default-features --test it --no-run --message-format=json-render-diagnostics)
+          printf '%q ' "${command[@]}" > "$EVIDENCE_DIR/build.command"
+          printf '\n' >> "$EVIDENCE_DIR/build.command"
+          set +e
+          "${command[@]}" 2>&1 | tee "$EVIDENCE_DIR/build.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf 'command_exit=%s\nlog_exit=%s\n' "${statuses[@]}" > "$EVIDENCE_DIR/build.status"
+          if (( statuses[0] != 0 || statuses[1] != 0 )); then
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+          expected_source = (Path(os.environ["GITHUB_WORKSPACE"]) / "crates/mcp-agent-mail-db/tests/it.rs").resolve()
+          executables = set()
+          artifacts = []
+          finished = []
+          for line in (evidence / "build.log").read_text().splitlines():
+              try:
+                  message = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if not isinstance(message, dict):
+                  continue
+              if message.get("reason") == "build-finished":
+                  finished.append(message["success"])
+              if message.get("reason") != "compiler-artifact":
+                  continue
+              artifacts.append(message)
+              target = message["target"]
+              if (target["name"] == "it" and "test" in target["kind"]
+                      and Path(target["src_path"]).resolve() == expected_source
+                      and message["profile"]["test"] and message.get("executable")):
+                  executables.add(message["executable"])
+          (evidence / "compiled-dependencies.json").write_text(json.dumps(artifacts, indent=2) + "\n")
+          assert finished == [True], f"unexpected Cargo build completion: {finished}"
+          assert len(executables) == 1, f"expected one database integration executable: {executables}"
+          executable = Path(executables.pop()).resolve()
+          assert executable.is_file() and os.access(executable, os.X_OK), executable
+          (evidence / "test-executable.path").write_text(str(executable) + "\n")
+          PY
+          sha256sum "$(cat "$EVIDENCE_DIR/test-executable.path")" > "$EVIDENCE_DIR/test-executable.sha256"
+      - name: Run all five exact memory and integrity gates
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          export TEST_EXECUTABLE="$(cat "$EVIDENCE_DIR/test-executable.path")"
+          export CARGO_MANIFEST_DIR="$GITHUB_WORKSPACE/crates/mcp-agent-mail-db"
+          export LD_LIBRARY_PATH="$(dirname "$TEST_EXECUTABLE"):$(rustc --print target-libdir)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          cd "$CARGO_MANIFEST_DIR"
+          cases=(
+            memory-original:startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory
+            memory-larger-bodies:startup_page_leak::existing_mailbox_reads_remain_bounded_with_larger_unread_bodies
+            snapshots-durability:startup_page_leak::existing_mailbox_readers_preserve_snapshots_and_durable_writes
+            index-density:startup_page_leak::descending_metrics_insertions_keep_index_pages_dense
+            legacy-compatibility:canonical_schema_readable::canonical_legacy_mailbox_survives_native_upgrade_and_new_writes
+          )
+          printf 'gate\tresult\texact_test\n' > "$EVIDENCE_DIR/gate-results.tsv"
+          failed=0
+          for case_name in "${cases[@]}"; do
+            gate=${case_name%%:*}
+            test_name=${case_name#*:}
+            if bash "$EVIDENCE_DIR/run-gate.sh" "$gate" "$test_name"; then
+              result=passed
+            else
+              result=failed
+              failed=1
+            fi
+            printf '%s\t%s\t%s\n' "$gate" "$result" "$test_name" >> "$EVIDENCE_DIR/gate-results.tsv"
+          done
+          cat "$EVIDENCE_DIR/"*.measurements.log > "$EVIDENCE_DIR/measurements.log"
+          cat "$EVIDENCE_DIR/gate-results.tsv" >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
+      - name: Verify tracked source stayed unchanged
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/source-after.sha"
+          git status --porcelain --untracked-files=no | tee "$EVIDENCE_DIR/source-after.txt"
+          git diff --no-ext-diff --exit-code HEAD -- 2>&1 | tee "$EVIDENCE_DIR/source.diff"
+          cmp "$EVIDENCE_DIR/source.sha" "$EVIDENCE_DIR/source-after.sha"
+          test ! -s "$EVIDENCE_DIR/source-after.txt"
+      - name: Preserve commands, memory measurements, and actual failures
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gh372-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
