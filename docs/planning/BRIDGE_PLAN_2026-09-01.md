@@ -28,12 +28,26 @@ rewinding after a failed save; implementation takes precedence over reporting.
   - [x] Add a private test-only regression: real mailbox, changed logical generation,
     old checkpoint, real directory-blocked publication, real Git repair and a
     second read of the obsolete snapshot. Production remains unchanged.
-  - [ ] Execute the unchanged-production negative at its intended progress assertion.
-  - [ ] Only after reproduction, fix the distinction between current process memory
-    and foreign disk hints; retain reset/refusal for unknown or changed bindings.
+  - [x] Execute the unchanged-production negative at its intended progress assertion:
+    0pass1fail/0ignored/1043filtered in3.16s, exit101. The obsolete snapshot
+    erased current `(Some(925), None)` progress after an actual failed save.
+    Build receipt3f008c11:3,911fresh inputs/0mismatch; identified ELFc94cc040.
+    Remote compilation0; client1 retrieval failure retained separately.
+  - [ ] Validate the candidate distinction between current process memory and
+    foreign disk hints; retain reset/refusal for unknown or changed bindings.
+    Compile it in a separate frozen checkout alongside the unchanged original
+    probe to avoid another serial cold build. Publish/close only after both
+    the intended original negative and unchanged repaired positive execute.
   - [ ] Prove real message convergence and unchanged source rows/read/ACK receipts.
   - [ ] Re-run original checkpoint/pool-reopen controls, all mandatory compiler
     graphs, formatting and reviewed static findings on frozen final source.
+    - [x] Preserve the merged startup-search Clippy101 receipt (c526f06b,
+      3,917 fresh inputs, zero mismatches); repair the lock-result expression
+      and first documentation paragraph without suppressions or changed tests.
+    - [ ] Qualify that integration edit with the existing real Tantivy writer
+      retention/error controls and all three cancelled-startup-backfill cases.
+    - [ ] Re-run all-target, separate production and strict Clippy on the final
+      two-file source; the earlier one-file all-target pass is historical.
   - [ ] Fresh solo acceptance and second source review; record exact revision and
     proof limitations before closing. No independent-review claim.
 - [ ] Use terminal findings to choose any further ready capability repair; keep
