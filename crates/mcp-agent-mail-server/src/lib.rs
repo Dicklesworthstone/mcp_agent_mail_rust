@@ -194,7 +194,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -662,8 +662,15 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
 }
 
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Server {
+    build_server_with_startup_workers(config, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_server_with_startup_workers(
+    config: &mcp_agent_mail_core::Config,
+    startup_workers: Option<Arc<StartupWorkers>>,
+) -> fastmcp_server::Server {
     // Wire the config flag into the global atomic gate.
     mcp_agent_mail_core::set_shedding_enabled(config.backpressure_shedding_enabled);
 
@@ -674,6 +681,9 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     // builder deliberately stays on the underlying dual-era server.
     let server = fastmcp_server::Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"))
         .on_shutdown(move || {
+            if let Some(workers) = &startup_workers {
+                workers.shutdown();
+            }
             shutdown_runtime_services(&shutdown_config);
         });
 
@@ -1083,6 +1093,169 @@ fn cleanup_shutdown_sqlite_sidecars_with_resolver<F>(
     }
 }
 
+/// Startup work belongs to the server whose mailbox authority admitted it.
+/// A listener-bind deadline only stops waiting for readiness; it never releases
+/// ownership of the readiness worker. The scope is declared after the mailbox
+/// locks, so cancellation, errors and unwinding join it before those locks drop.
+#[derive(Default)]
+struct StartupWorkerScope {
+    workers: Arc<StartupWorkers>,
+}
+
+impl Drop for StartupWorkerScope {
+    fn drop(&mut self) {
+        self.workers.shutdown();
+    }
+}
+
+#[derive(Default)]
+struct StartupWorkers {
+    state: Mutex<StartupWorkersState>,
+    joined: Condvar,
+}
+
+#[derive(Default)]
+struct StartupWorkersState {
+    stopping: bool,
+    joining: bool,
+    workers: Vec<(Arc<StartupWorkerControl>, JoinHandle<()>)>,
+}
+
+/// The delay and native pool acquisition share the worker's stop request.
+/// Synchronous filesystem/engine operations already in progress are joined;
+/// the stop flag is checked between operations, never treated as permission
+/// to detach a thread that can still access the mailbox.
+#[derive(Default)]
+struct StartupWorkerControl {
+    stopped: AtomicBool,
+    wait: Mutex<()>,
+    wake: Condvar,
+    native_context: Mutex<Option<Cx>>,
+}
+
+struct StartupWorkerContextGuard<'a>(&'a StartupWorkerControl);
+
+impl Drop for StartupWorkerContextGuard<'_> {
+    fn drop(&mut self) {
+        *lock_mutex(&self.0.native_context) = None;
+    }
+}
+
+impl StartupWorkerControl {
+    fn request_shutdown(&self) {
+        {
+            let _wait = lock_mutex(&self.wait);
+            self.stopped.store(true, Ordering::Release);
+            self.wake.notify_all();
+        }
+        let context = lock_mutex(&self.native_context).clone();
+        if let Some(cx) = context {
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("server startup shutdown"),
+            );
+        }
+    }
+
+    fn checkpoint(&self) -> Result<(), String> {
+        if self.stopped.load(Ordering::Acquire) {
+            Err("startup worker cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_delay(&self, delay: Duration) -> bool {
+        let guard = lock_mutex(&self.wait);
+        let _wait = self
+            .wake
+            .wait_timeout_while(guard, delay, |_| !self.stopped.load(Ordering::Acquire))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !self.stopped.load(Ordering::Acquire)
+    }
+
+    fn bind_native_context(&self, cx: &Cx) -> Result<StartupWorkerContextGuard<'_>, String> {
+        let mut context = lock_mutex(&self.native_context);
+        if self.stopped.load(Ordering::Acquire) {
+            drop(context);
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("server startup shutdown"),
+            );
+            return Err("startup worker cancelled".into());
+        }
+        *context = Some(cx.clone());
+        Ok(StartupWorkerContextGuard(self))
+    }
+}
+
+impl StartupWorkers {
+    fn spawn(
+        &self,
+        name: &'static str,
+        work: impl FnOnce(Arc<StartupWorkerControl>) + Send + 'static,
+    ) -> std::io::Result<()> {
+        // Registration and shutdown admission are atomic. No successful spawn
+        // can be lost between creating its thread and retaining its handle.
+        let mut state = lock_mutex(&self.state);
+        if state.stopping {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "server startup workers are stopping",
+            ));
+        }
+        let control = Arc::new(StartupWorkerControl::default());
+        let worker_control = Arc::clone(&control);
+        let handle = std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || work(worker_control))?;
+        state.workers.push((control, handle));
+        Ok(())
+    }
+
+    fn request_shutdown(&self) {
+        let controls: Vec<_> = {
+            let mut state = lock_mutex(&self.state);
+            state.stopping = true;
+            state
+                .workers
+                .iter()
+                .map(|(control, _)| Arc::clone(control))
+                .collect()
+        };
+        for control in controls {
+            control.request_shutdown();
+        }
+    }
+
+    fn shutdown(&self) {
+        self.request_shutdown();
+        let workers = {
+            let mut state = lock_mutex(&self.state);
+            while state.joining {
+                state = self
+                    .joined
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.joining = true;
+            std::mem::take(&mut state.workers)
+        };
+        // Only lifecycle owners call shutdown, never the workers themselves.
+        // Do not hold the manager lock during a join: a TUI starter may still
+        // be registering work, which must receive the stopping refusal.
+        for (_, worker) in workers {
+            if worker.join().is_err() {
+                tracing::warn!("startup worker panicked during server shutdown");
+            }
+        }
+        let mut state = lock_mutex(&self.state);
+        state.joining = false;
+        self.joined.notify_all();
+    }
+}
+
 static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const DEFAULT_STARTUP_SEARCH_BACKFILL_DELAY_SECS: u64 = 8;
 
@@ -1118,10 +1291,20 @@ fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> Stri
     )
 }
 
-fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
+fn run_startup_search_backfill(
+    config: &mcp_agent_mail_core::Config,
+    control: &StartupWorkerControl,
+) {
+    if control.checkpoint().is_err() {
+        return;
+    }
     let backfill_database_url =
         normalized_startup_search_backfill_database_url(&config.database_url);
-    match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+    match mcp_agent_mail_db::search_v3::backfill_from_db_cancellable(
+        &backfill_database_url,
+        &control.stopped,
+    ) {
+        Ok(_) if control.checkpoint().is_err() => {}
         Ok((indexed, _skipped)) if indexed > 0 => {
             record_startup_search_backfill_completion(config);
             tracing::info!(
@@ -1133,9 +1316,16 @@ fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
             record_startup_search_backfill_completion(config);
         } // nothing to backfill or already up-to-date
         Err(err) => {
+            if control.checkpoint().is_err() {
+                return;
+            }
             tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
             if recover_startup_search_backfill_db(config, &err) {
-                match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+                match mcp_agent_mail_db::search_v3::backfill_from_db_cancellable(
+                    &backfill_database_url,
+                    &control.stopped,
+                ) {
+                    Ok(_) if control.checkpoint().is_err() => {}
                     Ok((indexed, _)) if indexed > 0 => {
                         record_startup_search_backfill_completion(config);
                         tracing::warn!(
@@ -1168,30 +1358,42 @@ fn startup_search_backfill_delay_secs() -> u64 {
     )
 }
 
-fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
+fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    spawn_startup_search_backfill_after(
+        config,
+        workers,
+        Duration::from_secs(startup_search_backfill_delay_secs()),
+    );
+}
+
+fn spawn_startup_search_backfill_after(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+    delay: Duration,
+) {
     if STARTUP_SEARCH_BACKFILL_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         return;
     }
 
     let thread_config = config.clone();
-    let spawn = std::thread::Builder::new()
-        .name("am-search-backfill".to_string())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            let _reset_guard = StartupSearchBackfillResetGuard;
-            let delay_secs = startup_search_backfill_delay_secs();
-            if delay_secs > 0 {
-                tracing::info!(
-                    delay_secs,
-                    "[startup-search] delaying backfill to prioritize startup responsiveness"
-                );
-                std::thread::sleep(Duration::from_secs(delay_secs));
+    // Capturing the guard also resets admission if spawning is refused or
+    // fails before the closure is ever run.
+    let reset_guard = StartupSearchBackfillResetGuard;
+    let spawn = workers.spawn("am-search-backfill", move |control| {
+        let _reset_guard = reset_guard;
+        if !delay.is_zero() {
+            tracing::info!(
+                delay_secs = delay.as_secs(),
+                "[startup-search] delaying backfill to prioritize startup responsiveness"
+            );
+            if !control.wait_for_delay(delay) {
+                return;
             }
-            run_startup_search_backfill(&thread_config);
-        });
+        }
+        run_startup_search_backfill(&thread_config, &control);
+    });
 
     if let Err(err) = spawn {
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
         tracing::warn!(
             error = %err,
             "{}",
@@ -1200,7 +1402,7 @@ fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     }
 }
 
-fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
+fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
     // Only initialize when lexical-capable modes are active.
     // This avoids creating the index directory when lexical retrieval is disabled.
     let rollout = &config.search_rollout;
@@ -1229,7 +1431,7 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
             // Backfill on a dedicated worker to keep first-render startup latency low.
             // Search tool semantics remain robust: this is idempotent and retries with
             // auto-recovery on recoverable sqlite failures.
-            spawn_startup_search_backfill(config);
+            spawn_startup_search_backfill(config, workers);
         }
         Err(err) => {
             tracing::warn!(
@@ -1279,8 +1481,16 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
     false
 }
 
-fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
-    match mcp_agent_mail_storage::heal_archive_locks(config) {
+fn heal_storage_lock_artifacts(
+    config: &mcp_agent_mail_core::Config,
+    control: Option<&StartupWorkerControl>,
+) {
+    let result = if let Some(control) = control {
+        mcp_agent_mail_storage::heal_archive_locks_cancellable(config, &control.stopped)
+    } else {
+        mcp_agent_mail_storage::heal_archive_locks(config)
+    };
+    match result {
         Ok(report) => {
             if !report.locks_quarantined.is_empty() || !report.metadata_quarantined.is_empty() {
                 tracing::info!(
@@ -1296,20 +1506,45 @@ fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
                 );
             }
         }
+        Err(mcp_agent_mail_storage::StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            tracing::debug!("[startup-heal] lock scan interrupted by shutdown");
+        }
         Err(err) => {
             tracing::warn!("[startup-heal] lock scan failed: {err}");
         }
     }
 }
 
-fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
+fn start_storage_lock_healing(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
     let config = config.clone();
-    let _ = std::thread::Builder::new()
-        .name("startup-consistency-probe".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            startup_checks::run_consistency_probe_advisory(&config);
-        });
+    if let Err(error) = workers.spawn("startup-heal", move |control| {
+        if control.checkpoint().is_ok() {
+            heal_storage_lock_artifacts(&config, Some(&control));
+        }
+    }) {
+        tracing::warn!(%error, "could not start archive lock healing worker");
+    }
+}
+
+fn start_advisory_consistency_probe(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+) {
+    let config = config.clone();
+    if let Err(error) = workers.spawn("startup-consistency-probe", move |control| {
+        if control.checkpoint().is_ok() {
+            if let Err(error) = startup_checks::run_consistency_probe_advisory_cancellable(
+                &config,
+                &control.stopped,
+            ) {
+                tracing::debug!(%error, "startup consistency probe interrupted");
+            }
+        }
+    }) {
+        tracing::warn!(%error, "could not start advisory archive consistency probe");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1859,19 +2094,14 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     // otherwise race its schema migrations. Retain the pool for the session so
     // tool calls can reuse its initialized connections through the weak cache.
     let _runtime_database_pool = initialize_stdio_database(cx, config).await?;
+    let startup_scope = StartupWorkerScope::default();
 
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    let heal_config = config.clone();
-    let _ = std::thread::Builder::new()
-        .name("startup-heal".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            heal_storage_lock_artifacts(&heal_config);
-        });
+    start_storage_lock_healing(config, &startup_scope.workers);
 
     integrity_guard::start(config);
     disk_monitor::start(config);
@@ -1890,7 +2120,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     start_atc_operator_runtime(config);
 
     // Start background backfill for Search V3 if enabled.
-    spawn_startup_search_backfill(config);
+    spawn_startup_search_backfill(config, &startup_scope.workers);
 
     log_active_database(config);
 
@@ -1907,7 +2137,9 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     }
 
     tracing::info!("MCP Agent Mail server (stdio) starting transport loop");
-    build_server(config).run_stdio_with_cx(cx).await;
+    build_server_with_startup_workers(config, Some(Arc::clone(&startup_scope.workers)))
+        .run_stdio_with_cx(cx)
+        .await;
 
     // run_stdio() returns `!` so the lines below are unreachable today.
     // They are kept as documentation of the intended graceful-shutdown
@@ -1915,6 +2147,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     #[allow(unreachable_code)]
     {
         tracing::info!("stdio loop exited; performing graceful shutdown of background services");
+        startup_scope.workers.shutdown();
         stop_atc_operator_runtime();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
@@ -3742,15 +3975,19 @@ impl TuiDeferredWorkerProgress {
         }
     }
 
-    fn start_db_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+    fn start_db_if_needed(&self, config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
         if self.claim_db_start() {
-            start_tui_db_background_workers(config);
+            start_tui_db_background_workers(config, workers);
         }
     }
 
-    fn start_advisory_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+    fn start_advisory_if_needed(
+        &self,
+        config: &mcp_agent_mail_core::Config,
+        workers: &StartupWorkers,
+    ) {
         if self.claim_advisory_start() {
-            start_advisory_consistency_probe(config);
+            start_advisory_consistency_probe(config, workers);
         }
     }
 }
@@ -3758,6 +3995,7 @@ impl TuiDeferredWorkerProgress {
 struct TuiDeferredWorkerHandle {
     join: Option<std::thread::JoinHandle<()>>,
     progress: Arc<TuiDeferredWorkerProgress>,
+    tui_state: Arc<tui_bridge::TuiSharedState>,
 }
 
 impl TuiDeferredWorkerHandle {
@@ -3768,12 +4006,24 @@ impl TuiDeferredWorkerHandle {
     }
 }
 
+impl Drop for TuiDeferredWorkerHandle {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            // Errors and unwinding must stop the starter before the startup
+            // scope joins its workers or releases mailbox authority. Explicit
+            // joins during headless detach leave this guard inert.
+            self.tui_state.request_shutdown();
+            self.join();
+        }
+    }
+}
+
 fn start_tui_non_db_background_workers(config: &mcp_agent_mail_core::Config) {
     disk_monitor::start(config);
 }
 
-fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config) {
-    init_search_bridge(config);
+fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    init_search_bridge(config, workers);
     cleanup::start(config);
     ack_ttl::start(config);
     tool_metrics::start(config);
@@ -3870,12 +4120,14 @@ fn handle_tui_deferred_background_worker_spawn_failure(
 fn spawn_tui_deferred_background_workers(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
+    workers: &Arc<StartupWorkers>,
 ) -> TuiDeferredWorkerHandle {
     let worker_config = config.clone();
     let inline_tui_state = Arc::clone(tui_state);
     let worker_tui_state = Arc::clone(&inline_tui_state);
     let progress = Arc::new(TuiDeferredWorkerProgress::default());
     let worker_progress = Arc::clone(&progress);
+    let workers = Arc::clone(workers);
     match std::thread::Builder::new()
         .name("tui-deferred-workers".into())
         .stack_size(mcp_agent_mail_core::worker_stack_size())
@@ -3887,15 +4139,16 @@ fn spawn_tui_deferred_background_workers(
             if !wait_for_tui_db_readiness(&worker_tui_state) {
                 return;
             }
-            worker_progress.start_db_if_needed(&worker_config);
+            worker_progress.start_db_if_needed(&worker_config, &workers);
             if sleep_with_tui_shutdown(&worker_tui_state, TUI_ADVISORY_CONSISTENCY_IDLE_GRACE) {
                 return;
             }
-            worker_progress.start_advisory_if_needed(&worker_config);
+            worker_progress.start_advisory_if_needed(&worker_config, &workers);
         }) {
         Ok(handle) => TuiDeferredWorkerHandle {
             join: Some(handle),
             progress,
+            tui_state: Arc::clone(&inline_tui_state),
         },
         Err(error) => {
             handle_tui_deferred_background_worker_spawn_failure(
@@ -3906,6 +4159,7 @@ fn spawn_tui_deferred_background_workers(
             TuiDeferredWorkerHandle {
                 join: None,
                 progress,
+                tui_state: Arc::clone(&inline_tui_state),
             }
         }
     }
@@ -3914,17 +4168,17 @@ fn spawn_tui_deferred_background_workers(
 fn spawn_tui_readiness_warmup(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
+    workers: &StartupWorkers,
 ) {
     let config = config.clone();
     let tui_state = Arc::clone(tui_state);
     let failure_tui_state = Arc::clone(&tui_state);
-    if let Err(error) = std::thread::Builder::new()
-        .name("tui-readiness-warmup".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check(&config));
-        })
-    {
+    if let Err(error) = workers.spawn("tui-readiness-warmup", move |control| {
+        let result = readiness_check_with_startup_control(&config, &control);
+        if control.checkpoint().is_ok() {
+            handle_tui_readiness_warmup_result(Some(&tui_state), result);
+        }
+    }) {
         handle_tui_readiness_warmup_result(
             Some(&failure_tui_state),
             Err(format!("spawn failed: {error}")),
@@ -3973,21 +4227,29 @@ fn parse_startup_readiness_bind_deadline_secs(raw: Option<&str>) -> u64 {
 ///   * `/health` honestly reports `warming_up` / `service unavailable` (503)
 ///     until the DB settles, then `ready` (200);
 ///   * if the warmup is still running at the deadline it is left to finish in
-///     the background — never joined — and recovery/diagnosis stay available via
-///     `am doctor`.
+///     the background, still owned and joined by the server's shutdown scope.
+///     Recovery/diagnosis stay available via `am doctor`.
 ///
 /// No data is mutated beyond what `readiness_check` already does; this is the
 /// "bind-degraded + report" contract, not aggressive auto-remediation.
-fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
+fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    run_startup_readiness_with_bind_deadline(config, workers, startup_readiness_bind_deadline());
+}
+
+fn run_startup_readiness_with_bind_deadline(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+    bind_deadline: Duration,
+) {
     let cfg = config.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("am-db-readiness".to_string())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            let _ = tx.send(readiness_check(&cfg));
-        });
+    let spawned = workers.spawn("am-db-readiness", move |control| {
+        let _ = tx.send(readiness_check_with_startup_control(&cfg, &control));
+    });
     if let Err(error) = spawned {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return;
+        }
         // Could not even spawn the warmup thread; fall back to an inline
         // (blocking) readiness so we never silently skip migrations. This path
         // is the pre-br-5mnkl behavior and only triggers under thread
@@ -3998,7 +4260,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
         }
         return;
     }
-    match rx.recv_timeout(startup_readiness_bind_deadline()) {
+    match rx.recv_timeout(bind_deadline) {
         Ok(Ok(())) => {
             tracing::debug!("database readiness warmup completed before listener bind");
         }
@@ -4014,14 +4276,15 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
         }
         Err(_timeout) => {
             tracing::warn!(
-                deadline_secs = startup_readiness_bind_deadline().as_secs(),
+                deadline_secs = bind_deadline.as_secs(),
                 db = %config.database_url,
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup still running after the bind deadline; binding the HTTP \
                  listener NOW so the server is reachable (degraded). Recovery continues in the \
                  background. If this persists, stop the service and run `am doctor check --json`."
             );
-            // Detach: let the warmup finish in the background; never join here.
+            // Stop waiting for readiness, not owning it. The server scope
+            // retains the handle and cancels/joins it on shutdown.
         }
     }
 }
@@ -4191,17 +4454,18 @@ fn run_http_supervised(
     // Preparation ran the exclusive integrity probe before runtime locks.
     // Acquire the real locks now; a competing owner still makes this fail.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    let startup_scope = StartupWorkerScope::default();
 
     // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
     // pathologically slow recovery can never wedge the listener bind. The
     // listener always comes up within the bind deadline; `/healthz` stays live
     // and `/health` reports degraded honestly until the DB settles.
-    run_bounded_startup_readiness(config);
+    run_bounded_startup_readiness(config, &startup_scope.workers);
 
     log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
-    heal_storage_lock_artifacts(config);
-    init_search_bridge(config);
+    heal_storage_lock_artifacts(config, None);
+    init_search_bridge(config, &startup_scope.workers);
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
@@ -4218,7 +4482,7 @@ fn run_http_supervised(
     maintenance::start(config);
     integrity_guard::start(config);
     disk_monitor::start(config);
-    start_advisory_consistency_probe(config);
+    start_advisory_consistency_probe(config, &startup_scope.workers);
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
     arm_startup_readiness_fast_path();
@@ -4229,6 +4493,7 @@ fn run_http_supervised(
     let result = run_http_headless_supervisor(config.clone(), control_rx, on_ready);
     clear_startup_readiness_fast_path();
 
+    startup_scope.workers.shutdown();
     retention::shutdown();
     tool_metrics::shutdown();
     ack_ttl::shutdown();
@@ -4283,12 +4548,13 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
 
     // Preparation already ran the probes before runtime activity locks.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    let startup_scope = StartupWorkerScope::default();
 
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     log_active_database(config);
 
     // ── 2. Pre-paint essentials only ────────────────────────────────
-    heal_storage_lock_artifacts(config);
+    heal_storage_lock_artifacts(config, None);
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
@@ -4337,8 +4603,9 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
     // Keep first paint fast: screens and the DB poller already degrade
     // gracefully while SQLite is still warming up, so do not block the
     // interactive handoff on migrations/readiness work here.
-    spawn_tui_readiness_warmup(config, &tui_state);
-    let mut deferred_workers = spawn_tui_deferred_background_workers(config, &tui_state);
+    spawn_tui_readiness_warmup(config, &tui_state, &startup_scope.workers);
+    let mut deferred_workers =
+        spawn_tui_deferred_background_workers(config, &tui_state, &startup_scope.workers);
 
     // ── 5. DB poller on dedicated thread ────────────────────────────
     let mut db_poller =
@@ -4387,8 +4654,12 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
         // leave the thread parked forever while the poller is being stopped.
         deferred_workers.join();
         deferred_workers.progress.start_non_db_if_needed(config);
-        deferred_workers.progress.start_db_if_needed(config);
-        deferred_workers.progress.start_advisory_if_needed(config);
+        deferred_workers
+            .progress
+            .start_db_if_needed(config, &startup_scope.workers);
+        deferred_workers
+            .progress
+            .start_advisory_if_needed(config, &startup_scope.workers);
         // Stop the poller BEFORE clearing the detach latch (finding F8).
         // The latch is the narrow TUI-side release here: while it is set,
         // `wait_for_db_warmup`-style startup waits short-circuit (see
@@ -4410,6 +4681,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
             &tui_state,
             HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
         );
+        startup_scope.workers.shutdown();
         drop(http_runtime);
 
         retention::shutdown();
@@ -4434,6 +4706,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
     // control-channel recv / idle sleep), so this flag alone guarantees an
     // orderly supervisor exit even if the control message below is dropped.
     tui_state.request_shutdown();
+    startup_scope.workers.request_shutdown();
     // Belt-and-suspenders: also deliver the explicit Shutdown control message
     // with a bounded retry instead of a silent-drop `try_send`.
     send_server_shutdown_control(&server_ctl_tx);
@@ -4444,6 +4717,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
         &supervisor_result_rx,
         HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
     );
+    startup_scope.workers.shutdown();
     drop(http_runtime);
 
     // Shutdown background workers
@@ -16498,6 +16772,13 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     readiness_check_with_integrity(config, true)
 }
 
+fn readiness_check_with_startup_control(
+    config: &mcp_agent_mail_core::Config,
+    control: &StartupWorkerControl,
+) -> Result<(), String> {
+    readiness_check_with_integrity_and_startup_control(config, true, Some(control))
+}
+
 #[cfg(test)]
 fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
@@ -16978,6 +17259,17 @@ fn readiness_check_with_integrity(
     config: &mcp_agent_mail_core::Config,
     run_integrity_check: bool,
 ) -> Result<(), String> {
+    readiness_check_with_integrity_and_startup_control(config, run_integrity_check, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn readiness_check_with_integrity_and_startup_control(
+    config: &mcp_agent_mail_core::Config,
+    run_integrity_check: bool,
+    control: Option<&StartupWorkerControl>,
+) -> Result<(), String> {
+    let checkpoint = || control.map_or(Ok(()), StartupWorkerControl::checkpoint);
+    checkpoint()?;
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
     let sqlite_path = if is_memory {
         None
@@ -16999,6 +17291,7 @@ fn readiness_check_with_integrity(
     {
         let storage_root = std::path::Path::new(&config.storage_root);
         if !sqlite_path.exists() {
+            checkpoint()?;
             let recovery_res = if storage_root.is_dir() {
                 mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
                     sqlite_path,
@@ -17038,12 +17331,14 @@ fn readiness_check_with_integrity(
         cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
 
-    // Borrow the runtime-backed ambient Cx<cap::All> that `Runtime::block_on`
-    // installs (INFINITE budget) rather than the test-only `Cx::for_testing()`
-    // constructor, which is gated behind `test-internals`.
-    let cx = block_on(async {
-        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
-    });
+    // Keep a request context whose cancellation registry outlives checkout.
+    // An ambient root Cx escaped from a completed block_on has already had
+    // its wakers retired, so shutdown cannot wake a later pending acquire.
+    let cx = runtime_request_cx(Budget::INFINITE);
+    let _context_guard = control
+        .map(|control| control.bind_native_context(&cx))
+        .transpose()?;
+    checkpoint()?;
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
     let conn = match block_on(pool.acquire(&cx)) {
         asupersync::Outcome::Ok(c) => c,
@@ -17062,6 +17357,7 @@ fn readiness_check_with_integrity(
         }
     };
 
+    checkpoint()?;
     if let Err(e) = conn.query_sync("SELECT 1", &[]) {
         let error = e.to_string();
         if run_integrity_check && mcp_agent_mail_db::is_corruption_error_message(&error) {
@@ -17072,6 +17368,7 @@ fn readiness_check_with_integrity(
         return Err(error);
     }
 
+    checkpoint()?;
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
     drop(conn);
 
@@ -17082,6 +17379,7 @@ fn readiness_check_with_integrity(
                 startup_integrity_cache_is_fresh(config, sqlite_path, *fingerprint)
             });
     if run_integrity_check && config.integrity_check_on_startup && !is_memory {
+        checkpoint()?;
         if skip_startup_integrity {
             tracing::debug!(
                 "startup integrity quick-check skipped (schema fingerprint unchanged and cache is fresh)"
@@ -17090,6 +17388,7 @@ fn readiness_check_with_integrity(
             // Note: If we just recovered above, this is redundant but extremely fast and safe.
             pool.run_startup_integrity_check()
                 .map_err(|e| format!("startup integrity check failed: {e}"))?;
+            checkpoint()?;
             // The guard's first cycle would repeat this quick-check at once; on
             // a large mailbox one costs seconds and a burst of engine threads.
             integrity_guard::note_startup_integrity_probe_completed();
@@ -21352,6 +21651,283 @@ first body
     }
 
     #[test]
+    fn startup_readiness_shutdown_cancels_pending_native_acquisition_and_retries() {
+        const TEST: &str =
+            "tests::startup_readiness_shutdown_cancels_pending_native_acquisition_and_retries";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let mut config = prepared_http_test_config();
+        config.integrity_check_on_startup = false;
+        let pool = create_pool(&DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("one-connection readiness pool");
+        let cx = runtime_request_cx(Budget::INFINITE);
+
+        for tui in [false, true] {
+            let held = block_on(pool.acquire(&cx))
+                .into_result()
+                .expect("hold the actual readiness pool's sole connection");
+            held.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+                .expect("native schema remains usable");
+            let scope = StartupWorkerScope::default();
+            let state = tui_bridge::TuiSharedState::new(&config);
+            if tui {
+                spawn_tui_readiness_warmup(&config, &state, &scope.workers);
+            } else {
+                // Exercise the same headless readiness worker after its bind
+                // wait expires. The production wrapper keeps the 20s default.
+                run_startup_readiness_with_bind_deadline(
+                    &config,
+                    &scope.workers,
+                    Duration::from_millis(10),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let parked = loop {
+                pool.sample_pool_stats_now();
+                if mcp_agent_mail_core::global_metrics()
+                    .db
+                    .pool_pending_requests
+                    .load()
+                    != 0
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let retained = lock_mutex(&scope.workers.state)
+                .workers
+                .iter()
+                .any(|(_, worker)| !worker.is_finished());
+            let workers = Arc::clone(&scope.workers);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let (finished_while_held, pending_after_stop) = std::thread::scope(|threads| {
+                let shutdown = threads.spawn(move || {
+                    if tui {
+                        scope.workers.shutdown();
+                    }
+                    // The headless case exercises the same ownership guard
+                    // used on an early return after the bind wait expired.
+                    drop(scope);
+                    done_tx.send(()).unwrap();
+                });
+                let finished = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                pool.sample_pool_stats_now();
+                let pending = mcp_agent_mail_core::global_metrics()
+                    .db
+                    .pool_pending_requests
+                    .load();
+                // Release and reap even if cancellation is broken, so a
+                // negative control fails without leaving an orphan waiter.
+                drop(held);
+                shutdown.join().expect("join readiness shutdown");
+                (finished, pending)
+            });
+            assert!(
+                parked,
+                "readiness must reach a real pending pool acquisition"
+            );
+            assert!(
+                retained,
+                "bind timeout must retain the active readiness worker"
+            );
+            assert!(
+                finished_while_held,
+                "shutdown waited for the foreign pool lease"
+            );
+            assert_eq!(pending_after_stop, 0, "cancelled native waiter leaked");
+            assert!(lock_mutex(&workers.state).workers.is_empty());
+            assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Pending);
+
+            let retry = StartupWorkerScope::default();
+            let retry_state = tui_bridge::TuiSharedState::new(&config);
+            spawn_tui_readiness_warmup(&config, &retry_state, &retry.workers);
+            let ready = retry_state.wait_for_db_ready(Duration::from_secs(20));
+            retry.workers.shutdown();
+            assert!(ready, "a later startup must acquire the same native pool");
+            let conn = block_on(pool.acquire(&cx))
+                .into_result()
+                .expect("pool reusable");
+            conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
+                .expect("mailbox still readable after cancelled readiness");
+        }
+    }
+
+    #[test]
+    fn startup_search_delay_is_owned_and_next_startup_indexes_retained_mail() {
+        const TEST: &str =
+            "tests::startup_search_delay_is_owned_and_next_startup_indexes_retained_mail";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let path = resolve_server_database_url_sqlite_path(&config.database_url).unwrap();
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path.display().to_string())
+            .expect("open retained mailbox");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'first', 'first', 1), (2, 'second', 'second', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+             (1, 1, 'BlueLake', 'test', 'test', 1, 1), (2, 2, 'RedFox', 'test', 'test', 1, 1); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+             (1, 1, 1, 'retainedstartupmail', 'first project', 1), \
+             (2, 2, 2, 'retainedstartupmail', 'second project', 2);",
+        ).expect("seed retained mail in two projects");
+        drop(conn);
+        mcp_agent_mail_db::search_v3::init_bridge(&config.storage_root.join("search_index"))
+            .expect("real Tantivy index");
+        let delayed = StartupWorkerScope::default();
+        spawn_startup_search_backfill_after(&config, &delayed.workers, Duration::from_secs(8));
+        assert!(STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        let started = Instant::now();
+        delayed.workers.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown slept through the startup delay"
+        );
+        assert!(!STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        let bridge = mcp_agent_mail_db::search_v3::get_bridge().unwrap();
+        let query =
+            mcp_agent_mail_db::search_planner::SearchQuery::messages("retainedstartupmail", 1);
+        assert!(
+            bridge.search(&query).is_empty(),
+            "cancelled delay must not publish documents"
+        );
+
+        let retry = StartupWorkerScope::default();
+        spawn_startup_search_backfill_after(&config, &retry.workers, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let completed = !STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire);
+        retry.workers.shutdown();
+        assert!(completed, "next startup backfill must complete");
+        let first = bridge.search(&query);
+        let second = bridge.search(&mcp_agent_mail_db::search_planner::SearchQuery::messages(
+            "retainedstartupmail",
+            2,
+        ));
+        assert_eq!(first.iter().map(|hit| hit.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(second.iter().map(|hit| hit.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn startup_advisory_and_healer_workers_complete_before_scope_release() {
+        const TEST: &str =
+            "tests::startup_advisory_and_healer_workers_complete_before_scope_release";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let path = resolve_server_database_url_sqlite_path(&config.database_url).unwrap();
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'probe', 'probe', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (1, 1, 1, 'real advisory probe', 'retained body', 1000000);",
+        ).unwrap();
+        drop(conn);
+        let project = config.storage_root.join("projects/probe");
+        std::fs::create_dir_all(&project).unwrap();
+        let stale = project.join("stale.lock");
+        std::fs::write(&stale, b"preserved stale lock evidence").unwrap();
+        let authority =
+            acquire_mailbox_activity_lock_for_sqlite_path(&path, MailboxActivityLockMode::Shared)
+                .unwrap();
+        let scope = StartupWorkerScope::default();
+        start_storage_lock_healing(&config, &scope.workers);
+        start_advisory_consistency_probe(&config, &scope.workers);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let complete = loop {
+            let state = lock_mutex(&scope.workers.state);
+            let complete = state.workers.len() == 2
+                && state.workers.iter().all(|(_, worker)| worker.is_finished());
+            drop(state);
+            if complete || Instant::now() >= deadline {
+                break complete;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        scope.workers.shutdown();
+        assert!(complete, "actual one-shot startup work did not finish");
+        assert!(!stale.exists());
+        let evidence = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("stale.lock.startup-quarantine-")
+            })
+            .expect("healer must preserve the real lock artifact");
+        assert_eq!(
+            std::fs::read(evidence).unwrap(),
+            b"preserved stale lock evidence"
+        );
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .needs_reindex_total
+                .load(),
+            1
+        );
+        assert!(lock_mutex(&scope.workers.state).workers.is_empty());
+        std::fs::write(&stale, b"later server owns this artifact").unwrap();
+        start_storage_lock_healing(&config, &scope.workers);
+        start_advisory_consistency_probe(&config, &scope.workers);
+        assert_eq!(
+            std::fs::read(stale).unwrap(),
+            b"later server owns this artifact"
+        );
+        assert!(lock_mutex(&scope.workers.state).workers.is_empty());
+        drop(scope);
+        drop(authority);
+        acquire_mailbox_activity_lock_for_sqlite_path(&path, MailboxActivityLockMode::Exclusive)
+            .expect("mailbox authority can pass to the next owner");
+    }
+
+    #[test]
+    fn deferred_starter_drop_joins_before_first_paint_and_preserves_explicit_detach() {
+        let config = mcp_agent_mail_core::Config::default();
+        for detach in [false, true] {
+            let scope = StartupWorkerScope::default();
+            let state = tui_bridge::TuiSharedState::new(&config);
+            let mut starter =
+                spawn_tui_deferred_background_workers(&config, &state, &scope.workers);
+            let progress = Arc::clone(&starter.progress);
+            if detach {
+                state.request_headless_detach();
+                starter.join();
+                assert!(state.take_headless_detach_requested());
+            }
+            let started = Instant::now();
+            drop(starter);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(state.is_shutdown_requested(), !detach);
+            assert!(!progress.non_db.load(Ordering::Acquire));
+            assert!(!progress.db.load(Ordering::Acquire));
+            assert!(!progress.advisory.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
     fn init_search_bridge_skips_startup_backfill_for_memory_db() {
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
@@ -21365,7 +21941,8 @@ first body
             ..mcp_agent_mail_core::Config::default()
         };
 
-        init_search_bridge(&config);
+        let startup_scope = StartupWorkerScope::default();
+        init_search_bridge(&config, &startup_scope.workers);
 
         assert!(config.storage_root.join("search_index").exists());
         assert!(

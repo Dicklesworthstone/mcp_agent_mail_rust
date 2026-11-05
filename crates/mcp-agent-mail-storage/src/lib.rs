@@ -8932,6 +8932,35 @@ pub fn commit_paths_with_retry(
 ///
 /// Should be called at application startup.
 pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
+    heal_archive_locks_with_checkpoint(config, &|| Ok(()))
+}
+
+/// Heal startup lock artifacts until shutdown is requested. Completed
+/// quarantines are preserved, but an interrupted scan is never reported as a
+/// completed scan. The owner must join the caller before releasing authority.
+pub fn heal_archive_locks_cancellable(
+    config: &Config,
+    cancelled: &AtomicBool,
+) -> Result<HealResult> {
+    heal_archive_locks_with_checkpoint(config, &|| archive_scan_checkpoint(cancelled))
+}
+
+fn archive_scan_checkpoint(cancelled: &AtomicBool) -> std::io::Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "startup archive scan cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn heal_archive_locks_with_checkpoint(
+    config: &Config,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> Result<HealResult> {
+    checkpoint()?;
     let root = archive_storage_root(config);
     if !root.exists() {
         return Ok(HealResult::default());
@@ -8964,9 +8993,14 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
     }
 
-    fn maybe_cleanup_lock(path: &Path, result: &mut HealResult) {
+    fn maybe_cleanup_lock(
+        path: &Path,
+        result: &mut HealResult,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        checkpoint()?;
         if path.extension().is_none_or(|e| e != "lock") {
-            return;
+            return Ok(());
         }
         // Never remove Git's existence-based locks via generic flock
         // heuristics. They can be active even when no advisory lock is held.
@@ -8988,7 +9022,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 .and_then(Path::file_name)
                 .is_some_and(|name| name == std::ffi::OsStr::new("objects"));
         if is_git_index_lock || is_git_maintenance_lock {
-            return;
+            return Ok(());
         }
 
         result.locks_scanned += 1;
@@ -8998,6 +9032,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
             use fs2::FileExt;
             if f.try_lock_exclusive().is_ok() {
+                checkpoint()?;
                 let quarantine = next_startup_quarantine_path(path, "archive-lock-artifact");
                 let mut quarantined = false;
                 match fs::rename(path, &quarantine) {
@@ -9006,6 +9041,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                         // Windows can require closing/unlocking first before renaming.
                         let _ = f.unlock();
                         drop(f);
+                        checkpoint()?;
                         quarantined = fs::rename(path, &quarantine).is_ok();
                     }
                     Err(_) => {}
@@ -9018,6 +9054,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                     // Try to quarantine corresponding metadata file.
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     let meta_path = path.with_file_name(format!("{name}.owner.json"));
+                    checkpoint()?;
                     if let Some(meta_quarantine) = quarantine_startup_artifact_if_exists(
                         &meta_path,
                         "archive-lock-artifact",
@@ -9030,17 +9067,21 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 }
             }
         }
+        Ok(())
     }
 
     fn walk_recursive(
         dir: &Path,
         result: &mut HealResult,
         metadata_candidates: &mut Vec<PathBuf>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
+        checkpoint()?;
         if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
+            checkpoint()?;
             let entry = entry?;
             let Some(file_type) = entry_file_type(&entry)? else {
                 continue;
@@ -9051,9 +9092,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             }
             let path = entry.path();
             if file_type.is_dir() {
-                walk_recursive(&path, result, metadata_candidates)?;
+                walk_recursive(&path, result, metadata_candidates, checkpoint)?;
             } else if file_type.is_file() {
-                maybe_cleanup_lock(&path, result);
+                maybe_cleanup_lock(&path, result, checkpoint)?;
                 maybe_collect_metadata(&path, metadata_candidates);
             }
         }
@@ -9064,11 +9105,14 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         dir: &Path,
         result: &mut HealResult,
         metadata_candidates: &mut Vec<PathBuf>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
+        checkpoint()?;
         if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
+            checkpoint()?;
             let entry = entry?;
             let Some(file_type) = entry_file_type(&entry)? else {
                 continue;
@@ -9077,13 +9121,17 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 continue;
             }
             let path = entry.path();
-            maybe_cleanup_lock(&path, result);
+            maybe_cleanup_lock(&path, result, checkpoint)?;
             maybe_collect_metadata(&path, metadata_candidates);
         }
         Ok(())
     }
 
-    fn gather_lock_scan_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    fn gather_lock_scan_dirs(
+        root: &Path,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<Vec<PathBuf>> {
+        checkpoint()?;
         let mut dirs = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -9100,6 +9148,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         push_dir(projects_dir.clone());
         if path_is_nonsymlink_dir(&projects_dir) {
             for entry in fs::read_dir(&projects_dir)? {
+                checkpoint()?;
                 let entry = entry?;
                 let Some(file_type) = entry_file_type(&entry)? else {
                     continue;
@@ -9114,15 +9163,16 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     }
 
     if should_force_deep_scan() {
-        walk_recursive(&root, &mut result, &mut metadata_candidates)?;
+        walk_recursive(&root, &mut result, &mut metadata_candidates, checkpoint)?;
     } else {
-        for dir in gather_lock_scan_dirs(&root)? {
-            scan_dir_shallow(&dir, &mut result, &mut metadata_candidates)?;
+        for dir in gather_lock_scan_dirs(&root, checkpoint)? {
+            scan_dir_shallow(&dir, &mut result, &mut metadata_candidates, checkpoint)?;
         }
     }
 
     // Quarantine orphaned metadata files (no matching lock) without re-walking.
     for path in metadata_candidates {
+        checkpoint()?;
         if !path_is_occupied(&path) {
             continue;
         }
@@ -9134,6 +9184,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             continue;
         };
         let lock_candidate = parent.join(lock_name);
+        checkpoint()?;
         if !path_is_occupied(&lock_candidate)
             && let Some(quarantine) = quarantine_startup_artifact_if_exists(
                 &path,
@@ -9147,6 +9198,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
     }
 
+    checkpoint()?;
     Ok(result)
 }
 
@@ -16811,11 +16863,34 @@ pub fn check_archive_consistency(
     storage_root: &Path,
     messages: &[ConsistencyMessageRef],
 ) -> ConsistencyReport {
+    check_archive_consistency_with_checkpoint(storage_root, messages, &|| Ok(()))
+        .expect("an uncancellable archive consistency scan cannot be interrupted")
+}
+
+/// Check archive references until startup shutdown is requested. Interrupted
+/// scans return an error instead of publishing a partial missing-file metric.
+pub fn check_archive_consistency_cancellable(
+    storage_root: &Path,
+    messages: &[ConsistencyMessageRef],
+    cancelled: &AtomicBool,
+) -> std::io::Result<ConsistencyReport> {
+    check_archive_consistency_with_checkpoint(storage_root, messages, &|| {
+        archive_scan_checkpoint(cancelled)
+    })
+}
+
+fn check_archive_consistency_with_checkpoint(
+    storage_root: &Path,
+    messages: &[ConsistencyMessageRef],
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<ConsistencyReport> {
+    checkpoint()?;
     let mut found = 0usize;
     let mut missing = 0usize;
     let mut missing_ids: Vec<i64> = Vec::new();
 
     for msg in messages {
+        checkpoint()?;
         let project_slug = if let Ok(project_slug) =
             validate_archive_component("project slug", &msg.project_slug)
         {
@@ -16865,28 +16940,38 @@ pub fn check_archive_consistency(
         } else if path_is_nonsymlink_dir(&messages_dir) {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
-                Ok(entries) => entries.flatten().any(|entry| {
-                    let Ok(file_type) = entry.file_type() else {
-                        return false;
-                    };
-                    if file_type.is_symlink() || !file_type.is_file() {
-                        return false;
+                Ok(entries) => {
+                    let mut found_file = false;
+                    for entry in entries.flatten() {
+                        checkpoint()?;
+                        let Ok(file_type) = entry.file_type() else {
+                            continue;
+                        };
+                        if file_type.is_symlink() || !file_type.is_file() {
+                            continue;
+                        }
+                        let path = entry.path();
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        // Primary match: timestamp prefix + exact DB ID suffix
+                        if name_str.starts_with(&iso_prefix) && name_str.ends_with(&id_suffix) {
+                            found_file = true;
+                            break;
+                        }
+                        checkpoint()?;
+                        if archive_fallback_matches_message_ref(
+                            &path,
+                            &name_str,
+                            msg,
+                            &iso_prefix,
+                            &fallback_subject_marker,
+                        ) {
+                            found_file = true;
+                            break;
+                        }
                     }
-                    let path = entry.path();
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    // Primary match: timestamp prefix + exact DB ID suffix
-                    if name_str.starts_with(&iso_prefix) && name_str.ends_with(&id_suffix) {
-                        return true;
-                    }
-                    archive_fallback_matches_message_ref(
-                        &path,
-                        &name_str,
-                        msg,
-                        &iso_prefix,
-                        &fallback_subject_marker,
-                    )
-                }),
+                    found_file
+                }
                 Err(_) => false,
             }
         } else {
@@ -16903,18 +16988,19 @@ pub fn check_archive_consistency(
         }
     }
 
-    // Update global metrics
+    checkpoint()?;
+    // Only a complete scan may update the missing-file metric.
     mcp_agent_mail_core::global_metrics()
         .storage
         .needs_reindex_total
         .store(missing as u64);
 
-    ConsistencyReport {
+    Ok(ConsistencyReport {
         sampled: messages.len(),
         found,
         missing,
         missing_ids,
-    }
+    })
 }
 
 fn archive_filename_timestamp_prefix(iso: &str) -> String {
@@ -22617,6 +22703,59 @@ mod tests {
             "unexpected metadata quarantine path: {}",
             quarantined.display()
         );
+    }
+
+    #[test]
+    fn cancelled_archive_lock_healing_preserves_quarantine_and_retries() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = tmp.path().join("projects/cancelled-heal");
+        fs::create_dir_all(&project).unwrap();
+        let locks = [project.join("first.lock"), project.join("second.lock")];
+        for (index, lock) in locks.iter().enumerate() {
+            fs::write(lock, format!("lock-{index}")).unwrap();
+            fs::write(
+                lock.with_extension("lock.owner.json"),
+                format!("owner-{index}"),
+            )
+            .unwrap();
+        }
+        let cancelled = AtomicBool::new(false);
+        let result = heal_archive_locks_with_checkpoint(&config, &|| {
+            // Stop after the real first rename, before its metadata rename or
+            // the next file. Do not replace any filesystem operation.
+            if locks.iter().any(|lock| !lock.exists()) {
+                cancelled.store(true, Ordering::Release);
+            }
+            archive_scan_checkpoint(&cancelled)
+        });
+        assert!(
+            matches!(result, Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert_eq!(locks.iter().filter(|lock| lock.exists()).count(), 1);
+        let quarantine: Vec<_> = fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".startup-quarantine-")
+            })
+            .collect();
+        assert_eq!(quarantine.len(), 1, "completed rename remains preserved");
+        let content = fs::read_to_string(&quarantine[0]).unwrap();
+        assert!(content == "lock-0" || content == "lock-1");
+        assert!(heal_archive_locks_cancellable(&config, &cancelled).is_err());
+        assert_eq!(locks.iter().filter(|lock| lock.exists()).count(), 1);
+
+        cancelled.store(false, Ordering::Release);
+        let resumed = heal_archive_locks_cancellable(&config, &cancelled).unwrap();
+        assert_eq!(resumed.locks_quarantined.len(), 1);
+        assert_eq!(resumed.metadata_quarantined.len(), 2);
+        assert!(locks.iter().all(|lock| !lock.exists()));
+        assert_eq!(fs::read_to_string(&quarantine[0]).unwrap(), content);
     }
 
     #[test]
@@ -29236,6 +29375,75 @@ mod tests {
     // -----------------------------------------------------------------------
     // Consistency checks
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn cancelled_archive_consistency_scan_does_not_publish_partial_metrics() {
+        const CHILD: &str = "AM_TEST_CANCELLED_ARCHIVE_CONSISTENCY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::cancelled_archive_consistency_scan_does_not_publish_partial_metrics",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(&month).unwrap();
+        for index in 0..32 {
+            fs::write(
+                month.join(format!("unrelated-{index}.md")),
+                "retained archive body",
+            )
+            .unwrap();
+        }
+        let refs = [ConsistencyMessageRef {
+            project_slug: "test-project".into(),
+            message_id: 42,
+            sender_name: "BlueLake".into(),
+            subject: "hello world".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+        let metric = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .needs_reindex_total;
+        metric.store(71);
+        let cancelled = AtomicBool::new(false);
+        let checkpoints = std::cell::Cell::new(0);
+        let result = check_archive_consistency_with_checkpoint(dir.path(), &refs, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            // The scan has entered a real month directory and processed
+            // entries before stopping inside that same message's fallback.
+            if checkpoints.get() == 8 {
+                cancelled.store(true, Ordering::Release);
+            }
+            archive_scan_checkpoint(&cancelled)
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(checkpoints.get(), 8);
+        assert_eq!(
+            metric.load(),
+            71,
+            "partial scan must not replace the last complete result"
+        );
+        assert!(check_archive_consistency_cancellable(dir.path(), &refs, &cancelled).is_err());
+        cancelled.store(false, Ordering::Release);
+        let resumed = check_archive_consistency_cancellable(dir.path(), &refs, &cancelled).unwrap();
+        assert_eq!(resumed.sampled, 1);
+        assert_eq!(resumed.missing_ids, [42]);
+        assert_eq!(metric.load(), 1);
+        assert_eq!(fs::read_dir(&month).unwrap().count(), 32);
+    }
 
     #[test]
     fn consistency_empty_messages_returns_zero() {

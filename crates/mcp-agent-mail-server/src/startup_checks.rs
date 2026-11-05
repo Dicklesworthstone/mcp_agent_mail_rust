@@ -15,6 +15,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -3071,7 +3072,21 @@ fn probe_auth(config: &Config) -> ProbeResult {
 /// Samples the last `limit` messages from the DB and verifies that their
 /// canonical archive files exist on disk. Reports count of missing files
 /// but does NOT block startup (warnings only).
-fn probe_consistency(config: &Config) -> ProbeResult {
+fn probe_consistency(
+    config: &Config,
+    cancelled: Option<&AtomicBool>,
+) -> std::io::Result<ProbeResult> {
+    let checkpoint = || {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "startup consistency probe cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    checkpoint()?;
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
         storage_root: Some(config.storage_root.clone()),
@@ -3082,27 +3097,40 @@ fn probe_consistency(config: &Config) -> ProbeResult {
     let Ok(pool) = mcp_agent_mail_db::DbPool::new(&pool_config) else {
         // If we can't open DB, skip consistency check (integrity probe
         // will catch the root cause).
-        return ProbeResult::Ok {
+        checkpoint()?;
+        return Ok(ProbeResult::Ok {
             name: "consistency",
-        };
+        });
     };
 
     // Sample last 100 messages for consistency check
+    checkpoint()?;
     let limit = 100i64;
     let Ok(refs) = pool.sample_recent_message_refs(limit) else {
         // DB query failed; skip silently (other probes will catch DB issues).
-        return ProbeResult::Ok {
+        checkpoint()?;
+        return Ok(ProbeResult::Ok {
             name: "consistency",
-        };
+        });
     };
 
+    checkpoint()?;
     if refs.is_empty() {
-        return ProbeResult::Ok {
+        return Ok(ProbeResult::Ok {
             name: "consistency",
-        };
+        });
     }
 
-    let report = mcp_agent_mail_storage::check_archive_consistency(&config.storage_root, &refs);
+    let report = if let Some(cancelled) = cancelled {
+        mcp_agent_mail_storage::check_archive_consistency_cancellable(
+            &config.storage_root,
+            &refs,
+            cancelled,
+        )?
+    } else {
+        mcp_agent_mail_storage::check_archive_consistency(&config.storage_root, &refs)
+    };
+    checkpoint()?;
 
     if report.missing > 0 {
         tracing::warn!(
@@ -3117,9 +3145,9 @@ fn probe_consistency(config: &Config) -> ProbeResult {
     }
 
     // Consistency is advisory; never block startup
-    ProbeResult::Ok {
+    Ok(ProbeResult::Ok {
         name: "consistency",
-    }
+    })
 }
 
 /// Run the archive consistency probe as an advisory one-shot.
@@ -3127,7 +3155,14 @@ fn probe_consistency(config: &Config) -> ProbeResult {
 /// Intended for background execution so startup critical path stays focused on
 /// hard readiness checks while still preserving consistency diagnostics.
 pub fn run_consistency_probe_advisory(config: &Config) {
-    let _ = probe_consistency(config);
+    let _ = probe_consistency(config, None);
+}
+
+pub(crate) fn run_consistency_probe_advisory_cancellable(
+    config: &Config,
+    cancelled: &AtomicBool,
+) -> std::io::Result<()> {
+    probe_consistency(config, Some(cancelled)).map(drop)
 }
 
 /// Minimum recommended file descriptor limit for production workloads.

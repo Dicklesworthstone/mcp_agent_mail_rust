@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 
 use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
 use crate::search_filter_compiler::compile_filters;
@@ -703,14 +703,22 @@ fn observe_lexical_source(bridge: &TantivyBridge, source: ObservedLexicalSource)
 /// Errors reading a present clock must remain errors rather than becoming a
 /// zero revision that could authorize a stale marker.
 pub(crate) fn lexical_change_clock(conn: &DbConn) -> Result<Option<LexicalChangeClock>, String> {
+    lexical_change_clock_with_cancellation(conn, None)
+}
+
+fn lexical_change_clock_with_cancellation(
+    conn: &DbConn,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<LexicalChangeClock>, String> {
     let rows = match query_sync_with_lock_retry(
         conn,
         "lexical change clock",
         "SELECT revision, rewrite_revision FROM lexical_change_clock WHERE id = 1",
         &[],
+        cancelled,
     ) {
         Ok(rows) => rows,
-        Err(err) if sqlite_error_is_missing_table(&err.to_string(), "lexical_change_clock") => {
+        Err(err) if sqlite_error_is_missing_table(&err, "lexical_change_clock") => {
             return Ok(None);
         }
         Err(err) => return Err(format!("cannot read lexical change clock: {err}")),
@@ -906,7 +914,10 @@ fn write_backfill_state(
     }
 }
 
-fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
+fn fetch_db_message_stats(
+    conn: &DbConn,
+    cancelled: Option<&AtomicBool>,
+) -> Result<MessageStats, String> {
     // Keep COUNT and MAX in separate scalar subqueries; FrankensQLite rejects
     // mixed aggregate/non-aggregate projections in one SELECT.
     // Also avoid wrapping MAX() with COALESCE() because FrankensQLite's current
@@ -918,9 +929,10 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
              (SELECT COUNT(*) FROM messages) AS count, \
              (SELECT MAX(id) FROM messages) AS max_id",
         &[],
+        cancelled,
     ) {
         Ok(rows) => rows,
-        Err(e) if sqlite_error_is_missing_table(&e.to_string(), "messages") => {
+        Err(e) if sqlite_error_is_missing_table(&e, "messages") => {
             return Ok(MessageStats::default());
         }
         Err(e) => return Err(format!("backfill stats query failed: {e}")),
@@ -938,15 +950,19 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     })
 }
 
-fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
+fn fetch_db_message_watermark(
+    conn: &DbConn,
+    cancelled: Option<&AtomicBool>,
+) -> Result<MessageWatermark, String> {
     let max_id_rows = match query_sync_with_lock_retry(
         conn,
         "backfill watermark max-id",
         "SELECT MAX(id) AS max_id FROM messages",
         &[],
+        cancelled,
     ) {
         Ok(rows) => rows,
-        Err(e) if sqlite_error_is_missing_table(&e.to_string(), "messages") => {
+        Err(e) if sqlite_error_is_missing_table(&e, "messages") => {
             return Ok(MessageWatermark::default());
         }
         Err(e) => return Err(format!("backfill watermark max-id query failed: {e}")),
@@ -962,6 +978,7 @@ fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String>
         "backfill watermark sequence",
         "SELECT seq FROM sqlite_sequence WHERE name = 'messages' LIMIT 1",
         &[],
+        cancelled,
     )
     .ok()
     .and_then(|rows| {
@@ -973,6 +990,7 @@ fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String>
     // monotonic watermark for append-only message IDs.
     .unwrap_or(max_id);
 
+    backfill_checkpoint(cancelled)?;
     Ok(MessageWatermark { sequence, max_id })
 }
 
@@ -998,6 +1016,55 @@ fn sqlite_error_is_missing_table(message: &str, table: &str) -> bool {
 const BOOTSTRAP_LOCK_MAX_RETRIES: usize = 12;
 const BACKFILL_SOURCE_CHANGED: &str =
     "backfill source changed during scan; index was not published";
+const BACKFILL_CANCELLED: &str = "startup lexical backfill cancelled";
+
+fn backfill_checkpoint(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+        Err(BACKFILL_CANCELLED.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn backfill_wait(delay: std::time::Duration, cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        backfill_checkpoint(cancelled)?;
+        let remaining = delay.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(if cancelled.is_some() {
+            remaining.min(std::time::Duration::from_millis(10))
+        } else {
+            remaining
+        });
+    }
+}
+
+fn backfill_source_lock<'a>(
+    bridge: &'a TantivyBridge,
+    cancelled: Option<&AtomicBool>,
+) -> Result<MutexGuard<'a, ()>, String> {
+    if cancelled.is_none() {
+        return Ok(bridge
+            .source_operation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+    loop {
+        backfill_checkpoint(cancelled)?;
+        match bridge.source_operation.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                observe_backfill_lock_wait("source");
+                backfill_wait(std::time::Duration::from_millis(10), cancelled)?;
+            }
+        }
+    }
+}
 
 /// A rejected scan has already rolled back its unpublished writer changes.
 /// Interactive searches may retry that whole scan on a fresh connection;
@@ -1044,16 +1111,18 @@ fn bootstrap_lock_retry_delay(retry_index: usize) -> std::time::Duration {
 /// classification keeps working.
 fn with_bootstrap_lock_retry<T, E: std::fmt::Display>(
     operation: &str,
+    cancelled: Option<&AtomicBool>,
     mut op: impl FnMut() -> Result<T, E>,
-) -> Result<T, E> {
+) -> Result<T, String> {
     let mut retries = 0_usize;
     loop {
+        backfill_checkpoint(cancelled)?;
         match op() {
             Ok(value) => return Ok(value),
             Err(err) => {
                 let message = err.to_string();
                 if !crate::error::is_lock_error(&message) || retries >= BOOTSTRAP_LOCK_MAX_RETRIES {
-                    return Err(err);
+                    return Err(message);
                 }
                 let delay = bootstrap_lock_retry_delay(retries);
                 tracing::warn!(
@@ -1064,7 +1133,7 @@ fn with_bootstrap_lock_retry<T, E: std::fmt::Display>(
                     delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                     "search backfill operation hit lock/busy error; retrying"
                 );
-                std::thread::sleep(delay);
+                backfill_wait(delay, cancelled)?;
                 retries += 1;
             }
         }
@@ -1076,8 +1145,9 @@ fn query_sync_with_lock_retry(
     operation: &str,
     sql: &str,
     params: &[Value],
-) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::error::Error> {
-    with_bootstrap_lock_retry(operation, || conn.query_sync(sql, params))
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<sqlmodel_core::Row>, String> {
+    with_bootstrap_lock_retry(operation, cancelled, || conn.query_sync(sql, params))
 }
 
 /// Open the bespoke backfill connection with bounded lock retry, and give it
@@ -1086,6 +1156,14 @@ fn query_sync_with_lock_retry(
 /// connection surfaced writer contention as an immediate "database is busy"
 /// hard failure.
 fn open_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, String> {
+    open_backfill_conn_with_cancellation(db_path, None)
+}
+
+fn open_backfill_conn_with_cancellation(
+    db_path: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<crate::DbConnGuard, String> {
+    backfill_checkpoint(cancelled)?;
     if db_path != ":memory:" {
         let metadata = std::fs::metadata(db_path)
             .map_err(|error| format!("backfill: cannot open DB {db_path}: {error}"))?;
@@ -1096,11 +1174,11 @@ fn open_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, String> {
         }
     }
     let conn = crate::guard_db_conn(
-        with_bootstrap_lock_retry("backfill open", || DbConn::open_file(db_path))
+        with_bootstrap_lock_retry("backfill open", cancelled, || DbConn::open_file(db_path))
             .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
         "search backfill connection",
     );
-    with_bootstrap_lock_retry("backfill busy_timeout pragma", || {
+    with_bootstrap_lock_retry("backfill busy_timeout pragma", cancelled, || {
         conn.execute_raw("PRAGMA busy_timeout = 10000;")
     })
     .map_err(|e| format!("backfill: busy_timeout pragma failed: {e}"))?;
@@ -1120,7 +1198,10 @@ fn open_read_only_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, Str
 /// read transaction and compare its indexed contents with a fresh transaction
 /// before publishing. The extra passes are limited to those old schemas and
 /// retain at most one page plus one serialized row at a time.
-fn legacy_backfill_content_digest(conn: &DbConn) -> Result<[u8; 32], String> {
+fn legacy_backfill_content_digest(
+    conn: &DbConn,
+    cancelled: Option<&AtomicBool>,
+) -> Result<[u8; 32], String> {
     let mut digest = Sha256::new();
     for sql in [
         "SELECT id, name FROM agents WHERE (? IS NULL OR id > ?) ORDER BY id LIMIT 500",
@@ -1131,11 +1212,13 @@ fn legacy_backfill_content_digest(conn: &DbConn) -> Result<[u8; 32], String> {
         digest.update(sql.as_bytes());
         let mut last_id = Value::Null;
         loop {
+            backfill_checkpoint(cancelled)?;
             let rows = query_sync_with_lock_retry(
                 conn,
                 "legacy backfill content seal",
                 sql,
                 &[last_id.clone(), last_id.clone()],
+                cancelled,
             )
             .map_err(|error| format!("legacy backfill content query failed: {error}"))?;
             if rows.is_empty() {
@@ -1158,21 +1241,30 @@ fn legacy_backfill_content_digest(conn: &DbConn) -> Result<[u8; 32], String> {
     Ok(digest.finalize().into())
 }
 
-fn backfill_table_exists(conn: &DbConn, table: &str) -> Result<bool, String> {
+fn backfill_table_exists(
+    conn: &DbConn,
+    table: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<bool, String> {
     match query_sync_with_lock_retry(
         conn,
         "backfill table probe",
         &format!("SELECT 1 FROM {table} LIMIT 1"),
         &[],
+        cancelled,
     ) {
         Ok(_) => Ok(true),
-        Err(e) if sqlite_error_is_missing_table(&e.to_string(), table) => Ok(false),
+        Err(e) if sqlite_error_is_missing_table(&e, table) => Ok(false),
         Err(e) => Err(format!("backfill table probe failed for {table}: {e}")),
     }
 }
 
-fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, String> {
-    let rows = query_sync_with_lock_retry(conn, "backfill id/text map", sql, &[])
+fn fetch_id_text_map(
+    conn: &DbConn,
+    sql: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<HashMap<i64, String>, String> {
+    let rows = query_sync_with_lock_retry(conn, "backfill id/text map", sql, &[], cancelled)
         .map_err(|e| format!("backfill map query failed: {e}"))?;
     let mut out = HashMap::with_capacity(rows.len());
     for row in rows {
@@ -1183,12 +1275,17 @@ fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, S
     Ok(out)
 }
 
-fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String> {
+fn fetch_db_tail_count(
+    conn: &DbConn,
+    start_after_id: i64,
+    cancelled: Option<&AtomicBool>,
+) -> Result<u64, String> {
     let rows = query_sync_with_lock_retry(
         conn,
         "backfill tail count",
         "SELECT COUNT(*) AS count FROM messages WHERE id > ?",
         &[Value::BigInt(start_after_id)],
+        cancelled,
     )
     .map_err(|e| format!("backfill tail-count query failed: {e}"))?;
     let count_i64 = rows
@@ -1212,6 +1309,7 @@ fn only_appends_outside_scanned_range(
     rows_at_start: u64,
     (after, max): (i64, i64),
     indexed_in_range: usize,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<bool, String> {
     let Some(start) = start else {
         return Ok(false);
@@ -1219,13 +1317,13 @@ fn only_appends_outside_scanned_range(
     seal.execute_sync("BEGIN DEFERRED", &[])
         .map_err(|error| format!("backfill seal snapshot: {error}"))?;
     let verdict = (|| {
-        let Some(now) = lexical_change_clock(seal)? else {
+        let Some(now) = lexical_change_clock_with_cancellation(seal, cancelled)? else {
             return Ok(false);
         };
         if now.rewrite_revision != start.rewrite_revision || now.revision < start.revision {
             return Ok(false);
         }
-        let rows_now = fetch_db_message_stats(seal)?.count;
+        let rows_now = fetch_db_message_stats(seal, cancelled)?.count;
         let revision_delta = u64::try_from(now.revision - start.revision).unwrap_or(u64::MAX);
         if rows_now.checked_sub(rows_at_start) != Some(revision_delta) {
             return Ok(false);
@@ -1235,6 +1333,7 @@ fn only_appends_outside_scanned_range(
             "backfill seal range count",
             "SELECT COUNT(*) AS count FROM messages WHERE id > ? AND id <= ?",
             &[Value::BigInt(after), Value::BigInt(max)],
+            cancelled,
         )
         .map_err(|error| format!("backfill seal range count failed: {error}"))?
         .first()
@@ -1253,6 +1352,7 @@ fn marker_resume_plan(
     conn: &DbConn,
     db: MessageStats,
     state: Option<&BackfillState>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Option<BackfillPlan>, String> {
     let Some(state) = state else {
         return Ok(None);
@@ -1263,9 +1363,9 @@ fn marker_resume_plan(
     let Ok(marker_max_id) = i64::try_from(state.db_stats.max_id) else {
         return Ok(None);
     };
-    let rows_through_marker = db
-        .count
-        .saturating_sub(fetch_db_tail_count(conn, marker_max_id)?);
+    let rows_through_marker =
+        db.count
+            .saturating_sub(fetch_db_tail_count(conn, marker_max_id, cancelled)?);
     Ok(
         (rows_through_marker == state.db_stats.count).then_some(BackfillPlan::Incremental {
             start_after_id: marker_max_id,
@@ -1289,6 +1389,7 @@ fn recent_hole_repair_plan(
     bridge: &TantivyBridge,
     db: MessageStats,
     index: MessageStats,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Option<BackfillPlan>, String> {
     // Only the append shape: an index holding an id the source lacks needs
     // the rebuild's delete_all_documents.
@@ -1298,7 +1399,7 @@ fn recent_hole_repair_plan(
     if db.max_id < index.max_id {
         return Ok(None);
     }
-    let tail = fetch_db_tail_count(conn, index_max_id)?;
+    let tail = fetch_db_tail_count(conn, index_max_id, cancelled)?;
     let Some(holes) = db
         .count
         .checked_sub(index.count.saturating_add(tail))
@@ -1319,6 +1420,7 @@ fn recent_hole_repair_plan(
                 Value::BigInt(index_max_id.saturating_sub(window)),
                 Value::BigInt(index_max_id),
             ],
+            cancelled,
         )
         .map_err(|e| format!("backfill hole scan failed: {e}"))?;
         let mut missing = Vec::new();
@@ -1326,6 +1428,7 @@ fn recent_hole_repair_plan(
             .iter()
             .filter_map(|row| row.get_named::<i64>("id").ok())
         {
+            backfill_checkpoint(cancelled)?;
             let Ok(id_u64) = u64::try_from(id) else {
                 return Ok(None);
             };
@@ -1387,6 +1490,7 @@ fn choose_backfill_plan(
     conn: &DbConn,
     db: MessageStats,
     index: MessageStats,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<BackfillPlan, String> {
     if db.count == 0 {
         return Ok(if index.count == 0 {
@@ -1409,7 +1513,7 @@ fn choose_backfill_plan(
         let Ok(start_after_id) = i64::try_from(index.max_id) else {
             return Ok(BackfillPlan::FullRebuild);
         };
-        let tail_count = fetch_db_tail_count(conn, start_after_id)?;
+        let tail_count = fetch_db_tail_count(conn, start_after_id, cancelled)?;
         if index.count.saturating_add(tail_count) == db.count {
             // Pure append since the last indexed id.
             return Ok(BackfillPlan::Incremental { start_after_id });
@@ -1429,11 +1533,26 @@ const TANTIVY_WRITER_MEMORY_BUDGET_BYTES: usize = 15_000_000;
 type BackfillScanObserver = Box<dyn FnMut(usize)>;
 
 #[cfg(test)]
+type BackfillLockWaitObserver = Box<dyn FnOnce(&'static str)>;
+
+#[cfg(test)]
 std::thread_local! {
     // Coordinate a real second connection's commit after a paged scan has
     // passed the former intermediate-publication boundary.
     static BACKFILL_SCAN_OBSERVER: std::cell::RefCell<Option<BackfillScanObserver>> =
         std::cell::RefCell::new(None);
+    // Observe real mutex contention before a test requests cancellation.
+    static BACKFILL_LOCK_WAIT_OBSERVER: std::cell::RefCell<Option<BackfillLockWaitObserver>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn observe_backfill_lock_wait(lock: &'static str) {
+    if let Some(observer) =
+        BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| observer.borrow_mut().take())
+    {
+        observer(lock);
+    }
 }
 
 /// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
@@ -1465,10 +1584,12 @@ enum WriterBusyPolicy {
 fn acquire_writer_with_retry(
     index: &tantivy::Index,
     busy: WriterBusyPolicy,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<tantivy::IndexWriter, String> {
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
     loop {
+        backfill_checkpoint(cancelled)?;
         match index
             .writer_with_num_threads(TANTIVY_WRITER_THREADS, TANTIVY_WRITER_MEMORY_BUDGET_BYTES)
         {
@@ -1488,7 +1609,7 @@ fn acquire_writer_with_retry(
                     return Err(format!("Tantivy writer error (after retries): {e}"));
                 }
                 retries -= 1;
-                std::thread::sleep(delay);
+                backfill_wait(delay, cancelled)?;
                 delay *= 2; // Exponential backoff
             }
         }
@@ -1498,9 +1619,26 @@ fn acquire_writer_with_retry(
 fn with_tantivy_writer_policy<T>(
     bridge: &TantivyBridge,
     busy: WriterBusyPolicy,
+    cancelled: Option<&AtomicBool>,
     operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut slot = match bridge.writer.lock() {
+    let acquired = if cancelled.is_some() {
+        loop {
+            backfill_checkpoint(cancelled)?;
+            match bridge.writer.try_lock() {
+                Ok(guard) => break Ok(guard),
+                Err(TryLockError::Poisoned(error)) => break Err(error),
+                Err(TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    observe_backfill_lock_wait("writer");
+                    backfill_wait(std::time::Duration::from_millis(10), cancelled)?;
+                }
+            }
+        }
+    } else {
+        bridge.writer.lock()
+    };
+    let mut slot = match acquired {
         Ok(guard) => guard,
         Err(poisoned) => {
             // A panic mid-write leaves the retained writer in an unknown
@@ -1511,7 +1649,7 @@ fn with_tantivy_writer_policy<T>(
         }
     };
     if slot.is_none() {
-        *slot = Some(acquire_writer_with_retry(bridge.index(), busy)?);
+        *slot = Some(acquire_writer_with_retry(bridge.index(), busy, cancelled)?);
     }
     let writer = slot
         .as_mut()
@@ -1556,6 +1694,31 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     backfill_from_db_as(db_url, None)
 }
 
+/// Run the ordinary startup backfill while its server still owns the mailbox.
+/// Cancellation interrupts local lock/retry waits and checks each scan page
+/// and publication boundary. An in-flight native operation finishes before
+/// returning; callers must still join their worker before releasing authority.
+/// Interrupted scans drop their unpublished writer operations and never claim
+/// a fresh completion marker, so a subsequent startup can safely retry.
+pub fn backfill_from_db_cancellable(
+    db_url: &str,
+    cancelled: &AtomicBool,
+) -> Result<(usize, usize), String> {
+    backfill_checkpoint(Some(cancelled))?;
+    let Some(bridge) = get_bridge() else {
+        return Ok((0, 0));
+    };
+    let _source_guard = backfill_source_lock(&bridge, Some(cancelled))?;
+    backfill_into_bridge_locked_with_opener(
+        &bridge,
+        db_url,
+        None,
+        |db_path| open_backfill_conn_with_cancellation(db_path, Some(cancelled)),
+        WriterBusyPolicy::Retry,
+        Some(cancelled),
+    )
+}
+
 /// Backfill with an explicit mailbox identity.
 ///
 /// Private snapshots must use private snapshot search; they cannot publish
@@ -1590,6 +1753,7 @@ pub(crate) fn backfill_read_only_live(db_url: &str, index_dir: &Path) -> Result<
             None,
             open_read_only_backfill_conn,
             WriterBusyPolicy::FailFast,
+            None,
         )
     })?;
     Ok(())
@@ -1680,10 +1844,7 @@ fn backfill_into_bridge(
     db_url: &str,
     identity_path: Option<&str>,
 ) -> Result<(usize, usize), String> {
-    let _source_guard = bridge
-        .source_operation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _source_guard = backfill_source_lock(bridge, None)?;
     backfill_into_bridge_locked(bridge, db_url, identity_path)
 }
 
@@ -1699,6 +1860,7 @@ fn backfill_into_bridge_locked(
         identity_path,
         open_backfill_conn,
         WriterBusyPolicy::Retry,
+        None,
     )
 }
 
@@ -1707,10 +1869,12 @@ fn backfill_into_bridge_locked_with_opener(
     bridge: &TantivyBridge,
     db_url: &str,
     identity_path: Option<&str>,
-    open_connection: fn(&str) -> Result<crate::DbConnGuard, String>,
+    open_connection: impl Fn(&str) -> Result<crate::DbConnGuard, String>,
     writer_busy: WriterBusyPolicy,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
+    backfill_checkpoint(cancelled)?;
 
     // Open a sync connection via FrankenSQLite.
     let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
@@ -1735,8 +1899,9 @@ fn backfill_into_bridge_locked_with_opener(
     // same WAL mailbox and can surface "database is busy" — retry it on the
     // bootstrap budget instead of failing the whole bootstrap.
     let mut conn = open_connection(db_path)?;
+    backfill_checkpoint(cancelled)?;
 
-    if !backfill_table_exists(&conn, "messages")? {
+    if !backfill_table_exists(&conn, "messages", cancelled)? {
         if db_path != ":memory:" {
             return Err(format!(
                 "backfill: source DB {db_path} has no messages table"
@@ -1744,7 +1909,8 @@ fn backfill_into_bridge_locked_with_opener(
         }
         let index_stats = fetch_index_message_stats(bridge)?;
         if index_stats.count > 0 {
-            with_tantivy_writer_policy(bridge, writer_busy, |writer| {
+            with_tantivy_writer_policy(bridge, writer_busy, cancelled, |writer| {
+                backfill_checkpoint(cancelled)?;
                 writer
                     .delete_all_documents()
                     .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
@@ -1763,13 +1929,14 @@ fn backfill_into_bridge_locked_with_opener(
     }
 
     let db_generation = crate::queries::db_generation_id_conn(&conn);
+    backfill_checkpoint(cancelled)?;
     // One read snapshot for the change clock, the watermark, the message
     // stats and the scan, as the legacy digest path always had.
     conn.execute_sync("BEGIN DEFERRED", &[])
         .map_err(|error| format!("backfill read transaction: {error}"))?;
-    let change_clock = lexical_change_clock(&conn)?;
+    let change_clock = lexical_change_clock_with_cancellation(&conn, cancelled)?;
     let legacy_digest = if change_clock.is_none() {
-        Some(legacy_backfill_content_digest(&conn)?)
+        Some(legacy_backfill_content_digest(&conn, cancelled)?)
     } else {
         None
     };
@@ -1781,9 +1948,10 @@ fn backfill_into_bridge_locked_with_opener(
             clock: change_clock,
         },
     );
-    let message_watermark = fetch_db_message_watermark(&conn)?;
+    let message_watermark = fetch_db_message_watermark(&conn, cancelled)?;
     let current_index_fingerprint = index_meta_fingerprint(bridge);
     let previous_state = read_backfill_state(bridge);
+    backfill_checkpoint(cancelled)?;
     let source_file_replaced = previous_state.as_ref().is_some_and(|state| {
         db_fingerprint
             .is_none_or(|current| !same_backfill_source_file(state.db_fingerprint, current))
@@ -1826,8 +1994,9 @@ fn backfill_into_bridge_locked_with_opener(
         ));
     }
 
-    let db_stats = fetch_db_message_stats(&conn)?;
+    let db_stats = fetch_db_message_stats(&conn, cancelled)?;
     let index_stats = fetch_index_message_stats(bridge)?;
+    backfill_checkpoint(cancelled)?;
     // A marker written for another mailbox path or another generation of
     // this mailbox means the indexed documents belong to a database whose
     // numeric ids cannot be trusted against this one, however similar the
@@ -1864,7 +2033,7 @@ fn backfill_into_bridge_locked_with_opener(
         // inserts as appends: INSERT OR REPLACE can preserve count/max-ID
         // without firing a DELETE trigger. Already-ingested pure appends may
         // legitimately yield Skip here.
-        match choose_backfill_plan(&conn, db_stats, index_stats)? {
+        match choose_backfill_plan(&conn, db_stats, index_stats, cancelled)? {
             BackfillPlan::FullRebuild => {
                 // br-kp1in.18: indexes written by versions that indexed some
                 // deliveries live and skipped others (source lock busy) have
@@ -1875,10 +2044,12 @@ fn backfill_into_bridge_locked_with_opener(
                 // harmless. A delivery that commits after a higher id was
                 // already indexed leaves a hole below the marker instead,
                 // which the recent-hole plan repairs.
-                match marker_resume_plan(&conn, db_stats, previous_state.as_ref())? {
+                match marker_resume_plan(&conn, db_stats, previous_state.as_ref(), cancelled)? {
                     Some(plan) => plan,
-                    None => recent_hole_repair_plan(&conn, bridge, db_stats, index_stats)?
-                        .unwrap_or(BackfillPlan::FullRebuild),
+                    None => {
+                        recent_hole_repair_plan(&conn, bridge, db_stats, index_stats, cancelled)?
+                            .unwrap_or(BackfillPlan::FullRebuild)
+                    }
                 }
             }
             plan => plan,
@@ -1886,6 +2057,7 @@ fn backfill_into_bridge_locked_with_opener(
     };
 
     if matches!(plan, BackfillPlan::Skip) {
+        backfill_checkpoint(cancelled)?;
         tracing::info!(
             db_count = db_stats.count,
             db_max_id = db_stats.max_id,
@@ -1925,15 +2097,19 @@ fn backfill_into_bridge_locked_with_opener(
                WHERE id > ? AND id <= ? \
                ORDER BY id \
                LIMIT ?";
-    let sender_name_map = fetch_id_text_map(&conn, "SELECT id, name AS value FROM agents")?;
-    let project_slug_map = fetch_id_text_map(&conn, "SELECT id, slug AS value FROM projects")?;
+    let sender_name_map =
+        fetch_id_text_map(&conn, "SELECT id, name AS value FROM agents", cancelled)?;
+    let project_slug_map =
+        fetch_id_text_map(&conn, "SELECT id, slug AS value FROM projects", cancelled)?;
+    backfill_checkpoint(cancelled)?;
 
     let mut last_id = match plan {
         BackfillPlan::Incremental { start_after_id } => start_after_id,
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
     let scan_start_after = last_id;
-    let total_indexed = with_tantivy_writer_policy(bridge, writer_busy, |writer| {
+    let total_indexed = with_tantivy_writer_policy(bridge, writer_busy, cancelled, |writer| {
+        backfill_checkpoint(cancelled)?;
         if matches!(plan, BackfillPlan::FullRebuild) {
             writer
                 .delete_all_documents()
@@ -1942,6 +2118,7 @@ fn backfill_into_bridge_locked_with_opener(
 
         let mut total_indexed = 0_usize;
         loop {
+            backfill_checkpoint(cancelled)?;
             // br-5u3w5: the page scan runs while live workers keep
             // committing, and the engine's busy verdict here is FAIL-FAST —
             // it is not absorbed by busy_timeout and was observed to stay
@@ -1953,6 +2130,7 @@ fn backfill_into_bridge_locked_with_opener(
             // one.
             let mut scan_retries = 0_usize;
             let rows = loop {
+                backfill_checkpoint(cancelled)?;
                 match conn.query_sync(
                     sql,
                     &[
@@ -1978,7 +2156,7 @@ fn backfill_into_bridge_locked_with_opener(
                             delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                             "backfill page scan hit lock/busy error; retrying on a fresh connection"
                         );
-                        std::thread::sleep(delay);
+                        backfill_wait(delay, cancelled)?;
                         match open_connection(db_path) {
                             Ok(fresh) => conn = fresh,
                             Err(open_error) => tracing::warn!(
@@ -1995,6 +2173,7 @@ fn backfill_into_bridge_locked_with_opener(
             }
 
             for row in &rows {
+                backfill_checkpoint(cancelled)?;
                 let project_id = row.get_as::<i64>(1).unwrap_or(0);
                 let sender_id = row.get_as::<i64>(2).unwrap_or(0);
                 let project_slug = project_slug_map
@@ -2040,15 +2219,16 @@ fn backfill_into_bridge_locked_with_opener(
         // a fresh source connection confirms the scan did not cross a write.
         // The original revision goes into the marker: a later source commit
         // remains visible as drift on the next check.
+        backfill_checkpoint(cancelled)?;
         let seal = open_connection(db_path)?;
         if let Some(expected) = legacy_digest {
             seal.execute_sync("BEGIN DEFERRED", &[])
                 .map_err(|error| format!("legacy backfill seal transaction: {error}"))?;
-            if legacy_backfill_content_digest(&seal)? != expected {
+            if legacy_backfill_content_digest(&seal, cancelled)? != expected {
                 return Err(BACKFILL_SOURCE_CHANGED.to_string());
             }
         }
-        let seal_clock = lexical_change_clock(&seal)?;
+        let seal_clock = lexical_change_clock_with_cancellation(&seal, cancelled)?;
         let source_unchanged_for_scan = seal_clock == change_clock
             || only_appends_outside_scanned_range(
                 &seal,
@@ -2056,6 +2236,7 @@ fn backfill_into_bridge_locked_with_opener(
                 db_stats.count,
                 (scan_start_after, scan_max_id),
                 total_indexed,
+                cancelled,
             )?;
         if !source_unchanged_for_scan
             || crate::queries::db_generation_id_conn(&seal) != db_generation
@@ -2066,12 +2247,14 @@ fn backfill_into_bridge_locked_with_opener(
         {
             return Err(BACKFILL_SOURCE_CHANGED.to_string());
         }
+        backfill_checkpoint(cancelled)?;
         writer
             .commit()
             .map_err(|e| format!("Tantivy commit error: {e}"))?;
         Ok(total_indexed)
     })?;
 
+    backfill_checkpoint(cancelled)?;
     refresh_index_health_metrics(bridge);
     if bridge.publish_source_state {
         crate::search_service::invalidate_search_cache(
@@ -2080,6 +2263,7 @@ fn backfill_into_bridge_locked_with_opener(
     }
 
     let final_index_stats = fetch_index_message_stats(bridge)?;
+    backfill_checkpoint(cancelled)?;
     if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
         write_backfill_state(
             bridge,
@@ -2935,11 +3119,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("index dir");
         let holder = TantivyBridge::open_scoped(dir.path(), false).expect("holder index");
         let contender = TantivyBridge::open_scoped(dir.path(), false).expect("contender index");
-        let held = acquire_writer_with_retry(holder.index(), WriterBusyPolicy::Retry)
+        let held = acquire_writer_with_retry(holder.index(), WriterBusyPolicy::Retry, None)
             .expect("holder takes the writer");
 
         let started = std::time::Instant::now();
-        let Err(error) = acquire_writer_with_retry(contender.index(), WriterBusyPolicy::FailFast)
+        let Err(error) =
+            acquire_writer_with_retry(contender.index(), WriterBusyPolicy::FailFast, None)
         else {
             panic!("the writer is held, fail-fast must not acquire it");
         };
@@ -2951,7 +3136,8 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let Err(error) = acquire_writer_with_retry(contender.index(), WriterBusyPolicy::Retry)
+        let Err(error) =
+            acquire_writer_with_retry(contender.index(), WriterBusyPolicy::Retry, None)
         else {
             panic!("the writer is still held, retry must not acquire it");
         };
@@ -2963,7 +3149,7 @@ mod tests {
         );
 
         drop(held);
-        acquire_writer_with_retry(contender.index(), WriterBusyPolicy::FailFast)
+        acquire_writer_with_retry(contender.index(), WriterBusyPolicy::FailFast, None)
             .expect("a released writer is acquired under fail-fast too");
     }
 
@@ -2977,7 +3163,7 @@ mod tests {
         let handles = bridge.handles();
         for id in [301_i64, 302_i64] {
             let msg = make_indexable(id, "Retained writer", "Body");
-            with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
+            with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, None, |writer| {
                 upsert_indexable_message(writer, handles, &msg)?;
                 writer
                     .commit()
@@ -3009,7 +3195,7 @@ mod tests {
         let handles = bridge.handles();
 
         let stale = make_indexable(401, "Uncommitted casualty", "Body");
-        let err = with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
+        let err = with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, None, |writer| {
             upsert_indexable_message(writer, handles, &stale)?;
             Err::<(), String>("simulated failure after staging a doc".to_string())
         });
@@ -3020,7 +3206,7 @@ mod tests {
         );
 
         let msg = make_indexable(402, "Fresh start", "Body");
-        with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
+        with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, None, |writer| {
             upsert_indexable_message(writer, handles, &msg)?;
             writer
                 .commit()
@@ -3395,6 +3581,231 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_startup_backfill_preserves_committed_index_and_retries() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "preservedmail", "committed body", "normal", "thread")],
+        );
+        let conn =
+            crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "cancel backfill fixture");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (2, 'other-proj', 'other', 0)",
+            &[],
+        ).unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 2, 'RedFox')",
+            &[],
+        )
+        .unwrap();
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+        {
+            conn.execute_sync(&migration.up, &[]).unwrap();
+        }
+        init_bridge(index.path()).unwrap();
+        assert_eq!(backfill_from_db(&path).unwrap(), (1, 0));
+        let bridge = get_bridge().unwrap();
+        let marker_before = std::fs::read(backfill_state_path(&bridge)).unwrap();
+        let index_before = std::fs::read(index.path().join("meta.json")).unwrap();
+
+        conn.execute_sync("BEGIN", &[]).unwrap();
+        for id in 2..=502 {
+            let project = if id == 502 { 2 } else { 1 };
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES (?, ?, ?, ?, 'retained source body', 2000000)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(project),
+                    Value::BigInt(project),
+                    Value::Text(
+                        if project == 2 {
+                            "othermailbox"
+                        } else {
+                            "resumablemail"
+                        }
+                        .into(),
+                    ),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_sync("COMMIT", &[]).unwrap();
+        drop(conn);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let scanned = Arc::new(AtomicU64::new(0));
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            let cancelled = Arc::clone(&cancelled);
+            let scanned = Arc::clone(&scanned);
+            *observer.borrow_mut() = Some(Box::new(move |indexed| {
+                scanned.store(u64::try_from(indexed).unwrap(), Ordering::Release);
+                cancelled.store(true, Ordering::Release);
+            }));
+        });
+        let interrupted = backfill_from_db_cancellable(&path, &cancelled);
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        assert_eq!(
+            scanned.load(Ordering::Acquire),
+            500,
+            "cancel after an actual full scan page"
+        );
+        assert_eq!(interrupted.unwrap_err(), BACKFILL_CANCELLED);
+        assert_eq!(
+            std::fs::read(backfill_state_path(&bridge)).unwrap(),
+            marker_before
+        );
+        assert_eq!(
+            std::fs::read(index.path().join("meta.json")).unwrap(),
+            index_before
+        );
+        assert!(
+            bridge
+                .search(&PlannerQuery::messages("resumablemail", 1))
+                .is_empty()
+        );
+        assert_eq!(
+            bridge.search(&PlannerQuery::messages("preservedmail", 1))[0].id,
+            1
+        );
+        drop(bridge);
+
+        // Reopen the actual on-disk index as a later server would. The stopped
+        // scan may not leave a false watermark or retained uncommitted deletes.
+        reset_bridge_for_tests();
+        init_bridge(index.path()).unwrap();
+        let resumed = backfill_from_db_cancellable(&path, &AtomicBool::new(false)).unwrap();
+        assert_eq!(resumed, (501, 0));
+        let bridge = get_bridge().unwrap();
+        assert_eq!(bridge.index().reader().unwrap().searcher().num_docs(), 502);
+        assert!(
+            bridge
+                .search(&PlannerQuery::messages("othermailbox", 1))
+                .is_empty()
+        );
+        assert_eq!(
+            bridge.search(&PlannerQuery::messages("othermailbox", 2))[0].id,
+            502
+        );
+        assert_eq!(
+            bridge.search(&PlannerQuery::messages("preservedmail", 1))[0].id,
+            1
+        );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn cancelled_startup_backfill_leaves_contended_local_locks() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "preservedmail", "body", "normal", "thread")],
+        );
+        init_bridge(index.path()).unwrap();
+        let bridge = get_bridge().unwrap();
+
+        for hold_source in [true, false] {
+            let source_lock = hold_source.then(|| bridge.source_operation.lock().unwrap());
+            let writer_lock = (!hold_source).then(|| bridge.writer.lock().unwrap());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&cancelled);
+            let worker_path = path.clone();
+            let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
+                    *observer.borrow_mut() = Some(Box::new(move |lock| {
+                        let _ = parked_tx.send(lock);
+                    }));
+                });
+                let result = backfill_from_db_cancellable(&worker_path, &worker_cancel);
+                finished_tx.send(result).unwrap();
+            });
+            let parked = parked_rx.recv_timeout(std::time::Duration::from_secs(5));
+            cancelled.store(true, Ordering::Release);
+            let result = finished_rx.recv_timeout(std::time::Duration::from_secs(1));
+            // Always release before joining/asserting so the old blocking
+            // implementation fails the assertion instead of hanging the test.
+            drop(source_lock);
+            drop(writer_lock);
+            worker.join().unwrap();
+            assert_eq!(
+                parked.expect("backfill must enter the real contended mutex wait"),
+                if hold_source { "source" } else { "writer" }
+            );
+            assert_eq!(
+                result
+                    .expect("cancelled backfill must not wait for the held lock")
+                    .unwrap_err(),
+                BACKFILL_CANCELLED
+            );
+        }
+        assert!(!backfill_state_path(&bridge).exists());
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn cancelled_startup_backfill_stops_native_busy_retries() {
+        let source = tempfile::tempdir().unwrap();
+        let path = create_test_db(source.path(), &[]);
+        let owner = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "busy retry owner");
+        let contender =
+            crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "busy retry contender");
+        owner
+            .execute_raw("PRAGMA autocommit_retain = OFF; PRAGMA busy_timeout = 0;")
+            .unwrap();
+        contender
+            .execute_raw("PRAGMA autocommit_retain = OFF; PRAGMA busy_timeout = 0;")
+            .unwrap();
+        owner.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut observed_busy = false;
+        let result =
+            with_bootstrap_lock_retry("native startup retry control", Some(&cancelled), || {
+                attempts += 1;
+                if attempts > 1 {
+                    // A broken retry loop must finish and fail the count assertion
+                    // rather than consume the entire bootstrap retry budget.
+                    owner.execute_sync("ROLLBACK", &[]).unwrap();
+                }
+                let result = contender.execute_sync("BEGIN IMMEDIATE", &[]);
+                if let Err(error) = &result {
+                    observed_busy = crate::error::is_lock_error(&error.to_string());
+                    cancelled.store(true, Ordering::Release);
+                }
+                result
+            });
+        let _ = owner.execute_sync("ROLLBACK", &[]);
+        let _ = contender.execute_sync("ROLLBACK", &[]);
+        assert!(
+            observed_busy,
+            "control must encounter an actual native writer lock"
+        );
+        assert_eq!(
+            attempts, 1,
+            "shutdown must not issue another native operation"
+        );
+        assert_eq!(result.unwrap_err(), BACKFILL_CANCELLED);
+        contender.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+        contender.execute_sync("ROLLBACK", &[]).unwrap();
+    }
+
+    #[test]
     fn backfill_from_db_nonexistent_file_returns_error() {
         let _guard = BRIDGE_TEST_LOCK
             .lock()
@@ -3530,13 +3941,13 @@ mod tests {
         };
         assert_eq!(search("amberstart").len(), 1);
         let conn = DbConn::open_file(&db_path).expect("open real runtime writer");
-        let before = fetch_db_message_watermark(&conn).expect("initial watermark");
+        let before = fetch_db_message_watermark(&conn, None).expect("initial watermark");
         conn.execute_sync(
             "UPDATE messages SET subject = 'violetfinish', body_md = 'silverfinish' WHERE id = 1",
             &[],
         )
         .expect("change lower-ID subject and body");
-        assert_eq!(fetch_db_message_watermark(&conn).unwrap(), before);
+        assert_eq!(fetch_db_message_watermark(&conn, None).unwrap(), before);
         backfill_from_db(&db_path).expect("refresh after committed edit");
         assert_eq!(
             search("violetfinish").len(),
@@ -3965,7 +4376,7 @@ mod tests {
             if legacy_hole {
                 let handles = bridge.handles();
                 let live = make_indexable(6, "appended6", "appended body 6");
-                with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
+                with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, None, |writer| {
                     upsert_indexable_message(writer, handles, &live)?;
                     writer
                         .commit()
@@ -4597,7 +5008,7 @@ mod tests {
         )
         .expect("create messages");
 
-        let watermark = fetch_db_message_watermark(&conn).expect("watermark query");
+        let watermark = fetch_db_message_watermark(&conn, None).expect("watermark query");
         assert_eq!(watermark.max_id, 0);
         assert_eq!(watermark.sequence, 0);
     }
@@ -4606,7 +5017,7 @@ mod tests {
     fn fetch_db_message_watermark_treats_missing_messages_table_as_empty() {
         let conn = DbConn::open_memory().expect("open in-memory db");
 
-        let watermark = fetch_db_message_watermark(&conn).expect("watermark query");
+        let watermark = fetch_db_message_watermark(&conn, None).expect("watermark query");
         assert_eq!(watermark.max_id, 0);
         assert_eq!(watermark.sequence, 0);
     }
@@ -4620,7 +5031,7 @@ mod tests {
         )
         .expect("create messages");
 
-        let stats = fetch_db_message_stats(&conn).expect("stats query");
+        let stats = fetch_db_message_stats(&conn, None).expect("stats query");
         assert_eq!(stats.count, 0);
         assert_eq!(stats.max_id, 0);
     }
@@ -4629,7 +5040,7 @@ mod tests {
     fn fetch_db_message_stats_treats_missing_messages_table_as_empty() {
         let conn = DbConn::open_memory().expect("open in-memory db");
 
-        let stats = fetch_db_message_stats(&conn).expect("stats query");
+        let stats = fetch_db_message_stats(&conn, None).expect("stats query");
         assert_eq!(stats.count, 0);
         assert_eq!(stats.max_id, 0);
     }
