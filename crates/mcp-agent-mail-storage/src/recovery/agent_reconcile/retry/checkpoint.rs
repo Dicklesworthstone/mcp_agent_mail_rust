@@ -492,6 +492,16 @@ impl AgentReconcileCursor {
                 Binding::capture(cx, pool, config, stop)?,
             )
         };
+        // A new pool is not a new mailbox. Preserve unsaved retry debt, scan
+        // progress, and the held checkpoint lock only when the independently
+        // retained binding agrees with this freshly validated source. Updating
+        // the process-local key also prevents the ordinary batch from resetting
+        // the cursor. Unknown or changed bindings still take the rescan path.
+        if self.source_identity != scope
+            && self.retries.persistence.binding.as_ref() == Some(&captured)
+        {
+            self.source_identity.clone_from(&scope);
+        }
         let rebind = self.source_identity != scope
             || self
                 .retries
@@ -1441,8 +1451,7 @@ mod tests {
         });
     }
 
-    #[test]
-    fn checkpoint_io_failure_never_reloads_older_progress_over_live_retry_debt() {
+    fn exercise_checkpoint_io_failure(reopen_pool: bool) {
         with_mailbox(|cx, pool, config, scratch| {
             let stop = AtomicBool::new(false);
             let mut cursor = AgentReconcileCursor::default();
@@ -1474,11 +1483,70 @@ mod tests {
             assert!(cursor.retries.persistence.warned);
             std::fs::rename(&path, scratch.join("retained-checkpoint-obstruction")).unwrap();
             std::fs::rename(scratch.join("old-checkpoint"), &path).unwrap();
+            let binding = cursor.retries.persistence.binding.clone().unwrap();
+            let reopened = reopen_pool.then(|| {
+                DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                    database_url: config.database_url.clone(),
+                    storage_root: Some(config.storage_root.clone()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .unwrap()
+            });
+            let source = reopened.as_ref().unwrap_or(pool);
+            assert_eq!(
+                source.sqlite_identity_key() != pool.sqlite_identity_key(),
+                reopen_pool,
+                "a cached pool would not exercise source-key turnover"
+            );
+            assert_eq!(
+                Binding::capture(cx, source, config, &stop).unwrap(),
+                binding
+            );
+            // Pool initialization can be slow under contention. Establish the
+            // observed cooldown after it completes instead of racing a timer.
+            cursor.retries.entries.front_mut().unwrap().ready_at = Instant::now() + MAX_BACKOFF;
+            let debt = cursor
+                .retries
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                .collect::<Vec<_>>();
+            // Linux flock belongs to the shared open-file description. Keeping
+            // a duplicate makes an accidental drop/reopen fail deterministically
+            // instead of allowing a new owner through a temporary lock gap.
+            #[cfg(target_os = "linux")]
+            let _retained_lock = cursor
+                .retries
+                .persistence
+                .store
+                .as_ref()
+                .unwrap()
+                .lock
+                .try_clone()
+                .unwrap();
             let report = cursor
-                .reconcile_checkpointed(cx, pool, config, &stop)
+                .reconcile_checkpointed(cx, source, config, &stop)
                 .unwrap();
             assert_eq!(report.retry_len, 1);
+            assert_eq!(cursor.source_identity, source.sqlite_identity_key());
+            assert_eq!(
+                cursor
+                    .retries
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                    .collect::<Vec<_>>(),
+                debt,
+                "pool turnover must not reload or rebase the live cooldown"
+            );
             assert!(!cursor.retries.persistence.warned);
+            assert_eq!(
+                Store::open(binding).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
             let saved = cursor
                 .retries
                 .persistence
@@ -1489,6 +1557,90 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(saved.retries[0].id, 999_999);
+        });
+    }
+
+    #[test]
+    fn checkpoint_io_failure_never_reloads_older_progress_over_live_retry_debt() {
+        exercise_checkpoint_io_failure(false);
+    }
+
+    #[test]
+    fn same_source_pool_recreation_retains_unsaved_agent_debt_and_checkpoint_owner() {
+        exercise_checkpoint_io_failure(true);
+    }
+
+    #[test]
+    fn pool_recreation_without_a_retained_agent_binding_starts_a_new_scan() {
+        with_mailbox(|cx, pool, config, _| {
+            let stop = AtomicBool::new(false);
+            let mut cursor = AgentReconcileCursor::default();
+            reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert!(cursor.retries.persistence.binding.is_none());
+            cursor.retries.defer(999_999, Instant::now() + MAX_BACKOFF);
+            let reopened = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            let report = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!((report.unchanged, report.retry_len), (1, 0));
+            assert_eq!(cursor.source_identity, reopened.sqlite_identity_key());
+        });
+    }
+
+    #[test]
+    fn pool_recreation_with_a_changed_agent_generation_rejects_old_debt() {
+        with_mailbox(|cx, pool, config, _| {
+            let stop = AtomicBool::new(false);
+            let mut cursor = AgentReconcileCursor::default();
+            cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            let binding = cursor.retries.persistence.binding.clone().unwrap();
+            cursor.retries.defer(999_999, Instant::now() + MAX_BACKOFF);
+            let generation = if binding.generation == "ccdd" {
+                "eeff"
+            } else {
+                "ccdd"
+            };
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_sync(
+                "UPDATE db_identity SET generation_id = ? WHERE singleton = 0",
+                &[generation.into()],
+            )
+            .unwrap();
+            drop(conn);
+            let reopened = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            assert_ne!(
+                Binding::capture(cx, &reopened, config, &stop).unwrap(),
+                binding
+            );
+            let report = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!((report.unchanged, report.retry_len), (1, 0));
+            let store = cursor.retries.persistence.store.as_ref().unwrap();
+            assert_eq!(
+                store.load().unwrap().unwrap().binding.generation,
+                generation
+            );
         });
     }
 }

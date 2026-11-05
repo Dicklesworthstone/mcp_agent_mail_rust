@@ -864,8 +864,10 @@ mod tests {
         let previous = conn.query_sync(PREVIOUS_SOURCE_SQL, &params).unwrap();
         assert_eq!(actual.len(), previous.len(), "source {id}");
         for (actual, previous) in actual.iter().zip(&previous) {
-            assert_eq!(actual.values(), previous.values(), "source {id}");
-            assert_eq!(actual.values().len(), 14);
+            let actual = actual.values().collect::<Vec<_>>();
+            let previous = previous.values().collect::<Vec<_>>();
+            assert_eq!(actual, previous, "source {id}");
+            assert_eq!(actual.len(), 14);
         }
         actual
     }
