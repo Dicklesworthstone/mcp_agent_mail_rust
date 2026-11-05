@@ -475,6 +475,18 @@ impl ActiveReservationCursor {
                 Binding::capture(cx, pool, config),
             )
         };
+        // Pool turnover must not discard newer in-memory debt or release the
+        // checkpoint lock when the mailbox itself is unchanged. Only a fresh,
+        // successful capture matching the independently retained binding can
+        // carry progress forward; failed/unknown/changed bindings keep the
+        // existing reset and memory-only behavior below.
+        if self.identity != scope
+            && captured
+                .as_ref()
+                .is_ok_and(|binding| self.retries.persistence.binding.as_ref() == Some(binding))
+        {
+            self.identity.clone_from(&scope);
+        }
         let rebind = self.identity != scope
             || captured.as_ref().is_ok_and(|binding| {
                 self.retries
@@ -1182,6 +1194,206 @@ mod tests {
             );
             let saved: Snapshot = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved.binding.generation, "ccdd");
+        });
+    }
+
+    #[test]
+    fn same_source_pool_recreation_retains_unsaved_active_debt_and_checkpoint_owner() {
+        fixture(|cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let mut cursor = ActiveReservationCursor::default();
+            assert_eq!(
+                cursor
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap()
+                    .repaired,
+                4
+            );
+            assert_eq!((cursor.after, cursor.ceiling), (404, Some(480)));
+            let binding = cursor.retries.persistence.binding.clone().unwrap();
+            let path = cursor
+                .retries
+                .persistence
+                .store
+                .as_ref()
+                .unwrap()
+                .path
+                .clone();
+            let saved_path = path.with_extension("json.before-failed-save");
+            let blocker_path = path.with_extension("json.blocked-directory");
+            let original = std::fs::read(&path).unwrap();
+            std::fs::rename(&path, &saved_path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+
+            // Acquire real publication contention after the older checkpoint.
+            // The directory at the sidecar path prevents this new debt from
+            // reaching disk, so a reset/restore would lose the entire page.
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                crate::with_archive_snapshot_publication_fence(|| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(15))
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let deferred = cursor.reconcile_checkpointed(cx, pool, config, &stop);
+            let _ = release_tx.send(());
+            assert!(
+                owner.join().unwrap().is_ok(),
+                "repair waited for fence expiry"
+            );
+            let deferred = deferred.unwrap();
+            assert_eq!(
+                (
+                    deferred.scanned,
+                    deferred.deferred_transient,
+                    deferred.retry_len
+                ),
+                (32, 32, 32)
+            );
+            assert_eq!((cursor.after, cursor.ceiling), (436, Some(480)));
+            assert!(cursor.retries.persistence.warned);
+            std::fs::rename(&path, &blocker_path).unwrap();
+            std::fs::rename(&saved_path, &path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            let reopened = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            assert_eq!(Binding::capture(cx, &reopened, config).unwrap(), binding);
+            // Keep the real refused page cooling while discovery advances. No
+            // sleep or serialization should alter its FIFO or Instant values.
+            let ready_at = Instant::now() + MAX_BACKOFF;
+            for entry in &mut cursor.retries.entries {
+                entry.ready_at = ready_at;
+            }
+            let debt = cursor
+                .retries
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                debt.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+                (405..=436).collect::<Vec<_>>()
+            );
+            // On Linux, a duplicate retains the same flock owner. Dropping
+            // and reopening Store would contend with this duplicate, making
+            // a lock gap observable without a racy second worker.
+            #[cfg(target_os = "linux")]
+            let retained_lock = cursor
+                .retries
+                .persistence
+                .store
+                .as_ref()
+                .unwrap()
+                .lock
+                .try_clone()
+                .unwrap();
+            let resumed = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!((resumed.repaired, resumed.retry_len), (4, 32));
+            assert_eq!((cursor.after, cursor.ceiling), (440, Some(480)));
+            assert_eq!(cursor.identity, reopened.sqlite_identity_key());
+            assert_eq!(
+                cursor
+                    .retries
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                    .collect::<Vec<_>>(),
+                debt
+            );
+            assert!(!cursor.retries.persistence.warned);
+            assert_eq!(
+                Store::open(binding.clone()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let saved = cursor
+                .retries
+                .persistence
+                .store
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!((saved.after, saved.ceiling), (440, Some(480)));
+            assert_eq!(
+                saved
+                    .retries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                (405..=436).collect::<Vec<_>>()
+            );
+            #[cfg(target_os = "linux")]
+            drop(retained_lock);
+
+            // Retained IDs still reread live release and renewal authority.
+            // Nothing captured before pool turnover may authorize ACTIVE data.
+            let conn = outcome(block_on(reopened.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(405, 5000000)").unwrap();
+            conn.execute_raw("UPDATE file_reservations SET reason = 'renewed after pool turnover', expires_ts = expires_ts + 1000000 WHERE id = 406").unwrap();
+            drop(conn);
+            for entry in cursor.retries.entries.iter_mut().take(2) {
+                entry.ready_at = Instant::now();
+            }
+            cursor.retry_first = true;
+            cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert!(!cursor.retries.contains(405) && !cursor.retries.contains(406));
+            assert!(
+                !config
+                    .storage_root
+                    .join("projects/project/file_reservations/id-405-gaabb.json")
+                    .exists()
+            );
+            let relative = "projects/project/file_reservations/id-406-gaabb.json";
+            let bytes = std::fs::read(config.storage_root.join(relative)).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["reason"], "renewed after pool turnover");
+            let repo = git2::Repository::open(&config.storage_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            let entry = tree.get_path(Path::new(relative)).unwrap();
+            assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+        });
+    }
+
+    #[test]
+    fn pool_recreation_without_a_retained_active_binding_starts_a_new_scan() {
+        fixture(|cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let mut cursor = ActiveReservationCursor::default();
+            reconcile_active_reservations(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert!(cursor.retries.persistence.binding.is_none());
+            assert!(cursor.retries.defer(999_999, Instant::now() + MAX_BACKOFF));
+            let reopened = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            let report = cursor
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!(report.retry_len, 0);
+            assert_eq!(cursor.identity, reopened.sqlite_identity_key());
+            assert_eq!(cursor.after, 408);
         });
     }
 
