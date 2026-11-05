@@ -3989,6 +3989,12 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
         stderr
     );
     assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("- Plan status: refused; nothing was changed"),
+        "expected the refused status line:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
         source_archive_file.exists(),
         "conflict should preserve source artifacts"
     );
@@ -4001,6 +4007,43 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
     assert!(
         !target_archive_file.exists(),
         "conflict should not move artifacts to target"
+    );
+}
+
+#[test]
+fn projects_adopt_dry_run_refuses_duplicate_agent_name_conflict() {
+    // --apply refuses this pair, so the dry run must not call it executable.
+    let env = TestEnv::new();
+    let (_source_slug, _target_slug, source_key, target_key) = seed_projects_for_adopt(&env, true);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    insert_agent(&conn, 101, 1, "GreenCastle", "test", "test");
+    insert_agent(&conn, 202, 2, "greencastle", "test", "test");
+    drop(conn);
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["projects", "adopt", &source_key, &target_key],
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a dry run of a conflicting pair must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Plan status: refused; nothing was changed")
+            && !stdout.contains("- Plan status: executable"),
+        "expected a refused plan:\n{stdout}"
+    );
+    assert!(
+        stderr
+            .to_ascii_lowercase()
+            .contains("agent name conflicts in target project"),
+        "expected the conflict reason in stderr:\n{stderr}"
     );
 }
 

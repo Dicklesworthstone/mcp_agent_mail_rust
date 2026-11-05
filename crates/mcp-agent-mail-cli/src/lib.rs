@@ -27835,6 +27835,39 @@ fn handle_projects_adopt_with_conn(
         return Err(CliError::ExitCode(1));
     }
 
+    // --apply refuses an agent name present in both projects, so the dry run
+    // must report that plan as refused rather than executable.
+    let duplicate_agent_rows = conn
+        .query_sync(
+            "SELECT s.name AS name FROM agents s \
+             INNER JOIN agents d ON lower(s.name) = lower(d.name) \
+             WHERE s.project_id = ? AND d.project_id = ? \
+             ORDER BY lower(s.name), s.name",
+            &[
+                sqlmodel_core::Value::BigInt(source_project.id),
+                sqlmodel_core::Value::BigInt(target_project.id),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("agent conflict check failed: {e}")))?;
+    let mut duplicate_agent_names: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for row in duplicate_agent_rows {
+        let name: String = row.get_named("name").unwrap_or_default();
+        if !name.is_empty() {
+            duplicate_agent_names.insert(name);
+        }
+    }
+    if !duplicate_agent_names.is_empty() {
+        ftui_runtime::ftui_println!("- Plan status: refused; nothing was changed");
+        return Err(CliError::InvalidArgument(format!(
+            "agent name conflicts in target project: {}",
+            duplicate_agent_names
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
     // Safety contract: adoption is dry-run by default; --apply is required to mutate.
     let effective_dry_run = !apply;
     if effective_dry_run {
@@ -27860,36 +27893,6 @@ fn handle_projects_adopt_with_conn(
             .map(serde_json::Value::String)
             .collect(),
     );
-
-    let duplicate_agent_rows = conn
-        .query_sync(
-            "SELECT s.name AS name FROM agents s \
-             INNER JOIN agents d ON lower(s.name) = lower(d.name) \
-             WHERE s.project_id = ? AND d.project_id = ? \
-             ORDER BY lower(s.name), s.name",
-            &[
-                sqlmodel_core::Value::BigInt(source_project.id),
-                sqlmodel_core::Value::BigInt(target_project.id),
-            ],
-        )
-        .map_err(|e| CliError::Other(format!("agent conflict check failed: {e}")))?;
-    let mut duplicate_agent_names: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
-    for row in duplicate_agent_rows {
-        let name: String = row.get_named("name").unwrap_or_default();
-        if !name.is_empty() {
-            duplicate_agent_names.insert(name);
-        }
-    }
-    if !duplicate_agent_names.is_empty() {
-        return Err(CliError::InvalidArgument(format!(
-            "agent name conflicts in target project: {}",
-            duplicate_agent_names
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
 
     std::fs::create_dir_all(&source_archive)?;
     std::fs::create_dir_all(&target_archive)?;

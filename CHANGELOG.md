@@ -169,6 +169,10 @@ alongside the current unlink policy and its real-process and retention tests.
   repository root. Two directories at different depths of one checkout were
   refused, and keys one level below two repositories nested in a parent
   repository were treated as one repository.
+- **A dry run reports an agent-name conflict as refused.** `--apply` refuses a
+  pair whose projects share an agent name, but the dry run called that plan
+  executable and exited 0. It now prints the refused status and the conflict
+  and exits 1, as `--apply` does.
 
 ### Released-reservation prune warning (GH#362)
 
