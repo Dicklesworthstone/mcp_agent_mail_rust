@@ -922,9 +922,72 @@ impl ComposeAgent {
 /// snapshots may predate the ledger and retirement column, so retain their
 /// task-description tombstones without attempting a migration here.
 fn query_compose_agents(
-    mut query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
+    query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
     project_slug: &str,
     name: Option<&str>,
+) -> Result<Vec<ComposeAgent>, String> {
+    let (project, mut params) = synthetic_project_id(project_slug).map_or_else(
+        || {
+            (
+                "(SELECT id FROM projects WHERE slug = ? LIMIT 1)",
+                vec![Value::Text(project_slug.to_string())],
+            )
+        },
+        |project_id| ("?", vec![Value::BigInt(project_id)]),
+    );
+    let name_filter = if let Some(name) = name {
+        params.push(Value::Text(name.to_string()));
+        " AND name = ? COLLATE NOCASE"
+    } else {
+        ""
+    };
+    query_compose_agent_rows(
+        query,
+        &format!("project_id = {project}{name_filter}"),
+        &params,
+    )
+}
+
+/// A cross-project message lives in the recipient's project but retains the
+/// original sender's ID. Check that exact identity, never a local namesake.
+/// Bind the message scope and lifecycle read in one statement; backend reply
+/// routing still resolves the sender's home project and approved contact link.
+fn query_quick_reply_recipient(
+    query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
+    project_slug: &str,
+    message_id: i64,
+) -> Result<ComposeAgent, String> {
+    let mut params = vec![Value::BigInt(message_id)];
+    let project_filter = if let Some(project_id) = synthetic_project_id(project_slug) {
+        params.push(Value::BigInt(project_id));
+        params.push(Value::Text(project_slug.to_string()));
+        "m.project_id = ? AND NOT EXISTS \
+         (SELECT 1 FROM projects p WHERE p.id = m.project_id AND p.slug <> ?)"
+    } else {
+        params.push(Value::Text(project_slug.to_string()));
+        "m.project_id = (SELECT id FROM projects WHERE slug = ? LIMIT 1)"
+    };
+    let source_filter = format!(
+        "id = (SELECT m.sender_id FROM messages m \
+               WHERE m.id = ? AND {project_filter} LIMIT 1)"
+    );
+    let sender = query_compose_agent_rows(query, &source_filter, &params)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "Message #{message_id} or its original sender is unavailable in project \
+                 '{project_slug}'. Reload the message before replying."
+            )
+        })?;
+    sender.require_active()?;
+    Ok(sender)
+}
+
+fn query_compose_agent_rows(
+    mut query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
+    source_filter: &str,
+    params: &[Value],
 ) -> Result<Vec<ComposeAgent>, String> {
     let query_error = |error| format!("Failed to load agents for compose: {error}");
     let columns: HashSet<String> = query("PRAGMA table_info(agents)", &[])
@@ -961,30 +1024,15 @@ fn query_compose_agents(
     } else {
         ("", "NULL")
     };
-    let (project, mut params) = synthetic_project_id(project_slug).map_or_else(
-        || {
-            (
-                "(SELECT id FROM projects WHERE slug = ? LIMIT 1)",
-                vec![Value::Text(project_slug.to_string())],
-            )
-        },
-        |project_id| ("?", vec![Value::BigInt(project_id)]),
-    );
-    let name_filter = if let Some(name) = name {
-        params.push(Value::Text(name.to_string()));
-        " AND name = ? COLLATE NOCASE"
-    } else {
-        ""
-    };
     let source_projection = source_columns.join(", ");
     let sql = format!(
         "SELECT a.id AS id, a.name AS name, {retired} AS retired_at, \
          {deregistered} AS deregistered_id, {task} AS task_description \
          FROM (SELECT {source_projection} FROM agents \
-               WHERE project_id = {project}{name_filter}) a \
+               WHERE {source_filter}) a \
          {ledger_join} ORDER BY a.id ASC"
     );
-    let rows = query(&sql, &params).map_err(query_error)?;
+    let rows = query(&sql, params).map_err(query_error)?;
     let mut seen_names = HashSet::new();
     let mut agents = Vec::with_capacity(rows.len());
     for row in rows {
@@ -1552,20 +1600,38 @@ impl MessageBrowserScreen {
         name: Option<&str>,
         state: Option<&TuiSharedState>,
     ) -> Result<Vec<ComposeAgent>, String> {
-        let config = Self::runtime_config_from_state(state);
-        let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
-            .ok_or_else(|| "Database connection unavailable".to_string())?;
-        let conn = crate::open_read_only_sync_db_connection_with_busy_timeout(
-            sqlite_path.to_string_lossy().as_ref(),
-            crate::INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS,
-            "message recipient lifecycle",
-        )
-        .map_err(|error| format!("Cannot verify current agent lifecycle: {error}"))?;
+        let conn = Self::open_live_recipient_connection(state)?;
         query_compose_agents(
             |sql, params| conn.query_sync(sql, params),
             project_slug,
             name,
         )
+    }
+
+    fn live_quick_reply_recipient(
+        context: &QuickReplyContext,
+        state: Option<&TuiSharedState>,
+    ) -> Result<ComposeAgent, String> {
+        let conn = Self::open_live_recipient_connection(state)?;
+        query_quick_reply_recipient(
+            |sql, params| conn.query_sync(sql, params),
+            &context.project_slug,
+            context.message_id,
+        )
+    }
+
+    fn open_live_recipient_connection(
+        state: Option<&TuiSharedState>,
+    ) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, String> {
+        let config = Self::runtime_config_from_state(state);
+        let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
+            .ok_or_else(|| "Database connection unavailable".to_string())?;
+        crate::open_read_only_sync_db_connection_with_busy_timeout(
+            sqlite_path.to_string_lossy().as_ref(),
+            crate::INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS,
+            "message recipient lifecycle",
+        )
+        .map_err(|error| format!("Cannot verify current agent lifecycle: {error}"))
     }
 
     fn open_compose_error_form(
@@ -1707,12 +1773,11 @@ impl MessageBrowserScreen {
             return Err("Selected message is missing required reply context".to_string());
         };
         if let Some(conn) = &self.db_conn {
-            form.errors.general = query_compose_agents(
+            form.errors.general = query_quick_reply_recipient(
                 |sql, params| conn.query_sync(sql, params),
                 &form.context.project_slug,
-                Some(&form.context.to_agent),
+                form.context.message_id,
             )
-            .and_then(|agents| require_active_compose_recipient(&agents, &form.context.to_agent))
             .err();
         }
         self.quick_reply_form = Some(form);
@@ -2058,10 +2123,8 @@ impl MessageBrowserScreen {
         };
 
         self.ensure_modal_db_conn(state);
-        let admission =
-            Self::live_compose_agents(&context.project_slug, Some(&context.to_agent), state)
-                .and_then(|agents| require_active_compose_recipient(&agents, &context.to_agent))
-                .and_then(|()| self.ensure_compose_sender(&context.project_slug, state));
+        let admission = Self::live_quick_reply_recipient(&context, state)
+            .and_then(|_| self.ensure_compose_sender(&context.project_slug, state));
         if let Err(err) = admission {
             if let Some(form) = self.quick_reply_form.as_mut() {
                 form.errors.general = Some(err.clone());
@@ -8629,6 +8692,199 @@ first body
                 .query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn quick_reply_admission_follows_remote_sender_id_instead_of_local_namesake() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        conn.execute_raw(
+            "UPDATE messages SET sender_id = 4 WHERE id = 41; \
+             UPDATE agents SET retired_at = 20 WHERE id = 1; \
+             INSERT INTO agent_deregistrations VALUES (1, 30);",
+        )
+        .unwrap();
+        let history = compose_history_values(&conn);
+        let state = TuiSharedState::new(&config);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
+        screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+        let form = screen.quick_reply_form.as_mut().unwrap();
+        assert!(
+            form.errors.general.is_none(),
+            "inactive local namesake is unrelated"
+        );
+        assert_eq!(form.context.project_slug, "proj");
+        assert_eq!(form.context.to_agent, "BlueLake");
+        form.body_input.set_text("Reply to the remote sender.");
+        let context = form.context.clone();
+        assert_eq!(
+            MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state))
+                .unwrap()
+                .id,
+            4
+        );
+
+        screen
+            .db_conn
+            .as_ref()
+            .unwrap()
+            .execute_raw(
+                "UPDATE agents SET name = 'LocalLake' WHERE id = 1; \
+             UPDATE agents SET name = 'LocalVariant' WHERE id = 3;",
+            )
+            .unwrap();
+        assert_eq!(
+            MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state))
+                .unwrap()
+                .id,
+            4,
+            "the remote sender need not be registered in the message's project"
+        );
+        screen
+            .db_conn
+            .as_ref()
+            .unwrap()
+            .execute_raw(
+                "UPDATE agents SET name = 'BlueLake', retired_at = NULL WHERE id = 1; \
+             DELETE FROM agent_deregistrations WHERE agent_id = 1;",
+            )
+            .unwrap();
+
+        for (transition, refusal) in [
+            (
+                "UPDATE agents SET retired_at = 20 WHERE id = 4",
+                Some("retired"),
+            ),
+            ("UPDATE agents SET retired_at = NULL WHERE id = 4", None),
+            (
+                "INSERT INTO agent_deregistrations VALUES (4, 30)",
+                Some("deregistered"),
+            ),
+            (
+                "DELETE FROM agent_deregistrations WHERE agent_id = 4; \
+                 UPDATE agents SET task_description = '[DEREGISTERED at 2026-08-24T00:00:00Z] legacy' WHERE id = 4",
+                Some("deregistered"),
+            ),
+        ] {
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .execute_raw(transition)
+                .unwrap();
+            let admission =
+                MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state));
+            if let Some(reason) = refusal {
+                assert!(admission.unwrap_err().contains(reason));
+                let _ = screen.submit_quick_reply_form(Some(&state));
+                let form = screen
+                    .quick_reply_form
+                    .as_ref()
+                    .expect("reply draft retained");
+                assert!(form.errors.general.as_deref().unwrap().contains(reason));
+                assert_eq!(form.body_input.text(), "Reply to the remote sender.");
+                assert_eq!(form.context.original_body_md, "Original historical body");
+                assert_eq!(form.context.thread_id.as_deref(), Some("history-41"));
+            } else {
+                assert_eq!(
+                    admission.unwrap().id,
+                    4,
+                    "unretired remote sender is eligible"
+                );
+            }
+            let conn = screen.db_conn.as_ref().unwrap();
+            assert_eq!(compose_history_values(conn), history);
+            assert!(
+                conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn quick_reply_refuses_missing_or_moved_live_message_and_preserves_draft() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let state = TuiSharedState::new(&config);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
+        screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+        screen
+            .quick_reply_form
+            .as_mut()
+            .unwrap()
+            .body_input
+            .set_text("Keep this reply draft.");
+
+        for change in [
+            "UPDATE messages SET project_id = 88 WHERE id = 41",
+            "DELETE FROM message_recipients WHERE message_id = 41; DELETE FROM messages WHERE id = 41;",
+        ] {
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .execute_raw(change)
+                .unwrap();
+            let before = compose_history_values(screen.db_conn.as_ref().unwrap());
+            let _ = screen.submit_quick_reply_form(Some(&state));
+            let form = screen
+                .quick_reply_form
+                .as_ref()
+                .expect("reply draft retained");
+            let error = form.errors.general.as_deref().unwrap();
+            assert!(error.contains("Message #41"), "{error}");
+            assert!(error.contains("project 'proj'"), "{error}");
+            assert_eq!(form.body_input.text(), "Keep this reply draft.");
+            assert_eq!(form.context.original_from_agent, "BlueLake");
+            assert_eq!(form.context.original_body_md, "Original historical body");
+            assert_eq!(form.context.thread_id.as_deref(), Some("history-41"));
+            let conn = screen.db_conn.as_ref().unwrap();
+            assert_eq!(compose_history_values(conn), before);
+            assert!(
+                conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn quick_reply_admission_preserves_orphan_scope_and_refuses_missing_sender() {
+        let (_dir, _config, conn) = compose_lifecycle_fixture();
+        let recipient = |project, message_id| {
+            query_quick_reply_recipient(
+                |sql, params| conn.query_sync(sql, params),
+                project,
+                message_id,
+            )
+        };
+        assert_eq!(recipient("proj", 41).unwrap().id, 1);
+        assert!(recipient("other", 41).unwrap_err().contains("unavailable"));
+        assert!(recipient("proj", 999).unwrap_err().contains("unavailable"));
+        assert!(
+            recipient("[unknown-project-77]", 41)
+                .unwrap_err()
+                .contains("unavailable")
+        );
+        conn.execute_raw("PRAGMA foreign_keys = OFF; DELETE FROM projects WHERE id = 77;")
+            .unwrap();
+        assert_eq!(recipient("[unknown-project-77]", 41).unwrap().id, 1);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (77, '[unknown-project-77]', '[unknown-project-77]', 1);",
+        )
+        .unwrap();
+        assert_eq!(recipient("[unknown-project-77]", 41).unwrap().id, 1);
+        conn.execute_raw("UPDATE messages SET sender_id = 999 WHERE id = 41")
+            .unwrap();
+        assert!(
+            recipient("[unknown-project-77]", 41)
+                .unwrap_err()
+                .contains("original sender")
         );
     }
 
