@@ -371,26 +371,32 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, Repair
     result
 }
 
-fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, RepairFailure> {
-    // One SQL snapshot supplies the holder, generation and both release stores.
-    // The size predicate bounds materialized strings, not the SQL engine's work.
-    let rows = conn.query_sync(
-        "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+const SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                 fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
                 rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
-         FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
+         FROM (SELECT * FROM file_reservations WHERE id = ?1) fr \
+         JOIN projects p ON p.id = fr.project_id \
          JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
-         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+         LEFT JOIN (SELECT * FROM file_reservation_releases WHERE reservation_id = ?1) rr \
+                ON rr.reservation_id = fr.id \
          LEFT JOIN db_identity d ON d.singleton = 0 \
-         WHERE fr.id = ? AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
+         WHERE length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
                length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
                length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
                length(CAST(fr.\"exclusive\" AS BLOB)) + \
                COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
                COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?",
-        &[id.into(), SOURCE_BYTES.into()],
-    ).map_err(RepairFailure::source_unavailable)?;
+               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?2";
+
+fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, RepairFailure> {
+    // One SQL snapshot supplies the holder, generation and both release stores.
+    // Filter each reservation table before joining: the runtime cannot push an
+    // ID predicate through the cross-table byte bound, so an outer ID filter
+    // would repeatedly build the full reservation history (GH#354). Keep the
+    // byte bound in SQL so oversized strings never reach the source projection.
+    let rows = conn
+        .query_sync(SOURCE_SQL, &[id.into(), SOURCE_BYTES.into()])
+        .map_err(RepairFailure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
             "active reservation source missing, oversized, or without holder authority".into(),
@@ -1041,8 +1047,38 @@ pub fn reconcile_active_reservations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    // Keep the pre-GH#354 projection as a runtime equivalence oracle. These
+    // tests execute both statements against the same real FrankenSQLite DB;
+    // timing is deliberately not a unit-test assertion.
+    const PREVIOUS_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
+                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+         FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
+         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
+         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+         LEFT JOIN db_identity d ON d.singleton = 0 \
+         WHERE fr.id = ? AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
+               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
+               length(CAST(fr.\"exclusive\" AS BLOB)) + \
+               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?";
+
+    fn assert_source_projection_unchanged(conn: &DbConn, id: i64) {
+        let project = |sql| -> Vec<Vec<SqlValue>> {
+            conn.query_sync(sql, &[id.into(), SOURCE_BYTES.into()])
+                .unwrap()
+                .iter()
+                .map(|row| row.values().cloned().collect())
+                .collect()
+        };
+        assert_eq!(project(SOURCE_SQL), project(PREVIOUS_SOURCE_SQL), "id={id}");
+    }
 
     type RenewalStageHook = Box<dyn FnOnce(&DbConn, &Path)>;
 
@@ -1260,6 +1296,160 @@ mod tests {
         conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
             .get_as::<i64>(0)
             .unwrap()
+    }
+
+    #[test]
+    fn active_source_point_lookup_preserves_projection_with_unrelated_history() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_sync(
+                "UPDATE file_reservations SET expires_ts = ? WHERE id = 401",
+                &[expires.into()],
+            )
+            .unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other-project', '/other-project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'RedFox', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            for start in (1_000..3_048).step_by(128) {
+                let reservations = (start..start + 128)
+                    .map(|id| {
+                        format!(
+                            "({id},72,82,'other/*.rs',1,'unrelated history',1000000,9000000,NULL)"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations(id,project_id,agent_id,path_pattern,\"exclusive\",reason,created_ts,expires_ts,released_ts) VALUES {reservations}"
+                )).unwrap();
+                let releases = (start..start + 128)
+                    .step_by(2)
+                    .map(|id| format!("({id},5000000)"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservation_releases(reservation_id,released_ts) VALUES {releases}"
+                )).unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+
+            for id in [401, 1_000, 1_001, 3_047, 9_999] {
+                assert_source_projection_unchanged(&conn, id);
+            }
+            let source = read_source_connection(&conn, 401).unwrap().unwrap();
+            assert_eq!(
+                (source.id, source.project_id, source.agent_id),
+                (401, 71, 81)
+            );
+            assert_eq!(source.slug, "project");
+            assert_eq!(source.generation, "aabb");
+            assert_eq!(
+                source.artifact,
+                json!({
+                    "id": 401, "project": "/project", "agent": "BlueLake",
+                    "path_pattern": "src/*.rs", "exclusive": true, "reason": "active-test",
+                    "created_ts": mcp_agent_mail_db::micros_to_iso(1_000_000),
+                    "expires_ts": mcp_agent_mail_db::micros_to_iso(expires),
+                    "db_generation": "aabb",
+                })
+            );
+            assert!(read_source_connection(&conn, 1_000).unwrap().is_none());
+            assert!(read_source_connection(&conn, 1_001).unwrap().is_none());
+            assert!(!read_source_connection(&conn, 9_999).unwrap_err().transient);
+            assert!(!config.storage_root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn active_source_point_lookup_preserves_byte_bound_holder_and_release_authority() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_sync(
+                "UPDATE file_reservations SET expires_ts = ? WHERE id = 401",
+                &[expires.into()],
+            )
+            .unwrap();
+            // Account for every projected source byte independently of the
+            // SQL expression. A multibyte prefix distinguishes BLOB length
+            // from character count at the exact inclusive boundary.
+            let fixed_bytes = [
+                "src/*.rs", "project", "/project", "BlueLake", "1000000", "1", "aabb",
+            ]
+            .into_iter()
+            .map(str::len)
+            .sum::<usize>()
+                + expires.to_string().len();
+            let reason_bytes = usize::try_from(SOURCE_BYTES).unwrap() - fixed_bytes;
+            let mut reason = format!("é{}", "x".repeat(reason_bytes - "é".len()));
+            conn.execute_sync(
+                "UPDATE file_reservations SET reason = ? WHERE id = 401",
+                &[reason.clone().into()],
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert_eq!(
+                read_source_connection(&conn, 401)
+                    .unwrap()
+                    .unwrap()
+                    .artifact["reason"],
+                reason
+            );
+            reason.push('x');
+            conn.execute_sync(
+                "UPDATE file_reservations SET reason = ? WHERE id = 401",
+                &[reason.into()],
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            let oversized = read_source_connection(&conn, 401).unwrap_err();
+            assert!(!oversized.transient);
+            assert!(oversized.detail.contains("oversized"));
+            conn.execute_raw("UPDATE file_reservations SET reason = 'active-test' WHERE id = 401")
+                .unwrap();
+
+            // The agent exists, but belongs to another project. Neither the
+            // old nor new join can authorize it as this reservation's holder.
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other-project', '/other-project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'RedFox', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("UPDATE file_reservations SET agent_id = 82 WHERE id = 401")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(!read_source_connection(&conn, 401).unwrap_err().transient);
+            conn.execute_raw(
+                "UPDATE file_reservations SET agent_id = 81, released_ts = 5000000 WHERE id = 401",
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(read_source_connection(&conn, 401).unwrap().is_none());
+            conn.execute_raw("UPDATE file_reservations SET released_ts = 'invalid' WHERE id = 401")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(
+                read_source_connection(&conn, 401)
+                    .unwrap_err()
+                    .detail
+                    .contains("malformed reservation release timestamp")
+            );
+            conn.execute_raw("UPDATE file_reservations SET released_ts = NULL WHERE id = 401")
+                .unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id,released_ts) VALUES(401,5000000)").unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(read_source_connection(&conn, 401).unwrap().is_none());
+            conn.execute_raw(
+                "UPDATE file_reservation_releases SET released_ts = 0 WHERE reservation_id = 401",
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(
+                read_source_connection(&conn, 401)
+                    .unwrap_err()
+                    .detail
+                    .contains("malformed reservation release ledger")
+            );
+            assert!(!config.storage_root.join(".git").exists());
+        });
     }
 
     #[test]
