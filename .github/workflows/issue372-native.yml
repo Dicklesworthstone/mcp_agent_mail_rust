@@ -45,10 +45,11 @@ jobs:
   native:
     name: Existing mailbox memory and integrity
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 270
     env:
       EVIDENCE_DIR: ${{ runner.temp }}/gh372-native
       CARGO_TARGET_DIR: ${{ runner.temp }}/gh372-target
+      GH372_DIAGNOSTICS_DIR: ${{ runner.temp }}/gh372-native/connection-maps
     defaults:
       run:
         shell: bash
@@ -75,12 +76,14 @@ jobs:
             printf -- '- Workflow commit: `%s`\n- Tested commit: `%s`\n\n' "$GITHUB_SHA" "$tested_sha"
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        timeout-minutes: 5
         with:
           repository: ${{ github.repository }}
           ref: ${{ steps.source.outputs.sha }}
           persist-credentials: false
           fetch-depth: 1
       - name: Record exact source and install its pinned compiler
+        id: setup
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -118,7 +121,7 @@ jobs:
           gate=$1
           test_name=$2
           # A stuck gate must not prevent the remaining exact tests from running.
-          command=(timeout --signal=TERM --kill-after=30s 6m "$TEST_EXECUTABLE" "$test_name" --exact --nocapture --test-threads=1)
+          command=(timeout --signal=TERM --kill-after="${GATE_KILL_AFTER:-30s}" "${GATE_TIMEOUT:-6m}" "$TEST_EXECUTABLE" "$test_name" --exact --nocapture --test-threads=1)
           printf '%q ' "${command[@]}" > "$EVIDENCE_DIR/$gate.command"
           printf '\n' >> "$EVIDENCE_DIR/$gate.command"
           set +e
@@ -136,6 +139,20 @@ jobs:
             exit 1
           fi
           BASH
+      - name: Record whether facade controls apply to the tested source
+        id: facade_source
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          if [[ -f vendor/fsqlite/Cargo.toml ]]; then
+            printf 'present=true\n' >> "$GITHUB_OUTPUT"
+            printf 'required: vendored facade controls have not run yet\n' | tee "$EVIDENCE_DIR/facade-qualification.status"
+          else
+            printf 'present=false\n' >> "$GITHUB_OUTPUT"
+            printf 'not applicable: registry baseline\n' | tee "$EVIDENCE_DIR/facade-qualification.status"
+            printf '\nFacade controls: not applicable: registry baseline.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Build the native database integration executable once
         id: build
         timeout-minutes: 130
@@ -219,9 +236,145 @@ jobs:
           cat "$EVIDENCE_DIR/"*.measurements.log > "$EVIDENCE_DIR/measurements.log"
           cat "$EVIDENCE_DIR/gate-results.tsv" >> "$GITHUB_STEP_SUMMARY"
           exit "$failed"
+      # The current workflow supplies the runner even when source_sha selects a
+      # candidate whose checked-out workflow predates these facade controls.
+      # An application failure must not hide independent facade failures.
+      - name: Build the three focused facade test executables once
+        id: facade_build
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && steps.facade_source.outputs.present == 'true' }}
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          facade_evidence="$EVIDENCE_DIR/facade"
+          mkdir -p "$facade_evidence"
+          cp vendor/fsqlite/Cargo.toml "$facade_evidence/Cargo.toml"
+          cp vendor/fsqlite/Cargo.lock "$facade_evidence/Cargo.lock"
+          sha256sum vendor/fsqlite/Cargo.toml vendor/fsqlite/Cargo.lock vendor/fsqlite/src/async_api.rs > "$facade_evidence/build-inputs.sha256"
+          command=(cargo test --locked --manifest-path vendor/fsqlite/Cargo.toml --features async-api --lib --test async_api_storage_migration --test async_drop_skips_detached_checkpoint --no-run --message-format=json-render-diagnostics)
+          printf '%q ' "${command[@]}" > "$facade_evidence/build.command"
+          printf '\n' >> "$facade_evidence/build.command"
+          set +e
+          "${command[@]}" 2>&1 | tee "$facade_evidence/build.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf 'command_exit=%s\nlog_exit=%s\n' "${statuses[@]}" > "$facade_evidence/build.status"
+          if (( statuses[0] != 0 || statuses[1] != 0 )); then
+            printf 'failed: facade test executables did not build\n' > "$EVIDENCE_DIR/facade-qualification.status"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"]) / "facade"
+          facade = Path(os.environ["GITHUB_WORKSPACE"]) / "vendor/fsqlite"
+          expected = {
+              "lib": ("fsqlite", "lib", (facade / "src/lib.rs").resolve()),
+              "async_api_storage_migration": (
+                  "async_api_storage_migration", "test",
+                  (facade / "tests/async_api_storage_migration.rs").resolve()),
+              "async_drop_skips_detached_checkpoint": (
+                  "async_drop_skips_detached_checkpoint", "test",
+                  (facade / "tests/async_drop_skips_detached_checkpoint.rs").resolve()),
+          }
+          executables = {name: set() for name in expected}
+          artifacts = []
+          finished = []
+          with (evidence / "build.log").open() as build_log:
+              for line in build_log:
+                  try:
+                      message = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if not isinstance(message, dict):
+                      continue
+                  if message.get("reason") == "build-finished":
+                      finished.append(message["success"])
+                  if message.get("reason") != "compiler-artifact":
+                      continue
+                  artifacts.append(message)
+                  if not message["profile"]["test"] or not message.get("executable"):
+                      continue
+                  target = message["target"]
+                  for name, (target_name, kind, source) in expected.items():
+                      if (target["name"] == target_name and kind in target["kind"]
+                              and Path(target["src_path"]).resolve() == source):
+                          executables[name].add(message["executable"])
+          (evidence / "compiled-dependencies.json").write_text(json.dumps(artifacts, indent=2) + "\n")
+          assert finished == [True], f"unexpected facade build completion: {finished}"
+          for name, matches in executables.items():
+              assert len(matches) == 1, f"expected one {name} test executable: {matches}"
+              executable = Path(matches.pop()).resolve()
+              assert executable.is_file() and os.access(executable, os.X_OK), executable
+              (evidence / f"{name}.executable.path").write_text(str(executable) + "\n")
+          PY
+          for executable_record in "$facade_evidence/"*.executable.path; do
+            sha256sum "$(cat "$executable_record")"
+          done > "$facade_evidence/test-executables.sha256"
+      - name: Run all sixteen exact facade controls
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && steps.facade_build.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          gate_runner="$EVIDENCE_DIR/run-gate.sh"
+          qualification_status="$EVIDENCE_DIR/facade-qualification.status"
+          export EVIDENCE_DIR="$EVIDENCE_DIR/facade"
+          export CARGO_MANIFEST_DIR="$GITHUB_WORKSPACE/vendor/fsqlite"
+          export GATE_TIMEOUT=1m GATE_KILL_AFTER=5s
+          export LD_LIBRARY_PATH="$(dirname "$(cat "$EVIDENCE_DIR/lib.executable.path")"):$(rustc --print target-libdir)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          cd "$CARGO_MANIFEST_DIR"
+          cases=(
+            lib:gh524_async_open_cancels_worker_waiting_for_another_process
+            lib:gh524_async_open_preserves_environment_cancellation_lineage
+            lib:gh524_async_open_success_outlives_opening_cancellation_scope
+            lib:gh524_async_open_preserves_bootstrap_mask_without_masking_connection
+            lib:dropped_open_future_is_nonblocking_and_cleans_once
+            lib:inflight_cancellation_interrupts_running_worker_operation
+            lib:transaction_state_is_worker_published_when_response_is_abandoned
+            lib:synchronous_stream_callback_observes_current_worker_transaction_state
+            lib:synchronous_stream_guard_clears_after_callback_error_and_panic
+            lib:cleanup_runs_once_for_every_worker_exit
+            lib:receiver_drop_panic_cannot_skip_connection_cleanup
+            lib:close_without_checkpoint_sync_preserves_wal_and_memoizes
+            lib:close_sync_runs_checkpointing_cleanup
+            async_api_storage_migration:async_explicit_close_rolls_back_uncommitted_file_transaction
+            async_api_storage_migration:sync_drop_rolls_back_uncommitted_file_transaction
+            async_drop_skips_detached_checkpoint:readonly_open_must_not_rewrite_main_db
+          )
+          printf 'gate\tresult\texact_test\n' > "$EVIDENCE_DIR/gate-results.tsv"
+          failed=0
+          for case_name in "${cases[@]}"; do
+            target=${case_name%%:*}
+            test_name=${case_name#*:}
+            gate=$test_name
+            if [[ "$target" == lib ]]; then
+              test_name="async_api::tests::$test_name"
+            fi
+            export TEST_EXECUTABLE="$(cat "$EVIDENCE_DIR/$target.executable.path")"
+            if bash "$gate_runner" "$gate" "$test_name"; then
+              result=passed
+            else
+              result=failed
+              failed=1
+            fi
+            printf '%s\t%s\t%s\n' "$gate" "$result" "$test_name" >> "$EVIDENCE_DIR/gate-results.tsv"
+          done
+          if (( failed )); then
+            printf 'failed: one or more facade controls failed\n' > "$qualification_status"
+          else
+            printf 'passed: all sixteen facade controls completed\n' > "$qualification_status"
+          fi
+          {
+            printf '\n### Facade controls\n\n'
+            cat "$qualification_status"
+            printf '\n'
+            cat "$EVIDENCE_DIR/gate-results.tsv"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
       - name: Verify tracked source stayed unchanged
         if: always()
-        timeout-minutes: 5
+        timeout-minutes: 3
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -232,7 +385,7 @@ jobs:
           test ! -s "$EVIDENCE_DIR/source-after.txt"
       - name: Preserve commands, memory measurements, and actual failures
         if: always()
-        timeout-minutes: 10
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gh372-native-${{ github.run_id }}-${{ github.run_attempt }}

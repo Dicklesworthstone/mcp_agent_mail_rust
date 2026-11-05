@@ -634,6 +634,108 @@ fn log_connection_memory(stage: &str, connection: usize) {
     );
 }
 
+/// Optional attribution evidence captured only after the memory sample is frozen.
+#[cfg(target_os = "linux")]
+#[inline(never)]
+fn capture_memory_diagnostics(fixture: &Path, baseline_kib: u64, peak_kib: u64, delta_kib: u64) {
+    let Some(root) = std::env::var_os("GH372_DIAGNOSTICS_DIR").filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let pid = std::process::id();
+    let prefix = format!("gh372-memory-{pid}-");
+    let evidence = std::fs::create_dir_all(&root)
+        .and_then(|()| tempfile::Builder::new().prefix(&prefix).tempdir_in(&root));
+    let evidence = match evidence {
+        Ok(directory) => directory.keep(),
+        Err(error) => {
+            eprintln!("GH372 diagnostics_unavailable {}: {error}", root.display());
+            return;
+        }
+    };
+    let capture = |source: &Path, filename: &str| {
+        let result = std::fs::File::open(source).and_then(|mut input| {
+            let mut output = std::fs::File::create(evidence.join(filename))?;
+            std::io::copy(&mut input, &mut output)
+        });
+        match result {
+            Ok(bytes) => serde_json::json!({ "file": filename, "available": true, "bytes": bytes }),
+            Err(error) => {
+                eprintln!("GH372 diagnostics_capture_failed {filename}: {error}");
+                serde_json::json!({
+                    "file": filename,
+                    "available": false,
+                    "error": error.to_string(),
+                    "raw_os_error": error.raw_os_error(),
+                })
+            }
+        }
+    };
+    let status = capture(Path::new("/proc/self/status"), "status.txt");
+    let smaps = capture(Path::new("/proc/self/smaps"), "smaps.txt");
+    let mut workers = Vec::new();
+    let mut task_errors = Vec::new();
+    match std::fs::read_dir("/proc/self/task") {
+        Ok(tasks) => {
+            for task in tasks {
+                let task = match task {
+                    Ok(task) => task,
+                    Err(error) => {
+                        task_errors.push(format!("task entry unavailable: {error}"));
+                        continue;
+                    }
+                };
+                let tid = task.file_name().to_string_lossy().into_owned();
+                let comm_path = task.path().join("comm");
+                match std::fs::read_to_string(&comm_path) {
+                    Ok(comm) if comm.trim() == "fsqlite-worker" => {
+                        workers.push(serde_json::json!({
+                            "tid": tid,
+                            "observed_comm": comm,
+                            "comm": capture(&comm_path, &format!("task-{tid}-comm.txt")),
+                            "syscall": capture(&task.path().join("syscall"), &format!("task-{tid}-syscall.txt")),
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        task_errors.push(format!("task {tid} comm unavailable: {error}"));
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            task_errors.push(format!("task directory unavailable: {error}"));
+        }
+    }
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "test": MEMORY_CHILD_TEST,
+        "pid": pid,
+        "fixture_path": fixture.to_string_lossy(),
+        "recorded_before_diagnostic_capture": {
+            "baseline_kib": baseline_kib,
+            "peak_kib": peak_kib,
+            "delta_kib": delta_kib,
+        },
+        "observation": "post-sample; mappings are not an exact decomposition of the earlier HWM",
+        "status": status,
+        "smaps": smaps,
+        "fsqlite_workers": workers,
+        "task_inspection_errors": task_errors,
+    });
+    let metadata_result = std::fs::File::create(evidence.join("metadata.json")).and_then(|file| {
+        serde_json::to_writer_pretty(file, &metadata).map_err(std::io::Error::other)
+    });
+    if let Err(error) = metadata_result {
+        eprintln!(
+            "GH372 diagnostics_metadata_unavailable {}: {error}",
+            evidence.display()
+        );
+    }
+    eprintln!("GH372 diagnostics_directory={}", evidence.display());
+}
+
 fn seed_legacy_memory_mailbox(path: &Path, message_count: i64) -> String {
     seed_legacy_memory_mailbox_with_body_scale(path, message_count, 1)
 }
@@ -782,6 +884,7 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
         let peak_kib = process_memory_kib("VmHWM:");
         let delta_kib = peak_kib.saturating_sub(baseline_kib);
         eprintln!("GH372 baseline_kib={baseline_kib} peak_kib={peak_kib} delta_kib={delta_kib}");
+        capture_memory_diagnostics(&path, baseline_kib, peak_kib, delta_kib);
         // The file holds >16 MiB of message bodies. Five live connections may
         // use bounded pager caches, but must not each hydrate the entire image.
         assert!(
@@ -834,43 +937,69 @@ fn existing_mailbox_reads_remain_bounded_with_larger_unread_bodies() {
         .expect("private archive-size fixture directory");
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let mut deltas_kib = Vec::new();
+    let mut failed_scales = Vec::new();
     for unread_body_scale in [1, 4] {
-        let path = root.join(format!("body-scale-{unread_body_scale}.sqlite3"));
-        let body =
-            seed_legacy_memory_mailbox_with_body_scale(&path, MESSAGE_COUNT, unread_body_scale);
-        let body_bytes = i64::try_from(body.len()).unwrap();
-        let expected_body_bytes =
-            body_bytes * (1 + (MESSAGE_COUNT - 1) * i64::try_from(unread_body_scale).unwrap());
-        assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
-        if unread_body_scale == 4 {
-            assert!(expected_body_bytes > 64 * 1024 * 1024);
-        }
-        deltas_kib.push(run_bounded_connection_memory_child(&path));
+        eprintln!("GH372 archive_case unread_body_scale={unread_body_scale} outcome=started");
+        let outcome = std::panic::catch_unwind(|| {
+            let path = root.join(format!("body-scale-{unread_body_scale}.sqlite3"));
+            let body =
+                seed_legacy_memory_mailbox_with_body_scale(&path, MESSAGE_COUNT, unread_body_scale);
+            let body_bytes = i64::try_from(body.len()).unwrap();
+            let expected_body_bytes =
+                body_bytes * (1 + (MESSAGE_COUNT - 1) * i64::try_from(unread_body_scale).unwrap());
+            assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+            if unread_body_scale == 4 {
+                assert!(expected_body_bytes > 64 * 1024 * 1024);
+            }
+            let delta_kib = run_bounded_connection_memory_child(&path);
+            eprintln!(
+                "GH372 archive_case unread_body_scale={unread_body_scale} child_delta_kib={delta_kib}"
+            );
 
-        let canonical = CanonicalDbConn::open_file(path.to_str().unwrap())
-            .expect("reopen measured mailbox with canonical SQLite");
-        let totals = canonical
-            .query_sync("SELECT COUNT(*), SUM(length(body_md)) FROM messages", &[])
-            .expect("verify measured mailbox row and payload counts");
-        assert_eq!(totals[0].get_as::<i64>(0).unwrap(), MESSAGE_COUNT);
-        assert_eq!(totals[0].get_as::<i64>(1).unwrap(), expected_body_bytes);
-        let matching_bodies = canonical
-            .query_sync(
-                "SELECT COUNT(*) FROM messages \
-                 WHERE body_md = CASE WHEN id = 1 THEN ? ELSE ? END",
-                &[
-                    Value::Text(body.clone()),
-                    Value::Text(body.repeat(unread_body_scale)),
-                ],
-            )
-            .expect("verify every unread body survived native opens and the point update");
-        assert_eq!(matching_bodies[0].get_as::<i64>(0).unwrap(), MESSAGE_COUNT);
-        let integrity = canonical
-            .query_sync("PRAGMA integrity_check", &[])
-            .expect("verify measured mailbox integrity with canonical SQLite");
-        assert_eq!(integrity.len(), 1);
-        assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+            let canonical = CanonicalDbConn::open_file(path.to_str().unwrap())
+                .expect("reopen measured mailbox with canonical SQLite");
+            let totals = canonical
+                .query_sync("SELECT COUNT(*), SUM(length(body_md)) FROM messages", &[])
+                .expect("verify measured mailbox row and payload counts");
+            assert_eq!(totals[0].get_as::<i64>(0).unwrap(), MESSAGE_COUNT);
+            assert_eq!(totals[0].get_as::<i64>(1).unwrap(), expected_body_bytes);
+            let matching_bodies = canonical
+                .query_sync(
+                    "SELECT COUNT(*) FROM messages \
+                     WHERE body_md = CASE WHEN id = 1 THEN ? ELSE ? END",
+                    &[
+                        Value::Text(body.clone()),
+                        Value::Text(body.repeat(unread_body_scale)),
+                    ],
+                )
+                .expect("verify every unread body survived native opens and the point update");
+            assert_eq!(matching_bodies[0].get_as::<i64>(0).unwrap(), MESSAGE_COUNT);
+            let integrity = canonical
+                .query_sync("PRAGMA integrity_check", &[])
+                .expect("verify measured mailbox integrity with canonical SQLite");
+            assert_eq!(integrity.len(), 1);
+            assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+            delta_kib
+        });
+        match outcome {
+            Ok(delta_kib) => {
+                eprintln!(
+                    "GH372 archive_case unread_body_scale={unread_body_scale} outcome=passed delta_kib={delta_kib}"
+                );
+                deltas_kib.push(delta_kib);
+            }
+            Err(_) => {
+                failed_scales.push(unread_body_scale);
+                eprintln!(
+                    "GH372 archive_case unread_body_scale={unread_body_scale} outcome=failed"
+                );
+            }
+        }
     }
+    assert!(
+        failed_scales.is_empty(),
+        "archive-size memory or integrity checks failed for unread body scales {failed_scales:?}"
+    );
     eprintln!(
         "GH372 unread_body_scale=4 small_delta_kib={} large_delta_kib={}",
         deltas_kib[0], deltas_kib[1]
