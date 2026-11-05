@@ -102,20 +102,77 @@ win or a successful hosted workflow result. Worker admission/source-packing
 refusals and the initial formatting failure remain retained zero-case/red
 attempts. The initializer failure above still keeps its separate task open.
 
-An optimized portable CLI build and the original full end-to-end workload are
-being rerun for this query snapshot. Their verdict is pending. The intended
-control is the actual published GNU v0.3.40 executable, SHA-256
+The original 25,100-message archive case executed on `vmi1152480` and failed:
+zero passed, one failed, zero ignored, 31 filtered, 220.25 seconds. Seeding
+completed with 25,100 messages and 117,178,368 database bytes in 120,236 ms.
+An unnamed concurrent participant then panicked on a pool-acquisition timeout
+(`archive_test_outcome`, line 253). The stop-on-unwind guard subsequently caused
+the reconciliation interruption assertion to fail; that is a secondary failure.
+The last progress sample reported 36 passes, 16 repairs and 43 scanned messages
+after 78,204 ms of the concurrent phase. This was not a 45-minute convergence
+timeout, and the case did not reach its final archive/integrity acceptance.
+The participant's role and the timeout's cause remain unproved. Receipt
+`828cdcc8683ba19808d02afc5db96b03d3bd7ba213118b3bc3b36096ae148bf3`
+freshly matches all 3,910 source records. A later attempt to retain the exact
+worker executable found its managed source directory empty; no executable
+identity or diagnostic replay is claimed for that failed case. Its original
+terminal output and source receipt remain retained.
+
+The separate original 25,100-message HTTP responsiveness case passed on
+`vmi1149989`: one passed, zero failed/ignored, 5,499 filtered, 57.43 seconds
+(57.33 seconds in its isolated child). It recorded 418 real inbox reads,
+including 186 large-recipient reads overlapping repair batches: 93 metadata
+and 93 full-body reads. Eight batches repaired 16 messages; the concurrent
+phase lasted 11,180 ms, maximum batch 1,695 ms, and maximum inbox read 248 ms.
+Every original deadline, payload/receipt, unrelated Git staging, cancellation
+drain and graceful-stop assertion was retained. Its own witness explicitly
+states `full_convergence_checked: false`: this is responsiveness evidence,
+not full archive convergence, a comparative speed win, or release clearance.
+Receipt `d5d9c422fa87cb307c036f50a165a9aa848bb30f5fb6413f120e128bda139d13`
+freshly matches all 3,910 source records. The running worker test executable
+and retained local copy are both 327,234,936 bytes, SHA-256
+`4fc2770248855eb554f7520d0325083bff88a521ac5b91cd28174e0295c9c70d`.
+The 112-minute compilation is separate from the case's runtime verdict.
+
+The unchanged HTTP cancellation case also passed from that retained executable
+on the local host: one passed, zero failed/ignored, 5,499 filtered, 31.80 seconds
+(31.78 in its child). Its real eight-message mailbox deliberately holds the
+only read connection until the original request deadline. The request returned
+the intended timeout at 30,001 ms; its dispatch permit drained before the held
+connection was released. Pending counts before release and after follow-up were
+both zero; subsequent reads took 19 and 4 ms, with one idle connection and zero
+active connections afterward. The executable hash remained unchanged. This
+separate real-consumer cancellation pass does not erase the earlier initializer
+failure, the untraced warmup assertion (zero of five requested connections), or
+the large archive failure.
+
+The optimized portable CLI build reached its 7,200-second build transport
+deadline. RCH verified that the remote process group was killed; supported
+recovery acknowledged terminal exit 137. It produced no completed CLI or runtime
+qualification. A new normal-cache attempt was refused before compilation by
+the excluded dashboard's sibling-path containment check (exit 103, zero cases).
+An explicit isolated-target retry uses two build jobs and a 14,400-second
+build-only deadline; release optimization and runtime acceptance limits are
+unchanged. Its verdict and the original full end-to-end rerun remain pending.
+The intended control is the actual published GNU v0.3.40 executable, SHA-256
 `009ee7b746daafc26ec5f1ffe7627b38a942a031710c0076de4075323de115b4`.
 Fresh release metadata, signed manifest, pinned-key Minisign verification and
 streaming archive-member equality were rechecked. Earlier private read-retry
-control results remain labeled as that separate subject. No release clearance
-or 25,100-message archive/HTTP qualification is claimed.
+control results remain labeled as that separate subject. The bounded HTTP pass
+above establishes neither complete 25,100-message archive qualification nor
+release clearance.
+
+The existing manual native workflow dispatch was accepted for published source
+`6e70244c` as run `41957916399`, but the latest read still reports `queued` with
+no jobs. Cancellation returned HTTP 409, "not been queued yet," despite that
+status. No hosted test executed or passed, and no cancellation is claimed.
 
 The initial cancellation-accounting fix and qualification tests are on main.
 Formatting, provenance, configuration parsing, and independent source review
 have passed; those checks are not native execution of the pool, HTTP, or recovery
-paths. Native execution evidence and its limits are recorded below. The
-25,100-message convergence and HTTP variants have not executed in this workspace.
+paths. Native execution evidence and its limits are recorded below. The failed
+large archive attempt and the bounded HTTP pass above do not establish complete
+large-mailbox qualification.
 The changes do not establish production-scale qualification or resolution of
 issue #374.
 
