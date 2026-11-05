@@ -1,5 +1,47 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 5 fresh-eyes continuation — EmeraldEagle
+
+The operator requested a meticulous review, fixes and continued Beads execution.
+This revises the existing checklist; it adds no runtime gate or status framework.
+Process worksheet: the operator is the consumer; their requested review and
+task-completion report is the gate; their explicit request supplies provenance.
+Retire this section as execution history after its findings are implemented or
+recorded on the original Beads. No integrity-control exception is needed for
+the checklist. The highest-value current repair candidate is obsolete-checkpoint
+rewinding after a failed save; implementation takes precedence over reporting.
+
+- [x] Refresh checkout, live mailbox health, ownership and governing constraints.
+- [x] Trace new checkpoint binding through selection, restore, repair and save.
+- [x] Complete diff and integration review of the earlier owned changes:
+  - [x] Shutdown notification/start/join ordering, including replay supervision;
+    original stop/join barriers remain and the separate detached startup gap .90 stays open.
+  - [x] Inbox identity retries, cancellation, cache scope and timestamp seeks;
+    retry only transient failures, preserve cancellation/non-busy errors, retain tie/page bounds.
+  - [x] Diagnostic tree/error propagation and independent retained golden checks.
+    Fresh shell syntax0 and real schema suite12cases/16assertions/0fail/0skip at20261105_202350.
+  - [x] Warmup child isolation and GH372 snapshot test changes; child-only foreign
+    archive sentinel and original counts/deadlines/assertions remain intact. No new native
+    execution or large-memory qualification claimed from this source review.
+- [ ] br-kp1in.95: preserve independently current memory on obsolete checkpoint reads.
+  - [x] Claim the candidate defect and reserve the existing code/evidence surfaces.
+  - [x] Add a private test-only regression: real mailbox, changed logical generation,
+    old checkpoint, real directory-blocked publication, real Git repair and a
+    second read of the obsolete snapshot. Production remains unchanged.
+  - [ ] Execute the unchanged-production negative at its intended progress assertion.
+  - [ ] Only after reproduction, fix the distinction between current process memory
+    and foreign disk hints; retain reset/refusal for unknown or changed bindings.
+  - [ ] Prove real message convergence and unchanged source rows/read/ACK receipts.
+  - [ ] Re-run original checkpoint/pool-reopen controls, all mandatory compiler
+    graphs, formatting and reviewed static findings on frozen final source.
+  - [ ] Fresh solo acceptance and second source review; record exact revision and
+    proof limitations before closing. No independent-review claim.
+- [ ] Use terminal findings to choose any further ready capability repair; keep
+  original .35/.87/capacity/reader/memory/platform/release criteria open unless
+  their original named probes actually pass.
+- [ ] Flush graph, verify empty cycles, commit/push owned changes, preserve evidence,
+  release reservations and account for every owned job.
+
 ## November 4 execution TODO — EmeraldEagle
 
 The operator explicitly requested implementation, systematic Beads execution and
