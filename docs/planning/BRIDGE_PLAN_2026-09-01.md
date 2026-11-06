@@ -2,12 +2,15 @@
 
 ## November 5 fresh-eyes continuation — EmeraldEagle
 
-Qualification is now pinned to published source5ec128ce, which includes
+Qualification is pinned to source5ec128ce, which includes
 971c1d2e's reviewed fixes plus the incoming descriptor-pressure and ATC work.
-Runtime code is identical to that commit; this checklist tracks pending gates.
-The native selection is77 unique cases:55 checkpoint,5 search,4 reservation,
-3 real OS spawn failures,8 existing queue/backlog/coalescer controls and2
-typed error-classifier controls, plus1 pre-existing ignored CPU benchmark.
+The only subsequent code overlay is an isomorphic ATC Option branch and doc
+paragraph correction for two actual strict Clippy errors. Native execution
+passes78 unique cases:55 checkpoint,5 search,5 reservation,3 real OS spawn
+failures,8 existing queue/backlog/coalescer controls and2 typed error-classifier
+controls. Eight fresh solo repeats also pass. Correction: the existing CPU
+comparison is an ordinary test and passed; the earlier ignored-case assumption
+was wrong. No test or ignore was changed, and its child is not counted twice.
 The classifier controls do not prove actual descriptor-limit exhaustion.
 Native compilation uses three advertised RCH slots; a four-slot request was
 refused before execution. Compiler gates and native test execution remain serial.
@@ -45,7 +48,7 @@ rewinding after a failed save; implementation takes precedence over reporting.
     Remote compilation0; client1 retrieval failure retained separately.
     Full original checkpoint-family baseline additionally executes52cases:
     51pass1fail/0ignored/992filtered in86.88s, exit101, only the new case fails.
-  - [ ] Validate the candidate distinction between current process memory and
+  - [x] Validate the candidate distinction between current process memory and
     foreign disk hints; retain reset/refusal for unknown or changed bindings.
     Compile it in a separate frozen checkout alongside the unchanged original
     probe to avoid another serial cold build. Publish/close only after both
@@ -56,19 +59,23 @@ rewinding after a failed save; implementation takes precedence over reporting.
       Final family is55cases; fresh obsolete_checkpoint selector is5cases.
       Source prefix follows canonical captured-binding ordering. CLI br-hb3mk
       remains peer partial progress, without a native/full-exclusion claim here.
-  - [ ] Prove real message convergence and unchanged source rows/read/ACK receipts.
+  - [x] Prove real message convergence and unchanged source rows/read/ACK receipts:
+    all55 checkpoint cases pass in113.16s; fresh obsolete-checkpoint5pass in21.03s.
   - [ ] Re-run original checkpoint/pool-reopen controls, all mandatory compiler
     graphs, formatting and reviewed static findings on frozen final source.
     - [x] Preserve the merged startup-search Clippy101 receipt (c526f06b,
       3,917 fresh inputs, zero mismatches); repair the lock-result expression
       and first documentation paragraph without suppressions or changed tests.
-    - [ ] Qualify that integration edit with the existing real Tantivy writer
+    - [x] Qualify that integration edit with the existing real Tantivy writer
       retention/error controls and all three cancelled-startup-backfill cases.
+      All5 pass in0.89s on the identified current DB executable.
     - [x] Preserve the next Clippy101 receipt (4a9b5a68, 3,917 fresh inputs,
       zero mismatches); box the existing private reservation helper's typed
       SQLModel error without changing SQL, parameters or retry classification.
-    - [ ] Run the original reservation-source functional controls; report the
-      pre-existing ignored CPU benchmark separately, without a performance claim.
+    - [x] Run the original reservation-source controls:5pass/0fail/0ignored in18.11s.
+      The CPU comparison was mistakenly described as ignored; it actually runs
+      an isolated child. Retain its query-only measurements without a server
+      performance claim or an extra count for that child.
     - [x] Preserve the actual server Clippy101 (`option_if_let_else`) and
       replace the branch with `map_or_else`, preserving both healing paths.
     - [ ] Re-run all-target, separate production and strict Clippy on the final
@@ -76,6 +83,11 @@ rewinding after a failed save; implementation takes precedence over reporting.
     - [x] Preserve the additional Clippy101 at the incoming TUI lifecycle query
       (4ccc0df1,3,917fresh/0mismatch); use `map_or` with identical SQL and
       parameter insertion. No lint allowance or new runtime feature claim.
+    - [x] Preserve final5ec Clippy101 at incoming ATC Option/doc lints:
+      receipt0ea4bd37 freshly matches3,917inputs. Correct lazy guard selection
+      and paragraph length without changing priorities or adding allowances.
+      Seven-file scan0critical/11,711warning/3,930info, no failed modules; fmt0.
+    - [ ] Complete strict Clippy and both compiler graphs with that ATC correction.
   - [ ] Fresh solo acceptance and second source review; record exact revision and
     proof limitations before closing. No independent-review claim.
 - [ ] br-kp1in.96 (dependency of .95): recover safely from archive worker spawn errors.
@@ -98,30 +110,33 @@ rewinding after a failed save; implementation takes precedence over reporting.
     Final native/compiler qualification is still pending.
   - [x] Assert that the caught coalescer panic specifically reports the second
     thread's spawn error, so an unrelated test-hook panic cannot satisfy refusal.
-  - [ ] Execute those three regressions and normal queue/backlog/coalescer controls.
+  - [x] Execute those three regressions and normal queue/backlog/coalescer controls:
+    3pass in0.20s and8pass in1.61s, with zero failures/ignores.
     - [x] Correct false WBQ progress on rejected thread creation; publish the
       baseline only after success and preserve any actual worker progress.
-    - [ ] Execute its unchanged-clock/real-drain assertions, both existing
+    - [x] Execute its unchanged-clock/real-drain assertions, both existing
       shutdown/restart controls, and fresh5-checkpoint/3-spawn acceptance replays.
+      Fresh spawn replay3pass in0.32s; same existing deadlines and serial execution.
   - [x] Verify the trusted current-executable permission-test false positive in
     the root/uid-drop branch: identified old ELFc94cc040 passes1/0/0 in0.02s.
     Retain the narrowly justified scanner annotations for final qualification.
   - [x] Keep planted untrusted-executable and unconditional-panic controls red:
     exact2critical/exit1; frozen v5 scan5files exits0/0critical,9,854warning,
     3,410info/0failed modules. No warning-free claim.
-  - [ ] Re-scan final source after the test synchronization correction; qualify
+  - [x] Re-scan final source after the test synchronization correction; qualify
     the intentional constructor-refusal annotation with the native rollback case.
     - [x] Preserve v8's six-file scan1critical: the existing cfg(test) synthetic
       registration token is a fixture, never a deployed credential. Main's
       line-specific annotation retains the exact value and all assertions.
       Its TUI scan exits0/0critical. Expanded same-file countercontrol retains
       all three planted hazards (including a credential literal), exit1/3critical.
-    - [ ] Complete final six-file scan and compiler graphs on annotated main;
-      keep active private v8 compiler/native snapshots unchanged until terminal.
+    - [x] Complete final seven-file scan; constructor rollback passes on the
+      real OS failure after an observed live first worker. Planted hazards stay red.
   - [ ] Complete the same frozen-source mandatory compiler graphs and formatting,
     then freshly re-execute acceptance before any closure. No global lazy-pool
     restartability, loaded shutdown, performance or release qualification claim.
-- [ ] Use terminal findings to choose any further ready capability repair; keep
+- [x] Use terminal findings to choose the actual incoming ATC compiler repair;
+  refresh the ready graph (47 open ready issues at this observation). Keep
   original .35/.87/capacity/reader/memory/platform/release criteria open unless
   their original named probes actually pass.
 - [ ] Flush graph, verify empty cycles, commit/push owned changes, preserve evidence,

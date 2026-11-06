@@ -471,10 +471,11 @@ with committed runtime code and three documentation-only overlays. Commit
 `971c1d2e` already contains the six reviewed files, including bounded journal-claim
 release waiting, the exact constructor-spawn panic reason and the progress-clock
 correction. Main and the frozen candidate contained identical reviewed code at
-preparation. Formatting passes; native/compiler qualification remains pending.
-Native positive execution and final
-compiler qualification are pending; the earlier `.94` receipts do not qualify
-this candidate. Raw attempts are retained under
+preparation. Subsequent strict Clippy found two errors in incoming ATC code;
+the final overlay adds only an isomorphic lazy Option branch and documentation
+paragraph split, preserving guard priority. Formatting passes. Native execution
+is complete; compiler qualification remains pending. Earlier `.94` receipts do
+not qualify this candidate. Raw attempts are retained under
 `/data/tmp/am-fresh-eyes-20261105.n3gaE0Mt`.
 
 Canonical checkpoint repair6684bcfd and CLI admission workd903bf5a arrived
@@ -507,9 +508,30 @@ coalescer startup. The candidate retains staged operations/journal ownership
 when a consumer cannot start and joins every earlier constructor worker before
 a later spawn refusal unwinds. Three new Linux x86_64 tests request an impossible
 stack allocation, using the real operating-system error, retained signals,
-real message archives and an observed live first worker. They are integrated,
-not yet executed. Global lazy-pool restartability and loaded shutdown are not
-claimed.
+real message archives and an observed live first worker. All three pass, as
+do the eight normal worker/queue controls. Global lazy-pool restartability and
+loaded shutdown are not claimed.
+
+Final-source native build receipt `fe78d8a2e748be4655e058199e6513bbe37dc8c24df668ccdffbf93416756803`
+freshly matches all3,917 input records. Cargo and client exit0, terminal
+acknowledgement true. The 105,417,096-byte storage test image has SHA-256
+`befb9603cd6ca8435d8755cf5e8e0969308ee8dc400714c270513b3b9d502372`;
+the 147,628,992-byte DB image is
+`a3a43978dc75cd134c2a0e6f9858531aeb5ed40a514023a7c1d16cb3b8761bff`.
+Producer, worker-retained and local images match before and after execution.
+The final build after the ATC-only correction produces those same images.
+
+Actual unique native results are checkpoint55pass (113.16s), real search5pass
+(0.89s), reservation-source5pass (18.11s), real spawn failures3pass (0.20s),
+normal worker controls8pass (1.61s) and typed FD classifiers2pass. Fresh solo
+checkpoint5pass (21.03s) and spawn3pass (0.32s) are repeats, not independent
+review. Total78 unique tests, eight repeats, zero failures or ignores.
+Correction: planning wrongly described the existing reservation CPU comparison
+as ignored. It is an ordinary test in the pinned source and also passed; its
+child1pass is not another unique test. No test or ignore changed. Its real
+incumbent/candidate query measurements remain query-only evidence, with no
+running-server performance claim. The other77 cases match the predeclared
+functional selection.
 
 Raw four-file UBS first reported4critical. Two actual worker panic boundaries
 are repaired. The remaining deliberate constructor refusal now has rollback;
@@ -517,9 +539,14 @@ the permission test executes only a retained current-executable descriptor,
 then drops uid/gid. Its original root branch passed1/0/0 on the identified old
 ELF. Both narrowly annotated lines retain their behavior. A separate planted
 untrusted executable and unconditional panic still produce exactly2critical
-in the same annotated countercontrol file. Final five-file UBS exits0 with
+in the same annotated countercontrol file. Earlier five-file UBS exits0 with
 0critical,9,854warning,3,410info and no failed modules; this is not warning-free
-or release clearance. Formatting exits0. All first failures are retained.
+or release clearance. The final seven-file scan exits0 with0critical,
+11,711warning,3,930info and no failed module. All three planted hazards remain
+red in the expanded countercontrol. Formatting exits0. All first failures are
+retained, including ATC Clippy101 receipt `0ea4bd37` (3,917fresh/0mismatch),
+the incorrect ignored-case planning/parser assumption and normal disk-admission
+refusals. No compiler allowance, resource floor or runtime deadline changed.
 
 ### Filled anti-ceremony worksheets (solo; provisional until qualification)
 
