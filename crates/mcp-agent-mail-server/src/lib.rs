@@ -1485,11 +1485,10 @@ fn heal_storage_lock_artifacts(
     config: &mcp_agent_mail_core::Config,
     control: Option<&StartupWorkerControl>,
 ) {
-    let result = if let Some(control) = control {
-        mcp_agent_mail_storage::heal_archive_locks_cancellable(config, &control.stopped)
-    } else {
-        mcp_agent_mail_storage::heal_archive_locks(config)
-    };
+    let result = control.map_or_else(
+        || mcp_agent_mail_storage::heal_archive_locks(config),
+        |control| mcp_agent_mail_storage::heal_archive_locks_cancellable(config, &control.stopped),
+    );
     match result {
         Ok(report) => {
             if !report.locks_quarantined.is_empty() || !report.metadata_quarantined.is_empty() {

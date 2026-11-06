@@ -1986,6 +1986,83 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_checkpoint_failed_replacement_preserves_current_memory_progress() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (old, _) = seed_obsolete_progress(cx, pool, config);
+            let path = old.path.clone();
+            let original = std::fs::read(&path).unwrap();
+            change_logical_generation(cx, pool, &old.binding.database_generation);
+            drop(old);
+
+            let saved_path = path.with_extension("json.before-failed-replacement");
+            let blocked_path = path.with_extension("json.retained-blocker");
+            let observed_path = path.clone();
+            let retained_path = saved_path.clone();
+            let fired = std::sync::Arc::new(AtomicBool::new(false));
+            let observed = fired.clone();
+            let scan = super::super::super::cancellable_tests::ObserveScan::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    // Read the obsolete snapshot first, then cause a real
+                    // publication refusal without deleting the old evidence.
+                    std::fs::rename(&observed_path, &retained_path).unwrap();
+                    std::fs::create_dir(&observed_path).unwrap();
+                    std::thread::sleep(super::super::MAX_BATCH_TURN);
+                }
+            });
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let stop = AtomicBool::new(false);
+            let first = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            drop(scan);
+            assert!(fired.load(Ordering::Acquire));
+            assert_eq!(first.scanned, 1);
+            assert_eq!(first.repaired, 1);
+            assert_eq!(first.deferred, 0);
+            assert!(!first.interrupted && first.budget_exhausted);
+            assert!(!first.checkpoint_restored);
+            assert_eq!(first.checkpoint_saved, Some(false));
+            assert!(cursor.checkpoint_dirty);
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
+
+            std::fs::rename(&path, &blocked_path).unwrap();
+            std::fs::rename(&saved_path, &path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            let current = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            assert_eq!(
+                cursor.checkpoint_source_binding.as_ref(),
+                Some(&current.binding)
+            );
+            let progress = (cursor.tail_after, cursor.backfill_ceiling);
+            assert_eq!(progress.0, Some(941 - super::super::IDS_PER_LANE));
+            assert!(current.restore(&mut cursor).is_err());
+            assert_eq!(
+                (cursor.tail_after, cursor.backfill_ceiling),
+                progress,
+                "an obsolete disk checkpoint must not rewind independently current memory after a failed save"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            drop(current);
+
+            let mut repaired = first.repaired;
+            for _ in 0..40 {
+                let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(report.checkpoint_saved, Some(true));
+                assert!(!report.interrupted);
+                assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+                assert!(report.repaired <= super::super::MAX_REPAIRS_PER_BATCH);
+                assert_eq!(report.deferred, 0);
+                repaired += report.repaired;
+                if repaired == 40 {
+                    break;
+                }
+            }
+            assert_eq!(repaired, 40, "all current-source messages must converge");
+            for id in 901..=940 {
+                assert_message_committed(cx, pool, config, id, 40);
+            }
+        });
+    }
+
+    #[test]
     fn obsolete_checkpoint_preserves_current_progress_after_real_publication_failure() {
         super::super::tests::retention_fixture(40, |cx, pool, config| {
             let (previous, mut cursor) = seed_obsolete_progress(cx, pool, config);

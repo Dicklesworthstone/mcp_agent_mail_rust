@@ -67,13 +67,15 @@ fn query_reservation_source(
     conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     max_source_bytes: i64,
-) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, mcp_agent_mail_db::sqlmodel_core::Error> {
+) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, Box<mcp_agent_mail_db::sqlmodel_core::Error>>
+{
     #[cfg(test)]
     tests::record_reservation_source_query();
     conn.query_sync(
         RESERVATION_SOURCE_SQL,
         &[id.into(), max_source_bytes.into()],
     )
+    .map_err(Box::new)
 }
 
 /// A ref that cannot be followed because its target object is missing

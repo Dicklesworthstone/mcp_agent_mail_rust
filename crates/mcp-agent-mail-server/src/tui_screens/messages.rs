@@ -935,12 +935,10 @@ fn query_compose_agents(
         },
         |project_id| ("?", vec![Value::BigInt(project_id)]),
     );
-    let name_filter = if let Some(name) = name {
+    let name_filter = name.map_or("", |name| {
         params.push(Value::Text(name.to_string()));
         " AND name = ? COLLATE NOCASE"
-    } else {
-        ""
-    };
+    });
     query_compose_agent_rows(
         query,
         &format!("project_id = {project}{name_filter}"),
@@ -8918,7 +8916,7 @@ first body
     #[test]
     fn compose_sender_heartbeat_preserves_committed_profile_and_refuses_inactive_identity() {
         let (_dir, config, conn) = compose_lifecycle_fixture();
-        let token = "synthetic-operator-registration-secret";
+        let token = "synthetic-operator-registration-secret"; // ubs:ignore -- synthetic token confined to this cfg(test) temporary DB fixture; never a deployed credential.
         conn.execute_sync(
             "INSERT INTO agents (id, project_id, name, program, model, task_description, \
              inception_ts, last_active_ts, contact_policy, reaper_exempt, registration_token) \

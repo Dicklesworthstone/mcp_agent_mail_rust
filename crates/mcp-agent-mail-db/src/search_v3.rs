@@ -1622,7 +1622,7 @@ fn with_tantivy_writer_policy<T>(
     cancelled: Option<&AtomicBool>,
     operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
 ) -> Result<T, String> {
-    let acquired = if cancelled.is_some() {
+    let mut slot = match if cancelled.is_some() {
         loop {
             backfill_checkpoint(cancelled)?;
             match bridge.writer.try_lock() {
@@ -1637,8 +1637,7 @@ fn with_tantivy_writer_policy<T>(
         }
     } else {
         bridge.writer.lock()
-    };
-    let mut slot = match acquired {
+    } {
         Ok(guard) => guard,
         Err(poisoned) => {
             // A panic mid-write leaves the retained writer in an unknown
@@ -1695,6 +1694,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
 }
 
 /// Run the ordinary startup backfill while its server still owns the mailbox.
+///
 /// Cancellation interrupts local lock/retry waits and checks each scan page
 /// and publication boundary. An in-flight native operation finishes before
 /// returning; callers must still join their worker before releasing authority.

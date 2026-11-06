@@ -1209,6 +1209,32 @@ pub fn archive_epoch_read_stamp(storage_root: &Path) -> Result<Option<ArchiveEpo
     }))
 }
 
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+std::thread_local! {
+    static STORAGE_WORKER_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static COALESCER_AFTER_SPAWN_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn storage_worker_stack_size() -> usize {
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    if STORAGE_WORKER_FAIL_AFTER.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            false
+        }
+        None => false,
+    }) {
+        // Page-aligned and larger than Linux x86_64's entire user address
+        // space. Exercise the real OS spawn error, not an injected Result.
+        return 1_usize << 62;
+    }
+    mcp_agent_mail_core::worker_stack_size()
+}
+
 fn new_write_behind_queue() -> WriteBehindQueue {
     let op_depth = Arc::new(AtomicU64::new(0));
     let channel_capacity = Config::get().wbq_channel_capacity;
@@ -1256,10 +1282,6 @@ fn wbq_start_locked(wbq: &WriteBehindQueue, _lifecycle: &std::sync::MutexGuard<'
     let channel_capacity = config.wbq_channel_capacity;
     let drain_batch_cap = config.wbq_drain_batch_cap;
     let (tx, rx) = std::sync::mpsc::sync_channel(channel_capacity);
-    // A (re)started drain is the progress baseline: salvaged ops it never
-    // drains still read as stalled (br-kp1in.23).
-    WBQ_LAST_PROGRESS_US.store(now_micros_u64().max(1), Ordering::Relaxed);
-
     // br-b9x63: a dead drain thread leaves its buffered ops in the old
     // channel. Salvage them into the fresh channel instead of silently
     // dropping them, and reconcile op_depth/wbq_depth to what the fresh
@@ -1328,9 +1350,11 @@ fn wbq_start_locked(wbq: &WriteBehindQueue, _lifecycle: &std::sync::MutexGuard<'
     });
     let receiver_slot = Arc::clone(&wbq.receiver_slot);
     let op_depth_worker = Arc::clone(&wbq.op_depth);
+    let previous_progress_us = WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed);
+    let started_at_us = now_micros_u64().max(1);
     let handle = std::thread::Builder::new()
         .name("wbq-drain".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
+        .stack_size(storage_worker_stack_size())
         .spawn(move || {
             wbq_drain_loop(
                 receiver_slot,
@@ -1338,9 +1362,29 @@ fn wbq_start_locked(wbq: &WriteBehindQueue, _lifecycle: &std::sync::MutexGuard<'
                 channel_capacity,
                 drain_batch_cap,
             );
-        })
-        .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
+        });
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            // The staged receiver retains salvaged operations. Do not publish
+            // a sender without its consumer: callers already handle rejection.
+            *wbq.sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            tracing::error!(%error, "wbq drain could not start; retained work remains retryable");
+            return;
+        }
+    };
 
+    // A successfully (re)started drain establishes a progress baseline for
+    // salvaged ops (br-kp1in.23). A failed attempt is not progress, and a
+    // newly running worker may already have recorded actual progress.
+    let _ = WBQ_LAST_PROGRESS_US.compare_exchange(
+        previous_progress_us,
+        started_at_us,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
     *wbq.sender
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
@@ -3150,9 +3194,17 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
     }
     let handle = std::thread::Builder::new()
         .name("archive-backlog-drain".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || archive_backlog_drain_loop(backlog))
-        .unwrap_or_else(|error| panic!("failed to spawn archive-backlog-drain thread: {error}"));
+        .stack_size(storage_worker_stack_size())
+        .spawn(move || archive_backlog_drain_loop(backlog));
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Journal ownership and queued entries remain intact. Another
+            // handoff, recovery or flush can retry creating the consumer.
+            tracing::error!(%error, "archive backlog drain could not start; journals remain retained");
+            return;
+        }
+    };
     *backlog
         .drain_handle
         .lock()
@@ -6232,6 +6284,34 @@ fn coalescer_worker_count() -> usize {
         .clamp(2, max_workers)
 }
 
+struct CoalescerStartup {
+    handles: Vec<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    work_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
+    committed: bool,
+}
+
+impl Drop for CoalescerStartup {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        {
+            let (lock, wake) = &*self.work_cv;
+            let _guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.shutdown.store(true, Ordering::Release);
+            wake.notify_all();
+        }
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                tracing::warn!("coalescer startup worker panicked during rollback");
+            }
+        }
+    }
+}
+
 impl CommitCoalescer {
     /// Create a new coalescer and spawn the worker pool.
     pub fn new(flush_interval: Duration) -> Self {
@@ -6246,6 +6326,12 @@ impl CommitCoalescer {
         let force_flush = Arc::new(AtomicBool::new(false));
 
         let worker_count = coalescer_worker_count();
+        let mut startup = CoalescerStartup {
+            handles: Vec::with_capacity(worker_count),
+            shutdown: Arc::clone(&shutdown),
+            work_cv: Arc::clone(&work_cv),
+            committed: false,
+        };
 
         for worker_idx in 0..worker_count {
             let w_repos = Arc::clone(&repos);
@@ -6256,9 +6342,9 @@ impl CommitCoalescer {
             let w_sizes = Arc::clone(&batch_sizes);
             let w_pending = Arc::clone(&pending_requests);
 
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("commit-coalescer-{worker_idx}"))
-                .stack_size(mcp_agent_mail_core::worker_stack_size())
+                .stack_size(storage_worker_stack_size())
                 .spawn(move || {
                     // I5 (br-bvq1x.9.5): mark this worker alive for its whole
                     // lifetime. The guard's Drop decrements even on panic unwind,
@@ -6277,8 +6363,15 @@ impl CommitCoalescer {
                     );
                 })
                 .unwrap_or_else(|error| {
-                    panic!("failed to spawn commit-coalescer-{worker_idx} thread: {error}")
+                    panic!("failed to spawn commit-coalescer-{worker_idx} thread: {error}") // ubs:ignore -- constructor refuses an unavailable pool; startup rollback joins all earlier workers before unwinding completes.
                 });
+            startup.handles.push(handle);
+            #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+            COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(worker_idx);
+                }
+            });
         }
 
         // I5: record how many workers should stay alive so health can detect
@@ -6290,7 +6383,7 @@ impl CommitCoalescer {
             .commit_soft_cap
             .set(COMMIT_COALESCER_SOFT_CAP);
 
-        Self {
+        let coalescer = Self {
             repos,
             work_cv,
             shutdown,
@@ -6299,7 +6392,9 @@ impl CommitCoalescer {
             pending_requests,
             _batch_sizes: batch_sizes,
             worker_count,
-        }
+        };
+        startup.committed = true;
+        coalescer
     }
 
     /// Get or create a per-repo queue for the given `repo_root`.
@@ -8935,9 +9030,11 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     heal_archive_locks_with_checkpoint(config, &|| Ok(()))
 }
 
-/// Heal startup lock artifacts until shutdown is requested. Completed
-/// quarantines are preserved, but an interrupted scan is never reported as a
-/// completed scan. The owner must join the caller before releasing authority.
+/// Heal startup lock artifacts until shutdown is requested.
+///
+/// Completed quarantines are preserved, but an interrupted scan is never
+/// reported as a completed scan. The owner must join the caller before
+/// releasing authority.
 pub fn heal_archive_locks_cancellable(
     config: &Config,
     cancelled: &AtomicBool,
@@ -22244,7 +22341,7 @@ mod tests {
             };
             #[cfg(not(target_os = "linux"))]
             let executable_path = std::env::current_exe().unwrap();
-            let output = std::process::Command::new(executable_path)
+            let output = std::process::Command::new(executable_path) // ubs:ignore -- retained current_exe descriptor, no external program input; child drops uid/gid.
                 .args([
                     "--exact",
                     "tests::test_file_lock_stale_cleanup_permission_denied_returns_false",
@@ -27727,6 +27824,219 @@ mod tests {
         if let Some(h) = handle {
             let _ = h.join();
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn wbq_spawn_failure_retains_staged_work_until_retry() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_spawn_failure_retains_staged_work_until_retry",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal = config
+            .notifications_signals_dir
+            .join("projects/spawn-retry/agents/Retained.signal");
+        let wbq = new_write_behind_queue();
+        let (old_tx, old_rx) = std::sync::mpsc::sync_channel(1);
+        old_tx
+            .try_send(WbqMsg::Op(WbqOpEnvelope {
+                enqueued_at: Instant::now(),
+                op: Box::new(WriteOp::NotificationSignal {
+                    config,
+                    project_slug: "spawn-retry".to_string(),
+                    agent_name: "Retained".to_string(),
+                    metadata: None,
+                }),
+            }))
+            .unwrap();
+        *wbq.receiver_slot.lock().unwrap() = Some(old_rx);
+        wbq.op_depth.store(1, Ordering::Relaxed);
+
+        let progress_before = WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed);
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| remaining.set(Some(0)));
+        wbq_start_inner(&wbq);
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| assert_eq!(remaining.get(), None));
+        assert!(wbq_sender_clone(&wbq).is_none());
+        assert!(wbq.drain_handle.lock().is_none());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert!(wbq.receiver_slot.lock().unwrap().is_some());
+        assert!(!signal.exists());
+        assert_eq!(
+            WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed),
+            progress_before
+        );
+
+        wbq_start_inner(&wbq);
+        let sender = wbq_sender_clone(&wbq).expect("retry publishes a working sender");
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        sender.send(WbqMsg::Flush(done_tx)).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert!(signal.is_file(), "retained operation must actually execute");
+        assert!(WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed) > progress_before);
+        wbq_shutdown_inner(&wbq, Duration::from_secs(10), Duration::from_secs(5));
+        assert!(wbq.drain_handle.lock().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn archive_backlog_spawn_failure_retains_journal_and_claim_until_retry() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_spawn_failure_retains_journal_and_claim_until_retry",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "spawn-retry";
+        let archive = ensure_archive(&config, project).unwrap();
+        let op = backlog_test_message_op(&config, project, 97);
+        let expected = serde_json::to_vec(&PersistedWriteOp::from_op(&op)).unwrap();
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| remaining.set(Some(0)));
+        assert_eq!(archive_backlog_push(op), ArchiveBacklogPush::Queued);
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| assert_eq!(remaining.get(), None));
+        let backlog = &*ARCHIVE_BACKLOG;
+        assert!(backlog.drain_handle.lock().unwrap().is_none());
+        assert_eq!(archive_backlog_depth(), 1);
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), expected);
+        assert!(backlog.owned_journals.lock().unwrap().contains(&journal));
+
+        // Retirement empties the queue before releasing its claim. Hold that
+        // real mutex to expose this window deterministically: an immediate
+        // post-flush claim-absent assertion would fail despite a healthy drain.
+        let owned = backlog.owned_journals.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(archive_backlog_flush_blocking(
+            deadline.saturating_duration_since(Instant::now())
+        ));
+        assert!(owned.contains(&journal));
+        drop(owned);
+        while backlog.owned_journals.lock().unwrap().contains(&journal) {
+            assert!(
+                Instant::now() < deadline,
+                "journal claim must retire after draining"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(archive_backlog_depth(), 0);
+        assert_eq!(
+            fs::read(
+                journal
+                    .parent()
+                    .unwrap()
+                    .join("resolved")
+                    .join(journal.file_name().unwrap())
+            )
+            .unwrap(),
+            expected
+        );
+        let WriteOp::MessageBundle {
+            message_json,
+            sender,
+            recipients,
+            body_md,
+            ..
+        } = backlog_test_message_op(&config, project, 97)
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            let (actual, body) = read_message_file(path).unwrap();
+            assert_eq!(actual["id"], 97);
+            assert_eq!(body.trim(), body_md);
+        }
+        flush_async_commits();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn coalescer_spawn_failure_joins_already_started_workers() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_spawn_failure_joins_already_started_workers",
+        ) {
+            return;
+        }
+        assert_eq!(coalescer_worker_count(), 2);
+        assert_eq!(COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed), 0);
+        COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|index| {
+                assert_eq!(index, 0);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed) != 1 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "first worker must actually start"
+                    );
+                    std::thread::yield_now();
+                }
+            }));
+        });
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| remaining.set(Some(1)));
+        let result = std::panic::catch_unwind(|| CommitCoalescer::new(Duration::from_secs(60)));
+        COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| assert_eq!(remaining.get(), None));
+        let Err(error) = result else {
+            panic!("unavailable pool must refuse construction");
+        };
+        let message = error
+            .downcast_ref::<String>()
+            .expect("formatted spawn error");
+        assert!(
+            message.starts_with("failed to spawn commit-coalescer-1 thread: "),
+            "{message}"
+        );
+        assert_eq!(
+            COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed),
+            0,
+            "earlier worker must be joined before constructor refusal returns"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(
+            tmp.path().join("retry.txt"),
+            b"real commit after spawn refusal\n",
+        )
+        .unwrap();
+        let coalescer = CommitCoalescer::new(Duration::from_millis(10));
+        coalescer.enqueue(
+            tmp.path().to_path_buf(),
+            &config,
+            "retry".to_string(),
+            vec!["retry.txt".to_string()],
+        );
+        coalescer.flush_sync();
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new("retry.txt")).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            b"real commit after spawn refusal\n"
+        );
     }
 
     #[test]
