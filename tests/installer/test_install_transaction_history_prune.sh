@@ -34,7 +34,8 @@ extract="$tmp/prune_functions.sh"
     echo 'info() { printf "INFO %s\n" "$*" >&2; }'
     echo 'warn() { printf "WARN %s\n" "$*" >&2; }'
     echo 'err() { printf "ERROR %s\n" "$*" >&2; }'
-    for fn in installer_directory_identity installer_lock_fd_identity \
+    for fn in installer_path_owner_uid installer_path_mode ensure_real_directory_tree \
+        installer_directory_identity installer_lock_fd_identity \
         installer_kernel_lock verify_installer_lock_authorities \
         release_installer_lock acquire_installer_lock \
         binary_transaction_history_in_use prune_binary_transaction_history; do
@@ -100,9 +101,11 @@ test_locked_history_prune() (
 
     acquire_installer_lock "$locked_dest" destination \
         || fail "$scenario: cannot acquire the actual destination lock"
+    mkdir -m 700 "$original_expected/${DESTINATION_LOCK_DIR##*/}" \
+        || fail "$scenario: cannot preserve private lock directory expectation"
     # A separately opened descriptor must be refused by the kernel. Closing
     # the child's inherited descriptor does not release the parent's owner.
-    (exec 8<&-; exec 8<"$locked_dest" || exit 91; installer_kernel_lock 8 acquire) \
+    (exec 8<&-; exec 8<"$DESTINATION_LOCK_DIR" || exit 91; installer_kernel_lock 8 acquire) \
         || contender_rc=$?
     [ "$contender_rc" -eq 1 ] || fail "$scenario: independent contender was not excluded"
 
@@ -167,11 +170,11 @@ test_locked_history_prune() (
             || fail "$scenario: replacement unexpectedly has the original lock"
     fi
     contender_rc=0
-    (exec 8<&-; exec 8<"$original_after" || exit 91; installer_kernel_lock 8 acquire) \
+    (exec 8<&-; exec 8<"$original_after/${DESTINATION_LOCK_DIR##*/}" || exit 91; installer_kernel_lock 8 acquire) \
         || contender_rc=$?
     [ "$contender_rc" -eq 1 ] || fail "$scenario: pruning released the held authority"
     release_installer_lock destination || fail "$scenario: cannot release the owned descriptor"
-    (exec 8<"$original_after" || exit 91; installer_kernel_lock 8 acquire) \
+    (exec 8<"$original_after/${DESTINATION_LOCK_DIR##*/}" || exit 91; installer_kernel_lock 8 acquire) \
         || fail "$scenario: original directory stayed locked after final release"
 )
 
@@ -249,10 +252,13 @@ mkdir -p "$dest4"
 in_use=$(make_entry "$dest4" committed 401 202604010000)
 make_entry "$dest4" committed 402 202604020000 >/dev/null
 newest4=$(make_entry "$dest4" committed 403 202604030000)
-sleep_bin=$(command -v sleep)
-cp "$sleep_bin" "$in_use/old-cli"
+cp "$BASH" "$in_use/old-cli"
 chmod 755 "$in_use/old-cli"
-"$in_use/old-cli" 300 &
+# A renamed multicall utility may exit before the liveness check. A real Bash
+# executable waiting in its read builtin remains mapped at this exact copy,
+# with no child process to orphan when the holder is stopped.
+mkfifo "$tmp/holder.fifo"
+"$in_use/old-cli" -c 'IFS= read -r -t 300 <&3' 3<>"$tmp/holder.fifo" &
 holder_pid=$!
 # Give the exec a moment to land so /proc/<pid>/exe names the copy.
 for _ in 1 2 3 4 5 6 7 8 9 10; do

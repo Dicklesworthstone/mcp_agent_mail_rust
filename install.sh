@@ -75,8 +75,8 @@ MINISIGN_BIN=""
 RELEASE_TRUST_MODEL=""
 EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-# The destination inode is the primary lock authority. An explicit override
-# adds an auxiliary lock; TMPDIR never chooses who may install to a directory.
+# A private directory within the destination carries the per-user kernel lock.
+# An explicit override adds an auxiliary lock; TMPDIR never selects authority.
 LOCK_FILE="${AM_INSTALL_LOCK_FILE:-}"
 SYSTEM=0
 NO_GUM=0
@@ -2368,7 +2368,7 @@ git_authority_probe() (
 git_worktree_root_for_path() {
   local candidate="$1"
   local cursor="$candidate"
-  local root=""
+  local root="" bare=""
 
   [ -n "$candidate" ] || return 2
   command -v git >/dev/null 2>&1 || return 2
@@ -2395,7 +2395,8 @@ git_worktree_root_for_path() {
 
   # A bare repository is also an unsafe destination for token material even
   # though it has no worktree root.
-  if [ "$(git_authority_probe -C "$cursor" rev-parse --is-bare-repository 2>/dev/null || true)" = "true" ]; then
+  bare=$(git_authority_probe -C "$cursor" rev-parse --is-bare-repository 2>/dev/null || true)
+  if [ "$bare" = "true" ]; then
     return 2
   fi
 
@@ -7908,17 +7909,9 @@ ensure_rust() {
     return 0
   fi
   if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
-  if [ "$EASY" -ne 1 ]; then
-    if [ -t 0 ]; then
-      echo -n "Install Rust nightly via rustup? (y/N): "
-      read -r ans
-      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
-    fi
-  fi
-  info "Installing rustup (nightly)"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
-  export PATH="$HOME/.cargo/bin:$PATH"
-  rustup component add rustfmt clippy || true
+  err "Building from source requires an installed Rust nightly toolchain."
+  err "Install it with your trusted toolchain manager, then rerun with --from-source."
+  return 1
 }
 
 checkout_exact_release_source() {
@@ -9068,10 +9061,18 @@ PY
 verify_installer_lock_authorities() {
   local identity=""
   if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    identity=$(installer_directory_identity "$DESTINATION_TARGET_DIR") || identity=""
+    if [ -z "$identity" ] || [ "$identity" != "$DESTINATION_TARGET_IDENTITY" ] || \
+       [ "$(installer_path_owner_uid "$DESTINATION_TARGET_DIR")" != "$DESTINATION_TARGET_UID" ]; then
+      err "Install destination changed after lock acquisition; refusing pathname mutations: $DESTINATION_TARGET_DIR"
+      return 1
+    fi
     identity=$(installer_directory_identity "$DESTINATION_LOCK_DIR") || identity=""
     if [ -z "$identity" ] || [ "$identity" != "$DESTINATION_LOCK_IDENTITY" ] || \
-       [ "$(installer_lock_fd_identity 8)" != "$identity" ]; then
-      err "Install destination changed after lock acquisition; refusing pathname mutations: $DESTINATION_LOCK_DIR"
+       [ "$(installer_lock_fd_identity 8)" != "$identity" ] || \
+       [ "$(installer_path_owner_uid "$DESTINATION_LOCK_DIR")" != "$DESTINATION_LOCK_UID" ] || \
+       [ "$(installer_path_mode "$DESTINATION_LOCK_DIR")" != 700 ]; then
+      err "Private installer lock authority changed; refusing pathname mutations: $DESTINATION_LOCK_DIR"
       return 1
     fi
   fi
@@ -9195,6 +9196,10 @@ LOCK_IDENTITY=""
 DESTINATION_LOCK_DIR=""
 DESTINATION_LOCKED=0
 DESTINATION_LOCK_IDENTITY=""
+DESTINATION_LOCK_UID=""
+DESTINATION_TARGET_DIR=""
+DESTINATION_TARGET_IDENTITY=""
+DESTINATION_TARGET_UID=""
 TMP=""
 trap cleanup EXIT
 trap 'handle_binary_transaction_signal HUP 129' HUP
@@ -9206,7 +9211,39 @@ acquire_installer_lock() {
   local lock_dir="$1"
   local lock_kind="$2"
   local identity="" fd="" original_cwd="" acquired=0
+  local target_dir="" target_identity="" target_uid="" lock_uid="" authority_uid=""
   case "$lock_kind" in initial) fd=7 ;; destination) fd=8 ;; *) return 1 ;; esac
+  if [ "$lock_kind" = destination ]; then
+    target_dir="$lock_dir"
+    target_identity=$(installer_directory_identity "$target_dir") || {
+      err "Install destination is not a non-symlink directory: $target_dir"
+      return 1
+    }
+    lock_uid=$(id -u) || return 1
+    [[ "$lock_uid" =~ ^[0-9]+$ ]] || return 1
+    target_uid=$(installer_path_owner_uid "$target_dir") || return 1
+    # The directory owner and a privileged system installer must rendezvous on
+    # one lock, even when root installs into a user-owned /usr/local/bin.
+    if [ "$lock_uid" != "$target_uid" ] && [ "$lock_uid" != 0 ]; then
+      err "Install destination must be owned by the installing user (or use a privileged installer): $target_dir"
+      return 1
+    fi
+    lock_dir="${target_dir%/}/.mcp-agent-mail-install.lock.${target_uid}.d"
+    # A read-only open of a public bin directory lets an unrelated UID flock
+    # that inode and deny installation. Never lock that public object. Keep
+    # this owner-only authority stable instead; release only its descriptor.
+    if ! (umask 077; ensure_real_directory_tree "$lock_dir" "private installer lock") || \
+       [ "$(installer_path_mode "$lock_dir")" != 700 ]; then
+      err "Installer lock must be an owner-only non-symlink directory: $lock_dir"
+      return 1
+    fi
+    authority_uid=$(installer_path_owner_uid "$lock_dir") || return 1
+    if { [ "$authority_uid" != "$target_uid" ] && [ "$authority_uid" != 0 ]; } || \
+       { [ "$lock_uid" != "$authority_uid" ] && [ "$lock_uid" != 0 ]; }; then
+      err "Installer lock authority belongs to another user; use its privileged owner: $lock_dir"
+      return 1
+    fi
+  fi
   identity=$(installer_directory_identity "$lock_dir") || {
     err "Installer lock authority is not a non-symlink directory: $lock_dir"
     return 1
@@ -9226,7 +9263,11 @@ acquire_installer_lock() {
   if [ "$acquired" -eq 1 ]; then
     case "$lock_kind" in
       initial) LOCKED=1; LOCK_DIR="$lock_dir"; LOCK_IDENTITY="$identity" ;;
-      destination) DESTINATION_LOCKED=1; DESTINATION_LOCK_DIR="$lock_dir"; DESTINATION_LOCK_IDENTITY="$identity" ;;
+      destination)
+        DESTINATION_LOCKED=1; DESTINATION_LOCK_DIR="$lock_dir"; DESTINATION_LOCK_IDENTITY="$identity"
+        DESTINATION_LOCK_UID="$authority_uid"; DESTINATION_TARGET_DIR="$target_dir"
+        DESTINATION_TARGET_IDENTITY="$target_identity"; DESTINATION_TARGET_UID="$target_uid"
+        ;;
     esac
     if verify_installer_lock_authorities; then return 0; fi
     release_installer_lock "$lock_kind" || true
@@ -9238,8 +9279,8 @@ acquire_installer_lock() {
   return 1
 }
 
-# Create only the destination before locking its inode; persistent install
-# state and recovery remain behind the destination lock.
+# Create the destination and its private lock authority before acquisition;
+# persistent install state and recovery remain behind that kernel lock.
 if ! ensure_real_directory_tree "$DEST" "install destination"; then
   err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
   exit 1
@@ -9247,14 +9288,17 @@ fi
 acquire_installer_lock "$DEST" destination || exit 1
 if [ -n "$LOCK_FILE" ]; then
   LOCK_DIR="${LOCK_FILE}.d"
-  if ! (umask 077; ensure_real_directory_tree "$LOCK_DIR" "additional installer lock") || \
-     [ "$(installer_path_owner_uid "$LOCK_DIR")" != "$(id -u)" ] || \
-     [ "$(installer_path_mode "$LOCK_DIR")" != 700 ]; then
+  if ! (umask 077; ensure_real_directory_tree "$LOCK_DIR" "additional installer lock"); then
     err "Additional installer lock must be an owner-only non-symlink directory: $LOCK_DIR"
     exit 1
   fi
   # Equivalent spellings of the destination must not lock our own inode twice.
   if [ "$(installer_directory_identity "$LOCK_DIR")" != "$DESTINATION_LOCK_IDENTITY" ]; then
+    if [ "$(installer_path_owner_uid "$LOCK_DIR")" != "$(id -u)" ] || \
+       [ "$(installer_path_mode "$LOCK_DIR")" != 700 ]; then
+      err "Additional installer lock must be an owner-only non-symlink directory: $LOCK_DIR"
+      exit 1
+    fi
     acquire_installer_lock "$LOCK_DIR" initial || exit 1
   fi
 fi
@@ -9327,7 +9371,7 @@ fi
 if [ "$FROM_SOURCE" -eq 1 ]; then
   INSTALL_METHOD_LABEL="exact-tag source build"
   info "Building exact release tag $VERSION from source"
-  ensure_rust
+  ensure_rust || exit 1
   source_repository_url="https://github.com/${OWNER}/${REPO}.git"
   source_commit=""
   if ! checkout_exact_release_source "$source_repository_url" "$TMP/src" "$VERSION"; then

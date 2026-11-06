@@ -38,12 +38,13 @@ extract_function() {
 unit_library="$scratch/exit-functions.sh"
 for fn in info ok warn err error_support_hint init_verbose_log verbose \
     dump_verbose_tail on_error early_exit_dump installer_path_owner_uid \
+    installer_path_mode ensure_real_directory_tree \
     installer_directory_identity installer_lock_fd_identity installer_kernel_lock \
     acquire_installer_lock verify_installer_lock_authorities release_installer_lock \
     remove_installer_tmp_dir cleanup \
     capture_command_with_timeout installed_am_db_query_scalar installed_am_db_exec \
     installed_am_db_backup ensure_remote_http_client_readiness activate_mac_python_cli_compat_shell \
-    handle_binary_transaction_signal update_mcp_configs configure_mcp_clients \
+    handle_binary_transaction_signal ensure_rust update_mcp_configs configure_mcp_clients \
     configure_mcp_clients_for_install; do
     extract_function "$fn" >> "$unit_library" \
         || { echo "Cannot extract installer function: $fn" >&2; exit 2; }
@@ -114,6 +115,16 @@ case "$mode" in
         if [ "$mode" = term-recovery-fails ]; then RECOVERY_RC=71; fi
         kill -s TERM "$$"
         exit 99
+        ;;
+    missing-nightly)
+        # Actual command discovery sees an empty PATH. A source install must
+        # fail here, before attempting an unchecked toolchain bootstrap.
+        mkdir "$root/no-toolchain"
+        if PATH="$root/no-toolchain" ensure_rust; then
+            printf 'source build continued without a compiler\n' > "$root/forbidden.calls"
+            exit 99
+        fi
+        exit 1
         ;;
     no-agents|required-client|authority-error)
         # Native CLI output is an explicit fixture, not release evidence.
@@ -202,6 +213,9 @@ while read -r name expected_rc expected_errs; do
         authority-error)
             [ ! -e "$case_root/forbidden.calls" ] && [ ! -e "$case_root/after-mcp" ] || case_failed=1
             grep -Fq 'MCP client authority discovery failed' "$output" || case_failed=1 ;;
+        missing-nightly)
+            [ ! -e "$case_root/forbidden.calls" ] || case_failed=1
+            grep -Fq 'requires an installed Rust nightly toolchain' "$output" || case_failed=1 ;;
     esac
     unit_cases=$((unit_cases + 1))
     printf 'unit %-5s %-26s exit=%s expected=%s ERR=%s expected=%s\n' "$delivery" "$name" "$rc" "$expected_rc" "$errs" "$expected_errs"
@@ -232,6 +246,7 @@ term-recovery-fails 143 0
 no-agents 0 0
 required-client 1 0
 authority-error 1 0
+missing-nightly 1 0
 CASES
 done
 
@@ -301,7 +316,7 @@ done
 # before recovery, while unrelated destinations can make progress.
 destination_cases=0
 for delivery in file stdin; do
-for sharing in same different shared-tmp alias; do
+for sharing in same different shared-tmp alias public-inode; do
     if ! python3 - "$INSTALL_SH" "$scratch/destination-$delivery-$sharing" \
         "$ARTIFACT_DIR" "$BASH" "$VERSION" "$delivery" "$sharing" <<'PY'
 import fcntl
@@ -335,7 +350,9 @@ exit 22
 curl.chmod(0o755)
 prefix = "destination-" + delivery + "-" + sharing
 
-def assert_locked(path, expected):
+def assert_locked(path, expected, primary=True):
+    if primary:
+        path = path / f".mcp-agent-mail-install.lock.{os.geteuid()}.d"
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         try:
@@ -360,7 +377,7 @@ def launch(role, destination):
     }
     if role == "first" and sharing == "alias":
         # Distinct spellings of one lock directory must not self-contend.
-        env["AM_INSTALL_LOCK_FILE"] = str(destination) + "/./.mcp-agent-mail-install.lock"
+        env["AM_INSTALL_LOCK_FILE"] = str(destination) + f"/./.mcp-agent-mail-install.lock.{os.geteuid()}"
     args = ["--version", version, "--dest", str(destination), "--yes",
             "--no-gum", "--no-service", "--no-migrate"]
     log = Path(artifacts) / (prefix + "-" + role + ".log")
@@ -372,6 +389,12 @@ def launch(role, destination):
             return subprocess.Popen([bash, "-s", "--", *args], env=env, cwd=root,
                                     stdin=stdin, stdout=output, stderr=subprocess.STDOUT)
 
+public_fd = None
+if sharing == "public-inode":
+    # A world-readable destination is not private lock authority. This real
+    # unrelated inode lock must not prevent the installer reaching download.
+    public_fd = os.open(root / "destination", os.O_RDONLY | os.O_DIRECTORY)
+    fcntl.flock(public_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 first = launch("first", root / "destination")
 try:
     deadline = time.monotonic() + 15
@@ -381,9 +404,9 @@ try:
     assert (root / "first.curl").exists(), first_log.read_text()
     destination_lock = root / "destination"
     assert_locked(destination_lock, True)
-    initial = destination_lock / ".mcp-agent-mail-install.lock.d" if sharing == "alias" else None
+    initial = destination_lock / f".mcp-agent-mail-install.lock.{os.geteuid()}.d" if sharing == "alias" else None
     if initial is not None:
-        assert_locked(initial, True)
+        assert_locked(initial, True, primary=False)
         assert initial.stat().st_mode & 0o777 == 0o700
     else:
         assert not (root / "tmp-first/mcp-agent-mail-install.lock.d").exists()
@@ -402,7 +425,7 @@ try:
     assert first.poll() is None, first_log.read_text()
     assert_locked(destination_lock, True)
     if initial is not None:
-        assert_locked(initial, True)
+        assert_locked(initial, True, primary=False)
     if sharing in ("different", "shared-tmp"):
         assert (root / "second.curl").exists(), second_log
         assert "Another installer is running" not in second_log, second_log
@@ -418,10 +441,12 @@ try:
 finally:
     (root / "release").touch()
     first_rc = first.wait(timeout=15)
+    if public_fd is not None:
+        os.close(public_fd)
 assert first_rc == 1, first_log.read_text()
 assert_locked(destination_lock, False)
 if initial is not None:
-    assert_locked(initial, False)
+    assert_locked(initial, False, primary=False)
     assert not (initial / "pid").exists(), "kernel locking never creates a PID authority"
 if evidence is not None:
     assert (evidence.stat().st_ino, evidence.read_bytes()) == before
@@ -483,8 +508,9 @@ probe, library, scratch, artifacts, bash = sys.argv[1:]
 completed = 0
 unavailable = []
 
-def locked(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+def locked(path, primary=True):
+    authority = path / f".mcp-agent-mail-install.lock.{os.geteuid()}.d" if primary else path
+    fd = os.open(authority, os.O_RDONLY | os.O_DIRECTORY)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -498,7 +524,9 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
     if shutil.which(executable) is None:
         unavailable.append(backend)
         continue
-    for mode in ("ordinary", "rename", "symlink", "crash", "descendant-normal", "descendant-crash"):
+    for mode in ("ordinary", "rename", "symlink", "crash", "descendant-normal", "descendant-crash",
+                 "precreated", "precreated-public", "precreated-symlink", "precreated-file", "precreated-fifo",
+                 "authority-rename", "authority-symlink", "authority-permissions"):
         root = Path(scratch) / (backend + "-" + mode)
         authority = root / "authority"
         authority.mkdir(parents=True, mode=0o700)
@@ -507,12 +535,53 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
         evidence = authority / "pid"
         evidence.write_text(str(os.getpid()) + "\n")
         original_evidence = (evidence.stat().st_ino, evidence.read_bytes())
+        private = authority / f".mcp-agent-mail-install.lock.{os.geteuid()}.d"
+        private_evidence = None
+        unsafe_before = None
+        if mode == "precreated":
+            private.mkdir(mode=0o700)
+            private_evidence = private / "pid"
+            private_evidence.write_text(str(os.getpid()) + "\n")
+            private_before = (private_evidence.stat().st_ino, private_evidence.read_bytes())
+        elif mode.startswith("precreated-"):
+            victim = root / "private-victim"
+            victim.mkdir(mode=0o700)
+            witness = victim / "evidence"
+            witness.write_bytes(b"private-authority victim must survive\n")
+            witness_before = (witness.stat().st_ino, witness.read_bytes())
+            if mode == "precreated-public":
+                private.mkdir(mode=0o755)
+                private.chmod(0o755)
+            elif mode == "precreated-symlink":
+                private.symlink_to(victim, target_is_directory=True)
+            elif mode == "precreated-file":
+                private.write_bytes(b"not a lock directory\n")
+            else:
+                os.mkfifo(private, 0o600)
+            st = private.lstat()
+            unsafe_before = (st.st_ino, st.st_mode, st.st_uid)
         log_path = Path(artifacts) / ("kernel-" + backend + "-" + mode + ".log")
         child_pid = None
         with log_path.open("wb") as log:
             owner = subprocess.Popen([bash, probe, str(root), backend, mode, library],
                                      stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
         try:
+            if unsafe_before is not None:
+                owner.stdin.close()
+                assert owner.wait(timeout=15) == 1, log_path.read_text()
+                assert not (root / "ready").exists(), "unsafe authority reached acquired state"
+                assert "Installer lock must be an owner-only non-symlink directory" in log_path.read_text()
+                st = private.lstat()
+                assert (st.st_ino, st.st_mode, st.st_uid) == unsafe_before
+                assert (witness.stat().st_ino, witness.read_bytes()) == witness_before
+                if mode == "precreated-file":
+                    assert private.read_bytes() == b"not a lock directory\n"
+                if mode == "precreated-symlink":
+                    assert private.readlink() == victim
+                assert (evidence.stat().st_ino, evidence.read_bytes()) == original_evidence
+                completed += 1
+                print("kernel", backend, mode, "refused without changing precreated evidence")
+                continue
             deadline = time.monotonic() + 15
             while not (root / "ready").exists() and owner.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -521,10 +590,13 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
             if (root / "child").exists():
                 child_pid = int((root / "child").read_text())
             retained = authority
+            retained_private = private
             replacement_evidence = None
+            replacement_slot = None
             if mode in ("rename", "symlink"):
                 retained = root / "retained-authority"
                 authority.rename(retained)
+                retained_private = retained / private.name
                 if mode == "symlink":
                     victim = root / "victim"
                     victim.mkdir(mode=0o700)
@@ -532,9 +604,28 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
                 else:
                     authority.mkdir(mode=0o700)
                 (authority / "pid").write_text("replacement evidence must survive\n")
+                replacement_slot = authority / "pid"
                 replacement_evidence = ((authority / "pid").stat().st_ino,
                                         (authority / "pid").read_bytes())
                 assert locked(retained), "rename lost the held inode lock"
+                owner.stdin.write(b"verify\n")
+                owner.stdin.flush()
+            elif mode in ("authority-rename", "authority-symlink", "authority-permissions"):
+                if mode == "authority-permissions":
+                    private.chmod(0o755)
+                else:
+                    retained_private = root / "retained-private"
+                    private.rename(retained_private)
+                    if mode == "authority-symlink":
+                        victim = root / "replacement-private-victim"
+                        victim.mkdir(mode=0o700)
+                        private.symlink_to(victim, target_is_directory=True)
+                    else:
+                        private.mkdir(mode=0o700)
+                    replacement_slot = private / "pid"
+                    replacement_slot.write_bytes(b"replacement private evidence must survive\n")
+                    replacement_evidence = (replacement_slot.stat().st_ino, replacement_slot.read_bytes())
+                assert locked(retained_private, primary=False), "private replacement lost the held inode lock"
                 owner.stdin.write(b"verify\n")
                 owner.stdin.flush()
             elif mode.endswith("crash"):
@@ -545,18 +636,25 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
             rc = owner.wait(timeout=15)
             assert rc == (-signal.SIGKILL if mode.endswith("crash") else 0), log_path.read_text()
             if mode == "descendant-crash":
-                assert locked(retained), "a surviving installer child must still exclude a writer"
+                assert locked(retained_private, primary=False), "a surviving installer child must still exclude a writer"
                 os.kill(child_pid, signal.SIGTERM)
                 child_pid = None
                 deadline = time.monotonic() + 5
-                while locked(retained) and time.monotonic() < deadline:
+                while locked(retained_private, primary=False) and time.monotonic() < deadline:
                     time.sleep(0.02)
-            assert not locked(retained), "the old acquisition was not released"
+            assert not locked(retained_private, primary=False), "the old acquisition was not released"
             assert ((retained / "pid").stat().st_ino, (retained / "pid").read_bytes()) == original_evidence
+            if private_evidence is not None:
+                assert (private_evidence.stat().st_ino, private_evidence.read_bytes()) == private_before
             if replacement_evidence is not None:
                 assert (root / "refused").read_text() == "refused\n"
-                assert ((authority / "pid").stat().st_ino, (authority / "pid").read_bytes()) == replacement_evidence
+                assert (replacement_slot.stat().st_ino, replacement_slot.read_bytes()) == replacement_evidence
                 assert authority.is_symlink() == (mode == "symlink")
+                if mode == "authority-symlink":
+                    assert private.is_symlink() and private.readlink() == victim
+            if mode == "authority-permissions":
+                assert (root / "refused").read_text() == "refused\n"
+                assert private.stat().st_mode & 0o777 == 0o755
             if mode == "descendant-normal":
                 os.kill(child_pid, 0)  # explicit unlock works while the child remains alive
             completed += 1
@@ -696,7 +794,7 @@ for fd in (7, 8):
     else:
         inherited.append(fd)
 held = []
-for directory in (root / "destination", root / "additional"):
+for directory in (root / "destination" / f".mcp-agent-mail-install.lock.{os.geteuid()}.d", root / "additional"):
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         try:
@@ -728,6 +826,8 @@ elif sys.argv[1:3] == ["tooling", "db-query"]:
 '''
 
 def locked(directory):
+    if directory.name == "destination":
+        directory = directory / f".mcp-agent-mail-install.lock.{os.geteuid()}.d"
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         try:
