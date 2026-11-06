@@ -41,6 +41,8 @@ for fn in info ok warn err error_support_hint init_verbose_log verbose \
     installer_directory_identity installer_lock_fd_identity installer_kernel_lock \
     acquire_installer_lock verify_installer_lock_authorities release_installer_lock \
     remove_installer_tmp_dir cleanup \
+    capture_command_with_timeout installed_am_db_query_scalar installed_am_db_exec \
+    installed_am_db_backup ensure_remote_http_client_readiness activate_mac_python_cli_compat_shell \
     handle_binary_transaction_signal update_mcp_configs configure_mcp_clients \
     configure_mcp_clients_for_install; do
     extract_function "$fn" >> "$unit_library" \
@@ -130,6 +132,7 @@ case "$mode" in
         sync_codex_http_configs() { printf 'sync\n' >> "$root/forbidden.calls"; return 0; }
         cat > "$root/am" <<'CLI'
 #!/bin/sh
+if [ -e /dev/fd/7 ] || [ -e /dev/fd/8 ]; then exit 94; fi
 case "$*" in
     'setup --help') exit 0 ;;
     'setup run --yes --no-hooks')
@@ -578,7 +581,231 @@ else
     failures=$((failures + 1))
 fi
 
-printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s kernel cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$kernel_cases" "$failures"
+# Native commands can start processes that outlive the installer. Exercise the
+# real launch functions with harmless executables that inspect their inherited
+# descriptors and independently test the parent's two kernel locks. Service
+# discovery/readiness are explicit fixtures; no real service is installed.
+native_probe="$scratch/native-lock-probe.sh"
+cat > "$native_probe" <<'PROBE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root="$1" mode="$2"
+source "$3"
+QUIET=0 VERBOSE=0 HAS_GUM=0 NO_GUM=1 DRY_RUN=0
+LOG_INITIALIZED=0 ERROR_TAIL_EMITTED=0 VERBOSE_DUMP_LINES=20
+LOG_FILE="$root/verbose.log"
+ISSUES_URL=https://example.invalid/installer-native-lock-test
+INSTALLER_EXIT_SUCCESS=0
+BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=''
+BINARY_TRANSACTION_RECOVERY_ACTIVE=0
+BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0
+LOCKED=0 DESTINATION_LOCKED=0
+DEST="$root/destination" BIN_CLI=am
+TMP="$root/mcp-agent-mail-install.native"
+mkdir "$TMP"
+printf 'temporary install data\n' > "$TMP/payload"
+trap cleanup EXIT
+acquire_installer_lock "$DEST" destination
+acquire_installer_lock "$root/additional" initial
+case "$mode" in
+    query) installed_am_db_query_scalar "$root/fixture.db" 'SELECT 1' ;;
+    exec) installed_am_db_exec "$root/fixture.db" 'SELECT 1' ;;
+    exec-stdin) printf 'SELECT 1;\n' | installed_am_db_exec "$root/fixture.db" ;;
+    backup) installed_am_db_backup "$root/fixture.db" "$root/fixture.backup" ;;
+    bounded|bounded-without-python)
+        if [ "$mode" = bounded-without-python ]; then
+            command() {
+                if [ "$1" = -v ] && [ "$2" = python3 ]; then return 1; fi
+                builtin command "$@"
+            }
+        fi
+        rc=0
+        capture_command_with_timeout 5 "$DEST/am" --probe || rc=$?
+        if [ "$mode" = bounded-without-python ]; then unset -f command; fi
+        [ "$rc" -eq 0 ] || exit "$rc"
+        [ "$CAPTURED_CMD_OUTPUT" = probe-ok ] || exit 95
+        ;;
+    service|service-unready)
+        # These fixtures admit the isolated CLI executable, never host service
+        # configuration or a network endpoint. The production launch remains.
+        has_remote_http_client_targets() { return 0; }
+        desired_mcp_http_url() { printf 'http://127.0.0.1:1/mcp/'; }
+        probe_remote_http_endpoint() { return 1; }
+        service_management_allowed() { return 0; }
+        platform_supports_user_service_management() { return 0; }
+        desired_service_bind_host() { printf '127.0.0.1'; }
+        desired_service_bind_port() { printf '1'; }
+        repair_launchd_service_env_from_rust_config() { return 0; }
+        service_setup_unavailable_failure() { return 1; }
+        wait_for_remote_http_endpoint() {
+            [ "$mode" = service ] && [ -f "$root/service-started" ]
+        }
+        REMOTE_HTTP_PROBE_DETAIL=fixture
+        if ensure_remote_http_client_readiness; then
+            [ "$mode" = service ] || exit 96
+        else
+            [ "$mode" = service-unready ] || exit 96
+        fi
+        ;;
+    interactive|noninteractive)
+        MAC_DIRECT_EXEC_COMPAT_MODE=1
+        SHELL="$root/bin/bash"
+        activate_mac_python_cli_compat_shell
+        if [ "$mode" = interactive ]; then exit 97; fi
+        printf 'noninteractive\n' > "$root/no-exec"
+        verify_installer_lock_authorities
+        ;;
+    *) exit 98 ;;
+esac
+INSTALLER_EXIT_SUCCESS=1
+PROBE
+
+native_cases=0
+if python3 - "$native_probe" "$unit_library" "$scratch/native" "$ARTIFACT_DIR" "$BASH" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import shutil
+import subprocess
+import sys
+import time
+
+probe, library, scratch, artifacts, bash = sys.argv[1:]
+base = Path(scratch)
+base.mkdir()
+completed = 0
+unavailable = []
+
+executable = r'''#!/usr/bin/env python3
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["PROBE_ROOT"])
+interactive = Path(sys.argv[0]).name == "bash"
+inherited = []
+for fd in (7, 8):
+    try:
+        os.fstat(fd)
+    except OSError:
+        pass
+    else:
+        inherited.append(fd)
+held = []
+for directory in (root / "destination", root / "additional"):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            held.append(True)
+        else:
+            held.append(False)
+    finally:
+        os.close(fd)
+record = {"args": sys.argv[1:], "inherited": inherited, "held": held,
+          "interactive": interactive}
+with (root / "executions.jsonl").open("a") as output:
+    output.write(json.dumps(record) + "\n")
+if inherited or held != ([False, False] if interactive else [True, True]):
+    raise SystemExit(94)
+if interactive:
+    (root / "shell-ready").write_text("ready\n")
+    sys.stdin.readline()
+elif sys.argv[1:] == ["--probe"]:
+    print("probe-ok")
+elif sys.argv[1:3] == ["service", "install"] and "--help" not in sys.argv[1:]:
+    (root / "service-started").write_text("isolated fixture only\n")
+elif sys.argv[1:3] == ["service", "status"]:
+    print("isolated service is deliberately not ready")
+    raise SystemExit(1)
+elif sys.argv[1:3] == ["tooling", "db-query"]:
+    print("1")
+'''
+
+def locked(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+for mode in ("query", "exec", "exec-stdin", "backup", "bounded",
+             "bounded-without-python", "service", "service-unready",
+             "noninteractive", "interactive"):
+    if mode == "bounded-without-python" and not (shutil.which("timeout") or shutil.which("gtimeout")):
+        unavailable.append(mode)
+        continue
+    root = base / mode
+    for directory in ("home", "destination", "additional", "bin"):
+        (root / directory).mkdir(parents=True, mode=0o700)
+    for target in (root / "destination/am", root / "bin/bash"):
+        target.write_text(executable)
+        target.chmod(0o700)
+    env = {"HOME": str(root / "home"), "PATH": os.environ["PATH"],
+           "PROBE_ROOT": str(root), "LC_ALL": "C", "TERM": "dumb"}
+    master = slave = None
+    if mode == "interactive":
+        master, slave = pty.openpty()
+    log_path = Path(artifacts) / ("native-lock-" + mode + ".log")
+    with log_path.open("wb") as log:
+        process = subprocess.Popen([bash, probe, str(root), mode, library], env=env,
+                                   stdin=slave if slave is not None else subprocess.DEVNULL,
+                                   stdout=log, stderr=subprocess.STDOUT)
+    if slave is not None:
+        os.close(slave)
+    try:
+        if mode == "interactive":
+            deadline = time.monotonic() + 15
+            while process.poll() is None and not (root / "shell-ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert process.poll() is None and (root / "shell-ready").exists(), log_path.read_text()
+            assert not locked(root / "destination"), "interactive exec retained the destination lease"
+            assert not locked(root / "additional"), "interactive exec retained the additional lease"
+            assert not (root / "mcp-agent-mail-install.native").exists(), "exec bypassed EXIT cleanup"
+            os.write(master, b"exit\n")
+        assert process.wait(timeout=15) == 0, log_path.read_text()
+        assert not locked(root / "destination")
+        assert not locked(root / "additional")
+        assert not (root / "mcp-agent-mail-install.native").exists()
+        records_path = root / "executions.jsonl"
+        records = [json.loads(line) for line in records_path.read_text().splitlines()] if records_path.exists() else []
+        expected_count = 0 if mode == "noninteractive" else 3 if mode == "service-unready" else 2 if mode == "service" else 1
+        assert len(records) == expected_count, (mode, records, log_path.read_text())
+        for record in records:
+            assert not record["inherited"], (mode, record)
+            assert record["held"] == ([False, False] if mode == "interactive" else [True, True]), (mode, record)
+        if mode == "service-unready":
+            assert records[-1]["args"] == ["service", "status"], records
+        if mode == "noninteractive":
+            assert (root / "no-exec").read_text() == "noninteractive\n"
+        completed += 1
+        print("native-lock", mode, "descriptor ownership and lifetime verified", flush=True)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if master is not None:
+            os.close(master)
+assert completed, "no native execution boundary ran"
+print(f"Native lock cases: {completed} passed; unavailable runners: {','.join(unavailable) or 'none'}")
+(base / "native-count").write_text(str(completed))
+PY
+then
+    native_cases=$(cat "$scratch/native/native-count")
+else
+    failures=$((failures + 1))
+fi
+
+printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s kernel cases, %s native cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$kernel_cases" "$native_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
     [ "$failures" -eq 0 ]
     exit $?

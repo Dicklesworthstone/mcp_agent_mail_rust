@@ -146,6 +146,14 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
         .stats()
 }
 
+/// Recheck population and engine coverage before executing a queued release.
+/// A report admitted before a failed or unfinished refresh grants no exemption.
+/// Locks are released before the caller enters the reservation tool.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn atc_release_capacity_admission() -> Result<(), &'static str> {
+    population::release_capacity_admission()
+}
+
 /// Advance bounded hydration or inference, then admit actionable notifications.
 ///
 /// Inference yields while a population refresh is incomplete. A concurrent reset

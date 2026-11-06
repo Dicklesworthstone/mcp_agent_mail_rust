@@ -156,6 +156,14 @@ pub struct AgentRow {
     pub retired_at: Option<i64>,
 }
 
+/// Maximum retained agent-name bytes in an ATC population observation.
+/// Matches the public agent identity limit; names are never truncated.
+pub const ATC_POPULATION_MAX_NAME_BYTES: usize = 128;
+/// Maximum retained project-key bytes in an ATC population observation.
+pub const ATC_POPULATION_MAX_PROJECT_BYTES: usize = 4_096;
+/// Maximum retained program metadata bytes in an ATC population observation.
+pub const ATC_POPULATION_MAX_PROGRAM_BYTES: usize = 1_024;
+
 /// Compact agent projection used to hydrate the in-process ATC population.
 ///
 /// Keeping this projection separate from [`AgentRow`] avoids materializing
@@ -169,6 +177,18 @@ pub struct AtcPopulationAgentRow {
     pub name: String,
     pub program: String,
     pub last_active_ts: i64,
+}
+
+impl AtcPopulationAgentRow {
+    /// Validate before cloning a row into hydration, scope, or inference state.
+    /// These are byte limits, including bytes after an embedded NUL. Refusal
+    /// means incomplete coverage, not an absent agent or a shortened identity.
+    #[must_use]
+    pub const fn metadata_within_limits(&self) -> bool {
+        self.name.len() <= ATC_POPULATION_MAX_NAME_BYTES
+            && self.project_key.len() <= ATC_POPULATION_MAX_PROJECT_BYTES
+            && self.program.len() <= ATC_POPULATION_MAX_PROGRAM_BYTES
+    }
 }
 
 impl Default for AgentRow {

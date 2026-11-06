@@ -14,8 +14,9 @@ use crate::idempotency::{
     idempotency_retention_secs,
 };
 use crate::models::{
-    AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
-    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
+    ATC_POPULATION_MAX_NAME_BYTES, ATC_POPULATION_MAX_PROGRAM_BYTES,
+    ATC_POPULATION_MAX_PROJECT_BYTES, AgentLinkRow, AgentRow, AtcPopulationAgentRow,
+    FileReservationRow, InboxStatsRow, MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
@@ -6747,6 +6748,35 @@ pub async fn list_agent_roster(
     }
 }
 
+// Bound each projected value in SQL, before the driver materializes strings.
+// A NULL is a refusal witness, not a row to omit: the caller must fail the
+// entire refresh so an incomplete roster cannot authorize automatic effects.
+// BLOB length counts UTF-8 bytes and includes suffixes after an embedded NUL.
+const ATC_POPULATION_SQL: &str = "\
+SELECT p.id, \
+       CASE WHEN length(CAST(p.human_key AS BLOB)) <= ?3 THEN p.human_key ELSE NULL END, \
+       CASE WHEN length(CAST(a.name AS BLOB)) <= ?4 THEN a.name ELSE NULL END, \
+       CASE WHEN length(CAST(a.program AS BLOB)) <= ?5 THEN a.program ELSE NULL END, \
+       a.last_active_ts \
+FROM agents AS a \
+JOIN projects AS p ON p.id = a.project_id \
+WHERE (a.last_active_ts <= 0 OR a.last_active_ts >= ?1) \
+  AND a.retired_at IS NULL \
+  AND a.id NOT IN (SELECT agent_id FROM agent_deregistrations) \
+ORDER BY a.last_active_ts DESC, a.id DESC \
+LIMIT ?2";
+
+fn atc_population_query_params(min_last_active_ts: i64, limit: usize) -> [Value; 5] {
+    let limit = limit.min(mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX);
+    [
+        Value::BigInt(min_last_active_ts),
+        Value::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(ATC_POPULATION_MAX_PROJECT_BYTES).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(ATC_POPULATION_MAX_NAME_BYTES).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(ATC_POPULATION_MAX_PROGRAM_BYTES).unwrap_or(i64::MAX)),
+    ]
+}
+
 /// Load the bounded, recent agent population needed by the ATC operator.
 ///
 /// This deliberately performs one joined query for the entire mailbox. The
@@ -6754,6 +6784,9 @@ pub async fn list_agent_roster(
 /// query/runtime boundaries on every periodic ATC refresh; on a mailbox with
 /// hundreds of projects that dominated the operator tick and caused sustained
 /// allocator churn (GH#190).
+/// Count and metadata-byte bounds apply before materializing the projection.
+/// An oversized selected identity fails the entire refresh without altering
+/// mailbox data or silently omitting evidence from the population.
 pub async fn list_atc_population_snapshot(
     cx: &Cx,
     pool: &DbPool,
@@ -6767,38 +6800,33 @@ pub async fn list_atc_population_snapshot(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
     let tracked = tracked(&*conn);
-    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let sql = "SELECT p.id, p.human_key, a.name, a.program, a.last_active_ts \
-               FROM agents AS a \
-               JOIN projects AS p ON p.id = a.project_id \
-               WHERE (a.last_active_ts <= 0 OR a.last_active_ts >= ?) \
-                 AND a.retired_at IS NULL \
-                 AND a.id NOT IN (SELECT agent_id FROM agent_deregistrations) \
-               ORDER BY a.last_active_ts DESC, a.id DESC \
-               LIMIT ?";
-    let params = [Value::BigInt(min_last_active_ts), Value::BigInt(limit)];
+    let params = atc_population_query_params(min_last_active_ts, limit);
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+    match map_sql_outcome(traw_query(cx, &tracked, ATC_POPULATION_SQL, &params).await) {
         Outcome::Ok(rows) => {
-            let get_string = |row: &SqlRow, index: usize| {
-                row.get(index)
-                    .and_then(|value| match value {
-                        Value::Text(value) => Some(value.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default()
+            let get_string = |row: &SqlRow, index: usize, max_bytes: usize| match row.get(index) {
+                Some(Value::Text(value)) if value.len() <= max_bytes => Ok(value.clone()),
+                _ => Err(DbError::invalid(
+                    "atc_population",
+                    "ATC population metadata exceeds byte limits or is not text; coverage is incomplete",
+                )),
             };
-            Outcome::Ok(
-                rows.iter()
-                    .map(|row| AtcPopulationAgentRow {
+            match rows
+                .iter()
+                .map(|row| {
+                    Ok(AtcPopulationAgentRow {
                         project_id: row.get(0).and_then(value_as_i64).unwrap_or_default(),
-                        project_key: get_string(row, 1),
-                        name: get_string(row, 2),
-                        program: get_string(row, 3),
+                        project_key: get_string(row, 1, ATC_POPULATION_MAX_PROJECT_BYTES)?,
+                        name: get_string(row, 2, ATC_POPULATION_MAX_NAME_BYTES)?,
+                        program: get_string(row, 3, ATC_POPULATION_MAX_PROGRAM_BYTES)?,
                         last_active_ts: row.get(4).and_then(value_as_i64).unwrap_or_default(),
                     })
-                    .collect(),
-            )
+                })
+                .collect::<Result<Vec<_>, DbError>>()
+            {
+                Ok(population) => Outcome::Ok(population),
+                Err(error) => Outcome::Err(error),
+            }
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -27924,6 +27952,98 @@ mod tests {
                 capped.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
                 vec!["RecentA", "RecentB"]
             );
+        });
+    }
+
+    async fn atc_population_projection_after_update(
+        cx: &Cx,
+        pool: &DbPool,
+        sql: &str,
+        id: i64,
+        value: &str,
+    ) -> Vec<SqlRow> {
+        let conn = acquire_conn(cx, pool).await.into_result().unwrap();
+        let tracked = tracked(&*conn);
+        traw_execute(
+            cx,
+            &tracked,
+            sql,
+            &[Value::Text(value.to_string()), Value::BigInt(id)],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        traw_query(
+            cx,
+            &tracked,
+            ATC_POPULATION_SQL,
+            &atc_population_query_params(0, 2),
+        )
+        .await
+        .into_result()
+        .unwrap()
+    }
+
+    #[test]
+    fn atc_population_snapshot_bounds_bytes_without_truncating_or_omitting_rows() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("atc-population-metadata.db");
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/atc-metadata")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'codex-cli', 'test', 1, 500), \
+                        (2, {project_id}, 'RedFox', 'codex-cli', 'test', 1, 300)"
+            )).unwrap();
+            drop(conn);
+            for (sql, id, column, max_bytes, original) in [
+                ("UPDATE projects SET human_key = ? WHERE id = ?", project_id,
+                    1, ATC_POPULATION_MAX_PROJECT_BYTES, "/tmp/atc-metadata"),
+                ("UPDATE agents SET name = ? WHERE id = ?", 1,
+                    2, ATC_POPULATION_MAX_NAME_BYTES, "BlueLake"),
+                ("UPDATE agents SET program = ? WHERE id = ?", 1,
+                    3, ATC_POPULATION_MAX_PROGRAM_BYTES, "codex-cli"),
+            ] {
+                let at_limit = "é".repeat(max_bytes / 2);
+                let projected = atc_population_projection_after_update(
+                    &cx, &pool, sql, id, &at_limit,
+                ).await;
+                assert_eq!(projected.len(), 2);
+                assert!(matches!(projected[0].get(column), Some(Value::Text(value)) if value == &at_limit));
+                let population = list_atc_population_snapshot(&cx, &pool, 0, 2)
+                    .await.into_result().expect("exact byte boundary is valid");
+                assert_eq!(population.len(), 2);
+                assert!(population.iter().all(AtcPopulationAgentRow::metadata_within_limits));
+                let retained = match column {
+                    1 => &population[0].project_key,
+                    2 => &population[0].name,
+                    _ => &population[0].program,
+                };
+                assert_eq!(retained, &at_limit, "valid metadata must remain exact");
+
+                for oversized in [format!("{at_limit}x"), format!("x\0{}", "x".repeat(max_bytes))] {
+                    let projected = atc_population_projection_after_update(
+                        &cx, &pool, sql, id, &oversized,
+                    ).await;
+                    assert_eq!(projected.len(), 2, "oversized rows must not disappear");
+                    assert!(matches!(projected[0].get(column), Some(Value::Null)),
+                        "the driver must never receive the oversized text");
+                    let error = list_atc_population_snapshot(&cx, &pool, 0, 2)
+                        .await.into_result().expect_err("incomplete population must fail closed");
+                    assert!(error.to_string().contains("coverage is incomplete"));
+                    assert!(error.to_string().len() < 200, "errors must not echo oversized values");
+                }
+                atc_population_projection_after_update(&cx, &pool, sql, id, original).await;
+            }
+            let recovered = list_atc_population_snapshot(&cx, &pool, 0, 2)
+                .await.into_result().unwrap();
+            assert_eq!(recovered.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+                vec!["BlueLake", "RedFox"]);
         });
     }
 
