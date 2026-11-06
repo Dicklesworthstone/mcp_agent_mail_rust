@@ -2,6 +2,58 @@
 
 ## November 6 fresh-eyes review and startup ownership — EmeraldEagle
 
+Continuation from `60c34d76` (22:30 UTC), requested second fresh pass:
+
+- [x] Refresh governing-doc drift, mailbox health, peer state and ready graph.
+- [x] Re-read installer source preflight, exact-tag/dependency callers and BV
+  labels producer/test; no additional defect confirmed in those edits.
+- [ ] Execute the original `.90` native selection if normal disk admission
+  permits:30 unique real cases and six declared fresh repeats. Keep the
+  qualifier frozen, source-bound and all earlier failures/deadlines intact.
+  - [x] Inspect current fleet capacity: native preflight selects vmi1152480
+    with the original30GiB growth/10GiB floor; no resource changes.
+  - [ ] Complete actual compilation, then execute the named populated cases.
+    Actual build again refuses120 before Cargo:50,806,059,008 free bytes,
+    unchanged budgets/floor and active reservations. Zero native cases; do not
+    retry unchanged admission. Wrapper `rchw-f5faa4ec` terminal/acknowledged.
+  - [x] Classify the admission failure; retain it without weakening criteria.
+    Later capacity inventory has no worker with even40GiB free; no retry.
+- [x] Trace the remaining `br-cdwya` broad-filter requirement through existing
+  claimable routing and consumers; preserve library planning diagnostics.
+  - [x] Add eight handler cases (mixed/inactive × full/brief/track/label), with
+    enough parked P0 rows to catch filtering after TopN. Old code fails all8.
+  - [x] Reuse cached authoritative actionability before the recommendation cap;
+    enable it for robot output. Four original36-node JSONL/SQLite fixtures pass
+    strict filtering across all five modes; current ten recommendations match
+    real `br show`. Health inventory and original JSON schemas stay intact.
+  - [x] Run build/vet successfully and start full tests. Retain the caught E2E
+    conflict: existing future-deferral guidance must remain inspectable.
+  - [x] Add explicit opt-in inactive diagnostics; preserve every existing E2E
+    guidance assertion and add a default-exclusion assertion. Add opt-in
+    handler coverage before final full tests/artifact/fixture verification.
+    The second full run finds three more old planning assumptions: copied
+    queries, brief blocked-item details and grouped layers. Preserve every
+    original detail under explicit opt-in and add ready-only default checks;
+    the focused real-binary E2E rerun passes all three. Final full Go suite0.
+  - [x] Finish final gates, reread diff, publish source and rerun original
+    populated acceptance in a fresh solo pass before closure.
+    Build/vet/full tests0; aggregate3/4 remains red for33 unchanged vendor
+    format files. All edited files are formatted; seven-file UBS has9critical/
+    11warnings, no new critical/warning signature, raw exit1 retained.
+    Publish upstream `516e96aa`; all nine qualified files match. Fresh solo
+    post-commit re-execution passes all four36-row layouts and24 output checks;
+    ten live-clock recommendations match actual `br show`. Close only original
+    `br-cdwya`. No new release/global binary or independent verification claim.
+- [x] Fresh review of final diff; required checks, honest Beads comments,
+  existing evidence/TODO update, exact owned publication and lease release.
+  Bound canonical ACFS candidate differs only by timestamp: leave policy/mirrors
+  unchanged, verify published BV installer still matches. `.90` remains open.
+
+Process gate: this operator-requested TODO is consumed by the operator for this
+fresh review and retires as execution history at handoff. It prevents losing
+the declared native population after observed zero-run refusals; no new process
+framework. Actual startup qualification takes priority over more reporting.
+
 Fresh continuation from `ae38477f` (19:00 UTC):
 
 - [x] Refresh governing-doc drift, shared checkout, health and ready Beads.

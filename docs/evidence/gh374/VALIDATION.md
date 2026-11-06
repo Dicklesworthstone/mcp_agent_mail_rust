@@ -16,6 +16,162 @@ prohibited pull requests.
 
 ## Status and evidence boundary
 
+### November 6 second fresh review: actionable robot recommendations
+
+Started22:30 UTC from MCP `60c34d76` and BV `964cb5ce`. Governing project
+files have no drift from the prior full read. The installer preflight and
+callers, labels producer/test and startup worker ownership were reread; no
+additional bug was confirmed in those changes. Mailbox health passes. The
+remaining original `br-cdwya` gap was actionable: robot triage forwarded the
+library's broad planning list although authoritative actionability already
+existed. The repair applies that cached predicate before TopN for robot output;
+the library's planning default and selected-source health inventory remain.
+
+Eight mixed/inactive handler cases cover full, brief, track and label modes,
+including16 parked P0 rows that would crowd out ready work if filtering happened
+after the cap. All eight fail against the unchanged producer. The first full
+Go run then caught a real contract conflict: an existing end-to-end test requires
+future-deferral guidance to remain inspectable. That failed run is retained,
+not qualified. An explicit `--robot-include-inactive` now requests those planning
+diagnostics. Every original timestamp/wait/count/plan/recipe assertion remains;
+the test adds default exclusion and refusal to enable a deferred claim. A ninth
+handler case covers the explicit opt-in. CLI modifier validation and documented
+help are wired; the flag is refused outside triage, just like existing modifiers.
+The next full run caught three additional old planning expectations in copied
+documentation queries, brief output and grouped execution layers. Those original
+blocked-bridge/dependency/assignee/layer assertions are also retained under the
+explicit flag, alongside new ready-only default checks. Both failed full runs
+remain retained; their test exits are1, not a pass attributed to setup noise.
+No JSON field/schema, deadline, threshold, dependency or vendor code was changed.
+
+Final artifact SHA-256:
+`8a3c12972c0253c070f140c1cca4cc2c9a7167c635bf5f77152324ec5704b450`.
+It self-reports Go1.26.10, base `964cb5ce` and modified=true. It is a private
+source-qualified image, not a global installation or release. Four real36-row
+JSONL/SQLite fixtures pass24 native output checks (next/full/brief/track/label/
+explicit diagnostics), including the original strict filter and original
+advertised schemas. The old image records16 strict-filter failures in those
+four default triage modes; its four next controls remain successful. These are
+four reader/layout cases, not144 independent issues. The final image's ten
+current recommendations also match actual `br show` statuses, including a fresh
+live-clock run without `SOURCE_DATE_EPOCH`. All nine qualified source/doc files
+match published upstream `516e96aa1ac78d6f634b0d394f5102bf430de016` byte for byte.
+Fresh post-commit solo re-execution passes the same four layouts and24 outputs;
+repeated cohorts are not added to the unique denominator. Original `br-cdwya`
+closes after that pass. No independent-verification claim.
+
+Final bounded local DSR Go1.26.10 build, vet and full tests all exit0. The
+four-check aggregate remains failed3/4 solely for the existing vendor formatting
+gate; no all-green claim. Final receipt:
+`/home/ubuntu/.local/state/dsr/quality-logs/bv/20261106T175935-712836/receipt.json`,
+SHA-256 `93b28d38757cf9b0d84c099757c7250d9c406aaa530636427e6fa9aa0ed770e9`.
+Its before/after source identity equals the final artifact build identity:
+`964cb5ce4d4b33eb4ed606df4e3380bbff845951|ce6761792686921bc0401ae1d009cd8e91c7c3a74f9bea58b39ac7d59b1f4080|no-lockfile`.
+Both preceding full runs remain failed2/4 with test exit1, not overwritten by
+this result. The three corrected E2E contracts also pass a separate focused
+DSR run before the final full run completes. All seven edited Go files are
+formatted with the pinned tool; no Rust source changed in this continuation,
+so prior Rust gate receipts remain prior evidence rather than new execution.
+
+Seven-file UBS remains exit1: nine critical,11 warning and1,783 informational
+findings, no failed module. Critical/warning signatures exactly match the base
+scan (nine/11/1,777). The nine taint findings are inspected CLI stderr diagnostic
+writes, not HTML response sinks. Warnings are registration invariant panics and
+heuristics around correctly forwarded history errors/deferred cancellation,
+plus the existing documentation test's fixed-executable argument parser.
+No scanner suppressions or clean-scan claim. The33 whole-tree formatting
+findings remain unchanged vendor files; all edited Go files are formatted with
+pinned Go1.26.10. Initial and final aggregate outcomes remain separately recorded.
+Go executes through bounded local DSR because its RCH allowlist refusal was
+already established; no remote-Go or independent-verification claim.
+
+The original `.90` native no-run build again refuses120 before Cargo on
+vmi1152480:50,806,059,008 free bytes, zero growth, unchanged32,212,254,720 growth
+budget/10,737,418,240 floor, active reservations cannot be covered. Zero of the
+original30+6 cases execute; it stays in progress. Wrapper `rchw-f5faa4ec` /
+build30097323753209928 is terminal/acknowledged with no live wrapper. The fleet
+inventory still has117 unrelated journal errors, not a fleet-health pass.
+No worker/process/ledger/floor/resource change, source mutation during a job,
+or unchanged native retry. Later inventory finds no worker with even40GiB free
+for the original30GiB growth plus10GiB floor. Existing send-p99/release exclusions
+remain red.
+
+Canonical ACFS verification observes48:46 matches, existing Atuin/Grok drift,
+zero errors/skips. BV installer pin remains
+`13a80ec48ef72b3f50f2f9ce49453175dc5e80afcf11f996ec2ed97356544f0c`.
+Bound builder/validator differs only in timestamp; policy and mirrors are left
+unchanged. The published BV installer is freshly re-fetched after the source
+push and still matches that pin. Report SHA-256:
+`541a6ad15abe80329318fe0ea5104663ce9b813468e75c7cb2766e23074a8c96`.
+BV tracker flush again refuses its nonempty recovery WAL (exit6); no owned
+tracker edits or repair/checkpoint/rebuild/deletion were attempted there. MCP's
+original Bead is the task record. No global binary replacement, installer
+execution or new release. Raw root:
+`/data/tmp/am-second-review-20261106.ZV4zAGXX`.
+
+#### Required worksheets for this second pass
+
+Process gate: requested TODO/report is PROCESS, consumed by this operator for
+fresh-review acceptance of observed inactive recommendations. It retires as
+execution history at handoff. Minimal raw source/negative receipts prevent
+observed evidence loss between failed/admitted attempts: necessary, smallest
+reliable record, no cheaper equivalent. The ready robot fix and blocked original
+native controls outrank more reporting. Verdict: minimum requested gate.
+
+Real-work audit: Git diffs/logs, recent three closes and oldest five open items
+were inspected mechanically. README purpose: mail-like coding-agent coordination.
+USER: one robot-selection capability; ENABLER: its real tests, native admission
+and checksum review; PROCESS: requested tracking/handoff; UNKNOWN:0. These are
+named work units, not a quota. (1) Demo default ready recommendations versus
+explicit nonclaimable planning guidance. (2) Removing process files changes no
+runtime result. (3) Compiled CLI, real readers and `br show` exercise the enablers.
+(4) Oldest `br-mmnyj` remains open; the owned native task was attempted first,
+then the confirmed ready robot gap was implemented. (5) Solo, no pane comparison.
+(6) No acceptance edit or follow-up laundering. Verdict: bounded capability work;
+setup/observer mistakes cost unnecessary time. Freeze further scope at handoff.
+
+Honesty inventory,22:30 UTC through handoff; answers bounded to inspected diffs,
+logs and original acceptance, with no older-session audit (CASS not initialized):
+
+1. No (checked all assertion/ignore/deadline/config diffs: none weakened).
+2. No (checked real reader/compiled CLI paths; synthetic graph rows are explicit
+   R1 test inputs, not a substitute runtime or a server-release proof).
+3. No (checked diffs: no regenerated golden/snapshot).
+4. Yes: tests changed with feature. The original deferral-guidance assertions
+   now run under explicit opt-in, with added default-exclusion/no-claim controls;
+   the caught failure is retained. No tolerance/suppression/skip introduced.
+   Publication uses `[skip ci]` only under existing mandatory BV DSR-only policy.
+5. No (checked production predicate: existing readiness, no fixture hardcoding).
+6. No (checked native0/120 stays unqualified; Go populations actually execute).
+7. No (checked cited command/results; incomplete full runs are labeled pending).
+8. No (checked local Go/private dirty-image/fixture/solo/release boundaries).
+9. No (checked both retained full-run E2E failures, scanner nonzero, vendor-format red,
+   WAL refusal and original native/latency exclusions).
+10. No (checked cited stdout/stderr retained; diagnostic printing stays intact).
+11. No (checked originals: closure waits for exact source and fresh positive
+    acceptance; no follow-up split; `.90` remains in progress).
+12. No (checked original Bead/schema/threshold requirements remain unchanged).
+13. N/A: solo; exact source and fresh solo acceptance are cited for closure.
+14. N/A: no subagents dispatched.
+15. N/A: no subagent reports accepted.
+16. N/A: no panes; refusal-only native work earns no closure.
+17. No (checked no shared-agent agreement is presented as independent proof).
+18. No (checked declared8 negative cases, ninth opt-in case, four36-row layouts,
+   24 output modes and ten actual tracker recommendations; repeats stay separate).
+19. Yes: initial DSR `--path` was invalid (exit4/no checks); first reader probe
+    selected SQLite implicitly instead of intended JSONL; an observer expected
+    invalid-modifier exit2 although the existing contract uses1. Corrections use
+    documented `--work-dir`, explicit source paths and the existing modifier
+    control; original failures remain. Two premature/shape-mismatched receipt
+    parsers were corrected without counting them as test results. No bypass.
+20. Strongest evidence: unchanged producer fails all eight default controls;
+    rebuilt actual CLI passes original populated readers/schema/filter criteria
+    and preserves requested guidance without enabling deferred claims.
+
+Disposition: failures/corrections disclosed in place; RH-1 retains original
+guidance assertions plus stronger default/no-claim controls, RH-17 retains failed
+receipts, and proof classes remain explicit. This is solo re-verification.
+
 ### November 6 fresh review: source toolchain context and BV labels
 
 Continuation from `ae38477f`, starting19:00 UTC. Fresh review found a real
