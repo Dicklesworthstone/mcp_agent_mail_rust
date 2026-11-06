@@ -16670,10 +16670,14 @@ fn archive_project_root_checked(archive: &ProjectArchive) -> Result<PathBuf> {
 fn archive_project_root_canonical_checked(archive: &ProjectArchive) -> Result<PathBuf> {
     let project_root = archive_project_root_checked(archive)?;
     canonicalize_with_existing_prefix(&project_root).map_err(|err| {
-        StorageError::InvalidPath(format!(
-            "project archive root is not accessible: {} ({err})",
-            project_root.display()
-        ))
+        recovery::contextual_io_error(
+            format!(
+                "project archive root is not accessible: {} ({err})",
+                project_root.display()
+            ),
+            err,
+        )
+        .into()
     })
 }
 

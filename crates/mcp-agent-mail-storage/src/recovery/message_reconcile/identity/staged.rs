@@ -120,9 +120,11 @@ pub(super) fn preflight(
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(invalid(format!(
-                "staged canonical index read or byte budget failed: {error}",
-            )));
+            return Err(crate::recovery::contextual_io_error(
+                format!("staged canonical index read or byte budget failed: {error}"),
+                error,
+            )
+            .into());
         }
     };
     budget.bytes_left = budget

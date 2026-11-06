@@ -1,7 +1,8 @@
 //! Storage-pressure retry retention through the production message recorder.
 //!
-//! The ENOSPC case uses a real kernel error at the recording boundary, then
-//! the real mailbox/Git repair path. It is not a full-filesystem fault test.
+//! The pressure cases use real kernel errors at the recording boundary, then
+//! the real mailbox/Git repair path. Descriptor limits apply only to a private
+//! child process; the ENOSPC case is not a full-filesystem fault test.
 
 use super::*;
 use std::io::{Error, ErrorKind};
@@ -12,6 +13,10 @@ fn io_failure(kind: ErrorKind) -> ReconcileFailure {
 
 #[test]
 fn typed_pressure_keeps_retry_debt_without_trusting_error_text() {
+    #[cfg(any(unix, windows))]
+    for error in crate::recovery::descriptor_exhaustion_errors() {
+        assert!(ReconcileFailure::from(crate::StorageError::Io(error)).transient);
+    }
     for kind in [
         ErrorKind::WouldBlock,
         ErrorKind::TimedOut,
@@ -229,6 +234,73 @@ fn full_cooling_retry_queue_does_not_consume_an_unretained_message() {
 fn real_enospc_outcome_repairs_current_mail_before_history_wrap() {
     use std::io::Write;
 
+    assert_pressure_outcome_repairs_current_mail_before_history_wrap(|| {
+        let error = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap()
+            .write_all(b"message archive witness")
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::ENOSPC));
+        assert_eq!(error.kind(), ErrorKind::StorageFull);
+        error.into()
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn real_emfile_outcome_repairs_current_mail_before_history_wrap() {
+    const CHILD: &str = "AM_TEST_MESSAGE_EMFILE_CHILD";
+    let thread = std::thread::current();
+    let name = thread.name().expect("named libtest thread");
+    if std::env::var(CHILD).as_deref() != Ok(name) {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "ulimit -n 128 && exec \"$@\"", "archive-emfile-test"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env("AM_TEST_MESSAGE_BATCH_ADMISSION_CHILD", name)
+            .output()
+            .expect("run descriptor-limited archive repair child");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "descriptor-limited {name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    assert_pressure_outcome_repairs_current_mail_before_history_wrap(|| {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("message.md");
+        std::fs::write(&path, "---json\n{}\n---\n\nretained witness").unwrap();
+        let mut held = Vec::new();
+        let exhaustion = loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => break error,
+            }
+        };
+        // Obtain the failure from the production no-follow artifact reader,
+        // not a fabricated error string. Release pressure before assertions
+        // or the real database/Git repair needs descriptors of its own.
+        let failed_read = read_surviving_message(&path);
+        drop(held);
+        assert_eq!(exhaustion.raw_os_error(), Some(nix::libc::EMFILE));
+        let error = failed_read.expect_err("artifact open must hit the real descriptor limit");
+        assert!(matches!(&error, crate::StorageError::Io(error)
+            if error.raw_os_error() == Some(nix::libc::EMFILE)));
+        assert!(read_surviving_message(&path).unwrap().is_some());
+        error
+    });
+}
+
+#[cfg(unix)]
+fn assert_pressure_outcome_repairs_current_mail_before_history_wrap(
+    fail: impl FnOnce() -> crate::StorageError,
+) {
     tests::retention_fixture(40, |cx, pool, config| {
         for id in 902..941 {
             reconcile_prepared(config, &prepare_message(cx, pool, id).unwrap()).unwrap();
@@ -247,23 +319,10 @@ fn real_enospc_outcome_repairs_current_mail_before_history_wrap() {
                 .unwrap();
         assert_eq!((scanned.repaired, scanned.unchanged), (0, 16));
 
-        let error = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/full")
-            .unwrap()
-            .write_all(b"message archive witness")
-            .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(nix::libc::ENOSPC));
-        assert_eq!(error.kind(), ErrorKind::StorageFull);
+        let error = fail();
         let mut cursor = past_orphan();
         let mut failed = ReconcileReport::default();
-        record_failure(
-            901,
-            crate::StorageError::Io(error).into(),
-            &mut cursor,
-            &mut failed,
-            Instant::now(),
-        );
+        record_failure(901, error.into(), &mut cursor, &mut failed, Instant::now());
         assert_eq!(
             (failed.deferred_transient, failed.deferred_conflict),
             (1, 0)

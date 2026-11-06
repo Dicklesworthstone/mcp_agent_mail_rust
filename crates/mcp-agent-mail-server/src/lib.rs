@@ -7052,6 +7052,7 @@ fn atc_status_consumes_cooldown(status: &str) -> bool {
             status,
             "suppressed:missing_project_precondition"
                 | "suppressed:agent_capacity"
+                | "suppressed:conflict_capacity"
                 | "suppressed:agent_coverage_unavailable"
         )
 }
@@ -24403,6 +24404,7 @@ first body
         ));
         for status in [
             "suppressed:agent_capacity",
+            "suppressed:conflict_capacity",
             "suppressed:agent_coverage_unavailable",
         ] {
             assert!(!atc_status_consumes_cooldown(status));

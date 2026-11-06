@@ -282,7 +282,8 @@ impl From<crate::StorageError> for RepairFailure {
                         | std::io::ErrorKind::ResourceBusy
                         | std::io::ErrorKind::StorageFull
                         | std::io::ErrorKind::QuotaExceeded
-                        | std::io::ErrorKind::OutOfMemory));
+                        | std::io::ErrorKind::OutOfMemory)
+                    || crate::recovery::is_file_descriptor_exhaustion(error));
         // AlreadyExists can be a concurrent create-only publisher. A retry
         // revalidates its file; it never changes noclobber into replacement.
         // Resource pressure likewise proves no conflicting lease. Every
@@ -2739,6 +2740,10 @@ mod tests {
 
     #[test]
     fn retry_classification_does_not_turn_conflicts_or_permissions_into_contention() {
+        #[cfg(any(unix, windows))]
+        for error in crate::recovery::descriptor_exhaustion_errors() {
+            assert!(RepairFailure::from(crate::StorageError::Io(error)).transient);
+        }
         for kind in [
             std::io::ErrorKind::WouldBlock,
             std::io::ErrorKind::TimedOut,

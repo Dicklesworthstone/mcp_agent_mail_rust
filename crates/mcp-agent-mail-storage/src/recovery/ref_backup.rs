@@ -171,15 +171,14 @@ fn publish(destination: &Path, bytes: &[u8]) -> crate::Result<()> {
             Ok(())
         }
         Err(error) => {
-            let kind = error.error.kind();
             let (file, path) = error.file.keep().map_err(|error| error.error)?;
             drop(file);
-            Err(std::io::Error::new(
-                kind,
+            Err(crate::recovery::contextual_io_error(
                 format!(
                     "backup publication refused; candidate retained at {}",
                     path.display()
                 ),
+                error.error,
             )
             .into())
         }

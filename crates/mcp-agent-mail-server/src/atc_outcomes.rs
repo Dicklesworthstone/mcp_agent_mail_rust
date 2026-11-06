@@ -107,7 +107,10 @@ impl<K: Clone + Eq + Hash + Ord, V: Copy + Eq> BoundedOutcomes<K, V> {
         }
     }
 
-    fn forget_through(&mut self, timestamp_micros: i64) {
+    /// Discard evidence through a timestamp, including the event-ring view.
+    /// Callers that cannot retain an incoming identity must not let its missing
+    /// newer observation expose an older outcome as the apparent latest one.
+    pub(super) fn forget_through(&mut self, timestamp_micros: i64) {
         let floor = self
             .forgotten_through
             .map_or(timestamp_micros, |previous| previous.max(timestamp_micros));
