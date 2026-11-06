@@ -463,6 +463,165 @@ responsiveness at the base commit. These are prior maintainer results, not new
 results from this investigation. That comment explicitly leaves large-mailbox
 qualification and the pool's pending counter unresolved.
 
+## November 6 fresh-eyes review: ATC build repair and startup ownership
+
+The reviewed source is `aceebacc297aacc262de246469121dede4ae0156`
+with three manual source overlays in the separate
+`mcp_agent_mail_rust-ee-startup90-20261106` checkout. The production repair
+qualifies `std::result::Result` in the ATC population collector: SQLModel's
+one-parameter `Result` alias caused E0107, three E0277 diagnostics and E0308.
+The other overlays add two required semicolons to existing test assignments
+and correct a stale comment about automatic database recovery. SQL, byte
+limits, refusal behavior, assertions, test populations and deadlines are
+unchanged. The lifecycle implementation was already present at the baseline;
+this review does not claim to have newly implemented it.
+
+All three required compiler graphs pass on the same 3,917 exact file records,
+freshly checked against the frozen source with zero mismatches. Commands use
+`--locked`, `-j2` and `--config profile.dev.debug=0`, strict remote execution,
+and the existing nightly-2026-08-31 toolchain on `vmi1149989`:
+
+- Full all-target strict Clippy, including `--keep-going` and `-D warnings`:
+  client/remote exit0, receipt
+  `e565e112d4769f83d02b9c5fe05ffb4ae5d85d25a916856a73d99c5a7ea4d5ac`.
+- Workspace all-target check: client/remote exit0, receipt
+  `eabec2cfc983ec88ec1bbed4bfd574e53aa002f028026f2ac94f38551d8de8d2`.
+- Separate production lib/bin check: client/remote exit0, receipt
+  `f1994bbe27b4b6a60812bb631fc2f6369bdaaf70151d66492ca573046b1eb705`.
+
+The failed initial CLI build remains receipt
+`c59201fcfa025f8ed27272edbeed3c08152610d64afaebb0484f3a8f33e77e97`
+(101, the query type errors). The intermediate full Clippy remains receipt
+`470b31f8182254c4861c1f8a477862424a7be9b9b8552bf91190ae61278970de`
+(101, the two semicolon lints). Both matched 3,917 fresh inputs at their
+respective source points. They are not discarded or rewritten as passes.
+
+Frozen formatting passes. UBS on the eight baseline reviewed files returns0
+with zero critical findings, 12,603 warnings, 4,026 informational findings
+and no failed modules. Separate scans of the three final changed files
+return0 with zero critical findings, 7,735 warnings and 2,462 informational
+findings in aggregate, with no failed module. These are scoped scanner
+results, not a warning-free or full-workspace qualification claim.
+
+`br-kp1in.90` remains in progress. Before native execution, the declared
+selection is 30 unique cases (17 server, seven DB, six storage), followed
+by six fresh solo repeats. It covers real pool acquisition, delayed search
+and exact subsequent indexing, retained writer contention, interrupted
+archive healing and consistency reads, shutdown/deferred-start ordering,
+and the unchanged ATC bounds controls. Compiler success does not execute
+these cases. Original quiet/loaded stdio and mail/durability acceptance
+is required in addition; this candidate's results are below. Earlier November 5 results are historical evidence
+for their own source cohort, not a substitute for this candidate.
+
+Several native requests were refused before Cargo: namespace collision103,
+disk admission120, queue timeout103 and a draining worker103. The latest
+native request was refused120 despite 69,745,319,936 free bytes because
+normal active reservations and the protected floor did not fit its normal
+30GiB growth reservation. No resource budget, protected floor, worker
+configuration or foreign job was changed. These attempts ran zero cases.
+The corrected production CLI build passes client/remote0. Receipt
+`309123f55f2d4144251080d6f725643051c1f17d50cbd7f23faa4f02d8a65bc5`
+freshly matches the same 3,917 inputs with zero mismatches. The worker,
+retrieved and protected local 305,231,496-byte CLI images share SHA-256
+`caac40a68450b715cb17b9a03450b3b2c5a172d4b7493794ad7f7634dc625479`.
+Quiet native-runner stdio passes: seven cases, 18 assertions, zero failures
+or skips, 45,194ms. Its malformed-frame whole-case time is 3,484ms, below
+the unchanged 5,000ms bound. These subprocess/transport results are not
+the unexecuted 30 selected library cases. The native-build retry after the
+CLI completed is also refused120 before Cargo (65,247,039,488 free bytes,
+normal reservation and floor unchanged). The full original release-smoke
+workload ran against this exact protected CLI in a private mailbox:
+**FAIL, 54 checks pass and one fails**, native runner exit1/974,330ms. The sole
+failure is `send_message` p99 **6.010874s > 5.000s**, with8,830 measured
+successful sends, p50 2.479508s and max12.346421s. The original gate is retained.
+
+All six original phases executed: flow, cross-project isolation, storm, crash
+and soak pass; swarm fails that latency condition. The300s soak reports9,907
+sends,53,045 inbox reads and zero tool errors. The60-agent/three-project swarm
+runs486.2s, SIGKILL at245.7s, restart8.31s; all8,830 acknowledged swarm sends
+survive. Post-load archive verification completes in21.453s within the unchanged
+300s bound, without MCP reads:19,788 DB messages,19,788 verified Git archive
+messages,68,194 committed copies, no missing/extra/duplicate/mismatched IDs or
+missing/uncommitted copies. Both stopped independent C SQLite integrity checks
+and clean shutdown pass. SQLite FD maximum is2 and dispatch zombies0.
+
+Loaded original stdio runs09:29:10–09:30:09UTC, after registration of all60 swarm
+agents at09:27:10UTC. It passes seven cases/18 assertions with no failure/skip
+in59,723ms. The whole malformed-frame case is3,946ms versus the original5,000ms
+bound; `timed_out=false`, deliberate parse-error server exit1. Quiet and loaded
+execution use the same protected CLI. Concurrent stdio is declared diagnostic
+interference, not a clean performance comparison. The swarm producer and running
+`/proc/<pid>/exe` hashes match that CLI. Original host load averages are retained
+in the receipt, not used to waive the failure.
+This is the development profile (opt-level1, with the recorded debug override),
+not a release build. Even a passing full workload cannot satisfy `.35`'s
+explicit release-build criterion. That peer-owned task remains open.
+Raw logs, source diffs and receipts are retained under
+`/data/tmp/am-startup-review-20261106.mSIrexF8`.
+Final verification again matches all3,917 frozen inputs with zero mismatches;
+the three main source files match the frozen files and the protected CLI hash
+is unchanged after all execution. All13 identified owned RCH journal entries
+are terminal, acknowledged and have no live wrapper. The global inventory
+itself returns1/partial with117 journal errors; this is no whole-fleet health
+claim. The initial namespace refusal's client103 and final journal1 are
+separate retained statuses, with no Cargo execution or test credit.
+
+An avoidable Cargo-help inspection was intercepted and offloaded by the
+managed shim. The cancellation request was initially unconfirmed (E323);
+exact supported recovery later returned1 with terminal acknowledgement.
+The shell pipeline's later grep returned0 and supplies no validation credit.
+No replay or successful-cancellation claim is made.
+
+Process worksheet: the operator consumes the requested TODO and report;
+their review request supplies provenance and the original `.90` acceptance
+is the decision gate. The existing checklist retires as execution history
+after handoff. Raw receipts and protected executable copies are the minimum
+integrity controls needed after observed source/producer-artifact drift;
+they create no new release gate or status framework.
+
+Work audit window: November6 06:46UTC onward. At the pre-publication inventory,
+actual Git history has no new commit in the window; the most recent `.95`/`.96`
+closures predate it. The three-file patch is a build ENABLER plus a comment correction;
+qualification is an ENABLER; tracker/checklist/evidence edits are PROCESS.
+Changed-file tally before publication: USER0, ENABLER2, PROCESS6, UNKNOWN0;
+compiler/transport execution is a separate ENABLER activity, not another feature.
+There is no new user-facing feature or measured performance win. Disposition:
+DRIFTING, because repeated analysis, oversized diagnostic output, a cold build
+and the accidental help offload consumed too much time. The corrective action
+is to finish the concrete repair and retain unmet native acceptance honestly.
+
+There is no user-facing demo yet; the concrete consumer is the successful
+CLI compiler and live stdio subprocess. Removing PROCESS edits would not
+change runtime behavior. The older full-load/convergence work remains open;
+this window follows the operator's fresh-review and startup-ownership request.
+No subagents, follow-up carve-outs or closure claims were used. Redirect:
+finish the original real workload and publish the minimal build repair.
+
+Honesty worksheet (20 questions): 1–6, no test removal, ignore, weakened
+assertion, regenerated golden, narrowed original workload, new substitute or
+fake pass; 7, actual compiler failures and successes are separate; 8, no
+independent-review, release or moving-main qualification claim; 9, failures
+and original unmet criteria remain visible; 10, stderr is retained and the
+masked help-pipeline status earns no credit; 11, no Bead closes without its
+named probes; 12, requirements remain unchanged; 13–17, solo work, with no
+agent-consensus claim; 18, the native denominator is declared before execution
+and child cases will not be counted twice; 19, the overhead and diagnostic
+mistakes above are admitted; 20, the strongest current evidence is the actual
+compiler negative followed by all three corrected, source-bound compiler
+positives, now followed by source-bound quiet/loaded stdio and real persistence
+results with the full diagnostic's failed send-latency gate visible. Library native
+execution remains a separate requirement. Checks for 1–6 and12 are the entire
+current diff (only two test semicolons; no test/gate/config/golden additions),
+for7–10 the retained command logs and actual exit files, for11 and13 the
+current Bead state and bounded recent-closure listing, and for14–18 the solo
+dispatch record and pre-execution selection. Countermeasure for19: bound
+output before printing, stop report polishing, inspect Cargo profiles from
+source/docs rather than invoking the managed help shim, and credit only the
+original job's terminal result rather than a pipeline's last status. Preserve
+first failures (SM-11) and distinguish compiler, library and live transport
+proof (RH-2). No unobserved history sweep is claimed;
+CASS reports not_initialized.
+
 ## November 5 fresh-eyes continuation: checkpoint and worker-start failures
 
 `br-kp1in.96` closed first at06:28:58UTC on November6; `.95` closed afterward

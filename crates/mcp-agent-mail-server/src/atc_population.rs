@@ -696,11 +696,11 @@ mod tests {
                 0 => changed[1].name = "n".repeat(ATC_POPULATION_MAX_NAME_BYTES + 1),
                 1 => {
                     changed[1].program =
-                        format!("x\0{}", "p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES))
+                        format!("x\0{}", "p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES));
                 }
                 _ => {
                     changed[1].project_key =
-                        format!("{}x", "é".repeat(ATC_POPULATION_MAX_PROJECT_BYTES / 2))
+                        format!("{}x", "é".repeat(ATC_POPULATION_MAX_PROJECT_BYTES / 2));
                 }
             }
             assert!(state.refresh_with(2 + index, || Ok(changed)).is_err());

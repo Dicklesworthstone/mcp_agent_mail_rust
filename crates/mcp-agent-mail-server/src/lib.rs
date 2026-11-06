@@ -1429,8 +1429,8 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWor
                 return;
             }
             // Backfill on a dedicated worker to keep first-render startup latency low.
-            // Search tool semantics remain robust: this is idempotent and retries with
-            // auto-recovery on recoverable sqlite failures.
+            // Backfill is idempotent; failures leave search to its lazy path.
+            // Database recovery remains an explicit, supervised doctor operation.
             spawn_startup_search_backfill(config, workers);
         }
         Err(err) => {

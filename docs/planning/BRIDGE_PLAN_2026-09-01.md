@@ -1,5 +1,80 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 6 fresh-eyes review and startup ownership — EmeraldEagle
+
+Operator-requested review and granular TODO; Beads remains authoritative. This
+section retires as execution history when the findings and evidence are handed
+off. It introduces no runtime gate. Baseline: `aceebacc`; prior frozen receipts
+do not qualify new source or the separately integrated peer changes.
+
+- [x] Refresh shared checkout, governing rules, mailbox health and ready Beads.
+- [x] Review checkpoint binding/restore/save and unchanged refusal boundaries.
+- [x] Review WBQ spawn rejection, progress clock, retained receiver and admission.
+- [x] Review backlog journal/claim retention and coalescer rollback wake/join.
+- [x] Review test-fixture ownership, equivalent assertions and search writer guard.
+- [x] Claim ready `br-kp1in.90`; reserve its existing source and tracker surfaces.
+- [x] Trace all startup-worker ownership through stdio, HTTP, TUI and error exits.
+  - [x] Check registration versus shutdown, concurrent shutdown and native cancellation.
+  - [x] Check delayed/in-flight search, advisory probe and lock-healing boundaries.
+  - [x] Check readiness bind timeout and deferred TUI starter drop/detach ordering.
+- [x] Fix confirmed review findings; preserve original deadlines,
+  mailbox authority, source scopes, completion markers and recovery refusal.
+  Correct the stale startup-search comment claiming automatic DB recovery; the
+  implementation already refuses it. The initial CLI build then found a real
+  incoming ATC query compiler failure: SQLModel's one-argument `Result` alias
+  captured a two-argument collector. Qualify `std::result::Result` directly;
+  preserve all SQL, error refusals and existing assertions. Retain receipt
+  `c59201fc` (client/remote 101, 3,917 fresh inputs, zero mismatches).
+  Both corrected files matched main and the frozen candidate before execution;
+  final compiler results are below and native acceptance stays open.
+  Full Clippy subsequently clears that query but rejects two existing test
+  assignments in `atc_population.rs` without semicolons. Retain receipt
+  `470b31f8` (101, 3,917 fresh inputs, zero mismatches); add only the two
+  semicolons, preserving the 300-case loop and every assertion. The candidate
+  now has three source overlays, including this test-only correction.
+- [ ] Execute real delayed/in-flight startup and subsequent-startup controls.
+  - [ ] Complete native compilation; normal RCH admission repeatedly refuses
+    before Cargo, including the post-CLI retry (120). Zero selected library
+    cases executed. Predeclared selection: 30 unique cases
+    (17 server, 7 DB, 6 storage), plus six fresh solo repeats.
+  - [ ] Exercise native pool acquisition and retained Tantivy writer contention.
+  - [ ] Exercise actual advisory reads and stale-lock evidence preservation.
+    Execute the existing real interrupted-healing and interrupted-consistency
+    controls plus four ordinary archive controls; retain original quarantine
+    bytes, partial-metric refusal, retry and Git-index-lock exclusions.
+  - [ ] Exercise deferred starter shutdown/detach and readiness retry.
+  - [ ] Execute both existing native ATC population projection tests, including
+    byte boundaries, embedded NULs, exact retained rows and full-refresh refusal.
+  - [ ] Execute the unchanged population queue/scope metadata-bound control.
+- [x] Execute original quiet/loaded stdio and full mail/durability workload;
+  retain the failure and keep original acceptance open. Quiet and loaded each
+  pass 18 assertions with no failure/skip; whole malformed cases are
+  3,484ms and 3,946ms against unchanged 5,000ms. Full diagnostic: 54 checks pass,
+  one fails (`send_message` p99 6.011s > 5.000s). All 8,830 swarm acknowledgements
+  survive SIGKILL; all 19,788 DB messages converge to verified archive in21.453s.
+  Development opt-level1 and deliberate concurrent stdio mean no release-build
+  or comparative-performance claim. Earlier failed controls remain retained.
+- [x] Run required all-target, production, strict Clippy, formatting and scoped
+  static checks on any final source edits; re-read the completed diff.
+  - [x] Strict full all-target Clippy passes: `e565e112`; the subsequent
+    all-target check passes: `eabec2cf`. Both freshly match 3,917 inputs
+    with zero mismatches and identical file records. Earlier failures remain.
+  - [x] Separate production lib/bin check passes: `f1994bbe`, freshly matching
+    the same 3,917 file records as both other compiler gates, zero mismatches.
+  - [x] Frozen eight-file UBS: exit 0, zero critical, 12,603 warnings,
+    4,026 informational findings and no failed module; no warning-free claim.
+  - [x] Re-scan the corrected comment in main and check both trees' formatting.
+  - [x] Build and hash the corrected CLI: client/remote0, `309123f5`, same
+    3,917 inputs/zero mismatches. Worker and protected local SHA-256
+    `caac40a68450b715cb17b9a03450b3b2c5a172d4b7493794ad7f7634dc625479`.
+  No independent verification claim. Pending native helper controls complete
+  the original cancellation criteria rather than create another gate or task.
+- [x] Record actual results and limitations, update Beads on cited evidence,
+  flush graph/cycle checks, publish owned work and release reservations.
+  `.90` remains in progress; `.35` retains peer ownership and its original
+  release-build requirement. Thirteen owned RCH entries are terminal/acknowledged;
+  all eight leases are released at handoff. No Bead closes in this continuation.
+
 ## November 5 fresh-eyes continuation — EmeraldEagle
 
 Qualification is pinned to source `5ec128ce`, which includes

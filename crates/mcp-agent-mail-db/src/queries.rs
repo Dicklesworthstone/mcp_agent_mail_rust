@@ -6822,7 +6822,7 @@ pub async fn list_atc_population_snapshot(
                         last_active_ts: row.get(4).and_then(value_as_i64).unwrap_or_default(),
                     })
                 })
-                .collect::<Result<Vec<_>, DbError>>()
+                .collect::<std::result::Result<Vec<_>, DbError>>()
             {
                 Ok(population) => Outcome::Ok(population),
                 Err(error) => Outcome::Err(error),
