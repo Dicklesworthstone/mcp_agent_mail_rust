@@ -16,6 +16,175 @@ prohibited pull requests.
 
 ## Status and evidence boundary
 
+### November 6 fresh review: source toolchain context and BV labels
+
+Continuation from `ae38477f`, starting19:00 UTC. Fresh review found a real
+regression in the prior installer repair: the nightly preflight ran in the
+caller directory before checking out the release. Actual installed Rustup,
+stable and nightly reproduce caller refusal versus release-directory success
+in `rust-preflight-negative.json` under the raw root below. Published fix
+`09b5215df14b03bcd14d2adf9fbcf14789f56f1a` runs the preflight after exact-tag
+verification, in that source directory, without changing caller CWD or global
+toolchain settings. Unchecked-bootstrap refusal and private lock guards remain.
+Final installer SHA-256:
+`d30b3d17ec5c0267c27c8ca305f3facf8091bcc6e8fb76c3185ff8607ecd7d16`;
+exit-test SHA-256:
+`e6d6f5bc22e9998530a691cc0b3cc39d2b40c952b33dd542f3af85dc8710de4d`.
+
+- Final full installer script:130 boundary cases, zero failures
+  (52 exit,16 lock,10 destination,42 real-kernel,10 explicitly R2 native-launch
+  fixtures), then four genuine signed public v0.3.40 delivery modes pass.
+  The unchanged installer fails exactly the six new context cases; the124
+  prior cases still pass. Repeated cohorts are not added to the denominator.
+- Real installed Rustup positive and fresh repeat pass; stable-source and
+  missing-source controls refuse. Actual local-Git file/stdin probes check out
+  the verified tag and admit installed nightly, then reach the unchanged
+  missing-dependency-pin gate. These are R1 local-source probes, not completed
+  source builds. Global Rustup settings remain byte-identical.
+- Genuine signed file/stdin installs while real UID65534 holds the public
+  destination lock pass at `/data/tmp/am-installer-private-lock-w3nzy4ht/result.json`
+  (13.452s/13.046s). Exact tag, Minisign key, checksum, versions and `--verify`
+  pass; foreign witness and private authority inode survive. Artifact/rollback
+  and real live-ELF pruning pass separately; fixture artifacts remain R1/R2.
+- Final two-file UBS exits0 with zero findings and no failed module. Shell
+  syntax and main/frozen formatting pass. All-target check, separate production
+  lib/bin check and strict all-target Clippy each pass against the same3,917
+  freshly verified records, zero mismatches. Receipt-file SHA-256 values:
+  `59a06e6534b625261f4acb1f6e64847609d9f7a880b09c4a5a6625c6a35e710a`,
+  `59dd99d379976b1564244fb77ec536dc69766bbe4f29c4620daa52ff5b5a536b`,
+  `275c7cbbc761d4c4d259964245167724777151c3bc3e725cb8d077d881c2bab8`.
+  Workers are vmi1149989, ovh-a and hz3 respectively. Frozen qualifier is
+  `aceebacc` plus the retained source overlays; code matches published main,
+  while its older reports do not claim to equal moving handoff documentation.
+
+Ready `br-cdwya` also exposed a concrete upstream BV producer defect:
+unlabeled recommendations emitted `labels:null`, violating its advertised array
+schema. Upstream `964cb5ce4d4b33eb4ed606df4e3380bbff845951` initializes that
+slice and adds nil/empty/populated regression coverage. Actual unchanged-producer
+negative fails at nil; controls succeed. No schema or recommendation-filter
+requirement changed. Rebuilt private CLI SHA-256
+`ce2c02867b73ebc5328ddeff06b27a472265463e27e97ce339c56d47be2b6fc2`
+reports Go1.26.10, base `f2297dc3` and modified=true; its two overlays match
+the published commit. It is not a newly released or globally installed binary.
+Four36-node real JSONL/SQLite fixtures and two fresh solo repeats pass both
+original/current schemas and live-claim routing. High-centrality tombstones and
+closed nodes never claim; commands use `br`. However, all four original strict
+broad-recommendation filters fail because deferred diagnostics remain with
+claimable=false. **Original `br-cdwya` stays in progress**, without a follow-up
+split or altered acceptance.
+
+Go is outside RCH's execution allowlist. Actual Go1.26.10 build, vet and full
+tests ran through bounded local DSR and passed. The full four-check DSR aggregate
+remains failed: whole-tree gofmt reports33 unchanged vendor files. Both edited
+files are formatted with pinned Go1.26.10; no vendor edits or gate bypass.
+DSR receipt: `/home/ubuntu/.local/state/dsr/quality-logs/bv/20261106T144753-685562/receipt.json`.
+The scoped Go scan exits0: zero critical, zero warnings,90 informational findings,
+no failed module. BV's tracker flush refuses a nonempty recovery WAL; no owned
+BV tracker changes, checkpoint, replacement, rebuild or deletion was attempted.
+Publication was source-only. `[skip ci]` obeys BV's permanent DSR-only policy;
+it is disclosed here and does not turn the failed aggregate into a pass.
+
+The ACFS checksum handoff was already published by another agent as
+`367ba8b085ffe6fc067515a2999032a4e5f2ac3e`; this review fast-forwards the clean
+checkout and verifies it, without a duplicate pin commit. Canonical verification
+observes48 installers:46 matches including exact MCP and unchanged BV, two
+existing mismatches (Atuin/Grok), zero errors/skips. Report SHA-256
+`6bc63fb46bfb9e090710d080a213ab09b4c84d64a85e27f324aba824bc31a7cc`;
+policy SHA-256 `0e1f6916d50d4c6cf0422c9ce8cd598b6f37be7d65b45d771c6a18d1d36ecd52`.
+Bound candidate/validator confirms no target pin change is needed. Existing
+unrelated pins stay unchanged. Checker validate/list/local dry-run, generated
+ShellCheck and461 manifest checks pass. Strong checker exit4 reaches all48
+URLs and matches46 hashes; only the two existing unrelated mismatches fail.
+No ACFS installer execution, global dependency installation or new release.
+
+The `.90` native build is refused120 before Cargo on vmi1152480, with free
+53,052,309,504 bytes, unchanged32,212,254,720 growth budget and10,737,418,240
+floor. **Zero of the predeclared30+6 native cases execute; `.90` stays in
+progress.** Production/Clippy admission refusals are retained separately from
+later successful distinct-worker checks. Read-only primary inventory confirms
+a real live21GiB foreign reservation; no process/ledger/floor/budget was changed.
+Seven owned RCH entries are terminal/acknowledged, zero live wrappers. The global
+job inventory has117 unrelated malformed journals and is not a fleet-health pass.
+Prior full-load p99 failure and release/cross-platform exclusions remain red.
+Only `br-x0aie` is reclosed after fresh solo re-execution of its original criteria.
+
+Raw root: `/data/tmp/am-fresh-review-20261106.sF3xqB`. Preserve the original
+six-case negative, all admission refusals, DSR unregistered-tool failure,
+pre-execution Go allowlist refusal, incorrect-yq setup exit4 with zero checks,
+unsupported Go UBS retention exit2 and aggregate vendor-format failure.
+One dynamic-argv probe was rejected by DCG before execution; explicit complete
+native argv then succeeds without a bypass. CASS reports not_initialized;
+no older-session audit is claimed. Verification here is solo, not independent
+verification, full source-install completion, server release clearance or
+completion of all remaining Beads.
+
+#### Required anti-ceremony worksheets (19:00 UTC through handoff)
+
+Process: the requested granular TODO/report is PROCESS, consumed by this
+operator for fresh-review acceptance of the observed stable-default refusal.
+It retires as execution history at handoff. Minimal retained source/negative
+receipts prevent concrete evidence loss; necessary here, smallest reliable
+record, no cheaper equivalent. Ready source repair/native controls beat more
+status machinery. Verdict: minimum requested gate, no new framework.
+
+Real-work audit: actual Git diffs/logs, recent three closes and oldest five open
+items were inspected. README purpose is mail-like coordination for coding agents.
+USER: two producer fixes; ENABLER: their real tests/compiler gates/checksum
+consumer verification; PROCESS: this requested tracking/evidence handoff;
+UNKNOWN:0. These categories describe work units, not a success quota.
+(1) Two-minute demo: stable-default Rustup admits the pinned release nightly;
+BV unlabeled output validates as an array. (2) Omitting process files changes no
+runtime behavior. (3) Real old/new probes, compiled CLI and ACFS exercised the
+enablers. (4) Oldest `br-mmnyj` and remaining P0 archive work stay open; effort
+went to a confirmed introduced regression and ready robot bug while native
+admission was blocked. (5) Solo: no pane/closure comparison. (6) No spec edits
+or follow-up laundering; unmet originals remain open. Verdict: **DRIFTING** in
+time allocation; excessive exploration/tool setup delayed two small fixes.
+Correction: freeze scope, finish required publication/evidence, add no machinery.
+
+Honesty inventory, same bounded window; every answer refers to inspected
+source/test/gate diffs, commands and retained receipts:
+
+1. No (checked original assertions, counts, deadlines, ignores and configs;
+   all retained, with six added context cases and one three-case Go test).
+2. No (checked fixtures: R2 compiler/native outputs are labeled and compensated
+   by actual Rustup, real local Git and genuine signed installs/compiled BV).
+3. No (checked diffs: no regenerated golden or snapshot).
+4. Yes: tests changed with code; BV uses `[skip ci]` under its existing mandatory
+   DSR-only policy. No suppression, DSR skip or widened test limit; aggregate
+   vendor-format failure remains failed. Transport timeouts are not test limits.
+5. No (checked production diffs: no fixture-name sniffing or success hardcoding).
+6. No (checked counts: native zero-run refusals remain120; no positive claim).
+7. No (checked cited command exits and source commit before reporting publication).
+8. No (checked proof labels: local Go, R1/R2, public payloads and unrun native
+   cases remain distinct from newly built server/release qualification).
+9. No (checked report includes all decisive failures and unmet original criteria).
+10. No (checked cited commands retain stdout/stderr; existing internal version
+    discovery redirection is not claimed as separate diagnostic proof).
+11. Yes: prior closure needed reopening after an integration regression; original
+    `br-x0aie` was reopened on record, then re-executed against original criteria.
+    `.90` and `br-cdwya` stay open; no follow-up item carries unmet acceptance.
+12. No (checked acceptance/schema/filter/threshold diffs: none weakened).
+13. N/A: solo; reclosure cites exact source and fresh solo evidence.
+14. N/A: no agents dispatched.
+15. N/A: no subagent report accepted. Peer ACFS publication was reverified.
+16. N/A: no panes/agents; refusal-only native work remains open.
+17. No (checked report makes no agent-agreement or independent-review claim).
+18. No (checked predeclared populations:130 cases, six expected negative
+    failures, four36-node fixtures plus two separate repeats; Go aggregate3/4).
+19. Yes: tool/setup failures and excessive exploration above merit explanation;
+    corrections retain failures, use explicit argv/trusted PATH and distinguish
+    bounded local DSR from refused RCH. BV recovery WAL remains untouched.
+20. Strongest evidence: actual unchanged-code Rustup negative versus corrected
+    context plus genuine signed installs; unchanged BV producer nil failure
+    versus rebuilt native CLI passing the original advertised schema.
+
+Disposition: corrections and original reopening are recorded; failure chains
+are disclosed here and in the handoff. Countermeasures: RH-1 preserves original
+assertions/schema/thresholds; RH-17 retains failed receipts; proof-class
+inflation is prevented by explicit local/fixture/unrun/release boundaries.
+Solo re-verification is expressly not independent verification.
+
 ### November 6 continuation: private installer lock authority
 
 The ready item `br-x0aie` had a real remaining availability defect at

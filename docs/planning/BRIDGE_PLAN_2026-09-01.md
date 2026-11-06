@@ -2,6 +2,81 @@
 
 ## November 6 fresh-eyes review and startup ownership — EmeraldEagle
 
+Fresh continuation from `ae38477f` (19:00 UTC):
+
+- [x] Refresh governing-doc drift, shared checkout, health and ready Beads.
+- [x] Re-read lock acquisition, mutation checks, cleanup, Git authority and source callers.
+- [x] Reproduce premature nightly refusal using real installed stable/nightly
+  compilers and a private Rustup home; global toolchain settings stay untouched.
+- [x] Reopen the original owned installer item for the regression introduced
+  alongside its repair; keep its original lock acceptance unchanged.
+- [x] Validate nightly in the verified release directory; preserve caller CWD,
+  exact-tag checkout, explicit source selection and unchecked-bootstrap refusal.
+- [x] Cover valid/stable/missing source contexts and missing tools: original
+  source fails exactly the six new context cases; final 130 boundary cases
+  and four genuine signed delivery modes pass. Actual installed nightly
+  positive/repeat and stable/missing negatives pass without changing defaults.
+  Real local-Git file/stdin source probes reach the unchanged dependency gate;
+  these bounded probes do not claim a completed source build.
+- [x] Recheck `.90` worker admission with normal resources. Worker vmi1152480
+  refuses120 before Cargo (active reservations plus protected floor), zero of
+  the original30+6 cases execute. No resource changes or unchanged retries.
+- [x] Re-read final diff; run all mandatory compiler/static/format gates on
+  frozen source, and preserve earlier red load/release acceptance.
+  - [x] Freeze both shell overlays; syntax, formatting and two-file UBS0/zero findings.
+  - [x] All-target check on the primary passes; receipt file `59a06e65`,
+    3,917 freshly verified records and zero mismatches.
+  - [x] Preserve production/Clippy admission120 refusals, including the primary
+    retry. Read-only primary inventory confirms a live21GiB Clippy reservation;
+    no foreign process, ledger, floor or budget was changed.
+  - [x] Separate production passes on ovh-a: `59dd99d3`, same3,917 exact records,
+    zero mismatches.
+  - [x] Strict Clippy on hz3 passes: `275c7cbb`, identical3,917 records,
+    zero mismatches. All three receipts are freshly verified; no refusal substitute.
+- [x] Claim ready `br-cdwya` and execute its high-centrality tombstone controls
+  against the installed `bv` image. Live selection excludes tombstones and
+  emits actual `br` routes; absent tracker metadata refuses to invent a claim.
+- [x] Validate the advertised JSON schema against real JSONL/SQLite outputs:
+  catch nil labels emitted as null instead of the required array. Preserve
+  the original schema failure and original stricter deferred-filter acceptance.
+- [x] Add the upstream three-case labels regression and execute the actual
+  unchanged-producer negative: nil fails, empty/populated controls succeed.
+- [x] Fix only the upstream labels producer; run Go build/vet/full tests,
+  formatting, scoped scan and compiled-CLI fixtures through DSR. Go is outside
+  RCH's execution allowlist, so these are bounded local Go checks, not remote proof.
+  Build/vet/full tests pass; aggregate format gate remains red for33 unchanged
+  vendor files. Edited source is clean under Go1.26.10. The rebuilt CLI passes
+  both original/current schemas on four36-node fixtures and two fresh repeats.
+  Scoped UBS passes with0 critical,0 warnings,90 informational findings and no
+  failed module; unsupported Go scratch retention attempt is retained separately.
+  Upstream source/tests publish as `964cb5ce`; no global tool binary is replaced.
+- [x] Keep `br-cdwya` in progress: its stricter original broader-recommendation
+  filter fails all four fixtures because deferred diagnostics remain. No
+  acceptance edit, new follow-up split, or claim that this original task closed.
+- [x] Update original Beads, canonical ACFS pin/mirrors, evidence and handoff;
+  publish owned changes and release leases.
+  - [x] Publish installer/context regressions as `09b5215d`; reclose only original
+    `br-x0aie` after fresh solo re-execution. `.90` and `br-cdwya` stay in progress.
+  - [x] Preserve peer ACFS handoff `367ba8b0`: fast-forward clean checkout,
+    canonical verify all48 (46match/two existing drift/no errors/skips), bound
+    builder/validator differs only in timestamp, so leave policy unchanged.
+    Exact MCP and unchanged BV pins match. Basic checker, ShellCheck and461
+    manifest checks pass; stronger checker exit4 solely existing Atuin/Grok drift.
+  - [x] Record all three worksheets in the existing evidence report. Verdict:
+    DRIFTING in time allocation, two concrete fixes, freeze further scope.
+  - [x] Inspect all seven owned RCH entries: terminal/acknowledged, zero live
+    wrappers. Global117 unrelated journal failures are not a fleet-health pass.
+  - [x] Flush/check graph, publish exact owned evidence/tracker files and release
+    owned leases; preserve all seven pre-existing untracked peer artifacts.
+
+Process worksheet: this requested TODO is PROCESS, with the operator as consumer,
+their fresh-review acceptance as gate and the actual stable-default refusal as
+observed defect; retire it as execution history at handoff. Raw source/probe
+receipts are the minimum integrity control against losing failed evidence:
+necessary here, minimal, no cheaper durable equivalent. The ready source-build
+repair and original native controls take precedence over more status machinery.
+Verdict: minimum requested gate; no new framework or runtime gate.
+
 Continuation from `334400d0` (operator-requested review; same checklist, no new gate):
 
 - [x] Re-read the three source edits and trace ATC query/hydration and recovery consumers.
