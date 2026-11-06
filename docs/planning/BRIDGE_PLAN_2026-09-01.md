@@ -46,8 +46,13 @@ rewinding after a failed save; implementation takes precedence over reporting.
       and first documentation paragraph without suppressions or changed tests.
     - [ ] Qualify that integration edit with the existing real Tantivy writer
       retention/error controls and all three cancelled-startup-backfill cases.
+    - [x] Preserve the next Clippy101 receipt (4a9b5a68, 3,917 fresh inputs,
+      zero mismatches); box the existing private reservation helper's typed
+      SQLModel error without changing SQL, parameters or retry classification.
+    - [ ] Run the original reservation-source functional controls; report the
+      pre-existing ignored CPU benchmark separately, without a performance claim.
     - [ ] Re-run all-target, separate production and strict Clippy on the final
-      two-file source; the earlier one-file all-target pass is historical.
+      three-file source; the earlier one-file all-target pass is historical.
   - [ ] Fresh solo acceptance and second source review; record exact revision and
     proof limitations before closing. No independent-review claim.
 - [ ] Use terminal findings to choose any further ready capability repair; keep
