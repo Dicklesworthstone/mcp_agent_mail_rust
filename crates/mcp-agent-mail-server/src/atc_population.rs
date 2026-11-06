@@ -176,6 +176,20 @@ impl HydrationState {
                 return Err(error);
             }
         };
+        if rows.len() > mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX
+            || rows.iter().any(|row| !row.metadata_within_limits())
+        {
+            // Validate the entire observation before scope, queue or snapshot
+            // clones. Never filter out an oversized row: it may be newer
+            // activity or a conflicting identity for an otherwise valid row.
+            // Keep the previous bounded state, but suspend inference until a
+            // complete valid refresh replaces it.
+            self.progress.refresh_failures = self.progress.refresh_failures.saturating_add(1);
+            return Err(
+                "ATC population exceeds count or metadata byte limits; coverage is incomplete"
+                    .to_string(),
+            );
+        }
         // Build scope from the actual projection before deduplicating cache
         // keys. Conflicting duplicate identities must not become last-row-wins.
         let next_scope = PopulationScope::from_rows(&rows);
@@ -329,6 +343,25 @@ static HYDRATION: OnceLock<Mutex<HydrationState>> = OnceLock::new();
 
 fn hydration() -> &'static Mutex<HydrationState> {
     HYDRATION.get_or_init(|| Mutex::new(HydrationState::default()))
+}
+
+pub(super) fn release_capacity_admission() -> Result<(), &'static str> {
+    // Match refresh/reset's HYDRATION -> ENGINE order and keep the observed
+    // population stable through the engine check. A busy or poisoned state is
+    // unavailable evidence, not permission to use an older admitted report.
+    let state = hydration()
+        .try_lock()
+        .map_err(|_| "agent_coverage_unavailable")?;
+    if state.active_refresh.is_some()
+        || state.progress.refresh_failed
+        || !state.pending.is_empty()
+        || state.resume_pending
+    {
+        return Err("agent_coverage_unavailable");
+    }
+    // Preserve standalone engine use before the first DB population. This is
+    // the existing capacity check, not a new target-scope authorization.
+    engine::atc_release_capacity_admission()
 }
 
 /// Keep the current population authority stable through delivery admission.
@@ -640,6 +673,62 @@ mod tests {
                 last_active_ts: 1_000_000,
             })
             .collect()
+    }
+
+    #[test]
+    fn oversized_population_metadata_never_enters_queues_or_replaces_valid_scope() {
+        use mcp_agent_mail_db::models::{
+            ATC_POPULATION_MAX_NAME_BYTES, ATC_POPULATION_MAX_PROGRAM_BYTES,
+            ATC_POPULATION_MAX_PROJECT_BYTES,
+        };
+        let mut state = HydrationState::default();
+        state.refresh_with(1, || Ok(rows(2))).unwrap();
+        state.drain_with(|_| {}, || true);
+        state.resume_pending = false;
+        let retained = state.previous_snapshot.clone();
+        for index in 0..300 {
+            let mut changed = rows(2);
+            changed[0].last_active_ts = 2_000_000 + index;
+            // If this row were silently skipped, the first row could appear
+            // authoritative despite missing newer/conflicting identity data.
+            changed[1].name = changed[0].name.clone();
+            match index % 3 {
+                0 => changed[1].name = "n".repeat(ATC_POPULATION_MAX_NAME_BYTES + 1),
+                1 => {
+                    changed[1].program =
+                        format!("x\0{}", "p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES))
+                }
+                _ => {
+                    changed[1].project_key =
+                        format!("{}x", "é".repeat(ATC_POPULATION_MAX_PROJECT_BYTES / 2))
+                }
+            }
+            assert!(state.refresh_with(2 + index, || Ok(changed)).is_err());
+            assert!(state.pending.is_empty());
+            assert_eq!(state.previous_snapshot, retained);
+            assert_eq!(
+                state.progress.refresh_failures,
+                u64::try_from(index + 1).unwrap()
+            );
+            assert_eq!(
+                state
+                    .health_snapshot(2 + index)
+                    .inference_deferred_by_hydration,
+                Some(true)
+            );
+            assert!(
+                state
+                    .scope
+                    .as_ref()
+                    .unwrap()
+                    .permits("HydratedAgent0000", Some("/hydration"))
+            );
+        }
+        state.refresh_with(400, || Ok(rows(2))).unwrap();
+        assert!(!state.progress.refresh_failed);
+        assert_eq!(state.progress.unchanged_agents, 2);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.health_snapshot(400).status, "complete");
     }
 
     #[test]
@@ -1620,6 +1709,196 @@ mod tests {
             agent: "HydratedAgent0000".into(),
         }];
         report
+    }
+
+    #[test]
+    fn release_execution_admission_waits_for_usable_population_evidence() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let unavailable = Err("agent_coverage_unavailable");
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            Ok(()),
+            "standalone engine use before hydration remains supported"
+        );
+        {
+            let _state = hydration().lock().unwrap();
+            assert_eq!(
+                super::super::atc_release_capacity_admission(),
+                unavailable,
+                "contended population evidence must not block or authorize execution"
+            );
+        }
+        let refresh = PopulationRefresh::start(&mut hydration().lock().unwrap());
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+        drop(refresh);
+        assert!(atc_population_hydration_stats().refresh_failed);
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+
+        sync_population_with(1_000_000, || Ok(rows(65))).unwrap();
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+        while atc_population_hydration_stats().pending_agents > 0 {
+            tick_report(2_000_000).unwrap();
+        }
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            unavailable,
+            "the final inference yield is still incomplete population work"
+        );
+        tick_report(3_000_000).unwrap();
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+
+        let poisoned = std::panic::catch_unwind(|| {
+            let _state = hydration().lock().unwrap();
+            panic!("interrupted population update");
+        });
+        assert!(poisoned.is_err());
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+        super::super::reset_global_atc_state_for_test(&config);
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn oversized_durable_metadata_suspends_public_inference_and_release_admission() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let cx = asupersync::Cx::for_testing();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("population-metadata.db");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        fastmcp_core::block_on(mcp_agent_mail_db::schema::migrate_to_latest_base(
+            &cx, &conn,
+        ))
+        .into_result()
+        .unwrap();
+        let now = mcp_agent_mail_core::timestamps::now_micros();
+        conn.execute_raw(&format!(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'hydration', '/hydration', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'HydratedAgent0000', 'codex-cli', 'test', 1, {now})"
+        )).unwrap();
+        let pool =
+            mcp_agent_mail_db::create_pool_without_startup_init(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(atc_sync_population_from_db(&pool).unwrap().agents, 1);
+        let epoch = super::super::capture_delivery_epoch().unwrap();
+        let planned = release_report(now + 1);
+        assert!(!hydration().lock().unwrap().resume_pending);
+        let admitted = super::super::admit_report(&epoch, planned, now + 1).unwrap();
+        let queued = admitted
+            .effects
+            .into_iter()
+            .find(|effect| effect.kind == "release_reservations_requested")
+            .expect("release was admitted before the invalid refresh");
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+        let mut projects = crate::AtcExecutorProjectCache::default();
+        assert_eq!(
+            crate::execute_atc_effect(None, crate::AtcExecutorMode::Live, &mut projects, &queued),
+            "failed:executor_unavailable",
+            "control: population admission permits reaching the runtime"
+        );
+        assert_eq!(
+            engine::atc_agent_last_activity("HydratedAgent0000"),
+            Some(now)
+        );
+        assert!(!atc_population_hydration_stats().refresh_failed);
+        let oversized = "p".repeat(mcp_agent_mail_db::models::ATC_POPULATION_MAX_PROGRAM_BYTES + 1);
+        conn.execute_raw(&format!(
+            "UPDATE agents SET program = '{oversized}' WHERE id = 1"
+        ))
+        .unwrap();
+
+        assert!(
+            atc_sync_population_from_db(&pool)
+                .unwrap_err()
+                .contains("coverage is incomplete")
+        );
+        assert_eq!(
+            engine::atc_release_capacity_admission(),
+            Ok(()),
+            "engine capacity alone cannot detect a failed population refresh"
+        );
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            Err("agent_coverage_unavailable")
+        );
+        assert_eq!(
+            crate::execute_atc_effect(None, crate::AtcExecutorMode::Live, &mut projects, &queued),
+            "suppressed:agent_coverage_unavailable",
+            "a previously admitted release must stop before runtime work"
+        );
+        for step in 2..=8 {
+            let report = super::super::atc_tick_report(now + step).unwrap();
+            assert!(report.effects.is_empty() && report.actions.is_empty());
+            assert_eq!(
+                report.summary.completeness,
+                engine::SnapshotCompleteness::Partial
+            );
+            assert_eq!(
+                report.summary.policy.fallback_reason.as_deref(),
+                Some("population_refresh_failed")
+            );
+        }
+        let state = hydration().lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert_eq!(state.previous_snapshot.len(), 1);
+        assert_eq!(
+            state.previous_snapshot.values().next().unwrap().program,
+            "codex-cli"
+        );
+        assert_eq!(state.progress.refresh_failures, 1);
+        drop(state);
+        assert_eq!(
+            engine::atc_agent_last_activity("HydratedAgent0000"),
+            Some(now)
+        );
+
+        conn.execute_raw(&format!(
+            "UPDATE agents SET program = 'claude-code', last_active_ts = {} WHERE id = 1",
+            now + 10
+        ))
+        .unwrap();
+        assert_eq!(atc_sync_population_from_db(&pool).unwrap().agents, 1);
+        assert!(!atc_population_hydration_stats().refresh_failed);
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            Err("agent_coverage_unavailable")
+        );
+        let recovered = super::super::atc_tick_report(now + 11).unwrap();
+        assert_eq!(
+            recovered.summary.completeness,
+            engine::SnapshotCompleteness::Full
+        );
+        assert_eq!(
+            engine::atc_agent_last_activity("HydratedAgent0000"),
+            Some(now + 10)
+        );
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+        super::super::reset_global_atc_state_for_test(&config);
     }
 
     fn add_passive_probe(report: &mut AtcTickReport) {

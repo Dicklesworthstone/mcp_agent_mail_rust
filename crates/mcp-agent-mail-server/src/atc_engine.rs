@@ -15,6 +15,10 @@
 //! All downstream subsystems (liveness, conflict, routing, calibration)
 //! are built on top of these two primitives.
 
+use mcp_agent_mail_db::models::{
+    ATC_POPULATION_MAX_NAME_BYTES, ATC_POPULATION_MAX_PROGRAM_BYTES,
+    ATC_POPULATION_MAX_PROJECT_BYTES,
+};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -3439,7 +3443,7 @@ pub struct AtcKernelTelemetry {
     pub scheduled_agents: usize,
     pub tracked_agents: usize,
     pub max_tracked_agents: usize,
-    /// Refused registration attempts, not a count of distinct identities.
+    /// Refused identity-count or metadata-byte admissions, not distinct agents.
     pub agent_capacity_refusals: u64,
     /// Latches after the first refusal; resetting the engine clears it.
     pub agent_coverage_incomplete: bool,
@@ -4064,8 +4068,8 @@ pub struct AtcEngine {
     conflict_core: DecisionCore<ConflictState, ConflictAction>,
     /// Per-agent liveness tracking.
     agents: HashMap<String, AgentLivenessEntry>,
-    /// Saturating count of registration attempts refused at capacity. A nonzero
-    /// count permanently marks this engine's liveness coverage as incomplete;
+    /// Saturating count of identity or metadata admissions refused at capacity.
+    /// A nonzero count permanently marks liveness coverage as incomplete;
     /// forgetting the refused identities must not restore release authority.
     agent_capacity_refusals: u64,
     /// Cached deterministic agent ordering for summary rendering.
@@ -5273,7 +5277,16 @@ impl AtcEngine {
     /// retain their state and feedback; new identities are refused without
     /// allocating a liveness entry or scheduling work. Refusals latch incomplete
     /// coverage until an engine reset, normally with a larger population limit.
+    /// Metadata byte limits also apply to existing-agent updates: retain the
+    /// last valid state and fail closed instead of truncating routing identity.
     pub fn register_agent(&mut self, name: &str, program: &str, project_key: Option<&str>) -> bool {
+        if name.len() > ATC_POPULATION_MAX_NAME_BYTES
+            || program.len() > ATC_POPULATION_MAX_PROGRAM_BYTES
+            || project_key.is_some_and(|key| key.len() > ATC_POPULATION_MAX_PROJECT_BYTES)
+        {
+            self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
+            return false;
+        }
         if name.trim().is_empty() || name == ATC_AGENT_NAME {
             return false;
         }
@@ -5372,6 +5385,13 @@ impl AtcEngine {
         // previously still consumed feedback, changed project attribution,
         // resurrected dead agents, and churned the scheduler.
         if timestamp_micros <= entry.rhythm.last_activity_ts {
+            return;
+        }
+        if project_key.is_some_and(|key| key.len() > ATC_POPULATION_MAX_PROJECT_BYTES) {
+            // A newer signal with unretainable routing metadata is incomplete
+            // evidence. Do not replace the project, consume pending feedback,
+            // or resurrect the agent from a partially accepted observation.
+            self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
             return;
         }
         self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
@@ -6795,12 +6815,75 @@ mod engine_tests {
     }
 
     #[test]
+    fn liveness_metadata_bounds_preserve_existing_state_and_feedback() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        let mut engine = AtcEngine::new_for_testing();
+        let name = "N".repeat(ATC_POPULATION_MAX_NAME_BYTES);
+        let program = "é".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES / 2);
+        let project = "é".repeat(ATC_POPULATION_MAX_PROJECT_BYTES / 2);
+        assert!(engine.register_agent(&name, &program, Some(&project)));
+        engine.observe_activity(&name, Some(&project), 5_000_000);
+        engine.record_pending_liveness_feedback(&name, LivenessAction::Suspect, 2.0, 10_000_000);
+        let schedule_version = engine.agents[&name].schedule_version;
+        let schedule_len = engine.liveness_schedule.len();
+        let posterior = engine.agents[&name].core.posterior().to_vec();
+
+        assert!(!engine.register_agent(&format!("{name}x"), "codex-cli", None));
+        assert!(!engine.register_agent(&name, &format!("{program}x"), Some("/changed")));
+        assert!(!engine.register_agent(&name, "codex-cli", Some(&format!("{project}x"))));
+        engine.observe_activity(&name, Some(&format!("x\0{project}")), 11_000_000);
+        let oversized_program = format!("x\0{program}");
+        for index in 0..1_000 {
+            assert!(!engine.register_agent(
+                &format!("Overflow{index}"),
+                &oversized_program,
+                Some("/new"),
+            ));
+        }
+        assert_eq!(engine.agents.len(), 1);
+        assert_eq!(engine.agent_capacity_refusals, 1_004);
+        assert_eq!(engine.liveness_schedule.len(), schedule_len);
+        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert_eq!(engine.resolved_experience_count, 0);
+        let retained = &engine.agents[&name];
+        assert_eq!(retained.name, name);
+        assert_eq!(retained.program, program);
+        assert_eq!(retained.project_key.as_deref(), Some(project.as_str()));
+        assert_eq!(retained.rhythm.last_activity_ts, 5_000_000);
+        assert_eq!(retained.schedule_version, schedule_version);
+        assert_eq!(retained.core.posterior(), posterior);
+        assert_eq!(
+            engine.current_release_guard_reason().as_deref(),
+            Some("agent_capacity")
+        );
+
+        assert!(engine.register_agent(&name, "codex-cli", Some("/valid-update")));
+        engine.observe_activity(&name, None, 12_000_000);
+        assert_eq!(engine.agents[&name].program, "codex-cli");
+        assert_eq!(
+            engine.agents[&name].project_key.as_deref(),
+            Some("/valid-update")
+        );
+        assert_eq!(engine.agents[&name].rhythm.last_activity_ts, 12_000_000);
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(
+            engine.agent_capacity_refusals, 1_004,
+            "a subsequent valid update cannot certify refused evidence"
+        );
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
     fn incomplete_coverage_blocks_release_even_if_policy_disables_guard() {
         let _guard = GLOBAL_ATC_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
-        for conflict_limited in [false, true] {
+        for (conflict_limited, metadata_limited) in [(false, false), (false, true), (true, false)] {
             let mut engine = AtcEngine::new(AtcConfig {
                 max_tracked_agents: 1,
                 ..AtcConfig::default()
@@ -6851,6 +6934,13 @@ mod engine_tests {
                     1,
                 );
                 "conflict_capacity"
+            } else if metadata_limited {
+                assert!(!engine.register_agent(
+                    "StillTracked",
+                    &"p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES + 1),
+                    None,
+                ));
+                "agent_capacity"
             } else {
                 assert!(!engine.register_agent("Untracked", "codex-cli", None));
                 "agent_capacity"
@@ -6925,7 +7015,7 @@ mod engine_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
-        for conflict_limited in [false, true] {
+        for (conflict_limited, metadata_limited) in [(false, false), (false, true), (true, false)] {
             let mut engine = AtcEngine::new(AtcConfig {
                 max_tracked_agents: 1,
                 ..AtcConfig::default()
@@ -6975,6 +7065,13 @@ mod engine_tests {
                     1,
                 );
                 "conflict_capacity"
+            } else if metadata_limited {
+                assert!(!engine_lock.lock().unwrap().register_agent(
+                    "ReleaseTarget",
+                    &"p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES + 1),
+                    Some("/project"),
+                ));
+                "agent_capacity"
             } else {
                 assert!(!engine_lock.lock().unwrap().register_agent(
                     "LaterArrival",
@@ -12357,7 +12454,10 @@ pub fn atc_record_outcome(
     if let Some(engine_lock) = ATC_ENGINE.get()
         && let Ok(mut engine) = engine_lock.lock()
     {
-        engine.eprocess.update(correct, subsystem, agent);
+        // Outcomes for unknown/refused identities still inform aggregate safety,
+        // but cannot bypass population admission by allocating per-agent state.
+        let tracked_agent = agent.filter(|name| engine.agents.contains_key(*name));
+        engine.eprocess.update(correct, subsystem, tracked_agent);
         let now = mcp_agent_mail_core::timestamps::now_micros();
         engine.cusum.update(!correct, now);
 
@@ -13696,6 +13796,48 @@ mod alien_enhancement_tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn unknown_outcome_identities_do_not_grow_per_agent_calibration() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        reset_global_atc_state_for_test(&config);
+        atc_register_agent("Tracked", "codex-cli");
+        atc_record_outcome(AtcSubsystem::Liveness, Some("Tracked"), 1.0, 100.0, false);
+        for index in 0..1_000 {
+            atc_record_outcome(
+                AtcSubsystem::Liveness,
+                Some(&format!("Untracked{index}")),
+                1.0,
+                100.0,
+                false,
+            );
+        }
+        atc_record_outcome(
+            AtcSubsystem::Liveness,
+            Some(&"x".repeat(ATC_POPULATION_MAX_NAME_BYTES + 1)),
+            1.0,
+            100.0,
+            false,
+        );
+        let engine = ATC_ENGINE.get().unwrap().lock().unwrap();
+        assert_eq!(engine.agents.len(), 1);
+        assert_eq!(engine.eprocess.per_agent.len(), 1);
+        assert!(engine.eprocess.per_agent.contains_key("Tracked"));
+        assert_eq!(ATC_THRESHOLDS.get().unwrap().lock().unwrap().len(), 1);
+        assert!(engine.eprocess.miscalibrated());
+        assert!(
+            engine.calibration.is_safe_mode(),
+            "refused per-agent detail must not discard aggregate safety evidence"
+        );
+        drop(engine);
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]
