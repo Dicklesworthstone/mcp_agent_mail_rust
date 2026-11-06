@@ -2,6 +2,16 @@
 
 ## November 5 fresh-eyes continuation — EmeraldEagle
 
+Qualification is now pinned to published source5ec128ce, which includes
+971c1d2e's reviewed fixes plus the incoming descriptor-pressure and ATC work.
+Runtime code is identical to that commit; this checklist tracks pending gates.
+The native selection is77 unique cases:55 checkpoint,5 search,4 reservation,
+3 real OS spawn failures,8 existing queue/backlog/coalescer controls and2
+typed error-classifier controls, plus1 pre-existing ignored CPU benchmark.
+The classifier controls do not prove actual descriptor-limit exhaustion.
+Native compilation uses three advertised RCH slots; a four-slot request was
+refused before execution. Compiler gates and native test execution remain serial.
+
 The operator requested a meticulous review, fixes and continued Beads execution.
 This revises the existing checklist; it adds no runtime gate or status framework.
 Process worksheet: the operator is the consumer; their requested review and
@@ -89,6 +99,10 @@ rewinding after a failed save; implementation takes precedence over reporting.
   - [x] Assert that the caught coalescer panic specifically reports the second
     thread's spawn error, so an unrelated test-hook panic cannot satisfy refusal.
   - [ ] Execute those three regressions and normal queue/backlog/coalescer controls.
+    - [x] Correct false WBQ progress on rejected thread creation; publish the
+      baseline only after success and preserve any actual worker progress.
+    - [ ] Execute its unchanged-clock/real-drain assertions, both existing
+      shutdown/restart controls, and fresh5-checkpoint/3-spawn acceptance replays.
   - [x] Verify the trusted current-executable permission-test false positive in
     the root/uid-drop branch: identified old ELFc94cc040 passes1/0/0 in0.02s.
     Retain the narrowly justified scanner annotations for final qualification.

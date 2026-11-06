@@ -466,11 +466,12 @@ qualification and the pool's pending counter unresolved.
 ## November 5 fresh-eyes continuation: checkpoint and worker-start failures
 
 `br-kp1in.95` and `.96` remain in progress. The compiler candidate is frozen
-in a separate checkout at `d903bf5a4115a71143f8e2020024721a41b8c83d`
-plus six manually edited source files. Shared main now contains the same
-production bytes and two stronger new-test checks: bounded journal-claim
-release waiting and the exact constructor-spawn panic reason. Main formatting
-passes; those test corrections await final native/compiler qualification.
+in a separate checkout at `5ec128ceb55259eab9ced0183485b0c635f02298`
+with committed runtime code and three documentation-only overlays. Commit
+`971c1d2e` already contains the six reviewed files, including bounded journal-claim
+release waiting, the exact constructor-spawn panic reason and the progress-clock
+correction. Main and the frozen candidate contained identical reviewed code at
+preparation. Formatting passes; native/compiler qualification remains pending.
 Native positive execution and final
 compiler qualification are pending; the earlier `.94` receipts do not qualify
 this candidate. Raw attempts are retained under
@@ -540,8 +541,9 @@ Mechanical log classification: `d77a2672`, `98211dcb`, `24ffa2de`, `805ce223`,
 `0018483c`, `a9253d72`, `64cf2ee5` are USER (peer runtime changes);
 `db6ce671`/`e7c2db6b` are ENABLER integration merges; `cc480333`, `1adf2bec`,
 `283245fe` are PROCESS. Tally7/2/3/0; peer work earns this agent no credit.
-No current-block source fix has shipped yet. (1) The most visible peer change
-is lifecycle-correct TUI replies; the private checkpoint repair is not shipped.
+Shared-checkout commit `971c1d2e` subsequently integrated the reviewed repairs;
+`6fb538fa` records process metadata. Their publication supplies no test credit.
+(1) The checkpoint and worker-start repairs are committed but still unqualified.
 (2) Omitting status edits changes no runtime behavior. (3) Compiler/static
 checks gate the named fixes; no new speculative framework was built.
 (4) Original `.35` live-load convergence remains in progress since October8;
@@ -549,7 +551,7 @@ the narrow progress-loss defect was reproducible, but does not prove its cause.
 (5) No delegated panes. (6) Metadata commits stand for reporting, never
 implementation; `.95` depends on `.96`, and unmet original criteria stay open.
 Verdict: DRIFTING. Excessive analysis, repeated cold builds and infrastructure
-diagnostics consumed hours without integrating a current-block fix. Correction:
+diagnostics consumed hours before integrating a current-block fix. Correction:
 freeze scope and reporting machinery; finish the two concrete fixes and their
 original checks. Waiting and receipts earn zero capability credit.
 
