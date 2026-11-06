@@ -90,7 +90,8 @@ pub(super) fn transient(error: &StorageError) -> bool {
     ) || matches!(error, StorageError::Io(error)
         if matches!(error.kind(),
             ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ResourceBusy
-                | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory))
+                | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory)
+            || crate::recovery::is_file_descriptor_exhaustion(error))
 }
 
 fn finish(
@@ -764,6 +765,10 @@ mod tests {
     fn resource_pressure_is_retryable_without_trusting_error_text() {
         use std::io::{Error, ErrorKind};
 
+        #[cfg(any(unix, windows))]
+        for error in crate::recovery::descriptor_exhaustion_errors() {
+            assert!(transient(&error.into()));
+        }
         for kind in [
             ErrorKind::WouldBlock,
             ErrorKind::TimedOut,

@@ -34,6 +34,126 @@ use std::path::Path;
 
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 
+#[derive(Debug, thiserror::Error)]
+#[error("{context}")]
+struct RecoveryIoContext {
+    context: String,
+    #[source]
+    source: std::io::Error,
+}
+
+/// Keep diagnostic context without discarding the native cause needed by
+/// bounded recovery retries. A display-only wrapper loses EMFILE/ENFILE.
+pub(super) fn contextual_io_error(context: String, source: std::io::Error) -> std::io::Error {
+    std::io::Error::new(source.kind(), RecoveryIoContext { context, source })
+}
+
+/// Descriptor pressure cannot contradict archived message, lease or identity
+/// evidence. Preserve the native error code: the pinned compiler exposes its
+/// error kind only through the unstable `io_error_too_many_open_files` feature.
+/// Each reconciler keeps its existing cancellation and conflict classification.
+fn is_file_descriptor_exhaustion(error: &std::io::Error) -> bool {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
+    // Path-authority checks attach typed context around the original I/O
+    // error. Inspect that cause too, but never parse its display text or allow
+    // an arbitrary error-source cycle to make a maintenance pass unbounded.
+    for _ in 0..16 {
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            #[cfg(unix)]
+            if matches!(
+                error.raw_os_error(),
+                Some(nix::libc::EMFILE | nix::libc::ENFILE)
+            ) {
+                return true;
+            }
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(4) {
+                // Win32 ERROR_TOO_MANY_OPEN_FILES.
+                return true;
+            }
+            #[cfg(not(any(unix, windows)))]
+            let _ = error;
+        }
+        let Some(source) = cause.source() else {
+            return false;
+        };
+        cause = source;
+    }
+    false
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn descriptor_exhaustion_errors() -> impl Iterator<Item = std::io::Error> {
+    #[cfg(unix)]
+    let codes = [nix::libc::EMFILE, nix::libc::ENFILE];
+    #[cfg(windows)]
+    let codes = [4];
+    codes.into_iter().map(std::io::Error::from_raw_os_error)
+}
+
+#[cfg(all(test, any(unix, windows)))]
+#[test]
+fn descriptor_exhaustion_requires_a_native_cause() {
+    use std::io::{Error, ErrorKind};
+
+    for error in descriptor_exhaustion_errors() {
+        assert!(is_file_descriptor_exhaustion(&error));
+        let wrapped = contextual_io_error("archive component metadata unavailable".into(), error);
+        assert_eq!(wrapped.raw_os_error(), None);
+        assert!(is_file_descriptor_exhaustion(&wrapped));
+        assert_eq!(
+            wrapped.to_string(),
+            "archive component metadata unavailable"
+        );
+    }
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::InvalidData,
+        ErrorKind::NotFound,
+        ErrorKind::Interrupted,
+        ErrorKind::Other,
+    ] {
+        assert!(!is_file_descriptor_exhaustion(&Error::new(
+            kind,
+            "EMFILE ENFILE Too many open files (os error 24)",
+        )));
+    }
+    #[cfg(unix)]
+    for code in [nix::libc::EACCES, nix::libc::EBADF, nix::libc::EIO] {
+        assert!(!is_file_descriptor_exhaustion(&Error::from_raw_os_error(
+            code
+        )));
+    }
+    #[cfg(windows)]
+    for code in [2, 5, 6] {
+        assert!(!is_file_descriptor_exhaustion(&Error::from_raw_os_error(
+            code
+        )));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn descriptor_exhaustion_source_inspection_is_bounded() {
+    #[derive(Debug)]
+    struct Cycle;
+
+    impl std::fmt::Display for Cycle {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("EMFILE is text, not a native I/O cause")
+        }
+    }
+
+    impl std::error::Error for Cycle {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self)
+        }
+    }
+
+    let error = std::io::Error::other(Cycle);
+    assert!(!is_file_descriptor_exhaustion(&error));
+}
+
 /// A reservation and both release authorities from one database snapshot.
 ///
 /// Keep the point lookups inside their own SELECTs. In FrankenSQLite 0.4.13,

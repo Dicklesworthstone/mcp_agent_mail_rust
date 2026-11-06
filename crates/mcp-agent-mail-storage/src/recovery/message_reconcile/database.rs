@@ -141,7 +141,8 @@ impl From<crate::StorageError> for ReconcileFailure {
         ) || matches!(&error, crate::StorageError::Io(error)
             if matches!(error.kind(),
                 ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ResourceBusy
-                    | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory));
+                    | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory)
+                || crate::recovery::is_file_descriptor_exhaustion(error));
         Self {
             detail: error.to_string(),
             transient,

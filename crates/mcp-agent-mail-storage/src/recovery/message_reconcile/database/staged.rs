@@ -45,7 +45,9 @@ struct StagedMessages {
 impl StagedMessages {
     fn open(repo: &Repository) -> Result<Option<Self>, ReconcileFailure> {
         let path = repo.path().join("index");
-        if crate::path_existing_prefix_has_symlink(&path).map_err(|error| error.to_string())? {
+        if crate::path_existing_prefix_has_symlink(&path).map_err(|error| {
+            index_io_failure("staged archive index authority is unavailable", error)
+        })? {
             return Err("staged archive index has a symlinked authority"
                 .to_string()
                 .into());

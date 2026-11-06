@@ -66,7 +66,7 @@ fn retryable_io_error(error: &std::io::Error) -> bool {
             | ErrorKind::StorageFull
             | ErrorKind::QuotaExceeded
             | ErrorKind::OutOfMemory
-    )
+    ) || crate::recovery::is_file_descriptor_exhaustion(error)
 }
 
 impl From<StorageError> for Failure {
@@ -308,6 +308,10 @@ mod tests {
     fn resource_pressure_keeps_lifecycle_debt_without_erasing_other_ids() {
         use std::io::ErrorKind;
 
+        #[cfg(any(unix, windows))]
+        for error in crate::recovery::descriptor_exhaustion_errors() {
+            assert!(Failure::from(StorageError::Io(error)).transient);
+        }
         for kind in [
             ErrorKind::Interrupted,
             ErrorKind::ResourceBusy,
