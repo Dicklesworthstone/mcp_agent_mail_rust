@@ -886,16 +886,18 @@ impl Store {
             StoredSnapshot::Current(snapshot) => snapshot,
         };
         if snapshot.binding != self.binding {
-            // A generation can change BETWEEN passes, while the same pool and
-            // cursor survive. Reject its disk watermarks and reset the live
-            // scan too. Preserve all memory-only retry IDs on a failed save;
-            // every ID still requires an authoritative current-source read.
-            cursor.tail_after = None;
-            cursor.backfill_ceiling = None;
-            cursor.next_lane_is_history = false;
-            cursor.startup_backfill_complete = false;
-            cursor.startup_tail = None;
-            cursor.startup_tail_initialized = false;
+            // A failed replacement can leave obsolete disk hints behind every
+            // pass. Reject them without rewinding progress independently bound
+            // to the current source. Unknown or changed memory still needs a
+            // fresh scan; retained retry IDs always require a live-source read.
+            if cursor.checkpoint_source_binding.as_ref() != Some(&self.binding) {
+                cursor.tail_after = None;
+                cursor.backfill_ceiling = None;
+                cursor.next_lane_is_history = false;
+                cursor.startup_backfill_complete = false;
+                cursor.startup_tail = None;
+                cursor.startup_tail_initialized = false;
+            }
             return Err(io_context(
                 "restore snapshot binding",
                 &self.path,
@@ -1075,6 +1077,7 @@ pub(super) fn run(
         return reconcile_message_batch_inner(cx, pool, config, cursor, stop);
     }
     let scope;
+    let captured_binding;
     let store = {
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
@@ -1117,7 +1120,7 @@ pub(super) fn run(
             };
         }
         cursor.checkpoint_database_generation = Some(generation);
-        cursor.checkpoint_source_binding = binding.as_ref().ok().cloned();
+        captured_binding = binding.as_ref().ok().cloned();
         match binding.and_then(Store::open) {
             Ok(store) => Some(store),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1158,6 +1161,10 @@ pub(super) fn run(
             Err(error) => warn_unavailable("restore", &error),
         }
     }
+    // Restore must inspect the provenance of the preceding progress. Installing
+    // today's binding earlier would give an unbound cursor proof it never had.
+    // Bind the new pass before it selects, repairs, or publishes any progress.
+    cursor.checkpoint_source_binding = captured_binding;
     let mut result = reconcile_message_batch_inner(cx, pool, config, cursor, stop);
     cursor.checkpoint_dirty = true;
     let saved = if save_permitted && let Some(store) = &store {
@@ -1979,6 +1986,147 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_checkpoint_preserves_current_progress_after_real_publication_failure() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (previous, mut cursor) = seed_obsolete_progress(cx, pool, config);
+            cursor.checkpoint_database_generation =
+                Some(previous.binding.database_generation.clone());
+            cursor.checkpoint_source_binding = Some(previous.binding.clone());
+            let path = previous.path.clone();
+            let obsolete_bytes = std::fs::read(&path).unwrap();
+            change_logical_generation(cx, pool, &previous.binding.database_generation);
+            let current_binding = Binding::capture(cx, pool, config).unwrap();
+            assert_ne!(current_binding, previous.binding);
+            drop(previous);
+            let source_before = super::super::admission_tests::database_evidence(cx, pool);
+
+            // Let the worker read the obsolete checkpoint, then obstruct its
+            // replacement during an actual Git repair. The real save must fail
+            // without discarding the old snapshot or mutating source rows.
+            let retained_path = path.with_extension("json.before-failed-save");
+            let blocked_path = path.with_extension("json.blocked-directory");
+            let hook_path = path.clone();
+            let hook_retained = retained_path.clone();
+            let fired = std::sync::Arc::new(AtomicBool::new(false));
+            let observed = fired.clone();
+            let scan = super::super::super::cancellable_tests::ObserveScan::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    std::fs::rename(&hook_path, &hook_retained).unwrap();
+                    std::fs::create_dir(&hook_path).unwrap();
+                    std::thread::sleep(super::super::MAX_BATCH_TURN);
+                }
+            });
+            let stop = AtomicBool::new(false);
+            let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            drop(scan);
+            assert!(
+                fired.load(Ordering::Acquire),
+                "real repair was not observed"
+            );
+            assert!(!report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(false));
+            assert_eq!(
+                (report.scanned, report.repaired, report.deferred),
+                (1, 1, 0)
+            );
+            assert!(report.budget_exhausted);
+            assert!(cursor.checkpoint_dirty);
+            assert_eq!(
+                cursor.checkpoint_source_binding.as_ref(),
+                Some(&current_binding)
+            );
+            assert_eq!(cursor.tail_after, Some(941 - super::super::IDS_PER_LANE));
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
+            assert_eq!(std::fs::read(&retained_path).unwrap(), obsolete_bytes);
+            std::fs::rename(&path, &blocked_path).unwrap();
+            std::fs::rename(&retained_path, &path).unwrap();
+
+            // The on-disk binding is stale; the independently sampled live
+            // binding is not. Repeated reads must reject the former without
+            // rewinding this worker's scan, lane turns, or retry state.
+            let current = Store::open(current_binding).unwrap();
+            let progress = format!("{cursor:?}");
+            for _ in 0..2 {
+                let error = current.restore(&mut cursor).unwrap_err();
+                assert!(
+                    error.to_string().contains("source/archive generation"),
+                    "{error}"
+                );
+                assert_eq!(
+                    format!("{cursor:?}"),
+                    progress,
+                    "obsolete disk hints erased independently current progress after a failed save"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), obsolete_bytes);
+            }
+            drop(current);
+
+            let mut repaired = report.repaired;
+            for _ in 0..40 {
+                let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(report.checkpoint_saved, Some(true));
+                assert!(report.repaired <= super::super::MAX_REPAIRS_PER_BATCH);
+                assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+                assert_eq!(report.deferred, 0, "{report:?}");
+                repaired += report.repaired;
+                if repaired == 40 {
+                    break;
+                }
+            }
+            assert_eq!(repaired, 40, "remaining real messages must converge");
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            for id in 901..=940 {
+                let prepared = super::super::prepare_message(cx, pool, id).unwrap();
+                assert!(
+                    super::super::verify_retention_archive(&archive, &prepared, &mut 0)
+                        .unwrap()
+                        .is_some(),
+                    "message {id}: committed copies must retain source content and recipient roles"
+                );
+                assert_message_committed(cx, pool, config, id, 40);
+            }
+            assert_eq!(
+                super::super::admission_tests::database_evidence(cx, pool),
+                source_before
+            );
+            let repeat = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((repeat.repaired, repeat.deferred), (0, 0));
+        });
+    }
+
+    #[test]
+    fn obsolete_checkpoint_rescans_when_live_memory_binding_is_unknown() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (store, mut cursor) = seed_obsolete_progress(cx, pool, config);
+            change_logical_generation(cx, pool, &store.binding.database_generation);
+            let current = Binding::capture(cx, pool, config).unwrap();
+            // The pool and logical generation alone cannot establish that
+            // these existing watermarks belong to the current physical source
+            // and archive. A failed physical binding capture leaves this state.
+            cursor.checkpoint_database_generation = Some(current.database_generation.clone());
+            assert!(cursor.checkpoint_source_binding.is_none());
+            cursor.checkpoint_dirty = true;
+            cursor.startup_backfill_complete = true;
+            cursor.startup_tail_initialized = true;
+            assert_eq!(cursor.source_identity, pool.sqlite_identity_key());
+            let source_before = super::super::admission_tests::database_evidence(cx, pool);
+            drop(store);
+
+            let report =
+                run_with_slow_first_scan(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+            assert!(!report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_eq!(report.repaired, 1);
+            assert_message_committed(cx, pool, config, 941 - super::super::IDS_PER_LANE, 40);
+            assert_eq!(cursor.checkpoint_source_binding.as_ref(), Some(&current));
+            assert_eq!(
+                super::super::admission_tests::database_evidence(cx, pool),
+                source_before
+            );
+        });
+    }
+
+    #[test]
     fn obsolete_checkpoint_resets_scan_but_cannot_discard_memory_only_retry_debt() {
         let (_temp, database, archive) = fixture();
         let old = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
@@ -2014,6 +2162,79 @@ mod tests {
         assert_eq!(saved.binding.database_generation, "11223344");
         assert_eq!(saved.retries.len(), 1);
         assert_eq!(saved.retries[0].id, 77);
+    }
+
+    #[test]
+    fn obsolete_checkpoint_resets_progress_bound_to_a_different_live_source() {
+        for changed in ["logical", "physical", "archive"] {
+            let (_temp, database, archive) = fixture();
+            let old = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+            old.save(&debt(Instant::now())).unwrap();
+            let obsolete = std::fs::read(&old.path).unwrap();
+            drop(old);
+
+            let previous = Binding::at(&database, &archive, "11223344").unwrap();
+            let mut current_archive = archive.clone();
+            let current_generation = if changed == "logical" {
+                "55667788"
+            } else {
+                "11223344"
+            };
+            if changed == "physical" {
+                std::fs::rename(&database, database.with_extension("retained-source")).unwrap();
+                std::fs::write(&database, b"replacement database").unwrap();
+            } else if changed == "archive" {
+                current_archive = archive.with_file_name("replacement-archive");
+                std::fs::create_dir(&current_archive).unwrap();
+            }
+            let current =
+                Store::open(Binding::at(&database, &current_archive, current_generation).unwrap())
+                    .unwrap();
+            assert_ne!(previous, current.binding, "{changed}");
+            if changed == "archive" {
+                // Even if an obsolete sidecar is copied into a new namespace,
+                // neither it nor the previous live binding can authorize hints.
+                std::fs::write(&current.path, &obsolete).unwrap();
+            }
+            let mut cursor = debt(Instant::now());
+            cursor.checkpoint_source_binding = Some(previous);
+            cursor.startup_backfill_complete = true;
+            cursor.startup_tail = Some(super::super::StartupTail {
+                after: 90_000,
+                ceiling: 100_000,
+            });
+            cursor.startup_tail_initialized = true;
+            cursor.checkpoint_dirty = true;
+            let retry_ids = cursor
+                .retries
+                .iter()
+                .map(|retry| retry.id)
+                .collect::<Vec<_>>();
+            assert!(current.restore(&mut cursor).is_err(), "{changed}");
+            assert_eq!(
+                (cursor.tail_after, cursor.backfill_ceiling),
+                (None, None),
+                "{changed}"
+            );
+            assert!(
+                !cursor.next_lane_is_history && !cursor.startup_backfill_complete,
+                "{changed}"
+            );
+            assert!(
+                cursor.startup_tail.is_none() && !cursor.startup_tail_initialized,
+                "{changed}"
+            );
+            assert_eq!(
+                cursor
+                    .retries
+                    .iter()
+                    .map(|retry| retry.id)
+                    .collect::<Vec<_>>(),
+                retry_ids,
+                "{changed}: reset must retain source-checked retry obligations"
+            );
+            assert_eq!(std::fs::read(&current.path).unwrap(), obsolete, "{changed}");
+        }
     }
 
     #[cfg(any(unix, windows))]
