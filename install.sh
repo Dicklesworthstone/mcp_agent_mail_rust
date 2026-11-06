@@ -3039,6 +3039,9 @@ move_installer_entry_no_replace() {
   local source="$1"
   local destination="$2"
   local label="$3"
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   installer_entry_exists "$source" || {
     err "$label source is missing: $source"
     return 1
@@ -3049,6 +3052,9 @@ move_installer_entry_no_replace() {
   fi
   # Both GNU and BSD mv support -n. It may report success when it skips an
   # occupied target, so the postconditions are authoritative.
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   mv -n "$source" "$destination" 2>/dev/null || return 1
   if installer_entry_exists "$source" || ! installer_entry_exists "$destination"; then
     err "$label was not moved without replacement."
@@ -3059,13 +3065,27 @@ move_installer_entry_no_replace() {
 write_binary_transaction_file_exclusive() {
   local destination="$1"
   local mode="$2"
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   if installer_entry_exists "$destination"; then
     err "Refusing to replace binary transaction entry: $destination"
     return 1
   fi
-  if ! (umask 077; set -o noclobber; exec 9>"$destination"; cat >&9); then
+  if ! (
+    umask 077
+    set -o noclobber
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || exit 1
+    fi
+    exec 9>"$destination" || exit 1
+    cat >&9
+  ); then
     err "Could not create binary transaction entry exclusively: $destination"
     return 1
+  fi
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
   fi
   chmod "$mode" "$destination" || return 1
   validate_installer_owned_regular_file "$destination" "Binary transaction entry" "$mode" || return 1
@@ -3604,6 +3624,9 @@ prune_binary_transaction_history() {
   local install_dir="$1"
   local keep="${AM_INSTALL_TRANSACTION_HISTORY_KEEP:-2}"
   local entries="" entry="" name="" kept=0 pruned=0
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   case "$keep" in
     ''|*[!0-9]*) keep=2 ;;
   esac
@@ -3632,6 +3655,11 @@ prune_binary_transaction_history() {
     if binary_transaction_history_in_use "$entry"; then
       info "Keeping install history $name: a running process uses a binary inside it"
       continue
+    fi
+    # The liveness probe can be slow. Recheck the held inode before every
+    # deletion so a replacement destination retains all of its evidence.
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || return 1
     fi
     if rm -rf -- "$entry"; then
       pruned=$((pruned + 1))
@@ -3749,11 +3777,17 @@ publish_binary_transaction_new() {
   local new_hash="$5"
   local staged="$journal/new-$stem"
   local dest="$install_dir/$binary_name"
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   installer_entry_exists "$dest" && {
     err "The $stem destination is occupied before publication."
     return 1
   }
   validate_binary_transaction_hash "$staged" "$new_hash" "Staged $stem binary" || return 1
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   chmod 755 "$staged" || return 1
   sync_installer_paths_durably "$staged" "$journal" || return 1
   move_installer_entry_no_replace "$staged" "$dest" "Publish new $stem binary" || return 1
@@ -3771,6 +3805,9 @@ prepare_binary_pair_transaction() {
   local server_dest="$install_dir/$BIN_SERVER"
   local cli_dest="$install_dir/$BIN_CLI"
   local metadata="" source_path=""
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
 
   active=$(binary_transaction_active_path "$install_dir")
   installer_entry_exists "$active" && {
@@ -3785,7 +3822,13 @@ prepare_binary_pair_transaction() {
       return 1
     fi
   done
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   ensure_real_file_target_path "$server_dest" "$BIN_SERVER install target" || return 1
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   ensure_real_file_target_path "$cli_dest" "$BIN_CLI install target" || return 1
   validate_installer_owned_regular_file "$server_src" "Staged server source" || return 1
   validate_installer_owned_regular_file "$cli_src" "Staged CLI source" || return 1
@@ -3812,14 +3855,38 @@ prepare_binary_pair_transaction() {
   # Apply the private mode in the mkdir syscall itself; chmod alone would
   # leave a caller-umask-dependent window where another user could enter the
   # non-authoritative staging directory before it is published.
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   (umask 077; mkdir "$preparing") || return 1
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   chmod 700 "$preparing" || return 1
   validate_binary_transaction_directory "$preparing" || return 1
   sync_installer_paths_durably "$preparing" "$install_dir" || return 1
-  if ! (umask 077; set -o noclobber; exec 9>"$preparing/new-server"; cat "$server_src" >&9) || \
-     ! (umask 077; set -o noclobber; exec 9>"$preparing/new-cli"; cat "$cli_src" >&9); then
+  if ! (
+    umask 077
+    set -o noclobber
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || exit 1
+    fi
+    exec 9>"$preparing/new-server" || exit 1
+    cat "$server_src" >&9
+  ) || ! (
+    umask 077
+    set -o noclobber
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || exit 1
+    fi
+    exec 9>"$preparing/new-cli" || exit 1
+    cat "$cli_src" >&9
+  ); then
     err "Could not stage both binaries in the durable transaction journal."
     return 1
+  fi
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
   fi
   chmod 700 "$preparing/new-server" "$preparing/new-cli" || return 1
   validate_binary_transaction_hash "$preparing/new-server" "$TXN_NEW_SERVER_HASH" \

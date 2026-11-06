@@ -1285,6 +1285,173 @@ if run_minisign_case untrusted-signer v9.9.9 "$minisign_root/exact-manifest" \
 fi
 assert_minisign_rejected_before_checksum untrusted-signer 'Minisign verification FAILED'
 
+run_transaction_authority_cases() {
+    local authority_root="$tmp/transaction-authority-fixtures"
+    local scenario="" operation="" mode="" case_dir="" failed=0
+    mkdir -p "$authority_root/source"
+    make_version_fixture "$authority_root/source/am" 'am 9.9.9'
+    make_version_fixture "$authority_root/source/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
+
+    for scenario in prepare:unchanged publish:unchanged move:unchanged write:unchanged \
+        prepare:replaced publish:replaced move:replaced write:replaced prepare-copy:replaced; do
+        operation="${scenario%:*}"
+        mode="${scenario#*:}"
+        case_dir="$authority_root/${operation}-${mode}"
+        mkdir "$case_dir"
+        if EXTRACT="$extract" SOURCE_DIR="$authority_root/source" CASE_DIR="$case_dir" \
+            OPERATION="$operation" AUTHORITY_MODE="$mode" bash -c '
+            set -euo pipefail
+            source "$EXTRACT"
+            BIN_CLI=am
+            BIN_SERVER=mcp-agent-mail
+            DEST="$CASE_DIR/destination"
+            mkdir "$DEST"
+            printf "%s\n" preserved-destination >"$DEST/sentinel"
+            case "$OPERATION" in
+                publish)
+                    mkdir -m 700 "$DEST/journal"
+                    cp "$SOURCE_DIR/mcp-agent-mail" "$DEST/journal/new-server"
+                    chmod 600 "$DEST/journal/new-server"
+                    ;;
+                move) printf "%s\n" preserved-source >"$DEST/move-source" ;;
+            esac
+
+            acquire_installer_lock "$DEST" destination
+            trap "release_installer_lock destination || true" EXIT
+            # A real second acquisition must conflict with the retained lock.
+            if bash -c '\''source "$1"; acquire_installer_lock "$2" destination'\'' \
+                -- "$EXTRACT" "$DEST" 7<&- 8<&- >"$CASE_DIR/contender.log" 2>&1; then
+                echo "FAIL: test owner did not hold an exclusive destination lock" >&2
+                exit 1
+            fi
+
+            record_tree() {
+                local root="$1" entry=""
+                find "$root" -print | LC_ALL=C sort | while IFS= read -r entry; do
+                    if [ -d "$entry" ]; then
+                        printf "directory %s %s\n" "${entry#"$root"}" "$(installer_path_mode "$entry")"
+                    elif [ -f "$entry" ] && [ ! -L "$entry" ]; then
+                        printf "file %s %s %s\n" "${entry#"$root"}" \
+                            "$(installer_path_mode "$entry")" "$(file_sha256_hex "$entry")"
+                    else
+                        echo "FAIL: unexpected authority fixture entry: $entry" >&2
+                        return 1
+                    fi
+                done
+            }
+
+            replace_destination() {
+                command mv "$DEST" "$CASE_DIR/held-destination" || return 1
+                command mkdir "$DEST" || return 1
+                printf "%s\n" preserved-destination >"$DEST/sentinel"
+                case "$OPERATION" in
+                    publish)
+                        command mkdir -m 700 "$DEST/journal" || return 1
+                        command cp "$SOURCE_DIR/mcp-agent-mail" "$DEST/journal/new-server" || return 1
+                        command chmod 600 "$DEST/journal/new-server" || return 1
+                        ;;
+                    move) printf "%s\n" preserved-source >"$DEST/move-source" ;;
+                    prepare-copy)
+                        # The first copy holds an already-open output in the
+                        # original inode. Its sibling must not enter this new
+                        # destination when that first copy finishes.
+                        command mkdir -m 700 "$preparing" || return 1
+                        printf "%s\n" replacement-server >"$preparing/new-server"
+                        command chmod 600 "$preparing/new-server" || return 1
+                        ;;
+                esac
+                record_tree "$DEST" >"$CASE_DIR/replacement.before" || return 1
+                record_tree "$CASE_DIR/held-destination" >"$CASE_DIR/held.before"
+            }
+
+            if [ "$OPERATION" = prepare-copy ]; then
+                cat() {
+                    command cat "$@" || return $?
+                    if [ "${1:-}" = "$SOURCE_DIR/mcp-agent-mail" ]; then
+                        replace_destination
+                    fi
+                }
+            elif [ "$AUTHORITY_MODE" = replaced ]; then
+                replace_destination
+            fi
+
+            rc=0
+            case "$OPERATION" in
+                prepare|prepare-copy)
+                    prepare_binary_pair_transaction \
+                        "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$DEST" || rc=$?
+                    ;;
+                publish)
+                    expected_hash=$(file_sha256_hex "$SOURCE_DIR/mcp-agent-mail")
+                    publish_binary_transaction_new "$DEST/journal" "$DEST" \
+                        server mcp-agent-mail "$expected_hash" || rc=$?
+                    ;;
+                move)
+                    move_installer_entry_no_replace "$DEST/move-source" \
+                        "$DEST/move-target" "authority test move" || rc=$?
+                    ;;
+                write)
+                    printf "%s\n" receipt-payload \
+                        | write_binary_transaction_file_exclusive "$DEST/receipt" 600 || rc=$?
+                    ;;
+            esac
+
+            if [ "$AUTHORITY_MODE" = replaced ]; then
+                [ -f "$CASE_DIR/replacement.before" ] || {
+                    echo "FAIL: destination replacement did not actually run" >&2
+                    exit 1
+                }
+                [ "$(installer_lock_fd_identity 8)" = "$DESTINATION_LOCK_IDENTITY" ]
+                record_tree "$DEST" >"$CASE_DIR/replacement.after"
+                record_tree "$CASE_DIR/held-destination" >"$CASE_DIR/held.after"
+                if [ "$rc" -eq 0 ] || \
+                    ! cmp -s "$CASE_DIR/replacement.before" "$CASE_DIR/replacement.after" || \
+                    ! cmp -s "$CASE_DIR/held.before" "$CASE_DIR/held.after"; then
+                    echo "FAIL: $OPERATION accepted lost authority or changed preserved files (rc=$rc)" >&2
+                    diff -u "$CASE_DIR/replacement.before" "$CASE_DIR/replacement.after" || true
+                    diff -u "$CASE_DIR/held.before" "$CASE_DIR/held.after" || true
+                    exit 1
+                fi
+            else
+                [ "$rc" -eq 0 ]
+                verify_installer_lock_authorities
+                [ "$(command cat "$DEST/sentinel")" = preserved-destination ]
+                case "$OPERATION" in
+                    prepare)
+                        journal=$(binary_transaction_active_path "$DEST")
+                        cmp -s "$SOURCE_DIR/mcp-agent-mail" "$journal/new-server"
+                        cmp -s "$SOURCE_DIR/am" "$journal/new-cli"
+                        [ -f "$journal/phase.00-prepared" ]
+                        ;;
+                    publish)
+                        cmp -s "$SOURCE_DIR/mcp-agent-mail" "$DEST/mcp-agent-mail"
+                        [ "$(installer_path_mode "$DEST/mcp-agent-mail")" = 755 ]
+                        [ ! -e "$DEST/journal/new-server" ]
+                        ;;
+                    move)
+                        [ "$(command cat "$DEST/move-target")" = preserved-source ]
+                        [ ! -e "$DEST/move-source" ]
+                        ;;
+                    write)
+                        [ "$(command cat "$DEST/receipt")" = receipt-payload ]
+                        [ "$(installer_path_mode "$DEST/receipt")" = 600 ]
+                        ;;
+                esac
+            fi
+        ' >"$case_dir/result.log" 2>&1; then
+            step "transaction authority $scenario: passed"
+        else
+            step "transaction authority $scenario: FAILED"
+            cat "$case_dir/result.log" >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+step "scenario J3: real held destination authority fences every binary mutation"
+run_transaction_authority_cases
+
 step "scenario K: Unix pair journal converges old-old or new-new across every durable phase"
 transaction_root="$tmp/transaction-fixtures"
 mkdir -p "$transaction_root/old" "$transaction_root/new" \
