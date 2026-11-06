@@ -465,17 +465,21 @@ qualification and the pool's pending counter unresolved.
 
 ## November 5 fresh-eyes continuation: checkpoint and worker-start failures
 
-`br-kp1in.95` and `.96` remain in progress. The compiler candidate is frozen
+`br-kp1in.96` closed first at06:28:58UTC on November6; `.95` closed afterward
+at06:28:59UTC. The qualified candidate is frozen
 in a separate checkout at `5ec128ceb55259eab9ced0183485b0c635f02298`
-with committed runtime code and three documentation-only overlays. Commit
+with five source overlays and three documentation overlays. Four source
+overlays are test-only; the fifth preserves ATC guard semantics. Commit
 `971c1d2e` already contains the six reviewed files, including bounded journal-claim
 release waiting, the exact constructor-spawn panic reason and the progress-clock
 correction. Main and the frozen candidate contained identical reviewed code at
 preparation. Subsequent strict Clippy found two errors in incoming ATC code;
 the final overlay adds only an isomorphic lazy Option branch and documentation
-paragraph split, preserving guard priority. Formatting passes. Native execution
-is complete; compiler qualification remains pending. Earlier `.94` receipts do
-not qualify this candidate. Raw attempts are retained under
+paragraph split, preserving guard priority. Final compiler qualification now
+passes after the test-only corrections below. Final native execution passes
+81 unique tests plus8 fresh solo repeats. The earlier78-case positive remains
+its own source cohort.
+Earlier `.94` receipts do not qualify this candidate. Raw attempts are retained under
 `/data/tmp/am-fresh-eyes-20261105.n3gaE0Mt`.
 
 Canonical checkpoint repair6684bcfd and CLI admission workd903bf5a arrived
@@ -512,16 +516,17 @@ real message archives and an observed live first worker. All three pass, as
 do the eight normal worker/queue controls. Global lazy-pool restartability and
 loaded shutdown are not claimed.
 
-Final-source native build receipt `fe78d8a2e748be4655e058199e6513bbe37dc8c24df668ccdffbf93416756803`
+The earlier native build receipt `fe78d8a2e748be4655e058199e6513bbe37dc8c24df668ccdffbf93416756803`
 freshly matches all3,917 input records. Cargo and client exit0, terminal
 acknowledgement true. The 105,417,096-byte storage test image has SHA-256
 `befb9603cd6ca8435d8755cf5e8e0969308ee8dc400714c270513b3b9d502372`;
 the 147,628,992-byte DB image is
 `a3a43978dc75cd134c2a0e6f9858531aeb5ed40a514023a7c1d16cb3b8761bff`.
-Producer, worker-retained and local images match before and after execution.
-The final build after the ATC-only correction produces those same images.
+Producer and worker-retained/local images matched at capture; local hashes
+remained unchanged after execution.
+The earlier build after the ATC-only correction produces those same images.
 
-Actual unique native results are checkpoint55pass (113.16s), real search5pass
+That cohort's actual unique native results are checkpoint55pass (113.16s), real search5pass
 (0.89s), reservation-source5pass (18.11s), real spawn failures3pass (0.20s),
 normal worker controls8pass (1.61s) and typed FD classifiers2pass. Fresh solo
 checkpoint5pass (21.03s) and spawn3pass (0.32s) are repeats, not independent
@@ -533,6 +538,60 @@ incumbent/candidate query measurements remain query-only evidence, with no
 running-server performance claim. The other77 cases match the predeclared
 functional selection.
 
+Full final-source compiler qualification subsequently found and corrected
+test-only similar names, a stale TUI fixture's `TempDir`/`SnapshotDirGuard` type
+mismatch, three empty-result assertion styles, and the new callback's complex
+type. The real stale fixture directory transfers through `TempDir::keep()` to
+the existing guard; its DB path, all assertions and cleanup ownership remain.
+The callback receives a test-only type alias. Migration assertions compare the
+same returned `Vec<String>` with a typed empty vector. No runtime deadline,
+historical checksum, source/receipt assertion, ignore or compiler allowance changes.
+
+Strict Clippy exits0 (receipt `d5c1fde4`), all-target check exits0 (`de58c219`),
+and the separate production lib/bin graph exits0 (`6509ac34`). Each freshly
+matches the same3,917 records, zero mismatches. Cargo `--keep-going` only
+collects independent target errors; `-D warnings` still applies. Formatting0;
+final eight-file scan0critical/12,561warning/4,021info, no failed module.
+Failed101 receipts `c807be1c`, `cfc71c52`, `86fac71d` and `8396c144` remain
+retained with fresh3,917-record/zero-mismatch comparisons.
+
+The final native selection adds the existing three lifecycle migration cases.
+All81 unique tests plus8 fresh solo repeats pass, with zero failures or ignores.
+Native build receipt `8809b5311d9569c8e191f490627142cbe98107d07e23f167a701f25f42392b40`
+freshly matches the same3,917 exact inputs as all three passing compiler gates.
+The105,416,688-byte storage image is
+`685b33913f64254d2bda4c64f7fbf82632d3d5d03121bc8511298a44c00f26fe`;
+the147,628,888-byte DB image is
+`14ad6a1da3c0453614a1bfbd3129dd22c188ac9ad5702aedb456b4fefa69cb25`.
+Both producer descriptors remained stable across byte-identical copy. Protected
+worker copies and executed local copies still matched after all cases. A later
+managed-producer lookup failed because both paths were unavailable; its cause
+is unproved. That failed lookup is retained, with no successful post-execution
+producer recheck claimed. This is why the protected images remain necessary.
+
+| Final native selection | Passed | Seconds |
+| --- | --- | --- |
+| Checkpoint family, including original regression and pool-reopen controls | 55 | 139.03 |
+| Real OS worker-start failures and recovery | 3 | 0.26 |
+| Existing normal queue/backlog/coalescer controls | 8 | 1.80 |
+| Reservation source, including ordinary CPU comparison | 5 | 21.55 |
+| Typed FD-error classifier controls | 2 | 0.00 |
+| Real search writer/cancellation controls | 5 | 1.31 |
+| Canonical SQLite lifecycle compatibility | 3 | 0.09 |
+| Fresh solo obsolete-checkpoint replay | 5 | 23.33 |
+| Fresh solo spawn-failure replay | 3 | 0.23 |
+
+The last two rows are repeats, not additional unique cases or independent review.
+The CPU comparison's child summary is not counted twice. Migration cases use
+real canonical SQLite for compatibility;
+they do not qualify the runtime engine's complete migration path. Corrected
+server test fixtures are compiler-checked, with no new server-runtime claim.
+An owned compile-onlyj1 attempt was stopped through supported recovery
+(client143, earlier daemon130, recovered120/acktrue, zero cases) after actual
+dependency recompilation disproved assumed warmth. The normalj3 build uses
+the three advertised worker slots; source/profile/features/runtime bounds and
+resource floors stay unchanged. No build or wait is a test pass.
+
 Raw four-file UBS first reported4critical. Two actual worker panic boundaries
 are repaired. The remaining deliberate constructor refusal now has rollback;
 the permission test executes only a retained current-executable descriptor,
@@ -541,14 +600,29 @@ ELF. Both narrowly annotated lines retain their behavior. A separate planted
 untrusted executable and unconditional panic still produce exactly2critical
 in the same annotated countercontrol file. Earlier five-file UBS exits0 with
 0critical,9,854warning,3,410info and no failed modules; this is not warning-free
-or release clearance. The final seven-file scan exits0 with0critical,
+or release clearance. The earlier seven-file scan exits0 with0critical,
 11,711warning,3,930info and no failed module. All three planted hazards remain
 red in the expanded countercontrol. Formatting exits0. All first failures are
 retained, including ATC Clippy101 receipt `0ea4bd37` (3,917fresh/0mismatch),
 the incorrect ignored-case planning/parser assumption and normal disk-admission
 refusals. No compiler allowance, resource floor or runtime deadline changed.
 
-### Filled anti-ceremony worksheets (solo; provisional until qualification)
+Newer incoming peer ATC/population and installer work arrived after this source
+freeze. It retains separate qualification; these receipts do not establish a
+latest-main, full-server, installer, platform, capacity or release pass.
+Qualified implementation commit `2c54ddb05f6594c4059b7dde29ab34966da3d353`
+records the reviewed test corrections and the two evidence-based closures.
+Merge `8d7ac0861706c1d22124b96966798dfc04d756c0` preserves the newer peer
+`52b07086`/`c20d9dbe`/`d35decb6` history. It merges the ATC assertion change
+without conflict and deletes no files. Post-merge formatting and four individual
+installer Bash syntax checks pass; these are separate from the frozen receipts.
+Five individual Bash syntax checks passed. An earlier multi-file `bash -n`
+command parsed only its first argument; the individual checks correct that
+verification mistake. Live mailbox health was freshly healthy, with860/860
+reservation parity and zero drift; no repair was applied. All53 owned RCH
+journals examined after native execution were terminal and acknowledged.
+
+### Filled anti-ceremony worksheets (solo; final disposition)
 
 Process worksheet, November5 review block: running code does not branch on
 this report or TODO. Consumer: the operator who explicitly requested a detailed
@@ -570,7 +644,7 @@ Mechanical log classification: `d77a2672`, `98211dcb`, `24ffa2de`, `805ce223`,
 `283245fe` are PROCESS. Tally7/2/3/0; peer work earns this agent no credit.
 Shared-checkout commit `971c1d2e` subsequently integrated the reviewed repairs;
 `6fb538fa` records process metadata. Their publication supplies no test credit.
-(1) The checkpoint and worker-start repairs are committed but still unqualified.
+(1) The checkpoint and worker-start repairs now have the named native and compiler proof.
 (2) Omitting status edits changes no runtime behavior. (3) Compiler/static
 checks gate the named fixes; no new speculative framework was built.
 (4) Original `.35` live-load convergence remains in progress since October8;
@@ -581,6 +655,13 @@ Verdict: DRIFTING. Excessive analysis, repeated cold builds and infrastructure
 diagnostics consumed hours before integrating a current-block fix. Correction:
 freeze scope and reporting machinery; finish the two concrete fixes and their
 original checks. Waiting and receipts earn zero capability credit.
+At the pre-publication refresh through `323763a3`, the latest12commits classify
+as6 USER (`9c065222`, `971c1d2e`, `69451f2f`, `51a96dcc`, `d903bf5a`, `6684bcfd`),
+2 ENABLER (`a33f95a7`, `5ec128ce`) and4 PROCESS (`323763a3`, `5264350f`,
+`6fb538fa`, `cc480333`). Peer work earns no credit here. The current test-only
+compiler repairs enable qualification; metadata reports the result. DRIFTING
+remains the overhead verdict: excessive analysis, setup and repeated cold builds
+were avoidable. Two bounded repairs are now complete on their cited evidence.
 
 Honesty inventory, current fresh-eyes block:
 
@@ -605,31 +686,40 @@ Honesty inventory, current fresh-eyes block:
    and another assumed exit120 where recovery established137. Corrections4055
    and4058 retain both original statements and the corrected observations.
 8. No (checked: source manifests, identified ELF and real failure assertion);
-   fresh solo rechecks will not be called independent review.
+   the eight fresh solo rechecks are not independent review.
 9. Yes: any happy-path summary without first failures would hide material limits;
    raw Clippy101, UBS4critical, admission refusals, monitor137 and client retrieval
-   failures are retained separately. No final positive qualification yet.
+   failures are retained separately. Final scoped native/compiler positives do
+   not erase those failures or the unqualified broader gates.
 10. No (checked: retained stdout/stderr logs and recovery receipts); evidence
     stderr was not discarded. An initial formatting command masked its status
     with a later shell command; its diff is retained and direct fmt0 rerun used.
-11. No (checked: authoritative Beads); no new closure; `.35/.87/.90` stay open.
+11. No unsupported closure (checked: original acceptance, native images, all
+    compiler receipts and authoritative Beads); `.96` then `.95` close after
+    their named checks. `.35/.87/.90` and broader criteria stay open.
 12. No (checked: `.95/.96` acceptance and TODO diff); no original requirement
     lowered. The predeclared sequencing adjustment overlapped separate old and
     candidate compilation, preserving the same original negative before closure.
 13–17. N/A: this block is solo, with no subagents, pane closes, accepted reports
     or inter-agent agreement used as evidence. Peer commits remain peer work.
-18. No (checked: selectors and predeclared family/three-fault acceptance);
-    actual selected/ignored counts must be reported, not inferred from exit0.
+18. No (checked: exact executable lists and all nine native summaries);
+    actual81 unique/8repeat/0ignored counts are reported, excluding the nested
+    CPU child. The mistaken ignored-case assumption is corrected explicitly.
 Part4: `cass` reports `not_initialized`; no historical search/index or historical
 honesty clearance is claimed.
 19. Yes: the timeout typo wasted a cold build; initial source-copy selection was
     wrong and corrected before runtime evidence; one formatting status was masked;
     a read-only worker diagnostic had shell-quoting errors before corrected reads;
-    warm-cache expectations were wrong; build/report overhead has been excessive.
+    warm-cache expectations and the CPU-ignore assumption were wrong; a multi-file
+    Bash syntax check needed individual invocations; a broad journal read hit a
+    malformed foreign record before the corrected own-only inventory. A generic
+    Python sequencer was blocked by DCG; direct statically visible commands were
+    used without overrides. Build/report overhead has been excessive.
     These are corrected on record, not justification for lowering any gate.
 20. Strongest completed evidence: the exact old ELF reproduces the intended
     progress-loss assertion after an actual failed save. A skeptic can replay
-    the retained named case. Positive repaired execution is still required.
+    the retained named case. Final identified images now pass the unchanged
+    checkpoint family, real spawn faults, normal controls and fresh solo replays.
 
 Disposition: mistakes are corrected and disclosed here to the operator. RH-1,
 RH-2, RH-13 and RH-15 countermeasures are unchanged original assertions/budgets,
@@ -638,8 +728,10 @@ and exact timeout-variable checks. SM-11 preserves first failures; RH-17 and
 SM-12 preserve history and frozen-source identity. No history rewrite, deletion,
 foreign-process kill, resource-floor override or new hosted workflow dispatch
 occurred in this block. A prior erroneous workflow dispatch remains separately
-recorded as queued, without execution credit. Final disposition must be updated
-after the pending native/compiler runs, with no unsupported done declaration.
+recorded as queued, without execution credit. Final disposition: the two scoped
+repairs close on their actual native and compiler evidence. Mistakes and first
+failures remain disclosed; avoidable process overhead is not capability. Broader
+qualification and newer peer changes retain their original gates.
 
 ## November 4 continuation: timestamp seeks and current dependency qualification
 
