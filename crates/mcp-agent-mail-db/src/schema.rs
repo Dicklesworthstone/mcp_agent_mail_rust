@@ -7778,12 +7778,12 @@ mod tests {
                     .into_iter()
                     .filter(|migration| migration.id.starts_with("v28_"))
                     .collect();
-                assert!(
+                assert_eq!(
                     run_specific_migrations(&cx, conn, lifecycle)
                         .await
                         .into_result()
-                        .expect("already-applied lifecycle migrations remain compatible")
-                        .is_empty()
+                        .expect("already-applied lifecycle migrations remain compatible"),
+                    Vec::<String>::new()
                 );
             }
         });
@@ -7880,12 +7880,12 @@ mod tests {
                 &format!("INSERT INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at, checksum) VALUES (?, 'historical lifecycle upgrade', 123, ?)"),
                 &[Value::Text(migration.id.clone()), Value::Text(OLD_CHECKSUM.into())],
             ).unwrap();
-            assert!(
+            assert_eq!(
                 run_specific_migrations(&cx, &conn, vec![migration.clone()])
                     .await
                     .into_result()
-                    .unwrap()
-                    .is_empty()
+                    .unwrap(),
+                Vec::<String>::new()
             );
             assert!(
                 migration_set_is_complete(&cx, &conn, std::slice::from_ref(&migration))

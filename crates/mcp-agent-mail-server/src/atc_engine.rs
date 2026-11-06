@@ -7544,7 +7544,7 @@ mod engine_tests {
         assert!(engine.conflict_graphs.is_empty());
         assert!(engine.deadlock_cache.is_empty());
         assert!(engine.dirty_projects.is_empty());
-        assert!(engine.detect_deadlocks().is_empty());
+        assert_eq!(engine.detect_deadlocks(), []);
         assert_eq!(engine.capacity_guard_reason(), Some("conflict_capacity"));
 
         note_test_conflict_cycle(&mut engine, "new", "NewHolder", "NewWaiter", now);

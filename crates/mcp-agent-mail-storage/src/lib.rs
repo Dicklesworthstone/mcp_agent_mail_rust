@@ -1210,9 +1210,12 @@ pub fn archive_epoch_read_stamp(storage_root: &Path) -> Result<Option<ArchiveEpo
 }
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+type CoalescerAfterSpawnHook = Box<dyn FnMut(usize)>;
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 std::thread_local! {
     static STORAGE_WORKER_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    static COALESCER_AFTER_SPAWN_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> = const { std::cell::RefCell::new(None) };
+    static COALESCER_AFTER_SPAWN_TEST_HOOK: std::cell::RefCell<Option<CoalescerAfterSpawnHook>> = const { std::cell::RefCell::new(None) };
 }
 
 fn storage_worker_stack_size() -> usize {

@@ -21854,10 +21854,13 @@ first body
         start_advisory_consistency_probe(&config, &scope.workers);
         let deadline = Instant::now() + Duration::from_secs(20);
         let complete = loop {
-            let state = lock_mutex(&scope.workers.state);
-            let complete = state.workers.len() == 2
-                && state.workers.iter().all(|(_, worker)| worker.is_finished());
-            drop(state);
+            let registry = lock_mutex(&scope.workers.state);
+            let complete = registry.workers.len() == 2
+                && registry
+                    .workers
+                    .iter()
+                    .all(|(_, worker)| worker.is_finished());
+            drop(registry);
             if complete || Instant::now() >= deadline {
                 break complete;
             }
@@ -21917,9 +21920,9 @@ first body
                 starter.join();
                 assert!(state.take_headless_detach_requested());
             }
-            let started = Instant::now();
+            let before_drop = Instant::now();
             drop(starter);
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(before_drop.elapsed() < Duration::from_secs(2));
             assert_eq!(state.is_shutdown_requested(), !detach);
             assert!(!progress.non_db.load(Ordering::Acquire));
             assert!(!progress.db.load(Ordering::Acquire));

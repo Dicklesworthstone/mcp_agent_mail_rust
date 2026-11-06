@@ -8570,7 +8570,9 @@ first body
         let mut screen = MessageBrowserScreen::new();
         let (stale_dir, _stale_config, stale_conn) = compose_lifecycle_fixture();
         screen.db_conn = Some(stale_conn);
-        screen._db_snapshot_dir = Some(stale_dir);
+        screen._db_snapshot_dir = Some(crate::SnapshotDirGuard {
+            path: stale_dir.keep(),
+        });
         let mut form = ComposeFormState::new(
             "proj".into(),
             Some("BlueLake".into()),
