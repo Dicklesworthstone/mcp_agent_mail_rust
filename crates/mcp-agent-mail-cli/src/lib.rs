@@ -23284,10 +23284,33 @@ fn migrate_format_needs_conversion_attempt(
     format.needs_migration() || migrate_format_requires_force(format)
 }
 
-fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
+#[cfg(test)]
+type MigrationFormatReadObserver = Box<dyn FnMut(&Path, &'static str)>;
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_FORMAT_READ_OBSERVER: std::cell::RefCell<Option<MigrationFormatReadObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_migration_format_read(path: &Path, phase: &'static str) {
+    MIGRATION_FORMAT_READ_OBSERVER.with(|cell| {
+        if let Some(observer) = cell.borrow_mut().as_mut() {
+            observer(path, phase);
+        }
+    });
+}
+
+/// Retain the runtime's exclusive admission while a sidecarless database is
+/// read by canonical SQLite. A preflight alone cannot keep a server from
+/// entering between the ownership check and the first format query.
+/// Bare engine opens do not consult this cooperative activity authority;
+/// excluding them still requires a separate namespace reservation.
+fn acquire_migration_format_detection_locks(
     db_path: &Path,
     database_url: &str,
-) -> CliResult<()> {
+) -> CliResult<Option<CliMailboxMutationLocks>> {
     let context = "migration format detection";
     let franken_admitted = mcp_agent_mail_db::pool::is_franken_admitted_family(db_path, context)
         .map_err(|error| {
@@ -23297,7 +23320,7 @@ fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
             ))
         })?;
     if franken_admitted {
-        return Ok(());
+        return Ok(None);
     }
 
     let sqlite_activity_path = resolve_mailbox_activity_sqlite_path(database_url)?;
@@ -23373,7 +23396,29 @@ fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
         )));
     }
 
-    Ok(())
+    // Acquire after the read-only refusals above, then retain these guards
+    // through the canonical connection's complete lifetime. Contending
+    // startup or repair that wins the check/acquire race is refused here.
+    let storage_root_lock =
+        if should_lock_mailbox_storage_root(&sqlite_activity_path, &storage_root, None)
+            || should_lock_mailbox_storage_root(db_path, &storage_root, None)
+        {
+            acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)?
+        } else {
+            None
+        };
+    // Lock the already selected source. Re-resolving DATABASE_URL here could
+    // choose a different legacy absolute fallback from the file being read.
+    let selected_path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(db_path)
+    };
+    let sqlite_lock = acquire_doctor_mailbox_activity_lock_for_sqlite_path(&selected_path, false)?;
+    Ok(Some(CliMailboxMutationLocks {
+        _storage_root_lock: storage_root_lock,
+        _sqlite_lock: sqlite_lock,
+    }))
 }
 
 fn handle_migrate_cmd(
@@ -23410,8 +23455,8 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    let mut resolved_path = resolve_sqlite_runtime_path(&path);
-    let mut db_path = PathBuf::from(&resolved_path);
+    let resolved_path = resolve_sqlite_runtime_path(&path);
+    let db_path = PathBuf::from(&resolved_path);
     if !db_path.exists() {
         if !check {
             return handle_migrate_with_database_url(&cfg.database_url);
@@ -23421,11 +23466,36 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    ensure_sidecarless_sqlite_family_offline_for_format_detection(&db_path, &cfg.database_url)?;
-    let (format_conn, opened_path) =
-        open_live_sqlite_read_only(&resolved_path, "migration format detection")?;
-    resolved_path = opened_path;
-    db_path = PathBuf::from(&resolved_path);
+    let format_detection_locks =
+        acquire_migration_format_detection_locks(&db_path, &cfg.database_url)?;
+    #[cfg(test)]
+    observe_migration_format_read(&db_path, "before_open");
+    // Keep the engine chosen by admission. If the namespace appears or
+    // disappears before this open, the bound opener refuses; a live
+    // Franken read must never silently fall back to an unlocked canonical
+    // read merely because its namespace disappeared.
+    let context = "migration format detection";
+    let format_conn = if format_detection_locks.is_some() {
+        mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(&db_path, context)
+            .map(mcp_agent_mail_db::pool::GuardedReadOnlyConn::Canonical)
+    } else {
+        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(&db_path, context)
+            .map(mcp_agent_mail_db::pool::GuardedReadOnlyConn::Franken)
+    }
+    .map_err(|error| {
+        CliError::Other(format!(
+            "{context}: cannot open DB at {resolved_path} read-only: {error}"
+        ))
+    })?;
+    format_conn
+        .execute_raw("PRAGMA busy_timeout = 20000;")
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context}: cannot configure DB at {resolved_path} read-only: {error}"
+            ))
+        })?;
+    #[cfg(test)]
+    observe_migration_format_read(&db_path, "read_open");
     let format = migrate::detect_timestamp_format(&format_conn)
         .map_err(|e| CliError::Other(format!("format detection failed: {e}")))?;
     drop(format_conn);
@@ -23459,7 +23529,12 @@ fn handle_migrate_cmd(
         ));
     }
 
-    let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
+    // Sidecarless detection already owns this admission. Keep it through
+    // migration instead of releasing/reacquiring or contending with ourselves.
+    let _mailbox_mutation_locks = match format_detection_locks {
+        Some(locks) => locks,
+        None => acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?,
+    };
 
     // Create a pristine backup before schema migration whenever conversion may be attempted.
     let mut backup_path = if needs_conversion_attempt {
@@ -56657,6 +56732,243 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn migrate_format_detection_holds_authority_across_canonical_read() {
+        const TEST_NAME: &str =
+            "tests::migrate_format_detection_holds_authority_across_canonical_read";
+        const MODE_ENV: &str = "AM_TEST_MIGRATION_FORMAT_AUTHORITY_MODE";
+        const PATH_ENV: &str = "AM_TEST_MIGRATION_FORMAT_AUTHORITY_PATH";
+        const BUSY_ENV: &str = "AM_TEST_MIGRATION_FORMAT_AUTHORITY_BUSY";
+        const CHILD_WITNESS: &str = "migration-format-contender-checked";
+        const READ_WITNESS: &str = "migration-format-read-guarded";
+
+        if std::env::var(MODE_ENV).as_deref() == Ok("contender") {
+            let path = PathBuf::from(std::env::var_os(PATH_ENV).expect("contender path"));
+            let admission = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+                &path,
+                mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+            );
+            if std::env::var(BUSY_ENV).as_deref() == Ok("1") {
+                let error = admission.expect_err(
+                    "a competing runtime must not enter during canonical format detection",
+                );
+                assert!(is_resource_busy_cli_error(&error), "{error}");
+            } else {
+                assert!(
+                    admission
+                        .expect("completed format detection releases admission")
+                        .is_some()
+                );
+            }
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_admission(path: &Path, busy: bool) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(MODE_ENV, "contender")
+            .env(PATH_ENV, path)
+            .env(BUSY_ENV, if busy { "1" } else { "0" })
+            .output()
+            .expect("run real child admission contender");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(stdout.contains(CHILD_WITNESS), "{stdout}\n{stderr}");
+        }
+
+        if std::env::var(MODE_ENV).as_deref() == Ok("read") {
+            let path = PathBuf::from(std::env::var_os(PATH_ENV).expect("reader path"));
+            let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = std::rc::Rc::clone(&phases);
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move |path, phase| {
+                    // Exercise both the OS lock and the same-process registry
+                    // at the actual handler's check/open and open/read seams.
+                    assert_child_admission(path, true);
+                    let error = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+                        path,
+                        mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+                    )
+                    .expect_err("same-process admission must remain exclusive");
+                    assert!(is_resource_busy_cli_error(&error), "{error}");
+                    observed.borrow_mut().push(phase);
+                }));
+            });
+            let result = handle_migrate_cmd(true, false, false, None);
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| *cell.borrow_mut() = None);
+            result.expect("read the real sidecarless canonical timestamp format");
+            assert_eq!(*phases.borrow(), ["before_open", "read_open"]);
+            assert_child_admission(&path, false);
+            println!("{READ_WITNESS}");
+            return;
+        }
+
+        // Only the exact child receives configuration changes; parallel tests
+        // keep their own database and archive environment throughout.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("migration-authority.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("private storage root");
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+                .expect("seed canonical source");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("sidecarless fixture");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("seed mailbox schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('migration-authority', '/tmp/migration-authority', '2026-01-15T10:30:00Z');",
+            )
+            .expect("seed legacy timestamp");
+        drop(canonical);
+        let source_before = std::fs::read(&path).expect("original source bytes");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(MODE_ENV, "read")
+                .env(PATH_ENV, &path)
+                .env("DATABASE_URL", format!("sqlite:///{}", path.display()))
+                .env("STORAGE_ROOT", &storage_root)
+                .output()
+                .expect("run isolated migration reader");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains(READ_WITNESS), "{stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read(&path).expect("source after check"),
+            source_before
+        );
+        for suffix in [
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            "-wal",
+            "-shm",
+            "-journal",
+        ] {
+            assert!(
+                !sqlite_sidecar_path(&path, suffix).exists(),
+                "read-only format detection must not create engine sidecar {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_format_detection_refuses_engine_change_after_admission() {
+        const CHILD_ENV: &str = "AM_TEST_MIGRATION_FORMAT_ENGINE_CHANGE";
+        const TEST_NAME: &str =
+            "tests::migrate_format_detection_refuses_engine_change_after_admission";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run isolated namespace-change control");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains("migration-engine-changes-refused"),
+                "{stdout}\n{stderr}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("private storage root");
+        for franken_source in [false, true] {
+            let path = dir.path().join(format!("engine-{franken_source}.sqlite3"));
+            let path_text = path.to_string_lossy().into_owned();
+            let seed = mcp_agent_mail_db::CanonicalDbConn::open_file(&path_text)
+                .expect("seed canonical source");
+            seed.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("sidecarless fixture");
+            seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("seed mailbox schema");
+            drop(seed);
+            if franken_source {
+                let runtime = mcp_agent_mail_db::DbConn::open_file(&path_text)
+                    .expect("admit private fixture to FrankenSQLite");
+                runtime
+                    .execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("settle private fixture");
+                drop(runtime);
+            }
+            assert_eq!(
+                mcp_agent_mail_db::pool::is_franken_admitted_family(&path, "test")
+                    .expect("fixture namespace"),
+                franken_source
+            );
+            let source_before = std::fs::read(&path).expect("source before namespace transition");
+            let quarantine = dir.path().join(format!("namespace-{franken_source}"));
+            std::fs::create_dir(&quarantine).expect("private namespace quarantine");
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move |path, phase| {
+                    assert_eq!(
+                        phase, "before_open",
+                        "changed namespace must refuse before reading"
+                    );
+                    if franken_source {
+                        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                            std::fs::rename(
+                                sqlite_sidecar_path(path, suffix),
+                                quarantine.join(suffix),
+                            )
+                            .expect("retain changed namespace witnesses");
+                        }
+                    } else {
+                        std::fs::write(
+                            sqlite_sidecar_path(path, "-fsqlite-ns-gate"),
+                            b"foreign namespace appeared",
+                        )
+                        .expect("place foreign namespace witness");
+                    }
+                }));
+            });
+            let database_url = format!("sqlite:///{}", path.display());
+            let storage_text = storage_root.to_string_lossy().into_owned();
+            let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("STORAGE_ROOT", storage_text.as_str()),
+                ],
+                || handle_migrate_cmd(true, false, false, None),
+            );
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| *cell.borrow_mut() = None);
+            let error =
+                result.expect_err("a changed engine authority must not switch read engines");
+            let detail = error.to_string();
+            assert!(detail.contains("cannot open DB"), "{detail}");
+            assert!(
+                detail.contains("namespace") || detail.contains("Franken-admitted"),
+                "{detail}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("unchanged source"),
+                source_before
+            );
+            if !franken_source {
+                assert_eq!(
+                    std::fs::read(sqlite_sidecar_path(&path, "-fsqlite-ns-gate"))
+                        .expect("foreign namespace preserved"),
+                    b"foreign namespace appeared"
+                );
+            }
+        }
+        println!("migration-engine-changes-refused");
+    }
+
+    #[test]
     fn migrate_check_and_convert_sidecarless_legacy_text_database() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
@@ -56685,6 +56997,7 @@ http_headers = { Authorization = "Bearer secret" }
             )
             .expect("insert legacy text timestamp row");
         drop(canonical);
+        let source_before_check = std::fs::read(&db_path).expect("original legacy source bytes");
 
         assert!(
             !mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
@@ -56702,6 +57015,11 @@ http_headers = { Authorization = "Bearer secret" }
             || {
                 handle_migrate_cmd(true, false, false, None)
                     .expect("migrate --check must succeed on sidecarless legacy text DB");
+                assert_eq!(
+                    std::fs::read(&db_path).expect("legacy source after check"),
+                    source_before_check,
+                    "format detection must leave the legacy source byte-identical"
+                );
 
                 for suffix in [
                     "-fsqlite-ns-gate",
@@ -56709,7 +57027,6 @@ http_headers = { Authorization = "Bearer secret" }
                     "-wal",
                     "-shm",
                     "-journal",
-                    ".activity.lock",
                 ] {
                     let sidecar = sqlite_sidecar_path(&db_path, suffix);
                     assert!(
@@ -56718,6 +57035,18 @@ http_headers = { Authorization = "Bearer secret" }
                         sidecar.display()
                     );
                 }
+                // Safe admission needs a stable lock inode even for a pure
+                // format read. It stays on disk, unlocked, for the next owner;
+                // unlinking it would let contenders lock different inodes.
+                assert!(
+                    std::fs::symlink_metadata(sqlite_sidecar_path(&db_path, ".activity.lock"))
+                        .expect("stable migration activity lock")
+                        .file_type()
+                        .is_file()
+                );
+                let released = acquire_cli_mailbox_mutation_locks(&database_url, None)
+                    .expect("migrate --check releases both mailbox activity locks");
+                drop(released);
 
                 handle_migrate_cmd(false, false, false, Some(backup_dir.clone()))
                     .expect("migrate must convert sidecarless legacy text DB");
