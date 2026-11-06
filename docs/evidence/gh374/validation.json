@@ -12,6 +12,33 @@
     "publication_result": "recorded separately by GitHub commit and branch-update receipts",
     "qualification_is_independent_of_publication": true
   },
+  "fresh_eyes_2026_11_05": {
+    "beads": ["br-kp1in.95", "br-kp1in.96"],
+    "status": "in_progress; final native and compiler qualification pending",
+    "candidate_base": "d903bf5a4115a71143f8e2020024721a41b8c83d",
+    "incoming_checkpoint_commit": "6684bcfde6e930f6ec84981b6ab2899a94634fdc",
+    "incoming_checkpoint_preserved_byte_for_byte_plus_original_77_line_regression": true,
+    "expected_final_checkpoint_cases": 55,
+    "expected_fresh_obsolete_checkpoint_cases": 5,
+    "candidate_overlay_files": 6,
+    "old_code_negative": {
+      "passed": 0, "failed": 1, "ignored": 0, "filtered_out": 1043, "seconds": 3.16, "exit_code": 101,
+      "assertion": "obsolete disk checkpoint erased independently current memory after a real failed save",
+      "expected_progress": "Some(925), None", "observed_progress": "None, None",
+      "source_receipt": "3f008c112a785a1168b1b0f8b32e30305f55c8d88df03343816685a5ff767855",
+      "fresh_input_records": 3911, "mismatches": 0,
+      "executable_sha256": "c94cc0404d0ea538b436c271647fdd3e9389e1032682316e1d58ec6aeef3399b"
+    },
+    "original_root_permission_control": {"passed": 1, "failed": 0, "ignored": 0, "seconds": 0.02},
+    "v5_static": {"exit_code": 0, "critical": 0, "warning": 9854, "info": 3410, "files": 5, "failed_modules": []},
+    "planted_static_countercontrol": {"exit_code": 1, "critical": 2, "hazards": ["untrusted executable", "unconditional panic"]},
+    "v5_format_exit_code": 0,
+    "pending_test_qualification": "main has bounded claim-release wait and exact spawn-error panic check; active v5 compiler inputs stay frozen; final qualification pending",
+    "source_and_binary_evidence_root": "/data/tmp/am-fresh-eyes-20261105.n3gaE0Mt",
+    "review": "solo; no independent verification",
+    "honesty_audit": "DRIFTING; avoidable setup/report/build overhead disclosed in report; no new closure yet",
+    "production_scale_qualified": false, "release_clearance": false
+  },
   "integration_qualification_2026_11_05": {
     "source_commit": "e088f5f65d62b72369136746b54ef7605bfad566",
     "historical_attempts_preserved": true,

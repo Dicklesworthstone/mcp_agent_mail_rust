@@ -33,11 +33,19 @@ rewinding after a failed save; implementation takes precedence over reporting.
     erased current `(Some(925), None)` progress after an actual failed save.
     Build receipt3f008c11:3,911fresh inputs/0mismatch; identified ELFc94cc040.
     Remote compilation0; client1 retrieval failure retained separately.
+    Full original checkpoint-family baseline additionally executes52cases:
+    51pass1fail/0ignored/992filtered in86.88s, exit101, only the new case fails.
   - [ ] Validate the candidate distinction between current process memory and
     foreign disk hints; retain reset/refusal for unknown or changed bindings.
     Compile it in a separate frozen checkout alongside the unchanged original
     probe to avoid another serial cold build. Publish/close only after both
     the intended original negative and unchanged repaired positive execute.
+    - [x] Integrate canonical6684bcfd/d903bf5a non-destructively, retaining all
+      peer source/tests and the original77-line regression byte-identical.
+      Combined checkpoint file is exactly incoming6684 plus that original block.
+      Final family is55cases; fresh obsolete_checkpoint selector is5cases.
+      Source prefix follows canonical captured-binding ordering. CLI br-hb3mk
+      remains peer partial progress, without a native/full-exclusion claim here.
   - [ ] Prove real message convergence and unchanged source rows/read/ACK receipts.
   - [ ] Re-run original checkpoint/pool-reopen controls, all mandatory compiler
     graphs, formatting and reviewed static findings on frozen final source.
@@ -51,10 +59,54 @@ rewinding after a failed save; implementation takes precedence over reporting.
       SQLModel error without changing SQL, parameters or retry classification.
     - [ ] Run the original reservation-source functional controls; report the
       pre-existing ignored CPU benchmark separately, without a performance claim.
+    - [x] Preserve the actual server Clippy101 (`option_if_let_else`) and
+      replace the branch with `map_or_else`, preserving both healing paths.
     - [ ] Re-run all-target, separate production and strict Clippy on the final
-      three-file source; the earlier one-file all-target pass is historical.
+      six-file source; the earlier one-file all-target pass is historical.
+    - [x] Preserve the additional Clippy101 at the incoming TUI lifecycle query
+      (4ccc0df1,3,917fresh/0mismatch); use `map_or` with identical SQL and
+      parameter insertion. No lint allowance or new runtime feature claim.
   - [ ] Fresh solo acceptance and second source review; record exact revision and
     proof limitations before closing. No independent-review claim.
+- [ ] br-kp1in.96 (dependency of .95): recover safely from archive worker spawn errors.
+  - [x] Claim the source-derived WBQ/backlog panic and partial-coalescer startup
+    findings; preserve the original UBS4critical receipt without calling it green.
+  - [x] Keep staged WBQ operations and durable backlog claims on spawn refusal;
+    publish no sender without a consumer, and allow an ordinary later retry.
+  - [x] Add a startup rollback guard that signals and joins every earlier
+    coalescer worker when a later spawn fails; preserve constructor refusal.
+  - [x] Add three Linux x86_64 regressions using real OS thread-start errors,
+    actual queued signals/message archives, and an observed running first worker.
+  - [x] In shared main, synchronize the new backlog test's eventual
+    claim-release assertion: queue-empty publication precedes claim release.
+    Keep its original ten-second total budget. Current v5 inputs stay frozen
+    until its compiler jobs terminate. Both v5 jobs are now acknowledged;
+    v8 jobs and the preliminary main production check were subsequently stopped
+    for the incoming source: clients143; exact recoveries137/120/120, all
+    acknowledged, zero cases. Final v10 is based on d903bf5a, with all peer
+    controls and both worker-test corrections. Its six sources match shared main.
+    Final native/compiler qualification is still pending.
+  - [x] Assert that the caught coalescer panic specifically reports the second
+    thread's spawn error, so an unrelated test-hook panic cannot satisfy refusal.
+  - [ ] Execute those three regressions and normal queue/backlog/coalescer controls.
+  - [x] Verify the trusted current-executable permission-test false positive in
+    the root/uid-drop branch: identified old ELFc94cc040 passes1/0/0 in0.02s.
+    Retain the narrowly justified scanner annotations for final qualification.
+  - [x] Keep planted untrusted-executable and unconditional-panic controls red:
+    exact2critical/exit1; frozen v5 scan5files exits0/0critical,9,854warning,
+    3,410info/0failed modules. No warning-free claim.
+  - [ ] Re-scan final source after the test synchronization correction; qualify
+    the intentional constructor-refusal annotation with the native rollback case.
+    - [x] Preserve v8's six-file scan1critical: the existing cfg(test) synthetic
+      registration token is a fixture, never a deployed credential. Main's
+      line-specific annotation retains the exact value and all assertions.
+      Its TUI scan exits0/0critical. Expanded same-file countercontrol retains
+      all three planted hazards (including a credential literal), exit1/3critical.
+    - [ ] Complete final six-file scan and compiler graphs on annotated main;
+      keep active private v8 compiler/native snapshots unchanged until terminal.
+  - [ ] Complete the same frozen-source mandatory compiler graphs and formatting,
+    then freshly re-execute acceptance before any closure. No global lazy-pool
+    restartability, loaded shutdown, performance or release qualification claim.
 - [ ] Use terminal findings to choose any further ready capability repair; keep
   original .35/.87/capacity/reader/memory/platform/release criteria open unless
   their original named probes actually pass.

@@ -463,6 +463,155 @@ responsiveness at the base commit. These are prior maintainer results, not new
 results from this investigation. That comment explicitly leaves large-mailbox
 qualification and the pool's pending counter unresolved.
 
+## November 5 fresh-eyes continuation: checkpoint and worker-start failures
+
+`br-kp1in.95` and `.96` remain in progress. The compiler candidate is frozen
+in a separate checkout at `d903bf5a4115a71143f8e2020024721a41b8c83d`
+plus six manually edited source files. Shared main now contains the same
+production bytes and two stronger new-test checks: bounded journal-claim
+release waiting and the exact constructor-spawn panic reason. Main formatting
+passes; those test corrections await final native/compiler qualification.
+Native positive execution and final
+compiler qualification are pending; the earlier `.94` receipts do not qualify
+this candidate. Raw attempts are retained under
+`/data/tmp/am-fresh-eyes-20261105.n3gaE0Mt`.
+
+Canonical checkpoint repair6684bcfd and CLI admission workd903bf5a arrived
+during qualification. Both are preserved. The combined checkpoint file is
+byte-for-byte incoming6684 plus the original77-line regression block, also
+byte-identical to the demonstrated negative. All three incoming cases remain;
+the final family therefore selects55, and the obsolete-checkpoint fresh pass5.
+The earlier whole-test-module identity assertion applies only before these
+additions. The incoming CLI work is partial progress on br-hb3mk, whose native
+and full engine-exclusion criteria remain open. Stopped intermediate jobs earn
+no test credit: v8 native/Clippy and preliminary main production clients143;
+exact recoveries137/120/120, respectively, all acknowledged. The shared index
+was initially empty, the incoming change had no file deletions, and both
+fast-forwards preserved all reviewed source bytes and the original regression.
+
+The unchanged old-code regression actually fails at the intended assertion:
+0 passed, 1 failed, 0 ignored, 1,043 filtered, 3.16 seconds, exit101. After a
+real blocked checkpoint publication, obsolete disk state erases independently
+current memory `(Some(925), None)`. Source receipt `3f008c11` freshly matches
+3,911 records; protected 104,500,840-byte ELF SHA-256 is
+`c94cc0404d0ea538b436c271647fdd3e9389e1032682316e1d58ec6aeef3399b`.
+Remote compilation succeeded, while client retrieval failed; exact recovery
+returned0 with terminal acknowledgement. These are separate results. The
+candidate rejects all foreign disk hints, preserving memory only when the
+previous pass already independently bound it to the current source. Today's
+new binding is installed after restore, so it cannot bless unknown old progress.
+
+Fresh review also found WBQ/backlog thread-start panics and an unowned partial
+coalescer startup. The candidate retains staged operations/journal ownership
+when a consumer cannot start and joins every earlier constructor worker before
+a later spawn refusal unwinds. Three new Linux x86_64 tests request an impossible
+stack allocation, using the real operating-system error, retained signals,
+real message archives and an observed live first worker. They are integrated,
+not yet executed. Global lazy-pool restartability and loaded shutdown are not
+claimed.
+
+Raw four-file UBS first reported4critical. Two actual worker panic boundaries
+are repaired. The remaining deliberate constructor refusal now has rollback;
+the permission test executes only a retained current-executable descriptor,
+then drops uid/gid. Its original root branch passed1/0/0 on the identified old
+ELF. Both narrowly annotated lines retain their behavior. A separate planted
+untrusted executable and unconditional panic still produce exactly2critical
+in the same annotated countercontrol file. Final five-file UBS exits0 with
+0critical,9,854warning,3,410info and no failed modules; this is not warning-free
+or release clearance. Formatting exits0. All first failures are retained.
+
+### Filled anti-ceremony worksheets (solo; provisional until qualification)
+
+Process worksheet, November5 review block: running code does not branch on
+this report or TODO. Consumer: the operator who explicitly requested a detailed
+review and granular TODO. Gate: the requested review/completion report for
+`.95/.96`; observed defect: actual lost checkpoint progress and worker-start
+ownership failure. Retirement: execution history after implementation or honest
+handoff, with no recurring gate. Raw source/executable copies additionally meet
+the minimal integrity exception: managed binary retrieval actually failed;
+copies are necessary at this scale, minimal exact inputs/images, and no cheaper
+reliable identity-preserving replay exists. Opportunity cost: finish the real
+checkpoint/worker fixes; another report-polishing hour would add less value.
+Verdict: minimum requested report only; freeze additional status machinery.
+
+Real-work audit, main's12commits through `cc480333`: README purpose is a
+mail-like coordination layer with durable Git archive and SQLite indexing.
+Mechanical log classification: `d77a2672`, `98211dcb`, `24ffa2de`, `805ce223`,
+`0018483c`, `a9253d72`, `64cf2ee5` are USER (peer runtime changes);
+`db6ce671`/`e7c2db6b` are ENABLER integration merges; `cc480333`, `1adf2bec`,
+`283245fe` are PROCESS. Tally7/2/3/0; peer work earns this agent no credit.
+No current-block source fix has shipped yet. (1) The most visible peer change
+is lifecycle-correct TUI replies; the private checkpoint repair is not shipped.
+(2) Omitting status edits changes no runtime behavior. (3) Compiler/static
+checks gate the named fixes; no new speculative framework was built.
+(4) Original `.35` live-load convergence remains in progress since October8;
+the narrow progress-loss defect was reproducible, but does not prove its cause.
+(5) No delegated panes. (6) Metadata commits stand for reporting, never
+implementation; `.95` depends on `.96`, and unmet original criteria stay open.
+Verdict: DRIFTING. Excessive analysis, repeated cold builds and infrastructure
+diagnostics consumed hours without integrating a current-block fix. Correction:
+freeze scope and reporting machinery; finish the two concrete fixes and their
+original checks. Waiting and receipts earn zero capability credit.
+
+Honesty inventory, current fresh-eyes block:
+
+1. No (checked: all owned test diffs, unchanged original regression block plus
+   byte-exact preservation of the complete incoming checkpoint file,
+   untouched limits/config/CI and main reflog); no removed assertion or new ignore.
+2. No (checked: actual SQLite/Git fixtures and real OS spawn failures); observation
+   hooks arrange filesystem/timing failures, never fabricate backend results.
+3. No (checked: owned diff and retained golden review); no golden regeneration.
+4. Yes: three line-scoped UBS annotations, separately justified above with the
+   root native permission case, constructor rollback and a still-red countercontrol.
+   The third is the existing synthetic token in a cfg(test) temporary-DB fixture;
+   its exact value and assertions remain. Expanded countercontrol flags all
+   three hazards, including a separate unannotated credential-shaped literal.
+   Also corrected an ignored `_TIMEOUT_SECS` typo to documented `_TIMEOUT_SEC=7200`
+   for compilation only; no test/SLO budget or runtime retry bound changed.
+5. No (checked: exact old/new regression body and unchanged authority/budgets);
+   test-only impossible-stack selection exercises genuine OS failure.
+6. No (checked: actual native summaries); compilation/refusal attempts ran zero
+   cases and are never counted as successful test runs.
+7. Yes: an intermediate Bead comment said “still compiling” after the job ended,
+   and another assumed exit120 where recovery established137. Corrections4055
+   and4058 retain both original statements and the corrected observations.
+8. No (checked: source manifests, identified ELF and real failure assertion);
+   fresh solo rechecks will not be called independent review.
+9. Yes: any happy-path summary without first failures would hide material limits;
+   raw Clippy101, UBS4critical, admission refusals, monitor137 and client retrieval
+   failures are retained separately. No final positive qualification yet.
+10. No (checked: retained stdout/stderr logs and recovery receipts); evidence
+    stderr was not discarded. An initial formatting command masked its status
+    with a later shell command; its diff is retained and direct fmt0 rerun used.
+11. No (checked: authoritative Beads); no new closure; `.35/.87/.90` stay open.
+12. No (checked: `.95/.96` acceptance and TODO diff); no original requirement
+    lowered. The predeclared sequencing adjustment overlapped separate old and
+    candidate compilation, preserving the same original negative before closure.
+13–17. N/A: this block is solo, with no subagents, pane closes, accepted reports
+    or inter-agent agreement used as evidence. Peer commits remain peer work.
+18. No (checked: selectors and predeclared family/three-fault acceptance);
+    actual selected/ignored counts must be reported, not inferred from exit0.
+Part4: `cass` reports `not_initialized`; no historical search/index or historical
+honesty clearance is claimed.
+19. Yes: the timeout typo wasted a cold build; initial source-copy selection was
+    wrong and corrected before runtime evidence; one formatting status was masked;
+    a read-only worker diagnostic had shell-quoting errors before corrected reads;
+    warm-cache expectations were wrong; build/report overhead has been excessive.
+    These are corrected on record, not justification for lowering any gate.
+20. Strongest completed evidence: the exact old ELF reproduces the intended
+    progress-loss assertion after an actual failed save. A skeptic can replay
+    the retained named case. Positive repaired execution is still required.
+
+Disposition: mistakes are corrected and disclosed here to the operator. RH-1,
+RH-2, RH-13 and RH-15 countermeasures are unchanged original assertions/budgets,
+separate proof classes, line-specific annotation review plus planted hazards,
+and exact timeout-variable checks. SM-11 preserves first failures; RH-17 and
+SM-12 preserve history and frozen-source identity. No history rewrite, deletion,
+foreign-process kill, resource-floor override or new hosted workflow dispatch
+occurred in this block. A prior erroneous workflow dispatch remains separately
+recorded as queued, without execution credit. Final disposition must be updated
+after the pending native/compiler runs, with no unsupported done declaration.
+
 ## November 4 continuation: timestamp seeks and current dependency qualification
 
 ### Production change and preserved contracts
