@@ -615,7 +615,9 @@ capture_command_with_timeout() {
       return 1
     }
 
-    if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" <<'PY'
+    # Probes and the processes they launch must not keep installation locks
+    # alive after this installer exits or is killed.
+    if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" 7<&- 8<&- <<'PY'
 import subprocess
 import sys
 import time
@@ -720,7 +722,7 @@ PY
 
   local fallback_output_file fallback_rc raw_output_size captured_output_size
   fallback_output_file=$(mktemp "${TMP:-/tmp}/am-install-capture.XXXXXX") || return 1
-  if "$timeout_bin" --signal=KILL "$timeout_secs" "$@" >"$fallback_output_file" 2>&1; then
+  if "$timeout_bin" --signal=KILL "$timeout_secs" "$@" 7<&- 8<&- >"$fallback_output_file" 2>&1; then
     fallback_rc=0
   else
     fallback_rc=$?
@@ -1137,7 +1139,7 @@ installed_am_db_query_scalar() {
   local cli_bin="${DEST:-}/${BIN_CLI:-am}"
 
   [ -x "$cli_bin" ] || return 1
-  "$cli_bin" tooling db-query --db "$db_path" --sql "$sql" --first
+  "$cli_bin" tooling db-query --db "$db_path" --sql "$sql" --first 7<&- 8<&-
 }
 
 installed_am_db_exec() {
@@ -1147,9 +1149,9 @@ installed_am_db_exec() {
 
   [ -x "$cli_bin" ] || return 1
   if [ -n "$sql" ]; then
-    "$cli_bin" tooling db-exec --db "$db_path" --sql "$sql" >/dev/null
+    "$cli_bin" tooling db-exec --db "$db_path" --sql "$sql" 7<&- 8<&- >/dev/null
   else
-    "$cli_bin" tooling db-exec --db "$db_path" >/dev/null
+    "$cli_bin" tooling db-exec --db "$db_path" 7<&- 8<&- >/dev/null
   fi
 }
 
@@ -1159,7 +1161,7 @@ installed_am_db_backup() {
   local cli_bin="${DEST:-}/${BIN_CLI:-am}"
 
   [ -x "$cli_bin" ] || return 1
-  "$cli_bin" tooling db-backup --db "$db_path" --output "$output_path" >/dev/null
+  "$cli_bin" tooling db-backup --db "$db_path" --output "$output_path" 7<&- 8<&- >/dev/null
 }
 
 # Copy a SQLite database as a consistent snapshot.
@@ -4268,7 +4270,15 @@ activate_mac_python_cli_compat_shell() {
   case "$(basename "$shell_bin")" in
     zsh|bash)
       warn "Launching a fresh interactive shell so 'am' resolves via the Python compatibility entrypoint on this Mac"
-      exec "$shell_bin" -il
+      # exec bypasses EXIT traps. Finish recovery and release both locks before
+      # replacing this process with a shell that can remain open indefinitely.
+      INSTALLER_EXIT_SUCCESS=1
+      if ! cleanup; then
+        return 1
+      fi
+      TMP=""
+      trap - EXIT
+      exec "$shell_bin" -il 7<&- 8<&-
       ;;
     *)
       warn "Open a fresh shell to use the Python compatibility entrypoint for 'am' on this Mac"
@@ -5093,7 +5103,7 @@ ensure_remote_http_client_readiness() {
     return 0
   fi
 
-  if ! "$DEST/$BIN_CLI" service install --help >/dev/null 2>&1; then
+  if ! "$DEST/$BIN_CLI" service install --help 7<&- 8<&- >/dev/null 2>&1; then
     err "This build does not expose 'am service install'; cannot start the required background service."
     err "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
     return 1
@@ -5108,7 +5118,8 @@ ensure_remote_http_client_readiness() {
   info "About to install/enable/restart ${service_unit_desc}"
   info "  via: ${DEST}/${BIN_CLI} service install (ExecStart will point at ${DEST}/${BIN_CLI})"
   local service_output=""
-  if service_output=$("$DEST/$BIN_CLI" service install --host "$(desired_service_bind_host)" --port "$(desired_service_bind_port)" 2>&1); then
+  # A service may outlive this installer; it must not inherit our lock handles.
+  if service_output=$("$DEST/$BIN_CLI" service install --host "$(desired_service_bind_host)" --port "$(desired_service_bind_port)" 7<&- 8<&- 2>&1); then
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "remote_http_readiness:service ${line}"
     done <<< "$service_output"
@@ -5155,7 +5166,7 @@ ensure_remote_http_client_readiness() {
   # unconditionally — otherwise a `if service_output=$(...); then` would drop
   # the diagnostic lines on the floor precisely when they're most needed.
   local service_output=""
-  service_output=$("$DEST/$BIN_CLI" service status 2>&1 || true)
+  service_output=$("$DEST/$BIN_CLI" service status 7<&- 8<&- 2>&1 || true)
   if [ -n "$service_output" ]; then
     while IFS= read -r line; do
       if [ -n "$line" ]; then
@@ -6798,8 +6809,8 @@ setup_claude_code_mcp_via_cli() {
   # change to that CLI's listing format. `claude mcp remove` is a no-op when
   # the entry is absent, so the unconditional call is safe on first install
   # too; both `|| true` fallbacks swallow the expected non-zero exit code.
-  claude mcp remove mcp-agent-mail --scope user >/dev/null 2>&1 \
-    || claude mcp remove mcp-agent-mail >/dev/null 2>&1 \
+  claude mcp remove mcp-agent-mail --scope user 7<&- 8<&- >/dev/null 2>&1 \
+    || claude mcp remove mcp-agent-mail 7<&- 8<&- >/dev/null 2>&1 \
     || true
 
   local -a add_args=(mcp add --scope user --transport http mcp-agent-mail "$desired_url")
@@ -6807,7 +6818,7 @@ setup_claude_code_mcp_via_cli() {
     add_args+=(--header "Authorization: Bearer ${bearer_token}")
   fi
 
-  if claude "${add_args[@]}" >/dev/null 2>&1; then
+  if claude "${add_args[@]}" 7<&- 8<&- >/dev/null 2>&1; then
     ok "[claude-code] Registered mcp-agent-mail via 'claude mcp add' (user scope, HTTP transport)"
     verbose "setup_claude_code_mcp:ok url=${desired_url}"
     return 0
@@ -7201,7 +7212,7 @@ update_mcp_configs() {
   # A native setup pass is the credential-persistence admission gate for all
   # shell fallback writers. An older binary without this surface must not let
   # the installer publish a bearer token only into client configs.
-  if ! AM_INTERFACE_MODE=cli "$am_cli" setup --help >/dev/null 2>&1; then
+  if ! AM_INTERFACE_MODE=cli "$am_cli" setup --help 7<&- 8<&- >/dev/null 2>&1; then
     verbose "update_mcp_configs:skip reason=no_setup_subcommand"
     warn "The installed 'am' binary has no setup subcommand; MCP client configs were not changed."
     return 1
@@ -7222,13 +7233,13 @@ update_mcp_configs() {
   local setup_token
   setup_token="$(resolve_setup_http_bearer_token)"
   if [ -n "$setup_token" ]; then
-    if setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1); then
+    if setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 7<&- 8<&- 2>&1); then
       setup_rc=0
     else
       setup_rc=$?
     fi
   else
-    if setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 2>&1); then
+    if setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 7<&- 8<&- 2>&1); then
       setup_rc=0
     else
       setup_rc=$?
@@ -8364,18 +8375,20 @@ interactive_shell_am_descriptor() {
   local shell_name
   shell_name=$(basename "${SHELL:-/bin/sh}")
 
+  # Startup files can launch persistent agents. They may inspect command
+  # resolution, but must not inherit the installer's exclusive authority.
   case "$shell_name" in
     zsh)
-      zsh -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      zsh -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
     bash)
-      bash -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      bash -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
     fish)
-      fish -i -c 'type -a am 2>/dev/null | head -1; or echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      fish -i -c 'type -a am 2>/dev/null | head -1; or echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
     *)
-      sh -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      sh -c 'command -V am 2>/dev/null || echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
   esac
 }
@@ -9832,7 +9845,7 @@ installer_reconstruct_database_from_archive() {
     return 1
   fi
 
-  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor reconstruct --yes 2>&1); then
+  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor reconstruct --yes 7<&- 8<&- 2>&1); then
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:doctor_reconstruct ${line}"
     done <<< "$output"
@@ -9861,7 +9874,7 @@ installer_archive_parity_verify() {
     return 1
   fi
 
-  if ! output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor check --json 2>&1); then
+  if ! output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor check --json 7<&- 8<&- 2>&1); then
     warn "Post-migration doctor check failed: $(printf '%s\n' "$output" | sed -n '1p')"
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:doctor_check ${line}"
@@ -9921,13 +9934,13 @@ installer_apply_schema_migration() {
     return 1
   fi
 
-  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     success_output="$output"
     success_label="primary"
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:schema_refresh ${line}"
     done <<< "$output"
-  elif output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  elif output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     success_output="$output_fallback"
     success_label="fallback"
     while IFS= read -r line; do
@@ -10137,7 +10150,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
 
   migration_before_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
   migration_start=$(date +%s)
-  if migration_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  if migration_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     migration_end=$(date +%s)
     migration_seconds=$((migration_end - migration_start))
     migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
@@ -10160,7 +10173,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
       warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
     fi
     migration_succeeded=1
-  elif migration_output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  elif migration_output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     migration_end=$(date +%s)
     migration_seconds=$((migration_end - migration_start))
     migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
@@ -10539,7 +10552,7 @@ verify_installation() {
   fi
 
   # 3. Check binary command surfaces (prevents swapped/mispackaged installs)
-  cli_help=$("$DEST/$BIN_CLI" --help 2>&1 || true)
+  cli_help=$("$DEST/$BIN_CLI" --help 7<&- 8<&- 2>&1 || true)
   if printf "%s\n" "$cli_help" | grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)'; then
     cli_surface_ok=1
     ok "VERIFY: '$BIN_CLI' exposes CLI command surface"
@@ -10548,7 +10561,7 @@ verify_installation() {
     issues=$((issues + 1))
   fi
 
-  server_help=$("$DEST/$BIN_SERVER" --help 2>&1 || true)
+  server_help=$("$DEST/$BIN_SERVER" --help 7<&- 8<&- 2>&1 || true)
   if printf "%s\n" "$server_help" | grep -qE '^Usage: mcp-agent-mail ' && \
      printf "%s\n" "$server_help" | grep -qE '(^|[[:space:]])serve([[:space:]]|$)'; then
     server_surface_ok=1
