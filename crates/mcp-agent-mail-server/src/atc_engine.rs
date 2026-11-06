@@ -4978,17 +4978,20 @@ impl AtcEngine {
     }
 
     fn current_release_guard_reason(&self) -> Option<String> {
-        if let Some(reason) = self.capacity_guard_reason() {
-            Some(reason.to_string())
-        } else if self.policy_bundle.validate().is_err() {
-            Some("policy_bundle_invalid".to_string())
-        } else if self.calibration.is_safe_mode() {
-            Some("calibration_safe_mode".to_string())
-        } else if self.slow_controller.probe_budget_fraction < 0.2 {
-            Some("budget_pressure".to_string())
-        } else {
-            None
-        }
+        self.capacity_guard_reason().map_or_else(
+            || {
+                if self.policy_bundle.validate().is_err() {
+                    Some("policy_bundle_invalid".to_string())
+                } else if self.calibration.is_safe_mode() {
+                    Some("calibration_safe_mode".to_string())
+                } else if self.slow_controller.probe_budget_fraction < 0.2 {
+                    Some("budget_pressure".to_string())
+                } else {
+                    None
+                }
+            },
+            |reason| Some(reason.to_string()),
+        )
     }
 
     fn mark_agents_dirty(&mut self) {
@@ -12515,7 +12518,9 @@ impl ExecutionPosture {
     }
 }
 
-/// How complete the snapshot is. A `Full` snapshot reads all maintained
+/// How complete the snapshot is.
+///
+/// A `Full` snapshot reads all maintained
 /// statistics; `Partial` indicates unavailable data or incomplete agent/conflict coverage;
 /// `Fallback` means only cached/stale data was available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
