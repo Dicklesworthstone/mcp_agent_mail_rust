@@ -7904,11 +7904,15 @@ uninstall() {
 }
 
 ensure_rust() {
+  local source_root="$1"
   if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
     info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
     return 0
   fi
-  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
+  # Rustup selects the release's pinned compiler from this directory. The
+  # caller may legitimately default to stable; do not change that default.
+  if command -v cargo >/dev/null 2>&1 && \
+     (cd "$source_root" && rustc --version 2>/dev/null | grep -q nightly); then return 0; fi
   err "Building from source requires an installed Rust nightly toolchain."
   err "Install it with your trusted toolchain manager, then rerun with --from-source."
   return 1
@@ -9371,7 +9375,6 @@ fi
 if [ "$FROM_SOURCE" -eq 1 ]; then
   INSTALL_METHOD_LABEL="exact-tag source build"
   info "Building exact release tag $VERSION from source"
-  ensure_rust || exit 1
   source_repository_url="https://github.com/${OWNER}/${REPO}.git"
   source_commit=""
   if ! checkout_exact_release_source "$source_repository_url" "$TMP/src" "$VERSION"; then
@@ -9384,6 +9387,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     err "Could not resolve one exact source commit for release tag $VERSION."
     exit 1
   fi
+  ensure_rust "$TMP/src" || exit 1
 
   if ! frankensearch_commit=$(release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT) || \
      ! fast_cmaes_commit=$(release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT) || \

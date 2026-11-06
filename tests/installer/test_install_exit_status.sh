@@ -120,11 +120,38 @@ case "$mode" in
         # Actual command discovery sees an empty PATH. A source install must
         # fail here, before attempting an unchecked toolchain bootstrap.
         mkdir "$root/no-toolchain"
-        if PATH="$root/no-toolchain" ensure_rust; then
+        if PATH="$root/no-toolchain" ensure_rust "$root"; then
             printf 'source build continued without a compiler\n' > "$root/forbidden.calls"
             exit 99
         fi
         exit 1
+        ;;
+    source-nightly|source-stable|source-missing)
+        # Compiler output is an explicit R2 fixture. This exercises the real
+        # context selection without requiring Rustup or downloading a compiler.
+        # Real installed-toolchain controls compensate for this fixture lane.
+        source_root="$root/tagged-source"
+        if [ "$mode" != source-missing ]; then mkdir "$source_root"; fi
+        original_cwd=$(pwd -P)
+        cargo() { printf 'unexpected cargo execution\n' > "$root/forbidden.calls"; return 97; }
+        rustc() {
+            pwd -P > "$root/rustc.cwd"
+            if [ "$PWD" = "$source_root" ] && [ "$mode" = source-nightly ]; then
+                printf 'rustc 1.100.0-nightly (explicit fixture)\n'
+            else
+                printf 'rustc 1.99.0 (explicit fixture)\n'
+            fi
+        }
+        toolchain_rc=0
+        ensure_rust "$source_root" || toolchain_rc=$?
+        [ "$(pwd -P)" = "$original_cwd" ] || exit 99
+        if [ "$toolchain_rc" -eq 0 ]; then
+            [ "$mode" = source-nightly ] || exit 99
+        else
+            [ "$mode" != source-nightly ] || exit 99
+            exit 1
+        fi
+        printf 'continued\n' > "$root/after-toolchain"
         ;;
     no-agents|required-client|authority-error)
         # Native CLI output is an explicit fixture, not release evidence.
@@ -216,6 +243,19 @@ while read -r name expected_rc expected_errs; do
         missing-nightly)
             [ ! -e "$case_root/forbidden.calls" ] || case_failed=1
             grep -Fq 'requires an installed Rust nightly toolchain' "$output" || case_failed=1 ;;
+        source-nightly|source-stable|source-missing)
+            [ ! -e "$case_root/forbidden.calls" ] || case_failed=1
+            if [ "$name" = source-missing ]; then
+                [ ! -e "$case_root/rustc.cwd" ] || case_failed=1
+            else
+                [ "$(cat "$case_root/rustc.cwd")" = "$case_root/tagged-source" ] || case_failed=1
+            fi
+            if [ "$name" = source-nightly ]; then
+                [ -f "$case_root/after-toolchain" ] || case_failed=1
+            else
+                [ ! -e "$case_root/after-toolchain" ] || case_failed=1
+                grep -Fq 'requires an installed Rust nightly toolchain' "$output" || case_failed=1
+            fi ;;
     esac
     unit_cases=$((unit_cases + 1))
     printf 'unit %-5s %-26s exit=%s expected=%s ERR=%s expected=%s\n' "$delivery" "$name" "$rc" "$expected_rc" "$errs" "$expected_errs"
@@ -247,6 +287,9 @@ no-agents 0 0
 required-client 1 0
 authority-error 1 0
 missing-nightly 1 0
+source-nightly 0 0
+source-stable 1 0
+source-missing 1 0
 CASES
 done
 
