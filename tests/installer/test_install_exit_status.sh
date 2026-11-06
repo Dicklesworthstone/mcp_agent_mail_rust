@@ -38,7 +38,9 @@ extract_function() {
 unit_library="$scratch/exit-functions.sh"
 for fn in info ok warn err error_support_hint init_verbose_log verbose \
     dump_verbose_tail on_error early_exit_dump installer_path_owner_uid \
-    remove_installer_tmp_dir remove_installer_lock_dir cleanup \
+    installer_directory_identity installer_lock_fd_identity installer_kernel_lock \
+    acquire_installer_lock verify_installer_lock_authorities release_installer_lock \
+    remove_installer_tmp_dir cleanup \
     handle_binary_transaction_signal update_mcp_configs configure_mcp_clients \
     configure_mcp_clients_for_install; do
     extract_function "$fn" >> "$unit_library" \
@@ -62,9 +64,10 @@ BINARY_TRANSACTION_RECOVERY_ACTIVE=0
 BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0
 TMP="$root/mcp-agent-mail-install.fixture"
 LOCK_DIR="$root/lock.d"
-LOCKED=1
+LOCKED=0 DESTINATION_LOCKED=0
 mkdir "$TMP" "$LOCK_DIR"
 printf '%s\n' "$$" > "$LOCK_DIR/pid"
+acquire_installer_lock "$LOCK_DIR" initial
 printf 'owned temporary data\n' > "$TMP/payload"
 
 # The recovery boundary is fault-injected. Normal temp/lock cleanup and the
@@ -92,7 +95,10 @@ case "$mode" in
     guarded) if fail_required_step; then exit 99; fi ;;
     cleanup-fails-success|cleanup-fails-23)
         remove_installer_tmp_dir() { printf 'temp\n' >> "$root/cleanup.calls"; return 71; }
-        remove_installer_lock_dir() { printf 'lock\n' >> "$root/cleanup.calls"; return 72; }
+        release_installer_lock() {
+            [ "$1" = initial ] || return 0
+            printf 'lock\n' >> "$root/cleanup.calls"; return 72
+        }
         if [ "$mode" = cleanup-fails-23 ]; then exit 23; fi
         ;;
     recovery-fails-success|recovery-fails-23|recovery-succeeds-23)
@@ -167,7 +173,8 @@ while read -r name expected_rc expected_errs; do
     [ "$rc" -eq "$expected_rc" ] && [ "$errs" -eq "$expected_errs" ] || case_failed=1
     case "$name" in
         noop|cleanup-fails-*|early-nounset) ;;
-        *) [ ! -e "$case_root/lock.d" ] && [ ! -e "$case_root/mcp-agent-mail-install.fixture" ] || case_failed=1 ;;
+        *) [ -d "$case_root/lock.d" ] && [ -f "$case_root/lock.d/pid" ] && \
+           [ ! -e "$case_root/mcp-agent-mail-install.fixture" ] || case_failed=1 ;;
     esac
     case "$name" in
         recovery-*|term*)
@@ -225,9 +232,9 @@ authority-error 1 0
 CASES
 done
 
-# Exercise the complete installer up to its real lock/destination boundary.
-# A regular-file destination stops a successful acquisition before downloads;
-# a live owner must instead stop it at the lock without altering that evidence.
+# A regular-file destination must be refused before any lock/state write.
+# Leftover PID records in the old global location are preserved, including a
+# PID that is alive again: they are no longer permission to remove or block it.
 lock_cases=0
 for delivery in file stdin; do
 for location in tmpdir trailing-slash explicit empty-override; do
@@ -265,15 +272,12 @@ for ownership in free busy; do
     ) > "$output" 2>&1 || rc=$?
     case_failed=0
     [ "$rc" -eq 1 ] || case_failed=1
-    grep -Fq "${expected_lock}.d" "$output" || case_failed=1
     [ "$(cat "$case_root/destination")" = 'destination sentinel' ] || case_failed=1
+    grep -Fq 'Install destination contains traversal, a symlink, or a non-directory component' "$output" || case_failed=1
+    if grep -Fq '+ LOCKED=1' "$output" || grep -Fq '+ DESTINATION_LOCKED=1' "$output"; then case_failed=1; fi
     if [ "$ownership" = busy ]; then
-        grep -Fq 'Another installer is running or the lock authority is unsafe' "$output" || case_failed=1
         [ "$(cat "${expected_lock}.d/pid")" = "$$" ] || case_failed=1
-        if grep -Fq '+ LOCKED=1' "$output"; then case_failed=1; fi
     else
-        grep -Fq '+ LOCKED=1' "$output" || case_failed=1
-        grep -Fq 'Install destination contains traversal, a symlink, or a non-directory component' "$output" || case_failed=1
         [ ! -e "${expected_lock}.d" ] || case_failed=1
     fi
     if grep -Fq 'Downloading https://' "$output"; then case_failed=1; fi
@@ -294,9 +298,10 @@ done
 # before recovery, while unrelated destinations can make progress.
 destination_cases=0
 for delivery in file stdin; do
-for sharing in same different alias; do
+for sharing in same different shared-tmp alias; do
     if ! python3 - "$INSTALL_SH" "$scratch/destination-$delivery-$sharing" \
         "$ARTIFACT_DIR" "$BASH" "$VERSION" "$delivery" "$sharing" <<'PY'
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -327,12 +332,24 @@ exit 22
 curl.chmod(0o755)
 prefix = "destination-" + delivery + "-" + sharing
 
+def assert_locked(path, expected):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            assert expected, f"unexpected lock survives: {path}"
+        else:
+            assert not expected, f"live installer lost its lock: {path}"
+    finally:
+        os.close(fd)
+
 def launch(role, destination):
     env = {
         "HOME": str(root / "home"),
         "PATH": str(root / "bin") + ":/usr/bin:/bin:/usr/sbin:/sbin",
         "SHELL": "/bin/bash", "LC_ALL": "C", "TERM": "dumb",
-        "TMPDIR": str(root / ("tmp-" + role)),
+        "TMPDIR": str(root / ("tmp-first" if sharing == "shared-tmp" else "tmp-" + role)),
         "LOG_FILE": str(Path(artifacts) / (prefix + "-" + role + ".verbose.log")),
         "PROBE_ENTRY": str(root / (role + ".curl")),
         "PROBE_RELEASE": str(root / "release"),
@@ -359,35 +376,39 @@ try:
         time.sleep(0.02)
     first_log = Path(artifacts) / (prefix + "-first.log")
     assert (root / "first.curl").exists(), first_log.read_text()
-    initial = root / ("destination/.mcp-agent-mail-install.lock.d" if sharing == "alias"
-                      else "tmp-first/mcp-agent-mail-install.lock.d")
-    assert (initial / "pid").read_text().strip() == str(first.pid)
-    destination_lock = root / "destination/.mcp-agent-mail-install.lock.d"
-    if destination_lock.exists():
-        assert (destination_lock / "pid").read_text().strip() == str(first.pid)
+    destination_lock = root / "destination"
+    assert_locked(destination_lock, True)
+    initial = destination_lock / ".mcp-agent-mail-install.lock.d" if sharing == "alias" else None
+    if initial is not None:
+        assert_locked(initial, True)
+        assert initial.stat().st_mode & 0o777 == 0o700
+    else:
+        assert not (root / "tmp-first/mcp-agent-mail-install.lock.d").exists()
     evidence = None
-    if delivery == "stdin" and sharing != "different":
+    if delivery == "stdin" and sharing not in ("different", "shared-tmp"):
         journal = root / "destination/.mcp-agent-mail-install-transaction.active"
         journal.mkdir(mode=0o700)
         evidence = journal / "live-owner-evidence"
         evidence.write_bytes(b"leave the active owner's journal unchanged\n")
         before = (evidence.stat().st_ino, evidence.read_bytes())
-    second_dest = root / ("other-destination" if sharing == "different" else "destination")
+    second_dest = root / ("other-destination" if sharing in ("different", "shared-tmp") else "destination")
     second = launch("second", second_dest)
     second_rc = second.wait(timeout=15)
     second_log = (Path(artifacts) / (prefix + "-second.log")).read_text()
     assert second_rc == 1, second_log
     assert first.poll() is None, first_log.read_text()
-    assert (initial / "pid").read_text().strip() == str(first.pid)
-    if sharing == "different":
+    assert_locked(destination_lock, True)
+    if initial is not None:
+        assert_locked(initial, True)
+    if sharing in ("different", "shared-tmp"):
         assert (root / "second.curl").exists(), second_log
         assert "Another installer is running" not in second_log, second_log
-        assert not (second_dest / ".mcp-agent-mail-install.lock.d").exists()
+        assert_locked(second_dest, False)
     else:
         assert not (root / "second.curl").exists(), second_log
         assert "Another installer is running" in second_log, second_log
         assert "previous binary transaction is ambiguous" not in second_log, second_log
-        assert (destination_lock / "pid").read_text().strip() == str(first.pid)
+        assert_locked(destination_lock, True)
     assert not (root / "tmp-second/mcp-agent-mail-install.lock.d").exists()
     if evidence is not None:
         assert (evidence.stat().st_ino, evidence.read_bytes()) == before
@@ -395,8 +416,10 @@ finally:
     (root / "release").touch()
     first_rc = first.wait(timeout=15)
 assert first_rc == 1, first_log.read_text()
-assert not initial.exists()
-assert not destination_lock.exists()
+assert_locked(destination_lock, False)
+if initial is not None:
+    assert_locked(initial, False)
+    assert not (initial / "pid").exists(), "kernel locking never creates a PID authority"
 if evidence is not None:
     assert (evidence.stat().st_ino, evidence.read_bytes()) == before
 print("destination", delivery, sharing, "owner preserved; contender and cleanup verified")
@@ -408,7 +431,154 @@ PY
 done
 done
 
-printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$failures"
+# Exercise the production lock helpers against real OS locks. Only adapter
+# discovery is controlled: the fallback paths execute actual Python/Perl
+# flock calls, and an independent Python descriptor tests their exclusion.
+kernel_probe="$scratch/kernel-lock-probe.sh"
+cat > "$kernel_probe" <<'PROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1" backend="$2" mode="$3"
+source "$4"
+QUIET=0 HAS_GUM=0 NO_GUM=1
+LOCKED=0 DESTINATION_LOCKED=0
+command() {
+    case "${1:-}:${2:-}" in
+        -v:flock) [ "$backend" = native ] || return 1 ;;
+        -v:python3) [ "$backend" != perl ] || return 1 ;;
+    esac
+    builtin command "$@"
+}
+acquire_installer_lock "$root/authority" destination
+case "$mode" in
+    descendant-*) sleep 30 & printf '%s\n' "$!" > "$root/child" ;;
+esac
+printf 'ready\n' > "$root/ready"
+IFS= read -r action
+if [ "$action" = verify ]; then
+    if verify_installer_lock_authorities; then
+        echo 'FAIL: a substituted directory passed authority validation' >&2
+        exit 91
+    fi
+    printf 'refused\n' > "$root/refused"
+fi
+release_installer_lock destination
+PROBE
+
+kernel_cases=0
+if python3 - "$kernel_probe" "$unit_library" "$scratch/kernel" "$ARTIFACT_DIR" "$BASH" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+probe, library, scratch, artifacts, bash = sys.argv[1:]
+completed = 0
+unavailable = []
+
+def locked(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+for backend, executable in (("native", "flock"), ("python", "python3"), ("perl", "perl")):
+    if shutil.which(executable) is None:
+        unavailable.append(backend)
+        continue
+    for mode in ("ordinary", "rename", "symlink", "crash", "descendant-normal", "descendant-crash"):
+        root = Path(scratch) / (backend + "-" + mode)
+        authority = root / "authority"
+        authority.mkdir(parents=True, mode=0o700)
+        # The historical PID slot deliberately names a live, unrelated owner.
+        # It must neither block the actual kernel lock nor be changed on exit.
+        evidence = authority / "pid"
+        evidence.write_text(str(os.getpid()) + "\n")
+        original_evidence = (evidence.stat().st_ino, evidence.read_bytes())
+        log_path = Path(artifacts) / ("kernel-" + backend + "-" + mode + ".log")
+        child_pid = None
+        with log_path.open("wb") as log:
+            owner = subprocess.Popen([bash, probe, str(root), backend, mode, library],
+                                     stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 15
+            while not (root / "ready").exists() and owner.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert (root / "ready").exists(), log_path.read_text()
+            assert locked(authority), "helper exited without leaving its kernel lock with Bash"
+            if (root / "child").exists():
+                child_pid = int((root / "child").read_text())
+            retained = authority
+            replacement_evidence = None
+            if mode in ("rename", "symlink"):
+                retained = root / "retained-authority"
+                authority.rename(retained)
+                if mode == "symlink":
+                    victim = root / "victim"
+                    victim.mkdir(mode=0o700)
+                    authority.symlink_to(victim, target_is_directory=True)
+                else:
+                    authority.mkdir(mode=0o700)
+                (authority / "pid").write_text("replacement evidence must survive\n")
+                replacement_evidence = ((authority / "pid").stat().st_ino,
+                                        (authority / "pid").read_bytes())
+                assert locked(retained), "rename lost the held inode lock"
+                owner.stdin.write(b"verify\n")
+                owner.stdin.flush()
+            elif mode.endswith("crash"):
+                owner.kill()
+            else:
+                owner.stdin.write(b"release\n")
+                owner.stdin.flush()
+            rc = owner.wait(timeout=15)
+            assert rc == (-signal.SIGKILL if mode.endswith("crash") else 0), log_path.read_text()
+            if mode == "descendant-crash":
+                assert locked(retained), "a surviving installer child must still exclude a writer"
+                os.kill(child_pid, signal.SIGTERM)
+                child_pid = None
+                deadline = time.monotonic() + 5
+                while locked(retained) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            assert not locked(retained), "the old acquisition was not released"
+            assert ((retained / "pid").stat().st_ino, (retained / "pid").read_bytes()) == original_evidence
+            if replacement_evidence is not None:
+                assert (root / "refused").read_text() == "refused\n"
+                assert ((authority / "pid").stat().st_ino, (authority / "pid").read_bytes()) == replacement_evidence
+                assert authority.is_symlink() == (mode == "symlink")
+            if mode == "descendant-normal":
+                os.kill(child_pid, 0)  # explicit unlock works while the child remains alive
+            completed += 1
+            print("kernel", backend, mode, "exclusion, authority, and release verified")
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait(timeout=5)
+            owner.stdin.close()
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+assert completed, "no real kernel-lock adapter ran"
+print(f"Kernel lock cases: {completed} passed; unavailable adapters: {','.join(unavailable) or 'none'}")
+Path(artifacts, "kernel-count").write_text(str(completed))
+PY
+then
+    kernel_cases=$(cat "$ARTIFACT_DIR/kernel-count")
+else
+    failures=$((failures + 1))
+fi
+
+printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s kernel cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$kernel_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
     [ "$failures" -eq 0 ]
     exit $?

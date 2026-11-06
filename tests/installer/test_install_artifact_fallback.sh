@@ -112,7 +112,12 @@ extract_function() {
     extract_function select_linux_x86_64_gnu_artifact
     extract_function select_linux_x86_64_gnu_artifact_if_available
     extract_function installer_path_owner_uid
-    extract_function remove_installer_lock_dir
+    extract_function installer_directory_identity
+    extract_function installer_lock_fd_identity
+    extract_function installer_kernel_lock
+    extract_function acquire_installer_lock
+    extract_function verify_installer_lock_authorities
+    extract_function release_installer_lock
     extract_function check_existing_install
     extract_function preflight_checks
     extract_function preflight_destination_checks
@@ -414,18 +419,15 @@ if grep -q 'x86_64-unknown-linux-gnu.tar.gz' "$tmp/scenario_d.curl.log"; then
     exit 1
 fi
 
-step "scenario E: stale installer lock cleanup uses pid-file removal plus rmdir"
-if [ "${AM_E2E_KEEP_TMP:-0}" = "1" ] || [ "${AM_E2E_KEEP_TMP:-0}" = "true" ]; then
-    step "SKIP: keep-temp mode forbids the stale-lock case's intentional fixture deletion"
-else
-    lock_dir="$tmp/mcp-agent-mail-install.lock.d"
-    mkdir "$lock_dir"
-    echo 999999 >"$lock_dir/pid"
-    bash -c "source '$extract'; remove_installer_lock_dir '$lock_dir'"
-    if [ -e "$lock_dir" ]; then
-        echo "FAIL: expected stale lock directory to be removed" >&2
-        exit 1
-    fi
+step "scenario E: kernel lock release preserves stale PID evidence and its directory"
+lock_dir="$tmp/mcp-agent-mail-install.lock.d"
+mkdir "$lock_dir"
+echo 999999 >"$lock_dir/pid"
+bash -c 'source "$1"; acquire_installer_lock "$2" initial && release_installer_lock initial' \
+    -- "$extract" "$lock_dir"
+if [ ! -d "$lock_dir" ] || [ "$(cat "$lock_dir/pid")" != 999999 ]; then
+    echo "FAIL: kernel lock acquisition/release changed stale PID evidence" >&2
+    exit 1
 fi
 
 lock_victim_dir="$tmp/installer-lock-victim"
@@ -435,8 +437,8 @@ mkdir "$lock_victim_dir"
 printf '%s\n' 'victim-pid-bytes-must-survive' >"$lock_victim_dir/pid"
 printf '%s\n' 'victim-pid-bytes-must-survive' >"$lock_victim_expected"
 ln -s "$lock_victim_dir" "$symlink_lock_dir"
-if bash -c "source '$extract'; remove_installer_lock_dir '$symlink_lock_dir'"; then
-    echo "FAIL: symlinked installer lock was accepted for cleanup" >&2
+if bash -c 'source "$1"; acquire_installer_lock "$2" initial' -- "$extract" "$symlink_lock_dir"; then
+    echo "FAIL: symlinked installer lock was accepted for acquisition" >&2
     exit 1
 fi
 if [ ! -L "$symlink_lock_dir" ]; then
@@ -444,19 +446,17 @@ if [ ! -L "$symlink_lock_dir" ]; then
     exit 1
 fi
 if [ ! -d "$lock_victim_dir" ] || ! cmp -s "$lock_victim_expected" "$lock_victim_dir/pid"; then
-    echo "FAIL: symlinked installer lock cleanup modified the victim directory" >&2
+    echo "FAIL: refused lock acquisition modified the victim directory" >&2
     exit 1
 fi
 
 changed_owner_lock_dir="$tmp/changed-owner-installer.lock.d"
 mkdir "$changed_owner_lock_dir"
 printf '%s\n' '222222' >"$changed_owner_lock_dir/pid"
-if bash -c "source '$extract'; remove_installer_lock_dir '$changed_owner_lock_dir' 111111"; then
-    echo "FAIL: stale-lock cleanup removed a lock whose observed pid changed" >&2
-    exit 1
-fi
+bash -c 'source "$1"; acquire_installer_lock "$2" initial && release_installer_lock initial' \
+    -- "$extract" "$changed_owner_lock_dir"
 if [ ! -d "$changed_owner_lock_dir" ] || [ "$(cat "$changed_owner_lock_dir/pid")" != '222222' ]; then
-    echo "FAIL: stale-lock cleanup failed to preserve the new lock owner" >&2
+    echo "FAIL: kernel lock release failed to preserve unrelated PID evidence" >&2
     exit 1
 fi
 
@@ -477,6 +477,7 @@ cleanup_probe="$tmp/cleanup-exit-status.sh"
     printf '%s\n' 'dump_verbose_tail() { :; }' \
         'err() { :; }' \
         'trap '\''exit 97'\'' ERR'
+    extract_function release_installer_lock
     extract_function cleanup
     printf '%s\n' 'trap cleanup EXIT' 'exit "${PROBE_RC:?}"'
 } >"$cleanup_probe"
