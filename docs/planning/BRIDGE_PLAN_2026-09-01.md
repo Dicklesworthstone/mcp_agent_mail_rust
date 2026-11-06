@@ -2,6 +2,50 @@
 
 ## November 6 fresh-eyes review and startup ownership — EmeraldEagle
 
+Continuation from `334400d0` (operator-requested review; same checklist, no new gate):
+
+- [x] Re-read the three source edits and trace ATC query/hydration and recovery consumers.
+- [x] Refresh health, peer state and ready graph; preserve untracked peer artifacts.
+- [x] Retry the original frozen native build once with normal resources:
+  refused120 before Cargo, zero library cases; `.90` remains in progress.
+- [x] Inspect top release recommendations against accepted DSR policy; no
+  disabled Actions work or release publication is substituted for that policy.
+- [x] Claim ready `br-x0aie` and inspect actual kernel-lock wiring and existing tests.
+- [x] Prove the public-directory lock defect with real UID65534 against UID1000:
+  unchanged installer refuses before download; victim inode/bytes survive.
+- [x] Move primary authority into a retained owner-only directory keyed by the
+  destination owner. Bind destination and private inode/owner separately; root
+  and the owner share one authority. Preserve cleanup, symlink and no-clobber guards.
+- [x] Execute final 124 boundary cases: 46 exit, 16 lock, 10 destination,
+  42 real-kernel and 10 explicit native-launch fixtures; zero failures.
+  Fresh full script also completes four genuine signed file/stdin/default installs.
+- [x] Repeat artifact authenticity/transaction controls and real live-executable
+  history pruning. Fix only the renamed-multicall fixture; preserve its assertions.
+- [x] Execute genuine signed v0.3.40 file/stdin installs while UID65534 holds
+  the public destination lock, then repeat both from final source. Both pairs
+  succeed without modifying the foreign witness or private authority inode.
+- [x] Execute a privileged signed fresh install into UID1000's empty destination
+  using that owner's retained private lock and its auxiliary alias. Keep the
+  existing refusal to replace another user's installed binary pair intact.
+- [x] Refuse missing nightly explicitly instead of piping unchecked Rustup
+  bytes into a shell; execute file/stdin missing-toolchain controls.
+- [x] Re-read final source/test diff; shell syntax, formatting and three-file
+  UBS pass (zero findings, no suppression or weakened gate).
+- [x] Complete final frozen all-target, separate production and strict Clippy
+  gates: all exit0; each freshly verifies the same 3,917 source records,
+  zero mismatches. Receipt file SHA prefixes: `94037c70`, `7fbff461`, `c9637e06`.
+- [x] Record retained setup/observer failures and all three honesty worksheets;
+  close only original `br-x0aie` after fresh solo acceptance re-execution.
+- [x] Publish repair `6b584bef` and ACFS checksum handoff `3358273c` through
+  the canonical bound-report builder/validator. Regenerate its two mirrors;
+  basic checker, ShellCheck and all 461 manifest checks pass. Strong checker
+  confirms MCP's exact hash and all 48 URLs; 46/48 hashes match. Its exit4 is
+  solely existing Atuin/Grok drift; their pins remain unchanged.
+- [x] Flush/check graph, publish handoff and release owned reservations.
+  Only `br-x0aie` closes; `.90` retains its original unexecuted native criteria.
+  Both repositories preserve peer work, and all five owned RCH wrappers are
+  terminal/acknowledged. Verification is solo; existing red gates remain open.
+
 Operator-requested review and granular TODO; Beads remains authoritative. This
 section retires as execution history when the findings and evidence are handed
 off. It introduces no runtime gate. Baseline: `aceebacc`; prior frozen receipts

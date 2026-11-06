@@ -16,6 +16,165 @@ prohibited pull requests.
 
 ## Status and evidence boundary
 
+### November 6 continuation: private installer lock authority
+
+The ready item `br-x0aie` had a real remaining availability defect at
+`334400d0`: the installer flocked the public destination directory itself.
+In `/data/tmp/am-installer-public-lock-jqmwiw46/result.json`, an actual UID65534
+holder locks UID1000's mode0755 destination; the unchanged full installer
+refuses before downloading. The intended no-foreign-interference assertion
+fails. The witness inode and bytes survive. This is an observed negative,
+not an inferred vulnerability or a performance comparison.
+
+The repair retains a mode0700 authority directory inside each destination,
+keyed by the destination owner's UID. The owner and root rendezvous on its
+same kernel lock. Destination identity/owner and held authority
+identity/owner/mode are checked separately before existing mutation paths.
+Release unlocks the held descriptor; it never deletes a PID or lock path.
+Explicit auxiliary aliases deduplicate against the held inode. Existing
+symlink, traversal, binary ownership, signature and transaction guards remain.
+Source builds now require an already installed nightly instead of executing
+an unchecked Rustup download. No Rust dependency or runtime source changed.
+
+Final `install.sh` SHA-256 is
+`bd7dadaa75736bcb3eb649a82bd691176420f2f11669239a0cf89123765297fd`.
+The final exit/prune test hashes are respectively
+`8ab1f45f2d0e92ffbcdf2ae44d5af033c045961a4f6e60d0c844eee68eea4359`
+and `25510f836284f87115fb90153cbaea7725439cccf7ca428c579547605432fc0a`.
+Frozen qualifier remains `aceebacc` plus the three previously qualified Rust
+overlays and these three shell overlays; its older report bytes are not
+claimed to equal the moving main report. Main's reviewed code matches it.
+
+- Fresh final-source boundary suite: 46 exit +16 lock +10 destination
+  +42 real-kernel +10 native-launch cases, zero failures. The same complete
+  script then passes four genuine signed file/stdin/default installations.
+  Native-launch executables are explicit R2 fixtures. Held-download controls
+  substitute transport only to expose the real kernel interleaving.
+- Fresh artifact/rollback suite and live-executable history pruning both
+  exit0. Artifact binaries/signing fixtures are R1/R2 evidence, compensated by
+  the genuine public-release installations; they are not published payloads.
+- Genuine final-source v0.3.40 file/stdin installs under a real foreign public
+  lock both succeed at `/data/tmp/am-installer-private-lock-myws96w3/`.
+  Fresh solo repeats at `/data/tmp/am-installer-private-lock-inxdvsqq/`
+  also succeed (11.157s/15.315s). Both verify the pinned Minisign key, exact
+  signed tag, SHA256SUMS, actual installed versions and `--verify`. UID65534
+  cannot open the private authority, even after release; its inode is retained.
+- Privileged fresh install at `/data/tmp/am-installer-root-fresh-vefq7224/`
+  passes with the same UID1000-owned authority and auxiliary alias, destination
+  still UID1000, installed pair UID0. Root contention during an owner's actual
+  held lock is refused; replacing the owner's installed binary pair remains
+  refused by the existing ownership guard. No guard was relaxed for root.
+- Shell syntax, both trees' formatting and final three-file UBS exit0;
+  UBS reports zero critical/warning/info findings and no failed module.
+  All-target, separate production lib/bin and strict all-target Clippy pass
+  on the same 3,917 freshly verified input records, zero mismatches. Their
+  retained receipt-file hashes are respectively `94037c706555d4276d23a3f345511d677ee61f56ecf5e350b3eb15edfce3d078`,
+  `7fbff4611536a966196a9669dd22945ceb872fc3fe0ccd3830bab5e90bd63604`
+  and `c9637e0685613ca330e25885869f94e225b64dc6e7a04ead2db4998acca21f1d`.
+  The six reviewed shell/Rust overlays match committed main `6b584bef` byte for
+  byte. No worker resources, gate bounds or dependency inputs were changed.
+- Final-source foreign-destination/precreated-foreign-authority controls both
+  refuse before network while preserving owners and witness inode/bytes:
+  `/data/tmp/am-installer-foreign-final-3qpzgivj/result.json`.
+
+Original `br-x0aie` closes on published `6b584bef` after that fresh solo pass.
+The ACFS consumer pin is published as `3358273c9f2c58e79c021aa6a1003483590f6eb3`.
+Its canonical report observes all48 with45 matches/3 mismatches, no errors/skips;
+SHA-256 `b28698248351f63f195142de500cc748bc66d41b516a6d2e0beb55bcc56306a7`.
+The bound builder/validator updates only MCP, explicitly deferring existing
+Atuin/Grok drift; validated policy SHA-256
+`60eeaa840e3792e21a83cf8251e00a38957bf309c53b0131d95cc0530a7f99fc`.
+Canonical generation refreshes the two provenance mirrors. Checker0.1.0
+validate/list/local dry-run pass. Its stronger actual URL/hash check reaches
+all48 URLs and matches46 hashes including MCP; exit4 is solely unchanged
+Atuin/Grok mismatches, not an all-green consumer claim. The initial ShellCheck
+attempt exits127 because it is absent locally and on the worker. An official
+0.11.0 archive is then verified against GitHub's recorded SHA-256 before
+extracting its binary into private scratch; all generated shell files pass.
+The manifest contract passes all461 checks, including121 internal hashes and
+six repository MCP configs. No global tool installation or ACFS host provisioning
+installer was run. Five owned RCH entries are terminal/acknowledged with no
+live wrapper;117 unrelated malformed fleet journals preclude a fleet-health claim.
+
+Raw continuation logs are retained under
+`/data/tmp/am-startup-review-20261106.mSIrexF8/installer-*` and the private
+probe directories above. Preserve the unsuccessful controls: two dynamic
+launch commands were rejected by DCG before execution and replaced by explicit
+native arguments; inherited project CWD triggered required Codex setup; a
+custom destination missing from PATH failed `--verify`; a renamed multicall
+`sleep` fixture exited early, including the ineffective `exec -a` attempt;
+one observer inspected stderr although the refusal printed on stdout; and
+the root probe incorrectly expected permission to replace user-owned binaries.
+Those fixture/observer expectations were corrected without weakening product
+guards, signature checks, deadlines or assertions. Their original logs remain.
+Initial UBS exited1 with two critical findings: the unchecked Rustup execution
+was removed; its compound-test syntax finding was resolved by assigning the
+unchanged Git probe result before comparing it, without scanner suppression.
+
+The unchanged `.90` native build retry again refuses120 before Cargo
+(`started:false`, free59,731,886,080 bytes, normal growth32,212,254,720 and
+floor10,737,418,240). Zero of its predeclared 30+6 library cases executed.
+It remains in progress. Prior full-load send p99 failure, missing release-build
+qualification and all previously documented exclusions remain red. These
+installer results qualify an installer using released payloads, not a newly
+built server, macOS/Windows execution, independent review or release clearance.
+
+#### Required anti-ceremony worksheets (solo continuation)
+
+Process worksheet: reports/TODO are PROCESS; running code does not read them.
+Consumer is the operator who explicitly requested a granular fresh review;
+gate is their acceptance of this installer repair against original `br-x0aie`;
+observed defect is the retained real cross-UID lock denial. Retire this checklist
+as execution history at handoff. Raw immutable source/negative receipts are the
+minimal integrity control for source/evidence loss: required at this scale,
+smallest reliable record, no cheaper equivalent. Highest ready tractable
+capability selected was this installer repair; more speculative status work
+would not improve it. Verdict: minimum requested gate, no new runtime gate.
+
+Real-work worksheet: window starts at 334400d0/09:45 UTC. Mechanical inventory
+is current three-file source/test diff, TODO/tracker diff, recent Git history,
+ready/open graph and latest three closed records; no closure credit is taken
+from unrelated history. Work units: USER1 (installer authority/toolchain behavior),
+ENABLER2 (kernel/transaction tests and mandatory compiler/checksum handoff),
+PROCESS1 (requested TODO/evidence/tracker), UNKNOWN0; this is not a productivity
+quota. Demo: retain the foreign public lock and perform the real signed install.
+Without process files the product behavior is unchanged. Tests exercise the
+repair now, rather than speculative infrastructure. The oldest listed
+read-neutrality task `br-mmnyj` and corruption task `br-htobc` remain open;
+this bounded ready repair avoids pretending a new
+upstream storage investigation can close it. No swarm, follow-up laundering,
+spec substitution or plan-only implementation. Verdict: DRIFTING: cold compiler
+qualification and excessive exploratory/fixture work consumed too much time.
+Correction: freeze source, finish required checks and the actual checksum consumer;
+create no additional framework or speculative tasks.
+
+Honesty inventory, all 20 questions: Q1 No (checked complete test/config/history
+diff; original assertions and bounds retained). Q2 No (checked new empty-PATH
+and real kernel controls; existing launch doubles remain labeled R2).
+Q3 No (checked diff: no golden regeneration). Q4 Yes: lock-aware test observers
+change with runtime authority; reviewed each directly against independent fcntl,
+cross-UID and genuine signed controls, with no suppression/relaxation.
+Q5 No (checked runtime diff: no benchmark path or result hardcoding).
+Q6 No (checked actual case summaries; native zero-run refusal remains open).
+Q7 No (checked observed terminal logs versus claims). Q8 No (checked explicit
+fixture/live distinctions above). Q9 No (checked retained failures and prior
+red gates are disclosed). Q10 No (checked commands: both output streams retained;
+expected internal probes suppress only their own discovery noise).
+Q11 No (checked original criteria and owned statuses; no follow-up split).
+Q12 No (checked no acceptance/spec edits). Q13–17 not applicable: truly solo,
+no delegated work or claimed independent verifier. Q18 No (checked case lists
+declared before each run; expanded cohorts/repeats are not summed as unique).
+Older-session CASS audit is unavailable (`not_initialized`); no such audit claim.
+Q19 Yes: the failed controls and wasted exploration are explicitly listed above;
+corrected in place with failures retained, not hidden behind later passes.
+Q20 strongest evidence: old full installer fails under real foreign UID lock,
+then final genuine signed file/stdin installs and fresh repeats pass under that
+same attack. A skeptic can rerun the retained probe with those original criteria.
+Disposition: Q4/Q19 corrections and limits are disclosed here and in the handoff;
+RH-1 gate weakening, RH-17 failure erasure and proof-class inflation are prevented
+by retained assertions, failed logs and separate live/fixture/source receipts.
+Fresh solo re-execution is self-verification, never independent verification.
+
 ### Integration on main after the November 4 merge
 
 The investigation below records its original 0.5.0 backport and build attempts.
