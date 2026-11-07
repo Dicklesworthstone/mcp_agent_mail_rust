@@ -314,7 +314,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 | Verb | Mutates? | Default exit |
 |------|----------|--------------|
-| `am doctor check` (`--json`, `--verbose`, `[PROJECT]`) | No | 0 healthy / 1 findings |
+| `am doctor check` (`--json`, `--verbose`, `[PROJECT]`) | No | Table: 0 healthy / 1 findings; JSON/TOON: 0 report produced (inspect `healthy`) |
 | `am doctor drain` | No (read-only) | 0 |
 | `am doctor locks` (`--json`) | No (read-only owner intelligence — D1) | 0 |
 | `am doctor fix --yes` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |

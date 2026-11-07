@@ -2590,6 +2590,11 @@ pub enum AgentCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum DoctorCommand {
+    /// Report mailbox diagnostics without changing state.
+    ///
+    /// Table output exits 1 when healthy is false. JSON and TOON output exit 0
+    /// after generating the report; inspect the healthy field for mailbox health.
+    /// Use `am doctor health` when scripts need findings to produce a nonzero exit.
     Check {
         project: Option<String>,
         #[arg(long, short = 'v')]

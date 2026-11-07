@@ -589,6 +589,12 @@ am doctor support-bundle --json       # sanitized incident bundle for maintainer
 
 **Expected output:** `doctor check` reports archive or database problems, and
 `doctor backups` lists any available backup snapshots or recovery artifacts.
+With `--json`, `--format json`, or `--format toon`, `doctor check` exits 0 when
+it produces the report, including reports with `healthy: false`. Scripts must
+inspect the top-level `healthy` field. Table output exits 1 when `healthy` is
+false; use `am doctor health` for a simple exit-status health gate. An installer
+smoke test that checks only the structured command's exit 0 proves report
+execution; mailbox health requires reading the result or running the health gate.
 `doctor locks` / `doctor drain` tell you whether a live `am` still owns the
 mailbox — `repair` and `reconstruct` refuse while a live owner is present, so
 drain it via your supervisor first (never kill `am` directly).
