@@ -7035,17 +7035,39 @@ fn coalescer_pool_worker(
                 continue;
             }
 
-            // Successfully claimed repo.
-            let had_failure = self_process_repo(
-                &repo_root,
-                &rq,
-                &stats,
-                &batch_sizes,
-                &pending_requests,
-                worker_count,
-                &repos,
-                &work_cv,
-            );
+            // Keep the fixed worker pool alive after a repository-local panic.
+            // self_process_repo's guards restore unfinished queue/spill work
+            // and install retry backoff before releasing the repository claim.
+            let had_failure = std::panic::catch_unwind(|| {
+                self_process_repo(
+                    &repo_root,
+                    &rq,
+                    &stats,
+                    &batch_sizes,
+                    &pending_requests,
+                    worker_count,
+                    &repos,
+                    &work_cv,
+                )
+            })
+            .unwrap_or_else(|_| {
+                rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                mcp_agent_mail_core::global_metrics()
+                    .storage
+                    .commit_errors_total
+                    .inc();
+                {
+                    let mut stats = stats
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    stats.errors = stats.errors.saturating_add(1);
+                }
+                tracing::error!(
+                    repo = %repo_root.display(),
+                    "[commit-coalescer] commit processing panicked; retaining work for retry"
+                );
+                true
+            });
             if had_failure {
                 heartbeat.finish_failure();
             } else {
@@ -7068,7 +7090,6 @@ fn self_process_repo(
     work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>,
 ) -> bool {
     let mut had_failure = false;
-    let max_batch_size = configured_coalescer_batch_size();
 
     // RAII guard to ensure processing flag is cleared even on panic
     struct ProcessingGuard<'a> {
@@ -7080,6 +7101,14 @@ fn self_process_repo(
     impl Drop for ProcessingGuard<'_> {
         fn drop(&mut self) {
             // PanicGuard restores uncommitted work before this guard drops.
+            // Back off before publishing the repository as available: another
+            // worker must not immediately retry a repeatedly panicking commit.
+            if std::thread::panicking() {
+                coalescer_note_commit_failure(self.rq);
+            }
+            self.rq
+                .last_serviced_us
+                .store(now_micros_u64(), Ordering::Relaxed);
             // Release the claim before waking peers; otherwise a peer can
             // consume the notification while the repository is unselectable.
             self.rq.set_inflight_oldest(None);
@@ -7101,6 +7130,7 @@ fn self_process_repo(
         work_cv,
         worker_count,
     };
+    let max_batch_size = configured_coalescer_batch_size();
 
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
@@ -7322,11 +7352,6 @@ fn self_process_repo(
         }
         panic_guard.inflight_spilled = None;
     }
-
-    // ProcessingGuard releases the claim and then wakes peers, including on
-    // panic after PanicGuard has restored unfinished work.
-    rq.last_serviced_us
-        .store(now_micros_u64(), Ordering::Relaxed);
 
     had_failure
 }
@@ -7914,6 +7939,15 @@ fn coalescer_commit_batch(
     }
 }
 
+#[cfg(test)]
+type CoalescerBeforeCommitTestHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static COALESCER_BEFORE_COMMIT_TEST_HOOK:
+        std::cell::RefCell<Option<CoalescerBeforeCommitTestHook>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Commit with retry and jittered backoff for index.lock contention.
 ///
 /// Unlike `commit_paths_with_retry`, this uses jitter to prevent thundering
@@ -7925,6 +7959,12 @@ fn coalescer_commit_with_retry(
     rel_paths: &[String],
 ) -> Result<()> {
     const MAX_RETRIES: usize = 7;
+    #[cfg(test)]
+    COALESCER_BEFORE_COMMIT_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(repo_root);
+        }
+    });
     let sm = &mcp_agent_mail_core::global_metrics().storage;
     sm.commit_attempts_total.inc();
     sm.commit_batch_size_last.set(rel_paths.len() as u64);
@@ -27572,6 +27612,174 @@ mod tests {
         assert_eq!(
             repo.find_blob(entry.id()).unwrap().content(),
             b"recovered wake\n"
+        );
+    }
+
+    #[test]
+    fn coalescer_worker_survives_commit_panic_and_recovers_queue_and_spill() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_worker_survives_commit_panic_and_recovers_queue_and_spill",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let failing_root = tmp.path().join("panicking");
+        let healthy_root = tmp.path().join("healthy");
+        let failing_repo = Repository::init(&failing_root).unwrap();
+        let healthy_repo = Repository::init(&healthy_root).unwrap();
+        let failing = Arc::new(RepoQueue::default());
+        let healthy = Arc::new(RepoQueue::default());
+        for name in ["queued.txt", "spill-a.txt", "spill-b.txt"] {
+            fs::write(failing_root.join(name), format!("retained {name}\n")).unwrap();
+            let request = coalescer_group_test_request(name.to_string(), vec![name.to_string()]);
+            if name == "queued.txt" {
+                coalescer_requeue_requests(&failing, vec![request]);
+            } else {
+                CommitCoalescer::spill_to_repo(&failing, request);
+            }
+        }
+        fs::write(
+            healthy_root.join("healthy.txt"),
+            b"independent repository\n",
+        )
+        .unwrap();
+        coalescer_requeue_requests(
+            &healthy,
+            vec![coalescer_group_test_request(
+                "healthy".to_string(),
+                vec!["healthy.txt".to_string()],
+            )],
+        );
+        // The only worker must hit the panic before it can service its peer.
+        healthy.last_serviced_us.store(1, Ordering::Relaxed);
+        let repos = Arc::new(Mutex::new(HashMap::from([
+            (failing_root.clone(), Arc::clone(&failing)),
+            (healthy_root, Arc::clone(&healthy)),
+        ])));
+        let work_cv = Arc::new((Mutex::new(1), std::sync::Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicU64::new(4));
+        let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+        let allow_recovery = Arc::new(AtomicBool::new(false));
+        let panic_count = Arc::new(AtomicU64::new(0));
+        let worker_cv = Arc::clone(&work_cv);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_pending = Arc::clone(&pending);
+        let worker_stats = Arc::clone(&stats);
+        let worker_allow_recovery = Arc::clone(&allow_recovery);
+        let worker_panic_count = Arc::clone(&panic_count);
+        let worker = std::thread::Builder::new()
+            .name("coalescer-panic-recovery-regression".to_string())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || {
+                let _alive = CoalescerAliveGuard::new(&COMMIT_COALESCER_WORKERS_ALIVE);
+                // The hook belongs to this worker and this repository only.
+                // Keep failing until the test observes independent progress.
+                COALESCER_BEFORE_COMMIT_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |repo_root| {
+                        if repo_root == failing_root
+                            && !worker_allow_recovery.load(Ordering::Acquire)
+                        {
+                            worker_panic_count.fetch_add(1, Ordering::Relaxed);
+                            panic!("injected repository commit panic"); // ubs:ignore -- Test-only fault injection exercises real worker unwind recovery.
+                        }
+                    }));
+                });
+                coalescer_pool_worker(
+                    repos,
+                    worker_cv,
+                    worker_shutdown,
+                    Arc::new(AtomicBool::new(true)),
+                    worker_stats,
+                    Arc::new(Mutex::new(VecDeque::new())),
+                    worker_pending,
+                    Duration::from_millis(10),
+                    1,
+                );
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (healthy.metrics.drained_total.load(Ordering::Relaxed) == 0
+            || failing.metrics.errors_total.load(Ordering::Relaxed) == 0
+            || healthy.processing.load(Ordering::Acquire))
+            && !worker.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let peer_progressed = healthy.metrics.drained_total.load(Ordering::Relaxed) == 1;
+        let pending_after_panic = pending.load(Ordering::Relaxed);
+        let alive_after_panic = COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed);
+        let failed_repo_uncommitted = failing_repo.head().is_err();
+
+        // No enqueue, flush, or replacement worker: the restored work must
+        // retry itself after its ordinary per-repository backoff expires.
+        allow_recovery.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while (pending.load(Ordering::Relaxed) != 0
+            || failing.processing.load(Ordering::Acquire)
+            || healthy.processing.load(Ordering::Acquire))
+            && !worker.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let survived = !worker.is_finished();
+        {
+            let _guard = work_cv.0.lock().unwrap();
+            shutdown.store(true, Ordering::Release);
+            work_cv.1.notify_all();
+        }
+        let joined = worker.join();
+
+        assert!(
+            joined.is_ok(),
+            "a commit panic must not kill the pool worker"
+        );
+        assert!(survived, "the same worker must remain alive until shutdown");
+        assert!(
+            peer_progressed,
+            "a failing repository must not starve its peer"
+        );
+        assert!(failed_repo_uncommitted);
+        assert_eq!(
+            pending_after_panic, 3,
+            "all failed queue and spill work remains owed"
+        );
+        assert_eq!(
+            alive_after_panic, 1,
+            "recoverable panics must not reduce worker capacity"
+        );
+        assert_eq!(COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert_eq!(failing.depth.load(Ordering::Relaxed), 0);
+        assert_eq!(failing.metrics.drained_total.load(Ordering::Relaxed), 3);
+        assert_eq!(failing.failure_streak.load(Ordering::Relaxed), 0);
+        let panics = panic_count.load(Ordering::Relaxed);
+        assert!(panics > 0, "the failure path must actually execute");
+        assert_eq!(failing.metrics.errors_total.load(Ordering::Relaxed), panics);
+        assert_eq!(
+            failing.metrics.retries_total.load(Ordering::Relaxed),
+            panics
+        );
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.batched, 4);
+        assert_eq!(stats.errors as u64, panics);
+        let tree = failing_repo.head().unwrap().peel_to_tree().unwrap();
+        for name in ["queued.txt", "spill-a.txt", "spill-b.txt"] {
+            let entry = tree.get_path(Path::new(name)).unwrap();
+            assert_eq!(
+                failing_repo.find_blob(entry.id()).unwrap().content(),
+                format!("retained {name}\n").as_bytes(),
+            );
+        }
+        let tree = healthy_repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new("healthy.txt")).unwrap();
+        assert_eq!(
+            healthy_repo.find_blob(entry.id()).unwrap().content(),
+            b"independent repository\n",
         );
     }
 
