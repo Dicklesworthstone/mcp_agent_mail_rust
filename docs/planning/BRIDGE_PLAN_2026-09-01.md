@@ -1,5 +1,40 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 7 fresh-eyes continuation — EmeraldEagle
+
+Review of `1d7c8eec`; raw results are retained under
+`/data/tmp/am-fourth-review-20261107.MQDJRejQ`.
+
+- [x] Check governing-doc drift, clean tracked state, mailbox health and ready
+  Beads; preserve the seven pre-existing untracked paths and peer ownership.
+- [x] Reread the doctor help changes, parent fixtures, output contract and
+  startup-worker admission/cancellation/join code. No new confirmed bug found.
+- [x] Check ordinary native admission without starting another known-insufficient
+  build: a single-package server test still requires40GiB and the warm worker
+  has22GiB. No disk floor, growth budget or build classification changes.
+- [x] Run every existing help-snapshot case against the qualified executable:
+  34/34 exact normalized matches; no fixture regeneration or code changes.
+- [x] Run the real native-entrypoint stdio suite using that executable and
+  private DB/archive state:18 assertions pass,0 fail,0 skip;64760ms runner time.
+  Negotiation, actual tool calls, malformed input, EOF and stale-reservation
+  release execute. Malformed-input whole case is3755ms, within its unchanged5s
+  bound; this quiet run is not a new loaded-latency or in-process ownership proof.
+- [x] Freshly compare all3,159 tracked crate/script/build inputs with the frozen
+  qualifier:0 missing,0 different. Executable SHA-256 remains `a8be3447…1292b`.
+- [x] Trace the accepted DSR release path: the local Agent Mail configuration
+  has no strict release contract; its old check list is not the required
+  publisher-side scorecard/ACFS enforcement. Preserve existing P0 release tasks
+  and their real publication acceptance; no Actions dispatch or release occurs.
+- [x] Record the bounded results on original `br-kp1in.90`; keep it in progress.
+- [ ] Original `.90`: execute30 real native cases and six repeats once normal
+  admission permits. Subprocess exit cannot establish the in-process barrier.
+- [ ] Original release acceptance: resolve retained loaded-send latency failure,
+  complete current-candidate full gates and prove the actual DSR publisher path.
+
+This requested TODO records review and verification, not new shipped capability
+or independent review. It retires as session history at handoff; original
+acceptance conditions remain on their existing Beads.
+
 ## November 6 fresh-eyes review and startup ownership — EmeraldEagle
 
 Continuation from `86a07526` (23:12 UTC), requested fresh review:
