@@ -1,5 +1,36 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 7 benchmark failure propagation — EmeraldEagle
+
+Original `br-kp1in.5` remains the owner of the broader measurement capability.
+This requested TODO tracks a concrete source-confirmed gap: `run_timed` records
+failed warmup/measurement invocations, while its CLI consumer discards them and
+can report/save successful-only samples as a passing baseline.
+
+- [x] Review the latest tracking diff and refresh governing-doc drift, peer
+  ownership, mailbox health and ready work. No new defect in the previous diff.
+- [x] Claim `.5` and reserve the two existing source files and tracking paths.
+- [x] Trace timing, aggregation, report/exit and baseline-writing consumers.
+- [x] Reject incomplete timings when constructing a qualified benchmark result;
+  keep raw successful samples and failed invocation details in the report.
+- [x] Return runtime failure for partial runs; retain a report even when every
+  selected benchmark fails, and prevent any failed run replacing a baseline.
+- [x] Add real subprocess controls for warmup and measurement failures and
+  retain the existing happy/empty/all-failed controls without relaxed assertions.
+- [ ] Reproduce the original CLI false success with an owned child failure.
+- [ ] Run formatting, all-target/production checks and strict Clippy through
+  normal admitted RCH execution; freeze the exact candidate and retain receipts.
+- [ ] Build/execute the actual candidate CLI; verify happy, warmup/measurement
+  failure, report/exit and absent/existing baseline preservation paths.
+- [ ] Execute focused native tests if ordinary admission permits; preserve
+  environmental refusals and original `.90`30+6 unexecuted acceptance.
+- [ ] Reread the final implementation and consumers; record precise evidence,
+  keep remaining `.5` route/load/comparability requirements open, and hand off.
+
+Consumer: the operator's explicitly requested TODO; gate: this bounded fix's
+review handoff; retirement: session history. No measurement-speedup, complete
+operational benchmark, lifecycle or release qualification is implied.
+
 ## November 7 fresh-eyes continuation — EmeraldEagle
 
 Review of `1d7c8eec`; raw results are retained under
