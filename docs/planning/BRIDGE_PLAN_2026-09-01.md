@@ -1,5 +1,219 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 7 combined-source follow-through — EmeraldEagle
+
+Main now contains parent-archive candidate I plus incoming peer commit9eae1660
+(candidate J). After I Clippy settles0, the qualifier receives the exact peer
+patch; all3,160 compiled inputs match main J. I/H/F evidence remains tied to
+those sources; it does not qualify J.
+
+- [x] Fetch and inspect incoming history, all seven modified paths and dirty
+  overlap: no file deletions, no overlap with local edits, one fast-forward.
+  Preserve the peer storage/retention reconciliation change and import Beads
+  with `br sync --import-only` after the fast-forward.
+- [x] Read the complete incoming diff and relevant authority validators.
+  Conflict hints remain bounded, freshly revalidated, separate from healthy
+  progress and transient retry debt; no obvious integration mismatch found.
+- [x] Formatting0 on combined main J. Our two Rust files are unchanged from I,
+  so their completed zero-critical per-file scans still describe those bytes.
+- [x] Finish I Clippy0/build10051/receipt3245699f and retain its exact source
+  vector; production10050, all-target10052 and CLI10048 match all3,917 records.
+- [x] Apply the exact checked peer patch to the isolated qualifier after I
+  source ownership settles, then freeze matching main/qualifier J inputs.
+- [x] Run fresh J formatting, separate production, separate all-target and
+  strict Clippy; verify full vectors without reusing I passes for J.
+  J formatting0 on main and qualifier. Strict all-target Clippy0 in287.3s,
+  worker vmi1149989/build10054/receipt8cb639a5; all3,917 records match J.
+  The first J production request expires103 in the worker115 queue without
+  Cargo execution; retain it separately. The normally admitted worker14
+  production request finishes0 in1,517.4s, build10055/receipt970aa0f1;
+  all3,917 hash/size/executable records match J and Clippy. The full J CLI
+  build10053 continues on worker115.
+  At22:00UTC fresh authoritative ledgers on all six workers fit no unchanged
+  native reservation. hz2's smaller compiler reservation now fits, so the
+  separate J all-target check starts there with the original graph/settings.
+  The22:15 worker14 ledger still refuses the unchanged native reservation:
+  51,306,602,496free bytes versus79,456,894,976required with active entries.
+  J all-target finishes0 in1,792.0s on hz2, build10056/receipt6cd87221.
+  All three compiler vectors agree across3,917 hashes/sizes/executable bits
+  and freshly match the frozen qualifier. None of the earlier refusals is
+  reclassified as a pass.
+- [x] Build and bind the full default J executable, then rerun original13 CLI
+  controls, both unchanged private-mailbox oracles and canonical18 stdio
+  assertions, retaining the original5000ms invalid-JSON whole-case bound.
+  J CLI10053/receiptffab7bab finishes0 in4,184.8s on worker115; its complete
+  3,917-file vector matches all three compiler vectors. Worker/returned/retained
+  ELF71ac1400776e33a913ad91876d2479da3ae30104d11cc6f9cc6f7456972e5ed8,
+  305,395,312bytes. Every own remote job is finished/acknowledged with sources
+  released. All13 original CLI controls pass8+5; both private-mailbox oracles
+  pass with2agents/60messages,3 successful samples and reported local route.
+  Canonical J stdio passes18/0/0 across7 cases in47,248ms; whole invalid-JSON
+  case3,885ms < unchanged5,000ms. Both binary hashes remain unchanged afterward.
+  Eight zero-assertion observation rows remain unknown, not additional passes.
+- [ ] Attempt original35 and separate30+6 native populations only when their
+  unchanged ordinary reservations fit. Original full acceptance stays open.
+  Fresh22:37 authoritative ledgers fit none of six workers. No J native bodies
+  run; retain original refusals/timeouts/missing-runner failures. Original `.5`
+  route/corpus/load/null/comparability/host-budget and unsupported catalog work,
+  `.90` ownership/restart/cancellation probes and loaded6.011s >5.000s failure
+  remain open. No scope split, closure, baseline reset or release clearance.
+- [x] Reread final producer/consumer/test diffs, preserve peer work and attach
+  exact J results to the two original in-progress Beads. Source inputs remain
+  frozen and matching. Solo review is not independent verification.
+- [ ] Finish flush/cycle checks, scoped source publication and exact owned-lease
+  release. This is the pre-publication checklist; final session receipts record
+  the resulting Git refs and release, without a second tracking-only commit.
+
+## November 7 parent archive isolation — EmeraldEagle
+
+Candidate I is frozen in the qualifier after H build10042 settles0. Main later
+fast-forwards peer9eae1660 without local overlap; combined J is tracked above.
+All H passes below remain H; they do not qualify I, and I does not qualify J.
+Continue original `.5`, no new task, acceptance split, closure or speed claim.
+
+- [x] Trace parent seeding through the database-open and archive recovery paths.
+  The private database URL used an ambient archive root for owner locking and
+  reconstruction; the explicit-root helper already exists but was unused in
+  production. Its post-bootstrap reopen also dropped the supplied override.
+- [x] Reproduce with the retained real F CLI and a private live server A.
+  The benchmark explicitly uses the existing local route, but inherits A's
+  archive. It exits1 on A's exclusive archive lock before seeding/measurement.
+  Raw parent-archive-before contains the real busy error and owner PID3480590;
+  the private server stops through the existing owned-process cleanup. The
+  control runner's JSON parse error reflects the CLI's early non-JSON failure,
+  not a product panic. F's ordinary private local benchmark is a positive control.
+- [x] Preserve both H source files and the original endpoint oracle verbatim.
+  Extend the existing oracle with a separate owned-archive input mode, leaving
+  its success assertions intact; run that same mode before/after I. The original
+  endpoint pair uses the preserved .before-parent-isolation script unchanged.
+- [x] Wire parent seeding to the existing explicit private-archive helper,
+  preserve the override through its post-bootstrap reopen, and remove its now
+  obsolete production dead-code allowance. Keep all owner refusals intact.
+- [x] Strengthen the existing HTTP case by giving the parent both the other
+  daemon's endpoint and its live archive. Keep every assertion and the original
+  35-case CLI selection; no new Rust case or feature graph.
+- [x] Main I formatting0 and HTTP-file UBS0/no failed modules/0critical.
+- [x] Finish the full I library scan0 in823s, statusok/no failed modules,
+  0critical/10,313warnings/5,025info; keep H results historical.
+- [x] Let H's full CLI job settle; verify its receipt/ELF, then manually overlay
+  I into the qualifier and freeze matching main/qualifier inputs.
+  H build10042/receipt093c08e1 matches all3,917 records in its three compiler
+  vectors and worker/local ELFa0610e1d/305,345,096bytes; source ownership is
+  acknowledged. H passes its original endpoint oracle but still fails the
+  owned-archive control, demonstrating the second bug independently.
+- [x] Run I formatting, separate production, separate all-target and strict
+  Clippy, preserving full source vectors and all real refusals. Production0
+  build10050/receiptcad8e1a5, all-target0 build10052/receipt5d9188b6,
+  Clippy0 build10051/receipt3245699f agree with CLI10048 across all3,917 records.
+- [x] Build the full default I CLI with ordinary admission and verify worker,
+  local ELF and exact source identity. Preserve useful prior executables.
+  I build10048/receipt4e66832e finishes0 in232.7s using the ordinary existing
+  pool. Worker/local retained ELF1aab21a0481fa9e8919b4a7d7da90b6633c919eccc6300f1769ca31f41eef4b6,
+  305,345,056bytes. All3,917 records match the frozen qualifier.
+- [x] Execute original13 I CLI controls:8 diagnostic/report controls plus all5
+  unchanged baseline controls pass, preserving exit1/exit3, file bytes/absence
+  and the same-second two-report population.
+- [x] Execute the unchanged original endpoint oracle and unchanged owned-archive
+  mode on I: each exits0 with2agents/60messages,3 successful samples and local
+  route metadata; all processes are private owned fixtures.
+- [x] Canonical I stdio passes18/0/0 in53,518ms. Whole invalid-JSON case3,004ms
+  remains below the original5,000ms bound. Both executed and retained ELF hashes
+  still match. Zero-assertion observation rows remain unknown, not pass claims.
+- [ ] Execute original35 CLI cases and separate lifecycle30+6 when a fresh
+  authoritative ledger fits their unchanged resource fences; no unchanged
+  refusal retries. Latest20:11 reads fit neither eligible worker.
+- [ ] Reread the complete final diff and consumers, record final original Bead
+  outcomes, flush/check graph, publish supported work and release owned leases.
+  Full `.5` and `.90` acceptance remains open until its original probes pass.
+
+## November 7 seeded-fixture route isolation — EmeraldEagle
+
+Continue original `.5`; no new task, scope split, closure or performance claim.
+Frame H is the next source candidate. All frame-F passes below remain F only.
+After G's strict Clippy settles0, freeze H. H changes only the HTTP test
+fixture to use fresh random credentials and propagate readiness errors.
+Production code is identical in G and H; old F/G results remain historical.
+
+- [x] Trace operational CLI routing and the existing `NO_SERVER_PORT` path.
+  Explicit inherited endpoints override private-mailbox discovery; benchmark
+  children replaced DATABASE_URL/STORAGE_ROOT but retained those endpoints.
+  Additional F supporting control uses that existing local route during a live
+  benchmark parent: exit0 in24s,3 samples/no failures,2agents/60messages. This
+  rules out a parent-ownership conflict; it does not qualify the H executable.
+- [x] Reproduce with two private mailboxes and a real F HTTP server: the
+  server rejects `/tmp/bench`, while the benchmark creates2agents/60messages
+  in its separate fixture. All4 agents-list invocations hit the other server
+  and exit1; the benchmark exits1 with all4 normal-exit failure records retained.
+  No shared mailbox, message send, mock service, deadline or baseline reset.
+  Raw fresh2-route-before under the existing review artifact root.
+- [x] Preserve F's changed input bytes and verified ELF before editing G.
+- [x] Route seeded children through the existing local path by overriding
+  inherited endpoint configuration after per-case env; retain ordinary local
+  ownership refusals. Expose the local seeded route in JSON/table output and
+  include it in the fixture signature parameters.
+- [x] Add a real HTTP regression in existing http_surface_isolation.rs: a
+  responding different mailbox must reject the project, the seeded benchmark
+  must succeed, and an independent local CLI read must return both seed agents.
+  Isolate the shared test helper's HOME/config/HTTP path; preserve every original
+  GH184 assertion and execute that existing case alongside the new regression.
+- [x] Finish G production check0 on hz2/build30097323753210038, receiptb393d66b,
+  and strict Clippy0 on vmi1149989/build30097323753210039, receipt88d501e6;
+  all3,917 hash/size/executable records agree. This is G evidence only.
+- [x] Complete H HTTP-file UBS0: statusok, no failed modules,0critical,
+  51warnings/33info. Original G scan1 had a fixed test credential and explicit
+  readiness panic; H uses the existing random-token generator, checks wrong-token
+  rejection and returns readiness errors. No suppression or scanner-policy edit.
+- [x] Formatting0 on main H. Whole-library default300s scan times out with
+  partial/no-verdict; rerun with1800s, retaining the failed300s result.
+- [x] Freeze H and run formatting, separate production, separate all-target and
+  strict all-target Clippy; verify full3917-file vectors and selected main inputs.
+  H production0 hz2/build30097323753210040/receipt55c0cae0; all-target0
+  hz2/build30097323753210044/receipt2a34316d; strict Clippy0
+  vmi1149989/build30097323753210045/receipt9abad75e. All3,917 records match
+  the same vector; all3,160 selected main/qualifier inputs agree. The first
+  H Clippy request on hz2 refuses120 before Cargo; retain it as a refusal.
+- [x] Scan both changed Rust files without suppressions; keep the historical
+  whole-bench critical red and distinct from these changed-file results.
+  Library scan0/statusok/no failed modules in811s:0critical/10,313warnings/
+  5,025info. HTTP scan0/statusok/no failed modules:0critical/51warnings/33info.
+  All6 library and57 HTTP changed-line findings are triaged: required per-case
+  env clones, tiny routing allocations, private fixture I/O and test assertions;
+  slash-containing paths are scanner division-pattern false positives.
+- [ ] Build the full default H CLI with verified source/worker/local ELF identity.
+  Preserve the F ELF and failed native receipts; do not reuse F passes for H.
+- [ ] Execute the unchanged two-private-mailbox oracle on H, original13 CLI
+  controls, and canonical18-assertion stdio with the original5000ms whole-case
+  bound. Verify route metadata and exact real fixture rows.
+- [ ] Execute original33 selected CLI Rust cases plus both HTTP isolation cases
+  (35 total) if ordinary30GiB growth/10GiB floor admission permits. Keep the
+  separate original lifecycle30+6 population and feature graph unchanged.
+  H vmi1149989/build30097323753210041 refuses120 before Cargo at58,563,690,496
+  free bytes with active reservations; terminal acknowledgment is true.
+  After the H all-target job releases, ordinary preflight selects hz2; one
+  unchanged35-case request exits101 because cargo-nextest is absent, before
+  any compilation/test body (build30097323753210046, acknowledged). Provision
+  the existing verified nextest0.9.143/commit60fa45f6 binary on hz2:35,533,816
+  bytes/SHA d97959a56feb7a1297576c1b47d9aaf7b5badd6be596e695ed203fa4490884ea,
+  verified direct runner exit0; atomic new hardlink, no overwrite/deletion.
+  Managed Cargo version-only probes refuseE301; retain them and the diagnostic
+  assertion failures, without weakening that policy. The unchanged request
+  after provisioning again refuses120 before Cargo at48,390,225,920free bytes
+  plus active reservations. No test bodies ran. Do not infer capacity release
+  from a finished own job; require a fresh authoritative ledger that fits.
+- [ ] Reread producer, consumer and tests; update original Beads with cited
+  outcomes, flush/check graph and publish only supported claims. Full `.5`
+  route/corpus/load/null/comparability and `.90` ownership/latency acceptance
+  remain open until their original conditions are met.
+
+The admitted F native request on vmi1152480/build30097323753210037 reaches the
+default1800s compiler transport limit before any test body. Exact-wrapper
+recovery confirms120/acktrue and667 rlibs remain. This corrects the earlier
+assumption that this nextest invocation used test_timeout_sec14400: RCH actually
+uses the compiler limit here. Future native invocations explicitly align that
+outer transport ceiling with the existing14400s test policy; individual nextest
+4-minute and stdio5-second bounds, source/profile/features and resource fences
+remain unchanged. The1800s attempt stays failed, not a passed or waived gate.
+
 ## November 7 regression-baseline follow-through — EmeraldEagle
 
 This requested fresh pass reuses original `.5` and `.90`; evidence remains
@@ -43,7 +257,7 @@ under `/data/tmp/am-fresh-bench-review-20261107.X0h2EI`, with fresh2 prefixes.
   5,024info, no failed modules. All31 changed-line findings are test assertions,
   necessary owned-path clones and private fixture I/O. The unchanged whole-bench
   critical remains a red precommit gate; no suppression or waiver.
-- [ ] Reconcile retained wrapper rchw-142f909d-b6fc-4083-aa66-bdc65013272e
+- [x] Reconcile retained wrapper rchw-142f909d-b6fc-4083-aa66-bdc65013272e
   through supported recovery. Its F build30097323753210022 reaches the original
   1,800s limit, client1/E104, unverified cleanup and quarantine. Exact recovery
   fails E504/source-authority locks; supported cancellation is accepted, but
@@ -51,14 +265,55 @@ under `/data/tmp/am-fresh-bench-review-20261107.X0h2EI`, with fresh2 prefixes.
   matches its retained identity and reports120, while lease acknowledgment and
   source retirement remain false. A census finds no matching namespace process;
   that is not exhaustive group-death or authority-release proof. Keep the job
-  unacknowledged and its original E104/E504 failures visible until resolved.
-- [ ] Finish the full default F CLI, verify source/worker/local ELF identity,
+  unacknowledged until resolved. Later15:52UTC journal state changes to finished
+  with source retirement; supported exact recovery now confirms120 and
+  terminal_acknowledged:true. Retain every earlier E104/E504/client1 failure.
+- [x] Finish the full default F CLI, verify source/worker/local ELF identity,
   then execute the same8 old controls plus all5 baseline controls (13 total).
-  No replay or fallback while the preceding ownership recovery is unsettled.
-- [ ] Run the existing18-assertion stdio E2E on the verified F binary with the
+  The retired target is absent, so an unchanged cold30-minute retry cannot
+  reuse compilation. After reading the actual task contracts, make one cold
+  build on vmi1149989 with supported RCH_BUILD_TIMEOUT_SEC=3600. This changes
+  compiler transport time only; test_timeout_sec14400, Cargo profile/feature
+  graph, normal resource admission, nextest4-minute bounds and stdio5s stay.
+  The previous1,800s attempt remains failed, with no build-time speed claim.
+  The cold3,600s build30097323753210029 also times out before the CLI at
+  17:04UTC: client1, process group verified dead. Exact-wrapper recovery
+  acknowledges120 (daemon130/delivery120 warning retained). A post-recovery
+  read confirms795 rlibs remain and no CLI exists. A warm continuation is
+  possible only after ordinary worker admission; initial preflight denies
+  this worker as unreachable, despite the successful read-only SSH probes.
+  Supported connectivity probe then returns ok and ordinary preflight selects
+  the same worker with its normal10GiB growth/10GiB floor. Start one warm
+  continuation at17:06UTC, with identical Cargo arguments and3,600s build
+  transport; main and qualifier still match all3,160 selected source inputs.
+  It finishes0 in2,097.8s (build30097323753210035, receiptb8633e49), freshly
+  verifies all3,917 records and the three compiler vectors. Worker/local ELF
+  SHA256a12320d49afeb75736e71673797370874504c7c12e811ef97e1164d8ca042fa8
+  and305,340,032bytes match; the old E executable remains distinct. All13
+  actual CLI controls pass: original8 plus the unchanged five-case baseline
+  oracle. The three regression-preservation cases change from E fail to F
+  pass; both positive saves remain passing. No performance or broader .5 claim.
+- [x] Run the existing18-assertion stdio E2E on the verified F binary with the
   original5s malformed-case bound and retained private state.
+  It passes18/0/0 in45,907ms; the malformed whole case is4,141ms against
+  5,000ms. Post-run ELF SHA is unchanged. Preserve a byte-identical copy at
+  fresh2-qualified/am before reusing the existing target pool for native tests.
 - [ ] Execute the missing benchmark/native test bodies once ordinary admission
   permits; keep this separate from actual CLI controls and lifecycle30+6.
+  After the successful CLI releases its reservation, original33 CLI cases
+  still refuse120 before Cargo on vmi1149989/build30097323753210036 at
+  50,576,302,080free bytes, unchanged30GiB growth/10GiB floor. A fresh worker
+  inventory shows vmi1152480 regained about5.4GiB; ordinary preflight selects
+  it, and the same33-case command now starts actual Cargo compilation there.
+  No native case is counted until nextest executes it. Whole-command quoting
+  preserves the filter: a multi-argv preflight had lost its quotes and wrongly
+  classified it as a local non-compilation command; that result is retained,
+  never followed locally. No workload, feature, assertion or deadline changes.
+  A later preflight selects vmi1293453 with49.1GiB free; the original30
+  lifecycle cases plus3 existing storage controls still refuse120 before
+  Cargo at16:14UTC:44,954,963,968free bytes, growth0 and started:false,
+  unchanged30GiB growth/10GiB floor plus active reservations. Zero original
+  cases or six solo repeats execute; no unchanged retry or resource change.
 - [ ] Repair the unsupported stub_encode catalog routes within original `.5`.
   The verified E executable rejects the advertised stub-encode verb with2;
   source still selects it when the fixture script exists. An enabled catalog

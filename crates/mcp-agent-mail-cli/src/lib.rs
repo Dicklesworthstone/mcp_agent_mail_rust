@@ -16472,7 +16472,6 @@ fn open_db_sync_with_database_url_with_path(
     open_db_sync_with_database_url_and_storage_root_with_path(database_url, None)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn open_db_sync_with_database_url_and_storage_root(
     database_url: &str,
     storage_root_override: Option<&Path>,
@@ -16594,7 +16593,8 @@ fn open_db_sync_after_mutation_locks(
                 return Err(init_error);
             }
         }
-        let (reopened, resolved_path) = open_sqlite_with_fallback(&opened_path)?;
+        let (reopened, resolved_path) =
+            open_sqlite_with_fallback_and_storage_root(&opened_path, storage_root_override)?;
         return maybe_reconcile_sync_opened_sqlite_archive_drift(
             reopened,
             resolved_path,
@@ -26640,6 +26640,8 @@ struct BenchRunReport {
     save_baseline_path: Option<String>,
     baseline_saved: bool,
     seed_report: Option<bench::BenchSeedReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seeded_database_route: Option<&'static str>,
     skipped: Vec<String>,
     failures: Vec<BenchRunFailure>,
     regression_count: usize,
@@ -26793,7 +26795,8 @@ fn handle_bench(
             CliError::Other(format!("failed to create bench archive root: {err}"))
         })?;
         let database_url = format!("sqlite:///{}", db_path.display());
-        let conn = open_db_sync_with_database_url(&database_url)?;
+        let conn =
+            open_db_sync_with_database_url_and_storage_root(&database_url, Some(&storage_root))?;
         let report = bench::seed_bench_database(&conn, false)
             .map_err(|err| CliError::Other(format!("benchmark seed failed: {err}")))?;
         bench_env.insert("DATABASE_URL".to_string(), database_url);
@@ -26823,18 +26826,30 @@ fn handle_bench(
         let mut command = vec![executable.clone()];
         command.extend(cfg.command.iter().cloned());
         let command_display = command.join(" ");
+        let mut benchmark_env = bench_env.clone();
+        benchmark_env.extend(cfg.env.clone());
+        if cfg.requires_seeded_db {
+            // Use the CLI's existing no-server route for this private fixture.
+            // Inherited endpoints would otherwise select a different mailbox;
+            // the ordinary local-path ownership checks still apply.
+            benchmark_env.insert("HTTP_HOST".into(), "127.0.0.1".into());
+            benchmark_env.insert("HTTP_PORT".into(), NO_SERVER_PORT.to_string());
+            benchmark_env.insert(
+                "AGENT_MAIL_URL".into(),
+                local_server_url_from_parts("127.0.0.1", NO_SERVER_PORT, "/mcp/"),
+            );
+        }
         let params_json = serde_json::json!({
             "warmup": cfg.warmup,
             "runs": cfg.runs,
             "requires_seeded_db": cfg.requires_seeded_db,
             "conditional": cfg.conditional,
             "env": cfg.env,
+            "seeded_database_route": cfg.requires_seeded_db.then_some("local"),
         })
         .to_string();
         let signature =
             bench::fixture_signature(&cfg.name, &command_display, &params_json, &hardware);
-        let mut benchmark_env = bench_env.clone();
-        benchmark_env.extend(cfg.env.clone());
         match bench::run_timed(&command, cfg.warmup, cfg.runs, &benchmark_env, Some(&cwd)) {
             Ok(timing) => {
                 match bench::BenchResult::from_timing(
@@ -26913,6 +26928,7 @@ fn handle_bench(
         save_baseline_path: save_baseline.map(|path| path.to_string_lossy().into_owned()),
         baseline_saved,
         seed_report,
+        seeded_database_route: needs_seeded_db.then_some("local"),
         skipped,
         failures,
         regression_count,
@@ -26933,6 +26949,9 @@ fn handle_bench(
             report.warmup,
             report.runs
         );
+        if let Some(route) = report.seeded_database_route {
+            ftui_runtime::ftui_println!("seeded fixture route: {route}");
+        }
         ftui_runtime::ftui_println!(
             "{:<18} {:>9} {:>9} {:>9} {:>12}",
             "Benchmark",
