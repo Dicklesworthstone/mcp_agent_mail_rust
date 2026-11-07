@@ -236,7 +236,7 @@ fn apply_snapshot_migrations(
                     let rows = conn
                         .query_sync(schema::PROJECT_EVENT_SCHEMA_SQL, &[])
                         .map_err(|error| DbError::Sqlite(error.to_string()))?;
-                    schema::validate_project_event_rebuild_schema(&migration, &rows)
+                    schema::validate_multi_statement_migration_schema(&migration, &rows)
                         .map_err(|error| DbError::Sqlite(error.to_string()))?;
                 }
                 for sql in statements {
@@ -8185,6 +8185,125 @@ mod tests {
             .map(|row| row.get_as::<String>(0).unwrap())
             .collect();
         assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn reconstructed_deregistration_excludes_shared_delivery_and_retains_direct_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("archive");
+        let project = storage.join("projects/lifecycle");
+        let messages = project.join("messages/2026/10");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"lifecycle","human_key":"/lifecycle","created_at":1}"#,
+        )
+        .unwrap();
+        for name in ["Sender", "Active", "Ended", "Retired"] {
+            let dir = project.join("agents").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let profile = serde_json::json!({
+                "name": name, "program": "test", "model": "test",
+                "inception_ts": 1, "last_active_ts": 2, "contact_policy": "auto",
+                "retired_at": (name == "Retired").then_some(100),
+                "deregistered_at": (name == "Ended").then_some(100),
+            });
+            std::fs::write(
+                dir.join("profile.json"),
+                serde_json::to_vec(&profile).unwrap(),
+            )
+            .unwrap();
+        }
+        for (id, recipient) in [(1, "project:lifecycle"), (2, "Ended")] {
+            let message = serde_json::json!({
+                "id": id, "from": "Sender", "to": [recipient], "cc": [], "bcc": [],
+                "subject": format!("lifecycle {id}"), "created": "2026-10-01T00:00:00Z",
+                "attachments": [], "importance": "high", "ack_required": true,
+            });
+            std::fs::write(
+                messages.join(format!("2026-10-01T00-00-00Z__lifecycle__{id}.md")),
+                format!("---json\n{message}\n---\n\nretained body {id}\n"),
+            )
+            .unwrap();
+        }
+        let db = tmp.path().join("restored.sqlite3");
+        let stats = reconstruct_from_archive(&db, &storage).unwrap();
+        assert_eq!(
+            (
+                stats.agents,
+                stats.messages,
+                stats.recipients,
+                stats.project_mailbox_deliveries
+            ),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(stats.parse_errors, 0);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(db.to_str().unwrap()).unwrap(),
+            "reconstructed lifecycle shared mailbox",
+        );
+        conn.execute_raw("PRAGMA query_only=ON").unwrap();
+        let identities = conn
+            .query_sync("SELECT id, project_id, name FROM agents", &[])
+            .unwrap();
+        let ids: HashMap<String, i64> = identities
+            .iter()
+            .map(|row| (row.get_named("name").unwrap(), row.get_named("id").unwrap()))
+            .collect();
+        let project_id = identities[0].get_named::<i64>("project_id").unwrap();
+        let lifecycle = conn
+            .query_sync(
+                "SELECT a.retired_at, a.contact_policy, d.deregistered_at FROM agents a \
+             JOIN agent_deregistrations d ON d.agent_id=a.id WHERE a.name='Ended'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle[0].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+        assert_eq!(
+            lifecycle[0].get_named::<String>("contact_policy").unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            lifecycle[0].get_named::<i64>("deregistered_at").unwrap(),
+            100
+        );
+        for (name, expected) in [("Active", vec![1]), ("Ended", vec![2]), ("Retired", vec![])] {
+            let inbox = crate::sync::fetch_inbox_rows_from_conn(
+                &*conn, project_id, ids[name], false, false, false, None, 50,
+            )
+            .unwrap();
+            assert_eq!(
+                inbox
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{name}"
+            );
+            if name == "Ended" {
+                assert_eq!(inbox[0].kind, "to");
+                assert_eq!(inbox[0].message.body_md, "retained body 2\n");
+            }
+        }
+        let delivery = crate::project_mailbox::project_mailbox_delivery_from_conn(&*conn, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivery
+                .agents
+                .iter()
+                .map(|agent| agent.agent_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Active"]
+        );
+        assert!(
+            conn.query_sync("SELECT * FROM project_mailbox_receipts", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -715,6 +715,47 @@ mod tests {
     }
 
     #[test]
+    fn product_fan_in_honors_project_scoped_deregistration_without_hiding_history() {
+        let (_directory, conn, pool) = fixture();
+        conn.execute_raw(
+            "INSERT INTO agent_deregistrations(agent_id,deregistered_at) VALUES(12,1); \
+             PRAGMA query_only=ON",
+        )
+        .unwrap();
+        let cx = Cx::for_testing();
+        let rows = run(fetch_inbox_for_product_agent_scoped(
+            &cx,
+            &pool,
+            1,
+            "BLUELAKE",
+            &[12, 22],
+            false,
+            None,
+            100,
+            true,
+        ))
+        .into_result()
+        .unwrap();
+        let ended: Vec<_> = rows
+            .iter()
+            .filter(|row| row.message.project_id == 1)
+            .collect();
+        assert_eq!(ended.len(), 20);
+        assert!(ended.iter().all(|row| row.kind == "bcc"));
+        assert!(
+            ended
+                .iter()
+                .all(|row| row.message.body_md.starts_with("body-"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.message.project_id == 2 && row.kind == "project"),
+            "the same agent name in another linked project retains its independent active identity"
+        );
+        assert!(rows.iter().all(|row| row.message.project_id != 3));
+    }
+
+    #[test]
     fn global_window_hydrates_only_returned_bodies_and_uses_no_history_join() {
         struct Recording<'a> {
             conn: &'a DbConn,

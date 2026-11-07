@@ -57,6 +57,7 @@ fn shared_mailbox_fixture() -> (tempfile::TempDir, DbConn) {
         "ALTER TABLE agents ADD COLUMN inception_ts INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN retired_at INTEGER",
         "ALTER TABLE agents ADD COLUMN contact_policy TEXT",
+        "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER NOT NULL)",
         "ALTER TABLE messages ADD COLUMN sender_id INTEGER NOT NULL DEFAULT 1",
         "CREATE TABLE project_mailbox_deliveries (
             message_id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL)",

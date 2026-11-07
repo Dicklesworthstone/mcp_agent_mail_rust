@@ -19,6 +19,7 @@ const VIEWERS_SQL: &str = "SELECT id, project_id, inception_ts FROM agents";
 // This is the agent-only portion of project_mailbox::visible_to_viewer_sql;
 // differential native tests below exercise the canonical query, not a copy.
 const VIEWERS_FILTER: &str = "retired_at IS NULL AND inception_ts IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM agent_deregistrations lifecycle WHERE lifecycle.agent_id = agents.id)
     AND LOWER(COALESCE(contact_policy, 'auto')) <> 'block_all'";
 const SHARED_MESSAGES_SQL: &str = "SELECT id, project_id, sender_id, created_ts,
     CASE WHEN importance IN ('urgent', 'high') THEN 1 ELSE 0 END AS urgent,
@@ -567,6 +568,7 @@ mod tests {
         for sql in [
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL)",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, inception_ts INTEGER, retired_at INTEGER, contact_policy TEXT)",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER NOT NULL)",
             "CREATE INDEX agents_project ON agents(project_id)",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER, created_ts INTEGER, importance TEXT, ack_required INTEGER)",
             "CREATE INDEX messages_project ON messages(project_id)",
@@ -738,6 +740,49 @@ mod tests {
         let shared_unread =
             usize::try_from(optimized(&conn).0["1"]["unread"].as_u64().unwrap()).unwrap();
         assert_eq!(alpha.unread, shared_unread + 1);
+    }
+
+    #[test]
+    fn deregistered_population_is_excluded_without_losing_direct_obligations() {
+        let (_dir, conn) = fixture();
+        seed(&conn, 5, 2);
+        execute(&conn, "INSERT INTO agent_deregistrations VALUES(2,1)");
+        execute(&conn, "UPDATE agents SET retired_at=1 WHERE id=4");
+        execute(
+            &conn,
+            "INSERT INTO message_recipients VALUES(1,2,NULL,NULL)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO project_mailbox_receipts VALUES(2,2,NULL,NULL)",
+        );
+        execute(&conn, "PRAGMA query_only=ON");
+        let (actual, _) = optimized(&conn);
+        assert_eq!(actual, canonical(&conn));
+        for field in ["unread", "urgent", "ack_overdue"] {
+            assert_eq!(actual["1"][field], 4, "only the two active peers count");
+        }
+        let (full, _) = build_at(&conn, NOW).unwrap();
+        let alpha = full.iter().find(|project| project.slug == "alpha").unwrap();
+        assert_eq!(
+            alpha.unread, 5,
+            "the ended agent's direct unread delivery remains"
+        );
+        assert_eq!(alpha.urgent, 5);
+        assert_eq!(alpha.ack_overdue, 5);
+        assert_eq!(
+            conn.query_sync("SELECT * FROM project_mailbox_receipts", &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        execute(&conn, "PRAGMA query_only=OFF");
+        execute(&conn, "UPDATE agents SET retired_at=NULL WHERE id IN (2,4)");
+        assert_eq!(
+            optimized(&conn).0["1"]["unread"],
+            6,
+            "unretirement restores one peer, while the separate permanent tombstone still excludes the other"
+        );
     }
 
     #[test]

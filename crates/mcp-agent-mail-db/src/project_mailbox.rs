@@ -9,7 +9,8 @@
 //!
 //! A project delivery appears in the inbox of an agent (the *viewer*) when:
 //!
-//! - the viewer is registered in the delivery's project and is not retired;
+//! - the viewer is registered in the delivery's project and is neither retired
+//!   nor permanently deregistered;
 //! - the viewer is not the sender;
 //! - the viewer registered at or before the message was sent
 //!   (`inception_ts <= created_ts`). A shared mailbox delivers to the agents
@@ -64,6 +65,14 @@ pub const INSERT_PROJECT_MAILBOX_EVENT_SQL: &str = "INSERT OR IGNORE INTO inbox_
 
 const MAX_IN_CLAUSE_ITEMS: usize = 500;
 
+/// Bounded identity lookup shared by the paged inbox and pending-ACK readers.
+/// The lifecycle ledger is authoritative even when an imported profile keeps
+/// `retired_at = NULL` and an ordinary contact policy. This filters only virtual
+/// project deliveries; historical direct recipients remain readable.
+pub(crate) const SHARED_VIEWER_SQL: &str = "SELECT project_id, inception_ts, retired_at, contact_policy FROM agents WHERE id = ? \
+     AND NOT EXISTS (SELECT 1 FROM agent_deregistrations lifecycle \
+                     WHERE lifecycle.agent_id = agents.id)";
+
 /// SQL predicate selecting the deliveries (`d`, joined to their message `m`)
 /// that the agent `viewer` may see. See the module docs for the rule. A macro
 /// so `concat!` can embed it in other `const` SQL (the retention predicate).
@@ -73,6 +82,8 @@ macro_rules! visible_to_viewer_sql {
          AND m.project_id = d.project_id \
          AND m.sender_id <> viewer.id \
          AND viewer.retired_at IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM agent_deregistrations lifecycle \
+                         WHERE lifecycle.agent_id = viewer.id) \
          AND viewer.inception_ts <= m.created_ts \
          AND LOWER(COALESCE(viewer.contact_policy, 'auto')) <> 'block_all' \
          AND NOT EXISTS (SELECT 1 FROM message_recipients direct \
@@ -1522,6 +1533,7 @@ mod tests {
             "PRAGMA foreign_keys = ON",
             "CREATE TABLE projects (id INTEGER PRIMARY KEY)",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), inception_ts INTEGER NOT NULL, retired_at INTEGER, contact_policy TEXT)",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY REFERENCES agents(id), deregistered_at INTEGER NOT NULL)",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), sender_id INTEGER NOT NULL REFERENCES agents(id), created_ts INTEGER NOT NULL)",
             "CREATE TABLE message_recipients (message_id INTEGER REFERENCES messages(id), agent_id INTEGER REFERENCES agents(id), PRIMARY KEY(message_id, agent_id))",
             "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY REFERENCES messages(id), project_id INTEGER NOT NULL REFERENCES projects(id))",
@@ -2303,6 +2315,132 @@ mod tests {
                 .map(|agent| agent.agent_id)
                 .collect::<Vec<_>>(),
             vec![reader]
+        );
+    }
+
+    #[test]
+    fn deregistration_ledger_excludes_shared_mail_without_erasing_direct_history() {
+        let conn = test_conn();
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'lifecycle','/lifecycle',0);
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES
+             (1,1,'Sender','test','test',0,0),(2,1,'Active','test','test',0,0),
+             (3,1,'Ended','test','test',0,0),(4,1,'Retired','test','test',0,0);
+             INSERT INTO agent_deregistrations(agent_id,deregistered_at) VALUES(3,50);
+             UPDATE agents SET retired_at=50 WHERE id=4;
+             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts,importance,ack_required) VALUES
+             (100,1,1,'shared','shared body',100,'urgent',1),
+             (101,1,1,'mixed','retained body',200,'high',1);
+             INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES
+             (100,1,'to',100),(101,1,'to',200);
+             INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(101,3,'bcc');
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES(100,3,500,NULL);
+             INSERT INTO inbox_delivery_events(project_id,agent_id,message_id,kind,delivered_ts) VALUES
+             (1,NULL,100,'project',100),(1,NULL,101,'project',200);",
+        )
+        .unwrap();
+        let ended = conn
+            .query_sync(
+                "SELECT retired_at, contact_policy FROM agents WHERE id=3",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            ended[0].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+        assert_eq!(
+            ended[0].get_named::<String>("contact_policy").unwrap(),
+            "auto"
+        );
+        assert_eq!(visible_ids(&conn, 1, 2), [101, 100]);
+        for inactive in [3, 4] {
+            assert!(visible_ids(&conn, 1, inactive).is_empty());
+            assert!(
+                reference_project_mailbox_rows_from_conn(&conn, 1, inactive, None, 50, options())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                project_mailbox_inbox_counts_from_conn(&conn, 1, inactive, 1_000).unwrap(),
+                ProjectMailboxInboxCounts::default()
+            );
+            let (sql, params) = visible_receipt_query(inactive, 100);
+            assert!(conn.query_sync(&sql, &params).unwrap().is_empty());
+            let (sql, params) = unread_visible_query(inactive, 1, None, 50);
+            assert!(conn.query_sync(&sql, &params).unwrap().is_empty());
+            assert_eq!(
+                mark_project_mailbox_read_batch_sync_conn(&conn, inactive, &[100, 101]).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            project_inbox_unread_counts_from_conn(&conn, 1).unwrap(),
+            HashMap::from([(2, 2), (3, 1)]),
+            "only the retained explicit delivery contributes to the ended agent's unread count"
+        );
+        assert_eq!(
+            project_mailbox_inbox_counts_from_conn(&conn, 1, 2, 1_000).unwrap(),
+            ProjectMailboxInboxCounts {
+                unread: 2,
+                urgent: 2,
+                ack_required: 2,
+                ack_overdue: 2,
+            }
+        );
+        for message in [100, 101] {
+            let delivery = project_mailbox_delivery_from_conn(&conn, message)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                delivery
+                    .agents
+                    .iter()
+                    .map(|agent| agent.agent_id)
+                    .collect::<Vec<_>>(),
+                [2]
+            );
+        }
+        let ended_inbox =
+            crate::sync::fetch_inbox_rows_from_conn(&conn, 1, 3, false, false, false, None, 50)
+                .unwrap();
+        assert_eq!(ended_inbox.len(), 1);
+        assert_eq!(ended_inbox[0].message.id, Some(101));
+        assert_eq!(ended_inbox[0].message.body_md, "retained body");
+        assert_eq!(ended_inbox[0].kind, "bcc");
+        let ended_events =
+            crate::sync::inbox_delivery_events_from_conn(&conn, 1, 3, None, 50).unwrap();
+        assert_eq!(ended_events.events.len(), 1);
+        assert_eq!(ended_events.events[0].message_id, 101);
+        assert_eq!(ended_events.events[0].kind, "bcc");
+        let active_events =
+            crate::sync::inbox_delivery_events_from_conn(&conn, 1, 2, None, 50).unwrap();
+        assert_eq!(active_events.events.len(), 2);
+        assert!(
+            active_events
+                .events
+                .iter()
+                .all(|event| event.kind == PROJECT_MAILBOX_KIND)
+        );
+
+        // Unretirement restores an ordinary identity; it cannot remove the
+        // separate permanent tombstone or manufacture receipts for that agent.
+        conn.execute_raw("UPDATE agents SET retired_at=NULL WHERE id IN (3,4)")
+            .unwrap();
+        assert_eq!(visible_ids(&conn, 1, 4), [101, 100]);
+        assert!(visible_ids(&conn, 1, 3).is_empty());
+        let receipts = conn
+            .query_sync(
+                "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].get_named::<i64>("agent_id").unwrap(), 3);
+        assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 500);
+        assert_eq!(
+            receipts[0].get_named::<Option<i64>>("ack_ts").unwrap(),
+            None
         );
     }
 

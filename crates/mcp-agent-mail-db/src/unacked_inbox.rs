@@ -511,7 +511,7 @@ fn extend_shared_window(
     .map_err(db_error)?;
     let viewers = conn
         .query_sync(
-            "SELECT project_id, inception_ts, retired_at, contact_policy FROM agents WHERE id = ?",
+            crate::project_mailbox::SHARED_VIEWER_SQL,
             &[Value::BigInt(agent_id)],
         )
         .map_err(db_error)?;
@@ -1021,6 +1021,29 @@ mod tests {
         conn.execute_raw("UPDATE agents SET contact_policy='auto', inception_ts=1000 WHERE id=2")
             .unwrap();
         assert_eq!(ids(&read(&*conn, 2, 100)), [2, 4]);
+    }
+
+    #[test]
+    fn deregistration_ledger_removes_shared_ack_debt_and_preserves_direct_history() {
+        let (_directory, conn, _pool) = fixture();
+        assert_eq!(ids(&read(&*conn, 2, 100)), [1, 2, 3, 4]);
+        let before = shared_receipt_state(&conn);
+        conn.execute_raw(
+            "INSERT INTO agent_deregistrations(agent_id,deregistered_at) VALUES(2,500); \
+             PRAGMA query_only=ON",
+        )
+        .unwrap();
+        let rows = read(&*conn, 2, 100);
+        assert_eq!(ids(&rows), [2, 4]);
+        assert_eq!(rows[0].kind, "cc");
+        assert_eq!(rows[0].read_ts, Some(123));
+        assert_eq!(rows[1].kind, "bcc");
+        assert_eq!(rows[1].message.body_md, "body-4");
+        assert!(
+            ids(&read(&*conn, 3, 100)).contains(&3),
+            "active peer retains shared debt"
+        );
+        assert_eq!(shared_receipt_state(&conn), before);
     }
 
     #[test]

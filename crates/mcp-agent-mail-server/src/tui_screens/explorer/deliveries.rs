@@ -317,6 +317,7 @@ mod tests {
             "PRAGMA foreign_keys = ON",
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER REFERENCES projects(id), name TEXT, inception_ts INTEGER, retired_at INTEGER, contact_policy TEXT)",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY REFERENCES agents(id), deregistered_at INTEGER NOT NULL)",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER REFERENCES projects(id), sender_id INTEGER REFERENCES agents(id), subject TEXT, topic TEXT, body_md TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER, thread_id TEXT)",
             "CREATE TABLE message_recipients (message_id INTEGER REFERENCES messages(id), agent_id INTEGER REFERENCES agents(id), kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
             "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY REFERENCES messages(id), project_id INTEGER REFERENCES projects(id), kind TEXT, delivered_ts INTEGER)",
@@ -411,6 +412,29 @@ mod tests {
             assert_eq!(
                 rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
                 [102, 101, 200]
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_inbox_keeps_deregistered_direct_history_without_shared_deliveries() {
+        fixture(|conn| {
+            conn.execute_raw(
+                "INSERT INTO agent_deregistrations VALUES(11,1); PRAGMA query_only=ON",
+            )
+            .unwrap();
+            let rows = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [102, 101, 200]
+            );
+            assert_eq!(rows[0].ack_ts, None, "retained direct receipt still wins");
+            assert_eq!(rows[1].body_md, "direct body");
+            assert_eq!(
+                rows[2].to_agents, "project:beta",
+                "same-name active identity in another project is independent"
             );
         });
     }

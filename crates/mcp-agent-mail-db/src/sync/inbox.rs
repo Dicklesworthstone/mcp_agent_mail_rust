@@ -846,7 +846,7 @@ pub fn fetch_shared_with_policy(
     }
     let viewer = query(
         conn,
-        "SELECT project_id, inception_ts, retired_at, contact_policy FROM agents WHERE id = ?",
+        crate::project_mailbox::SHARED_VIEWER_SQL,
         &[Value::BigInt(agent_id)],
     )?;
     let Some(viewer) = viewer.first() else {

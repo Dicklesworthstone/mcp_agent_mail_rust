@@ -142,6 +142,7 @@ struct Viewer {
     name: String,
     inception: i64,
     retired: bool,
+    deregistered: bool,
     blocked: bool,
 }
 
@@ -315,6 +316,7 @@ fn integer(row: &Row, column: &str) -> Result<i64, DbError> {
 fn current_viewers(
     conn: &impl SyncQuery,
     roster: &Roster,
+    shared: bool,
 ) -> Result<BTreeMap<i64, BTreeMap<i64, Viewer>>, DbError> {
     let ids: Vec<_> = roster
         .values()
@@ -324,6 +326,17 @@ fn current_viewers(
         .collect();
     let mut viewers: BTreeMap<i64, BTreeMap<i64, Viewer>> = BTreeMap::new();
     for chunk in ids.chunks(PAGE_SIZE) {
+        let mut deregistered = BTreeSet::new();
+        if shared {
+            for row in lookup(conn, "agent_deregistrations", "agent_id", "agent_id", chunk)? {
+                let id = integer(&row, "agent_id")?;
+                if chunk.binary_search(&id).is_err() || !deregistered.insert(id) {
+                    return Err(DbError::Internal(
+                        "unrequested or duplicate unified inbox deregistration".into(),
+                    ));
+                }
+            }
+        }
         let mut seen = BTreeSet::new();
         for row in lookup(
             conn,
@@ -352,6 +365,7 @@ fn current_viewers(
                     .get_named::<Option<i64>>("retired_at")
                     .map_err(database_error)?
                     .is_some(),
+                deregistered: deregistered.contains(&id),
                 blocked: policy
                     .as_deref()
                     .is_some_and(|policy| policy.eq_ignore_ascii_case("block_all")),
@@ -372,11 +386,11 @@ fn read(
         return Ok(Vec::new());
     }
     i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
-    let viewers = current_viewers(conn, roster)?;
+    let shared = ExplorerQuery::shared_mailbox_schema_available(conn)?;
+    let viewers = current_viewers(conn, roster, shared)?;
     if viewers.is_empty() {
         return Ok(Vec::new());
     }
-    let shared = ExplorerQuery::shared_mailbox_schema_available(conn)?;
     let mut window: BTreeMap<(i64, i64), Candidate> = BTreeMap::new();
     let mut ceiling = None;
     let mut skip_at_ceiling = 0_i64;
@@ -537,6 +551,7 @@ fn recipients(
         for (&agent, viewer) in &viewers[&candidate.header.project] {
             if agent == candidate.header.sender
                 || viewer.retired
+                || viewer.deregistered
                 || viewer.blocked
                 || viewer.inception > candidate.header.created
             {
@@ -703,6 +718,7 @@ mod tests {
         for sql in [
             "PRAGMA journal_mode=WAL",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, inception_ts INTEGER, retired_at INTEGER, contact_policy TEXT)",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER NOT NULL)",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, created_ts INTEGER, importance TEXT, thread_id TEXT, topic TEXT, subject TEXT DEFAULT 'subject', body_md TEXT DEFAULT 'body', ack_required INTEGER DEFAULT 1, recipients_json TEXT DEFAULT '{}', attachments TEXT DEFAULT '[]')",
             "CREATE INDEX idx_messages_created_ts ON messages(created_ts)",
             "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
@@ -806,6 +822,49 @@ mod tests {
             ids(&page(&*conn, &scope, 10, None)),
             [2],
             "explicit direct delivery to a selected retired viewer remains visible"
+        );
+    }
+
+    #[test]
+    fn deregistration_ledger_hides_virtual_recipients_and_preserves_direct_receipts() {
+        let (_dir, conn) = fixture();
+        conn.execute_raw("INSERT INTO agent_deregistrations VALUES(11,1); PRAGMA query_only=ON")
+            .unwrap();
+        let scope = BTreeMap::from([(1, BTreeSet::from([11]))]);
+        let rows = page(&*conn, &scope, 10, None);
+        assert_eq!(ids(&rows), [2, 3]);
+        assert_eq!(receipt(&rows, 2, "BlueLake").read, Some(7));
+        assert_eq!(receipt(&rows, 2, "BlueLake").ack, Some(8));
+        assert_eq!(receipt(&rows, 3, "BlueLake").kind, "bcc");
+        assert_eq!(receipt(&rows, 3, "BlueLake").read, None);
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.recipients)
+                .all(|receipt| !receipt.shared)
+        );
+
+        let rows = page(&*conn, &roster(), 10, None);
+        assert_eq!(ids(&rows), [4, 2, 3, 1]);
+        let first = rows
+            .iter()
+            .find(|row| row.inbox.message.id == Some(1))
+            .unwrap();
+        assert_eq!(first.recipients.len(), 1);
+        assert_eq!(first.recipients[0].name, "GoldFox");
+        assert!(
+            receipt(&rows, 3, "GoldFox").shared,
+            "active peer retains shared delivery"
+        );
+        assert_eq!(
+            receipt(&rows, 4, "BlueLake").read,
+            Some(9),
+            "a same-name identity in another project keeps its own direct history"
+        );
+        assert_eq!(
+            conn.query_sync("SELECT * FROM project_mailbox_receipts", &[])
+                .unwrap()
+                .len(),
+            3
         );
     }
 
