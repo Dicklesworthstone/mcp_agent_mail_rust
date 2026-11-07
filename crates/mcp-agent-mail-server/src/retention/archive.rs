@@ -391,6 +391,9 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
                                 unchanged = report.unchanged,
                                 repaired = report.repaired,
                                 deferred = report.deferred,
+                                suppressed_conflicts = report.suppressed_conflicts,
+                                conflict_len = report.conflict_len,
+                                conflict_evicted = report.conflict_evicted,
                                 interrupted = report.interrupted,
                                 budget_exhausted = report.budget_exhausted,
                                 "bounded agent profile reconciliation pass completed"

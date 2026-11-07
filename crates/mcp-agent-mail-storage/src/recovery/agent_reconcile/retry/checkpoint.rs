@@ -1,8 +1,9 @@
 //! Restart-safe scheduling for agent lifecycle archive recovery.
 //!
-//! The checkpoint contains IDs, roster position and bounded retry delays, never
-//! a profile or authorization token. The cursor owns one nonblocking sidecar
-//! lock for its lifetime, so independent workers cannot overwrite retry debt.
+//! The checkpoint contains IDs, roster position, bounded retry delays and
+//! conflict fingerprints, never a profile or authorization token. The cursor
+//! owns one nonblocking sidecar lock for its lifetime, so independent workers
+//! cannot overwrite retry debt or restore conflicting scheduling hints.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -23,9 +24,9 @@ use super::super::{
     AgentReconcileCursor, AgentReconcileReport, checkpoint, outcome, reconcile_agent_batch,
     source_error, validate_source,
 };
-use super::{Entry, MAX_BACKOFF, MAX_RETRY_IDS};
+use super::{ConflictEntry, Entry, MAX_BACKOFF, MAX_CONFLICT_IDS, MAX_RETRY_IDS};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Default)]
@@ -202,6 +203,7 @@ struct Snapshot {
     ceiling: Option<i64>,
     next_lane_is_retry: bool,
     retries: Vec<Retry>,
+    conflicts: Vec<ConflictEntry>,
 }
 
 impl Snapshot {
@@ -230,6 +232,7 @@ impl Snapshot {
                     .unwrap_or(u64::MAX),
                 })
                 .collect(),
+            conflicts: cursor.conflicts.entries.iter().cloned().collect(),
         }
     }
 
@@ -243,6 +246,7 @@ impl Snapshot {
             || self.after < 0
             || self.ceiling.is_some_and(|ceiling| ceiling < self.after)
             || self.retries.len() > MAX_RETRY_IDS
+            || self.conflicts.len() > MAX_CONFLICT_IDS
         {
             return Err(invalid("checkpoint scheduling bounds are invalid"));
         }
@@ -251,6 +255,13 @@ impl Snapshot {
         for retry in &self.retries {
             if retry.id <= 0 || retry.wait_us > max_wait || !ids.insert(retry.id) {
                 return Err(invalid("checkpoint retry IDs or delays are invalid"));
+            }
+        }
+        for conflict in &self.conflicts {
+            if !conflict.is_valid() || !ids.insert(conflict.id) {
+                return Err(invalid(
+                    "checkpoint conflict IDs or fingerprints are invalid",
+                ));
             }
         }
         Ok(())
@@ -270,6 +281,7 @@ impl Snapshot {
                 ready_at: now + Duration::from_micros(retry.wait_us.saturating_sub(elapsed)),
             })
             .collect();
+        cursor.conflicts.entries = self.conflicts.into();
         // Never import pool authority or ownership from scheduling metadata.
         // A backwards clock can delay a retry by at most MAX_BACKOFF.
     }
@@ -460,9 +472,10 @@ impl AgentReconcileCursor {
     /// Run the ordinary lifecycle reconciler with restart-safe scheduling hints.
     ///
     /// One cursor owns the sidecar lock until dropped or rebound. The checkpoint
-    /// pairs its roster watermark with all retry IDs, bound to the configured
-    /// database/root and physical/logical generation. It never contains profiles
-    /// or tokens and does not relax the normal source or publication checks.
+    /// pairs its roster watermark with retry IDs and conflict fingerprints,
+    /// bound to the configured database/root and physical/logical generation.
+    /// It never contains profiles or tokens and does not relax the normal
+    /// source or publication checks.
     /// Unavailable hints leave repair memory-only; a failed save cannot cause a
     /// later load to replace newer in-memory work with an older snapshot.
     ///
@@ -629,6 +642,8 @@ mod tests {
         cursor.retries.defer(401, now);
         cursor.retries.defer(401, now);
         cursor.retries.defer(402, now);
+        cursor.conflicts.remember(403, "a".repeat(64));
+        cursor.conflicts.remember(404, "b".repeat(64));
         cursor
     }
 
@@ -663,6 +678,18 @@ mod tests {
             [401, 402]
         );
         assert_eq!(resumed.retries.entries[0].attempts, 1);
+        assert_eq!(resumed.conflicts.len(), 2);
+        assert!(resumed.conflicts.matches(403, &"a".repeat(64)));
+        assert!(resumed.conflicts.matches(404, &"b".repeat(64)));
+        assert_eq!(
+            resumed
+                .conflicts
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            [403, 404]
+        );
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains("registration_token") && !text.contains("task_description"));
     }
@@ -736,6 +763,91 @@ mod tests {
     }
 
     #[test]
+    fn malformed_conflict_hints_and_overlap_with_retry_debt_reject_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(&temp);
+        let now = Instant::now();
+        for mutation in [
+            "old_version",
+            "zero_id",
+            "negative_id",
+            "duplicate",
+            "retry_overlap",
+            "short_digest",
+            "long_digest",
+            "uppercase_digest",
+            "non_hex_digest",
+            "count",
+        ] {
+            let mut snapshot = Snapshot::capture(binding.clone(), &debt(now), now, 1_000_000);
+            match mutation {
+                "old_version" => snapshot.version = 1,
+                "zero_id" => snapshot.conflicts[0].id = 0,
+                "negative_id" => snapshot.conflicts[0].id = -1,
+                "duplicate" => snapshot.conflicts[1].id = snapshot.conflicts[0].id,
+                "retry_overlap" => snapshot.conflicts[0].id = snapshot.retries[0].id,
+                "short_digest" => snapshot.conflicts[0].fingerprint = "a".repeat(63),
+                "long_digest" => snapshot.conflicts[0].fingerprint = "a".repeat(65),
+                "uppercase_digest" => snapshot.conflicts[0].fingerprint = "A".repeat(64),
+                "non_hex_digest" => snapshot.conflicts[0].fingerprint = "g".repeat(64),
+                _ => {
+                    snapshot.conflicts = (1..=MAX_CONFLICT_IDS + 1)
+                        .map(|id| ConflictEntry {
+                            id: i64::try_from(id + MAX_RETRY_IDS).unwrap(),
+                            fingerprint: "a".repeat(64),
+                        })
+                        .collect();
+                }
+            }
+            assert!(snapshot.validate(&binding).is_err(), "{mutation}");
+        }
+        let mut value =
+            serde_json::to_value(Snapshot::capture(binding, &debt(now), now, 1_000_000)).unwrap();
+        value["conflicts"][0]["profile"] = serde_json::json!({"retired_at": null});
+        assert!(serde_json::from_value::<Snapshot>(value).is_err());
+    }
+
+    #[test]
+    fn full_retry_and_conflict_queues_fit_the_existing_checkpoint_byte_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(&temp);
+        let now = Instant::now();
+        let mut cursor = AgentReconcileCursor::default();
+        cursor.retries.entries = (0..MAX_RETRY_IDS)
+            .map(|offset| Entry {
+                id: i64::MAX - i64::try_from(offset).unwrap(),
+                attempts: u32::MAX,
+                ready_at: now + MAX_BACKOFF,
+            })
+            .collect();
+        for offset in 0..MAX_CONFLICT_IDS {
+            assert!(!cursor.conflicts.remember(
+                i64::MAX - i64::try_from(MAX_RETRY_IDS + offset).unwrap(),
+                "a".repeat(64),
+            ));
+        }
+        let store = Store::open(binding.clone()).unwrap();
+        store.save(&cursor).unwrap();
+        assert!(std::fs::metadata(&store.path).unwrap().len() <= MAX_BYTES);
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.retries.len(), MAX_RETRY_IDS);
+        assert_eq!(loaded.conflicts.len(), MAX_CONFLICT_IDS);
+
+        // Include long source paths and the maximum validated generation length
+        // as well as maximum-width IDs, attempts and remaining retry delays.
+        let long_binding = Binding {
+            database: PathBuf::from(format!("/{}", "d".repeat(4095))),
+            archive: PathBuf::from(format!("/{}", "a".repeat(4095))),
+            generation: "a".repeat(128),
+            ..binding
+        };
+        let snapshot = Snapshot::capture(long_binding.clone(), &cursor, now, i64::MAX);
+        snapshot.validate(&long_binding).unwrap();
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(u64::try_from(bytes.len()).unwrap() <= MAX_BYTES);
+    }
+
+    #[test]
     fn binding_rejects_replacement_and_logical_generation_but_not_ordinary_writes() {
         let temp = tempfile::tempdir().unwrap();
         let before = binding(&temp);
@@ -798,6 +910,15 @@ mod tests {
         let restored = Store::open(binding).unwrap().load().unwrap().unwrap();
         assert_eq!(restored.after, 433);
         assert_eq!(restored.retries.len(), 2);
+        assert_eq!(restored.conflicts.len(), 2);
+        let mut resumed = AgentReconcileCursor::default();
+        restored.restore(
+            &mut resumed,
+            Instant::now(),
+            mcp_agent_mail_db::now_micros(),
+        );
+        assert!(resumed.conflicts.matches(403, &"a".repeat(64)));
+        assert!(resumed.conflicts.matches(404, &"b".repeat(64)));
     }
 
     #[test]
@@ -968,6 +1089,132 @@ mod tests {
         assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
         assert!(!String::from_utf8_lossy(&bytes).contains("never-checkpoint-this-token"));
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn archive_deregistration_conflict(config: &Config) -> serde_json::Value {
+        let relative = "projects/project/agents/BlueLake/profile.json";
+        let mut conflicting = profile(config);
+        conflicting["deregistered_at"] =
+            serde_json::json!(mcp_agent_mail_db::micros_to_iso(234_567_891));
+        conflicting["extension"] = serde_json::json!({"preserve": "archived evidence"});
+        crate::write_json(&config.storage_root.join(relative), &conflicting, true).unwrap();
+        crate::commit_paths_with_retry(
+            &config.storage_root,
+            config,
+            "fixture: archived deregistration without live ledger",
+            &[relative],
+        )
+        .unwrap();
+        assert_eq!(profile(config), conflicting);
+        conflicting
+    }
+
+    #[test]
+    fn restarted_conflict_suppression_keeps_evidence_and_repairs_changed_live_ledger() {
+        with_mailbox(|cx, pool, config, _| {
+            let stop = AtomicBool::new(false);
+            let mut first = AgentReconcileCursor::default();
+            assert_eq!(
+                first
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap()
+                    .repaired,
+                1
+            );
+            let conflicting = archive_deregistration_conflict(config);
+            let deferred = first
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!(
+                (deferred.deferred, deferred.conflict_len, deferred.retry_len),
+                (1, 1, 0)
+            );
+            assert_eq!(deferred.suppressed_conflicts, 0);
+            assert_eq!(profile(config), conflicting);
+            let binding = first.retries.persistence.binding.clone().unwrap();
+            assert_eq!(
+                first
+                    .retries
+                    .persistence
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .conflicts
+                    .len(),
+                1
+            );
+            drop(first);
+
+            // A new daemon owns neither the old cursor nor its process-local
+            // pool identity. Only the validated durable binding survives.
+            let reopened = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_ne!(pool.sqlite_identity_key(), reopened.sqlite_identity_key());
+            assert_eq!(
+                Binding::capture(cx, &reopened, config, &stop).unwrap(),
+                binding
+            );
+            let mut restarted = AgentReconcileCursor::default();
+            let repeated = restarted
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!(
+                (
+                    repeated.suppressed_conflicts,
+                    repeated.deferred,
+                    repeated.repaired,
+                    repeated.conflict_len,
+                ),
+                (1, 0, 0, 1)
+            );
+            assert_eq!(profile(config), conflicting);
+
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                &reopened,
+                101,
+                234_567_891,
+            )))
+            .unwrap();
+            let repaired = restarted
+                .reconcile_checkpointed(cx, &reopened, config, &stop)
+                .unwrap();
+            assert_eq!(
+                (
+                    repaired.repaired,
+                    repaired.deferred,
+                    repaired.suppressed_conflicts,
+                    repaired.conflict_len,
+                    repaired.retry_len,
+                ),
+                (1, 0, 0, 0, 0)
+            );
+            let archived = profile(config);
+            assert_eq!(archived["deregistered_at"], conflicting["deregistered_at"]);
+            assert_eq!(archived["extension"], conflicting["extension"]);
+            assert_eq!(archived["contact_policy"], "block_all");
+            let saved = restarted
+                .retries
+                .persistence
+                .store
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            assert!(saved.conflicts.is_empty());
+            assert!(saved.retries.is_empty());
+        });
     }
 
     #[test]
@@ -1476,10 +1723,12 @@ mod tests {
             // failed save and reappearance of the OLD valid checkpoint.
             cursor.retries.defer(999_999, Instant::now());
             cursor.retries.defer(999_999, Instant::now() + MAX_BACKOFF);
+            cursor.conflicts.remember(999_998, "a".repeat(64));
             let report = cursor
                 .reconcile_checkpointed(cx, pool, config, &stop)
                 .unwrap();
             assert_eq!(report.retry_len, 1);
+            assert!(cursor.conflicts.matches(999_998, &"a".repeat(64)));
             assert!(cursor.retries.persistence.warned);
             std::fs::rename(&path, scratch.join("retained-checkpoint-obstruction")).unwrap();
             std::fs::rename(scratch.join("old-checkpoint"), &path).unwrap();
@@ -1542,6 +1791,10 @@ mod tests {
                 debt,
                 "pool turnover must not reload or rebase the live cooldown"
             );
+            assert!(
+                cursor.conflicts.matches(999_998, &"a".repeat(64)),
+                "pool turnover must not reload older conflict hints"
+            );
             assert!(!cursor.retries.persistence.warned);
             assert_eq!(
                 Store::open(binding).unwrap_err().kind(),
@@ -1557,6 +1810,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(saved.retries[0].id, 999_999);
+            assert_eq!(saved.conflicts[0].id, 999_998);
         });
     }
 
@@ -1578,6 +1832,7 @@ mod tests {
             reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
             assert!(cursor.retries.persistence.binding.is_none());
             cursor.retries.defer(999_999, Instant::now() + MAX_BACKOFF);
+            cursor.conflicts.remember(999_998, "a".repeat(64));
             let reopened = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
                 database_url: config.database_url.clone(),
                 storage_root: Some(config.storage_root.clone()),
@@ -1592,20 +1847,34 @@ mod tests {
                 .reconcile_checkpointed(cx, &reopened, config, &stop)
                 .unwrap();
             assert_eq!((report.unchanged, report.retry_len), (1, 0));
+            assert_eq!(cursor.conflicts.len(), 0);
             assert_eq!(cursor.source_identity, reopened.sqlite_identity_key());
         });
     }
 
     #[test]
-    fn pool_recreation_with_a_changed_agent_generation_rejects_old_debt() {
+    fn pool_recreation_with_a_changed_agent_generation_rechecks_conflicts_and_rejects_old_debt() {
         with_mailbox(|cx, pool, config, _| {
             let stop = AtomicBool::new(false);
             let mut cursor = AgentReconcileCursor::default();
             cursor
                 .reconcile_checkpointed(cx, pool, config, &stop)
                 .unwrap();
+            let conflicting = archive_deregistration_conflict(config);
+            let report = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!((report.deferred, report.conflict_len), (1, 1));
             let binding = cursor.retries.persistence.binding.clone().unwrap();
             cursor.retries.defer(999_999, Instant::now() + MAX_BACKOFF);
+            cursor
+                .retries
+                .persistence
+                .store
+                .as_ref()
+                .unwrap()
+                .save(&cursor)
+                .unwrap();
             let generation = if binding.generation == "ccdd" {
                 "eeff"
             } else {
@@ -1635,7 +1904,17 @@ mod tests {
             let report = cursor
                 .reconcile_checkpointed(cx, &reopened, config, &stop)
                 .unwrap();
-            assert_eq!((report.unchanged, report.retry_len), (1, 0));
+            assert_eq!(
+                (
+                    report.deferred,
+                    report.suppressed_conflicts,
+                    report.conflict_len,
+                    report.retry_len,
+                ),
+                (1, 0, 1, 0),
+                "the new database generation must reclassify the conflict"
+            );
+            assert_eq!(profile(config), conflicting);
             let store = cursor.retries.persistence.store.as_ref().unwrap();
             assert_eq!(
                 store.load().unwrap().unwrap().binding.generation,

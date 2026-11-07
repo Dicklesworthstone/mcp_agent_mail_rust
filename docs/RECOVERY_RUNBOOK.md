@@ -18,6 +18,51 @@
 - `integrity-check` (SQLite + archive)
 - `doctor repair` (wraps the above with backups)
 
+## Repeated agent-profile conflicts (GH#375)
+
+An `agent_archive_reconcile_deferred` warning with `transient=false` can mean
+the archived profile disagrees with the live identity or deregistration ledger.
+For example, an archived permanent deregistration cannot be cleared merely
+because the live ledger lacks it. These conflicts require authoritative
+evidence; the background worker does not choose a winner or rewrite either
+side to silence the warning.
+
+The reconciler retains up to **1,024 conflict fingerprints** separately from
+transient retry debt. A readable identity, lifecycle or project conflict emits
+one warning for its current inputs. On subsequent finite roster visits, the
+worker rereads the live source and the exact working and committed
+`profile.json` / `project.json` payloads. If the same validated conflict
+remains, it skips publication admission and another warning. Changes to those
+inputs invalidate suppression; a legitimate repair still uses fresh source
+validation and the ordinary archive locks. Database heartbeat timestamps and
+unrelated Git commits do not invalidate an otherwise unchanged conflict.
+
+The `agent_archive_reconcile` summary distinguishes `suppressed_conflicts`
+from healthy `unchanged` profiles, reports the retained `conflict_len`, and
+counts capacity evictions as `conflict_evicted`. Suppressed conflicts alone
+do not request rapid catch-up. Source-query, lock and resource failures retain
+their normal transient retry behavior. Unreadable artifacts, invalid JSON,
+oversized or unsafe artifacts and incomplete source authority cannot acquire
+suppression.
+
+Fingerprints survive normal daemon restarts in the existing atomic agent
+reconciliation checkpoint beside the database. The checkpoint contains IDs
+and hashes, not profile contents or registration tokens; its physical/logical
+database and archive binding prevents reuse across a different mailbox
+generation. A missing, incompatible or corrupt checkpoint causes a fresh scan;
+unavailable checkpoint storage leaves suppression in memory and reports that
+restart progress is not durable. Conflicting records themselves remain intact.
+
+This is a bounded optimization, not a claim that the conflict has been fixed.
+Roster visits still perform source and evidence reads to detect legitimate
+changes. With more than 1,024 simultaneous conflicts, FIFO capacity eviction
+can cause renewed warnings and repeated checks for evicted entries; it never
+blocks later roster work or displaces transient retry debt. Use the initial
+warning's agent ID and reason to investigate both authorities. Read-only
+`am doctor check --json` can provide broader mailbox diagnostics, but this
+change does not add an automatic command to accept one side of a conflicting
+deregistration.
+
 ## Metrics-index growth and memory exhaustion (GH#372)
 
 FrankenSQLite 0.4.10 through 0.4.12 can leave very sparse B-tree pages when

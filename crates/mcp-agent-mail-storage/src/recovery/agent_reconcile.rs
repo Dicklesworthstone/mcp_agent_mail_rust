@@ -24,7 +24,7 @@ use mcp_agent_mail_db::{DbConn, DbError, DbPool, corruption_circuit_breaker};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use self::retry::{Candidate, Failure, RetryQueue};
+use self::retry::{Candidate, ConflictCache, Failure, RetryQueue};
 use crate::{ProjectArchive, StorageError};
 
 const IDS_PER_BATCH: i64 = 32;
@@ -57,12 +57,15 @@ const SOURCE_SQL: &str = "SELECT a.id, a.name, a.program, a.model, a.task_descri
 /// old lifecycle changes. Restarting or changing the live pool starts a new
 /// round; cursors never authorize a write or a deletion. Transient failures
 /// retain only IDs in a bounded retry lane instead of waiting for a full round.
+/// Proven conflicts retain bounded fingerprints; every roster visit checks
+/// their current authority before suppressing a repeated refusal.
 #[derive(Debug, Default)]
 pub struct AgentReconcileCursor {
     source_identity: String,
     after: i64,
     ceiling: Option<i64>,
     retries: RetryQueue,
+    conflicts: ConflictCache,
     next_lane_is_retry: bool,
 }
 
@@ -84,6 +87,12 @@ pub struct AgentReconcileReport {
     pub deferred: usize,
     pub deferred_transient: usize,
     pub retry_len: usize,
+    /// Still-conflicting profiles whose exact authority has not changed.
+    /// These are not healthy/unchanged profiles or productive retry debt.
+    pub suppressed_conflicts: usize,
+    pub conflict_len: usize,
+    /// Capacity evictions lose only suppression, never repair obligations.
+    pub conflict_evicted: usize,
     pub interrupted: bool,
     /// An execution limit or an unfinished, productive finite scan needs a
     /// bounded follow-up. This is not a count of missing lifecycle artifacts.
@@ -539,6 +548,15 @@ fn reconcile_agent(
     stop: &AtomicBool,
 ) -> Result<bool, Failure> {
     checkpoint(cx, stop)?;
+    // Complete profiles and proven conflicts can be observed without competing
+    // with publishers. A conflict needs neither another source checkout nor a
+    // publication fence: it only retains evidence from these readable inputs.
+    let observed = if let Some(observation) = observation::observe_profile(config, original) {
+        checkpoint(cx, stop)?;
+        Some(observation?)
+    } else {
+        None
+    };
     // Checkout can wait for pool capacity, validation, or database startup.
     // None of those waits may retain the global archive publication fence.
     // Keep the connection until the source is reread under both archive locks,
@@ -547,12 +565,10 @@ fn reconcile_agent(
     #[cfg(test)]
     let checkout = tests::observe_checkout_pending(checkout);
     let conn = outcome(block_on(checkout)).map_err(Failure::transient)?;
-    // Most roster entries already have their complete profile in Git. Do not
-    // make these read-only observations compete with unrelated publishers or
-    // rewrite the archive epoch merely to discover there is nothing to repair.
-    // This proof never authorizes publication: a failed observation is dropped
-    // before the ordinary guarded path rereads both source and archive below.
-    if let Some(observed) = observation::complete_profile(config, original) {
+    // A complete observation is revalidated after checkout, including any wait.
+    // It never authorizes publication: a failed observation is dropped before
+    // the guarded path rereads both source and archive below.
+    if let Some(observed) = observed {
         checkpoint(cx, stop)?;
         #[cfg(test)]
         tests::after_profile_observation(&conn);
@@ -701,7 +717,11 @@ fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
 ///
 /// Uses only the configured live pool. Missing/ambiguous source rows,
 /// conflicting identity evidence, symlinks and oversized metadata defer;
-/// another finite round retries them. Tokens are never selected or archived.
+/// another finite round checks them. Proven identity/lifecycle/project
+/// conflicts suppress repeat refusals only while fresh source and exact
+/// working/committed evidence retain the same fingerprint. These bounded
+/// hints never suppress source/I/O failures or authorize a write. Tokens are
+/// never selected or archived.
 /// SQL connections are released before profile/Git publication, and each
 /// successful repair verifies its exact bytes in Git HEAD. A concurrent later
 /// lifecycle change can require a later pass; this is eventual convergence.
@@ -730,6 +750,7 @@ pub fn reconcile_agent_batch(
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
         report.retry_len = cursor.retries.len();
+        report.conflict_len = cursor.conflicts.len();
         return Ok(report);
     }
     if corruption_circuit_breaker().is_tripped() {
@@ -797,6 +818,7 @@ pub fn reconcile_agent_batch(
         match result {
             Ok(repaired) => {
                 cursor.retries.forget(id);
+                cursor.conflicts.forget(id);
                 if repaired {
                     report.repaired += 1;
                 } else {
@@ -804,20 +826,37 @@ pub fn reconcile_agent_batch(
                 }
             }
             Err(reason) => {
-                report.deferred += 1;
+                let mut suppressed = false;
                 if reason.transient {
+                    cursor.conflicts.forget(id);
                     cursor.retries.defer(id, Instant::now());
                     report.deferred_transient += 1;
                 } else {
-                    // Permanent/conflicting evidence remains on the finite
-                    // roster scan, never the fast retry lane.
                     cursor.retries.forget(id);
+                    if let Some(fingerprint) = &reason.conflict_fingerprint {
+                        suppressed = cursor.conflicts.matches(id, fingerprint);
+                        if !suppressed {
+                            report.conflict_evicted +=
+                                usize::from(cursor.conflicts.remember(id, fingerprint.clone()));
+                        }
+                    } else {
+                        // Malformed/unsafe or unreadable inputs do not prove
+                        // the previous conflict still exists. Do not let a
+                        // retained signature disguise the current failure.
+                        cursor.conflicts.forget(id);
+                    }
                 }
-                tracing::warn!(
-                    target: "maintenance", event = "agent_archive_reconcile_deferred",
-                    agent_id = id, reason = %reason.detail, transient = reason.transient,
-                    "agent profile repair deferred; mailbox and conflicting evidence retained"
-                );
+                if suppressed {
+                    report.suppressed_conflicts += 1;
+                } else {
+                    report.deferred += 1;
+                    tracing::warn!(
+                        target: "maintenance", event = "agent_archive_reconcile_deferred",
+                        agent_id = id, reason = %reason.detail, transient = reason.transient,
+                        conflict_retained = reason.conflict_fingerprint.is_some(),
+                        "agent profile repair deferred; mailbox and conflicting evidence retained"
+                    );
+                }
             }
         }
         if !candidate.retry {
@@ -825,11 +864,13 @@ pub fn reconcile_agent_batch(
         }
     }
     report.retry_len = cursor.retries.len();
+    report.conflict_len = cursor.conflicts.len();
     // A full healthy page can hide a much older lifecycle change. Continue
     // this finite round at catch-up cadence rather than sleeping a minute per
     // page. A conflicting-only pass does not manufacture productive progress.
-    report.budget_exhausted |=
-        cursor.ceiling.is_some() && report.scanned > 0 && report.deferred == 0;
+    report.budget_exhausted |= cursor.ceiling.is_some()
+        && (report.repaired > 0 || report.unchanged > 0)
+        && report.deferred == 0;
     Ok(report)
 }
 
@@ -1151,8 +1192,11 @@ mod tests {
         with_mailbox(|cx, pool, config, _| {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(102, 'other', '/other', 1)").unwrap();
-            // The schema permits case-distinct names. Recovery must still
-            // refuse an identity ambiguous under its NOCASE name authority.
+            // Model legacy/recovered authority without the newer NOCASE
+            // uniqueness guard. Recovery must independently reject ambiguity,
+            // even when that schema protection is absent.
+            conn.execute_raw("DROP INDEX idx_agents_project_name_nocase")
+                .unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(102, 101, 'bluelake', 'test', 'test', 1000000, 2000000)").unwrap();
             assert!(assert_source_projection_unchanged(&conn, 101, MAX_PROFILE_BYTES).is_empty());
             assert!(!read_source_connection(&conn, 101).unwrap_err().transient);
@@ -2777,6 +2821,455 @@ mod tests {
             assert_eq!(resumed.repaired, 1);
             assert_eq!(resumed.retry_len, 1023);
             assert_profile_committed(config);
+        });
+    }
+
+    const CONFLICT_DEREGISTERED_AT: i64 = 234_567_891;
+
+    fn install_deregistration_conflict(cx: &Cx, pool: &DbPool, config: &Config) -> Value {
+        assert_eq!(reconcile(cx, pool, config).repaired, 1);
+        let mut profile = assert_profile_committed(config);
+        profile["deregistered_at"] = json!(timestamp(CONFLICT_DEREGISTERED_AT).unwrap());
+        profile["extension"] = json!({"evidence": "retain archived deregistration"});
+        crate::write_json(&profile_path(config), &profile, true).unwrap();
+        crate::commit_paths_with_retry(
+            &config.storage_root,
+            config,
+            "fixture: preserve conflicting deregistration",
+            &["projects/project/agents/BlueLake/profile.json"],
+        )
+        .unwrap();
+        crate::flush_async_commits();
+        assert_eq!(assert_profile_committed(config), profile);
+        profile
+    }
+
+    fn assert_single_conflict_round(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        cursor: &mut AgentReconcileCursor,
+        newly_observed: bool,
+    ) {
+        let report =
+            reconcile_agent_batch(cx, pool, config, cursor, &AtomicBool::new(false)).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.deferred, usize::from(newly_observed));
+        assert_eq!(report.suppressed_conflicts, usize::from(!newly_observed));
+        assert_eq!(
+            (report.repaired, report.unchanged, report.deferred_transient),
+            (0, 0, 0)
+        );
+        assert_eq!((report.retry_len, report.conflict_len), (0, 1));
+        assert_eq!(report.conflict_evicted, 0);
+        assert!(!report.budget_exhausted);
+        assert_eq!(cursor.ceiling, None);
+    }
+
+    #[test]
+    fn unchanged_conflicts_are_suppressed_across_316_finite_roster_rounds() {
+        with_mailbox(|cx, pool, config, _| {
+            install_deregistration_conflict(cx, pool, config);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 102_i64..110 {
+                conn.execute_sync(
+                    "INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(?, 101, ?, 'test', 'test', 'coordination', 1000000, 2000000)",
+                    &[id.into(), format!("Agent{id}").into()],
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let sources = (101..110)
+                .map(|id| read_source(cx, pool, id).unwrap())
+                .collect::<Vec<_>>();
+            let mut evidence = Vec::new();
+            for source in &sources {
+                let name = source.profile["name"].as_str().unwrap();
+                let relative = format!("projects/project/agents/{name}/profile.json");
+                let path = config.storage_root.join(&relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let mut profile = source.profile.clone();
+                profile["deregistered_at"] = json!(timestamp(CONFLICT_DEREGISTERED_AT).unwrap());
+                profile["extension"] = json!({"evidence": "retain archived deregistration"});
+                crate::write_json(&path, &profile, true).unwrap();
+                evidence.push((relative, fs::read(&path).unwrap()));
+            }
+            let paths = evidence
+                .iter()
+                .map(|(relative, _)| relative.as_str())
+                .collect::<Vec<_>>();
+            crate::commit_paths_with_retry(
+                &config.storage_root,
+                config,
+                "fixture: nine conflicting profiles",
+                &paths,
+            )
+            .unwrap();
+            crate::flush_async_commits();
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let head = repo.head().unwrap().target();
+            let epoch = crate::archive_mutation_epoch();
+            let mut cursor = AgentReconcileCursor::default();
+            let stop = AtomicBool::new(false);
+            let started = Instant::now();
+            let mut deferred = 0;
+            let mut suppressed = 0;
+            let mut scanned = 0;
+            for round in 0..316 {
+                let report = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(report.scanned, 9, "finite round {round}");
+                assert_eq!(report.deferred, if round == 0 { 9 } else { 0 });
+                assert_eq!(report.suppressed_conflicts, if round == 0 { 0 } else { 9 });
+                assert_eq!(
+                    (report.repaired, report.unchanged, report.deferred_transient),
+                    (0, 0, 0)
+                );
+                assert_eq!((report.retry_len, report.conflict_len), (0, 9));
+                assert_eq!(report.conflict_evicted, 0);
+                assert!(!report.budget_exhausted);
+                assert_eq!(cursor.ceiling, None);
+                deferred += report.deferred;
+                suppressed += report.suppressed_conflicts;
+                scanned += report.scanned;
+            }
+            let elapsed_ms = started.elapsed().as_millis();
+            assert_eq!((scanned, deferred, suppressed), (2_844, 9, 2_835));
+            assert_eq!(crate::archive_mutation_epoch(), epoch);
+            assert_eq!(repo.head().unwrap().target(), head);
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for (relative, bytes) in &evidence {
+                assert_eq!(
+                    fs::read(config.storage_root.join(relative)).unwrap(),
+                    *bytes
+                );
+                let entry = tree.get_path(Path::new(relative)).unwrap();
+                assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+            }
+            for source in &sources {
+                assert_eq!(&read_source(cx, pool, source.id).unwrap(), source);
+            }
+            eprintln!(
+                "nine conflicts over 316 rounds: scanned={scanned}, deferred={deferred}, suppressed={suppressed}, publication_epoch_delta=0, elapsed_ms={elapsed_ms}"
+            );
+
+            // Retained conflicts must not occupy repair slots or prevent a
+            // newly registered, later identity from reaching the archive.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(110, 101, 'GreenStone', 'test', 'test', 'healthy late arrival', 1000000, 2000000)").unwrap();
+            drop(conn);
+            let later = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (later.suppressed_conflicts, later.repaired, later.deferred),
+                (9, 1, 0)
+            );
+            assert_eq!((later.conflict_len, later.retry_len), (9, 0));
+            assert!(
+                config
+                    .storage_root
+                    .join("projects/project/agents/GreenStone/profile.json")
+                    .is_file()
+            );
+        });
+    }
+
+    #[test]
+    fn conflict_survives_heartbeat_and_unrelated_head_without_publication_admission() {
+        with_mailbox(|cx, pool, config, _| {
+            install_deregistration_conflict(cx, pool, config);
+            let bytes = fs::read(profile_path(config)).unwrap();
+            let mut cursor = AgentReconcileCursor::default();
+            let epoch = crate::archive_mutation_epoch();
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            assert_eq!(crate::archive_mutation_epoch(), epoch);
+
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE agents SET last_active_ts = 999999999 WHERE id = 101")
+                .unwrap();
+            drop(conn);
+            fs::write(
+                config.storage_root.join("unrelated.txt"),
+                b"unrelated archive work",
+            )
+            .unwrap();
+            crate::commit_paths_with_retry(
+                &config.storage_root,
+                config,
+                "fixture: unrelated HEAD advance",
+                &["unrelated.txt"],
+            )
+            .unwrap();
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let head = repo.head().unwrap().target();
+            during_native_mutation(config, || {
+                assert_single_conflict_round(cx, pool, config, &mut cursor, false);
+            });
+            assert_eq!(fs::read(profile_path(config)).unwrap(), bytes);
+            assert_eq!(repo.head().unwrap().target(), head);
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn changed_live_authority_rechecks_conflict_and_matching_ledger_repairs() {
+        with_mailbox(|cx, pool, config, _| {
+            let conflict = install_deregistration_conflict(cx, pool, config);
+            let mut cursor = AgentReconcileCursor::default();
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            assert_single_conflict_round(cx, pool, config, &mut cursor, false);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE agents SET program = 'new-program', model = 'new-model', reaper_exempt = 1 WHERE id = 101").unwrap();
+            drop(conn);
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            assert_single_conflict_round(cx, pool, config, &mut cursor, false);
+            assert_eq!(assert_profile_committed(config), conflict);
+
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                pool,
+                101,
+                CONFLICT_DEREGISTERED_AT,
+            )))
+            .unwrap();
+            let latest = read_source(cx, pool, 101).unwrap();
+            let repaired =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                (
+                    repaired.repaired,
+                    repaired.deferred,
+                    repaired.suppressed_conflicts
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!((repaired.retry_len, repaired.conflict_len), (0, 0));
+            let archived = assert_profile_committed(config);
+            for (field, value) in latest.profile.as_object().unwrap() {
+                assert_eq!(&archived[field], value, "fresh authority for {field}");
+            }
+            assert_eq!(archived["extension"], conflict["extension"]);
+            assert_eq!(read_source(cx, pool, 101).unwrap(), latest);
+            let complete =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                (
+                    complete.unchanged,
+                    complete.suppressed_conflicts,
+                    complete.conflict_len
+                ),
+                (1, 0, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn changed_working_and_committed_profile_and_project_evidence_is_rechecked() {
+        with_mailbox(|cx, pool, config, _| {
+            install_deregistration_conflict(cx, pool, config);
+            let mut cursor = AgentReconcileCursor::default();
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            assert_single_conflict_round(cx, pool, config, &mut cursor, false);
+            for relative in [
+                "projects/project/agents/BlueLake/profile.json",
+                "projects/project/project.json",
+            ] {
+                for committed_only in [false, true] {
+                    let path = config.storage_root.join(relative);
+                    let working = fs::read(&path).unwrap();
+                    let mut changed: Value = serde_json::from_slice(&working).unwrap();
+                    changed["new_evidence"] = json!({"committed_only": committed_only});
+                    crate::write_json(&path, &changed, true).unwrap();
+                    if committed_only {
+                        crate::commit_paths_with_retry(
+                            &config.storage_root,
+                            config,
+                            "fixture: independently changed committed authority",
+                            &[relative],
+                        )
+                        .unwrap();
+                        fs::write(&path, &working).unwrap();
+                    }
+                    let expected_working = fs::read(&path).unwrap();
+                    let repo = Repository::open(&config.storage_root).unwrap();
+                    let head = repo.head().unwrap().target();
+                    assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+                    assert_single_conflict_round(cx, pool, config, &mut cursor, false);
+                    assert_eq!(fs::read(&path).unwrap(), expected_working);
+                    assert_eq!(repo.head().unwrap().target(), head);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cached_conflict_source_panic_retains_transient_debt_without_starving_repairs() {
+        with_mailbox(|cx, pool, config, _| {
+            let conflict = install_deregistration_conflict(cx, pool, config);
+            let mut cursor = AgentReconcileCursor::default();
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(102, 101, 'GreenStone', 'test', 'test', 'unaffected healthy profile', 1000000, 2000000)").unwrap();
+            drop(conn);
+            SOURCE_READ_PANIC.with(|slot| slot.set(Some((101, false, 1))));
+            let report =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                (report.deferred, report.deferred_transient, report.retry_len),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                (
+                    report.repaired,
+                    report.suppressed_conflicts,
+                    report.conflict_len
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!(assert_profile_committed(config), conflict);
+            assert!(
+                config
+                    .storage_root
+                    .join("projects/project/agents/GreenStone/profile.json")
+                    .is_file()
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                0,
+                "the transiently failed reader must have been retired"
+            );
+            drop(conn);
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                pool,
+                101,
+                CONFLICT_DEREGISTERED_AT,
+            )))
+            .unwrap();
+            let resumed =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                (resumed.repaired, resumed.deferred, resumed.retry_len),
+                (1, 0, 0)
+            );
+            assert_eq!((resumed.suppressed_conflicts, resumed.conflict_len), (0, 0));
+            let archived = assert_profile_committed(config);
+            assert_eq!(
+                archived["deregistered_at"],
+                timestamp(CONFLICT_DEREGISTERED_AT).unwrap()
+            );
+            assert_eq!(archived["contact_policy"], "block_all");
+            assert_eq!(archived["extension"], conflict["extension"]);
+        });
+    }
+
+    #[test]
+    fn unreadable_evidence_and_invalid_source_are_not_hidden_by_cached_conflicts() {
+        with_mailbox(|cx, pool, config, _| {
+            install_deregistration_conflict(cx, pool, config);
+            let bytes = fs::read(profile_path(config)).unwrap();
+            let mut cursor = AgentReconcileCursor::default();
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            fs::write(profile_path(config), b"{broken profile").unwrap();
+            for _ in 0..2 {
+                let report =
+                    reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(
+                    (
+                        report.deferred,
+                        report.suppressed_conflicts,
+                        report.conflict_len
+                    ),
+                    (1, 0, 0)
+                );
+                assert_eq!(fs::read(profile_path(config)).unwrap(), b"{broken profile");
+            }
+            fs::write(profile_path(config), &bytes).unwrap();
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE agents SET reaper_exempt = 2 WHERE id = 101")
+                .unwrap();
+            drop(conn);
+            for _ in 0..2 {
+                let report =
+                    reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(
+                    (
+                        report.deferred,
+                        report.suppressed_conflicts,
+                        report.conflict_len
+                    ),
+                    (1, 0, 0)
+                );
+                assert_eq!((report.deferred_transient, report.retry_len), (0, 0));
+                assert_eq!(fs::read(profile_path(config)).unwrap(), bytes);
+            }
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE agents SET reaper_exempt = 0 WHERE id = 101")
+                .unwrap();
+            drop(conn);
+            assert_single_conflict_round(cx, pool, config, &mut cursor, true);
+            assert_single_conflict_round(cx, pool, config, &mut cursor, false);
+        });
+    }
+
+    #[test]
+    fn conflict_only_pages_advance_roster_without_requesting_catch_up() {
+        with_mailbox(|cx, pool, config, _| {
+            assert_eq!(reconcile(cx, pool, config).repaired, 1);
+            crate::flush_async_commits();
+            let project_path = config.storage_root.join("projects/project/project.json");
+            let mut project: Value =
+                serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+            project["human_key"] = json!("/foreign-project");
+            crate::write_json(&project_path, &project, true).unwrap();
+            let evidence = fs::read(&project_path).unwrap();
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let head = repo.head().unwrap().target();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 102_i64..=133 {
+                conn.execute_sync(
+                    "INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(?, 101, ?, 'test', 'test', 'coordination', 1000000, 2000000)",
+                    &[id.into(), format!("Agent{id}").into()],
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let mut cursor = AgentReconcileCursor::default();
+            let stop = AtomicBool::new(false);
+            // The second round's full page is the scheduling regression:
+            // zero new deferrals and a remaining ceiling must not manufacture
+            // productive catch-up work when every visit is suppressed.
+            for (scanned, deferred, suppressed, retained, after, ceiling) in [
+                (32, 32, 0, 32, 132, Some(133)),
+                (1, 1, 0, 33, 133, None),
+                (32, 0, 32, 33, 132, Some(133)),
+                (1, 0, 1, 33, 133, None),
+            ] {
+                let report = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(report.scanned, scanned);
+                assert_eq!(report.deferred, deferred);
+                assert_eq!(report.suppressed_conflicts, suppressed);
+                assert_eq!(report.conflict_len, retained);
+                assert_eq!((cursor.after, cursor.ceiling), (after, ceiling));
+                assert_eq!(
+                    (report.repaired, report.unchanged, report.deferred_transient),
+                    (0, 0, 0)
+                );
+                assert_eq!((report.retry_len, report.conflict_evicted), (0, 0));
+                assert!(!report.budget_exhausted);
+            }
+            assert_eq!(fs::read(&project_path).unwrap(), evidence);
+            assert_eq!(repo.head().unwrap().target(), head);
         });
     }
 }

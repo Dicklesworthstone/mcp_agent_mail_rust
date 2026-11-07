@@ -546,6 +546,15 @@ mod tests {
             ),
             (
                 AgentReconcileReport {
+                    scanned: 32,
+                    suppressed_conflicts: 32,
+                    conflict_len: 1024,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                AgentReconcileReport {
                     interrupted: true,
                     budget_exhausted: true,
                     ..Default::default()
@@ -613,6 +622,41 @@ mod tests {
         assert!(!follow_up);
         assert_eq!(calls, 2);
         assert_eq!(reports, [(32, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn suppressed_conflicts_do_not_hide_productive_work_or_create_retry_debt() {
+        let mut pending = std::collections::VecDeque::from([
+            AgentReconcileReport {
+                scanned: 32,
+                unchanged: 1,
+                suppressed_conflicts: 31,
+                conflict_len: 31,
+                budget_exhausted: true,
+                ..Default::default()
+            },
+            AgentReconcileReport {
+                scanned: 1,
+                repaired: 1,
+                conflict_len: 31,
+                ..Default::default()
+            },
+        ]);
+        let mut repaired = 0;
+        assert!(
+            !run_with(
+                || Ok(pending.pop_front().expect("finite scan must finish")),
+                || false,
+                || Duration::ZERO,
+                |report| repaired += report.repaired,
+            )
+            .unwrap()
+        );
+        assert!(
+            pending.is_empty(),
+            "later legitimate repair must be visited"
+        );
+        assert_eq!(repaired, 1);
     }
 
     #[test]
