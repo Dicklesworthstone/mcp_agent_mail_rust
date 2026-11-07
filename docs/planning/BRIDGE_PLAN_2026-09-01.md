@@ -20,12 +20,15 @@ Continuation from `86a07526` (23:12 UTC), requested fresh review:
   dead40GiB record is subsequently replaced by live20GiB+10GiB process groups;
   read-only thread inventory confirms ordinary competing reservations. No
   manual retirement, process signal, budget/floor change or further retry.
+  Final read-only capacity:41.29GiB free; a10GiB group is positively live with
+  23 tasks. Even ignoring the unobserved20GiB entry, native30GiB plus live10GiB
+  plus unchanged10GiB floor needs50GiB. Original native population remains zero.
 - [x] Claim ready `br-valyz`; source and actual compiled CLI confirm intended
   structured-report exit0, table/health exit1 on a missing database. Old help
   fails to explain the contract; all actual read-only exit controls pass.
 - [x] Explain structured/table exit semantics in CLI help, operator cookbook and
   the inconsistent AGENTS table row; retain all exit codes and report fields.
-- [ ] Freeze help candidate, compile/check required graphs, inspect new help and
+- [x] Freeze help candidate, compile/check required graphs, inspect new help and
   execute the same real missing-DB controls plus a fresh solo repeat. No new
   mirror-the-help unit test or gate is needed for this documentation fix.
   - [x] Preserve original native help-negative and all six real exit/read-only
@@ -35,22 +38,36 @@ Continuation from `86a07526` (23:12 UTC), requested fresh review:
     Initial CLI/all-target attempts refuse120 under normal reservations.
   - [x] Production graph and strict all-target Clippy pass; freshly verify all
     3,917 input records with zero mismatches and identical source vectors.
-  - [ ] Complete the separate all-target check and source-bound CLI artifact.
+  - [x] Complete the separate all-target check and source-bound CLI artifact.
     Retain the initial120, two hz3 admission103 refusals (slots, then disk),
     and warmed hz2 admission120. Later primary capacity changes to41GiB free
-    with20GiB reserved: the ordinary all-target check is admitted and running.
-    Original native30GiB growth still does not fit. No budget/floor/policy edit.
+    with20GiB reserved: the ordinary all-target check completes0 at01:32 UTC.
+    Receipt `7bcdeb5b`,3,917 fresh records, zero mismatch, same four-command input
+    vector. No budget/floor/policy edit; original native acceptance stays open.
   - [x] Native CLI build0; worker/retrieved ELF hash matches `a8be3447`.
     All3,917 inputs freshly match the other gates. Rendered help and all six
-    real missing-DB modes pass; no DB/WAL created. Await the separate all-target
-    result before publishing, then repeat the six modes solo before closure.
+    real missing-DB modes pass; no DB/WAL created. Preserve concurrent source/
+    evidence publication32dc23e6/dd2e8fc7 at01:25/01:26; its all-target result
+    completes later at01:32, with that timing corrected in the evidence.
+  - [x] Catch the parent-help snapshot omission in the final reread. Both old
+    fixtures match the old ELF; the new ELF differs only in the `check` purpose
+    row. GOLDEN-CHANGE: manually update that row in both runtime-read fixtures;
+    both new comparisons pass and reject the old ELF. No regeneration flag,
+    assertion change or fixture mutation in the frozen compiler checkout.
+  - [x] Commit the two reviewed runtime golden rows in `a50e9eef`. Fresh SOLO
+    post-commit execution passes all six modes and both committed parent-help
+    fixtures;3,079 runtime/build files and three help/docs match the compiled
+    source. Close only original `br-valyz` on cited evidence at01:42 UTC.
   - [x] Full-file scan completes in898s/exit0 with no critical finding or failed
     module; retain10,285 warnings (10,281 located records map to unchanged source,
     four count-only warnings), none at the five added comments. Initial300s
     timeout remains partial/exit2. Supported900s scanner budget only; no source
     exclusion, partial-result acceptance or application/test deadline change.
-- [ ] Reread findings, update original Beads and existing evidence, flush/cycle
-  check, publish exact owned changes and release reservations. No release claim.
+- [x] Reread findings, update original Beads and existing evidence, verify the
+  graph/export and prepare the exact owned handoff. `.90` stays in progress;
+  all nine owned RCH wrappers are terminal/acknowledged, no live wrapper.
+  Final ref publication and release of ten reservations are the handoff actions;
+  their observed result is reported at session end. No release/independent claim.
 
 This operator-requested TODO gates their fresh-review acceptance, records the
 observed missing native execution and retires as execution history at handoff.

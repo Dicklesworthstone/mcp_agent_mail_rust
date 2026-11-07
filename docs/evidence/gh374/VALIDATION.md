@@ -18,7 +18,7 @@ prohibited pull requests.
 
 ### November 6 third fresh review: doctor report exit semantics
 
-Started23:12 UTC from `86a07526`. Full governing-file reads remain applicable;
+Started 23:12 UTC from `86a07526`. Full governing-file reads remain applicable;
 the prior installer, robot-filter and startup changes were reread. No further
 defect was confirmed there. Ready contact-stats classification is already wired;
 its production macOS acceptance remains open. No duplicate repair or closure.
@@ -28,7 +28,7 @@ JSON/TOON report generation exits0 with `healthy:false`, while table output and
 `doctor health` exit1 for a genuinely missing database. The old `--help` fails
 to explain it. Five Clap help-comment lines, the operator cookbook and the
 inconsistent AGENTS table row now explain the existing contract. No runtime
-branch, report field, threshold, assertion or exit status changes.
+branch, report field, threshold, assertion code or exit status changes.
 
 Raw root: `/data/tmp/am-third-review-20261106.TXOHfqKq`.
 `doctor-original/result.json` records the observed help negative and all six
@@ -37,17 +37,40 @@ port that excludes the shared daemon. The database and WAL stay absent after
 every invocation. The new artifact passes the same six real modes, including
 the rendered help contract. Worker and retrieved ELF SHA-256 both equal
 `a8be34472ab307d96492575b1c9c0a7201a8d05e6e582be4e6f9893bfd21292b`
-(305,230,184 bytes; `am 0.3.40`). Its3,917 freshly verified source records match
+(305,230,184 bytes; `am 0.3.40`). Its 3,917 freshly verified source records match
 the completed compiler gates, zero mismatch. CLI receipt SHA-256:
 `58f54469f76fb5f6120caedfcf7312c0a9d87d8ac610e26e51f95fd9147bbdf7`.
-The separate all-target result and post-commit fresh solo repeat remain pending;
-`br-valyz` stays in progress until its positive acceptance is complete.
+The separate all-target command completes with exit 0 at 01:32 UTC. After source/help
+commit `32dc23e6` and golden-data commit `a50e9eef`, fresh solo executions pass
+the same six real modes and both committed parent-help fixture comparisons.
+The repeated cohort is not counted as twelve independent cases. Original
+`br-valyz` closes at 01:42 UTC on those receipts; `.90` remains in progress.
 The actual live compiler confirms pinned `nightly-2026-08-31`, Rust1.100 nightly,
 commit `90850177249efe0321573c569aec5d12b257f8d6`, LLVM23.1.0, Linux x86-64;
-ordinary dev optimization1 with debug0. This identifies the build, not a pass.
+ordinary dev optimization 1 with the command's `profile.dev.debug=0` override
+and captured package-specific Cargo settings. This is a private source-qualified
+development image, not a globally installed binary or a released artifact.
+
+GOLDEN-CHANGE: the final reread catches two parent `doctor --help` fixtures.
+Both exactly match the original ELF. The new ELF differs solely in the `check`
+row, which now says `Report mailbox diagnostics without changing state`.
+That is the intended purpose metadata, not broken output. Only that row is
+manually changed in `tests/fixtures/cli_help/doctor.txt` and
+`tests/fixtures/golden_snapshots/cli_help_doctor.txt`; no update flag or assertion
+code changes. Both direct real-CLI comparisons now pass and reject the old ELF.
+Raw old/new diff and before/after receipts are retained in the raw root. These
+comparisons use the existing newline/trailing-whitespace contract; the Rust
+integration-test bodies/full suite were not executed.
+
+The compiler frame stays immutable with its original expected-output data.
+These two fixtures are read from disk at test runtime, not embedded by the
+compiler; the 3,079 checked runtime/build files and three help/doc edits remain
+byte-identical to that frame. The two final fixture hashes are recorded
+separately, so full compiler-frame identity is not attributed to the final
+commit's fixture data. No Rust recompilation is required for those text rows.
 
 Frozen qualifier: `mcp_agent_mail_rust-ee-startup90-20261106`, base `aceebacc`.
-All3,079 tracked runtime/build files match main byte for byte. Production graph
+The 3,079 checked runtime/build files match main byte for byte. Production graph
 check and strict all-target Clippy pass remotely on hz3/hz2; each receipt has
 3,917 freshly verified records, zero mismatches and identical file vectors.
 Receipt-file SHA-256 values: production
@@ -61,10 +84,21 @@ confirms competing reservations. No budget, floor or worker policy was edited.
 One later capacity probe was blocked when the guard could not finish evaluating
 its embedded Python. `dcg explain` returned ALLOW; explicit `df`/ledger reads
 then succeeded. No override, bypass or guard-policy change was used.
-At01:09 UTC, primary capacity changes to about41GiB free with20GiB reserved.
+At 01:09 UTC, primary capacity changes to about 41 GiB free with 20 GiB reserved.
 That covers the ordinary all-target request plus its unchanged floor. A new
-all-target run is admitted and checking dependencies; result/source receipt
-remain pending. Original native30GiB growth plus10GiB floor still does not fit.
+all-target run completes with exit 0 on vmi1152480, build 30097323753209943. Its receipt
+SHA-256 is `7bcdeb5b373e02869a61526be6d662b1a7ac1f2114407f422b558b76fa0e3ad5`.
+All four compiler/build receipts have identical 3,917-file vectors, freshly
+verified with zero mismatches. Original native30GiB growth remains a separate
+admission/acceptance requirement.
+
+Publication boundary: concurrent commits `32dc23e6` and `dd2e8fc7` appear at
+01:25/01:26 UTC while this agent's separate all-target command is still running.
+Its first observed terminal0 is at01:32 UTC, so the earlier commit message must
+not be read as pre-publication completion of that command. Both commits and
+their history are preserved. The two reviewed golden rows are committed in
+`a50e9eef3489c9192a9b2518ee74997058e6895a`; post-commit native execution binds
+that revision's code and runtime fixture data separately to the qualified ELF.
 
 Full4MB CLI-file UBS completes in898s/exit0, no failed module or critical finding.
 Its10,285 warnings remain:10,281 located warning records map to byte-identical
@@ -88,6 +122,15 @@ new live20GiB+10GiB groups, confirmed by thread/cargo/rustc inventory. No foreig
 process signal, ledger retirement or resource change. No unchanged native retry,
 native pass, whole-workspace test pass, release clearance or independent review.
 Prior loaded send-p99/release failures and all other exclusions remain intact.
+The final primary snapshot at01:41 UTC has44,329,693,184 free bytes and reports
+20GiB+10GiB ledger entries. Full-thread inspection positively finds23 live tasks
+in the10GiB group; the20GiB group is not observed, with no retirement inference.
+Even ignoring that20GiB record, original native30GiB growth plus the live10GiB
+reservation and10GiB floor requires50GiB, above41.29GiB observed free. No further
+known-insufficient native attempt. Compiler evidence is complete; lifecycle
+execution is not. All nine owned RCH wrappers are terminal/acknowledged and have
+no live wrapper. Global job inventory remains incomplete/exit1 with117 unrelated
+journal errors; no fleet-health pass.
 
 #### Required worksheets for this third pass
 
@@ -112,24 +155,31 @@ the original native gap rather than claiming progress from refusals.
 Honesty inventory for that window; CASS remains uninitialized, no older-session
 audit claimed:
 
-1. No (checked test/workflow/config diffs: none changed or weakened).
+1. No (checked assertion/workflow/config diffs: none weakened; only two expected
+   parent-help rows change for the reviewed intentional purpose description).
 2. No (checked actual CLI, missing files and live port isolation; no mock output).
-3. No (checked diff: no golden/snapshot regeneration).
+3. No (checked old/new native diff: two manually updated golden rows describe the
+   intended feature; no broken output, bulk regeneration or update flag accepted).
 4. Yes: scanner budget300→900 after observed full-file timeout; same file/rules,
    initial exit2 retained. Compiler `-j2`→`-j1` follows actual RCH slot advice;
    entire target graph retained. No app/test deadline, suppression or bypass.
+   Two runtime-read golden rows intentionally change with the help metadata;
+   old-match/new-mismatch before, new-match/old-rejection after are both retained.
 5. No (checked runtime diff: only help metadata, no special-case behavior).
 6. No (checked zero native cases are unqualified; compiler passes are not tests).
 7. Yes: a progress message called core compilation successful after a start line.
    That unsupported intermediate claim was retracted explicitly; only terminal
    command receipts establish completion. The overall build stayed pending.
+   Concurrent publication also preceded the separate all-target completion;
+   its exact later success time is recorded above, without rewriting history.
 8. No (checked private CLI/real filesystem/solo/source-qualified boundaries).
 9. No (checked all admission refusals, scan timeout/warnings and prior reds retained).
 10. No (checked cited stdout/stderr captured and preserved).
-11. No (checked original `br-valyz` stays open pending positive acceptance; `.90` open).
+11. No (checked original `br-valyz` closes only after committed-source fresh solo
+    positive execution; original `.90` remains open with zero selected cases).
 12. No (checked original documentation alternative; AGENTS row corrects its own
     format inconsistency, no health criterion or original Bead requirement changed).
-13. N/A: solo; closure requires exact source and fresh solo native CLI execution.
+13. N/A: solo; closure cites exact source plus fresh solo native CLI execution.
 14. N/A: no subagents dispatched.
 15. N/A: no subagent report accepted.
 16. N/A: no panes; native refusals earn no closure.
@@ -138,15 +188,15 @@ audit claimed:
 19. Yes: the process-only retirement inference was too strong; corrected in place
     and disclosed with live competing groups. A default-key SSH refusal and a
     stale-host timeout were also corrected before any remote observation claim.
-20. Strongest completed evidence: exact source-qualified ELF passes all six real
-    CLI modes at `doctor-final/result.json`, with original help-negative retained.
-    Post-commit fresh solo repeat and the separate all-target result remain pending.
+20. Strongest evidence: `doctor-committed-repeat/result.json` and
+    `postcommit-code-and-parent-golden.json` bind fresh native six-mode/parent-help
+    results to `a50e9eef`, with original help-negative and golden deltas retained.
 
 Disposition: the scanner change, retirement inference and intermediate
 compilation claim are corrected/disclosed above;
 no incomplete gate becomes green. Countermeasures RH-2/RH-15/PL-3: retain failures,
 exact input populations and observed positive execution before original closure;
-no acceptance change, source exclusion, independent-review or release claim.
+no original Bead criterion waived, source exclusion, independent-review or release claim.
 
 ### November 6 second fresh review: actionable robot recommendations
 
