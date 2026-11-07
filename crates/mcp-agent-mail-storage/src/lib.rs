@@ -15290,8 +15290,29 @@ fn mark_archive_index_pending(state: &mut ArchiveIndexSyncState, git_dir: &Path,
         });
 }
 
+/// Keep a failed attempt owed without treating its retry as a new commit.
+/// Commits arriving while the index was being synchronized retain their newer
+/// quiet-period deadline, while the original lag bound remains in force.
+fn restore_archive_index_pending(
+    state: &mut ArchiveIndexSyncState,
+    git_dir: &Path,
+    attempted: ArchiveIndexLag,
+) {
+    state
+        .pending
+        .entry(git_dir.to_path_buf())
+        .and_modify(|pending| {
+            pending.since = pending.since.min(attempted.since);
+            pending.last_commit = pending.last_commit.max(attempted.last_commit);
+        })
+        .or_insert(attempted);
+}
+
 static ARCHIVE_INDEX_SYNC: LazyLock<(Mutex<ArchiveIndexSyncState>, Condvar)> =
     LazyLock::new(|| (Mutex::new(ArchiveIndexSyncState::default()), Condvar::new()));
+
+#[cfg(test)]
+type ArchiveIndexSyncAfterLockTestHook = Box<dyn FnMut(&Path)>;
 
 #[cfg(test)]
 thread_local! {
@@ -15299,6 +15320,8 @@ thread_local! {
     /// fixtures always find a current `.git/index`. Tests of the background
     /// contract switch this off for their thread.
     static ARCHIVE_INDEX_SYNC_INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static ARCHIVE_INDEX_SYNC_AFTER_LOCK_TEST_HOOK:
+        std::cell::RefCell<Option<ArchiveIndexSyncAfterLockTestHook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Mark `git_dir`'s shared index as behind HEAD and wake the sync worker.
@@ -15390,7 +15413,7 @@ fn archive_index_sync_backoff(elapsed: Duration) -> Duration {
 fn archive_index_sync_worker() {
     let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
     loop {
-        let git_dir = {
+        let (git_dir, attempted) = {
             let mut state = state_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -15400,9 +15423,12 @@ fn archive_index_sync_worker() {
                 }
                 match next_archive_index_sync(&state, Instant::now()) {
                     Ok(git_dir) => {
-                        state.pending.remove(&git_dir);
+                        let attempted = state
+                            .pending
+                            .remove(&git_dir)
+                            .expect("selected archive index sync must be pending");
                         state.in_flight = true;
-                        break git_dir;
+                        break (git_dir, attempted);
                     }
                     Err(Some(wait)) => {
                         state = wake
@@ -15434,17 +15460,21 @@ fn archive_index_sync_worker() {
             git_dir.clone(),
             Instant::now() + archive_index_sync_backoff(started.elapsed()),
         );
+        // Only a settled sync discharges this attempt. Contention, ordinary
+        // I/O/Git failures, and caught panics all leave the index work owed.
+        // Reuse one pending entry and the normal rewrite backoff: recovery
+        // needs no further commit and cannot spin while a failure persists.
+        if !matches!(&result, Ok(ArchiveIndexSync::Settled)) {
+            restore_archive_index_pending(&mut state, &git_dir, attempted);
+        }
         match result {
             Ok(ArchiveIndexSync::Settled) => {
                 state.warned.remove(&git_dir);
             }
-            // Someone else holds the lock: this commit's sync is still owed.
-            Ok(ArchiveIndexSync::Locked) => {
-                mark_archive_index_pending(&mut state, &git_dir, Instant::now());
-            }
+            Ok(ArchiveIndexSync::Locked) => {}
             Err(error) if state.warned.insert(git_dir.clone()) => tracing::warn!(
                 git_dir = %git_dir.display(),
-                "could not bring the archive's .git/index up to HEAD: {error}; repeats are logged at debug level until it succeeds"
+                "could not bring the archive's .git/index up to HEAD: {error}; retaining for retry, repeats are logged at debug level until it succeeds"
             ),
             Err(error) => tracing::debug!(
                 git_dir = %git_dir.display(),
@@ -15905,6 +15935,12 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
     // removed before the lock is released on every path: it can never erase
     // the record of whoever takes the lock next.
     let mut owner = IndexSyncLockOwner::new(repo_root.as_deref(), lock.as_file());
+    #[cfg(test)]
+    ARCHIVE_INDEX_SYNC_AFTER_LOCK_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(git_dir);
+        }
+    });
     // HEAD is read under the lock, so a slow sync cannot publish a tree older
     // than one another writer synced while this one waited.
     let Some(head_oid) = resolve_head_commit_oid(&repo)? else {
@@ -31585,6 +31621,279 @@ mod tests {
         fn drop(&mut self) {
             ARCHIVE_INDEX_SYNC_INLINE.with(|inline| inline.set(true));
         }
+    }
+
+    fn wait_for_archive_index_sync_state(
+        ready: impl Fn(&ArchiveIndexSyncState) -> bool,
+        timeout: Duration,
+    ) -> std::sync::MutexGuard<'static, ArchiveIndexSyncState> {
+        let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
+        let mut state = state_lock.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        while !ready(&state) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = wake.wait_timeout(state, left).unwrap().0;
+        }
+        state
+    }
+
+    #[test]
+    fn archive_index_sync_worker_retries_io_failure_without_another_commit() {
+        if !isolated_coalescer_regression(
+            "tests::archive_index_sync_worker_retries_io_failure_without_another_commit",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(tmp.path().join("base.txt"), b"base\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "base", &["base.txt"]).unwrap();
+        let original_tree = shared_index_tree(&repo);
+        let _background = BackgroundIndexSync::enter();
+        fs::write(tmp.path().join("pending.txt"), b"pending sync\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "pending", &["pending.txt"]).unwrap();
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap().id();
+        assert_ne!(original_tree, head_tree);
+        let git_dir = repo.path().to_path_buf();
+        let original_lag = ARCHIVE_INDEX_SYNC.0.lock().unwrap().pending[&git_dir];
+
+        // A directory in place of the index causes a real filesystem read
+        // failure even when the test runs as root. Preserve the old index so
+        // repairing this condition does not itself create another commit.
+        let index_path = git_dir.join("index");
+        let retained_index = tmp.path().join("retained-index");
+        fs::rename(&index_path, &retained_index).unwrap();
+        fs::create_dir(&index_path).unwrap();
+        assert!(matches!(
+            sync_archive_index_to_head(&git_dir),
+            Err(StorageError::Io(_))
+        ));
+        let worker = std::thread::Builder::new()
+            .name("index-sync-io-recovery-regression".to_string())
+            .stack_size(storage_worker_stack_size())
+            .spawn(archive_index_sync_worker)
+            .unwrap();
+
+        let state = wait_for_archive_index_sync_state(
+            |state| state.warned.contains(&git_dir) && !state.in_flight,
+            Duration::from_secs(10),
+        );
+        let observed_failure = state.warned.contains(&git_dir) && !state.in_flight;
+        let retained_lag = state.pending.get(&git_dir).copied();
+        let pending_count = state.pending.len();
+        let has_backoff = state.next_due.contains_key(&git_dir);
+        let released_lock =
+            !git_dir.join("index.lock").exists() && !git_dir.join("index.lock.owner").exists();
+        // Holding the state lock after the completed failure prevents another
+        // attempt from starting between the two fixture-repair renames.
+        if observed_failure {
+            fs::rename(&index_path, tmp.path().join("invalid-index-directory")).unwrap();
+            fs::rename(&retained_index, &index_path).unwrap();
+        }
+        drop(state);
+
+        // No commit, enqueue, or notification follows the filesystem repair.
+        let recovered = if retained_lag.is_some() && observed_failure {
+            let state = wait_for_archive_index_sync_state(
+                |state| {
+                    !state.pending.contains_key(&git_dir)
+                        && !state.warned.contains(&git_dir)
+                        && !state.in_flight
+                },
+                Duration::from_secs(35),
+            );
+            !state.pending.contains_key(&git_dir)
+                && !state.warned.contains(&git_dir)
+                && !state.in_flight
+        } else {
+            false
+        };
+        stop_archive_index_sync(Duration::from_secs(5));
+        worker.join().expect("index sync worker shuts down cleanly");
+
+        assert!(observed_failure, "the actual background read must fail");
+        let retained_lag = retained_lag.expect("a failed sync must remain pending");
+        assert_eq!(retained_lag.since, original_lag.since);
+        assert_eq!(retained_lag.last_commit, original_lag.last_commit);
+        assert_eq!(pending_count, 1, "retries reuse one repository entry");
+        assert!(has_backoff);
+        assert!(released_lock, "failed attempts must release their Git lock");
+        assert!(
+            recovered,
+            "the same worker must retry without another commit"
+        );
+        assert_eq!(shared_index_tree(&repo), head_tree);
+        assert!(!git_dir.join("index.lock").exists());
+        assert!(!git_dir.join("index.lock.owner").exists());
+    }
+
+    #[test]
+    fn archive_index_sync_worker_recovers_panics_merges_lag_and_stops_with_pending_work() {
+        if !isolated_coalescer_regression(
+            "tests::archive_index_sync_worker_recovers_panics_merges_lag_and_stops_with_pending_work",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(tmp.path().join("base.txt"), b"base\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "base", &["base.txt"]).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let original_index = fs::read(git_dir.join("index")).unwrap();
+        let _background = BackgroundIndexSync::enter();
+        fs::write(tmp.path().join("pending.txt"), b"pending sync\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "pending", &["pending.txt"]).unwrap();
+        let original_lag = ARCHIVE_INDEX_SYNC.0.lock().unwrap().pending[&git_dir];
+        let allow_recovery = Arc::new(AtomicBool::new(false));
+        let panic_count = Arc::new(AtomicU64::new(0));
+        let concurrent_lag = Arc::new(Mutex::new(None));
+        let worker_allow_recovery = Arc::clone(&allow_recovery);
+        let worker_panic_count = Arc::clone(&panic_count);
+        let worker_concurrent_lag = Arc::clone(&concurrent_lag);
+        let worker_root = tmp.path().to_path_buf();
+        let worker_git_dir = git_dir.clone();
+        let worker_config = config.clone();
+        let worker = std::thread::Builder::new()
+            .name("index-sync-panic-recovery-regression".to_string())
+            .stack_size(storage_worker_stack_size())
+            .spawn(move || {
+                ARCHIVE_INDEX_SYNC_AFTER_LOCK_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |attempted_git_dir| {
+                        if attempted_git_dir != worker_git_dir
+                            || worker_allow_recovery.load(Ordering::Acquire)
+                        {
+                            return;
+                        }
+                        if worker_panic_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                            // A real commit arrives after this attempt removed
+                            // its lag record and while it owns index.lock. The
+                            // lock-free commit path must remain independent of
+                            // shared-index maintenance, and its newer pending
+                            // work must merge with the failed attempt's lag.
+                            let _background = BackgroundIndexSync::enter();
+                            let repo = Repository::open(&worker_root).unwrap();
+                            fs::write(worker_root.join("during-sync.txt"), b"newer commit\n")
+                                .unwrap();
+                            commit_paths_lockfree(
+                                &repo,
+                                &worker_config,
+                                "commit during index sync",
+                                &["during-sync.txt"],
+                            )
+                            .unwrap();
+                            let lag = ARCHIVE_INDEX_SYNC
+                                .0
+                                .lock()
+                                .unwrap()
+                                .pending
+                                .get(attempted_git_dir)
+                                .copied();
+                            *worker_concurrent_lag.lock().unwrap() = lag;
+                        }
+                        panic!("injected index sync panic after acquiring its lock"); // ubs:ignore -- Test-only fault injection exercises real lock cleanup and worker recovery.
+                    }));
+                });
+                archive_index_sync_worker();
+            })
+            .unwrap();
+
+        let state = wait_for_archive_index_sync_state(
+            |state| state.warned.contains(&git_dir) && !state.in_flight,
+            Duration::from_secs(10),
+        );
+        let retained_lag = state.pending.get(&git_dir).copied();
+        let warned_after_panic = state.warned.contains(&git_dir);
+        let pending_count = state.pending.len();
+        let released_lock =
+            !git_dir.join("index.lock").exists() && !git_dir.join("index.lock.owner").exists();
+        let preserved_index = fs::read(git_dir.join("index")).unwrap() == original_index;
+        allow_recovery.store(true, Ordering::Release);
+        drop(state);
+        let state = wait_for_archive_index_sync_state(
+            |state| {
+                !state.pending.contains_key(&git_dir)
+                    && !state.warned.contains(&git_dir)
+                    && !state.in_flight
+            },
+            Duration::from_secs(35),
+        );
+        let recovered = !state.pending.contains_key(&git_dir)
+            && !state.warned.contains(&git_dir)
+            && !state.in_flight;
+        let recovered_tree = shared_index_tree(&repo);
+        let head_after_recovery = repo.head().unwrap().peel_to_tree().unwrap().id();
+        drop(state);
+
+        // Stop with a fresh failed attempt pending, rather than only testing
+        // idle shutdown. Shutdown must wake the backoff wait and start no more
+        // syncs, leaving queued work intact as shutdown returns.
+        allow_recovery.store(false, Ordering::Release);
+        fs::write(
+            tmp.path().join("shutdown-pending.txt"),
+            b"pending at shutdown\n",
+        )
+        .unwrap();
+        commit_paths_lockfree(
+            &repo,
+            &config,
+            "pending at shutdown",
+            &["shutdown-pending.txt"],
+        )
+        .unwrap();
+        let state = wait_for_archive_index_sync_state(
+            |state| state.warned.contains(&git_dir) && !state.in_flight,
+            Duration::from_secs(10),
+        );
+        let pending_at_shutdown = state.pending.contains_key(&git_dir);
+        let warned_at_shutdown = state.warned.contains(&git_dir);
+        drop(state);
+        stop_archive_index_sync(Duration::from_secs(5));
+        worker
+            .join()
+            .expect("panics must not kill the index sync worker");
+
+        assert!(
+            warned_after_panic,
+            "the worker must report the caught panic"
+        );
+        let retained_lag = retained_lag.expect("the failed attempt must remain owed");
+        let concurrent_lag = concurrent_lag
+            .lock()
+            .unwrap()
+            .expect("new commit was queued");
+        assert_eq!(retained_lag.since, original_lag.since);
+        assert_eq!(retained_lag.last_commit, concurrent_lag.last_commit);
+        assert!(concurrent_lag.since > original_lag.since);
+        assert_eq!(pending_count, 1);
+        assert!(
+            released_lock,
+            "unwinding must release the owned lock and witness"
+        );
+        assert!(
+            preserved_index,
+            "a failed sync must leave the index untouched"
+        );
+        assert!(
+            recovered,
+            "the same worker must recover without another notification"
+        );
+        assert_eq!(recovered_tree, head_after_recovery);
+        assert!(panic_count.load(Ordering::Relaxed) >= 2);
+        assert!(pending_at_shutdown && warned_at_shutdown);
+        let state = ARCHIVE_INDEX_SYNC.0.lock().unwrap();
+        assert!(state.stopping);
+        assert!(!state.in_flight);
+        assert!(state.pending.contains_key(&git_dir));
+        assert_eq!(shared_index_tree(&repo), recovered_tree);
+        assert!(!git_dir.join("index.lock").exists());
+        assert!(!git_dir.join("index.lock.owner").exists());
     }
 
     #[test]
