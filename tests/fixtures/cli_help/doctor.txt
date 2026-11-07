@@ -9,7 +9,7 @@ Commands:
   artifacts          Inventory test, perf, forensic, and e2e artifact roots without deleting anything
   backups
   capabilities       Print the agent-facing contract: detectors, fixers, exit codes, env vars, run-artifact schema. JSON only
-  check
+  check              Report mailbox diagnostics without changing state
   drain              Report the supervised drain/restart protocol for the current mailbox owner without killing any process (read-only)
   explain            Expand a single finding by id with full evidence + remediation
   fix                Attempt automatic remediation for detected issues
