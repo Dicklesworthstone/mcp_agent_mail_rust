@@ -13,19 +13,34 @@ can report/save successful-only samples as a passing baseline.
 - [x] Trace timing, aggregation, report/exit and baseline-writing consumers.
 - [x] Reject incomplete timings when constructing a qualified benchmark result;
   keep raw successful samples and failed invocation details in the report.
-- [x] Return runtime failure for partial runs; retain a report even when every
-  selected benchmark fails, and prevent any failed run replacing a baseline.
+- [x] Implement runtime failure for partial runs; retain a report even when every
+  selected benchmark fails, and prevent invocation failures replacing a baseline.
 - [x] Add real subprocess controls for warmup and measurement failures and
   retain the existing happy/empty/all-failed controls without relaxed assertions.
-- [ ] Reproduce the original CLI false success with an owned child failure.
-- [ ] Run formatting, all-target/production checks and strict Clippy through
-  normal admitted RCH execution; freeze the exact candidate and retain receipts.
+- [x] Reproduce both original CLI false successes with an owned child failure:
+  warmup and measurement controls each exit0 and overwrite an existing baseline.
+  A complete original happy control also executes four children and saves data.
+- [x] Find and reproduce a report-retention oversight: two concurrent successful
+  original CLI runs, same timestamp, retain only one file. Add process/sequence
+  names, exclusive creation and a deterministic same-timestamp storage test.
+- [x] Remove the quick benchmark unit test's obsolete installed-am PATH skip;
+  the handler invokes current_exe, so the existing body needs no installed am.
+- [ ] Complete formatting, all-target/production checks and strict Clippy on the
+  final source. Initial candidate: formatting0; all-target/production refuse120
+  before Cargo (normal14GiB growth/10GiB floor plus another10GiB reservation);
+  initial overlapping production and subsequent Clippy refuse103. No compiler
+  or native tests run, no budget/floor/classification changes. The retention
+  follow-up is newer than those refused attempts and needs its own qualification.
 - [ ] Build/execute the actual candidate CLI; verify happy, warmup/measurement
   failure, report/exit and absent/existing baseline preservation paths.
 - [ ] Execute focused native tests if ordinary admission permits; preserve
   environmental refusals and original `.90`30+6 unexecuted acceptance.
 - [ ] Reread the final implementation and consumers; record precise evidence,
   keep remaining `.5` route/load/comparability requirements open, and hand off.
+
+The first fix and TODO were committed by another process in `fdb5e763` and
+`16b4889e` while qualification was running; publication precedes compiler
+qualification. Raw controls/refusals: `/data/tmp/am-bench-failures-20261107.HKEhlZjC`.
 
 Consumer: the operator's explicitly requested TODO; gate: this bounded fix's
 review handoff; retirement: session history. No measurement-speedup, complete
