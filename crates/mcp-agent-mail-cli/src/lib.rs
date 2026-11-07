@@ -26645,6 +26645,29 @@ struct BenchRunReport {
     regression_count: usize,
 }
 
+fn write_bench_report(timestamp: &str, encoded: &str) -> CliResult<PathBuf> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let results_dir = PathBuf::from("benches/results");
+    std::fs::create_dir_all(&results_dir)
+        .map_err(|err| CliError::Other(format!("failed to create benches/results: {err}")))?;
+    let report_path = results_dir.join(format!(
+        "summary_{}_{}_{}.json",
+        timestamp,
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // Separate processes and repeated calls in one process retain distinct
+    // reports. Exclusive creation also preserves existing files on collision.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&report_path)
+        .map_err(|err| CliError::Other(format!("failed to create bench report: {err}")))?;
+    std::io::Write::write_all(&mut file, encoded.as_bytes())
+        .map_err(|err| CliError::Other(format!("failed to write bench report: {err}")))?;
+    Ok(report_path)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_bench(
     quick: bool,
@@ -26888,14 +26911,9 @@ fn handle_bench(
         regression_count,
     };
 
-    let results_dir = PathBuf::from("benches/results");
-    std::fs::create_dir_all(&results_dir)
-        .map_err(|err| CliError::Other(format!("failed to create benches/results: {err}")))?;
-    let report_path = results_dir.join(format!("summary_{}.json", report.summary.timestamp));
     let encoded = serde_json::to_string_pretty(&report)
         .map_err(|err| CliError::Other(format!("failed to encode bench report: {err}")))?;
-    std::fs::write(&report_path, &encoded)
-        .map_err(|err| CliError::Other(format!("failed to write bench report: {err}")))?;
+    let report_path = write_bench_report(&report.summary.timestamp, &encoded)?;
 
     output::emit_output(&report, fmt, || {
         ftui_runtime::ftui_println!(
@@ -53214,16 +53232,8 @@ http_headers = { Authorization = "Bearer secret" }
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CwdGuard::chdir(dir.path());
 
-        // Skip this test if 'am' is not in PATH, as handle_bench relies on invoking the CLI binary.
-        if std::process::Command::new("am")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            println!("Skipping handle_bench test because 'am' binary is not in PATH");
-            return;
-        }
-
+        // The handler invokes current_exe, not an installed am from PATH.
+        // In this unit test its help subprocess is this test executable.
         let capture = ftui_runtime::StdioCapture::install().expect("install capture");
 
         let result = handle_bench(
@@ -53258,6 +53268,22 @@ http_headers = { Authorization = "Bearer secret" }
             .filter_map(Result::ok)
             .count();
         assert_eq!(report_files, 1, "expected one quick bench report file");
+    }
+
+    #[test]
+    fn benchmark_reports_with_identical_timestamps_preserve_every_run() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().expect("report directory");
+        let _cwd = CwdGuard::chdir(dir.path());
+        let first = write_bench_report("same-timestamp", r#"{"run":1}"#).expect("first report");
+        let second = write_bench_report("same-timestamp", r#"{"run":2}"#).expect("second report");
+
+        assert_ne!(first, second, "one report must not overwrite another");
+        assert_eq!(std::fs::read_to_string(first).unwrap(), r#"{"run":1}"#);
+        assert_eq!(std::fs::read_to_string(second).unwrap(), r#"{"run":2}"#);
+        assert_eq!(std::fs::read_dir("benches/results").unwrap().count(), 2);
     }
 
     #[test]
