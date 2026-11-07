@@ -564,6 +564,9 @@ pub struct ScoreFactorSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
+    /// Ranking actually used, including filter-only queries rewritten to recency.
+    #[serde(default)]
+    pub ranking: RankingMode,
     pub next_cursor: Option<String>,
     pub explain: Option<QueryExplain>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2305,6 +2308,7 @@ mod tests {
     fn search_response_audit_omitted_when_empty() {
         let resp = SearchResponse {
             results: vec![],
+            ranking: RankingMode::Relevance,
             next_cursor: None,
             explain: None,
             assistance: None,
@@ -2319,6 +2323,7 @@ mod tests {
     fn search_response_audit_included_when_present() {
         let resp = SearchResponse {
             results: vec![],
+            ranking: RankingMode::Relevance,
             next_cursor: None,
             explain: None,
             assistance: None,
@@ -2343,6 +2348,7 @@ mod tests {
     fn guidance_omitted_when_none() {
         let resp = SearchResponse {
             results: vec![],
+            ranking: RankingMode::Relevance,
             next_cursor: None,
             explain: None,
             assistance: None,
@@ -2357,6 +2363,7 @@ mod tests {
     fn guidance_included_when_present() {
         let resp = SearchResponse {
             results: vec![],
+            ranking: RankingMode::Relevance,
             next_cursor: None,
             explain: None,
             assistance: None,

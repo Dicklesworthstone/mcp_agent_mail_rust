@@ -206,6 +206,7 @@ fn search_messages_arguments(bytes: &[u8]) -> Value {
             "until",
             "explain",
             "include_body_md",
+            "recipient_kind",
         ],
     )
 }

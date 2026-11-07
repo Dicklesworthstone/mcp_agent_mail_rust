@@ -646,6 +646,7 @@ fn capture_snapshot(
                         // Convert ScopedSearchResponse to SearchResponse shape
                         SearchResponse {
                             results: scoped.results.into_iter().map(|sr| sr.result).collect(),
+                            ranking: scoped.ranking,
                             next_cursor: scoped.next_cursor,
                             explain: scoped.explain,
                             assistance: scoped.assistance,

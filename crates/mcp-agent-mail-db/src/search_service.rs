@@ -297,6 +297,10 @@ fn engine_resolution(
 pub struct ScopedSearchResponse {
     /// Visible results (after scope filtering + redaction).
     pub results: Vec<ScopedSearchResult>,
+    /// Executed ranking, including the newest-first rewrite for filter-only
+    /// queries. Post-search filters use this to encode a visible-hit cursor.
+    #[serde(default)]
+    pub ranking: RankingMode,
     /// Pagination cursor for next page.
     pub next_cursor: Option<String>,
     /// Query explain metadata (when requested).
@@ -6009,6 +6013,7 @@ fn finish_scoped_response(
     };
     Outcome::Ok(ScopedSearchResponse {
         results: scoped_results,
+        ranking: query.ranking,
         next_cursor,
         explain,
         audit_summary: audit,
@@ -6041,6 +6046,7 @@ pub async fn execute_search_simple(
     match execute_search(cx, pool, query, &options).await {
         Outcome::Ok(scoped) => Outcome::Ok(SearchResponse {
             results: scoped.results.into_iter().map(|row| row.result).collect(),
+            ranking: scoped.ranking,
             next_cursor: scoped.next_cursor,
             explain: scoped.explain,
             assistance: scoped.assistance,
@@ -6066,12 +6072,21 @@ fn compute_next_cursor(
     if results.len() < limit {
         return None; // fewer than limit means no more pages
     }
-    // Use the last result's (score, id) as cursor
-    results.last().map(|r| {
-        let score = cursor_sort_score(r, ranking);
-        let cursor = SearchCursor { score, id: r.id };
-        cursor.encode()
-    })
+    results.last().map(|r| search_result_cursor(r, ranking))
+}
+
+/// Encode the continuation immediately after a visible search result.
+///
+/// Post-search filters must resume at their last returned hit when a backend
+/// page contains additional matching rows. Reusing that page's tail cursor
+/// would skip them. Keep the ranking-specific key identical to ordinary search.
+#[must_use]
+pub fn search_result_cursor(result: &SearchResult, ranking: RankingMode) -> String {
+    SearchCursor {
+        score: cursor_sort_score(result, ranking),
+        id: result.id,
+    }
+    .encode()
 }
 
 #[inline]

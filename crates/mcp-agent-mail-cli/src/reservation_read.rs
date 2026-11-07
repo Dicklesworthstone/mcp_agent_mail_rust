@@ -38,6 +38,7 @@ pub(crate) struct ServerResourceSession {
     bearer: Option<String>,
     ancestor_resolution: bool,
     inbox_priority_snapshot: bool,
+    search_recipient_kind: bool,
 }
 
 impl ServerResourceSession {
@@ -65,6 +66,7 @@ impl ServerResourceSession {
             bearer,
             ancestor_resolution: false,
             inbox_priority_snapshot: false,
+            search_recipient_kind: false,
         })
     }
 
@@ -118,6 +120,7 @@ impl ServerResourceSession {
         }
         session.ancestor_resolution = supports_ancestor_resolution(&payload)?;
         session.inbox_priority_snapshot = supports_inbox_priority_snapshot(&payload)?;
+        session.search_recipient_kind = supports_search_recipient_kind(&payload)?;
         Ok(Some(session))
     }
 
@@ -127,6 +130,10 @@ impl ServerResourceSession {
 
     pub(crate) const fn supports_inbox_priority_snapshot(&self) -> bool {
         self.inbox_priority_snapshot
+    }
+
+    pub(crate) const fn supports_search_recipient_kind(&self) -> bool {
+        self.search_recipient_kind
     }
 
     pub(crate) async fn verify_local_mailbox(&self, config: &Config) -> CliResult<()> {
@@ -141,6 +148,7 @@ impl ServerResourceSession {
         if !mailbox_config_matches(&payload, config)?
             || (self.ancestor_resolution && !supports_ancestor_resolution(&payload)?)
             || (self.inbox_priority_snapshot && !supports_inbox_priority_snapshot(&payload)?)
+            || (self.search_recipient_kind && !supports_search_recipient_kind(&payload)?)
         {
             return Err(invalid_response(
                 "mailbox identity changed during server read",
@@ -243,6 +251,14 @@ fn supports_inbox_priority_snapshot(value: &Value) -> CliResult<bool> {
         Some(_) => Err(invalid_response(
             "invalid inbox priority snapshot capability",
         )),
+    }
+}
+
+fn supports_search_recipient_kind(value: &Value) -> CliResult<bool> {
+    match value.get("search_recipient_kind") {
+        None => Ok(false),
+        Some(Value::String(capability)) => Ok(capability == "delivery_v1"),
+        Some(_) => Err(invalid_response("invalid search recipient-kind capability")),
     }
 }
 

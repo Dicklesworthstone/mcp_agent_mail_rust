@@ -8051,6 +8051,8 @@ pub struct SearchData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<mcp_agent_mail_tools::search::SearchDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_index: Option<LexicalBackfillHealth>,
@@ -8171,12 +8173,14 @@ fn search_via_server(
     config: &mcp_agent_mail_core::Config,
     selection: &crate::message_read::ProjectSelection,
     query: &str,
+    recipient_kind: Option<&str>,
     importance: Option<&str>,
     since: Option<&str>,
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<Option<(crate::context::ResolvedProject, SearchData)>, CliError> {
     validate_robot_search_window(limit, cursor)?;
+    let recipient_kind = parse_search_recipient_kind(recipient_kind)?;
     if !selection.permits_automatic_read(config) {
         return Ok(None);
     }
@@ -8187,6 +8191,9 @@ fn search_via_server(
         "explain": true,
         "include_body_md": true,
     });
+    if let Some(kind) = &recipient_kind {
+        arguments["recipient_kind"] = kind.as_str().into();
+    }
     if let Some(cursor) = cursor {
         arguments["cursor"] = cursor.into();
     }
@@ -8204,7 +8211,9 @@ fn search_via_server(
         else {
             return Ok(None);
         };
-        if !selection.supported_by(&session) {
+        if !selection.supported_by(&session)
+            || (recipient_kind.is_some() && !session.supports_search_recipient_kind())
+        {
             return Ok(None);
         }
         let (project_uri, project) =
@@ -8278,6 +8287,7 @@ fn search_data_from_server_response(
         assistance: response.assistance,
         guidance: response.guidance,
         next_cursor: response.next_cursor,
+        diagnostics: response.diagnostics,
         plan_diagnostic: None,
         search_index: None,
         by_thread,
@@ -8315,6 +8325,7 @@ fn build_search(
             assistance: None,
             guidance: Some(empty_search_guidance()),
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
                 pool,
@@ -8403,6 +8414,7 @@ fn build_search(
         assistance: collected.assistance,
         guidance,
         next_cursor,
+        diagnostics: None,
         plan_diagnostic,
         search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
             pool,
@@ -8523,21 +8535,15 @@ where
                 .then(|| out.last())
                 .flatten()
                 .and_then(|row| {
-                    // Robot search uses relevance ranking. Other rankings
-                    // require their own timestamp boundary, so refuse to
-                    // invent a continuation if this helper is reused there.
-                    if paged_query.ranking
-                        != mcp_agent_mail_db::search_planner::RankingMode::Relevance
-                    {
-                        return None;
-                    }
-                    // The SQL fallback has no relevance score. Its search
-                    // service uses zero as the cursor key, with id as the tie
-                    // breaker, so preserve that same continuation contract.
+                    // Query hints can rewrite relevance to recency. Use the
+                    // executed ranking so a timestamp cursor never becomes
+                    // an all-zero relevance boundary and loses later hits.
                     let score = row.score.unwrap_or(0.0);
                     score.is_finite().then(|| {
-                        mcp_agent_mail_db::search_planner::SearchCursor { score, id: row.id }
-                            .encode()
+                        mcp_agent_mail_db::search_service::search_result_cursor(
+                            row,
+                            response.ranking,
+                        )
                     })
                 });
             return Ok(CollectedSearchRows {
@@ -16806,15 +16812,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let config = mcp_agent_mail_core::Config::from_env();
             // br-kp1in.18: a running server answers from its live pool and
             // index in milliseconds; the private snapshot below costs seconds
-            // per call on a large mailbox. The server's search has no
-            // recipient-kind filter. Implicit CWD uses negotiated nearest
-            // ancestor selection, preserving the local project-scope contract.
-            if kind.is_none()
-                && !query.trim().is_empty()
+            // per call on a large mailbox. Recipient-kind filtering is
+            // negotiated before dispatch so older daemons cannot silently
+            // ignore it. Implicit CWD keeps nearest-ancestor project selection.
+            if !query.trim().is_empty()
                 && let Some((project, data)) = search_via_server(
                     &config,
                     &automatic_robot_project_selection(args.project.as_deref())?,
                     &query,
+                    kind.as_deref(),
                     importance.as_deref(),
                     since.as_deref(),
                     limit,
@@ -21602,6 +21608,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![FacetEntry {
@@ -21695,6 +21702,7 @@ mod tests {
                     results: vec![planner_search_result_row(
                         10, "first", 0.9, 100, "th-1", "Alpha",
                     )],
+                    ranking: Default::default(),
                     next_cursor: Some("more-search-results".into()),
                     explain: None,
                     assistance: None,
@@ -21747,6 +21755,7 @@ mod tests {
                     results: vec![planner_search_result_row(
                         id, "match", 0.9, 100, "th-1", "Alpha",
                     )],
+                    ranking: Default::default(),
                     next_cursor,
                     explain: None,
                     assistance: None,
@@ -21821,6 +21830,7 @@ mod tests {
                         planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
                         planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
                     ],
+                    ranking: Default::default(),
                     next_cursor: Some("cursor-2".into()),
                     explain: None,
                     assistance: None,
@@ -21831,6 +21841,7 @@ mod tests {
                     results: vec![planner_search_result_row(
                         30, "third", 0.7, 300, "th-3", "Gamma",
                     )],
+                    ranking: Default::default(),
                     next_cursor: None,
                     explain: None,
                     assistance: None,
@@ -21911,6 +21922,7 @@ mod tests {
                     }
                     Ok(SearchResponse {
                         results,
+                        ranking: Default::default(),
                         next_cursor: more_backend_pages.then(|| "cursor-after-page".into()),
                         explain: None,
                         assistance: None,
@@ -24121,6 +24133,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![FacetEntry {
@@ -24153,6 +24166,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![],
@@ -24194,9 +24208,11 @@ mod tests {
                         ProjectSelection::Exact(path.clone()),
                     ] {
                         assert!(
-                            search_via_server(&config, &selection, "deploy", None, None, 20, None)
-                                .unwrap()
-                                .is_none()
+                            search_via_server(
+                                &config, &selection, "deploy", None, None, None, 20, None,
+                            )
+                            .unwrap()
+                            .is_none()
                         );
                     }
                 }
@@ -24228,6 +24244,7 @@ mod tests {
                     config,
                     &crate::message_read::ProjectSelection::Exact("registered-project".into()),
                     "deploy",
+                    None,
                     Some("high"),
                     None,
                     20,
@@ -24246,6 +24263,113 @@ mod tests {
         );
         assert_eq!(requests[2]["params"]["arguments"]["importance"], "high");
         assert_eq!(requests.len(), 5);
+    }
+
+    #[test]
+    fn robot_search_kind_command_uses_negotiated_server_without_local_mailbox() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        let ((result, output), requests) = with_test_server(
+            |config| {
+                let mut capability = mailbox_payload(config);
+                capability["search_recipient_kind"] = "delivery_v1".into();
+                vec![
+                    TestReply::Resource(capability.clone()),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Tool(serde_json::json!({"result":[{
+                        "id":7,"subject":"Deploy","importance":"high","ack_required":0,
+                        "created_ts":"2026-10-28T00:00:00Z","thread_id":"release","from":"BlueLake",
+                        "to":["RedFox"],"cc":["GreenHill"],"body_md":"Ready to deploy","score":1.5
+                    }]})),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(capability),
+                ]
+            },
+            |_| {
+                let capture = ftui_runtime::StdioCapture::install().unwrap();
+                let result = handle_robot(RobotArgs {
+                    format: Some(OutputFormat::Json),
+                    json: true,
+                    project: Some("registered-project".into()),
+                    agent: None,
+                    command: RobotSubcommand::Search {
+                        query: "deploy".into(),
+                        kind: Some(" CC ".into()),
+                        importance: None,
+                        since: None,
+                        limit: 2,
+                        cursor: None,
+                    },
+                });
+                (result, capture.drain_to_string())
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let payload: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(payload["served_by"], "server");
+        assert_eq!(payload["results"][0]["id"], 7);
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[2]["method"], "tools/call");
+        assert_eq!(requests[2]["params"]["arguments"]["recipient_kind"], "cc");
+        assert_eq!(
+            requests[2]["params"]["arguments"]["project_key"],
+            "/work/demo"
+        );
+    }
+
+    #[test]
+    fn robot_search_kind_negotiates_before_dispatch_and_rechecks_capability() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        for fault in ["missing", "future", "malformed", "changed"] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut capability = mailbox_payload(config);
+                    match fault {
+                        "future" => capability["search_recipient_kind"] = "delivery_v2".into(),
+                        "malformed" => capability["search_recipient_kind"] = true.into(),
+                        "changed" => capability["search_recipient_kind"] = "delivery_v1".into(),
+                        _ => (),
+                    }
+                    let mut replies = vec![TestReply::Resource(capability)];
+                    if fault == "changed" {
+                        replies.extend([
+                            TestReply::Resource(project.clone()),
+                            TestReply::Tool(serde_json::json!({"result":[]})),
+                            TestReply::Resource(project.clone()),
+                            TestReply::Resource(mailbox_payload(config)),
+                        ]);
+                    }
+                    replies
+                },
+                |config| {
+                    search_via_server(
+                        config,
+                        &crate::message_read::ProjectSelection::Exact("registered-project".into()),
+                        "needle",
+                        Some("bcc"),
+                        None,
+                        None,
+                        2,
+                        None,
+                    )
+                },
+            );
+            if matches!(fault, "missing" | "future") {
+                assert!(
+                    result.unwrap().is_none(),
+                    "unsupported daemon must use explicit fallback"
+                );
+            } else {
+                assert!(result.is_err(), "{fault} authority must fail closed");
+            }
+            assert_eq!(requests.len(), if fault == "changed" { 5 } else { 1 });
+        }
     }
 
     #[test]
@@ -24277,7 +24401,7 @@ mod tests {
                     TestReply::Resource(ancestor_mailbox_payload(config)),
                 ]
             },
-            |config| search_via_server(config, &selection, "deploy", None, None, 20, None),
+            |config| search_via_server(config, &selection, "deploy", None, None, None, 20, None),
         );
         let (project, data) = result.unwrap().expect("ancestor search used the daemon");
         assert_eq!(project.human_key, human_key);
@@ -24344,6 +24468,12 @@ mod tests {
                          "from": "BlueLake", "to": [], "cc": [], "score": second_score},
                     ],
                     "next_cursor": "c2",
+                    "diagnostics": {
+                        "degraded": true,
+                        "fallback_mode": "recipient_kind_page_budget",
+                        "budget_exhausted": true,
+                        "remediation_hints": ["Continue with next_cursor"],
+                    },
                 }),
             )
             .expect("server response")
@@ -24354,6 +24484,20 @@ mod tests {
         assert_eq!(data.served_by, Some("server"));
         assert_eq!(data.total_results, 2);
         assert_eq!(data.next_cursor.as_deref(), Some("c2"));
+        let diagnostics = data
+            .diagnostics
+            .as_ref()
+            .expect("server diagnostics survive CLI mapping");
+        assert!(diagnostics.degraded);
+        assert_eq!(diagnostics.budget_exhausted, Some(true));
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("recipient_kind_page_budget")
+        );
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["diagnostics"]["budget_exhausted"],
+            true
+        );
         let (first, second) = (&data.results[0], &data.results[1]);
         assert_eq!((first.id, first.relevance), (7, 1.5));
         assert_eq!(first.snippet, "Roll out the new plan");
@@ -24403,6 +24547,7 @@ mod tests {
             next_cursor: None,
             plan_diagnostic: None,
             search_index: Some(health.clone()),
+            diagnostics: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -24473,6 +24618,7 @@ mod tests {
                 }],
             }),
             next_cursor: Some("s3feccccccccccccd:i42".into()),
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![],
@@ -30760,7 +30906,11 @@ mod tests {
             ..mcp_agent_mail_db::DbPoolConfig::default()
         })
         .expect("create real search pool");
-        for kind in [None, Some("to"), Some("cc")] {
+        for (query, kind) in ["pagewalk", "from:Alice"].into_iter().flat_map(|query| {
+            [None, Some("to"), Some("cc")]
+                .into_iter()
+                .map(move |kind| (query, kind))
+        }) {
             let mut cursor = None;
             let mut ids = HashSet::new();
             let mut cursors = HashSet::new();
@@ -30769,7 +30919,7 @@ mod tests {
                     &conn,
                     &pool,
                     1,
-                    "pagewalk",
+                    query,
                     kind,
                     None,
                     None,
@@ -30802,7 +30952,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 ids, expected,
-                "every matching message must be reachable for {kind:?}"
+                "every matching message must be reachable for {query} {kind:?}"
             );
         }
     }

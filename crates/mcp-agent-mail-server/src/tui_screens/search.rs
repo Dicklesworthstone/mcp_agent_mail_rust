@@ -4301,6 +4301,7 @@ fn run_unified_search(
     }) {
         Outcome::Ok(scoped) => Ok(mcp_agent_mail_db::search_planner::SearchResponse {
             results: scoped.results.into_iter().map(|row| row.result).collect(),
+            ranking: scoped.ranking,
             next_cursor: scoped.next_cursor,
             explain: scoped.explain,
             assistance: scoped.assistance,

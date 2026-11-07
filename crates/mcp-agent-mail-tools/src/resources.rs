@@ -862,6 +862,8 @@ pub struct EnvironmentSnapshot {
     pub project_path_resolution: String,
     #[serde(default)]
     pub inbox_priority_snapshot: String,
+    #[serde(default)]
+    pub search_recipient_kind: String,
     pub http: HttpSnapshot,
 }
 
@@ -896,6 +898,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
         storage_root: config.storage_root.to_string_lossy().into_owned(),
         project_path_resolution: "nearest_ancestor_v1".to_string(),
         inbox_priority_snapshot: "priority_v1".to_string(),
+        search_recipient_kind: "delivery_v1".to_string(),
         http: HttpSnapshot {
             host: config.http_host.clone(),
             port: config.http_port,

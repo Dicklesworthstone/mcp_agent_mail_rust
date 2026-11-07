@@ -25,6 +25,8 @@ const MAX_MESSAGES_PER_SUMMARIZED_THREAD: usize = 1000;
 const SEARCH_MESSAGES_DEFAULT_LIMIT: usize = 20;
 const SEARCH_MESSAGES_RESULT_LIMIT_MAX: usize = 1000;
 const SEARCH_MESSAGES_RESULT_LIMIT_MAX_I32: i32 = 1000;
+const RECIPIENT_KIND_SEARCH_MAX_PAGES: usize = 16;
+const RECIPIENT_KIND_SEARCH_PAGE_LIMIT: usize = 1000;
 
 fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
     if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
@@ -679,6 +681,288 @@ pub(crate) fn parse_importance_list(
     Ok(result)
 }
 
+fn parse_recipient_kind(raw: Option<&str>) -> McpResult<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let kind = raw.to_ascii_lowercase();
+    if matches!(kind.as_str(), "to" | "cc" | "bcc") {
+        Ok(Some(kind))
+    } else {
+        Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "recipient_kind must be one of: to, cc, bcc",
+            true,
+            json!({"field": "recipient_kind", "provided": raw}),
+        ))
+    }
+}
+
+fn merge_search_page_diagnostics(
+    combined: &mut Option<SearchDiagnostics>,
+    next: Option<SearchDiagnostics>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    let Some(combined) = combined else {
+        *combined = Some(next);
+        return;
+    };
+    combined.degraded |= next.degraded;
+    combined.fallback_mode = combined.fallback_mode.take().or(next.fallback_mode);
+    combined.timeout_stage = combined.timeout_stage.take().or(next.timeout_stage);
+    if next.budget_exhausted == Some(true) || combined.budget_tier.is_none() {
+        combined.budget_tier = next.budget_tier.or(combined.budget_tier.take());
+    }
+    combined.budget_exhausted = match (combined.budget_exhausted, next.budget_exhausted) {
+        (Some(a), Some(b)) => Some(a || b),
+        (a, b) => a.or(b),
+    };
+    combined.budget_remaining_ms = match (combined.budget_remaining_ms, next.budget_remaining_ms) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    for hint in next.remediation_hints {
+        if !combined.remediation_hints.contains(&hint) {
+            combined.remediation_hints.push(hint);
+        }
+    }
+}
+
+fn merge_search_page_explain(
+    combined: &mut Option<mcp_agent_mail_db::search_planner::QueryExplain>,
+    next: Option<mcp_agent_mail_db::search_planner::QueryExplain>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    let Some(combined) = combined else {
+        *combined = Some(next);
+        return;
+    };
+    combined.used_like_fallback |= next.used_like_fallback;
+    combined.denied_count = combined.denied_count.saturating_add(next.denied_count);
+    combined.redacted_count = combined.redacted_count.saturating_add(next.redacted_count);
+    if combined.method != next.method {
+        let method = format!("page_method:{}", next.method);
+        if !combined.facets_applied.contains(&method) {
+            combined.facets_applied.push(method);
+        }
+    }
+    for facet in next.facets_applied {
+        if !combined.facets_applied.contains(&facet) {
+            combined.facets_applied.push(facet);
+        }
+    }
+    combined.facet_count = combined.facets_applied.len();
+}
+
+/// Apply delivery-kind filtering against the live pool while retaining the
+/// search backend's ranking, visibility and cursor semantics. Each database
+/// read, search page and total page count is bounded. A budget-limited response
+/// retains a continuation, even when no match has been found yet. Cancellation
+/// uses the caller's context.
+/// Never infer delivery kind from recipient names or expose BCC identities.
+#[allow(clippy::too_many_lines)]
+async fn search_with_recipient_kind(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    query: &mcp_agent_mail_db::search_planner::SearchQuery,
+    options: &mcp_agent_mail_db::search_service::SearchOptions,
+    recipient_kind: Option<&str>,
+) -> McpResult<(
+    mcp_agent_mail_db::search_service::ScopedSearchResponse,
+    Option<SearchDiagnostics>,
+)> {
+    use mcp_agent_mail_db::search_service::{execute_search, search_result_cursor};
+
+    ctx.checkpoint()?;
+    let Some(kind) = recipient_kind else {
+        let response =
+            db_outcome_to_mcp_result(execute_search(ctx.cx(), pool, query, options).await)?;
+        let diagnostics = derive_search_diagnostics(response.explain.as_ref());
+        return Ok((response, diagnostics));
+    };
+    let project_id = query.project_id.ok_or_else(|| {
+        McpError::internal_error("recipient-kind search requires an explicit project")
+    })?;
+    let wanted = query.effective_limit();
+    let mut paged_query = query.clone();
+    paged_query.limit = Some(
+        wanted
+            .saturating_mul(4)
+            .min(RECIPIENT_KIND_SEARCH_PAGE_LIMIT),
+    );
+    // Execute once even when this kind is absent, so query validation and
+    // backend failures are not hidden by the cheap absence shortcut.
+    let mut response =
+        db_outcome_to_mcp_result(execute_search(ctx.cx(), pool, &paged_query, options).await)?;
+    let mut page = std::mem::take(&mut response.results);
+    let mut page_ranking = response.ranking;
+    let mut next_cursor = response.next_cursor.take();
+    let mut diagnostics = derive_search_diagnostics(response.explain.as_ref());
+    let mut results = Vec::with_capacity(wanted);
+    let mut seen_ids = HashSet::with_capacity(wanted);
+    let mut seen_cursors = HashSet::new();
+    if let Some(cursor) = &query.cursor {
+        seen_cursors.insert(cursor.clone());
+    }
+    let mut checked_presence = false;
+    let mut pages = 1;
+    let mut budget_limited = false;
+    loop {
+        ctx.checkpoint()?;
+        let ids: Vec<i64> = page.iter().map(|hit| hit.result.id).collect();
+        let matches = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::message_ids_with_recipient_kind(
+                ctx.cx(),
+                pool,
+                project_id,
+                kind,
+                &ids,
+            )
+            .await,
+        )?;
+        if !checked_presence {
+            checked_presence = true;
+            if matches.is_empty()
+                && !db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::project_has_recipient_kind(
+                        ctx.cx(),
+                        pool,
+                        project_id,
+                        kind,
+                    )
+                    .await,
+                )?
+            {
+                next_cursor = None;
+                break;
+            }
+        }
+        let mut omitted_match = false;
+        for hit in page {
+            if !matches.contains(&hit.result.id) || seen_ids.contains(&hit.result.id) {
+                continue;
+            }
+            if results.len() == wanted {
+                omitted_match = true;
+                break;
+            }
+            seen_ids.insert(hit.result.id);
+            results.push(hit);
+        }
+        if omitted_match {
+            next_cursor = results
+                .last()
+                .map(|hit| search_result_cursor(&hit.result, page_ranking));
+        }
+        if next_cursor
+            .as_ref()
+            .is_some_and(|cursor| seen_cursors.contains(cursor))
+        {
+            return Err(McpError::internal_error(
+                "recipient-kind search received a repeated backend cursor; refusing incomplete results",
+            ));
+        }
+        if results.len() == wanted {
+            break;
+        }
+        if next_cursor.is_some() && pages == RECIPIENT_KIND_SEARCH_MAX_PAGES {
+            budget_limited = true;
+            break;
+        }
+        let Some(cursor) = next_cursor.take() else {
+            break;
+        };
+        seen_cursors.insert(cursor.clone());
+        ctx.checkpoint()?;
+        paged_query.cursor = Some(cursor);
+        let next =
+            db_outcome_to_mcp_result(execute_search(ctx.cx(), pool, &paged_query, options).await)?;
+        pages += 1;
+        response.sql_row_count = response.sql_row_count.saturating_add(next.sql_row_count);
+        merge_search_page_diagnostics(
+            &mut diagnostics,
+            derive_search_diagnostics(next.explain.as_ref()),
+        );
+        merge_search_page_explain(&mut response.explain, next.explain);
+        if let Some(next_audit) = next.audit_summary {
+            let audit = response.audit_summary.get_or_insert_with(Default::default);
+            audit.total_before = audit.total_before.saturating_add(next_audit.total_before);
+            audit.visible_count = audit.visible_count.saturating_add(next_audit.visible_count);
+            audit.redacted_count = audit
+                .redacted_count
+                .saturating_add(next_audit.redacted_count);
+            audit.denied_count = audit.denied_count.saturating_add(next_audit.denied_count);
+            audit.entries.extend(next_audit.entries);
+        }
+        if response.assistance.is_none() {
+            response.assistance = next.assistance;
+        }
+        page_ranking = next.ranking;
+        page = next.results;
+        next_cursor = next.next_cursor;
+    }
+    response.results = results;
+    response.next_cursor = next_cursor;
+    if !response.results.is_empty() {
+        // An early page can be entirely denied by scope while later pages
+        // contain visible matches. Do not retain its zero-result guidance.
+        response.guidance = None;
+    }
+    if let Some(explain) = &mut response.explain {
+        explain
+            .facets_applied
+            .push(format!("recipient_kind:{kind}"));
+        explain
+            .facets_applied
+            .push(format!("recipient_kind_pages:{pages}"));
+        if budget_limited {
+            explain
+                .facets_applied
+                .push("recipient_kind_budget_limited:true".to_string());
+        }
+        explain.facet_count = explain.facets_applied.len();
+    }
+    if budget_limited {
+        merge_search_page_diagnostics(&mut diagnostics, Some(SearchDiagnostics {
+            degraded: true,
+            fallback_mode: Some("recipient_kind_page_budget".to_string()),
+            budget_tier: Some("recipient_kind".to_string()),
+            budget_exhausted: Some(true),
+            remediation_hints: vec![
+                "Continue with `next_cursor` and the same query and recipient_kind; this page does not prove search exhaustion.".to_string(),
+            ],
+            ..Default::default()
+        }));
+        response.guidance = Some(mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+            summary: "Recipient-kind search reached its page work budget; more candidates remain."
+                .to_string(),
+            suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+                kind: "continue_search".to_string(),
+                label: "Continue with next_cursor".to_string(),
+                detail: Some(
+                    "Keep the same query and filters to continue after the examined candidates."
+                        .to_string(),
+                ),
+            }],
+        });
+    } else if response.results.is_empty() && response.guidance.is_none() {
+        response.guidance = Some(mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+            summary: format!("No results found after applying recipient-kind filter `{kind}`."),
+            suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+                kind: "drop_recipient_kind_filter".to_string(),
+                label: "Remove recipient-kind filter".to_string(),
+                detail: Some("Retry without `--kind` to include to/cc/bcc matches.".to_string()),
+            }],
+        });
+    }
+    ctx.checkpoint()?;
+    Ok((response, diagnostics))
+}
+
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,6 +1127,8 @@ pub(crate) fn parse_time_range_with_aliases(
 ///   Default `false` preserves the lightweight FTS5 result-list cost; set `true` when the
 ///   caller intends to read the message contents directly from search output (e.g. when
 ///   `fetch_inbox` or `ReadMcpResourceTool` is unavailable from a spawned pane).
+/// - `recipient_kind`: Keep messages delivered as `to`, `cc`, or `bcc` to any
+///   recipient. Filtering never exposes BCC identities.
 /// - `diagnostics`: Optional degraded-mode metadata for budget/timeout signals
 ///
 /// # Returns
@@ -856,7 +1142,76 @@ pub(crate) fn parse_time_range_with_aliases(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Search over subject and body for a project using the unified Search V3 service.\n\nTips\n----\n- Query parser supports phrases (\"build plan\"), prefix (mig*), and boolean operators (plan AND users)\n- Results default to relevance ranking; set `ranking=\"recency\"` for newest-first\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
+    description = r#"Search over subject and body for a project using the unified Search V3 service.
+
+Tips
+----
+- Query parser supports phrases ("build plan"), prefix (mig*), and boolean operators (plan AND users)
+- Results default to relevance ranking; set `ranking="recency"` for newest-first
+- Limit defaults to 20; raise for broad queries
+- All filter parameters are optional; omit to search without filtering
+
+Query examples
+--------------
+- Phrase search: `"build plan"`
+- Prefix: `migrat*`
+- Boolean: `plan AND users`
+- Require urgent: `urgent AND deployment`
+
+Parameters
+----------
+project_key : str
+    Project identifier.
+query : str
+    Search query string.
+limit : int
+    Max results to return (default 20, max 1000).
+offset : int
+    Offset after filtering (default 0; offset plus limit at most 5000).
+cursor : str
+    Continue with next_cursor and the same query and filters; overrides offset.
+ranking : str
+    Ranking mode: "relevance" (default) or "recency" (newest first).
+sender : str
+    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.
+recipient_kind : str
+    Keep messages delivered to any agent as "to", "cc", or "bcc". BCC identities are never returned.
+    Sparse matches may reach the bounded page budget before filling limit. Continue with next_cursor,
+    including when result is empty; diagnostics and guidance identify a partial page.
+importance : str
+    Filter by importance level(s). Comma-separated: "low", "normal", "high", "urgent".
+thread_id : str
+    Filter by thread ID (exact match).
+date_start : str
+    Inclusive lower bound for created timestamp.
+date_end : str
+    Inclusive upper bound for created timestamp.
+    Aliases for start: `date_from`, `after`, `since`.
+    Aliases for end: `date_to`, `before`, `until`.
+    Date-only values are normalized in UTC (`date_end` includes the full day).
+explain : bool
+    If true, include query explain metadata in the response (default false).
+include_body_md : bool
+    Include full message bodies (default false).
+
+Returns
+-------
+dict
+    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }
+
+`diagnostics` is present when degraded-mode signals are detected (budget governor pressure, stage timeout, recipient-kind page budget).
+
+Examples
+--------
+Basic search:
+```json
+{"project_key":"/abs/path/backend","query":"build plan","limit":50}
+```
+
+Filtered search:
+```json
+{"project_key":"/abs/path/backend","query":"migration","sender":"BlueLake","recipient_kind":"cc","importance":"high,urgent","ranking":"recency"}
+```"#
 )]
 pub async fn search_messages(
     ctx: &McpContext,
@@ -881,6 +1236,7 @@ pub async fn search_messages(
     until: Option<String>,
     explain: Option<bool>,
     include_body_md: Option<bool>,
+    recipient_kind: Option<String>,
 ) -> McpResult<String> {
     let mut phase = TailLatencyPhaseRecorder::new("search_messages");
     phase.mark("queue_wait");
@@ -888,6 +1244,7 @@ pub async fn search_messages(
     phase.set_include_bodies(include_body_md);
     let (max_results, offset_val, planner_limit) =
         parse_search_messages_window(limit, offset, cursor.is_some())?;
+    let recipient_kind = parse_recipient_kind(recipient_kind.as_deref())?;
 
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();
@@ -970,16 +1327,26 @@ pub async fn search_messages(
         ..Default::default()
     };
 
-    let planner_response = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::search_service::execute_search(
-            ctx.cx(),
-            &pool,
-            &search_query,
-            &search_options,
-        )
-        .await,
-    )?;
+    let (planner_response, diagnostics) = search_with_recipient_kind(
+        ctx,
+        &pool,
+        &search_query,
+        &search_options,
+        recipient_kind.as_deref(),
+    )
+    .await?;
     phase.mark("search_service_query");
+    if recipient_kind.is_some()
+        && offset_val > planner_response.results.len()
+        && planner_response.next_cursor.is_some()
+    {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "recipient-kind search reached its work budget before the requested offset; use cursor pagination without offset or narrow the query",
+            true,
+            json!({"field": "offset", "offset": offset_val}),
+        ));
+    }
 
     // Map planner SearchResult → tool SearchResult (legacy format)
     // Apply offset manually (planner doesn't support offset for simple search)
@@ -1030,7 +1397,7 @@ pub async fn search_messages(
     );
 
     let diagnostics = merge_search_index_diagnostics(
-        derive_search_diagnostics(planner_response.explain.as_ref()),
+        diagnostics,
         &mcp_agent_mail_db::search_service::lexical_backfill_health(&pool),
     );
     phase.mark("diagnostics_derivation");
@@ -1424,7 +1791,425 @@ pub async fn summarize_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::{Cx, Outcome, runtime::RuntimeBuilder};
     use mcp_agent_mail_db::queries::ThreadMessageRow;
+    use mcp_agent_mail_db::search_planner::{RankingMode, SearchQuery};
+    use mcp_agent_mail_db::search_service::{SearchOptions, execute_search};
+    use std::sync::Mutex;
+
+    static RECIPIENT_SEARCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_recipient_search_corpus<F, Fut>(test: F)
+    where
+        F: FnOnce(McpContext, mcp_agent_mail_db::DbPool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        crate::test_support::with_isolated_mailbox(
+            &RECIPIENT_SEARCH_TEST_LOCK,
+            "recipient search",
+            &[
+                ("AM_SEARCH_ENGINE", "lexical"),
+                ("AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES", "lexical"),
+            ],
+            |_| {
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let pool: mcp_agent_mail_db::DbPool =
+                        crate::tool_util::get_db_pool().expect("seed pool").clone();
+                    let conn = match pool.acquire(&cx).await {
+                        Outcome::Ok(conn) => conn,
+                        Outcome::Err(error) => panic!("acquire corpus connection: {error}"),
+                        Outcome::Cancelled(reason) => panic!("acquire corpus connection cancelled: {reason:?}"),
+                        Outcome::Panicked(payload) => panic!("acquire corpus connection panicked: {}", payload.message()),
+                    };
+                    conn.execute_raw("BEGIN IMMEDIATE").expect("begin corpus");
+                    conn.execute_raw(
+                        "INSERT INTO projects (id,slug,human_key,created_at) VALUES
+                            (1,'kind-search','/tmp/kind-search',1),
+                            (2,'other-search','/tmp/other-search',1);
+                         INSERT INTO agents (id,project_id,name,program,model,inception_ts,last_active_ts) VALUES
+                            (1,1,'BlueLake','test','test',1,1),
+                            (2,1,'RedFox','test','test',1,1),
+                            (3,1,'GreenHill','test','test',1,1),
+                            (4,1,'AmberStone','test','test',1,1),
+                            (5,1,'HiddenOwl','test','test',1,1),
+                            (6,2,'OtherLake','test','test',1,1),
+                            (7,2,'OtherOwl','test','test',1,1);",
+                    ).expect("project and agent corpus");
+                    use mcp_agent_mail_db::sqlmodel_core::Value;
+                    for id in 1_i64..=96 {
+                        // Equal timestamps and identical text exercise both cursor
+                        // tie-breakers. The deliberately inaccurate envelope must
+                        // never determine the delivery kind.
+                        conn.execute_sync(
+                            "INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts,recipients_json)
+                             VALUES (?,1,1,'needle','needle body',?,'{\"to\":[\"RedFox\"],\"cc\":[],\"bcc\":[\"HiddenOwl\"]}')",
+                            &[Value::BigInt(id), Value::BigInt((id / 6 + 1) * 1_000_000)],
+                        ).expect("message corpus");
+                        conn.execute_sync(
+                            "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,2,'to')",
+                            &[Value::BigInt(id)],
+                        ).expect("direct delivery");
+                        if id % 3 == 0 {
+                            conn.execute_sync(
+                                "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,3,'cc'),(?,4,'cc')",
+                                &[Value::BigInt(id), Value::BigInt(id)],
+                            ).expect("two CC deliveries must produce one search hit");
+                        }
+                    }
+                    conn.execute_raw(
+                        "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (1,5,'bcc');
+                         INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts)
+                            VALUES (1000,2,6,'needle','needle body',1000000000);
+                         INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (1000,7,'bcc');
+                         COMMIT;",
+                    ).expect("sparse and foreign deliveries");
+                    drop(conn);
+                    test(McpContext::new(cx, 1), pool).await;
+                });
+            },
+        );
+    }
+
+    fn recipient_search_options() -> SearchOptions {
+        SearchOptions {
+            search_engine: Some(mcp_agent_mail_core::config::SearchEngine::Lexical),
+            track_telemetry: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn recipient_kind_search_drains_real_lexical_and_hint_only_pages_exactly() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            let options = recipient_search_options();
+            for (text, ranking) in [
+                ("needle", RankingMode::Relevance),
+                ("needle", RankingMode::Recency),
+                ("from:BlueLake", RankingMode::Relevance),
+            ] {
+                let mut query = SearchQuery::messages(text, 1);
+                query.ranking = ranking;
+                query.limit = Some(200);
+                query.explain = true;
+                let baseline = db_outcome_to_mcp_result(
+                    execute_search(ctx.cx(), &pool, &query, &options).await,
+                )
+                .expect("unfiltered real search");
+                assert_eq!(baseline.results.len(), 96, "full project corpus for {text}");
+                if text == "from:BlueLake" {
+                    assert_eq!(baseline.ranking, RankingMode::Recency);
+                } else if ranking == RankingMode::Relevance {
+                    assert!(
+                        baseline
+                            .results
+                            .iter()
+                            .all(|hit| hit.result.score.is_some_and(|score| score != 0.0)),
+                        "exercise scored lexical execution, not an unscored fallback"
+                    );
+                }
+                let expected: Vec<_> = baseline
+                    .results
+                    .iter()
+                    .filter(|hit| hit.result.id % 3 == 0)
+                    .map(|hit| (hit.result.id, hit.result.score))
+                    .collect();
+                query.limit = Some(2);
+                let mut actual = Vec::new();
+                let mut cursors = HashSet::new();
+                loop {
+                    let (page, diagnostics) =
+                        search_with_recipient_kind(&ctx, &pool, &query, &options, Some("cc"))
+                            .await
+                            .expect("filtered real search");
+                    assert!(page.results.len() <= 2);
+                    assert!(!diagnostics.is_some_and(|d| d.budget_exhausted == Some(true)));
+                    actual.extend(
+                        page.results
+                            .into_iter()
+                            .map(|hit| (hit.result.id, hit.result.score)),
+                    );
+                    let Some(cursor) = page.next_cursor else {
+                        break;
+                    };
+                    assert!(
+                        cursors.insert(cursor.clone()),
+                        "continuation must advance for {text}"
+                    );
+                    assert!(cursors.len() <= 32, "filtered search must terminate");
+                    query.cursor = Some(cursor);
+                }
+                assert_eq!(
+                    actual, expected,
+                    "retain order, scores and every matching ID for {text}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn recipient_kind_search_sparse_budget_retains_a_resumable_empty_page() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            let mut query = SearchQuery::messages("from:BlueLake", 1);
+            query.limit = Some(1);
+            query.explain = true;
+            let options = recipient_search_options();
+            let (first, diagnostics) =
+                search_with_recipient_kind(&ctx, &pool, &query, &options, Some("bcc"))
+                    .await
+                    .expect("bounded sparse search");
+            assert!(
+                first.results.is_empty(),
+                "oldest BCC is beyond the first 64 candidates"
+            );
+            let diagnostics = diagnostics.expect("partial response is explicit");
+            assert!(diagnostics.degraded);
+            assert_eq!(diagnostics.budget_exhausted, Some(true));
+            assert_eq!(
+                diagnostics.fallback_mode.as_deref(),
+                Some("recipient_kind_page_budget")
+            );
+            assert!(
+                first
+                    .explain
+                    .unwrap()
+                    .facets_applied
+                    .contains(&"recipient_kind_pages:16".to_string())
+            );
+            assert_eq!(
+                first.guidance.unwrap().suggestions[0].kind,
+                "continue_search"
+            );
+            query.cursor = Some(
+                first
+                    .next_cursor
+                    .expect("empty partial page must not report exhaustion"),
+            );
+            let (second, diagnostics) =
+                search_with_recipient_kind(&ctx, &pool, &query, &options, Some("bcc"))
+                    .await
+                    .expect("continue sparse search");
+            assert_eq!(
+                second
+                    .results
+                    .iter()
+                    .map(|hit| hit.result.id)
+                    .collect::<Vec<_>>(),
+                [1]
+            );
+            assert!(!diagnostics.is_some_and(|d| d.budget_exhausted == Some(true)));
+            if let Some(cursor) = second.next_cursor {
+                query.cursor = Some(cursor);
+                let (last, _) =
+                    search_with_recipient_kind(&ctx, &pool, &query, &options, Some("bcc"))
+                        .await
+                        .expect("final cursor");
+                assert!(last.results.is_empty());
+                assert!(last.next_cursor.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn recipient_kind_database_truth_is_project_scoped_batched_and_duplicate_free() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            // More than the SQLite IN-list batch size, with duplicate IDs and
+            // an existing foreign-project delivery in the second batch.
+            let mut ids: Vec<i64> = (1..=700).collect();
+            ids.extend([3, 6, 1000]);
+            let matching = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::message_ids_with_recipient_kind(
+                    ctx.cx(),
+                    &pool,
+                    1,
+                    "cc",
+                    &ids,
+                )
+                .await,
+            )
+            .expect("batched delivery query");
+            assert_eq!(
+                matching,
+                (1..=96).filter(|id| id % 3 == 0).collect::<HashSet<_>>()
+            );
+            let bcc = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::message_ids_with_recipient_kind(
+                    ctx.cx(),
+                    &pool,
+                    1,
+                    "bcc",
+                    &ids,
+                )
+                .await,
+            )
+            .expect("BCC is a delivery filter without recipient identity");
+            assert_eq!(bcc, HashSet::from([1]));
+            let mut query = SearchQuery::messages("needle", 2);
+            query.limit = Some(1);
+            query.explain = true;
+            let (page, _) = search_with_recipient_kind(
+                &ctx,
+                &pool,
+                &query,
+                &recipient_search_options(),
+                Some("cc"),
+            )
+            .await
+            .expect("kind absent in selected project");
+            assert!(page.results.is_empty());
+            assert!(page.next_cursor.is_none());
+            assert!(
+                page.explain
+                    .unwrap()
+                    .facets_applied
+                    .contains(&"recipient_kind_pages:1".to_string())
+            );
+        });
+    }
+
+    async fn call_recipient_search_tool(
+        ctx: &McpContext,
+        kind: &str,
+        offset: Option<i32>,
+        cursor: Option<String>,
+    ) -> serde_json::Value {
+        let router = fastmcp_server::ServerBuilder::new("recipient-kind-search-test", "0")
+            .tool(crate::SearchMessages)
+            .build()
+            .into_router();
+        let response = router
+            .handle_tools_call(
+                ctx,
+                fastmcp::CallToolParams {
+                    name: "search_messages".to_string(),
+                    arguments: Some(json!({
+                        "project_key": "kind-search",
+                        "query": "needle",
+                        "limit": 2,
+                        "offset": offset,
+                        "cursor": cursor,
+                        "ranking": "recency",
+                        "explain": true,
+                        "include_body_md": true,
+                        "recipient_kind": kind,
+                    })),
+                    meta: None,
+                },
+                fastmcp_core::SessionState::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("registered recipient-kind tool call");
+        assert!(!response.is_error, "search tool returned an error response");
+        assert_eq!(response.content.len(), 1, "one serialized search result");
+        let fastmcp::legacy_2024::LegacyContent::Text { text: payload, .. } = &response.content[0]
+        else {
+            panic!("search tool must return JSON text content");
+        };
+        assert!(
+            !payload.contains("HiddenOwl"),
+            "search must not disclose BCC identities"
+        );
+        serde_json::from_str(payload).expect("tool JSON")
+    }
+
+    #[test]
+    fn recipient_kind_tool_applies_offset_after_filtering_and_keeps_bcc_private() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            let mut query = SearchQuery::messages("needle", 1);
+            query.ranking = RankingMode::Recency;
+            query.limit = Some(200);
+            let baseline = db_outcome_to_mcp_result(
+                execute_search(ctx.cx(), &pool, &query, &recipient_search_options()).await,
+            )
+            .expect("baseline");
+            let expected: Vec<_> = baseline
+                .results
+                .iter()
+                .filter(|hit| hit.result.id % 3 == 0)
+                .map(|hit| hit.result.id)
+                .collect();
+            let first = call_recipient_search_tool(&ctx, " CC ", Some(3), None).await;
+            let ids = |payload: &serde_json::Value| {
+                payload["result"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit["id"].as_i64().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&first), expected[3..5]);
+            let second = call_recipient_search_tool(
+                &ctx,
+                "cc",
+                Some(3),
+                Some(first["next_cursor"].as_str().unwrap().to_string()),
+            )
+            .await;
+            assert_eq!(ids(&second), expected[5..7], "cursor overrides offset");
+            let bcc = call_recipient_search_tool(&ctx, "bcc", None, None).await;
+            assert_eq!(
+                ids(&bcc),
+                [1],
+                "stale recipients_json must not create false BCC matches"
+            );
+            assert!(bcc["result"][0].get("bcc").is_none());
+            assert_eq!(bcc["result"][0]["body_md"], "needle body");
+        });
+    }
+
+    #[test]
+    fn recipient_kind_search_cancellation_is_an_error() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            let _ = ctx.request_cancellation().cancel();
+            let mut query = SearchQuery::messages("needle", 1);
+            query.limit = Some(1);
+            assert!(
+                search_with_recipient_kind(
+                    &ctx,
+                    &pool,
+                    &query,
+                    &recipient_search_options(),
+                    Some("bcc"),
+                )
+                .await
+                .is_err(),
+                "cancellation must not become a successful empty page"
+            );
+        });
+    }
+
+    #[test]
+    fn recipient_kind_search_merges_later_page_degradation() {
+        let mut combined = Some(SearchDiagnostics {
+            budget_tier: Some("interactive".into()),
+            budget_remaining_ms: Some(90),
+            ..Default::default()
+        });
+        merge_search_page_diagnostics(
+            &mut combined,
+            Some(SearchDiagnostics {
+                degraded: true,
+                fallback_mode: Some("lexical".into()),
+                timeout_stage: Some("rerank".into()),
+                budget_tier: Some("pressure".into()),
+                budget_remaining_ms: Some(0),
+                budget_exhausted: Some(true),
+                remediation_hints: vec!["retry".into()],
+                ..Default::default()
+            }),
+        );
+        let diagnostics = combined.unwrap();
+        assert!(diagnostics.degraded);
+        assert_eq!(diagnostics.fallback_mode.as_deref(), Some("lexical"));
+        assert_eq!(diagnostics.timeout_stage.as_deref(), Some("rerank"));
+        assert_eq!(diagnostics.budget_tier.as_deref(), Some("pressure"));
+        assert_eq!(diagnostics.budget_remaining_ms, Some(0));
+        assert_eq!(diagnostics.budget_exhausted, Some(true));
+        assert_eq!(diagnostics.remediation_hints, ["retry"]);
+    }
 
     #[test]
     fn parse_thread_ids_trims_and_drops_empty_values() {
