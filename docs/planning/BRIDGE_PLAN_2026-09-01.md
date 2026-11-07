@@ -1,5 +1,181 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 7 regression-baseline follow-through — EmeraldEagle
+
+This requested fresh pass reuses original `.5` and `.90`; evidence remains
+under `/data/tmp/am-fresh-bench-review-20261107.X0h2EI`, with fresh2 prefixes.
+
+- [x] Verify unchanged governing docs and all3,160 selected code/build inputs
+  against the fully compiled and CLI-exercised frame E; zero differences.
+  Reacquire the same five narrow leases and confirm live mailbox health.
+- [x] Review timing errors, baseline load/compare/save and report/exit ordering
+  again. The all-failed envelope repair has no newly confirmed regression.
+- [x] Attempt the missing benchmark Rust bodies after the full CLI reservation
+  releases: unchanged native30GiB growth/10GiB floor refuses120 before Cargo
+  on hz3 at74,104,446,976free bytes. No test bodies, no unchanged retry.
+- [x] Reproduce a separate baseline-loss defect with the verified frame-E ELF:
+  `--baseline baseline.json --save-baseline baseline.json` against a private
+  planted0ms baseline exits3 with regression_count1 but baseline_savedtrue,
+  overwriting0 with12.29ms. Retain stdout, changed bytes and the receipt;
+  this deliberately planted threshold is a correctness control, no speed claim.
+- [x] Count regressions before baseline writing and prevent invocation failures
+  and regression exit3 from saving a replacement or new baseline.
+- [x] Preserve the original quick-handler assertions and extend the same real
+  subprocess fixture with failed-regression existing/absent output paths and
+  a non-regressing positive save control. No new CWD mutation fixture.
+- [x] Run one unchanged five-case actual-CLI oracle against the old E executable:
+  both positive saves pass, while all3 regression-preservation cases fail
+  (same input/output, absent output, distinct existing output). Retain the
+  deliberately red runner1, actual CLI3 and overwritten/created file bytes.
+  Those same5 assertions will run on F; the previous8 control bodies are also
+  byte-identical after adding only explicit binary/output-path arguments.
+- [x] Freeze F separately from E's identity: only the CLI library file differs;
+  retain the E library/driver verbatim and verify all3,160 selected inputs
+  still match main and the qualifier. No old E result qualifies F.
+- [x] Formatting0 and separate production0 (hz2/build30097323753210023,
+  receipt030b3c11), freshly verifying all3,917 hashes/sizes/executable bits.
+- [x] Separate workspace all-target0 on hz2/build30097323753210025,
+  receipt880f8b36; all3,917 records freshly match the production vector.
+- [x] Strict workspace all-target Clippy0 on vmi1149989/build30097323753210024,
+  receipt93c1466d; all3,917 records match the same vector. That worker's pinned
+  rustc90850177249efe0321573c569aec5d12b257f8d6/Cargo e8cb624d5 are verified.
+- [x] Full changed-library UBS completes0 in940s:0critical,10,312warnings,
+  5,024info, no failed modules. All31 changed-line findings are test assertions,
+  necessary owned-path clones and private fixture I/O. The unchanged whole-bench
+  critical remains a red precommit gate; no suppression or waiver.
+- [ ] Finish the full default F CLI, verify source/worker/local ELF identity,
+  then execute the same8 old controls plus all5 baseline controls (13 total).
+  First F build30097323753210022 reaches the unchanged1,800s limit, client1,
+  E104/unverified group cleanup and worker quarantine. Exact recovery fails
+  E504 on source-authority locks; supported exact-job cancellation is accepted,
+  but subsequent recoveries/attach still fail E504. No replay or fallback.
+- [ ] Reconcile retained wrapper rchw-142f909d-b6fc-4083-aa66-bdc65013272e
+  through supported recovery. A read-only worker completion record matches its
+  retained identity and reports120, while lease acknowledgment/source retirement
+  remain false. A reachable-worker census finds no matching namespace process;
+  that is not exhaustive group-death or authority-release proof. Keep the job
+  unacknowledged and its original E104/E504 failures visible until resolved.
+- [ ] Run the existing18-assertion stdio E2E on the verified F binary with the
+  original5s malformed-case bound and retained private state.
+- [ ] Execute the missing benchmark/native test bodies once ordinary admission
+  permits; keep this separate from actual CLI controls and lifecycle30+6.
+- [ ] Repair the unsupported stub_encode catalog routes within original `.5`.
+  The verified E executable rejects the advertised stub-encode verb with2;
+  source still selects it when the fixture script exists. An enabled catalog
+  row must dispatch its declared real route; no placeholder or silent skip.
+- [ ] Recheck the final producer/consumer/test diff, update original Beads and
+  flush/verify graph consistency. Keep unmet native, scanner, catalog,
+  route/load/comparability and release acceptance open. Publication remains
+  pending the required zero-exit UBS gate; current changes stay uncommitted.
+
+## November 7 review after a2b77157 — EmeraldEagle
+
+This continuation reuses the existing TODO and original Beads; raw results are
+under `/data/tmp/am-fresh-bench-review-20261107.X0h2EI`.
+
+- [x] Reread the complete suite/project AGENTS and README, recent source diffs,
+  benchmark execution/aggregation/report/baseline consumers and changed tests.
+- [x] Review the report-directory isolation, migration/mailbox assertions,
+  optional golden diagnostics and lazy search-diagnostic merge again. No
+  regression confirmed in those changes; retain the separate all-failed
+  diagnostic gap below. No golden fixture regeneration.
+- [x] Refresh mailbox health and ready-work triage. The live mailbox is healthy;
+  CASS has no initialized archive, so no wider indexed-history claim. Existing
+  release tasks still require proof on the accepted DSR publisher path.
+- [x] Freshly verify all3,160 selected crate/script/build/test inputs against
+  the qualified frame-D snapshot and frozen build tree: zero differences.
+  The earlier four passing source gates remain source evidence only.
+- [x] Identify changed ordinary capacity: hz4 reports66.6GiB free, versus about
+  52GiB at the earlier refusal. Read-only preflight selects it with the same
+  30GiB native growth budget and10GiB protected floor.
+- [x] Complete one strict-remote native attempt preserving all30 original
+  lifecycle cases plus3 existing storage controls. Supported isolated placement
+  avoids the interrupted pooled namespace; actual admission still refuses120
+  before Cargo with71,380,963,328free bytes against unchanged30GiB growth,
+  10GiB floor and active reservations. Original30+6 execution remains zero;
+  preflight selection was not an execution grant. Later, after the compiler
+  jobs release their hz2 slots, a fresh preflight selects hz2 with53GiB free.
+  The explicit original33-case command still refuses120 before Cargo
+  (build30097323753210020, free56,649,977,856bytes, unchanged growth/floor).
+  The exact filter matches the first attempt. No unchanged retry.
+- [ ] If admitted and successful, verify all30 original case identities and run
+  the original six fresh solo repeats; keep extra storage controls separate.
+- [x] Retain the refusal and implement the remaining all-failed timing gap on
+  original `.5`: the typed error owns its complete timing envelope, and the
+  CLI moves that envelope into the report without duplicating failure records.
+  Error exit, successful-only aggregation and baseline preservation remain.
+- [x] Strengthen the missing-command case and add a real exit23 control with
+  two warmups/three measurements, independent five-invocation counter, exact
+  phase/iteration/status records, and failed aggregation. Existing partial,
+  happy and typed error-count assertions remain intact.
+- [x] Qualify new frame E with formatting, separate production, separate
+  all-target and strict all-target Clippy. Only the two existing CLI source
+  files differ from D; old passing source receipts cannot qualify E. Fresh
+  formatting0 and production0 (hz2/build30097323753210014, receiptdb9d91ec,
+  all3,917 hash/size/executable-bit records freshly match) now complete;
+  separate all-target also finishes0 (hz2/build30097323753210016,
+  receipt1ef56d85), freshly matches all3,917 records and the production vector.
+  Strict Clippy on hz4 stops on output-scan/heartbeat failure, not a compiler
+  verdict. Exact recovery, including supported cancellation, still returns
+  source-pair-release E504. Its isolated retry queues out103 without a grant;
+  isolated Clippy on hz2 finishes0 (build30097323753210017), freshly verifies
+  all3,917 records and the same production/all-target vector. Later the hz4
+  journal reports terminal acknowledgment; supported exact-wrapper recovery
+  confirms120 with terminal_acknowledged:true. Its original monitor failure
+  and both failed E504 recoveries remain retained, without compiler credit.
+- [x] Complete and triage whole changed-file scans without suppression. Bench
+  scan finishes1 with the unchanged parameterized-command critical finding,
+  194warnings/35info; the CLI supplies current_exe and built-in arguments.
+  Lib scan finishes0 in1,167s with0critical/10,293warnings/5,012info. Findings
+  on new lines are test assertions, a shell printf literal, and necessary
+  diagnostic string/name allocations; no additional confirmed bug or
+  project-wide clean-scan claim. The required whole-bench scan remains red;
+  the repository's zero-exit precommit rule is not satisfied by false-positive
+  triage alone. Keep publication pending rather than suppressing the finding
+  or changing the general command API to evade it.
+- [x] Build the full default CLI and execute all eight actual controls. Their
+  original exit/baseline/concurrency conditions remain; the all-failed case
+  additionally requires all four invocation records instead of missing timing.
+  A production server-library preparation includes the default CLI's existing
+  core agent-detection feature; it reaches the unchanged1,800s limit after
+  starting server compilation (build30097323753210013). Exact recovery
+  acknowledges120. The first full CLI attempt uses that same explicit feature
+  argument, already enabled by the CLI's core dependency, so the effective
+  default graph is unchanged. It also reaches1,800s (build30097323753210018);
+  exact recovery acknowledges120. Read-only inspection finds1,100 completed
+  dependency libraries under the target's debug/build layout, so one identical
+  warm attempt follows on the same worker, source, arguments and limits.
+  That build finishes0 in693.5s (hz3/build30097323753210019,
+  receipt2fa2f6ac), freshly verifies all3,917 inputs and the same three compiler
+  vectors. Worker/local ELF SHA25625db2cfee2643d664a60d98504e430209e71ef6928c8b07f0fd10d4f6391dec1
+  and305,335,856bytes match. Main/qualifier still match all3,160 selected inputs.
+  All8 controls finish0 at the runner: two happy CLI0, four single-fault CLI1,
+  all-failed CLI1 retaining all4 records, and two concurrent happy parents
+  retaining two distinct same-second reports with exact contents. Every fault
+  is parent-bound, pidfd-bound and observed stopped before signaling. No old ELF,
+  feature cut, profile/deadline change, cold-build or performance claim.
+  CLI native tests and broader `.5` route/load/comparability acceptance remain
+  open on their original requirements.
+- [x] Execute the existing18-assertion stdio E2E through this verified CLI and
+  its canonical native entrypoint, retaining private state and the original
+  malformed-case5s bound. It finishes18/0/0 in47,232ms; malformed whole case
+  is3,914ms against5,000ms. The executable remains byte-identical afterward.
+  Historical original-ELF passes cannot qualify E; these are new E results.
+- [ ] Execute native CLI unit/integration bodies once ordinary admission allows
+  them, including the new exit23 and strengthened missing-command cases.
+  Compilation and actual CLI controls do not substitute for those test bodies.
+- [x] Reread the final product diff, update original `.5`/`.90` with observed
+  results, flush Beads and verify zero dependency cycles. Both JSONL deltas
+  contain only comments/updated_at on those two owned in-progress issues;
+  no new/removed tasks, scope/acceptance edits or closures. Diff check passes.
+- [ ] Publish this patch after satisfying the required zero-exit UBS gate.
+  Current code, TODO and Bead records remain uncommitted. Preserve the red scan,
+  native admission failures and all raw receipts; no suppressions or waiver.
+
+Consumer: the operator's requested detailed TODO and fresh-review handoff;
+retirement: session history. Review, waiting and refused execution earn no
+capability, native-test or release credit.
+
 ## November 7 benchmark failure propagation — EmeraldEagle
 
 Original `br-kp1in.5` remains the owner of the broader measurement capability.
