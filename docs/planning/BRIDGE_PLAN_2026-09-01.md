@@ -43,18 +43,18 @@ under `/data/tmp/am-fresh-bench-review-20261107.X0h2EI`, with fresh2 prefixes.
   5,024info, no failed modules. All31 changed-line findings are test assertions,
   necessary owned-path clones and private fixture I/O. The unchanged whole-bench
   critical remains a red precommit gate; no suppression or waiver.
-- [ ] Finish the full default F CLI, verify source/worker/local ELF identity,
-  then execute the same8 old controls plus all5 baseline controls (13 total).
-  First F build30097323753210022 reaches the unchanged1,800s limit, client1,
-  E104/unverified group cleanup and worker quarantine. Exact recovery fails
-  E504 on source-authority locks; supported exact-job cancellation is accepted,
-  but subsequent recoveries/attach still fail E504. No replay or fallback.
 - [ ] Reconcile retained wrapper rchw-142f909d-b6fc-4083-aa66-bdc65013272e
-  through supported recovery. A read-only worker completion record matches its
-  retained identity and reports120, while lease acknowledgment/source retirement
-  remain false. A reachable-worker census finds no matching namespace process;
+  through supported recovery. Its F build30097323753210022 reaches the original
+  1,800s limit, client1/E104, unverified cleanup and quarantine. Exact recovery
+  fails E504/source-authority locks; supported cancellation is accepted, but
+  subsequent recovery/attach still fails E504. Read-only worker completion
+  matches its retained identity and reports120, while lease acknowledgment and
+  source retirement remain false. A census finds no matching namespace process;
   that is not exhaustive group-death or authority-release proof. Keep the job
   unacknowledged and its original E104/E504 failures visible until resolved.
+- [ ] Finish the full default F CLI, verify source/worker/local ELF identity,
+  then execute the same8 old controls plus all5 baseline controls (13 total).
+  No replay or fallback while the preceding ownership recovery is unsettled.
 - [ ] Run the existing18-assertion stdio E2E on the verified F binary with the
   original5s malformed-case bound and retained private state.
 - [ ] Execute the missing benchmark/native test bodies once ordinary admission
@@ -63,10 +63,15 @@ under `/data/tmp/am-fresh-bench-review-20261107.X0h2EI`, with fresh2 prefixes.
   The verified E executable rejects the advertised stub-encode verb with2;
   source still selects it when the fixture script exists. An enabled catalog
   row must dispatch its declared real route; no placeholder or silent skip.
-- [ ] Recheck the final producer/consumer/test diff, update original Beads and
-  flush/verify graph consistency. Keep unmet native, scanner, catalog,
-  route/load/comparability and release acceptance open. Publication remains
-  pending the required zero-exit UBS gate; current changes stay uncommitted.
+- [x] Recheck the final producer/consumer/test diff, update original Beads and
+  flush/verify graph consistency. No further defect in these changes; keep
+  unmet native, scanner, catalog, route/load/comparability and release acceptance
+  open. No structure, scope, acceptance or closure changes.
+- [x] Preserve concurrent publication: another process commits source72ea482f
+  and planning46dae119 at15:39UTC. Fresh fetch verifies main and its compatibility
+  mirror match46dae119; all3,160 selected source inputs still match F. Earlier
+  uncommitted status is historical. Publication supplies no new scanner,
+  native-runtime, independent-verification or release credit.
 
 ## November 7 review after a2b77157 — EmeraldEagle
 
