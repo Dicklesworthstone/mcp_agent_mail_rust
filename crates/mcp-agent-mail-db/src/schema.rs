@@ -5497,12 +5497,12 @@ mod tests {
             102
         );
         let unchanged = v15_fixture_snapshot(conn);
-        assert!(
+        assert_eq!(
             run_specific_migrations(cx, conn, vec![migration.clone()])
                 .await
                 .into_result()
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Vec::<String>::new()
         );
         assert_eq!(v15_fixture_snapshot(conn), unchanged);
 

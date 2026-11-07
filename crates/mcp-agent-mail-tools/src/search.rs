@@ -713,7 +713,7 @@ fn merge_search_page_diagnostics(
     combined.fallback_mode = combined.fallback_mode.take().or(next.fallback_mode);
     combined.timeout_stage = combined.timeout_stage.take().or(next.timeout_stage);
     if next.budget_exhausted == Some(true) || combined.budget_tier.is_none() {
-        combined.budget_tier = next.budget_tier.or(combined.budget_tier.take());
+        combined.budget_tier = next.budget_tier.or_else(|| combined.budget_tier.take());
     }
     combined.budget_exhausted = match (combined.budget_exhausted, next.budget_exhausted) {
         (Some(a), Some(b)) => Some(a || b),
@@ -1924,7 +1924,7 @@ mod tests {
                             .await
                             .expect("filtered real search");
                     assert!(page.results.len() <= 2);
-                    assert!(!diagnostics.is_some_and(|d| d.budget_exhausted == Some(true)));
+                    assert!(diagnostics.is_none_or(|d| d.budget_exhausted != Some(true)));
                     actual.extend(
                         page.results
                             .into_iter()
@@ -1998,7 +1998,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [1]
             );
-            assert!(!diagnostics.is_some_and(|d| d.budget_exhausted == Some(true)));
+            assert!(diagnostics.is_none_or(|d| d.budget_exhausted != Some(true)));
             if let Some(cursor) = second.next_cursor {
                 query.cursor = Some(cursor);
                 let (last, _) =

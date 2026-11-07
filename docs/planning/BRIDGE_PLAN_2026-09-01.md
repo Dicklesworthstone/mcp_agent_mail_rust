@@ -11,8 +11,10 @@ can report/save successful-only samples as a passing baseline.
   ownership, mailbox health and ready work. No new defect in the previous diff.
 - [x] Claim `.5` and reserve the two existing source files and tracking paths.
 - [x] Trace timing, aggregation, report/exit and baseline-writing consumers.
-- [x] Reject incomplete timings when constructing a qualified benchmark result;
-  keep raw successful samples and failed invocation details in the report.
+- [x] Reject incomplete timings when constructing a successful benchmark result;
+  keep partial-run raw samples and failed invocation details in the report.
+  An all-failed run retains the existing typed error/count rather than a full
+  per-invocation timing envelope; broader `.5` telemetry acceptance remains open.
 - [x] Implement runtime failure for partial runs; retain a report even when every
   selected benchmark fails, and prevent invocation failures replacing a baseline.
 - [x] Add real subprocess controls for warmup and measurement failures and
@@ -23,20 +25,139 @@ can report/save successful-only samples as a passing baseline.
 - [x] Find and reproduce a report-retention oversight: two concurrent successful
   original CLI runs, same timestamp, retain only one file. Add process/sequence
   names, exclusive creation and a deterministic same-timestamp storage test.
+- [x] Fresh-review the new report fixture's process-wide CWD dependency. Pass
+  the output directory explicitly to the private writer and use the existing
+  canonical temporary-directory helper in the test. It keeps the same two-file
+  and exact-content assertions without changing CWD or taking a capture lock;
+  the production caller still writes to benches/results.
 - [x] Remove the quick benchmark unit test's obsolete installed-am PATH skip;
   the handler invokes current_exe, so the existing body needs no installed am.
-- [ ] Complete formatting, all-target/production checks and strict Clippy on the
-  final source. Initial candidate: formatting0; all-target/production refuse120
-  before Cargo (normal14GiB growth/10GiB floor plus another10GiB reservation);
-  initial overlapping production and subsequent Clippy refuse103. No compiler
-  or native tests run, no budget/floor/classification changes. The retention
-  follow-up is newer than those refused attempts and needs its own qualification.
+- [x] Fix the real all-target compiler failure: the existing robot golden search
+  fixture omitted the optional diagnostics field added by another change.
+  Set it to None; the production type omits None when serializing. No golden
+  content, assertion or update policy changes.
+- [x] Freeze the final production source in a build-only detached worktree;
+  verify 3,160 crate/script/build inputs against main. Final overlays are the
+  one-line integration-fixture correction, the lint repairs below and the
+  explicit report output directory. The first native --lib attempt captured
+  the prior fixture version, which it does not compile; no native execution
+  is attributed to the final source.
+- [x] Reread timing/result/report/baseline consumers and report-path readers.
+  Existing report consumers use summary_*.json; both filename changes fit.
+- [x] Strengthen the private fault driver: bind a pidfd before identity checks,
+  verify its parent PID, stop and observe the live owned help child, then kill
+  it through that handle. Fresh parent-bound original controls also reproduce
+  both false successes with all four children observed.
+  This prevents a signal to an already-exited child masquerading as a fault.
+  Both stronger original warmup/measurement controls still exit0 and overwrite
+  the baseline; the measurement control retains only two successful samples.
+- [x] Fix six real strict-Clippy findings in the existing mailbox, migration and
+  search files: preserve empty-result assertions, lazily take a fallback tier,
+  and simplify equivalent optional-diagnostic assertions. No lint suppression,
+  weakened assertion or golden change. Retain both original lint failures101.
+- [x] Complete frame-C formatting, separate production graph and strict workspace
+  all-target Clippy: all exit0. Production receipt ad1e6fbd and Clippy4565bdb6
+  each freshly match all3,917 source records, with identical input vectors.
+- [x] Complete the separate all-target check on frame C: exit0 on hz2,
+  receipt ffbd98f4, all3,917 fresh records match the production/Clippy vectors.
+  Cargo retains an upstream proc-macro-error2 future-compatibility warning.
+  Final all-target first refuses103 when hz4 becomes temporarily unreachable
+  after the production pass; ordinary placement admits the successful cold
+  second-worker compilation (25m07s).
+  Earlier refused120/103, fixture101, actual1,800s timeout/recovery120 and hz3
+  monitor_unavailable outcomes remain retained. Two hz3 exact recoveries return
+  E504 with sources retired and terminal acknowledgment initially unresolved.
+  Later supported exact-wrapper cancellation and recovery acknowledge both
+  failures120; the original client137/native zero-case result is retained.
+  None is
+  waived or reclassified; no policy, budget, floor or timeout changes.
+- [x] Requalify final frame D after making the report directory explicit.
+  Formatting0; normal hz2 strict-Clippy admission refuses120 (normal7GiB
+  growth,10GiB floor and existing reservations). The admitted hz4 Clippy run
+  stops on output-scan deadline/3s guardian heartbeat, not a compiler verdict
+  or measured disk exhaustion; exact recovery returns E504 for its source-pair
+  release receipt. Supported exact-job cancellation followed by recovery now
+  acknowledges that failure120; the earlier failed recovery remains retained.
+  Final production on hz2 (ab43a6a4), isolated Clippy on hz3 (5f6973f0), and
+  separate all-target on hz2 (9e72afc7) all exit0. Each full receipt freshly
+  matches3917 files/byte sizes/executable bits and the same source vector.
+  Retain the isolated-vmi114 all-target admission120 as well. The three older
+  frame-C passes above remain historical, not substituted for these results.
 - [ ] Build/execute the actual candidate CLI; verify happy, warmup/measurement
-  failure, report/exit and absent/existing baseline preservation paths.
+  failure, report/exit and absent/existing baseline preservation paths, all-failed
+  reporting and concurrent report retention. Eight controls declared before
+  candidate execution. First CLI attempt refuses103 at source namespace setup;
+  frozen build compiles but reaches its unchanged1,800s SSH limit. Exact-wrapper
+  recovery acknowledges exit120. A second one-job and a later two-job frozen
+  compilation also reach1,800s; both are now acknowledged120 by exact-wrapper
+  recovery. A concurrent warm attempt refuses120 under the ordinary disk guard.
+  An ordinary three-job attempt refuses103 while the worker is temporarily
+  unreachable. After recovery, normal placement refuses103 at source namespace
+  initialization; documented clean-baseline/three-file-overlay mode also
+  refuses103 at an owned-namespace collision. Neither grants execution. No
+  candidate ELF or actual candidate control has run; no installed binary
+  substitution, protected-namespace change, timeout or gate change. After the
+  cold all-target pass, the ordinary frame-C default-feature build on hz2
+  compiles until the unchanged1,800s limit; exact-wrapper recovery acknowledges
+  exit120. Final frame-D candidate execution remains zero.
+  After final frame-D checks pass, its ordinary default-feature CLI build is
+  admitted on hz2 but reaches the unchanged1,800s limit; exact recovery
+  acknowledges120. A normal production tools-library build on hz3 completes0
+  in1,622s; receipt53f0c676 freshly verifies all3,917 records and the same final
+  source vector. The full default CLI build on that worker's completed cache
+  also reaches the unchanged1,800s limit (build30097323753210011); exact-wrapper
+  recovery acknowledges120. No candidate executable, any of the eight real
+  controls, or current-candidate stdio is qualified. The library pass is build
+  preparation only, with no cold-build or performance win claimed. All
+  original failures remain retained; no further equivalent build retry.
+- [ ] Execute existing native CLI unit and integration cases: all bench unit
+  cases, both report/quick-run consumers, actual-binary help snapshots and the
+  search-query-class golden whose fixture was corrected. This genuine test
+  lane builds the real CLI, but unifies dev features and does not replace the
+  production graph check or reclassify the standalone-build failures. Both
+  actual ordinary attempts refuse120 at disk admission; zero test bodies run.
 - [ ] Execute focused native tests if ordinary admission permits; preserve
-  environmental refusals and original `.90`30+6 unexecuted acceptance.
-- [ ] Reread the final implementation and consumers; record precise evidence,
-  keep remaining `.5` route/load/comparability requirements open, and hand off.
+  environmental refusals and original `.90`30+6 acceptance. The declared real
+  selection compiled until the hz3 monitor failure; no test body executed.
+  A normal one-job retry refuses103 at source namespace setup. A later hz2
+  eligibility probe identifies normal30GiB growth/10GiB floor, but actual
+  admission refuses120 after accounting for live reservations (48.55GiB free).
+  A clean committed9a68 Git snapshot attempt on hz3 queues out103. Original
+  30+6 population is still zero. A later vmi1149989 attempt also refuses120
+  before Cargo:45.9GiB actually free cannot cover normal30GiB growth, existing
+  reservations and10GiB protected floor. No orphan-helper or release
+  qualification, reservation clearing or resource override.
+  RCH documents RCH_DISABLE_TARGET_REUSE=1 for interrupted pooled ownership;
+  an ordinary attempt with that supported isolated placement queues out103
+  behind the active compiler. It issues no execution grant or test pass.
+  A dedicated three-component selection preserves all30 original cases and
+  the3 existing storage controls, while leaving CLI benchmark tests separately
+  open. It removes only the unrelated CLI/embedded-Beads build dependency;
+  all original six solo repeats remain required. Its normal hz3 admission
+  still refuses120 with64.3GiB actually free: unchanged30GiB growth,10GiB floor
+  and active reservations. No native test body executes.
+- [x] Finish supported full-file scans and classify actual findings. Two-file
+  scans remain partial/exit2 at1,200/1,800s. Complete bench scan:1 critical,
+  173 warnings (parameterized executable finding is on unchanged code); fixture
+  scan:2 critical,17 warnings (unchanged panic and search-token literal). No
+  suppression or partial-result acceptance. Full lib scan completes in1,488s,
+  exit0,0 critical/10,293 warnings/5,012 info. Findings on new lines concern
+  required test assertions, small diagnostic allocations and synchronous CLI
+  I/O; no additional confirmed bug. This is not a project-wide clean scan.
+  Final full-file scan of the three lint-touched files also completes0 with
+  0 critical/1,498 warnings/205 info; changed-line warnings are test assertions.
+- [x] Complete the full CLI lib scan again on final frame D: exit0 in853s,
+  0 critical/10,292 warnings/5,011 info, no failed module. Changed-line findings
+  are required assertions/expect calls and ordinary synchronous CLI file I/O;
+  the reported division is the literal path benches/results. Same1,800s
+  scanner module budget; no suppression or partial-result acceptance.
+- [ ] Broader existing cross-module CWD/capture coordination still needs real
+  parallel native qualification: existing mutators use unrelated locks. The
+  new report fixture is isolated; no global test-harness repair is claimed.
+- [x] Reread final timing/result/report/baseline and diagnostic merge consumers;
+  compare all source changes again. No additional confirmed defect.
+- [x] Record final evidence, keep remaining `.5` route/load/comparability and
+  original `.90` requirements open, publish the bounded changes and hand off.
 
 The first fix and TODO were committed by another process in `fdb5e763` and
 `16b4889e` while qualification was running; publication precedes compiler

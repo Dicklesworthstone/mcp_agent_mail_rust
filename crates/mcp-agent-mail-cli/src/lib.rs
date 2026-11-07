@@ -26645,10 +26645,9 @@ struct BenchRunReport {
     regression_count: usize,
 }
 
-fn write_bench_report(timestamp: &str, encoded: &str) -> CliResult<PathBuf> {
+fn write_bench_report(results_dir: &Path, timestamp: &str, encoded: &str) -> CliResult<PathBuf> {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let results_dir = PathBuf::from("benches/results");
-    std::fs::create_dir_all(&results_dir)
+    std::fs::create_dir_all(results_dir)
         .map_err(|err| CliError::Other(format!("failed to create benches/results: {err}")))?;
     let report_path = results_dir.join(format!(
         "summary_{}_{}_{}.json",
@@ -26913,7 +26912,11 @@ fn handle_bench(
 
     let encoded = serde_json::to_string_pretty(&report)
         .map_err(|err| CliError::Other(format!("failed to encode bench report: {err}")))?;
-    let report_path = write_bench_report(&report.summary.timestamp, &encoded)?;
+    let report_path = write_bench_report(
+        Path::new("benches/results"),
+        &report.summary.timestamp,
+        &encoded,
+    )?;
 
     output::emit_output(&report, fmt, || {
         ftui_runtime::ftui_println!(
@@ -53272,18 +53275,16 @@ http_headers = { Authorization = "Bearer secret" }
 
     #[test]
     fn benchmark_reports_with_identical_timestamps_preserve_every_run() {
-        let _guard = stdio_capture_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let dir = tempfile::tempdir().expect("report directory");
-        let _cwd = CwdGuard::chdir(dir.path());
-        let first = write_bench_report("same-timestamp", r#"{"run":1}"#).expect("first report");
-        let second = write_bench_report("same-timestamp", r#"{"run":2}"#).expect("second report");
+        let dir = canonical_test_tempdir("bench-reports-");
+        let first =
+            write_bench_report(dir.path(), "same-timestamp", r#"{"run":1}"#).expect("first report");
+        let second = write_bench_report(dir.path(), "same-timestamp", r#"{"run":2}"#)
+            .expect("second report");
 
         assert_ne!(first, second, "one report must not overwrite another");
         assert_eq!(std::fs::read_to_string(first).unwrap(), r#"{"run":1}"#);
         assert_eq!(std::fs::read_to_string(second).unwrap(), r#"{"run":2}"#);
-        assert_eq!(std::fs::read_dir("benches/results").unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]

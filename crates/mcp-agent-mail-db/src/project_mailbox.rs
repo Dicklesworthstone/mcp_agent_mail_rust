@@ -2355,7 +2355,7 @@ mod tests {
         );
         assert_eq!(visible_ids(&conn, 1, 2), [101, 100]);
         for inactive in [3, 4] {
-            assert!(visible_ids(&conn, 1, inactive).is_empty());
+            assert_eq!(visible_ids(&conn, 1, inactive), Vec::<i64>::new());
             assert!(
                 reference_project_mailbox_rows_from_conn(&conn, 1, inactive, None, 50, options())
                     .unwrap()
@@ -2428,7 +2428,7 @@ mod tests {
         conn.execute_raw("UPDATE agents SET retired_at=NULL WHERE id IN (3,4)")
             .unwrap();
         assert_eq!(visible_ids(&conn, 1, 4), [101, 100]);
-        assert!(visible_ids(&conn, 1, 3).is_empty());
+        assert_eq!(visible_ids(&conn, 1, 3), Vec::<i64>::new());
         let receipts = conn
             .query_sync(
                 "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts",
