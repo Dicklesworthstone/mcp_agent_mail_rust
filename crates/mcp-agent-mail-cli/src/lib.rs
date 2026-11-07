@@ -26631,12 +26631,14 @@ struct BenchRunFailure {
 #[derive(Debug, Serialize)]
 struct BenchRunReport {
     summary: bench::BenchSummary,
+    timings: std::collections::BTreeMap<String, bench::TimingResult>,
     profile: bench::BenchProfile,
     warmup: u32,
     runs: u32,
     filter: Option<String>,
     baseline_path: Option<String>,
     save_baseline_path: Option<String>,
+    baseline_saved: bool,
     seed_report: Option<bench::BenchSeedReport>,
     skipped: Vec<String>,
     failures: Vec<BenchRunFailure>,
@@ -26785,6 +26787,7 @@ fn handle_bench(
         seeded_database_available: needs_seeded_db,
     };
     let mut summary = bench::BenchSummary::new(hardware.clone());
+    let mut timings = std::collections::BTreeMap::new();
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
     for cfg in &configs {
@@ -26811,20 +26814,22 @@ fn handle_bench(
         let mut benchmark_env = bench_env.clone();
         benchmark_env.extend(cfg.env.clone());
         match bench::run_timed(&command, cfg.warmup, cfg.runs, &benchmark_env, Some(&cwd)) {
-            Ok(timing) => match bench::BenchResult::from_samples(
-                cfg.name.clone(),
-                command_display,
-                &timing.samples_seconds,
-                signature,
-                None,
-            ) {
-                Ok(result) => summary.insert(result),
-                Err(err) => failures.push(BenchRunFailure {
-                    name: cfg.name.clone(),
-                    command: command.join(" "),
-                    error: err.to_string(),
-                }),
-            },
+            Ok(timing) => {
+                match bench::BenchResult::from_timing(
+                    cfg.name.clone(),
+                    command_display,
+                    &timing,
+                    signature,
+                ) {
+                    Ok(result) => summary.insert(result),
+                    Err(err) => failures.push(BenchRunFailure {
+                        name: cfg.name.clone(),
+                        command: command.join(" "),
+                        error: err.to_string(),
+                    }),
+                }
+                timings.insert(cfg.name.clone(), timing);
+            }
             Err(err) => failures.push(BenchRunFailure {
                 name: cfg.name.clone(),
                 command: command.join(" "),
@@ -26832,7 +26837,7 @@ fn handle_bench(
             }),
         }
     }
-    if summary.benchmarks.is_empty() {
+    if summary.benchmarks.is_empty() && failures.is_empty() {
         return Err(CliError::Other(
             "no benchmarks completed successfully; check failure diagnostics".to_string(),
         ));
@@ -26853,10 +26858,14 @@ fn handle_bench(
             BENCH_DEFAULT_REGRESSION_THRESHOLD,
         );
     }
-    if let Some(path) = save_baseline.as_ref() {
+    let baseline_saved = if let Some(path) = save_baseline.as_ref().filter(|_| failures.is_empty())
+    {
         bench::save_baseline(&summary.benchmarks, path)
             .map_err(|err| CliError::Other(format!("failed to save baseline: {err}")))?;
-    }
+        true
+    } else {
+        false
+    };
 
     let regression_count = summary
         .benchmarks
@@ -26865,12 +26874,14 @@ fn handle_bench(
         .count();
     let report = BenchRunReport {
         summary,
+        timings,
         profile,
         warmup,
         runs,
         filter: filter.clone(),
         baseline_path: baseline.map(|path| path.to_string_lossy().into_owned()),
         save_baseline_path: save_baseline.map(|path| path.to_string_lossy().into_owned()),
+        baseline_saved,
         seed_report,
         skipped,
         failures,

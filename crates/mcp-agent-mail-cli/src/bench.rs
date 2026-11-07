@@ -144,6 +144,13 @@ pub enum BenchValidationError {
     EmptySetupCommand,
     #[error("benchmark samples must not be empty")]
     EmptySamples,
+    #[error(
+        "benchmark invocations failed: warmup={warmup_failures}, measurement={measurement_failures}"
+    )]
+    FailedInvocations {
+        warmup_failures: u32,
+        measurement_failures: u32,
+    },
 }
 
 /// Timing phase for one benchmark process invocation.
@@ -1017,6 +1024,29 @@ fn percentile(sorted_values: &[f64], p: f64) -> f64 {
 }
 
 impl BenchResult {
+    /// Aggregate only a complete timing run; partial successes are diagnostic
+    /// samples and must not become a successful result or a saved baseline.
+    pub fn from_timing(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        timing: &TimingResult,
+        fixture_signature: impl Into<String>,
+    ) -> Result<Self, BenchValidationError> {
+        if timing.has_failures() {
+            return Err(BenchValidationError::FailedInvocations {
+                warmup_failures: timing.warmup_failures,
+                measurement_failures: timing.measurement_failures,
+            });
+        }
+        Self::from_samples(
+            name,
+            command,
+            &timing.samples_seconds,
+            fixture_signature,
+            None,
+        )
+    }
+
     /// Construct a benchmark result from duration samples measured in seconds.
     pub fn from_samples(
         name: impl Into<String>,
@@ -1730,6 +1760,61 @@ mod tests {
         assert_eq!(result.measurement_failures, 0);
         assert!(!result.has_failures());
         assert!(result.total_elapsed_us > 0);
+        let aggregate = BenchResult::from_timing("help", "test --help", &result, "fixture")
+            .expect("complete timing run");
+        assert_eq!(aggregate.timeseries_ms.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_timing_runs_preserve_failures_and_cannot_become_baselines() {
+        // Exercise real process exit statuses in both phases. A successful
+        // measurement must not hide an earlier failed invocation.
+        for failed_invocation in [1_u32, 3] {
+            let dir = tempfile::tempdir().expect("counter directory");
+            let counter = dir.path().join("invocations");
+            let command = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"count=0
+if [ -f "$1" ]; then read -r count < "$1"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$1"
+if [ "$count" -eq "$2" ]; then exit 23; fi"#
+                    .to_string(),
+                "bench-invocation".to_string(),
+                counter.to_string_lossy().into_owned(),
+                failed_invocation.to_string(),
+            ];
+            let timing = run_timed(&command, 1, 3, &BTreeMap::new(), None)
+                .expect("partial timing remains available for diagnostics");
+            let warmup_failure = u32::from(failed_invocation == 1);
+            let measurement_failure = 1 - warmup_failure;
+            assert_eq!(fs::read_to_string(counter).expect("counter"), "4\n");
+            assert_eq!(
+                timing.samples_seconds.len(),
+                3 - measurement_failure as usize
+            );
+            assert_eq!(timing.warmup_failures, warmup_failure);
+            assert_eq!(timing.measurement_failures, measurement_failure);
+            assert_eq!(timing.failures.len(), 1);
+            assert_eq!(timing.failures[0].exit_code, Some(23));
+            assert_eq!(
+                timing.failures[0].phase,
+                if warmup_failure == 1 {
+                    TimingPhase::Warmup
+                } else {
+                    TimingPhase::Measurement
+                }
+            );
+            assert_eq!(
+                BenchResult::from_timing("partial", "sh", &timing, "fixture"),
+                Err(BenchValidationError::FailedInvocations {
+                    warmup_failures: warmup_failure,
+                    measurement_failures: measurement_failure,
+                })
+            );
+        }
     }
 
     #[test]
