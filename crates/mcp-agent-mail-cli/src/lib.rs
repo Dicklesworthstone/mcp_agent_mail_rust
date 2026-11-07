@@ -26852,11 +26852,17 @@ fn handle_bench(
                 }
                 timings.insert(cfg.name.clone(), timing);
             }
-            Err(err) => failures.push(BenchRunFailure {
-                name: cfg.name.clone(),
-                command: command.join(" "),
-                error: err.to_string(),
-            }),
+            Err(err) => {
+                let error = err.to_string();
+                if let bench::BenchTimingError::NoSuccessfulMeasurementRuns { timing, .. } = err {
+                    timings.insert(cfg.name.clone(), *timing);
+                }
+                failures.push(BenchRunFailure {
+                    name: cfg.name.clone(),
+                    command: command.join(" "),
+                    error,
+                });
+            }
         }
     }
     if summary.benchmarks.is_empty() && failures.is_empty() {
@@ -26880,7 +26886,14 @@ fn handle_bench(
             BENCH_DEFAULT_REGRESSION_THRESHOLD,
         );
     }
-    let baseline_saved = if let Some(path) = save_baseline.as_ref().filter(|_| failures.is_empty())
+    let regression_count = summary
+        .benchmarks
+        .values()
+        .filter(|result| result.baseline.regression)
+        .count();
+    let baseline_saved = if let Some(path) = save_baseline
+        .as_ref()
+        .filter(|_| failures.is_empty() && regression_count == 0)
     {
         bench::save_baseline(&summary.benchmarks, path)
             .map_err(|err| CliError::Other(format!("failed to save baseline: {err}")))?;
@@ -26889,11 +26902,6 @@ fn handle_bench(
         false
     };
 
-    let regression_count = summary
-        .benchmarks
-        .values()
-        .filter(|result| result.baseline.regression)
-        .count();
     let report = BenchRunReport {
         summary,
         timings,
@@ -53271,6 +53279,80 @@ http_headers = { Authorization = "Bearer secret" }
             .filter_map(Result::ok)
             .count();
         assert_eq!(report_files, 1, "expected one quick bench report file");
+
+        let baseline_path = dir.path().join("baseline.json");
+        let regression_baseline = b"{\"help\":0.0}\n";
+        std::fs::write(&baseline_path, regression_baseline).expect("write regression baseline");
+        for (save_path, existed) in [
+            (baseline_path.clone(), true),
+            (dir.path().join("new-baseline.json"), false),
+        ] {
+            let result = handle_bench(
+                true,
+                None,
+                true,
+                Some(baseline_path.clone()),
+                Some(save_path.clone()),
+                Some("help".to_string()),
+                false,
+                None,
+                None,
+            );
+            let output = capture.drain_to_string();
+            assert!(
+                matches!(&result, Err(CliError::ExitCode(3))),
+                "regressing benchmark must fail: {result:?}"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(extract_json_block(&output).expect("regression report JSON"))
+                    .expect("valid regression report");
+            assert_eq!(parsed["regression_count"], 1);
+            assert_eq!(parsed["baseline_saved"], false);
+            assert!(
+                parsed["failures"]
+                    .as_array()
+                    .expect("failure list")
+                    .is_empty()
+            );
+            assert_eq!(
+                std::fs::read(&baseline_path).expect("preserved regression baseline"),
+                regression_baseline
+            );
+            assert_eq!(save_path.exists(), existed);
+        }
+
+        let passing_baseline = b"{\"help\":1000000000.0}\n";
+        std::fs::write(&baseline_path, passing_baseline).expect("write passing baseline");
+        let result = handle_bench(
+            true,
+            None,
+            true,
+            Some(baseline_path.clone()),
+            Some(baseline_path.clone()),
+            Some("help".to_string()),
+            false,
+            None,
+            None,
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "passing benchmark must save: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(extract_json_block(&output).expect("passing report JSON"))
+                .expect("valid passing report");
+        assert_eq!(parsed["regression_count"], 0);
+        assert_eq!(parsed["baseline_saved"], true);
+        assert_ne!(
+            std::fs::read(&baseline_path).expect("updated passing baseline"),
+            passing_baseline
+        );
+        assert_eq!(
+            std::fs::read_dir(&report_dir)
+                .expect("read every benchmark report")
+                .filter_map(Result::ok)
+                .count(),
+            4,
+            "passing and regressing runs must each retain a report"
+        );
     }
 
     #[test]

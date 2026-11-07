@@ -193,7 +193,7 @@ impl TimingResult {
 }
 
 /// Timing harness failures.
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum BenchTimingError {
     #[error("benchmark command must not be empty")]
     EmptyCommand,
@@ -205,6 +205,7 @@ pub enum BenchTimingError {
     NoSuccessfulMeasurementRuns {
         attempted_runs: u32,
         failure_count: u32,
+        timing: Box<TimingResult>,
     },
 }
 
@@ -797,14 +798,7 @@ pub fn run_timed(
         });
     }
 
-    if samples_seconds.is_empty() {
-        return Err(BenchTimingError::NoSuccessfulMeasurementRuns {
-            attempted_runs: runs,
-            failure_count: measurement_failures,
-        });
-    }
-
-    Ok(TimingResult {
+    let timing = TimingResult {
         samples_seconds,
         warmup_runs: warmup,
         measurement_runs: runs,
@@ -812,7 +806,16 @@ pub fn run_timed(
         measurement_failures,
         failures,
         total_elapsed_us: elapsed_us(started.elapsed()),
-    })
+    };
+    if timing.samples_seconds.is_empty() {
+        return Err(BenchTimingError::NoSuccessfulMeasurementRuns {
+            attempted_runs: runs,
+            failure_count: measurement_failures,
+            timing: Box::new(timing),
+        });
+    }
+
+    Ok(timing)
 }
 
 /// Built-in benchmark catalog, aligned to the existing benchmark script.
@@ -1840,12 +1843,91 @@ if [ "$count" -eq "$2" ]; then exit 23; fi"#
         let err = run_timed(&command, 2, 3, &BTreeMap::new(), None)
             .expect_err("expected no successful measurement runs");
 
+        let BenchTimingError::NoSuccessfulMeasurementRuns {
+            attempted_runs,
+            failure_count,
+            timing,
+        } = err
+        else {
+            panic!("expected no successful measurement runs");
+        };
+        assert_eq!(attempted_runs, 3);
+        assert_eq!(failure_count, 3);
+        assert_eq!(timing.samples_seconds, Vec::<f64>::new());
+        assert_eq!(timing.warmup_runs, 2);
+        assert_eq!(timing.measurement_runs, 3);
+        assert_eq!(timing.warmup_failures, 2);
+        assert_eq!(timing.measurement_failures, 3);
+        assert_eq!(timing.failures.len(), 5);
+        assert!(timing.failures.iter().all(|failure| {
+            failure.exit_code.is_none()
+                && failure
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| !error.is_empty())
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_failed_timing_runs_retain_every_process_invocation() {
+        let dir = tempfile::tempdir().expect("counter directory");
+        let counter = dir.path().join("invocations");
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"count=0
+if [ -f "$1" ]; then read -r count < "$1"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$1"
+exit 23"#
+                .to_string(),
+            "bench-invocation".to_string(),
+            counter.to_string_lossy().into_owned(),
+        ];
+        let err = run_timed(&command, 2, 3, &BTreeMap::new(), None)
+            .expect_err("all process invocations fail");
+        assert_eq!(fs::read_to_string(counter).expect("counter"), "5\n");
+        let BenchTimingError::NoSuccessfulMeasurementRuns {
+            attempted_runs,
+            failure_count,
+            timing,
+        } = err
+        else {
+            panic!("expected no successful measurement runs");
+        };
+        assert_eq!(attempted_runs, 3);
+        assert_eq!(failure_count, 3);
+        assert_eq!(timing.samples_seconds, Vec::<f64>::new());
+        assert_eq!(timing.warmup_failures, 2);
+        assert_eq!(timing.measurement_failures, 3);
         assert_eq!(
-            err,
-            BenchTimingError::NoSuccessfulMeasurementRuns {
-                attempted_runs: 3,
-                failure_count: 3,
-            }
+            timing
+                .failures
+                .iter()
+                .map(|failure| (failure.phase, failure.iteration, failure.exit_code))
+                .collect::<Vec<_>>(),
+            [
+                (TimingPhase::Warmup, 1, Some(23)),
+                (TimingPhase::Warmup, 2, Some(23)),
+                (TimingPhase::Measurement, 1, Some(23)),
+                (TimingPhase::Measurement, 2, Some(23)),
+                (TimingPhase::Measurement, 3, Some(23)),
+            ]
+        );
+        assert!(
+            timing
+                .failures
+                .iter()
+                .all(|failure| failure.error.is_none())
+        );
+        assert!(timing.total_elapsed_us > 0);
+        assert_eq!(
+            BenchResult::from_timing("all-failed", "sh", &timing, "fixture"),
+            Err(BenchValidationError::FailedInvocations {
+                warmup_failures: 2,
+                measurement_failures: 3,
+            })
         );
     }
 
