@@ -332,6 +332,7 @@ fn search_data(
         assistance: None,
         guidance: None,
         next_cursor: None,
+        diagnostics: None,
         plan_diagnostic: None,
         search_index: None,
         by_thread: vec![FacetEntry {
