@@ -2,6 +2,60 @@
 
 ## November 6 fresh-eyes review and startup ownership — EmeraldEagle
 
+Continuation from `86a07526` (23:12 UTC), requested fresh review:
+
+- [x] Refresh governing-doc drift, peer state, ready graph and mailbox health.
+- [x] Reread the complete robot-filter production diff and test changes;
+  trace authoritative readiness, scope, grouped/brief output, opt-in diagnostics
+  and claim guards. No additional confirmed defect in those changes.
+- [x] Inspect ready contact-stats work: its Rust classification repair is already
+  wired; retained production macOS acceptance remains open, no duplicate rewrite.
+- [ ] Continue original `.90` native qualification with unchanged30+6 selection.
+  - [x] Measure changed capacity: vmi1152480 now50.64GiB free, no daemon-visible
+    build on that worker, normal30GiB growth/10GiB floor. No resource changes.
+  - [ ] Complete one source-bound frozen native compilation at that new capacity.
+  - [ ] Execute selected real delayed/inflight, retry, scope and ownership cases
+    plus six fresh repeats if admitted; preserve failures and original deadlines.
+  Both changed-capacity attempts refuse120 before Cargo. The initially observed
+  dead40GiB record is subsequently replaced by live20GiB+10GiB process groups;
+  read-only thread inventory confirms ordinary competing reservations. No
+  manual retirement, process signal, budget/floor change or further retry.
+- [x] Claim ready `br-valyz`; source and actual compiled CLI confirm intended
+  structured-report exit0, table/health exit1 on a missing database. Old help
+  fails to explain the contract; all actual read-only exit controls pass.
+- [x] Explain structured/table exit semantics in CLI help, operator cookbook and
+  the inconsistent AGENTS table row; retain all exit codes and report fields.
+- [ ] Freeze help candidate, compile/check required graphs, inspect new help and
+  execute the same real missing-DB controls plus a fresh solo repeat. No new
+  mirror-the-help unit test or gate is needed for this documentation fix.
+  - [x] Preserve original native help-negative and all six real exit/read-only
+    controls; no mock or changed exit behavior.
+  - [x] Freeze the three help/doc overlays after native workers terminate;
+    main formatting passes. Production/Clippy and alternate CLI build admitted.
+    Initial CLI/all-target attempts refuse120 under normal reservations.
+  - [x] Production graph and strict all-target Clippy pass; freshly verify all
+    3,917 input records with zero mismatches and identical source vectors.
+  - [ ] Complete the separate all-target check and source-bound CLI artifact.
+    Retain the initial120, two hz3 admission103 refusals (slots, then disk),
+    and warmed hz2 admission120. Later primary capacity changes to41GiB free
+    with20GiB reserved: the ordinary all-target check is admitted and running.
+    Original native30GiB growth still does not fit. No budget/floor/policy edit.
+  - [x] Native CLI build0; worker/retrieved ELF hash matches `a8be3447`.
+    All3,917 inputs freshly match the other gates. Rendered help and all six
+    real missing-DB modes pass; no DB/WAL created. Await the separate all-target
+    result before publishing, then repeat the six modes solo before closure.
+  - [x] Full-file scan completes in898s/exit0 with no critical finding or failed
+    module; retain10,285 warnings (10,281 located records map to unchanged source,
+    four count-only warnings), none at the five added comments. Initial300s
+    timeout remains partial/exit2. Supported900s scanner budget only; no source
+    exclusion, partial-result acceptance or application/test deadline change.
+- [ ] Reread findings, update original Beads and existing evidence, flush/cycle
+  check, publish exact owned changes and release reservations. No release claim.
+
+This operator-requested TODO gates their fresh-review acceptance, records the
+observed missing native execution and retires as execution history at handoff.
+Original populated tests take priority over new status machinery.
+
 Continuation from `60c34d76` (22:30 UTC), requested second fresh pass:
 
 - [x] Refresh governing-doc drift, mailbox health, peer state and ready graph.
