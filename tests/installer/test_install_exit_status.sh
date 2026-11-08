@@ -502,6 +502,166 @@ PY
 done
 done
 
+# GH#376: inspect real inherited descriptors, even when a /dev/fd pathname
+# would report a different device. Adapter discovery and negative outputs are
+# explicit fixtures; the positive Python/Perl/procfs cases use native metadata.
+identity_probe="$scratch/fd-identity-probe.sh"
+cat > "$identity_probe" <<'PROBE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root="$1" backend="$2" mode="$3"
+source "$4"
+QUIET=0 HAS_GUM=0 NO_GUM=1
+LOCKED=0 DESTINATION_LOCKED=0
+mkdir "$root/destination"
+private="$root/destination/.mcp-agent-mail-install.lock.$(id -u).d"
+mkdir -m 700 "$private"
+printf 'keep this file\n' > "$root/file"
+expected=$(installer_directory_identity "$private")
+wrong_device="1${expected%:*}:${expected#*:}"
+wrong_inode="${expected%:*}:1${expected#*:}"
+
+command() {
+    case "${1:-}:${2:-}" in
+        -v:python3) case "$backend" in python|perl-fallback) ;; *) return 1 ;; esac ;;
+        -v:perl) case "$backend" in perl|perl-fallback) ;; *) return 1 ;; esac ;;
+        -v:flock) [ "$backend" = procfs ] || return 1 ;;
+    esac
+    builtin command "$@"
+}
+uname() {
+    # On Linux, model Darwin's lack of a trustworthy procfs fallback as well
+    # as its bad /dev/fd device. No macOS kernel behavior is claimed here.
+    if [ "$backend" = procfs ]; then builtin command uname "$@"; else printf 'Darwin\n'; fi
+}
+fault_output() {
+    case "$mode" in
+        device-mismatch) printf '%s' "$wrong_device" ;;
+        inode-mismatch) printf '%s' "$wrong_inode" ;;
+        empty) return 0 ;;
+        malformed) printf 'not-an-identity\n' ;;
+        noisy) printf '%s\nunexpected output\n' "$expected" ;;
+        nonzero) printf '%s' "$expected"; return 71 ;;
+        *) return 99 ;;
+    esac
+}
+native_identity() {
+    local tool="$1"
+    shift
+    printf '%s\n' "$tool" >> "$root/adapters"
+    if [ "$backend:$tool" = perl-fallback:python3 ]; then
+        # An installed but unusable Python (including a developer-tools shim)
+        # must not suppress a working independent native identity provider.
+        printf '%s' "$expected"
+        return 71
+    fi
+    case "$mode" in
+        device-mismatch|inode-mismatch|empty|malformed|noisy|nonzero) fault_output ;;
+        *) builtin command "$tool" "$@" ;;
+    esac
+}
+python3() { native_identity python3 "$@"; }
+perl() { native_identity perl "$@"; }
+stat() {
+    local argument=""
+    for argument in "$@"; do
+        case "$argument" in
+            /dev/fd/*)
+                printf 'untrustworthy devfs identity consulted\n' >> "$root/devfs.calls"
+                printf '%s' "$wrong_device"
+                return 0
+                ;;
+            /proc/self/fd/*)
+                [ "$backend" = procfs ] || return 72
+                case "$mode" in
+                    device-mismatch|inode-mismatch|empty|malformed|noisy|nonzero) fault_output; return $? ;;
+                esac
+                ;;
+        esac
+    done
+    builtin command stat "$@"
+}
+
+for fd in 7 8; do
+    case "$fd" in 7) exec 7< "$private" ;; 8) exec 8< "$private" ;; esac
+    case "$mode:$fd" in
+        file:7) exec 7< "$root/file" ;; file:8) exec 8< "$root/file" ;;
+        closed:7) exec 7<&- ;; closed:8) exec 8<&- ;;
+    esac
+    rc=0
+    identity=$(installer_lock_fd_identity "$fd") || rc=$?
+    case "$mode" in
+        ordinary) [ "$rc" -eq 0 ] && [ "$identity" = "$expected" ] || exit 93 ;;
+        device-mismatch) [ "$rc" -eq 0 ] && [ "$identity" = "$wrong_device" ] || exit 93 ;;
+        inode-mismatch) [ "$rc" -eq 0 ] && [ "$identity" = "$wrong_inode" ] || exit 93 ;;
+        *) [ "$rc" -ne 0 ] && [ -z "$identity" ] || exit 93 ;;
+    esac
+    case "$fd" in 7) exec 7<&- ;; 8) exec 8<&- ;; esac
+done
+for fd in 0 3 9 -1 invalid; do
+    rc=0
+    identity=$(installer_lock_fd_identity "$fd") || rc=$?
+    [ "$rc" -ne 0 ] && [ -z "$identity" ] || exit 93
+done
+
+case "$mode:$backend" in
+    ordinary:perl-fallback)
+        # Identity recovery is independent of the existing kernel adapter's
+        # selection policy; prove both native providers were actually tried.
+        grep -qx python3 "$root/adapters"
+        grep -qx perl "$root/adapters"
+        ;;
+    ordinary:*)
+        acquire_installer_lock "$root/destination" destination
+        [ "$DESTINATION_LOCKED" -eq 1 ]
+        verify_installer_lock_authorities
+        release_installer_lock destination
+        ;;
+    file:*|closed:*) ;;
+    *)
+        # Valid-looking but wrong, failed, or missing identities must never
+        # authorize acquisition, for either the primary or auxiliary lock.
+        if acquire_installer_lock "$root/destination" destination; then exit 91; fi
+        [ "$DESTINATION_LOCKED" -eq 0 ]
+        if acquire_installer_lock "$private" initial; then exit 92; fi
+        [ "$LOCKED" -eq 0 ]
+        ;;
+esac
+[ ! -e "$root/devfs.calls" ]
+[ "$(cat "$root/file")" = 'keep this file' ]
+printf 'descriptor identity and acquisition checks passed\n'
+PROBE
+
+identity_cases=0
+for backend in python perl perl-fallback procfs missing; do
+    case "$backend" in
+        python) command -v python3 >/dev/null || continue ;;
+        perl|perl-fallback) command -v perl >/dev/null || continue ;;
+        procfs) [ "$(uname -s)" = Linux ] && command -v flock >/dev/null || continue ;;
+    esac
+    modes='ordinary file closed device-mismatch inode-mismatch empty malformed noisy nonzero'
+    case "$backend" in perl-fallback) modes=ordinary ;; missing) modes=missing ;; esac
+    for delivery in file stdin; do
+    for mode in $modes; do
+        case_root="$scratch/identity-$backend-$delivery-$mode"
+        mkdir "$case_root"
+        output="$ARTIFACT_DIR/identity-$backend-$delivery-$mode.log"
+        rc=0
+        if [ "$delivery" = file ]; then
+            "$BASH" "$identity_probe" "$case_root" "$backend" "$mode" "$unit_library" > "$output" 2>&1 || rc=$?
+        else
+            "$BASH" -s -- "$case_root" "$backend" "$mode" "$unit_library" < "$identity_probe" > "$output" 2>&1 || rc=$?
+        fi
+        identity_cases=$((identity_cases + 1))
+        printf 'identity %-13s %-5s %-15s exit=%s expected=0\n' "$backend" "$delivery" "$mode" "$rc"
+        if [ "$rc" -ne 0 ]; then
+            failures=$((failures + 1))
+            cat "$output" >&2
+        fi
+    done
+    done
+done
+
 # Exercise the production lock helpers against real OS locks. Only adapter
 # discovery is controlled: the fallback paths execute actual Python/Perl
 # flock calls, and an independent Python descriptor tests their exclusion.
@@ -527,11 +687,18 @@ esac
 printf 'ready\n' > "$root/ready"
 IFS= read -r action
 if [ "$action" = verify ]; then
+    # Keep the actual lock alive on fd 9 while replacing the reserved fd.
+    # Metadata read from a pathname would miss this substitution entirely.
+    case "$mode" in
+        descriptor-directory|descriptor-file) exec 9<&8; exec 8< "$root/substitute" ;;
+        descriptor-closed) exec 9<&8; exec 8<&- ;;
+    esac
     if verify_installer_lock_authorities; then
         echo 'FAIL: a substituted directory passed authority validation' >&2
         exit 91
     fi
     printf 'refused\n' > "$root/refused"
+    case "$mode" in descriptor-*) exec 8<&9; exec 9<&- ;; esac
 fi
 release_installer_lock destination
 PROBE
@@ -569,7 +736,8 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
         continue
     for mode in ("ordinary", "rename", "symlink", "crash", "descendant-normal", "descendant-crash",
                  "precreated", "precreated-public", "precreated-symlink", "precreated-file", "precreated-fifo",
-                 "authority-rename", "authority-symlink", "authority-permissions"):
+                 "authority-rename", "authority-symlink", "authority-permissions",
+                 "descriptor-directory", "descriptor-file", "descriptor-closed"):
         root = Path(scratch) / (backend + "-" + mode)
         authority = root / "authority"
         authority.mkdir(parents=True, mode=0o700)
@@ -671,6 +839,14 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
                 assert locked(retained_private, primary=False), "private replacement lost the held inode lock"
                 owner.stdin.write(b"verify\n")
                 owner.stdin.flush()
+            elif mode.startswith("descriptor-"):
+                substitute = root / "substitute"
+                if mode == "descriptor-directory":
+                    substitute.mkdir(mode=0o700)
+                elif mode == "descriptor-file":
+                    substitute.write_bytes(b"not an installer lock\n")
+                owner.stdin.write(b"verify\n")
+                owner.stdin.flush()
             elif mode.endswith("crash"):
                 owner.kill()
             else:
@@ -698,6 +874,10 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
             if mode == "authority-permissions":
                 assert (root / "refused").read_text() == "refused\n"
                 assert private.stat().st_mode & 0o777 == 0o755
+            if mode.startswith("descriptor-"):
+                assert (root / "refused").read_text() == "refused\n"
+                if mode == "descriptor-file":
+                    assert substitute.read_bytes() == b"not an installer lock\n"
             if mode == "descendant-normal":
                 os.kill(child_pid, 0)  # explicit unlock works while the child remains alive
             completed += 1
@@ -948,7 +1128,7 @@ else
     failures=$((failures + 1))
 fi
 
-printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s kernel cases, %s native cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$kernel_cases" "$native_cases" "$failures"
+printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s identity cases, %s kernel cases, %s native cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$identity_cases" "$kernel_cases" "$native_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
     [ "$failures" -eq 0 ]
     exit $?

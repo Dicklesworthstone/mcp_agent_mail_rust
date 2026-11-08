@@ -1,7 +1,19 @@
-# Historical one-shot validation workflow (br-kp1in.27); retained pending RULE 1 removal approval.
-name: Installer exit status
+# Run offline lock/exit regressions for installer changes on each stock shell.
+# Full signed-release installation remains available through manual dispatch.
+name: Installer lock and exit status
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - tests/installer/test_install_exit_status.sh
+      - .github/workflows/installer-exit.yml
+  pull_request:
+    paths:
+      - install.sh
+      - tests/installer/test_install_exit_status.sh
+      - .github/workflows/installer-exit.yml
   workflow_dispatch:
 
 permissions:
@@ -9,7 +21,7 @@ permissions:
 
 jobs:
   signed-release-exit:
-    name: Signed release / ${{ matrix.os }} / stock Bash
+    name: Installer boundaries / ${{ matrix.os }} / stock Bash
     strategy:
       fail-fast: false
       matrix:
@@ -25,6 +37,7 @@ jobs:
           /bin/bash -n tests/installer/test_install_exit_status.sh
           /bin/bash tests/installer/test_install_exit_status.sh --unit
       - name: Install signature verifier
+        if: github.event_name == 'workflow_dispatch'
         shell: /bin/bash --noprofile --norc -e {0}
         run: |
           if [ "$(uname -s)" = Darwin ]; then
@@ -34,6 +47,7 @@ jobs:
             sudo apt-get install -y minisign
           fi
       - name: Verify full file and stdin installer exit paths
+        if: github.event_name == 'workflow_dispatch'
         shell: /bin/bash --noprofile --norc -e {0}
         run: /bin/bash tests/installer/test_install_exit_status.sh
       - name: Retain reproduction source and exit traces

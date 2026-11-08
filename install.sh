@@ -9020,10 +9020,48 @@ installer_directory_identity() {
 installer_lock_fd_identity() {
   local fd="$1" identity=""
   case "$fd" in 7|8) ;; *) return 1 ;; esac
-  [ -d "/dev/fd/$fd" ] || return 1
-  identity=$(stat -Lc '%d:%i' -- "/dev/fd/$fd" 2>/dev/null || exit "$?") \
-    || identity=$(stat -Lf '%d:%i' "/dev/fd/$fd" 2>/dev/null || exit "$?") \
-    || return 1
+
+  # macOS /dev/fd reports the devfs device rather than the open directory's
+  # device (GH#376). Inspect the inherited descriptor with native fstat instead.
+  # Dup onto a fixed child-only fd before starting either interpreter: a closed
+  # lock fd must fail in Bash, not accidentally name an interpreter's own file.
+  # Keep stdin for the program so this also works with `curl ... | bash` and
+  # stock macOS Bash 3.2. A failed/unusable Python (e.g. a developer-tools shim)
+  # may fall back to Perl, but only successful, well-formed identities count.
+  if command -v python3 >/dev/null 2>&1 && \
+     identity=$(python3 - 2>/dev/null 3<&"$fd" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    info = os.fstat(3)
+    if not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(1)
+    sys.stdout.write("%d:%d" % (info.st_dev, info.st_ino))
+except OSError:
+    raise SystemExit(1)
+PY
+     ) && [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    printf '%s' "$identity"
+    return 0
+  fi
+  if command -v perl >/dev/null 2>&1 && \
+     identity=$(perl -MFcntl=:mode -e '
+       open my $handle, "<&=", 3 or exit 1;
+       my @info = stat($handle);
+       @info && S_ISDIR($info[2]) or exit 1;
+       print join(":", @info[0, 1]);
+     ' 2>/dev/null 3<&"$fd") && [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    printf '%s' "$identity"
+    return 0
+  fi
+
+  # Minimal Linux hosts may have flock/stat without either interpreter. Linux
+  # procfs resolves an inherited fd to the underlying inode; this fallback is
+  # deliberately unavailable on macOS and never uses the /dev/fd facade.
+  [ "$(uname -s)" = Linux ] && [ -d "/proc/self/fd/$fd" ] || return 1
+  identity=$(stat -Lc '%d:%i' -- /proc/self/fd/3 2>/dev/null 3<&"$fd" || exit "$?") || return 1
   [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
   printf '%s' "$identity"
 }
