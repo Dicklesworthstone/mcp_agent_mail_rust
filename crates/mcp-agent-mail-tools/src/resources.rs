@@ -6285,6 +6285,7 @@ impl<'a> ReservationSnapshotBuild<'a> {
         );
         cache.builders = cache.builders.saturating_sub(1);
         self.reserved = false;
+        drop(cache);
         Ok(first)
     }
 }
@@ -6984,7 +6985,9 @@ mod resource_shape_tests {
             );
         }
         assert!(cache.read(&"e".repeat(64), &scope, 0, now).is_err());
-        let before_expiry = now + RESERVATION_SNAPSHOT_CACHE_TTL - Duration::from_nanos(1);
+        let before_expiry = (now + RESERVATION_SNAPSHOT_CACHE_TTL)
+            .checked_sub(Duration::from_nanos(1))
+            .expect("snapshot TTL exceeds one nanosecond");
         assert_eq!(cache.read(&token, &scope, 0, before_expiry).unwrap(), first);
         let expired = cache
             .read(&token, &scope, 250, now + RESERVATION_SNAPSHOT_CACHE_TTL)

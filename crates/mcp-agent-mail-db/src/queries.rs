@@ -17103,8 +17103,9 @@ pub async fn file_reservation_snapshot(
     .await
 }
 
-/// Materialize a larger bounded reservation set through an already-admitted
-/// pool. Every page must be served from this owned result: repeating reads with
+/// Materialize a larger bounded reservation set through an admitted pool.
+///
+/// Every page must be served from this owned result: repeating reads with
 /// an offset would lose the snapshot guarantee when leases change between pages.
 pub async fn file_reservation_paged_snapshot(
     cx: &Cx,
@@ -17146,8 +17147,9 @@ pub fn file_reservation_snapshot_from_conn(
     )
 }
 
-/// Capture a paged history once in the same read scope used for a single
-/// snapshot. The larger raw bounds do not authorize a larger wire response;
+/// Capture a paged history in the same read scope used for a single snapshot.
+///
+/// The larger raw bounds do not authorize a larger wire response;
 /// callers must retain this immutable result and enforce per-page byte limits.
 pub fn file_reservation_paged_snapshot_from_conn(
     conn: &impl crate::pool::SyncQuery,
