@@ -18,8 +18,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
@@ -5839,21 +5839,36 @@ fn reservation_row_is_active_at(
 /// Get file reservations for a project.
 ///
 /// Historical listings are paged with `limit` (default 20, max 250) and a
-/// zero-based `offset`; callers advance the offset by the page limit.
+/// zero-based `offset`; independent ordinary pages are not a snapshot.
+/// `snapshot_pages=true` instead materializes one bounded database snapshot,
+/// then serves immutable pages through authenticated requests for five minutes.
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://file_reservations/{slug}",
-    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), returns only unreleased, unexpired reservations.\nsnapshot : bool\n    If true, returns the complete bounded reservation set and project/holder identities from one database read snapshot. Retired holders remain resolvable. Does not accept limit or offset. Refuses more than 10000 reservations or holder identities, or more than 4 MiB JSON.\nlimit, offset : int\n    Pagination for ordinary reads; each page is capped at 250 rows. Independent pages are not a consistent snapshot.\n\nReturns\n-------\nWithout snapshot=true: list[dict], each with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts } and activity hints.\nWith snapshot=true: { schema_version: 1, complete: true, project, agents, active_only, captured_ts, count, reservations }. Each reservation also includes project_id and agent_id. Activity hints are omitted.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?snapshot=true&active_only=true&format=json\"}}\n```\n\nAlso see historical (including released) file_reservations in explicit pages:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=false&limit=250&offset=0\"}}\n```"
+    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), returns only unreleased, unexpired reservations.\nsnapshot : bool\n    If true, returns the complete bounded reservation set and project/holder identities from one database read snapshot. Retired holders remain resolvable. Does not accept limit or offset. Refuses more than 10000 reservations or holder identities, or more than 4 MiB JSON.\nsnapshot_pages : bool\n    If true, captures one immutable database snapshot of at most 100000 reservations or holder identities and 64 MiB, including repeated page metadata. Pages contain at most 250 rows and 4 MiB JSON. All pages are prepared before the first is returned. Does not accept snapshot or limit. One oversized row or holder roster is rejected.\nsnapshot_token, offset : str, int\n    Continue snapshot_pages=true with its opaque token and exact next_offset. Keep active_only and project unchanged. Every request is authenticated. Tokens expire five minutes after publication without renewal; server restart or mailbox replacement invalidates them. Unknown/expired tokens and invalid page boundaries are errors; restart from page zero rather than combining reads.\nlimit, offset : int\n    Pagination for ordinary reads; each page is capped at 250 rows. Independent pages are not a consistent snapshot.\n\nReturns\n-------\nWithout either snapshot mode: list[dict], each with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts } and activity hints.\nWith snapshot=true: { schema_version: 1, complete: true, project, agents, active_only, captured_ts, count, reservations }. Each reservation also includes project_id and agent_id. Activity hints are omitted.\nWith snapshot_pages=true: { schema_version: 1, consistency: materialized_snapshot, snapshot_token, project, agents, active_only, captured_ts, total_count, offset, count, next_offset, reservations }. Ordering is ascending (created_ts, id). next_offset is null only on the final page, including an empty history. A partial page can have a continuation. Individual pages never claim complete=true; verify all pages and total_count before treating their union as the complete state at captured_ts. Concurrent grants, releases, renewals and deletions do not change a captured snapshot.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?snapshot=true&active_only=true&format=json\"}}\n```\n\nFor large histories, start with snapshot_pages=true&active_only=false&format=json, then repeat that request with snapshot_token and the returned next_offset. Ordinary historical pages remain available with active_only=false&limit=250&offset=0, without snapshot guarantees."
 )]
 pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug_str, query) = split_param_and_query(&slug);
     let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
+    let snapshot_pages = query
+        .get("snapshot_pages")
+        .is_some_and(|value| parse_bool_param(value));
+    if query.contains_key("snapshot_token") && !snapshot_pages {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_INVALID_REQUEST",
+            "snapshot_token requires snapshot_pages=true",
+        ));
+    }
 
     let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug_str).await?;
 
     let project_id = project.id.unwrap_or(0);
+
+    if snapshot_pages {
+        return paged_file_reservations(ctx, &pool, &project, active_only, &query).await;
+    }
 
     if query
         .get("snapshot")
@@ -5865,7 +5880,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
                 "complete reservation snapshots do not accept limit or offset",
             ));
         }
-        let snapshot = db_outcome_to_mcp_result(
+        let snapshot = reservation_snapshot_result(
             mcp_agent_mail_db::queries::file_reservation_snapshot(
                 ctx.cx(),
                 &pool,
@@ -5873,6 +5888,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
                 active_only,
             )
             .await,
+            false,
         )?;
         return reservation_snapshot_json(snapshot);
     }
@@ -6061,6 +6077,531 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+const RESERVATION_SNAPSHOT_CACHE_MAX_SLOTS: usize = 4;
+const RESERVATION_SNAPSHOT_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const RESERVATION_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// A token is scoped to the admitted engine generation, not just the database
+/// path. Live read wrappers have different read-cache generations, so using
+/// `sqlite_identity_key` here would invalidate a token on the next request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReservationSnapshotScope {
+    engine_identity: String,
+    storage_root: PathBuf,
+    project_id: i64,
+    project_slug: String,
+    project_human_key: String,
+    project_created_at: i64,
+    active_only: bool,
+}
+
+impl ReservationSnapshotScope {
+    fn new(
+        pool: &mcp_agent_mail_db::DbPool,
+        project: &mcp_agent_mail_db::ProjectRow,
+        active_only: bool,
+    ) -> McpResult<Self> {
+        Ok(Self {
+            engine_identity: pool.engine_identity_key(),
+            storage_root: pool.storage_root().to_path_buf(),
+            project_id: project.id.ok_or_else(|| {
+                McpError::internal_error("reservation snapshot has no stored project identity")
+            })?,
+            project_slug: project.slug.clone(),
+            project_human_key: project.human_key.clone(),
+            project_created_at: project.created_at,
+            active_only,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ReservationSnapshotPage {
+    offset: usize,
+    json: String,
+}
+
+struct CachedReservationSnapshot {
+    scope: ReservationSnapshotScope,
+    created_at: Instant,
+    pages: Vec<ReservationSnapshotPage>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct ReservationSnapshotCache {
+    entries: HashMap<String, CachedReservationSnapshot>,
+    builders: usize,
+    bytes: usize,
+}
+
+static RESERVATION_SNAPSHOT_CACHE: LazyLock<Mutex<ReservationSnapshotCache>> =
+    LazyLock::new(|| Mutex::new(ReservationSnapshotCache::default()));
+
+impl ReservationSnapshotCache {
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.created_at) < RESERVATION_SNAPSHOT_CACHE_TTL
+        });
+        self.bytes = self.entries.values().map(|entry| entry.bytes).sum();
+    }
+
+    fn reserve(&mut self, now: Instant) -> McpResult<()> {
+        self.prune(now);
+        // Reserve the maximum serialized snapshot budget before doing any DB
+        // work. Concurrent builders count against both limits; abandoned or
+        // cancelled builders release their reservation through the RAII permit.
+        let reserved = (self.builders + 1)
+            .saturating_mul(mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_BYTES);
+        if self.entries.len() + self.builders >= RESERVATION_SNAPSHOT_CACHE_MAX_SLOTS
+            || self.bytes.saturating_add(reserved) > RESERVATION_SNAPSHOT_CACHE_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_BUSY",
+                "reservation snapshot cache is at capacity; retry after an existing snapshot expires",
+            ));
+        }
+        self.builders += 1;
+        Ok(())
+    }
+
+    fn read(
+        &mut self,
+        token: &str,
+        scope: &ReservationSnapshotScope,
+        offset: usize,
+        now: Instant,
+    ) -> McpResult<String> {
+        self.prune(now);
+        let snapshot = self.entries.get(token).ok_or_else(|| {
+            paged_reservation_error(
+                "PAGED_SNAPSHOT_EXPIRED",
+                "reservation snapshot token is unknown or expired; restart the read from its first page",
+            )
+        })?;
+        if &snapshot.scope != scope {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_SCOPE_MISMATCH",
+                "reservation snapshot mailbox, project identity or active_only scope changed; restart the read",
+            ));
+        }
+        let page = snapshot
+            .pages
+            .binary_search_by_key(&offset, |page| page.offset)
+            .ok()
+            .and_then(|index| snapshot.pages.get(index))
+            .ok_or_else(|| {
+                paged_reservation_error(
+                    "PAGED_SNAPSHOT_INVALID_OFFSET",
+                    "reservation snapshot offset is not a returned page boundary",
+                )
+            })?;
+        // Reading a page does not refresh the TTL or consume the token. A
+        // retry observes exactly the same bytes, including the terminal page.
+        Ok(page.json.clone())
+    }
+}
+
+struct ReservationSnapshotBuild<'a> {
+    cache: &'a Mutex<ReservationSnapshotCache>,
+    reserved: bool,
+}
+
+impl<'a> ReservationSnapshotBuild<'a> {
+    fn reserve(cache: &'a Mutex<ReservationSnapshotCache>, now: Instant) -> McpResult<Self> {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserve(now)?;
+        Ok(Self {
+            cache,
+            reserved: true,
+        })
+    }
+
+    fn publish(
+        mut self,
+        token: String,
+        scope: ReservationSnapshotScope,
+        pages: Vec<ReservationSnapshotPage>,
+        now: Instant,
+    ) -> McpResult<String> {
+        let bytes = pages.iter().map(|page| page.json.len()).sum::<usize>();
+        if pages.is_empty() || bytes > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_TOO_LARGE",
+                "reservation history exceeds the 64 MiB serialized snapshot limit",
+            ));
+        }
+        let first = pages[0].json.clone();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.prune(now);
+        if cache.entries.contains_key(&token) {
+            return Err(McpError::internal_error(
+                "reservation snapshot token collision; retry the read",
+            ));
+        }
+        cache.bytes += bytes;
+        cache.entries.insert(
+            token,
+            CachedReservationSnapshot {
+                scope,
+                created_at: now,
+                pages,
+                bytes,
+            },
+        );
+        cache.builders = cache.builders.saturating_sub(1);
+        self.reserved = false;
+        Ok(first)
+    }
+}
+
+impl Drop for ReservationSnapshotBuild<'_> {
+    fn drop(&mut self) {
+        if self.reserved {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.builders = cache.builders.saturating_sub(1);
+        }
+    }
+}
+
+fn paged_reservation_error(error_type: &str, message: &str) -> McpError {
+    crate::tool_util::legacy_mcp_error(
+        McpErrorCode::InvalidParams,
+        error_type,
+        message,
+        matches!(error_type, "PAGED_SNAPSHOT_BUSY" | "PAGED_SNAPSHOT_EXPIRED"),
+        Value::Null,
+    )
+}
+
+fn reservation_snapshot_limit_error(message: String) -> McpError {
+    crate::tool_util::legacy_mcp_error(
+        McpErrorCode::InvalidParams,
+        "FILE_RESERVATION_SNAPSHOT_TOO_LARGE",
+        message,
+        true,
+        serde_json::json!({ "snapshot_pages": true }),
+    )
+}
+
+fn reservation_snapshot_result(
+    outcome: Outcome<mcp_agent_mail_db::queries::FileReservationSnapshot, DbError>,
+    paged: bool,
+) -> McpResult<mcp_agent_mail_db::queries::FileReservationSnapshot> {
+    match outcome {
+        Outcome::Err(DbError::InvalidArgument {
+            field: "snapshot_limit",
+            message,
+        }) => Err(if paged {
+            paged_reservation_error("PAGED_SNAPSHOT_TOO_LARGE", &message)
+        } else {
+            reservation_snapshot_limit_error(message)
+        }),
+        other => db_outcome_to_mcp_result(other),
+    }
+}
+
+async fn paged_file_reservations(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project: &mcp_agent_mail_db::ProjectRow,
+    active_only: bool,
+    query: &HashMap<String, String>,
+) -> McpResult<String> {
+    if query.contains_key("snapshot") || query.contains_key("limit") {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_INVALID_REQUEST",
+            "snapshot_pages does not accept snapshot or limit; follow the returned next_offset",
+        ));
+    }
+    let scope = ReservationSnapshotScope::new(pool, project, active_only)?;
+    if let Some(token) = query.get("snapshot_token") {
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_INVALID_REQUEST",
+                "reservation snapshot_token must contain 64 lowercase hexadecimal characters",
+            ));
+        }
+        let offset = query
+            .get("offset")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|offset| *offset <= mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_ROWS)
+            .ok_or_else(|| {
+                paged_reservation_error(
+                    "PAGED_SNAPSHOT_INVALID_OFFSET",
+                    "reservation snapshot continuation requires a valid returned offset",
+                )
+            })?;
+        return RESERVATION_SNAPSHOT_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read(token, &scope, offset, Instant::now());
+    }
+    if query.contains_key("offset") {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_INVALID_REQUEST",
+            "reservation snapshot offset requires a snapshot_token",
+        ));
+    }
+
+    let build = ReservationSnapshotBuild::reserve(&RESERVATION_SNAPSHOT_CACHE, Instant::now())?;
+    let token = mcp_agent_mail_core::setup::generate_token().map_err(|_| {
+        McpError::internal_error("could not generate a secure reservation snapshot token")
+    })?;
+    let snapshot = reservation_snapshot_result(
+        mcp_agent_mail_db::queries::file_reservation_paged_snapshot(
+            ctx.cx(),
+            pool,
+            project,
+            active_only,
+        )
+        .await,
+        true,
+    )?;
+    let pages = reservation_snapshot_pages(snapshot, &token)?;
+    if ctx.cx().is_cancel_requested() {
+        return Err(McpError::request_cancelled());
+    }
+    build.publish(token, scope, pages, Instant::now())
+}
+
+#[derive(Serialize)]
+struct ReservationSnapshotWireRow<'a> {
+    id: Option<i64>,
+    project_id: i64,
+    agent_id: i64,
+    agent: &'a str,
+    path_pattern: &'a str,
+    exclusive: bool,
+    reason: &'a str,
+    created_ts: String,
+    expires_ts: String,
+    released_ts: Option<String>,
+}
+
+/// Bound JSON escaping while it is serialized. A raw string that fits the DB
+/// budget can expand sixfold on the wire; rejecting only after `to_string`
+/// would allocate that expansion before enforcing the response budget.
+struct ReservationJsonBuffer {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+impl std::io::Write for ReservationJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len())
+            > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            self.overflow = true;
+            return Err(std::io::Error::other(
+                "reservation JSON response limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_reservation_json(value: &impl Serialize) -> McpResult<String> {
+    let mut buffer = ReservationJsonBuffer {
+        bytes: Vec::new(),
+        overflow: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+        return Err(if buffer.overflow {
+            paged_reservation_error(
+                "PAGED_SNAPSHOT_ITEM_TOO_LARGE",
+                "one reservation or the holder identities exceed the 4 MiB page limit",
+            )
+        } else {
+            McpError::internal_error(format!("reservation snapshot JSON error: {error}"))
+        });
+    }
+    String::from_utf8(buffer.bytes)
+        .map_err(|_| McpError::internal_error("reservation snapshot JSON is not UTF-8"))
+}
+
+struct ReservationPageBuilder {
+    metadata: String,
+    total_count: usize,
+    offset: usize,
+    count: usize,
+    rows: String,
+    pages: Vec<ReservationSnapshotPage>,
+    bytes: usize,
+}
+
+impl ReservationPageBuilder {
+    fn frame(&self, count: usize) -> String {
+        let next = self.offset + count;
+        let next_offset = if next < self.total_count {
+            next.to_string()
+        } else {
+            "null".to_string()
+        };
+        format!(
+            ",\"offset\":{},\"count\":{count},\"next_offset\":{next_offset},\"reservations\":[",
+            self.offset,
+        )
+    }
+
+    fn page_bytes(&self, count: usize, rows_bytes: usize) -> usize {
+        self.metadata.len() + self.frame(count).len() + rows_bytes + 2
+    }
+
+    fn finish_page(&mut self) -> McpResult<()> {
+        let bytes = self.page_bytes(self.count, self.rows.len());
+        if bytes > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_ITEM_TOO_LARGE",
+                "one reservation or the holder identities exceed the 4 MiB page limit",
+            ));
+        }
+        if self.bytes.saturating_add(bytes)
+            > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_TOO_LARGE",
+                "reservation history and repeated holder identities exceed the 64 MiB serialized snapshot limit",
+            ));
+        }
+        let mut json = String::with_capacity(bytes);
+        json.push_str(&self.metadata);
+        json.push_str(&self.frame(self.count));
+        json.push_str(&self.rows);
+        json.push_str("]}");
+        self.pages.push(ReservationSnapshotPage {
+            offset: self.offset,
+            json,
+        });
+        self.bytes += bytes;
+        self.offset += self.count;
+        self.count = 0;
+        self.rows.clear();
+        Ok(())
+    }
+
+    fn push(&mut self, row: &str) -> McpResult<()> {
+        if self.count == FILE_RESERVATION_RESOURCE_LIMIT_MAX {
+            self.finish_page()?;
+        }
+        let candidate_bytes = self.rows.len() + usize::from(self.count > 0) + row.len();
+        if self.count > 0
+            && self.page_bytes(self.count + 1, candidate_bytes)
+                > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            self.finish_page()?;
+        }
+        if self.page_bytes(self.count + 1, self.rows.len() + row.len())
+            > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_ITEM_TOO_LARGE",
+                "one reservation with its holder identities exceeds the 4 MiB page limit",
+            ));
+        }
+        if self.count > 0 {
+            self.rows.push(',');
+        }
+        self.rows.push_str(row);
+        self.count += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> McpResult<Vec<ReservationSnapshotPage>> {
+        if self.count > 0 || self.total_count == 0 {
+            self.finish_page()?;
+        }
+        Ok(self.pages)
+    }
+}
+
+/// Capture once, then publish only after every fixed page has been rendered
+/// within both the per-response and aggregate budgets. Pages omit activity
+/// enrichment and all carry the same immutable project and holder authority.
+fn reservation_snapshot_pages(
+    snapshot: mcp_agent_mail_db::queries::FileReservationSnapshot,
+    token: &str,
+) -> McpResult<Vec<ReservationSnapshotPage>> {
+    if snapshot.reservations.len() > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_ROWS
+        || snapshot.agents.len() > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_ROWS
+    {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_TOO_LARGE",
+            "reservation history exceeds the 100000-row or holder identity limit",
+        ));
+    }
+    let holders: HashMap<_, _> = snapshot
+        .agents
+        .iter()
+        .map(|agent| (agent.id, agent.name.as_str()))
+        .collect();
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "consistency": "materialized_snapshot",
+        "snapshot_token": token,
+        "project": {
+            "id": snapshot.project.id, "slug": snapshot.project.slug,
+            "human_key": snapshot.project.human_key, "created_at": micros_to_iso(snapshot.project.created_at),
+        },
+        "agents": snapshot.agents.iter().map(|agent| serde_json::json!({
+            "id": agent.id, "project_id": agent.project_id, "name": agent.name,
+        })).collect::<Vec<_>>(),
+        "active_only": snapshot.active_only,
+        "captured_ts": micros_to_iso(snapshot.captured_ts),
+        "total_count": snapshot.reservations.len(),
+    });
+    let mut metadata = bounded_reservation_json(&metadata)?;
+    // The object has already been encoded by serde; only fixed field names,
+    // integer counters and separately encoded rows are appended below.
+    metadata.pop();
+    let mut builder = ReservationPageBuilder {
+        metadata,
+        total_count: snapshot.reservations.len(),
+        offset: 0,
+        count: 0,
+        rows: String::new(),
+        pages: Vec::new(),
+        bytes: 0,
+    };
+    for row in snapshot.reservations {
+        let name = holders.get(&row.agent_id).ok_or_else(|| {
+            McpError::internal_error("reservation snapshot has no authoritative holder")
+        })?;
+        let encoded = bounded_reservation_json(&ReservationSnapshotWireRow {
+            id: row.id,
+            project_id: row.project_id,
+            agent_id: row.agent_id,
+            agent: name,
+            path_pattern: &row.path_pattern,
+            exclusive: row.exclusive != 0,
+            reason: &row.reason,
+            created_ts: micros_to_iso(row.created_ts),
+            expires_ts: micros_to_iso(row.expires_ts),
+            released_ts: row.released_ts.map(micros_to_iso),
+        })?;
+        builder.push(&encoded)?;
+    }
+    builder.finish()
+}
+
 /// Snapshot mode intentionally omits filesystem/git activity enrichment: its
 /// authority is the database read scope, and its bounded wire contract is
 /// consumed by CLI clients that need the complete reservation set.
@@ -6101,9 +6642,8 @@ fn reservation_snapshot_json(
         McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}"))
     })?;
     if json.len() > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "complete reservation snapshot exceeds the 4 MiB JSON limit; narrow to active_only=true or use explicit resource pages",
+        return Err(reservation_snapshot_limit_error(
+            "complete reservation snapshot exceeds the 4 MiB JSON limit; use snapshot_pages=true or narrow to active_only=true".to_string(),
         ));
     }
     Ok(json)
@@ -6209,6 +6749,287 @@ mod resource_shape_tests {
         let error = reservation_snapshot_json(snapshot)
             .expect_err("JSON escaping must not bypass the response byte budget");
         assert!(error.to_string().contains("4 MiB JSON limit"));
+        assert_eq!(
+            crate::tool_util::tool_error_code(&error),
+            Some("FILE_RESERVATION_SNAPSHOT_TOO_LARGE")
+        );
+    }
+
+    fn paged_snapshot_scope() -> ReservationSnapshotScope {
+        ReservationSnapshotScope {
+            engine_identity: "fixture-mailbox@1".to_string(),
+            storage_root: PathBuf::from("/fixture-archive"),
+            project_id: 7,
+            project_slug: "snapshot-project".to_string(),
+            project_human_key: "/tmp/snapshot-project".to_string(),
+            project_created_at: 1_000_000,
+            active_only: false,
+        }
+    }
+
+    #[test]
+    fn paged_reservation_snapshot_preserves_order_and_complete_history_at_boundaries() {
+        let token = "a".repeat(64);
+        for count in [0, 1, 249, 250, 251, 500, 10_000, 10_001] {
+            let pages = reservation_snapshot_pages(reservation_snapshot_fixture(count), &token)
+                .expect("bounded history must be page-able");
+            assert_eq!(pages.len(), count.div_ceil(250).max(1));
+            let mut observed = 0;
+            for page in pages {
+                assert!(page.json.len() <= queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES);
+                let value: Value = serde_json::from_str(&page.json).unwrap();
+                assert_eq!(value["schema_version"], 1);
+                assert_eq!(value["consistency"], "materialized_snapshot");
+                assert!(value.get("complete").is_none());
+                assert_eq!(value["snapshot_token"], token);
+                assert_eq!(value["active_only"], false);
+                assert_eq!(value["captured_ts"], micros_to_iso(5_000_000));
+                assert_eq!(value["project"]["id"], 7);
+                assert_eq!(value["agents"][1]["name"], "RetiredHolder");
+                assert_eq!(value["total_count"], count);
+                assert_eq!(value["offset"], observed);
+                assert_eq!(page.offset, observed);
+                let rows = value["reservations"].as_array().unwrap();
+                assert!(rows.len() <= 250);
+                assert_eq!(value["count"], rows.len());
+                for row in rows {
+                    observed += 1;
+                    assert_eq!(row["id"], observed);
+                    assert_eq!(row["agent"], "RetiredHolder");
+                    assert_eq!(row["released_ts"], micros_to_iso(3_000_000));
+                }
+                if observed < count {
+                    assert_eq!(value["next_offset"], observed);
+                } else {
+                    assert!(value["next_offset"].is_null());
+                }
+            }
+            assert_eq!(observed, count);
+        }
+    }
+
+    #[test]
+    fn paged_reservation_snapshot_splits_by_encoded_bytes_and_rejects_oversized_items() {
+        let token = "b".repeat(64);
+        let mut snapshot = reservation_snapshot_fixture(2);
+        for row in &mut snapshot.reservations {
+            // Two individually valid rows exceed a response budget after
+            // escaping, even though their raw database strings fit easily.
+            row.reason = "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 12);
+        }
+        let pages = reservation_snapshot_pages(snapshot, &token).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages
+                .iter()
+                .all(|page| { page.json.len() <= queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES })
+        );
+        let first: Value = serde_json::from_str(&pages[0].json).unwrap();
+        let second: Value = serde_json::from_str(&pages[1].json).unwrap();
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["next_offset"], 1);
+        assert_eq!(second["offset"], 1);
+        assert!(second["next_offset"].is_null());
+        assert!(
+            pages.iter().map(|page| page.json.len()).sum::<usize>()
+                > queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        );
+
+        for oversized_roster in [false, true] {
+            let mut snapshot = reservation_snapshot_fixture(1);
+            let text = "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 6 + 1);
+            if oversized_roster {
+                snapshot.agents[0].name = text;
+            } else {
+                snapshot.reservations[0].reason = text;
+            }
+            let error = reservation_snapshot_pages(snapshot, &token).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_ITEM_TOO_LARGE")
+            );
+        }
+    }
+
+    #[test]
+    fn paged_reservation_snapshot_bounds_repeated_metadata_before_publication() {
+        let mut snapshot = reservation_snapshot_fixture(8_250);
+        // The unused current-agent name appears once in the DB snapshot but
+        // in every wire page. The aggregate limit must count that repetition.
+        snapshot.agents[0].name = "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 12);
+        let error = reservation_snapshot_pages(snapshot, &"c".repeat(64)).unwrap_err();
+        assert_eq!(
+            crate::tool_util::tool_error_code(&error),
+            Some("PAGED_SNAPSHOT_TOO_LARGE")
+        );
+    }
+
+    #[test]
+    fn paged_reservation_cache_pins_scope_boundaries_bytes_and_expiration() {
+        let now = Instant::now();
+        let token = "d".repeat(64);
+        let scope = paged_snapshot_scope();
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let pages = reservation_snapshot_pages(reservation_snapshot_fixture(251), &token).unwrap();
+        let bytes = pages.iter().map(|page| page.json.len()).sum::<usize>();
+        let first = ReservationSnapshotBuild::reserve(&cache, now)
+            .unwrap()
+            .publish(token.clone(), scope.clone(), pages, now)
+            .unwrap();
+        let mut cache = cache.lock().unwrap();
+        assert_eq!(cache.builders, 0);
+        assert_eq!(cache.bytes, bytes);
+        assert_eq!(cache.read(&token, &scope, 0, now).unwrap(), first);
+        let last = cache.read(&token, &scope, 250, now).unwrap();
+        assert_eq!(cache.read(&token, &scope, 250, now).unwrap(), last);
+        for offset in [1, 249, 251, usize::MAX] {
+            let error = cache.read(&token, &scope, offset, now).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_INVALID_OFFSET")
+            );
+        }
+        let mut other_scopes = vec![scope.clone(); 5];
+        other_scopes[0].engine_identity.push_str("-replaced");
+        other_scopes[1].storage_root = PathBuf::from("/different-archive");
+        other_scopes[2].project_created_at += 1;
+        other_scopes[3].active_only = true;
+        other_scopes[4].project_id += 1;
+        for other in other_scopes {
+            let error = cache.read(&token, &other, 0, now).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_SCOPE_MISMATCH")
+            );
+        }
+        assert!(cache.read(&"e".repeat(64), &scope, 0, now).is_err());
+        let before_expiry = now + RESERVATION_SNAPSHOT_CACHE_TTL - Duration::from_nanos(1);
+        assert_eq!(cache.read(&token, &scope, 0, before_expiry).unwrap(), first);
+        let expired = cache
+            .read(&token, &scope, 250, now + RESERVATION_SNAPSHOT_CACHE_TTL)
+            .unwrap_err();
+        assert_eq!(
+            crate::tool_util::tool_error_code(&expired),
+            Some("PAGED_SNAPSHOT_EXPIRED")
+        );
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn paged_reservation_cache_bounds_concurrent_builders_and_releases_abandoned_work() {
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let now = Instant::now();
+        let barrier = std::sync::Barrier::new(4);
+        let accepted = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let permit = ReservationSnapshotBuild::reserve(&cache, now);
+                        barrier.wait();
+                        permit.is_ok()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count()
+        });
+        assert_eq!(
+            accepted, 2,
+            "two 64 MiB builders exhaust the 128 MiB budget"
+        );
+        assert_eq!(cache.lock().unwrap().builders, 0);
+
+        let first = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        let second = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        let token = "f".repeat(64);
+        first
+            .publish(
+                token.clone(),
+                paged_snapshot_scope(),
+                reservation_snapshot_pages(reservation_snapshot_fixture(1), &token).unwrap(),
+                now,
+            )
+            .unwrap();
+        assert!(ReservationSnapshotBuild::reserve(&cache, now).is_err());
+        drop(second);
+        let replacement = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        drop(replacement);
+        assert_eq!(cache.lock().unwrap().builders, 0);
+    }
+
+    #[test]
+    fn paged_reservation_cache_refuses_new_work_without_evicting_live_tokens() {
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let now = Instant::now();
+        let scope = paged_snapshot_scope();
+        for index in 0..RESERVATION_SNAPSHOT_CACHE_MAX_SLOTS {
+            let token = format!("{index:064x}");
+            ReservationSnapshotBuild::reserve(&cache, now)
+                .unwrap()
+                .publish(
+                    token.clone(),
+                    scope.clone(),
+                    reservation_snapshot_pages(reservation_snapshot_fixture(0), &token).unwrap(),
+                    now,
+                )
+                .unwrap();
+        }
+        assert!(ReservationSnapshotBuild::reserve(&cache, now).is_err());
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .read(&"0".repeat(64), &scope, 0, now)
+                .is_ok()
+        );
+        let available =
+            ReservationSnapshotBuild::reserve(&cache, now + RESERVATION_SNAPSHOT_CACHE_TTL)
+                .expect("expired slots and bytes are reclaimed before admission");
+        drop(available);
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn reservation_snapshot_errors_distinguish_capacity_from_other_rejections() {
+        for paged in [false, true] {
+            let capacity = reservation_snapshot_result(
+                Outcome::Err(DbError::invalid(
+                    "snapshot_limit",
+                    "reservation snapshot too large",
+                )),
+                paged,
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&capacity),
+                Some(if paged {
+                    "PAGED_SNAPSHOT_TOO_LARGE"
+                } else {
+                    "FILE_RESERVATION_SNAPSHOT_TOO_LARGE"
+                })
+            );
+            let identity = reservation_snapshot_result(
+                Outcome::Err(DbError::invalid(
+                    "snapshot",
+                    "reservation holder is missing",
+                )),
+                paged,
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&identity),
+                Some("INVALID_ARGUMENT")
+            );
+            assert!(
+                identity
+                    .to_string()
+                    .contains("reservation holder is missing")
+            );
+        }
     }
 
     #[test]

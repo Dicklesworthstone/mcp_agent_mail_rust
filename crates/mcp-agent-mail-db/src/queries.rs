@@ -17057,6 +17057,11 @@ pub async fn thread_context_snapshot(
 pub const FILE_RESERVATION_SNAPSHOT_MAX_ROWS: usize = 10_000;
 /// Maximum raw string bytes and serialized JSON bytes for the snapshot resource.
 pub const FILE_RESERVATION_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum leases (and holder identities) materialized for a paged snapshot.
+pub const FILE_RESERVATION_PAGED_MAX_ROWS: usize = 100_000;
+/// Maximum raw string bytes materialized for a paged reservation snapshot.
+/// The resource must separately bound serialized pages and retained snapshots.
+pub const FILE_RESERVATION_PAGED_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct FileReservationSnapshotAgent {
@@ -17098,15 +17103,104 @@ pub async fn file_reservation_snapshot(
     .await
 }
 
+/// Materialize a larger bounded reservation set through an already-admitted
+/// pool. Every page must be served from this owned result: repeating reads with
+/// an offset would lose the snapshot guarantee when leases change between pages.
+pub async fn file_reservation_paged_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    active_only: bool,
+) -> Outcome<FileReservationSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "file_reservation_paged_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match file_reservation_paged_snapshot_from_conn(&**conn, project, active_only, now_micros())
+        {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
 /// A read savepoint keeps preflight bounds, identity, release state, and rows
 /// together even when another connection grants/releases leases concurrently.
-#[allow(clippy::too_many_lines)]
 pub fn file_reservation_snapshot_from_conn(
     conn: &impl crate::pool::SyncQuery,
     expected_project: &ProjectRow,
     active_only: bool,
     captured_ts: i64,
 ) -> std::result::Result<FileReservationSnapshot, DbError> {
+    file_reservation_snapshot_with_bounds(
+        conn,
+        expected_project,
+        active_only,
+        captured_ts,
+        FILE_RESERVATION_SNAPSHOT_MAX_ROWS,
+        FILE_RESERVATION_SNAPSHOT_MAX_BYTES,
+    )
+}
+
+/// Capture a paged history once in the same read scope used for a single
+/// snapshot. The larger raw bounds do not authorize a larger wire response;
+/// callers must retain this immutable result and enforce per-page byte limits.
+pub fn file_reservation_paged_snapshot_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    expected_project: &ProjectRow,
+    active_only: bool,
+    captured_ts: i64,
+) -> std::result::Result<FileReservationSnapshot, DbError> {
+    file_reservation_snapshot_with_bounds(
+        conn,
+        expected_project,
+        active_only,
+        captured_ts,
+        FILE_RESERVATION_PAGED_MAX_ROWS,
+        FILE_RESERVATION_PAGED_MAX_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn file_reservation_snapshot_with_bounds(
+    conn: &impl crate::pool::SyncQuery,
+    expected_project: &ProjectRow,
+    active_only: bool,
+    captured_ts: i64,
+    max_rows: usize,
+    max_bytes: usize,
+) -> std::result::Result<FileReservationSnapshot, DbError> {
+    let row_limit = i64::try_from(max_rows)
+        .map_err(|_| DbError::Internal("invalid reservation snapshot row limit".to_string()))?;
+    let byte_limit = i64::try_from(max_bytes)
+        .map_err(|_| DbError::Internal("invalid reservation snapshot byte limit".to_string()))?;
+    let fetch_limit = row_limit
+        .checked_add(1)
+        .ok_or_else(|| DbError::Internal("invalid reservation snapshot row limit".to_string()))?;
+    let limit_error = || {
+        let bytes = if max_bytes.is_multiple_of(1024 * 1024) {
+            format!("{} MiB", max_bytes / (1024 * 1024))
+        } else {
+            format!("{max_bytes} bytes")
+        };
+        let guidance = if max_rows == FILE_RESERVATION_SNAPSHOT_MAX_ROWS
+            && max_bytes == FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            "narrow to active_only=true or use a bounded paged snapshot"
+        } else {
+            "narrow to active_only=true"
+        };
+        DbError::invalid(
+            "snapshot_limit",
+            format!(
+                "complete reservation snapshot exceeds the {max_rows}-row or {bytes} limit; {guidance}"
+            ),
+        )
+    };
     crate::sync::with_read_snapshot(conn, || {
         let project_id = expected_project.id.ok_or_else(|| {
             DbError::invalid("project", "reservation snapshot requires a stored project")
@@ -17160,19 +17254,14 @@ pub fn file_reservation_snapshot_from_conn(
             let bytes = row
                 .get_named::<i64>("raw_bytes")
                 .map_err(|error| map_sql_error(&error))?;
-            raw_bytes = raw_bytes.checked_add(bytes).ok_or_else(|| {
-                DbError::invalid("snapshot", "reservation snapshot byte limit exceeded")
-            })?;
-            if count < 0
-                || count > i64::try_from(FILE_RESERVATION_SNAPSHOT_MAX_ROWS).unwrap_or(i64::MAX)
-                || bytes < 0
-                || raw_bytes
-                    > i64::try_from(FILE_RESERVATION_SNAPSHOT_MAX_BYTES).unwrap_or(i64::MAX)
-            {
-                return Err(DbError::invalid(
-                    "snapshot",
-                    "complete reservation snapshot exceeds the 10000-row or 4 MiB limit; narrow to active_only=true or use explicit resource pages",
+            if count < 0 || bytes < 0 {
+                return Err(DbError::Internal(
+                    "invalid reservation snapshot bounds".to_string(),
                 ));
+            }
+            raw_bytes = raw_bytes.checked_add(bytes).ok_or_else(limit_error)?;
+            if count > row_limit || raw_bytes > byte_limit {
+                return Err(limit_error());
             }
             expected_counts.push(
                 usize::try_from(count)
@@ -17198,8 +17287,8 @@ pub fn file_reservation_snapshot_from_conn(
             ));
         }
         let agents = query(
-            "SELECT id, project_id, name FROM agents WHERE project_id = ? ORDER BY id LIMIT 10001",
-            &project_params,
+            "SELECT id, project_id, name FROM agents WHERE project_id = ? ORDER BY id LIMIT ?",
+            &[Value::BigInt(project_id), Value::BigInt(fetch_limit)],
         )?
         .iter()
         .map(|row| {
@@ -17229,12 +17318,13 @@ pub fn file_reservation_snapshot_from_conn(
         } else {
             " LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id"
         };
+        reservation_params.push(Value::BigInt(fetch_limit));
         let rows = query(
             &format!(
                 "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
              fr.created_ts, fr.expires_ts, {released} AS released_ts \
              FROM file_reservations fr{release_join} WHERE fr.project_id = ?{predicate} \
-             ORDER BY fr.created_ts, fr.id LIMIT 10001"
+             ORDER BY fr.created_ts, fr.id LIMIT ?"
             ),
             &reservation_params,
         )?;
@@ -17271,14 +17361,9 @@ pub fn file_reservation_snapshot_from_conn(
                 })?;
             raw_bytes = raw_bytes
                 .checked_add(i64::try_from(name.len()).unwrap_or(i64::MAX))
-                .ok_or_else(|| {
-                    DbError::invalid("snapshot", "reservation snapshot byte limit exceeded")
-                })?;
-            if raw_bytes > i64::try_from(FILE_RESERVATION_SNAPSHOT_MAX_BYTES).unwrap_or(i64::MAX) {
-                return Err(DbError::invalid(
-                    "snapshot",
-                    "complete reservation snapshot exceeds the 4 MiB limit",
-                ));
+                .ok_or_else(limit_error)?;
+            if raw_bytes > byte_limit {
+                return Err(limit_error());
             }
         }
         Ok(FileReservationSnapshot {
@@ -21428,11 +21513,21 @@ mod tests {
             conn.execute_raw("ROLLBACK; PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK").unwrap();
             let mut rebound = project.clone();
             rebound.created_at += 1;
-            assert!(file_reservation_snapshot_from_conn(&**conn, &rebound, false, 500).is_err());
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &rebound, false, 500),
+                Err(DbError::InvalidArgument { field: "project", .. })
+            ));
             conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (99, 'foreign-snapshot', '/tmp/foreign-snapshot', 1); \
                 INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (99, 99, 'ForeignHolder', 'test', 'test', 1, 1); \
                 UPDATE file_reservations SET agent_id = 99 WHERE id = 2").unwrap();
-            assert!(file_reservation_snapshot_from_conn(&**conn, &project, false, 500).is_err());
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, false, 500),
+                Err(DbError::InvalidArgument { field: "snapshot", .. })
+            ));
+            assert!(matches!(
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500),
+                Err(DbError::InvalidArgument { field: "snapshot", .. })
+            ));
         });
     }
 
@@ -21456,7 +21551,14 @@ mod tests {
             )).unwrap();
             conn.execute_sync("UPDATE file_reservations SET reason = ? WHERE id = 1",
                 &[Value::Text("x".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1))]).unwrap();
-            assert!(file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap_err().to_string().contains("4 MiB"));
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, true, 500),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", message })
+                    if message.contains("4 MiB")
+            ));
+            let paged = file_reservation_paged_snapshot_from_conn(&**conn, &project, true, 500).unwrap();
+            assert_eq!(paged.reservations.len(), 1);
+            assert_eq!(paged.reservations[0].reason.len(), FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1);
             conn.execute_raw("UPDATE file_reservations SET reason = ''; BEGIN").unwrap();
             for _ in 0..14 {
                 conn.execute_raw(
@@ -21465,7 +21567,215 @@ mod tests {
                 ).unwrap();
             }
             conn.execute_raw("COMMIT").unwrap();
-            assert!(file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap_err().to_string().contains("10000-row"));
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, true, 500),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", message })
+                    if message.contains("10000-row")
+            ));
+        });
+    }
+
+    #[test]
+    fn reservation_paged_snapshot_reads_more_than_ten_thousand_history_rows() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_paged_snapshot_large.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-paged-large")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let empty =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert!(empty.reservations.is_empty());
+            assert!(empty.agents.is_empty());
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) \
+                 VALUES (1, {project_id}, 'RetiredHolder', 'test', 'test', 1, 1, 2); BEGIN; \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                 VALUES (1, {project_id}, 1, 'src/**', 1, '', 1, 1000, 400)"
+            )).unwrap();
+            for _ in 0..13 {
+                conn.execute_raw(
+                    "INSERT INTO file_reservations \
+                     (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                     SELECT project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
+                     FROM file_reservations"
+                ).unwrap();
+            }
+            conn.execute_raw(
+                "INSERT INTO file_reservations \
+                 (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                 SELECT project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
+                 FROM file_reservations ORDER BY id LIMIT 1808; \
+                 INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 450); COMMIT"
+            ).unwrap();
+            let at_limit =
+                file_reservation_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert_eq!(at_limit.reservations.len(), FILE_RESERVATION_SNAPSHOT_MAX_ROWS);
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (10001, {project_id}, 1, 'src/active.rs', 1, 'active', 1, 1000); \
+                 PRAGMA query_only=ON; BEGIN"
+            )).unwrap();
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, false, 500),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            let active =
+                file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap();
+            assert_eq!(active.reservations.len(), 1);
+            assert_eq!(active.reservations[0].id, Some(10001));
+            let history =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert_eq!(history.reservations.len(), 10_001);
+            assert_eq!(history.agents[0].name, "RetiredHolder");
+            assert_eq!(history.reservations[0].released_ts, Some(450));
+            assert_eq!(history.reservations[1].released_ts, Some(400));
+            assert_eq!(history.reservations[10_000].released_ts, None);
+            for (index, row) in history.reservations.iter().enumerate() {
+                assert_eq!(row.id, Some(i64::try_from(index + 1).unwrap()));
+            }
+            // Nested snapshots must not commit or disable the caller's
+            // read-only transaction, including after a bounds rejection.
+            conn.execute_raw("ROLLBACK; PRAGMA query_only=OFF").unwrap();
+            drop(conn);
+            let pooled = file_reservation_paged_snapshot(&cx, &pool, &project, false)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(pooled.reservations.len(), 10_001);
+        });
+    }
+
+    #[test]
+    fn reservation_snapshot_checks_exact_raw_bytes_and_holder_bounds() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_snapshot_exact_bounds.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-exact-bounds")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (1, {project_id}, 1, 'src/**', 1, 'é', 1, 1000)"
+            )).unwrap();
+            let raw_bytes = project.slug.len()
+                + project.human_key.len()
+                + "BlueLake".len() * 2
+                + "src/**".len()
+                + "é".len();
+            let exact = file_reservation_snapshot_with_bounds(
+                &**conn, &project, false, 500, 1, raw_bytes,
+            ).unwrap();
+            assert_eq!(exact.reservations.len(), 1);
+            assert!(matches!(
+                file_reservation_snapshot_with_bounds(
+                    &**conn, &project, false, 500, 1, raw_bytes - 1,
+                ),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            // A byte budget below the unique-string preflight is also rejected
+            // before rows are hydrated, independently of repeated holder names.
+            assert!(matches!(
+                file_reservation_snapshot_with_bounds(
+                    &**conn, &project, false, 500, 1, "é".len(),
+                ),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (2, {project_id}, 'GreenStone', 'test', 'test', 1, 1)"
+            )).unwrap();
+            assert!(matches!(
+                file_reservation_snapshot_with_bounds(
+                    &**conn, &project, false, 500, 1, FILE_RESERVATION_PAGED_MAX_BYTES,
+                ),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            let two_holders = file_reservation_snapshot_with_bounds(
+                &**conn, &project, false, 500, 2, FILE_RESERVATION_PAGED_MAX_BYTES,
+            ).unwrap();
+            assert_eq!(two_holders.agents.len(), 2);
+        });
+    }
+
+    #[test]
+    fn reservation_paged_snapshot_retains_capture_after_concurrent_writes() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_paged_snapshot_writes.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-paged-writes")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES \
+                 (1, {project_id}, 1, 'src/released.rs', 1, '', 10, 1000), \
+                 (2, {project_id}, 1, 'src/renewed.rs', 1, '', 10, 600), \
+                 (3, {project_id}, 1, 'src/earlier.rs', 1, '', 5, 1000); \
+                 PRAGMA query_only=ON"
+            )).unwrap();
+            let captured =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert_eq!(
+                captured.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                vec![Some(3), Some(1), Some(2)]
+            );
+            let writer = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            writer.execute_raw(&format!(
+                "BEGIN IMMEDIATE; \
+                 INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 700); \
+                 UPDATE file_reservations SET expires_ts = 1500 WHERE id = 2; \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (4, {project_id}, 1, 'src/new.rs', 1, '', 1, 1500); \
+                 UPDATE agents SET name = 'GreenStone' WHERE id = 1; COMMIT"
+            )).unwrap();
+            // Later pages can keep borrowing this owned capture after the
+            // database savepoint has ended; no database cursor remains live.
+            assert_eq!(captured.reservations.len(), 3);
+            assert_eq!(captured.reservations[1].released_ts, None);
+            assert_eq!(captured.reservations[2].expires_ts, 600);
+            assert_eq!(captured.agents[0].name, "BlueLake");
+            assert_eq!(captured.captured_ts, 500);
+            let fresh =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 800).unwrap();
+            assert_eq!(
+                fresh.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                vec![Some(4), Some(3), Some(1), Some(2)]
+            );
+            assert_eq!(fresh.reservations[2].released_ts, Some(700));
+            assert_eq!(fresh.reservations[3].expires_ts, 1500);
+            assert_eq!(fresh.agents[0].name, "GreenStone");
+            assert_eq!(fresh.captured_ts, 800);
+            let active =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, true, 800).unwrap();
+            assert_eq!(active.reservations.len(), 3);
+            assert!(active.reservations.iter().all(|row| row.id != Some(1)));
+            let readonly = conn.query_sync("PRAGMA query_only", &[]).unwrap();
+            assert_eq!(readonly[0].get_as::<i64>(0).unwrap(), 1);
+            conn.execute_raw("PRAGMA query_only=OFF").unwrap();
         });
     }
 
