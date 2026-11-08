@@ -1133,7 +1133,8 @@ one database read snapshot. Changes after capture appear only in a new read.
 Each page includes `consistency: "materialized_snapshot"`, `snapshot_token`,
 `captured_ts`, `total_count`, `offset`, `count`, and an explicit `next_offset`
 (null on the terminal page), alongside `project`, `agents`, `active_only`, and
-`reservations`. Continue with the same URI plus `snapshot_token=<token>` and
+`reservations`. `captured_ts` marks capture start, not an exact historical query
+timestamp. Continue with the same URI plus `snapshot_token=<token>` and
 `offset=<next_offset>`; do not supply `snapshot` or `limit` in paged mode.
 
 Tokens expire 300 seconds after publication, do not survive server restart,
