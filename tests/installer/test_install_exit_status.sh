@@ -662,9 +662,9 @@ for backend in python perl perl-fallback procfs missing; do
     done
 done
 
-# Exercise the production lock helpers against real OS locks. Only adapter
-# discovery is controlled: the fallback paths execute actual Python/Perl
-# flock calls, and an independent Python descriptor tests their exclusion.
+# Exercise production lock helpers against real OS locks. Isolate discovery
+# only for kernel locking so macOS can still use native descriptor identities.
+# Faults and traces distinguish a working fallback from an untested adapter.
 kernel_probe="$scratch/kernel-lock-probe.sh"
 cat > "$kernel_probe" <<'PROBE'
 #!/usr/bin/env bash
@@ -673,14 +673,66 @@ root="$1" backend="$2" mode="$3"
 source "$4"
 QUIET=0 HAS_GUM=0 NO_GUM=1
 LOCKED=0 DESTINATION_LOCKED=0
+real_flock=$(type -P flock) || real_flock=''
+real_python=$(type -P python3) || real_python=''
+real_perl=$(type -P perl) || real_perl=''
 command() {
-    case "${1:-}:${2:-}" in
-        -v:flock) [ "$backend" = native ] || return 1 ;;
-        -v:python3) [ "$backend" != perl ] || return 1 ;;
-    esac
-    builtin command "$@"
+    if [ "${FUNCNAME[1]:-}" = installer_kernel_lock ] && [ "${1:-}" = -v ]; then
+        case "$backend:${2:-}" in
+            native:flock|python:python3|perl:perl|broken-flock:flock|broken-flock:python3|\
+            broken-python:python3|broken-python:perl|broken-both:*|failing:*|closed:*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    builtin command "$@" || return "$?"
 }
+kernel_helper() {
+    local helper="$1" in_kernel=0 executable=''
+    shift
+    if [ "${FUNCNAME[2]:-}" = installer_kernel_lock ]; then
+        in_kernel=1
+        printf '%s\n' "$helper" >> "$root/kernel.adapters"
+    fi
+    case "$backend:$helper" in
+        broken-flock:flock|broken-both:flock|broken-python:python3|broken-both:python3) return 71 ;;
+    esac
+    if [ "$in_kernel" -eq 1 ]; then
+        case "$backend" in failing) return 71 ;; closed) return 0 ;; esac
+    fi
+    case "$helper" in flock) executable="$real_flock" ;; python3) executable="$real_python" ;; perl) executable="$real_perl" ;; esac
+    [ -n "$executable" ] || return 127
+    "$executable" "$@"
+}
+flock() { kernel_helper flock "$@"; }
+python3() { kernel_helper python3 "$@"; }
+perl() { kernel_helper perl "$@"; }
+printf 'before\nafter\n' > "$root/fd3-sentinel"
+exec 3< "$root/fd3-sentinel"
+if [ "$mode" = fault ] || [ "$mode" = denied ]; then
+    if [ "$backend" = closed ]; then
+        exec 7<&-; exec 8<&-
+        for fd in 7 8 0 3 9 invalid; do
+            for operation in acquire release; do
+                if installer_kernel_lock "$fd" "$operation"; then exit 92; fi
+            done
+        done
+    else
+        for kind in initial destination; do
+            [ "$mode:$kind" != denied:initial ] || continue
+            if acquire_installer_lock "${5:-$root/authority}" "$kind"; then exit 92; fi
+            [ "$LOCKED:$DESTINATION_LOCKED" = 0:0 ] || exit 93
+            case "$kind" in initial) fd=7 ;; destination) fd=8 ;; esac
+            if installer_lock_fd_identity "$fd"; then exit 94; fi
+        done
+    fi
+    IFS= read -r witness <&3
+    [ "$witness" = before ] || exit 95
+    printf 'refused\n' > "$root/refused"
+    exit 0
+fi
 acquire_installer_lock "$root/authority" destination
+IFS= read -r witness <&3
+[ "$witness" = before ] || exit 95
 case "$mode" in
     descendant-*) sleep 30 & printf '%s\n' "$!" > "$root/child" ;;
 esac
@@ -701,6 +753,8 @@ if [ "$action" = verify ]; then
     case "$mode" in descriptor-*) exec 8<&9; exec 9<&- ;; esac
 fi
 release_installer_lock destination
+IFS= read -r witness <&3
+[ "$witness" = after ] || exit 95
 PROBE
 
 kernel_cases=0
@@ -730,7 +784,11 @@ def locked(path, primary=True):
     finally:
         os.close(fd)
 
-for backend, executable in (("native", "flock"), ("python", "python3"), ("perl", "perl")):
+backends = (("native", "flock", ["flock"]), ("python", "python3", ["python3"]),
+            ("perl", "perl", ["perl"]), ("broken-flock", "python3", ["flock", "python3"]),
+            ("broken-python", "perl", ["python3", "perl"]),
+            ("broken-both", "perl", ["flock", "python3", "perl"]))
+for backend, executable, adapters in backends:
     if shutil.which(executable) is None:
         unavailable.append(backend)
         continue
@@ -790,6 +848,7 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
                 if mode == "precreated-symlink":
                     assert private.readlink() == victim
                 assert (evidence.stat().st_ino, evidence.read_bytes()) == original_evidence
+                assert not (root / "kernel.adapters").exists(), "unsafe authority reached a kernel helper"
                 completed += 1
                 print("kernel", backend, mode, "refused without changing precreated evidence")
                 continue
@@ -797,7 +856,20 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
             while not (root / "ready").exists() and owner.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert (root / "ready").exists(), log_path.read_text()
+            assert (root / "kernel.adapters").read_text().splitlines() == adapters
             assert locked(authority), "helper exited without leaving its kernel lock with Bash"
+            if mode == "ordinary":
+                # Another installer must try every permitted adapter and still
+                # fail against the same held authority, without acquiring state.
+                contender_root = root / "contender"
+                contender_root.mkdir()
+                contender = subprocess.run([bash, probe, str(contender_root), backend,
+                                            "denied", library, str(authority)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+                assert contender.returncode == 0, contender.stdout.decode()
+                assert (contender_root / "refused").read_text() == "refused\n"
+                assert (contender_root / "kernel.adapters").read_text().splitlines() == adapters
+                assert locked(authority), "a failed contender disturbed the owner's lock"
             if (root / "child").exists():
                 child_pid = int((root / "child").read_text())
             retained = authority
@@ -854,6 +926,8 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
                 owner.stdin.flush()
             rc = owner.wait(timeout=15)
             assert rc == (-signal.SIGKILL if mode.endswith("crash") else 0), log_path.read_text()
+            expected_adapters = adapters * (1 if mode.endswith("crash") else 2)
+            assert (root / "kernel.adapters").read_text().splitlines() == expected_adapters
             if mode == "descendant-crash":
                 assert locked(retained_private, primary=False), "a surviving installer child must still exclude a writer"
                 os.kill(child_pid, signal.SIGTERM)
@@ -892,6 +966,23 @@ for backend, executable in (("native", "flock"), ("python", "python3"), ("perl",
                     os.kill(child_pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
+for backend in ("missing", "failing", "closed"):
+    root = Path(scratch) / backend
+    authority = root / "authority"
+    authority.mkdir(parents=True, mode=0o700)
+    log_path = Path(artifacts) / ("kernel-" + backend + ".log")
+    with log_path.open("wb") as log:
+        result = subprocess.run([bash, probe, str(root), backend, "fault", library],
+                                stdout=log, stderr=subprocess.STDOUT, timeout=15)
+    assert result.returncode == 0, log_path.read_text()
+    assert (root / "refused").read_text() == "refused\n"
+    calls = (root / "kernel.adapters").read_text().splitlines() if (root / "kernel.adapters").exists() else []
+    assert calls == (["flock", "python3", "perl"] * 2 if backend == "failing" else []), calls
+    assert not locked(authority, primary=False), "failure left the auxiliary lock held"
+    if backend != "closed":
+        assert not locked(authority), "failure left the destination lock held"
+    completed += 1
+    print("kernel", backend, "refused without acquired state or parent fd 3 changes")
 assert completed, "no real kernel-lock adapter ran"
 print(f"Kernel lock cases: {completed} passed; unavailable adapters: {','.join(unavailable) or 'none'}")
 Path(artifacts, "kernel-count").write_text(str(completed))

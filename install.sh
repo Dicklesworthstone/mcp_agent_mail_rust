@@ -9073,31 +9073,41 @@ PY
 installer_kernel_lock() {
   local fd="$1" operation="$2"
   case "$fd:$operation" in 7:acquire|8:acquire|7:release|8:release) ;; *) return 1 ;; esac
+  # Command discovery alone cannot establish capability: macOS may expose a
+  # Python developer-tools shim, and an installed flock may be unusable. Each
+  # fallback must perform the same native operation on the same inherited open
+  # file description. Contention still fails every attempt while the owner
+  # holds its lock. Duplicate before startup so a closed fd cannot be reused.
   if command -v flock >/dev/null 2>&1; then
-    if [ "$operation" = acquire ]; then flock -n -x "$fd"; else flock -u "$fd"; fi
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 - "$fd" "$operation" <<'PY'
+    if [ "$operation" = acquire ]; then
+      if flock -n -x 3 2>/dev/null 3<&"$fd"; then return 0; fi
+    else
+      if flock -u 3 2>/dev/null 3<&"$fd"; then return 0; fi
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 - "$operation" 2>/dev/null 3<&"$fd" <<'PY'
 import fcntl
 import sys
 
 try:
-    operation = fcntl.LOCK_EX | fcntl.LOCK_NB if sys.argv[2] == "acquire" else fcntl.LOCK_UN
-    fcntl.flock(int(sys.argv[1]), operation)
-except OSError as error:
-    print(f"Installer kernel lock failed: {error}", file=sys.stderr)
+    operation = fcntl.LOCK_EX | fcntl.LOCK_NB if sys.argv[1] == "acquire" else fcntl.LOCK_UN
+    fcntl.flock(3, operation)
+except OSError:
     raise SystemExit(1)
 PY
-  elif command -v perl >/dev/null 2>&1; then
-    perl -MConfig -MFcntl=:flock -e '
-      die "Perl lacks native flock support\n" unless $Config{d_flock} eq "define";
-      open my $handle, "<&=$ARGV[0]" or die "Cannot open installer lock descriptor: $!\n";
-      my $operation = $ARGV[1] eq "acquire" ? LOCK_EX | LOCK_NB : LOCK_UN;
-      flock($handle, $operation) or die "Installer kernel lock failed: $!\n";
-    ' "$fd" "$operation"
-  else
-    err "Installer locking requires flock, Python 3, or Perl with native flock support."
-    return 1
+    then return 0; fi
   fi
+  if command -v perl >/dev/null 2>&1; then
+    if perl -MConfig -MFcntl=:flock -e '
+      die "Perl lacks native flock support\n" unless $Config{d_flock} eq "define";
+      open my $handle, "<&=", 3 or die "Cannot open installer lock descriptor: $!\n";
+      my $operation = $ARGV[0] eq "acquire" ? LOCK_EX | LOCK_NB : LOCK_UN;
+      flock($handle, $operation) or die "Installer kernel lock failed: $!\n";
+    ' "$operation" 2>/dev/null 3<&"$fd"; then return 0; fi
+  fi
+  err "Installer kernel lock $operation failed; a working flock, Python 3, or Perl with native flock support is required."
+  return 1
 }
 
 verify_installer_lock_authorities() {
