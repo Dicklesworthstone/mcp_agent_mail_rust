@@ -1007,7 +1007,8 @@ real_perl=$(type -P perl) || real_perl=''
 command() {
     if [ "${FUNCNAME[1]:-}" = capture_command_with_timeout ] && [ "${1:-}" = -v ]; then
         case "$backend:${2:-}" in
-            python:python3|perl:perl|timeout:timeout|gtimeout:gtimeout|\
+            python:python3|perl:perl|timeout:timeout|gtimeout:gtimeout|gnutimeout:gnutimeout|\
+            non-gnu-timeout:timeout|\
             broken-python:python3|broken-python:perl|noop-python:python3|noop-python:perl|\
             broken:python3|broken:perl|noop:python3|noop:perl|invalid:python3|invalid:perl|\
             python-selected:*|perl-selected:perl|perl-selected:timeout|perl-selected:gtimeout) return 0 ;;
@@ -1123,21 +1124,43 @@ def running(pid):
     state = result.stdout.strip()
     return bool(state) and not state.startswith(b"Z")
 
+gnu_timeout = None
+non_gnu_timeout = None
+for name in ("timeout", "gtimeout", "gnutimeout"):
+    executable = shutil.which(name)
+    if executable is None:
+        continue
+    version = subprocess.run([executable, "--version"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=3)
+    if version.returncode == 0 and version.stdout.startswith((
+            b"timeout (GNU coreutils) ", b"gtimeout (GNU coreutils) ",
+            b"gnutimeout (GNU coreutils) ")):
+        if gnu_timeout is None:
+            gnu_timeout = executable
+    elif non_gnu_timeout is None:
+        non_gnu_timeout = executable
+print("GNU timeout fixture:", gnu_timeout or "unavailable")
+print("Non-GNU timeout refusal fixture:", non_gnu_timeout or "unavailable")
+
 backends = (("python", "python3", ["python3:probe", "python3:run"]),
             ("perl", "perl", ["perl:probe", "perl:run"]),
             ("broken-python", "perl", ["python3:probe", "perl:probe", "perl:run"]),
             ("noop-python", "perl", ["python3:probe", "perl:probe", "perl:run"]),
-            ("timeout", "timeout", ["timeout:run"]),
-            ("gtimeout", "gtimeout", ["gtimeout:run"]))
+            ("timeout", "timeout", ["timeout:probe", "timeout:run"]),
+            ("gtimeout", "gtimeout", ["gtimeout:probe", "gtimeout:run"]),
+            ("gnutimeout", "gnutimeout", ["gnutimeout:probe", "gnutimeout:run"]))
 cases = []
 for backend, executable, trace in backends:
-    if shutil.which(executable) is None:
+    if shutil.which(executable) is None or (backend in ("timeout", "gtimeout", "gnutimeout")
+                                             and gnu_timeout is None):
         unavailable.append(backend)
         continue
     for mode in ("bytes", "extra-newline", "nul", "nonzero", "signal", "timeout"):
         status = 37 if mode == "nonzero" else 143 if mode == "signal" else (
-            137 if backend in ("timeout", "gtimeout") else 124) if mode == "timeout" else 0
+            137 if backend in ("timeout", "gtimeout", "gnutimeout") else 124) if mode == "timeout" else 0
         cases.append((backend, mode, trace, status, 1))
+if non_gnu_timeout is not None:
+    cases.append(("non-gnu-timeout", "bytes", ["timeout:probe"], 125, 0))
 for backend in ("missing", "broken", "noop", "invalid"):
     trace = [] if backend == "missing" else ["python3:probe", "perl:probe"]
     cases.append((backend, "bytes", trace, 125, 0))
@@ -1157,14 +1180,15 @@ for delivery in ("file", "stdin"):
         (root / "target.py").write_text(target)
         tools_dir = root / "bin"
         tools_dir.mkdir()
-        for helper in ("timeout", "gtimeout"):
-            executable = shutil.which(helper)
+        for helper in ("timeout", "gtimeout", "gnutimeout"):
+            executable = non_gnu_timeout if backend == "non-gnu-timeout" else gnu_timeout
             if executable:
                 # An external exec avoids the shell-function signal diagnostic
                 # contaminating output that production captures from GNU timeout.
                 wrapper = tools_dir / helper
                 wrapper.write_text("#!" + bash + "\n" +
-                    "printf '%s:run\\n' " + helper + " >> \"$CAPTURE_TEST_ROOT/runners\"\n" +
+                    "phase=run\n[ \"${1:-}\" != --version ] || phase=probe\n" +
+                    "printf '%s:%s\\n' " + helper + " \"$phase\" >> \"$CAPTURE_TEST_ROOT/runners\"\n" +
                     "if ( : <&7 ) 2>/dev/null || ( : <&8 ) 2>/dev/null; then exit 96; fi\n" +
                     "exec " + shlex.quote(executable) + ' "$@"\n')
                 wrapper.chmod(0o700)
@@ -1192,6 +1216,8 @@ for delivery in ("file", "stdin"):
             if mode == "removed-status":
                 assert (root / "removed-status-witness").read_bytes() == b"0"
             exact = (root / "exact.bin").read_bytes()
+            if backend == "non-gnu-timeout":
+                assert b"No bounded command runner is available" in exact
             if mode == "nul":
                 assert lossless == 0 and exact != payload, "NUL loss was not detected"
             else:
@@ -1259,7 +1285,7 @@ case "$mode" in
         command() {
             if [ "${FUNCNAME[1]:-}" = capture_command_with_timeout ] && [ "${1:-}" = -v ]; then
                 case "$mode:${2:-}" in
-                    bounded:python3|bounded-without-python:perl|bounded-timeout:timeout|bounded-timeout:gtimeout) ;;
+                    bounded:python3|bounded-without-python:perl|bounded-timeout:timeout|bounded-timeout:gtimeout|bounded-timeout:gnutimeout) ;;
                     *) return 1 ;;
                 esac
             fi
@@ -1390,7 +1416,7 @@ for mode in ("query", "exec", "exec-stdin", "backup", "bounded",
              "bounded-without-python", "bounded-timeout", "service", "service-unready",
              "noninteractive", "interactive"):
     if (mode == "bounded-without-python" and not shutil.which("perl")) or (
-            mode == "bounded-timeout" and not (shutil.which("timeout") or shutil.which("gtimeout"))):
+            mode == "bounded-timeout" and not (shutil.which("timeout") or shutil.which("gtimeout") or shutil.which("gnutimeout"))):
         unavailable.append(mode)
         continue
     root = base / mode

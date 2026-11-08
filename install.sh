@@ -802,15 +802,23 @@ PERL
   fi
 
   # Never turn a bounded probe into an unbounded one merely because Python is
-  # unusable. GNU timeout is common on Linux; Homebrew installs it as gtimeout
-  # on macOS. Hosts without any working native runner or timeout fail closed.
-  local timeout_bin=""
-  if command -v timeout >/dev/null 2>&1; then
-    timeout_bin="timeout"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    timeout_bin="gtimeout"
-  else
-    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires working Python 3, Perl, timeout, or gtimeout)."
+  # unusable. Require GNU's process-group timeout behavior: an executable named
+  # timeout may be uutils, whose older versions leave descendants alive. Ubuntu
+  # also installs GNU as gnutimeout; Homebrew uses gtimeout on macOS.
+  local timeout_bin="" timeout_candidate="" timeout_version=""
+  for timeout_candidate in timeout gtimeout gnutimeout; do
+    if command -v "$timeout_candidate" >/dev/null 2>&1 && \
+       timeout_version=$("$timeout_candidate" --version 7<&- 8<&- 2>/dev/null); then
+      case "$timeout_version" in
+        'timeout (GNU coreutils) '*|'gtimeout (GNU coreutils) '*|'gnutimeout (GNU coreutils) '*)
+          timeout_bin="$timeout_candidate"
+          break
+          ;;
+      esac
+    fi
+  done
+  if [ -z "$timeout_bin" ]; then
+    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires working Python 3, Perl, or GNU timeout/gtimeout/gnutimeout)."
     CAPTURED_CMD_OUTPUT_EXACT="$CAPTURED_CMD_OUTPUT"
     CAPTURED_CMD_OUTPUT_LOSSLESS=1
     CAPTURED_CMD_STATUS=125
