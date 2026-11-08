@@ -2826,6 +2826,51 @@ mod tests {
 
     const CONFLICT_DEREGISTERED_AT: i64 = 234_567_891;
 
+    fn conflict_checkpoint_path(scratch: &Path) -> std::path::PathBuf {
+        let mut paths = fs::read_dir(scratch)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(".am-agent-reconcile-") && name.ends_with(".json")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 1, "exactly one durable agent checkpoint");
+        paths.pop().unwrap()
+    }
+
+    fn checkpoint_file_identity(file: &fs::File) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata().unwrap();
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        }
+        #[cfg(windows)]
+        {
+            format!(
+                "{:?}",
+                mcp_agent_mail_core::disk::windows_file_identity(file).unwrap()
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            format!("{:?}", file.metadata().unwrap().created().unwrap())
+        }
+    }
+
+    fn assert_checkpoint_unchanged(path: &Path, pinned: &fs::File, bytes: &[u8]) {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            checkpoint_file_identity(&fs::File::open(path).unwrap()),
+            checkpoint_file_identity(pinned),
+            "unchanged scheduling must not replace its durable checkpoint"
+        );
+    }
+
     fn install_deregistration_conflict(cx: &Cx, pool: &DbPool, config: &Config) -> Value {
         assert_eq!(reconcile(cx, pool, config).repaired, 1);
         let mut profile = assert_profile_committed(config);
@@ -2867,8 +2912,8 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_conflicts_are_suppressed_across_316_finite_roster_rounds() {
-        with_mailbox(|cx, pool, config, _| {
+    fn unchanged_conflicts_and_checkpoint_are_stable_across_316_finite_roster_rounds() {
+        with_mailbox(|cx, pool, config, scratch| {
             install_deregistration_conflict(cx, pool, config);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             for id in 102_i64..110 {
@@ -2916,8 +2961,11 @@ mod tests {
             let mut deferred = 0;
             let mut suppressed = 0;
             let mut scanned = 0;
+            let mut saved_checkpoint: Option<(std::path::PathBuf, fs::File, Vec<u8>)> = None;
             for round in 0..316 {
-                let report = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                let report = cursor
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap();
                 assert_eq!(report.scanned, 9, "finite round {round}");
                 assert_eq!(report.deferred, if round == 0 { 9 } else { 0 });
                 assert_eq!(report.suppressed_conflicts, if round == 0 { 0 } else { 9 });
@@ -2932,6 +2980,19 @@ mod tests {
                 deferred += report.deferred;
                 suppressed += report.suppressed_conflicts;
                 scanned += report.scanned;
+                if let Some((path, pinned, bytes)) = &saved_checkpoint {
+                    assert_checkpoint_unchanged(path, pinned, bytes);
+                } else {
+                    let path = conflict_checkpoint_path(scratch);
+                    let bytes = fs::read(&path).unwrap();
+                    let saved: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(saved["conflicts"].as_array().unwrap().len(), 9);
+                    assert!(saved["retries"].as_array().unwrap().is_empty());
+                    // Keep the original inode/file ID alive through every
+                    // later pass, so replacement cannot hide behind reuse.
+                    let pinned = fs::File::open(&path).unwrap();
+                    saved_checkpoint = Some((path, pinned, bytes));
+                }
             }
             let elapsed_ms = started.elapsed().as_millis();
             assert_eq!((scanned, deferred, suppressed), (2_844, 9, 2_835));
@@ -2950,7 +3011,101 @@ mod tests {
                 assert_eq!(&read_source(cx, pool, source.id).unwrap(), source);
             }
             eprintln!(
-                "nine conflicts over 316 rounds: scanned={scanned}, deferred={deferred}, suppressed={suppressed}, publication_epoch_delta=0, elapsed_ms={elapsed_ms}"
+                "nine checkpointed conflicts over 316 rounds: scanned={scanned}, deferred={deferred}, suppressed={suppressed}, publication_epoch_delta=0, checkpoint_replacements_after_first=0, elapsed_ms={elapsed_ms}"
+            );
+
+            let (checkpoint_path, first_checkpoint, first_bytes) = saved_checkpoint.unwrap();
+            let first_saved: Value = serde_json::from_slice(&first_bytes).unwrap();
+            let first_fingerprint = first_saved["conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == 101)
+                .unwrap()["fingerprint"]
+                .clone();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE agents SET program = 'checkpoint-latest-program' WHERE id = 101",
+            )
+            .unwrap();
+            drop(conn);
+            let changed = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!(
+                (
+                    changed.deferred,
+                    changed.suppressed_conflicts,
+                    changed.repaired
+                ),
+                (1, 8, 0)
+            );
+            assert_eq!(changed.conflict_len, 9);
+            let changed_bytes = fs::read(&checkpoint_path).unwrap();
+            let changed_saved: Value = serde_json::from_slice(&changed_bytes).unwrap();
+            let changed_fingerprint = &changed_saved["conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == 101)
+                .unwrap()["fingerprint"];
+            assert_ne!(changed_fingerprint, &first_fingerprint);
+            let changed_checkpoint = fs::File::open(&checkpoint_path).unwrap();
+            assert_ne!(
+                checkpoint_file_identity(&changed_checkpoint),
+                checkpoint_file_identity(&first_checkpoint)
+            );
+            assert_eq!(repo.head().unwrap().target(), head);
+            for (relative, bytes) in &evidence {
+                assert_eq!(
+                    fs::read(config.storage_root.join(relative)).unwrap(),
+                    *bytes
+                );
+            }
+            let repeated = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!((repeated.suppressed_conflicts, repeated.deferred), (9, 0));
+            assert_checkpoint_unchanged(&checkpoint_path, &changed_checkpoint, &changed_bytes);
+
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                pool,
+                101,
+                CONFLICT_DEREGISTERED_AT,
+            )))
+            .unwrap();
+            let repaired = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!(
+                (
+                    repaired.repaired,
+                    repaired.suppressed_conflicts,
+                    repaired.deferred
+                ),
+                (1, 8, 0)
+            );
+            assert_eq!((repaired.conflict_len, repaired.retry_len), (8, 0));
+            let repaired_saved: Value =
+                serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+            let retained = repaired_saved["conflicts"].as_array().unwrap();
+            assert_eq!(retained.len(), 8);
+            assert!(retained.iter().all(|entry| entry["id"] != 101));
+            assert_ne!(
+                checkpoint_file_identity(&fs::File::open(&checkpoint_path).unwrap()),
+                checkpoint_file_identity(&changed_checkpoint)
+            );
+            let profile = assert_profile_committed(config);
+            assert_eq!(profile["program"], "checkpoint-latest-program");
+            assert_eq!(
+                profile["deregistered_at"],
+                timestamp(CONFLICT_DEREGISTERED_AT).unwrap()
+            );
+            assert_eq!(profile["contact_policy"], "block_all");
+            assert_eq!(
+                profile["extension"],
+                json!({"evidence": "retain archived deregistration"})
             );
 
             // Retained conflicts must not occupy repair slots or prevent a
@@ -2958,12 +3113,18 @@ mod tests {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(110, 101, 'GreenStone', 'test', 'test', 'healthy late arrival', 1000000, 2000000)").unwrap();
             drop(conn);
-            let later = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            let later = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
             assert_eq!(
                 (later.suppressed_conflicts, later.repaired, later.deferred),
-                (9, 1, 0)
+                (8, 1, 0)
             );
-            assert_eq!((later.conflict_len, later.retry_len), (9, 0));
+            assert_eq!((later.conflict_len, later.retry_len), (8, 0));
+            let later_saved: Value =
+                serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+            assert_eq!(later_saved["after"], 110);
+            assert_eq!(later_saved["conflicts"].as_array().unwrap().len(), 8);
             assert!(
                 config
                     .storage_root
@@ -3271,5 +3432,301 @@ mod tests {
             assert_eq!(fs::read(&project_path).unwrap(), evidence);
             assert_eq!(repo.head().unwrap().target(), head);
         });
+    }
+
+    const CONFLICT_PROCESS_PHASE: &str = "AM_TEST_AGENT_CONFLICT_CHECKPOINT_PHASE";
+    const CONFLICT_PROCESS_ROOT: &str = "AM_TEST_AGENT_CONFLICT_CHECKPOINT_ROOT";
+    const CONFLICT_PROCESS_READY: &str = "conflict-checkpoint-ready";
+
+    fn conflict_checkpoint_process(scratch: &Path, seed: bool) {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let config = Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &scratch.join("mail.sqlite3"),
+                ),
+                storage_root: scratch.join("archive"),
+                ..Default::default()
+            };
+            if seed {
+                fs::create_dir(&config.storage_root).unwrap();
+            }
+            let pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                // The second process opens the existing admitted mailbox;
+                // this is a checkpoint/engine restart, not a daemon launch.
+                run_migrations: seed,
+                ..Default::default()
+            })
+            .unwrap();
+            let cx = Cx::for_testing();
+            let stop = AtomicBool::new(false);
+            if seed {
+                let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
+                conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'project', '/project', 1)").unwrap();
+                conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts, registration_token) VALUES(101, 101, 'BlueLake', 'test', 'test', 'coordination', 1000000, 2000000, 'never-archive-this-secret')").unwrap();
+                drop(conn);
+                install_deregistration_conflict(&cx, &pool, &config);
+                let mut cursor = AgentReconcileCursor::default();
+                let first = cursor
+                    .reconcile_checkpointed(&cx, &pool, &config, &stop)
+                    .unwrap();
+                assert_eq!(
+                    (first.deferred, first.conflict_len, first.retry_len),
+                    (1, 1, 0)
+                );
+                let saved: Value =
+                    serde_json::from_slice(&fs::read(conflict_checkpoint_path(scratch)).unwrap())
+                        .unwrap();
+                assert_eq!(saved["conflicts"].as_array().unwrap().len(), 1);
+                fs::write(
+                    scratch.join(CONFLICT_PROCESS_READY),
+                    b"durable checkpoint ready",
+                )
+                .unwrap();
+                // Keep the actual cursor, pool and checkpoint lock alive for
+                // the parent's forced termination. Bound an orphan's lifetime
+                // as well if the parent itself disappears unexpectedly.
+                let deadline = Instant::now() + std::time::Duration::from_secs(120);
+                while Instant::now() < deadline {
+                    std::thread::park_timeout(std::time::Duration::from_millis(100));
+                }
+                drop(cursor);
+                panic!("parent did not terminate the checkpoint owner");
+            }
+
+            let path = conflict_checkpoint_path(scratch);
+            let original_checkpoint: Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let conflicting = assert_profile_committed(&config);
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let head = repo.head().unwrap().target();
+            assert!(read_source(&cx, &pool, 101).unwrap().profile["deregistered_at"].is_null());
+            let mut restored = AgentReconcileCursor::default();
+            let repeated = restored
+                .reconcile_checkpointed(&cx, &pool, &config, &stop)
+                .unwrap();
+            assert_eq!(
+                (
+                    repeated.suppressed_conflicts,
+                    repeated.deferred,
+                    repeated.repaired
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!((repeated.conflict_len, repeated.retry_len), (1, 0));
+            assert_eq!(assert_profile_committed(&config), conflicting);
+            assert_eq!(repo.head().unwrap().target(), head);
+            // A fresh Store must establish its own successful synchronization
+            // witness. Capture its checkpoint only after that first pass; the
+            // restored conflict still must not emit another refusal or repair.
+            let pinned = fs::File::open(&path).unwrap();
+            let before = fs::read(&path).unwrap();
+            let restored_checkpoint: Value = serde_json::from_slice(&before).unwrap();
+            assert_eq!(
+                restored_checkpoint["conflicts"],
+                original_checkpoint["conflicts"]
+            );
+            assert_eq!(
+                restored_checkpoint["binding"],
+                original_checkpoint["binding"]
+            );
+            for _ in 0..3 {
+                let settled = restored
+                    .reconcile_checkpointed(&cx, &pool, &config, &stop)
+                    .unwrap();
+                assert_eq!(
+                    (
+                        settled.suppressed_conflicts,
+                        settled.deferred,
+                        settled.repaired
+                    ),
+                    (1, 0, 0)
+                );
+                assert_checkpoint_unchanged(&path, &pinned, &before);
+            }
+
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                &cx,
+                &pool,
+                101,
+                CONFLICT_DEREGISTERED_AT,
+            )))
+            .unwrap();
+            let repaired = restored
+                .reconcile_checkpointed(&cx, &pool, &config, &stop)
+                .unwrap();
+            assert_eq!(
+                (
+                    repaired.repaired,
+                    repaired.deferred,
+                    repaired.suppressed_conflicts
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!((repaired.conflict_len, repaired.retry_len), (0, 0));
+            let repaired_bytes = fs::read(&path).unwrap();
+            let saved: Value = serde_json::from_slice(&repaired_bytes).unwrap();
+            assert!(saved["conflicts"].as_array().unwrap().is_empty());
+            assert!(saved["retries"].as_array().unwrap().is_empty());
+            let repaired_file = fs::File::open(&path).unwrap();
+            assert_ne!(
+                checkpoint_file_identity(&repaired_file),
+                checkpoint_file_identity(&pinned)
+            );
+            let profile = assert_profile_committed(&config);
+            assert_eq!(profile["deregistered_at"], conflicting["deregistered_at"]);
+            assert_eq!(profile["contact_policy"], "block_all");
+            assert_eq!(profile["extension"], conflicting["extension"]);
+            let healthy = restored
+                .reconcile_checkpointed(&cx, &pool, &config, &stop)
+                .unwrap();
+            assert_eq!(
+                (healthy.unchanged, healthy.conflict_len, healthy.retry_len),
+                (1, 0, 0)
+            );
+            assert_checkpoint_unchanged(&path, &repaired_file, &repaired_bytes);
+        });
+    }
+
+    struct OwnedConflictCheckpointProcess {
+        child: std::process::Child,
+        log: fs::File,
+    }
+
+    impl OwnedConflictCheckpointProcess {
+        fn spawn(name: &str, phase: &str, scratch: &Path) -> Self {
+            let log = tempfile::tempfile().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CONFLICT_PROCESS_PHASE, phase)
+                .env(CONFLICT_PROCESS_ROOT, scratch)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log.try_clone().unwrap())
+                .spawn()
+                .unwrap();
+            Self { child, log }
+        }
+
+        fn output(&mut self) -> String {
+            use std::io::{Seek as _, SeekFrom};
+            self.log.seek(SeekFrom::Start(0)).unwrap();
+            let mut output = String::new();
+            self.log.read_to_string(&mut output).unwrap();
+            output
+        }
+
+        fn terminate(&mut self) -> std::process::ExitStatus {
+            let _ = self.child.kill();
+            self.child.wait().unwrap()
+        }
+
+        fn wait_ready(&mut self, ready: &Path) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(90);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    panic!(
+                        "checkpoint owner exited before termination ({status}): {}",
+                        self.output()
+                    );
+                }
+                if ready.is_file() {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    self.terminate();
+                    panic!("checkpoint owner readiness timed out: {}", self.output());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fn wait_success(&mut self) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(90);
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    self.terminate();
+                    panic!(
+                        "checkpoint restart verification timed out: {}",
+                        self.output()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let output = self.output();
+            assert!(
+                status.success() && output.contains("1 passed; 0 failed"),
+                "checkpoint restart verification failed ({status}): {output}"
+            );
+        }
+    }
+
+    impl Drop for OwnedConflictCheckpointProcess {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn checkpointed_conflicts_survive_process_crash_and_fresh_process_repair() {
+        if let Ok(phase) = std::env::var(CONFLICT_PROCESS_PHASE) {
+            let scratch =
+                std::path::PathBuf::from(std::env::var_os(CONFLICT_PROCESS_ROOT).unwrap());
+            let seed = match phase.as_str() {
+                "seed" => true,
+                "verify" => false,
+                _ => panic!("unexpected checkpoint child phase: {phase}"),
+            };
+            conflict_checkpoint_process(&scratch, seed);
+            return;
+        }
+
+        // The parent only owns isolated files and children; real process-global
+        // database admission and archive operations happen inside the children.
+        let scratch = tempfile::tempdir().unwrap();
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        let mut owner = OwnedConflictCheckpointProcess::spawn(name, "seed", scratch.path());
+        owner.wait_ready(&scratch.path().join(CONFLICT_PROCESS_READY));
+        let path = conflict_checkpoint_path(scratch.path());
+        let pinned = fs::File::open(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("json.lock"))
+            .unwrap();
+        let blocked = fs2::FileExt::try_lock_exclusive(&lock).unwrap_err();
+        assert_eq!(
+            blocked.raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        drop(lock);
+        let terminated = owner.terminate();
+        assert!(
+            !terminated.success(),
+            "the checkpoint owner must be killed abruptly"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(terminated.signal(), Some(nix::libc::SIGKILL));
+        }
+        assert_checkpoint_unchanged(&path, &pinned, &before);
+
+        let mut restarted = OwnedConflictCheckpointProcess::spawn(name, "verify", scratch.path());
+        restarted.wait_success();
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["conflicts"].as_array().unwrap().is_empty());
+        assert!(saved["retries"].as_array().unwrap().is_empty());
     }
 }

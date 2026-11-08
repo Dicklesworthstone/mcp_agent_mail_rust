@@ -189,11 +189,13 @@ jobs:
           set -euo pipefail
           cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::message_reconcile::database::checkpoint::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/message-checkpoint.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/message-checkpoint.log"
-      - name: Test adjacent agent checkpoint lifecycle
+      # Include the parent module's real conflict rounds and process restart
+      # cases as well as the checkpoint store's publication safeguards.
+      - name: Test agent reconciliation conflicts, checkpoints and restart
         if: always()
         run: |
           set -euo pipefail
-          cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::agent_reconcile::retry::checkpoint::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/agent-checkpoint.log"
+          cargo test --locked -p mcp-agent-mail-storage --no-default-features --features portable --lib recovery::agent_reconcile:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/checkpoint-evidence/agent-checkpoint.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/checkpoint-evidence/agent-checkpoint.log"
       - name: Test adjacent active reservation checkpoint lifecycle
         if: always()

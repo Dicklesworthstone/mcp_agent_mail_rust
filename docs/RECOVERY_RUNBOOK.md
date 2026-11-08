@@ -53,6 +53,18 @@ generation. A missing, incompatible or corrupt checkpoint causes a fresh scan;
 unavailable checkpoint storage leaves suppression in memory and reports that
 restart progress is not durable. Conflicting records themselves remain intact.
 
+After confirming a durable checkpoint publication, the worker can retain that
+checkpoint without another replacement or fsync when a pass leaves the same
+scheduling state and neither the live queue nor the saved checkpoint contains
+transient retry debt. It verifies the actual file against the confirmed
+publication and compares the mailbox binding, roster position, preferred lane
+and ordered conflict fingerprints. A new checkpoint owner, a previous save
+failure, or a changed, missing, corrupt or obsolete file requires the normal
+atomic save path. Pending retries keep their existing timestamp and cooldown
+persistence rules. Readable matching bytes alone never establish that the
+required synchronization succeeded: the existing save path syncs the file
+and, on Unix, its parent directory.
+
 This is a bounded optimization, not a claim that the conflict has been fixed.
 Roster visits still perform source and evidence reads to detect legitimate
 changes. With more than 1,024 simultaneous conflicts, FIFO capacity eviction
