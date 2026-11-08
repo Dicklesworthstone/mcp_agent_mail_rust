@@ -22760,11 +22760,23 @@ fn discover_beads_dir_via_cli(start: &Path, pinned: Option<&Path>) -> CliResult<
             command
         };
         let value = br_command_json(command)?;
-        let beads_dir = value
+        let config_path = value
             .get("project_config")
             .and_then(serde_json::Value::as_str)
-            .and_then(|path| Path::new(path).parent())
             .ok_or_else(|| "br reported no project config path".to_string())?;
+        // br prints paths with Path::display(), which loses invalid UTF-8.
+        // Implicit discovery cannot distinguish that spelling from a different
+        // real workspace. Exact mode can verify even a literal U+FFFD name
+        // against the caller's canonical path before any data query.
+        if pinned.is_none() && config_path.contains('\u{fffd}') {
+            return Err(
+                "br reported a replacement character in its config path; pass an explicit UTF-8 project path so its identity can be verified"
+                    .to_string(),
+            );
+        }
+        let beads_dir = Path::new(config_path)
+            .parent()
+            .ok_or_else(|| "br reported no project config directory".to_string())?;
         std::fs::canonicalize(working_dir.join(beads_dir)).map_err(|error| {
             format!(
                 "cannot resolve beads directory {}: {error}",
@@ -22998,6 +23010,12 @@ fn handle_beads_show(
         .map_err(|e| CliError::Other(format!("br query failed: {e}")))?;
 
     output::emit_output(&issue, fmt, || {
+        // `br show <id>` returns a one-element array. Keep that complete wire
+        // value for JSON/TOON, but render the issue itself in the table view.
+        let issue = issue
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(&issue);
         output::section(&format!(
             "{}: {}",
             issue.get("id").and_then(|v| v.as_str()).unwrap_or(&id),
@@ -76749,6 +76767,44 @@ startup_timeout_sec = 42
         let error = br_json_command(&path, &["status".to_string()])
             .expect_err("Beads cannot consume a non-UTF-8 BEADS_DIR pin");
         assert!(error.contains("non-UTF-8 beads directory"));
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = std::fs::canonicalize(root.path()).expect("canonical fixture root");
+        let rendered_beads = root_path.join("project-\u{fffd}/.beads");
+        std::fs::create_dir_all(&rendered_beads).expect("create valid UTF-8 workspace");
+        assert_eq!(
+            resolve_beads_dir(Some(&rendered_beads))
+                .expect("an explicit valid UTF-8 replacement-character path is verifiable"),
+            std::fs::canonicalize(&rendered_beads).expect("canonical explicit workspace")
+        );
+    }
+
+    // APFS accepts only valid UTF-8 filenames. Keep the portable checks above,
+    // and reproduce the physical raw-byte collision on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn br_discovery_rejects_lossy_non_utf8_workspace_names() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = std::fs::canonicalize(root.path()).expect("canonical fixture root");
+        let raw_project = root_path.join(std::ffi::OsString::from_vec(b"project-\xFF".to_vec()));
+        let rendered_beads = root_path.join("project-\u{fffd}/.beads");
+        std::fs::create_dir_all(raw_project.join(".beads")).expect("create non-UTF-8 workspace");
+        std::fs::create_dir_all(&rendered_beads).expect("create distinct rendered-path workspace");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("BEADS_DIR", "")],
+            || {
+                let error = discover_beads_dir_via_cli(&raw_project, None)
+                    .expect_err("lossy discovery must not select the distinct UTF-8 workspace");
+                assert!(error.to_string().contains("replacement character"));
+                assert_eq!(
+                    resolve_beads_dir(Some(&rendered_beads))
+                        .expect("an explicit valid UTF-8 replacement-character path is verifiable"),
+                    std::fs::canonicalize(&rendered_beads).expect("canonical explicit workspace")
+                );
+            },
+        );
     }
 
     #[test]

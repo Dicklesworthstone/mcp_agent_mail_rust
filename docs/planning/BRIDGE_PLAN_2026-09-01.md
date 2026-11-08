@@ -11,7 +11,7 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   no complete-fleet capacity claim from that initial sample. Worker115
   has45,392,822,272bytes available; the remaining ledger group629821 has no
   surviving members in a complete procfs census. Normal RCH owns stale reaping.
-- [ ] Reverify all3,917 frozen U source records and actual-Q timeout config;
+- [x] Reverify all3,917 frozen U source records and actual-Q timeout config;
   submit original37-case compile-only preparation through strict RCH on115.
   Both timeout buckets must be14400 for --no-run; no runner-only flags there.
   Original source/features/profile/build-jobs2,30GiB growth/10GiB floor remain.
@@ -24,6 +24,17 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   foreign30GiB reservation and one fully absent group. Original own30GiB+floor10GiB
   fits beside the live reservation. Submit unchanged preparation on hz4 through
   ordinary RCH. Normal RCH owns stale reaping; no budget or worker-config change.
+  U preparation10132 actually compiles, then is deliberately superseded by V.
+  Cancel only its exact owned wrapper092f5fa3: original exit143, recovery
+  delivery120, terminal acknowledgment and source release confirmed. No native
+  body credit. Never replay an unconfirmed wrapper or touch foreign processes.
+- [x] Supersede V preparation of the unchanged37-body population on hz4/build10146
+  after the fresh review finds the two concrete defects below. Cancel/recover
+  exact owned wrapperf9e7455b only: original143, recovery120, acknowledged and
+  source-released. Zero body credit. Both preparation timeout buckets14400;
+  original source/features/profile/build-jobs2 and normal disk guards unchanged.
+  Earlier V attempts retained: hz4 disk refusal120,115 queue refusal103. These
+  are admission results, never compiler/test failures or passing bodies.
 - [ ] If preparation passes, execute the unchanged original37-body population
   with test-jobs1/no-fail-fast and both deadline buckets1800. Record every
   outcome; do not infer body credit from preparation or old CLI controls.
@@ -34,18 +45,157 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   Reject `br where` because prefix discovery can inspect SQLite even in no-DB
   mode. Real `br --no-db config path --json` passes7 workspace/redirect cases;
   a malformed-DB syscall trace opens no database and preserves its bytes.
-- [ ] Wire that existing database-free CLI discovery path while preserving
+- [x] Wire that existing database-free CLI discovery path while preserving
   exact explicit-project/directory, symlink, redirect and environment authority
   checks. Remove unused embedded library and its20 old engine patches, retain
   exact mailbox engine0.4.13, and verify lock resolution only prunes dependencies.
   This is real .45 implementation, not an incompatible upstream version swap.
+  Lock shrinks868→824 packages:44 removed, none added, all remaining versions
+  and checksums unchanged. Common feature removals were reviewed against actual
+  consumers. Main and Q match at all3,917 frozen paths except this operator TODO.
+- [x] Requalify separate production and all-target compiler graphs: actual V
+  builds10135/10136 both exit0. Main's actual RCH footprint is5,971 files,
+  including2,054 preexisting ignored/untracked extras, rather than the planned
+  3,917 records alone. Both complete receipt vectors match, all planned records
+  match, and post-run hashing of all5,971 paths finds zero changes. No deletion
+  or exclusion of those peer files. Q is reused for the remaining clean-input
+  checks; this does not reduce tests, features, resource budgets or thresholds.
+- [x] Complete full CLI-library UBS scan with all stock Rust rules: exit0,
+  status ok, critical0, warnings10,341. Earlier180s/300s timeouts remain failed
+  receipts. A1,800s scanner-completion allowance permits the actual scan;
+  no test/SLO deadline or scanner rule is relaxed. The older-source scan was
+  explicitly cancelled before Q promotion, so claim no before/after delta.
+  Formatting passes separately on main and Q.
+- [x] Finish strict Clippy and all-target checks on XQ: exits0, complete
+  3,917-file receipt vectors match frozen XQ exactly (builds10148/10153).
+  Earlier admission/namespace
+  refusals are retained. V1156319/build10147 is superseded after finding the
+  two concrete defects: exact wrapper5160afc4 cancelled143, recovery120,
+  acknowledged/source-released. No guard or worker-policy override.
 - [ ] Execute original Beads integration tests and a real CLI before/after
   positive plus poisoned-authority controls. Requalify final source through
   separate production/all-target/strict-Clippy/fmt gates and original37/66 runs.
-  The currently compiling U preparation is separate evidence; no U/V conflation.
-- [ ] Verify .45's original strict clean-source release requirements and its
-  negative submodule-source control; keep unmet public/all-platform acceptance
-  open. Do not weaken the DSR source gate or erase either rejected upgrade.
+  Build a production-feature V CLI and bind executable/toolchain/source identity;
+  old U/public-package binaries cannot validate this new code.
+- [x] Fresh consumer review reproduces an additional real display defect:
+  installed br returns an array for show, but am's table renderer reads it as
+  an object. Real private before-control exits0 printing only `show-mpp:`;
+  title/description are absent. Fix the table view to select the issue while
+  retaining the complete original JSON/TOON response. Add a real-br integration
+  regression asserting ID/title/description/priority/status and exact JSON.
+  This new main-only candidate is W; the active Q jobs still test frozen V.
+- [x] A real non-UTF-8 path plus its existing UTF-8 replacement-character
+  neighbor exposes lossy JSON path rebinding in implicit discovery. Reject
+  that ambiguity before selecting a workspace; explicit valid UTF-8 paths
+  remain usable because exact mode compares their canonical identity. Extend
+  the original non-UTF-8 test with that real collision and explicit positive.
+  Final candidate is X. W's scan uses frozen copies of its two earlier files,
+  so neither W nor V can certify this additional path repair.
+- [x] Settle both owned V wrappers before manually promoting final X to Q.
+  All3,917 frozen paths match main except this mutable operator TODO.
+- [x] Full W two-file UBS scan completes801s, exit1/status ok, critical1.
+  The critical is an existing real HTTP test's PID-derived bearer token.
+  Use the existing production cryptographic token generator instead, with no
+  assertion, scanner-rule, timeout or gate relaxation. This test-only change
+  makes final candidate Y; production library bytes remain identical to X.
+  Stop only the owned superseded X scanner controller after verifying its
+  birth, ancestor stdout and exact shadow path. Preserve its incomplete result.
+- [x] After X checks on1156319 settle, promote the test-only Y change to Q.
+  X production/CLI jobs on other workers keep their already-transferred X
+  snapshots. This is insufficient: RCH also compares the caller's full source
+  at completion. X production on116 finishes Cargo0 but invocation1 refuses
+  the one changed integration-test file; exact wrapperc092ad8b retains ownership
+  for recovery. The qualifier edit during those jobs was an operator mistake.
+  Preserve the refusal, recover without replay, and keep Q completely frozen
+  until every remaining invocation settles. No source restoration to obtain a
+  pass. X CLI onhz2 can likewise fail its final barrier; rerun final Y normally
+  after exact recovery, without bypassing the gate or manually fetching a pass.
+  Bind each result to its actual receipt, never to intended source identity.
+- [ ] Finish full Y changed-file scan and all required final Y compiler/native
+  checks, production CLI build and real display before/after control. Y Clippy
+  and complete same-rule scan are running. X production/CLI builds use
+  previously qualified worker pools under
+  normal guards. X native hz4 attempt refuses120 before Cargo because foreign
+  reservations change again (62,286,622,720bytes available); no body credit.
+- [x] Final Y full-file UBS completes802s, exit0/status ok, failed modules0,
+  critical0, warnings12,134 across both complete changed Rust files. Both frozen
+  scanner inputs still match main exactly. Preserve W's critical1 and the
+  deliberately stopped X scan; neither is relabeled a pass. Y formatting0.
+- [x] Final Y strict Clippy10154 and all-target10155 both exit0; each complete
+  3,917-file receipt vector equals frozen YQ. Source differs from X only at the
+  HTTP test's secure token construction, never at either production repair.
+- [x] Final Y production graph10160 exits0 on1156319; complete3,917-file vector
+  matches YQ and both other final compiler receipts. All three required compiler
+  gates are now terminal0 on final Y. The old X source-barrier refusal remains
+  separate; exact recovery acknowledges its compiler0, never a final-Y pass.
+- [x] Further test review finds a genuine platform assumption: APFS only
+  permits valid UTF-8 filenames ([Apple's filesystem contract](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html)).
+  Keep the original Unix non-UTF-8 pin assertions, add the valid literal-U+FFFD
+  exact-path positive on Unix, and preserve the whole physical collision plus
+  post-refusal positive in a separate Linux test. No original assertion is
+  removed; Linux gains one named test, and Unix retains its portable checks.
+  This is Z, a test-layout correction only; production behavior is unchanged.
+  Native macOS acceptance remains unexecuted, not inferred from documentation.
+- [ ] Finish final Z full-file scan (running on main-only changes), then all
+  three compiler gates and executable qualification after exact X CLI recovery.
+  X CLI has reached its expected source-consistency refusal1 after compilation;
+  no stale-source artifact earns a final-Z pass. Q stays Y until that owned
+  wrapper is acknowledged/source-released; then promote Z manually and freeze.
+- [x] X CLI exact recovery acknowledges compiler0 and releases its source;
+  preserve original source-barrier refusal1. Manually promote Z only afterward.
+  Final Z production10166, strict Clippy10164 and full CLI10165 each exit0,
+  with complete3,917-file vectors matching frozen ZQ exactly. Last Z all-target
+  check is running; all prior Y passes remain separately scoped.
+- [x] Final Z complete two-file UBS exits0/status ok, failed modules0,
+  critical0, warnings12,138. Frozen scanner copies equal current main. Z fmt0.
+- [x] Preserve returned/private/worker ELF bytes:296,616,264bytes, all three
+  SHA2567341a84157ca78131bc1b9be8f4cf6676c2b3b839967914578344820134a2a19.
+  Worker hz2 uses pinned rustc908501772 and Cargo e8cb624d5. This is a qualified
+  development executable, not a published release artifact or clean-commit build.
+- [x] All18 predeclared real CLI controls pass, failures0/skips0/retries0.
+  Same before-issue show-mpp now displays title/description/P1/open, with exact
+  JSON preservation and complete TOON details. Real br0.7.6 seeds/queries the
+  private workspaces; authority, redirect and encoding controls remain real.
+  Lossy implicit refusal opens no beads.db in a full strace child census.
+  No original37/66 native-body, performance-SLO or native-platform release credit.
+- [x] Final Z all-target check10170 exits0 with exact frozen3,917-file vector.
+  All three required final Z compiler gates, formatting and full scan pass.
+- [ ] Execute original37 preparation and bodies on the newly available hz4
+  window. At21:54UTC all12 enabled Linux workers receive a physical/complete
+  procfs reservation census: hz4 has62,039,117,824bytes free and no live competing
+  reservation. Original30GiB growth +10GiB floor fits; normal RCH owns reaping.
+  Start unchanged Z --no-run preparation with both timeout buckets14400;
+  actual bodies still require both1800. Q is frozen; no further source edits.
+  The21:56 attempt10171 refuses120 before Cargo after a foreign reservation wins
+  the race; exact wrapperc50c38c8 is terminal/acknowledged/source-released.
+  A bounded read-only watcher reports a fresh window22:08:45. Its proposed
+  dynamic execution step was rejected by DCG's unverifiable-argv rule; remove
+  that execution step entirely, use no override, and issue the full literal
+  RCH command separately. The22:10 retry actually reaches Cargo and compiles
+  final Z native targets. No body credit before native execution/results.
+- [ ] Finish Y production graph and executable build under normal guards;
+  retain actual worker/toolchain/returned and private-copy binary identities.
+  Current X production on116 and CLI onhz2 keep their transferred X snapshots;
+  final Y production on1156319 runs separately, no cross-frame pass claim.
+- [ ] Execute a fixed18-case real CLI control population: help/version;
+  explicit status/list/ready; complete show table/JSON/TOON; poisoned ambient
+  directory+database authority; explicit-child refusal and nested discovery;
+  explicit symlink refusal; self/foreign redirects; exact _beads versus sibling
+  .beads; lossy implicit refusal with no beads.db opens; explicit valid Unicode
+  replacement-character positive; explicit non-UTF-8 refusal. Preserve all
+  outcomes without retry; these controls do not replace original native37/66.
+- [x] Execute cold-source component positive and paired old-graph negative.
+  Fresh private Cargo fetch succeeds; offline reconstruction uses only those
+  new archives/index/bare Git databases, with no host checkout copying. Installed
+  DSR c2554b53 capture AND verify authenticate812 dependencies,46,182 files;
+  every dependency manifest is private and all3 Git roots have zero gitlinks.
+  Old f61973ea source with old-only cached archives/bare parent Git database,
+  never checked-out sources, exits101 specifically on offline materialization
+  of legacy_sqlite_code/sqlite. Keep that negative's host-cache provenance
+  explicit. This is preparation evidence, not a strict release-build result.
+- [ ] Verify .45's original strict clean-source EVERY-release-target builds
+  and native Beads tests; keep unmet public/all-platform acceptance open.
+  Do not weaken the DSR source gate or erase either rejected upgrade.
 - [ ] Freshly reread the complete patch and consumers, fix any confirmed defect,
   and requalify any new source separately. Finish exact receipts/Beads/source,
   export/graph/diff checks and release only this session's reservations.

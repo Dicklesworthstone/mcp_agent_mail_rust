@@ -7933,6 +7933,89 @@ fn list_acks_with_seeded_project() {
 }
 
 #[test]
+fn beads_show_renders_real_issue_and_preserves_json_response() {
+    let env = TestEnv::new();
+    let project_dir = std::fs::canonicalize(env.tmp.path()).expect("canonical project path");
+    let beads_dir = project_dir.join(".beads");
+    let mut child_env = env.isolated_env();
+    child_env.extend([
+        (
+            "PATH".to_string(),
+            std::env::var("PATH").expect("test PATH"),
+        ),
+        ("AM_BR_BIN".to_string(), "br".to_string()),
+        ("AM_INTERFACE_MODE".to_string(), "cli".to_string()),
+    ]);
+    let run_br = |args: &[&str]| {
+        let out = Command::new("br")
+            .current_dir(env.tmp.path())
+            .envs(child_env.iter().map(|(key, value)| (key, value)))
+            .env("BEADS_DIR", &beads_dir)
+            .env_remove("BEADS_DB")
+            .env_remove("BD_DB")
+            .env_remove("BD_DATABASE")
+            .args([
+                "--json",
+                "--quiet",
+                "--no-daemon",
+                "--allow-stale",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ])
+            .args(args)
+            .output()
+            .expect("run real br");
+        assert!(
+            out.status.success(),
+            "br {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    run_br(&["init", "--prefix", "show"]);
+    let created = run_br(&[
+        "create",
+        "Visible Beads title",
+        "--description",
+        "Visible Beads description",
+        "--priority",
+        "1",
+    ]);
+    let issue: Value = serde_json::from_slice(&created.stdout).expect("created issue JSON");
+    let id = issue["id"].as_str().expect("created issue ID");
+    let expected = run_br(&["show", id]);
+    let project = project_dir.to_str().expect("UTF-8 project path");
+    for format in ["table", "json"] {
+        let args = ["beads", "show", id, "--path", project, "--format", format];
+        let out = run_am(&child_env, Some(env.tmp.path()), &args, None);
+        if !out.status.success() {
+            write_artifact("beads_show_real_issue", &args, &out);
+        }
+        assert!(out.status.success(), "am beads show failed: {out:?}");
+        if format == "json" {
+            let actual: Value = serde_json::from_slice(&out.stdout).expect("am show JSON");
+            let expected: Value = serde_json::from_slice(&expected.stdout).expect("br show JSON");
+            assert_eq!(
+                actual, expected,
+                "JSON must retain the complete br response"
+            );
+        } else {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for required in [
+                id,
+                "Visible Beads title",
+                "Visible Beads description",
+                "P1",
+                "open",
+            ] {
+                assert!(text.contains(required), "missing {required:?} in {text:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
@@ -9576,7 +9659,7 @@ fn cli_serves_integrity_checked_tailwind_without_exposing_mailbox_pages() {
     }
     let env = TestEnv::new();
     let port = unused_loopback_port();
-    let token = format!("private-asset-test-{}", std::process::id());
+    let token = mcp_agent_mail_core::setup::generate_token().expect("secure test bearer token");
     let log_path = env.tmp.path().join("asset-daemon.log");
     let log = std::fs::File::create(&log_path).unwrap();
     let mut server = OwnedServer(
