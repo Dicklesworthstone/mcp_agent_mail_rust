@@ -22570,6 +22570,10 @@ async fn try_proxy_contact_handshake(
 // Beads integration
 // ---------------------------------------------------------------------------
 
+fn is_beads_dir_name(name: &std::ffi::OsStr) -> bool {
+    name == ".beads" || name == "_beads"
+}
+
 fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
     let start = match path {
         Some(p) => p.to_path_buf(),
@@ -22581,11 +22585,7 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
     // workspace, not ancestor discovery. Validate without following arbitrary
     // symlinks, and accept only a self-redirect so an explicit path cannot be
     // silently rebound to an unrelated workspace.
-    if path.is_some()
-        && start
-            .file_name()
-            .is_some_and(beads_rust::config::is_beads_dir_name)
-    {
+    if path.is_some() && start.file_name().is_some_and(is_beads_dir_name) {
         let absolute = if start.is_absolute() {
             start.clone()
         } else {
@@ -22600,10 +22600,7 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
                 absolute.display()
             ))
         })?;
-        if !canonical
-            .file_name()
-            .is_some_and(beads_rust::config::is_beads_dir_name)
-        {
+        if !canonical.file_name().is_some_and(is_beads_dir_name) {
             return Err(CliError::InvalidArgument(format!(
                 "explicit beads directory resolved to an invalid target: {}",
                 canonical.display()
@@ -22619,27 +22616,13 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
                 redirect_path.display()
             )));
         }
-        if let Some(redirect) =
-            beads_rust::config::routing::read_redirect(&canonical).map_err(|e| {
-                CliError::InvalidArgument(format!(
-                    "cannot read explicit beads redirect {}: {e}",
-                    redirect_path.display()
-                ))
-            })?
-        {
-            let redirect = std::fs::canonicalize(&redirect).map_err(|e| {
-                CliError::InvalidArgument(format!(
-                    "cannot resolve explicit beads redirect {}: {e}",
-                    redirect.display()
-                ))
-            })?;
-            if redirect != canonical {
-                return Err(CliError::InvalidArgument(format!(
-                    "explicit beads directory {} redirects to a different workspace {}; pass the target project path explicitly",
-                    canonical.display(),
-                    redirect.display()
-                )));
-            }
+        let selected = discover_beads_dir_via_cli(&canonical, Some(&canonical))?;
+        if selected != canonical {
+            return Err(CliError::InvalidArgument(format!(
+                "explicit beads directory {} redirects to a different workspace {}; pass the target project path explicitly",
+                canonical.display(),
+                selected.display()
+            )));
         }
         return Ok(canonical);
     }
@@ -22676,25 +22659,11 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
         )));
     }
 
-    let beads_dir = beads_rust::config::discover_beads_dir(Some(&start)).map_err(|e| {
-        CliError::InvalidArgument(format!(
-            "no beads directory found from {}: {e}",
-            start.display()
-        ))
-    })?;
-    std::fs::canonicalize(&beads_dir).map_err(|e| {
-        CliError::InvalidArgument(format!(
-            "cannot resolve beads directory {}: {e}",
-            beads_dir.display()
-        ))
-    })
+    discover_beads_dir_via_cli(&start, None)
 }
 
 fn beads_project_dir(beads_dir: &Path) -> PathBuf {
-    if beads_dir
-        .file_name()
-        .is_some_and(beads_rust::config::is_beads_dir_name)
-    {
+    if beads_dir.file_name().is_some_and(is_beads_dir_name) {
         beads_dir
             .parent()
             .map(Path::to_path_buf)
@@ -22717,19 +22686,11 @@ fn br_cli_path() -> PathBuf {
     PathBuf::from("br")
 }
 
-fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Command, String> {
-    let beads_dir_utf8 = beads_dir.to_str().ok_or_else(|| {
-        format!(
-            "cannot pin br to non-UTF-8 beads directory {}; Beads currently reads BEADS_DIR as UTF-8",
-            beads_dir.display()
-        )
-    })?;
-    let project_dir = beads_project_dir(beads_dir);
+fn br_base_command(working_dir: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(br_cli_path());
     command
-        .current_dir(project_dir)
+        .current_dir(working_dir)
         .env("RUST_LOG", "error")
-        .env("BEADS_DIR", beads_dir_utf8)
         .env_remove("BEADS_DB")
         .env_remove("BD_DB")
         .env_remove("BD_DATABASE")
@@ -22740,13 +22701,28 @@ fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Co
             "--allow-stale",
             "--no-auto-import",
             "--no-auto-flush",
-        ])
-        .args(args);
+        ]);
+    command
+}
+
+fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Command, String> {
+    let beads_dir_utf8 = beads_dir.to_str().ok_or_else(|| {
+        format!(
+            "cannot pin br to non-UTF-8 beads directory {}; Beads currently reads BEADS_DIR as UTF-8",
+            beads_dir.display()
+        )
+    })?;
+    let mut command = br_base_command(&beads_project_dir(beads_dir));
+    command.env("BEADS_DIR", beads_dir_utf8).args(args);
     Ok(command)
 }
 
 fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, String> {
-    let output = br_json_command(beads_dir, args)?
+    br_command_json(br_json_command(beads_dir, args)?)
+}
+
+fn br_command_json(mut command: std::process::Command) -> Result<serde_json::Value, String> {
+    let output = command
         .output()
         .map_err(|e| format!("failed to execute br: {e}"))?;
 
@@ -22766,6 +22742,41 @@ fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, S
     serde_json::from_slice(&output.stdout).map_err(|e| {
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         format!("failed to parse br JSON output: {e}; output={stdout}")
+    })
+}
+
+fn discover_beads_dir_via_cli(start: &Path, pinned: Option<&Path>) -> CliResult<PathBuf> {
+    // `where` can inspect SQLite to infer a prefix, even with --no-db. Config
+    // paths need only directory/config metadata and use the same discovery and
+    // redirect rules as the installed CLI that handles every subsequent query.
+    let args = ["--no-db", "config", "path"].map(str::to_string);
+    let working_dir = pinned.map_or_else(|| start.to_path_buf(), beads_project_dir);
+    let result = (|| -> Result<PathBuf, String> {
+        let command = if let Some(beads_dir) = pinned {
+            br_json_command(beads_dir, &args)?
+        } else {
+            let mut command = br_base_command(&working_dir);
+            command.args(&args);
+            command
+        };
+        let value = br_command_json(command)?;
+        let beads_dir = value
+            .get("project_config")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|path| Path::new(path).parent())
+            .ok_or_else(|| "br reported no project config path".to_string())?;
+        std::fs::canonicalize(working_dir.join(beads_dir)).map_err(|error| {
+            format!(
+                "cannot resolve beads directory {}: {error}",
+                beads_dir.display()
+            )
+        })
+    })();
+    result.map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "cannot discover beads directory from {}: {error}",
+            start.display()
+        ))
     })
 }
 
@@ -76486,7 +76497,7 @@ startup_timeout_sec = 42
                 err.to_string().contains("no beads directory"),
                 "expected 'no beads directory' in: {err}"
             ),
-            // beads_rust discovery deliberately walks UP from the start dir,
+            // br discovery deliberately walks UP from the start dir,
             // so on hosts where a tempdir ancestor is a real beads workspace
             // (e.g. a stray /data/tmp/.beads) resolution legitimately
             // escapes the tempdir (br-51028). The invariant that must hold
@@ -76507,6 +76518,11 @@ startup_timeout_sec = 42
         let underscore_beads = dir.path().join("_beads");
         std::fs::create_dir_all(&dot_beads).expect("create .beads");
         std::fs::create_dir_all(&underscore_beads).expect("create _beads");
+        let poisoned_database = b"not a SQLite database; discovery must not open or recover it";
+        for beads_dir in [&dot_beads, &underscore_beads] {
+            std::fs::write(beads_dir.join("beads.db"), poisoned_database)
+                .expect("write poisoned discovery database");
+        }
 
         assert_eq!(
             resolve_beads_dir(Some(&dot_beads)).expect("resolve explicit .beads"),
@@ -76517,6 +76533,20 @@ startup_timeout_sec = 42
             std::fs::canonicalize(&underscore_beads).expect("canonical _beads"),
             "an explicit _beads path must not lose to a sibling .beads"
         );
+        for beads_dir in [&dot_beads, &underscore_beads] {
+            assert_eq!(
+                std::fs::read(beads_dir.join("beads.db")).expect("read discovery database"),
+                poisoned_database,
+                "directory discovery must preserve even an unreadable database"
+            );
+            assert_eq!(
+                std::fs::read_dir(beads_dir)
+                    .expect("read discovery directory")
+                    .count(),
+                1,
+                "directory discovery must not create locks, sidecars or recovery artifacts"
+            );
+        }
     }
 
     #[test]
