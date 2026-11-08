@@ -1,5 +1,61 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 8 fresh review and baseline coverage — EmeraldEagle
+
+Continue original `br-kp1in.5` and `br-kp1in.90`; their full acceptance remains
+open. Retained evidence: `/data/tmp/am-fresh-review4-20261108.CQcX6K/`.
+
+- [x] Reread suite and repository instructions, verify README bytes match the
+  complete prior read, and reread the entire Count change and affected readers.
+  No new Count defect found. Shared live health is degraded by one reclaimable
+  orphan page with rows readable; no live repair is attempted.
+- [x] Refresh all42 ready Beads and original owned task state. Read current
+  authoritative worker disk ledgers; none fits the unchanged30GiB growth plus
+  10GiB floor alongside active reservations. Do not lower resource fences or
+  clean another job's artifacts. Original native populations stay unexecuted.
+- [x] Trace the distinct RCH build/nextest timeouts. Installed nextest supports
+  compile-only `--no-run`; a preparation run can use a longer compiler allowance
+  without changing the original test-run deadline. Do not count it as tests.
+- [x] Reproduce two real K false successes: empty baseline with same-path save,
+  and baseline containing only `lint` with a separate planted output. Both exit0
+  and overwrite the output despite having no `help` comparison. Two matched
+  baseline controls pass. Freeze that four-case evaluator before implementation.
+- [x] Load and validate baseline coverage before seeding or executing commands;
+  require every enabled selected benchmark, allow unrelated extra baseline rows,
+  and preserve existing skip conditions and comparison thresholds. Extend the
+  existing handler test with both missing-reference cases and byte/report checks.
+- [x] Reread the complete repair and tests, format, and freeze exact qualifier
+  inputs. Only the CLI library differs from K; selected compiled main/qualifier
+  files agree. No Count or threshold/condition change; extra baseline rows remain
+  valid and baseline values are loaded once before the measured work.
+- [x] Run the separate production check: hz3/build10065 finishes0 in724.7s;
+  receipt13d084c1 freshly matches all3,917 qualifier hash/size/executable records.
+- [x] Strict all-target Clippy finishes0 on vmi1153651/build10067 in837.2s;
+  receiptf16a4857 matches all3,917 inputs and the production vector.
+- [ ] Complete the separate all-target check through strict RCH.
+  Original all-target request10068 refuses120 at ordinary disk admission on
+  worker vmi1156319. After production settles and its own target still exists,
+  admit a distinct hz3 request against that completed cache; retain the refusal.
+- [ ] Build the complete CLI, verify source/executable identity, and execute the
+  unchanged four-case evaluator plus original13 failure/report/baseline controls.
+  First CLI request10066 refuses120 on worker115 disk reservations. Its old K
+  pool is now absent, so no imaginary warm retry. A separate normally admitted
+  hz2 build compiles from a fresh cache with unchanged features/profile/settings.
+- [ ] Complete the whole changed-library UBS scan. The first unchanged default
+  module allowance expires300s/exit2 with an explicitly partial result. Read-only
+  doctor verifies the AST engine/module checksums and reports a healthy scanner.
+  Rerun the same full file with documented `UBS_MODULE_TIMEOUT=1800`; do not
+  enable partial acceptance, exclusions, suppressions or a looser severity policy.
+- [ ] Execute original37 CLI native cases and original lifecycle30 plus required
+  repeats when ordinary capacity fits. If preparation is needed, keep compilation
+  separate, then retain the original1,800s test-run and per-test deadlines.
+- [ ] Resolve the prior quiet stdio5,141ms versus5,000ms failure through an actual
+  causal repair; another unmodified run cannot erase it. Preserve old-J control,
+  diagnostic strace and loaded-send p99 6.011s versus5.000s failure.
+- [ ] Complete a second source review, record exact outcomes on original Beads,
+  flush/cycle/diff checks, and publish only the owned qualified work. Keep missing
+  host/corpus/load/null controls, unsupported stubs and release acceptance open.
+
 ## November 7 fresh review and message-count wiring — EmeraldEagle
 
 Continue original `br-kp1in.5`; no new task, closure, scope split or performance
