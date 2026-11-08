@@ -26776,12 +26776,39 @@ fn handle_bench(
 
     let cwd = std::env::current_dir()
         .map_err(|err| CliError::Other(format!("failed to read current directory: {err}")))?;
+    let needs_seeded_db = configs.iter().any(|cfg| cfg.requires_seeded_db);
+    let condition_context = bench::BenchConditionContext {
+        stub_encoder_available: cwd.join("scripts/toon_stub_encoder.sh").is_file(),
+        seeded_database_available: needs_seeded_db,
+    };
+    let baseline_data = baseline
+        .as_ref()
+        .map(|path| {
+            bench::load_baseline(path)
+                .map_err(|err| CliError::Other(format!("failed to load baseline: {err}")))
+        })
+        .transpose()?;
+    // Admit the comparison before seeding or running any command. A missing
+    // reference must never look like a passing comparison and replace itself.
+    for cfg in &configs {
+        cfg.validate().map_err(|err| {
+            CliError::Other(format!("invalid benchmark config '{}': {err}", cfg.name))
+        })?;
+        if cfg.enabled_for(condition_context)
+            && let Some(data) = &baseline_data
+            && !data.contains_key(&cfg.name)
+        {
+            return Err(CliError::InvalidArgument(format!(
+                "baseline has no entry for enabled benchmark '{}'",
+                cfg.name
+            )));
+        }
+    }
     let executable = std::env::current_exe()
         .map_err(|err| CliError::Other(format!("failed to resolve current executable: {err}")))?;
     let executable = executable.to_string_lossy().into_owned();
     let hardware = bench::HardwareInfo::detect();
 
-    let needs_seeded_db = configs.iter().any(|cfg| cfg.requires_seeded_db);
     let mut bench_env = std::collections::BTreeMap::new();
     let mut seed_report = None;
     let mut temp_workspace: Option<tempfile::TempDir> = None;
@@ -26820,18 +26847,11 @@ fn handle_bench(
         seed_report = Some(report);
     }
 
-    let condition_context = bench::BenchConditionContext {
-        stub_encoder_available: cwd.join("scripts/toon_stub_encoder.sh").is_file(),
-        seeded_database_available: needs_seeded_db,
-    };
     let mut summary = bench::BenchSummary::new(hardware.clone());
     let mut timings = std::collections::BTreeMap::new();
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
     for cfg in &configs {
-        cfg.validate().map_err(|err| {
-            CliError::Other(format!("invalid benchmark config '{}': {err}", cfg.name))
-        })?;
         if !cfg.enabled_for(condition_context) {
             skipped.push(cfg.name.clone());
             continue;
@@ -26899,14 +26919,6 @@ fn handle_bench(
         ));
     }
 
-    let baseline_data = if let Some(path) = baseline.as_ref() {
-        Some(
-            bench::load_baseline(path)
-                .map_err(|err| CliError::Other(format!("failed to load baseline: {err}")))?,
-        )
-    } else {
-        None
-    };
     if let Some(data) = baseline_data.as_ref() {
         bench::apply_baseline_comparison(
             &mut summary.benchmarks,
@@ -53433,6 +53445,48 @@ http_headers = { Authorization = "Bearer secret" }
             4,
             "passing and regressing runs must each retain a report"
         );
+
+        let separate_output = dir.path().join("preserved-output.json");
+        let output_sentinel = b"preserve the existing output baseline verbatim\n";
+        std::fs::write(&separate_output, output_sentinel).expect("plant output baseline");
+        for (missing_baseline, save_path) in [
+            ("{}\n", baseline_path.clone()),
+            ("{\"lint\":1000000000}\n", separate_output.clone()),
+        ] {
+            std::fs::write(&baseline_path, missing_baseline).expect("write uncovered baseline");
+            let result = handle_bench(
+                true,
+                None,
+                true,
+                Some(baseline_path.clone()),
+                Some(save_path),
+                Some("help".to_string()),
+                false,
+                None,
+                None,
+            );
+            assert!(
+                matches!(&result, Err(CliError::InvalidArgument(message))
+                    if message.contains("baseline has no entry for enabled benchmark 'help'")),
+                "an uncovered comparison must fail before running: {result:?}"
+            );
+            assert!(capture.drain_to_string().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(&baseline_path).expect("preserved input baseline"),
+                missing_baseline
+            );
+            assert_eq!(
+                std::fs::read(&separate_output).expect("preserved output baseline"),
+                output_sentinel
+            );
+            assert_eq!(
+                std::fs::read_dir(&report_dir)
+                    .expect("report inventory after rejected comparison")
+                    .count(),
+                4,
+                "an uncovered comparison must not execute or produce a measurement report"
+            );
+        }
     }
 
     #[test]
