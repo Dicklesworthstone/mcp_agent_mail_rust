@@ -459,6 +459,19 @@ do not publish a complete result until the terminal page accounts for the
 entire `total_count`. Each continuation passes normal server authentication.
 Neither `limit` nor `snapshot` is accepted alongside `snapshot_pages=true`.
 
+Pages advertising `supports_release: true` support explicit cache cleanup.
+After consuming or abandoning a snapshot, use the same URI with
+`snapshot_token=<returned-token>&snapshot_release=true`, omitting `offset`.
+The authenticated response identifies the token and reports `released: true`
+when it frees the entry, or `released: false` when the token is already gone.
+Repeating release is safe; a known token with the wrong project or mailbox
+scope is rejected without removing it. Normal page reads remain repeatable
+until release or expiry. The CLI automatically attempts this cleanup with a
+two-second request timeout, without replacing a successful result or the
+original read error if cleanup fails. This allows repeated large-history reads
+to reuse the cache immediately. Process termination, lost authorization, and
+older paged servers without the capability still rely on the 300-second expiry.
+
 An already-running v0.3.39 server supports only ordinary resource pages and
 ignores the newer `snapshot` parameter. A newer client recognizes only a
 successful, well-formed array response as that older protocol. It discards

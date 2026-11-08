@@ -6115,6 +6115,7 @@ fn reservation_read_history_pages(port: u16, slug: &str, first: &Value) -> Vec<V
     assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(first["schema_version"], 1);
     assert_eq!(first["consistency"], "materialized_snapshot");
+    assert_eq!(first["supports_release"], true);
     assert_eq!(first["active_only"], false);
     let total = usize::try_from(first["total_count"].as_u64().unwrap()).unwrap();
     let mut rows = Vec::with_capacity(total);
@@ -6124,6 +6125,7 @@ fn reservation_read_history_pages(port: u16, slug: &str, first: &Value) -> Vec<V
             "schema_version",
             "consistency",
             "snapshot_token",
+            "supports_release",
             "project",
             "agents",
             "active_only",
@@ -6175,6 +6177,7 @@ fn reservation_history_real_server_reads_over_snapshot_row_limit_without_local_a
     .unwrap();
     let before = file_snapshot(&unavailable);
     let vars = reservation_read_env(&env, port, &format!("sqlite:///{}", unavailable.display()));
+    let history_started = Instant::now();
     let history = run_am_hermetic(
         &vars,
         Some(env.hostile_repo()),
@@ -6223,6 +6226,26 @@ fn reservation_history_real_server_reads_over_snapshot_row_limit_without_local_a
         reservation_read_native_ids(&automatic),
         (1..=10_001).collect::<Vec<_>>()
     );
+    // These are history reads three through five against the same daemon.
+    // Every completed CLI read must release its token: retaining all captures
+    // until TTL would exhaust the four-slot cache on the fifth invocation.
+    for read_number in 3..=5 {
+        let repeated = run_am_hermetic(
+            &vars,
+            Some(env.hostile_repo()),
+            &["file_reservations", "list", &project, "--all", "--server"],
+        );
+        assert_eq!(
+            reservation_read_native_ids(&repeated),
+            (1..=10_001).collect::<Vec<_>>(),
+            "completed history read {read_number} must not exhaust snapshot slots"
+        );
+    }
+    assert!(
+        history_started.elapsed() < Duration::from_secs(300),
+        "five history reads must complete inside the cache TTL to distinguish release from expiry"
+    );
+    assert_eq!(file_snapshot(&unavailable), before);
 }
 
 #[test]
@@ -6266,6 +6289,9 @@ fn reservation_history_real_server_byte_pages_remain_immutable_between_requests(
     let next_uri = format!(
         "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset={offset}&active_only=false&format=json"
     );
+    let release_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&snapshot_release=true&active_only=false&format=json"
+    );
 
     // Same total count, different membership and lease state: a count check or
     // independent offset reads would silently mix these two database versions.
@@ -6281,21 +6307,40 @@ fn reservation_history_real_server_byte_pages_remain_immutable_between_requests(
     ).unwrap();
 
     for bearer in [None, Some("wrong-history-token")] {
-        let (status, response) = reservation_read_http_rpc(
-            port,
-            bearer,
-            &json!({
-                "jsonrpc": "2.0", "id": "gh377-denied", "method": "resources/read",
-                "params": {"uri": next_uri},
-            }),
-        );
-        assert!(matches!(status, 401 | 403), "{status}: {response}");
-        assert!(
-            response.get("result").is_none(),
-            "snapshot token bypassed authentication"
-        );
+        for uri in [&next_uri, &release_uri] {
+            let (status, response) = reservation_read_http_rpc(
+                port,
+                bearer,
+                &json!({
+                    "jsonrpc": "2.0", "id": "gh377-denied", "method": "resources/read",
+                    "params": {"uri": uri},
+                }),
+            );
+            assert!(matches!(status, 401 | 403), "{status}: {response}");
+            assert!(
+                response.get("result").is_none(),
+                "snapshot token bypassed authentication"
+            );
+        }
     }
+    let (status, response) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-wrong-release-scope", "method": "resources/read",
+            "params": {"uri": format!(
+                "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&snapshot_release=true&active_only=true&format=json"
+            )},
+        }),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert!(response.get("result").is_none());
+    assert_eq!(
+        response["error"]["data"]["error"]["type"],
+        "PAGED_SNAPSHOT_SCOPE_MISMATCH"
+    );
 
+    // Unauthorized or mismatched releases must leave the capture usable.
     let captured = reservation_read_history_pages(port, &slug, &first);
     let ids = |rows: &[Value]| {
         rows.iter()
@@ -6314,6 +6359,29 @@ fn reservation_history_real_server_byte_pages_remain_immutable_between_requests(
     assert_eq!(
         repeated, first,
         "retrying an immutable page changed its contents"
+    );
+    assert_eq!(
+        reservation_read_http_resource(port, &release_uri),
+        json!({"schema_version": 1, "snapshot_token": token, "released": true})
+    );
+    let (status, response) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-released-snapshot", "method": "resources/read",
+            "params": {"uri": next_uri},
+        }),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert!(response.get("result").is_none());
+    assert_eq!(
+        response["error"]["data"]["error"]["type"],
+        "PAGED_SNAPSHOT_EXPIRED"
+    );
+    assert_eq!(
+        reservation_read_http_resource(port, &release_uri),
+        json!({"schema_version": 1, "snapshot_token": token, "released": false}),
+        "releasing an already released token must be idempotent"
     );
 
     let fresh = reservation_read_http_resource(port, &initial_uri);

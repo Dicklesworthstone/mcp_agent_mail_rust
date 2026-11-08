@@ -1140,6 +1140,14 @@ timestamp. Continue with the same URI plus `snapshot_token=<token>` and
 Tokens expire 300 seconds after publication, do not survive server restart,
 and remain bound to the mailbox engine generation, project identity, and
 active/history scope. Every continuation requires normal server authentication.
+New pages advertise `supports_release: true`. Once a client finishes or abandons
+the read, it can free the snapshot using the same URI with its `snapshot_token`
+and `snapshot_release=true`, omitting `offset`. Release is authenticated, scoped,
+and idempotent; page retries remain valid until release or expiry. The CLI makes
+this best-effort cleanup request after success or a pagination failure, with a
+two-second request timeout. Cleanup failure does not replace the listing or its
+original error; expiry handles crashes, lost connectivity, and older paged servers
+that do not advertise release.
 The server retains at most four snapshots within a 128 MiB serialized cache
 budget; in-progress captures reserve capacity too. A full cache, expired token,
 oversized individual row/identity metadata, or exceeded aggregate bound is an

@@ -34,6 +34,7 @@ const MAILBOX_CONFIG_RESOURCE: &str = "resource://config/environment";
 const RESOURCE_ERROR_MESSAGE_MAX_CHARS: usize = 1024;
 const PAGED_SNAPSHOT_MAX_PAGES: usize = 1024;
 const PAGED_SNAPSHOT_TIMEOUT_SECONDS: u64 = 300;
+const PAGED_SNAPSHOT_RELEASE_TIMEOUT_SECONDS: u64 = 2;
 
 /// Only an authenticated, well-formed capacity refusal permits negotiation of
 /// a larger snapshot. Other failures retain their original trust boundary.
@@ -529,33 +530,57 @@ async fn read_paged_reservation_snapshot(
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(PAGED_SNAPSHOT_TIMEOUT_SECONDS);
     let mut state = PagedReservationRead::default();
-    let mut uri = base_uri.clone();
-    for _ in 0..PAGED_SNAPSHOT_MAX_PAGES {
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .ok_or_else(|| {
-                invalid_response("paged reservation snapshot deadline exceeded; retry the read")
-            })?;
-        let (payload, text_bytes) = read_resource_json(
+    let result: CliResult<()> = async {
+        let mut uri = base_uri.clone();
+        for _ in 0..PAGED_SNAPSHOT_MAX_PAGES {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    invalid_response("paged reservation snapshot deadline exceeded; retry the read")
+                })?;
+            let (payload, text_bytes) = read_resource_json(
+                &session.client,
+                &session.server_url,
+                session.bearer.as_deref(),
+                &uri,
+                RESOURCE_TIMEOUT_SECONDS.min(remaining.as_secs().max(1)),
+            )
+            .await?;
+            if state.accept_page(&payload, project, text_bytes)? {
+                return Ok(());
+            }
+            uri = format!(
+                "{base_uri}&snapshot_token={}&offset={}",
+                state.token,
+                state.reservations.len()
+            );
+        }
+        Err(invalid_response(
+            "paged reservation snapshot exceeds the page request limit",
+        ))
+    }
+    .await;
+
+    if state.supports_release && !state.token.is_empty() {
+        // Finished and failed reads must not occupy a cache slot for the full
+        // TTL. Release only the original validated identity, and only when
+        // that snapshot advertised the operation: older servers may ignore
+        // unknown query flags. Cleanup cannot change the read's outcome.
+        let release_uri = format!(
+            "{base_uri}&snapshot_token={}&snapshot_release=true",
+            state.token
+        );
+        let _ = read_resource_json(
             &session.client,
             &session.server_url,
             session.bearer.as_deref(),
-            &uri,
-            RESOURCE_TIMEOUT_SECONDS.min(remaining.as_secs().max(1)),
+            &release_uri,
+            PAGED_SNAPSHOT_RELEASE_TIMEOUT_SECONDS,
         )
-        .await?;
-        if state.accept_page(&payload, project, text_bytes)? {
-            return Ok((state.roster, state.reservations));
-        }
-        uri = format!(
-            "{base_uri}&snapshot_token={}&offset={}",
-            state.token,
-            state.reservations.len()
-        );
+        .await;
     }
-    Err(invalid_response(
-        "paged reservation snapshot exceeds the page request limit",
-    ))
+    result?;
+    Ok((state.roster, state.reservations))
 }
 
 pub(crate) fn encode_resource_component(value: &str) -> String {
@@ -1109,6 +1134,7 @@ fn validate_snapshot_rows(
 #[derive(Default)]
 struct PagedReservationRead {
     token: String,
+    supports_release: bool,
     captured_ts: i64,
     total_count: usize,
     text_bytes: usize,
@@ -1157,6 +1183,15 @@ impl PagedReservationRead {
             return Err(invalid_response("invalid reservation snapshot token"));
         }
         let captured_ts = timestamp(value, "captured_ts")?;
+        let supports_release = match value.get("supports_release") {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(invalid_response(
+                    "invalid reservation snapshot release capability",
+                ));
+            }
+        };
         let total_count = page_count(value, "total_count")?;
         if total_count > FILE_RESERVATION_PAGED_MAX_ROWS {
             return Err(invalid_response(
@@ -1203,15 +1238,13 @@ impl PagedReservationRead {
         }
         let (roster, reservations) =
             validate_snapshot_rows(value, project, false, FILE_RESERVATION_PAGED_MAX_ROWS)?;
-        if self.token.is_empty() {
-            self.token = token.to_string();
-            self.captured_ts = captured_ts;
-            self.total_count = total_count;
-            self.roster = roster;
-        } else if self.token != token
-            || self.captured_ts != captured_ts
-            || self.total_count != total_count
-            || self.roster != roster
+        let first_page = self.token.is_empty();
+        if !first_page
+            && (self.token != token
+                || self.supports_release != supports_release
+                || self.captured_ts != captured_ts
+                || self.total_count != total_count
+                || self.roster != roster)
         {
             return Err(invalid_response(
                 "reservation snapshot identity changed between pages",
@@ -1226,6 +1259,13 @@ impl PagedReservationRead {
                 ));
             }
             previous = Some(key);
+        }
+        if first_page {
+            self.token = token.to_string();
+            self.supports_release = supports_release;
+            self.captured_ts = captured_ts;
+            self.total_count = total_count;
+            self.roster = roster;
         }
         self.reservations.extend(reservations);
         self.complete = terminal;
@@ -2011,6 +2051,175 @@ pub(crate) mod tests {
                 assert!(error.contains("authentication failed"));
             }
         }
+    }
+
+    fn releasable_snapshot_page(rows: Vec<Value>, offset: usize, total: usize) -> Value {
+        let mut page = snapshot_page(rows, offset, total);
+        page["supports_release"] = true.into();
+        page
+    }
+
+    #[test]
+    fn materialized_history_releases_completed_empty_and_paged_reads() {
+        for total in [0, 2] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    let mut replies = vec![TestReply::Resource(project()), snapshot_limit_reply()];
+                    if total == 0 {
+                        replies.push(TestReply::Resource(releasable_snapshot_page(vec![], 0, 0)));
+                    } else {
+                        for offset in 0..total {
+                            replies.push(TestReply::Resource(releasable_snapshot_page(
+                                vec![reservation(i64::try_from(offset + 1).unwrap())],
+                                offset,
+                                total,
+                            )));
+                        }
+                    }
+                    replies.push(TestReply::Resource(serde_json::json!({
+                        "schema_version":1, "snapshot_token":"a".repeat(64), "released":true
+                    })));
+                    replies.push(TestReply::Resource(project()));
+                    replies
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            assert_eq!(result.unwrap().reservations.len(), total);
+            let release_uri = requests[requests.len() - 2]["params"]["uri"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                release_uri,
+                format!(
+                    "resource://file_reservations/test-project?snapshot_pages=true&active_only=false&format=json&snapshot_token={}&snapshot_release=true",
+                    "a".repeat(64)
+                )
+            );
+            assert!(!release_uri.contains("offset="));
+        }
+    }
+
+    #[test]
+    fn materialized_history_release_failure_does_not_replace_a_complete_result() {
+        for status in [200, 401, 403, 503] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    vec![
+                        TestReply::Resource(project()),
+                        snapshot_limit_reply(),
+                        TestReply::Resource(releasable_snapshot_page(vec![reservation(1)], 0, 1)),
+                        TestReply::Raw(
+                            status,
+                            serde_json::json!({
+                                "jsonrpc":"2.0", "error":{"code":-32602,"message":"cleanup unavailable"}
+                            }),
+                        ),
+                        TestReply::Resource(project()),
+                    ]
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            assert_eq!(result.unwrap().reservations.len(), 1);
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests[3]["params"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("snapshot_release=true")
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_history_releases_original_identity_after_continuation_failure() {
+        for failure in ["token", "capability", "authentication"] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    let failed_page = if failure == "authentication" {
+                        TestReply::Raw(401, serde_json::json!({"error":"denied"}))
+                    } else {
+                        let mut page = releasable_snapshot_page(vec![reservation(2)], 1, 2);
+                        if failure == "token" {
+                            page["snapshot_token"] = "b".repeat(64).into();
+                        } else {
+                            page["supports_release"] = false.into();
+                        }
+                        TestReply::Resource(page)
+                    };
+                    vec![
+                        TestReply::Resource(project()),
+                        snapshot_limit_reply(),
+                        TestReply::Resource(releasable_snapshot_page(vec![reservation(1)], 0, 2)),
+                        failed_page,
+                        TestReply::Raw(503, serde_json::json!({"error":"cleanup unavailable"})),
+                    ]
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("10000-row"));
+            assert!(error.contains(if failure == "authentication" {
+                "authentication failed"
+            } else {
+                "snapshot identity changed"
+            }));
+            assert!(!error.contains("cleanup unavailable"));
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests[4]["params"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!(
+                        "snapshot_token={}&snapshot_release=true",
+                        "a".repeat(64)
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_history_release_capability_must_be_boolean_and_pinned() {
+        let project = validate_project(&project(), "test-project").unwrap();
+        for capability in [Value::Null, 1.into(), "true".into(), serde_json::json!({})] {
+            let mut state = PagedReservationRead::default();
+            let mut page = snapshot_page(vec![reservation(1)], 0, 1);
+            page["supports_release"] = capability;
+            assert!(
+                state
+                    .accept_page(&page, &project, page.to_string().len())
+                    .is_err()
+            );
+            assert!(!state.supports_release);
+            assert!(state.token.is_empty());
+        }
+        let mut state = PagedReservationRead::default();
+        let unordered = releasable_snapshot_page(vec![reservation(2), reservation(1)], 0, 2);
+        assert!(
+            state
+                .accept_page(&unordered, &project, unordered.to_string().len())
+                .is_err()
+        );
+        assert!(
+            state.token.is_empty(),
+            "a rejected first page grants no cleanup authority"
+        );
+        assert!(!state.supports_release);
+        // The earlier paged protocol did not advertise release. A later page
+        // cannot retroactively authorize a new operation on that token.
+        let mut state = PagedReservationRead::default();
+        let first = snapshot_page(vec![reservation(1)], 0, 2);
+        assert!(
+            !state
+                .accept_page(&first, &project, first.to_string().len())
+                .unwrap()
+        );
+        let second = releasable_snapshot_page(vec![reservation(2)], 1, 2);
+        assert!(
+            state
+                .accept_page(&second, &project, second.to_string().len())
+                .is_err()
+        );
+        assert!(!state.supports_release);
     }
 
     #[test]

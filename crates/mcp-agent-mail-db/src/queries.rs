@@ -21779,6 +21779,119 @@ mod tests {
         });
     }
 
+    #[test]
+    fn reservation_paged_snapshot_keeps_one_view_across_interleaved_peer_commits() {
+        struct PeerCommit<'a> {
+            reader: &'a crate::DbConn,
+            writer: &'a crate::DbConn,
+            mutations: String,
+            after_holders: bool,
+            committed: std::cell::Cell<bool>,
+        }
+
+        impl crate::pool::SyncQuery for PeerCommit<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> std::result::Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.reader.query_sync(sql, params)?;
+                let trigger = if self.after_holders {
+                    sql.starts_with("SELECT id, project_id, name FROM agents")
+                } else {
+                    sql.starts_with("SELECT COUNT(*) AS row_count")
+                        && sql.contains("FROM file_reservations fr")
+                };
+                if trigger && !self.committed.replace(true) {
+                    self.writer.execute_raw(&self.mutations)?;
+                }
+                Ok(rows)
+            }
+
+            fn execute_raw(&self, sql: &str) -> std::result::Result<(), sqlmodel_core::Error> {
+                self.reader.execute_raw(sql)
+            }
+        }
+
+        for after_holders in [false, true] {
+            let (cx, pool, _dir) = setup_test_pool("reservation_paged_snapshot_peer_commit.db");
+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let project = ensure_project(&cx, &pool, "/tmp/reservation-paged-peer-commit")
+                    .await
+                    .into_result()
+                    .unwrap();
+                let project_id = project.id.unwrap();
+                let reader = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                reader.execute_raw(&format!(
+                    "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                     VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                     INSERT INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES \
+                     (1, {project_id}, 1, 'src/released.rs', 1, '', 10, 1000), \
+                     (2, {project_id}, 1, 'src/renewed.rs', 1, '', 10, 600), \
+                     (3, {project_id}, 1, 'src/deleted.rs', 1, '', 5, 1000); \
+                     PRAGMA query_only=ON"
+                )).unwrap();
+                // Reuse an already-read connection so stale cached engine
+                // snapshots cannot make the subsequent fresh read pass.
+                let warm = file_reservation_paged_snapshot_from_conn(
+                    &**reader, &project, false, 400,
+                ).unwrap();
+                assert_eq!(warm.reservations.len(), 3);
+                let writer = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+                let racing = PeerCommit {
+                    reader: &reader,
+                    writer: &writer,
+                    mutations: format!(
+                        "BEGIN IMMEDIATE; \
+                         INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 700); \
+                         UPDATE file_reservations SET expires_ts = 1500 WHERE id = 2; \
+                         DELETE FROM file_reservations WHERE id = 3; \
+                         INSERT INTO file_reservations \
+                         (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                         VALUES (4, {project_id}, 1, 'src/inserted.rs', 1, 'new', 1, 1500); \
+                         UPDATE agents SET name = 'GreenStone' WHERE id = 1; COMMIT"
+                    ),
+                    after_holders,
+                    committed: std::cell::Cell::new(false),
+                };
+                let captured = file_reservation_paged_snapshot_from_conn(
+                    &racing, &project, false, 500,
+                ).unwrap();
+                assert!(racing.committed.get(), "peer must commit during the capture");
+                // Counts remain three on both sides of the commit: checking
+                // totals alone cannot detect a mixed or shifted snapshot.
+                assert_eq!(
+                    captured.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    vec![Some(3), Some(1), Some(2)]
+                );
+                assert_eq!(captured.agents[0].name, "BlueLake");
+                assert_eq!(captured.reservations[1].released_ts, None);
+                assert_eq!(captured.reservations[2].expires_ts, 600);
+                let fresh = file_reservation_paged_snapshot_from_conn(
+                    &**reader, &project, false, 800,
+                ).unwrap();
+                assert_eq!(
+                    fresh.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    vec![Some(4), Some(1), Some(2)]
+                );
+                assert_eq!(fresh.agents[0].name, "GreenStone");
+                assert_eq!(fresh.reservations[0].reason, "new");
+                assert_eq!(fresh.reservations[1].released_ts, Some(700));
+                assert_eq!(fresh.reservations[2].expires_ts, 1500);
+                assert_eq!(
+                    reader.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0).unwrap(),
+                    1
+                );
+                reader.execute_raw("PRAGMA query_only=OFF").unwrap();
+            });
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn open_fresh_file_backed_conn_accepts_regular_authority_and_rejects_existing_symlink() {
