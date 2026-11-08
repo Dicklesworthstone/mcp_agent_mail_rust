@@ -6,18 +6,46 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
 
 - [x] Reverify governing-document/main patch identity and ready Beads; health
   probe reports only leaked-page accounting on a private copy, no live repair.
-  At19:03UTC, all but115 are below the original40GiB physical minimum. Worker115
+  Initial19:03UTC ten-host census reused the earlier worker list and omitted
+  currently enabled hz1/hz4. Correct that omission using the live registry;
+  no complete-fleet capacity claim from that initial sample. Worker115
   has45,392,822,272bytes available; the remaining ledger group629821 has no
   surviving members in a complete procfs census. Normal RCH owns stale reaping.
 - [ ] Reverify all3,917 frozen U source records and actual-Q timeout config;
   submit original37-case compile-only preparation through strict RCH on115.
   Both timeout buckets must be14400 for --no-run; no runner-only flags there.
   Original source/features/profile/build-jobs2,30GiB growth/10GiB floor remain.
+  Frozen-source/config checks pass. Initial115/build10130 fails before source
+  preparation or execution on SSH connection reset; exact wrapper0d9f7403 is
+  recovered terminal/acknowledged with sources released, never replayed while
+  unconfirmed. A distinct attempt after a successful SSH check refuses103 because
+  normal RCH temporarily bypasses115. No policy override or source/test credit.
+  The corrected registry includes enabled hz4:85,470,289,920bytes free, one live
+  foreign30GiB reservation and one fully absent group. Original own30GiB+floor10GiB
+  fits beside the live reservation. Submit unchanged preparation on hz4 through
+  ordinary RCH. Normal RCH owns stale reaping; no budget or worker-config change.
 - [ ] If preparation passes, execute the unchanged original37-body population
   with test-jobs1/no-fail-fast and both deadline buckets1800. Record every
   outcome; do not infer body credit from preparation or old CLI controls.
 - [ ] Execute remaining original66 lifecycle runs when their unchanged
   admission conditions permit. Preserve previous SLO failures and counters.
+- [x] Inspect the actual embedded Beads consumers: only name/discovery/redirect
+  helpers use the Rust library; all data operations already use external br.
+  Reject `br where` because prefix discovery can inspect SQLite even in no-DB
+  mode. Real `br --no-db config path --json` passes7 workspace/redirect cases;
+  a malformed-DB syscall trace opens no database and preserves its bytes.
+- [ ] Wire that existing database-free CLI discovery path while preserving
+  exact explicit-project/directory, symlink, redirect and environment authority
+  checks. Remove unused embedded library and its20 old engine patches, retain
+  exact mailbox engine0.4.13, and verify lock resolution only prunes dependencies.
+  This is real .45 implementation, not an incompatible upstream version swap.
+- [ ] Execute original Beads integration tests and a real CLI before/after
+  positive plus poisoned-authority controls. Requalify final source through
+  separate production/all-target/strict-Clippy/fmt gates and original37/66 runs.
+  The currently compiling U preparation is separate evidence; no U/V conflation.
+- [ ] Verify .45's original strict clean-source release requirements and its
+  negative submodule-source control; keep unmet public/all-platform acceptance
+  open. Do not weaken the DSR source gate or erase either rejected upgrade.
 - [ ] Freshly reread the complete patch and consumers, fix any confirmed defect,
   and requalify any new source separately. Finish exact receipts/Beads/source,
   export/graph/diff checks and release only this session's reservations.
