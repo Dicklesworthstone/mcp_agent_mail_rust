@@ -32,20 +32,40 @@ open. Retained evidence: `/data/tmp/am-fresh-review4-20261108.CQcX6K/`.
   receipt13d084c1 freshly matches all3,917 qualifier hash/size/executable records.
 - [x] Strict all-target Clippy finishes0 on vmi1153651/build10067 in837.2s;
   receiptf16a4857 matches all3,917 inputs and the production vector.
-- [ ] Complete the separate all-target check through strict RCH.
+- [x] Complete the separate all-target check through strict RCH.
   Original all-target request10068 refuses120 at ordinary disk admission on
   worker vmi1156319. After production settles and its own target still exists,
-  admit a distinct hz3 request against that completed cache; retain the refusal.
+  a distinct hz3 request reuses that completed cache and finishes0 in295.1s,
+  build10070/receiptbfaee776. Its complete3,917 records match production,
+  Clippy and the frozen qualifier. Retain the earlier refusal separately.
 - [ ] Build the complete CLI, verify source/executable identity, and execute the
   unchanged four-case evaluator plus original13 failure/report/baseline controls.
   First CLI request10066 refuses120 on worker115 disk reservations. Its old K
   pool is now absent, so no imaginary warm retry. A separate normally admitted
   hz2 build compiles from a fresh cache with unchanged features/profile/settings.
-- [ ] Complete the whole changed-library UBS scan. The first unchanged default
+- [x] Complete the whole changed-library UBS scan. The first unchanged default
   module allowance expires300s/exit2 with an explicitly partial result. Read-only
   doctor verifies the AST engine/module checksums and reports a healthy scanner.
   Rerun the same full file with documented `UBS_MODULE_TIMEOUT=1800`; do not
   enable partial acceptance, exclusions, suppressions or a looser severity policy.
+  Full scan finishes0 in1,046s/statusok/no failed modules/0critical,
+  10,338warnings/5,040info. All19 M-added-line findings were read: test
+  assertions/private fixture I/O and path copies, a literal slash misread as
+  division, and the one error-string allocation immediately followed by return.
+  No suppression or project-wide clean-scan claim; old bench.rs critical stays red.
+- [x] Inspect the externally published source6e826809 and planninge941a46c.
+  Current main and frozen qualifier still agree on all3,450 selected compiled
+  records (crates/scripts/tests plus Cargo/toolchain/nextest inputs). The earlier
+  3,160 count used a narrower tracked selection; this is an explicit wider check.
+  Source receipt vectors describe Q's complete3,917 inputs, not current main's
+  later tracker/planning bytes. Preserve the separate qualifier Git stamp.
+- [ ] Finish executable qualification. hz2's compiler runs at SCHED_IDLE/nice19
+  and its Asupersync frontend shows55s CPU versus roughly700s runnable delay;
+  leave scheduler policy intact. One alternate hz3 request expires103 in queue
+  without Cargo. A fresh read-only census finds worker115 now has25,321,496,576
+  bytes after reservations/floor and load2.35 on10 CPUs; a new ordinary full CLI
+  request there compiles, with the same source/features/profile. Keep hz2 until
+  a successful replacement is bound; then cancel only the exact owned wrapper.
 - [ ] Execute original37 CLI native cases and original lifecycle30 plus required
   repeats when ordinary capacity fits. If preparation is needed, keep compilation
   separate, then retain the original1,800s test-run and per-test deadlines.
