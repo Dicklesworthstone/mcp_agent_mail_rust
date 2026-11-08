@@ -993,6 +993,237 @@ else
     failures=$((failures + 1))
 fi
 
+# Bounded probes must select a usable runner before starting their command,
+# retain exact output evidence, and never retry a command with side effects.
+capture_probe="$scratch/capture-probe.sh"
+cat > "$capture_probe" <<'PROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1" backend="$2" mode="$3"
+source "$4"
+TMP="$root"
+real_python=$(type -P python3) || real_python=''
+real_perl=$(type -P perl) || real_perl=''
+command() {
+    if [ "${FUNCNAME[1]:-}" = capture_command_with_timeout ] && [ "${1:-}" = -v ]; then
+        case "$backend:${2:-}" in
+            python:python3|perl:perl|timeout:timeout|gtimeout:gtimeout|\
+            broken-python:python3|broken-python:perl|noop-python:python3|noop-python:perl|\
+            broken:python3|broken:perl|noop:python3|noop:perl|invalid:python3|invalid:perl|\
+            python-selected:*|perl-selected:perl|perl-selected:timeout|perl-selected:gtimeout) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    builtin command "$@"
+}
+capture_helper() {
+    local helper="$1" phase=probe executable='' rc=0
+    shift
+    [ "${1:-}" != - ] || phase=run
+    printf '%s:%s\n' "$helper" "$phase" >> "$root/runners"
+    # Capability checks must not hand installation leases to helpers either.
+    if ( : <&7 ) 2>/dev/null || ( : <&8 ) 2>/dev/null; then return 96; fi
+    case "$backend:$helper" in
+        broken:*|broken-python:python3) return 71 ;;
+        noop:*|noop-python:python3) return 0 ;;
+        invalid:*) printf 'AM_INSTALLER_BOUNDED_RUNNER\nextra\n'; return 0 ;;
+    esac
+    if [ "$phase" = run ] && [ "$mode" = empty-status ]; then
+        return 0
+    fi
+    case "$helper" in
+        python3) executable="$real_python" ;; perl) executable="$real_perl" ;;
+    esac
+    [ -n "$executable" ] || return 127
+    "$executable" "$@" || rc=$?
+    if [ "$phase" = run ]; then
+        case "$mode" in
+            malformed-status) printf 'untrustworthy\n' > "$4"; return 0 ;;
+            nul-status) printf '0\0' > "$4"; return 0 ;;
+            newline-status) printf '0\n' > "$4"; return 0 ;;
+            out-of-range-status) printf '256' > "$4"; return 0 ;;
+            inconsistent-status) printf '37' > "$4"; return 0 ;;
+            removed-status) mv "$4" "$root/removed-status-witness"; return 0 ;;
+            runner-failure) return 71 ;;
+        esac
+    fi
+    return "$rc"
+}
+python3() { capture_helper python3 "$@"; }
+perl() { capture_helper perl "$@"; }
+printf 'parent descriptor\n' > "$root/fd3-sentinel"
+exec 3< "$root/fd3-sentinel"
+exec 7< "$root"; exec 8< "$root"
+deadline=5
+[ "$mode" != timeout ] || deadline=2
+rc=0
+capture_command_with_timeout "$deadline" "$real_python" "$root/target.py" "$root" "$mode" 'spaces ; $HOME * "quoted"' || rc=$?
+IFS= read -r witness <&3
+[ "$witness" = 'parent descriptor' ] || exit 95
+: <&7; : <&8
+printf '%s' "$CAPTURED_CMD_OUTPUT_EXACT" > "$root/exact.bin"
+printf '%s' "$CAPTURED_CMD_OUTPUT" > "$root/display.bin"
+printf '%s %s %s\n' "$rc" "$CAPTURED_CMD_STATUS" "$CAPTURED_CMD_OUTPUT_LOSSLESS" > "$root/status"
+PROBE
+
+capture_cases=0
+if python3 - "$capture_probe" "$unit_library" "$scratch/capture" "$ARTIFACT_DIR" "$BASH" <<'PY'
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+probe, library, scratch, artifacts, bash = sys.argv[1:]
+completed = 0
+unavailable = []
+target = r'''
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+root, mode = Path(sys.argv[1]), sys.argv[2]
+inherited = []
+for fd in (7, 8):
+    try:
+        os.fstat(fd)
+    except OSError:
+        pass
+    else:
+        inherited.append(fd)
+with (root / "executions.jsonl").open("a") as output:
+    output.write(json.dumps({"args": sys.argv[3:], "inherited": inherited}) + "\n")
+payload = (root / "payload.bin").read_bytes()
+os.write(1, payload[:3])
+os.write(2, payload[3:])
+if mode == "nonzero":
+    raise SystemExit(37)
+if mode == "signal":
+    os.kill(os.getpid(), signal.SIGTERM)
+if mode == "timeout":
+    (root / "parent.pid").write_text(str(os.getpid()))
+    child = os.fork()
+    if child == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    else:
+        (root / "child.pid").write_text(str(child))
+    time.sleep(30)
+'''
+
+def running(pid):
+    result = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=3)
+    state = result.stdout.strip()
+    return bool(state) and not state.startswith(b"Z")
+
+backends = (("python", "python3", ["python3:probe", "python3:run"]),
+            ("perl", "perl", ["perl:probe", "perl:run"]),
+            ("broken-python", "perl", ["python3:probe", "perl:probe", "perl:run"]),
+            ("noop-python", "perl", ["python3:probe", "perl:probe", "perl:run"]),
+            ("timeout", "timeout", ["timeout:run"]),
+            ("gtimeout", "gtimeout", ["gtimeout:run"]))
+cases = []
+for backend, executable, trace in backends:
+    if shutil.which(executable) is None:
+        unavailable.append(backend)
+        continue
+    for mode in ("bytes", "extra-newline", "nul", "nonzero", "signal", "timeout"):
+        status = 37 if mode == "nonzero" else 143 if mode == "signal" else (
+            137 if backend in ("timeout", "gtimeout") else 124) if mode == "timeout" else 0
+        cases.append((backend, mode, trace, status, 1))
+for backend in ("missing", "broken", "noop", "invalid"):
+    trace = [] if backend == "missing" else ["python3:probe", "perl:probe"]
+    cases.append((backend, "bytes", trace, 125, 0))
+for provider in ("python3", "perl"):
+    if shutil.which(provider) is None:
+        continue
+    for mode in ("nonzero", "signal", "empty-status", "malformed-status", "nul-status", "newline-status",
+                 "out-of-range-status", "inconsistent-status", "removed-status", "runner-failure"):
+        status = 37 if mode == "nonzero" else 143 if mode == "signal" else 125
+        backend = "python-selected" if provider == "python3" else "perl-selected"
+        cases.append((backend, mode, [provider + ":probe", provider + ":run"],
+                      status, 0 if mode == "empty-status" else 1))
+for delivery in ("file", "stdin"):
+    for backend, mode, trace, expected_status, expected_count in cases:
+        root = Path(scratch) / (backend + "-" + mode + "-" + delivery)
+        root.mkdir(parents=True)
+        (root / "target.py").write_text(target)
+        tools_dir = root / "bin"
+        tools_dir.mkdir()
+        for helper in ("timeout", "gtimeout"):
+            executable = shutil.which(helper)
+            if executable:
+                # An external exec avoids the shell-function signal diagnostic
+                # contaminating output that production captures from GNU timeout.
+                wrapper = tools_dir / helper
+                wrapper.write_text("#!" + bash + "\n" +
+                    "printf '%s:run\\n' " + helper + " >> \"$CAPTURE_TEST_ROOT/runners\"\n" +
+                    "if ( : <&7 ) 2>/dev/null || ( : <&8 ) 2>/dev/null; then exit 96; fi\n" +
+                    "exec " + shlex.quote(executable) + ' "$@"\n')
+                wrapper.chmod(0o700)
+        payload = b"\t'quoted' \\ $() \xff\r\n" if mode == "bytes" else (
+            b"am 0.3.40\n\n" if mode == "extra-newline" else b"before\0after\n" if mode == "nul" else b"probe\n")
+        (root / "payload.bin").write_bytes(payload)
+        log_path = Path(artifacts) / ("capture-" + root.name + ".log")
+        args = [bash] + ([probe] if delivery == "file" else ["-s", "--"])
+        args += [str(root), backend, mode, library]
+        try:
+            with log_path.open("wb") as log:
+                result = subprocess.run(args, input=Path(probe).read_bytes() if delivery == "stdin" else b"",
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=15,
+                                        env=dict(os.environ, LC_ALL="C", CAPTURE_TEST_ROOT=str(root),
+                                                 PATH=str(tools_dir) + os.pathsep + os.environ["PATH"]))
+            assert result.returncode == 0, log_path.read_text(errors="replace")
+            rc, status, lossless = map(int, (root / "status").read_text().split())
+            assert (rc, status) == (expected_status, expected_status), (backend, mode, rc, status)
+            actual_trace = (root / "runners").read_text().splitlines() if (root / "runners").exists() else []
+            assert actual_trace == trace, (backend, mode, actual_trace)
+            records = [json.loads(line) for line in (root / "executions.jsonl").read_text().splitlines()] if (root / "executions.jsonl").exists() else []
+            assert len(records) == expected_count, "a failed runner retried or unexpectedly started the target"
+            for record in records:
+                assert record == {"args": ['spaces ; $HOME * "quoted"'], "inherited": []}, record
+            if mode == "removed-status":
+                assert (root / "removed-status-witness").read_bytes() == b"0"
+            exact = (root / "exact.bin").read_bytes()
+            if mode == "nul":
+                assert lossless == 0 and exact != payload, "NUL loss was not detected"
+            else:
+                assert lossless == 1
+                if expected_count:
+                    assert exact == payload, (backend, mode, exact)
+                    assert (root / "display.bin").read_bytes() == payload.rstrip(b"\n")
+            if mode == "timeout":
+                for name in ("parent.pid", "child.pid"):
+                    pid = int((root / name).read_text())
+                    deadline = time.monotonic() + 2
+                    while running(pid) and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    assert not running(pid), "timeout left a process-group member running"
+            completed += 1
+            print("capture", backend, mode, delivery, "status, bytes, execution count, and descriptors verified")
+        finally:
+            for name in ("parent.pid", "child.pid"):
+                if (root / name).exists():
+                    try:
+                        os.kill(int((root / name).read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+print(f"Capture cases: {completed} passed; unavailable runners: {','.join(unavailable) or 'none'}")
+Path(artifacts, "capture-count").write_text(str(completed))
+PY
+then
+    capture_cases=$(cat "$ARTIFACT_DIR/capture-count")
+else
+    failures=$((failures + 1))
+fi
+
 # Native commands can start processes that outlive the installer. Exercise the
 # real launch functions with harmless executables that inspect their inherited
 # descriptors and independently test the parent's two kernel locks. Service
@@ -1024,16 +1255,19 @@ case "$mode" in
     exec) installed_am_db_exec "$root/fixture.db" 'SELECT 1' ;;
     exec-stdin) printf 'SELECT 1;\n' | installed_am_db_exec "$root/fixture.db" ;;
     backup) installed_am_db_backup "$root/fixture.db" "$root/fixture.backup" ;;
-    bounded|bounded-without-python)
-        if [ "$mode" = bounded-without-python ]; then
-            command() {
-                if [ "$1" = -v ] && [ "$2" = python3 ]; then return 1; fi
-                builtin command "$@"
-            }
-        fi
+    bounded|bounded-without-python|bounded-timeout)
+        command() {
+            if [ "${FUNCNAME[1]:-}" = capture_command_with_timeout ] && [ "${1:-}" = -v ]; then
+                case "$mode:${2:-}" in
+                    bounded:python3|bounded-without-python:perl|bounded-timeout:timeout|bounded-timeout:gtimeout) ;;
+                    *) return 1 ;;
+                esac
+            fi
+            builtin command "$@"
+        }
         rc=0
         capture_command_with_timeout 5 "$DEST/am" --probe || rc=$?
-        if [ "$mode" = bounded-without-python ]; then unset -f command; fi
+        unset -f command
         [ "$rc" -eq 0 ] || exit "$rc"
         [ "$CAPTURED_CMD_OUTPUT" = probe-ok ] || exit 95
         ;;
@@ -1153,9 +1387,10 @@ def locked(directory):
         os.close(fd)
 
 for mode in ("query", "exec", "exec-stdin", "backup", "bounded",
-             "bounded-without-python", "service", "service-unready",
+             "bounded-without-python", "bounded-timeout", "service", "service-unready",
              "noninteractive", "interactive"):
-    if mode == "bounded-without-python" and not (shutil.which("timeout") or shutil.which("gtimeout")):
+    if (mode == "bounded-without-python" and not shutil.which("perl")) or (
+            mode == "bounded-timeout" and not (shutil.which("timeout") or shutil.which("gtimeout"))):
         unavailable.append(mode)
         continue
     root = base / mode
@@ -1219,7 +1454,7 @@ else
     failures=$((failures + 1))
 fi
 
-printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s identity cases, %s kernel cases, %s native cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$identity_cases" "$kernel_cases" "$native_cases" "$failures"
+printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s identity cases, %s kernel cases, %s capture cases, %s native cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$identity_cases" "$kernel_cases" "$capture_cases" "$native_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
     [ "$failures" -eq 0 ]
     exit $?

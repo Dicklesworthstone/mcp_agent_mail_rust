@@ -606,8 +606,27 @@ capture_command_with_timeout() {
   CAPTURED_CMD_OUTPUT_LOSSLESS=1
   CAPTURED_CMD_STATUS=0
 
-  if command -v python3 >/dev/null 2>&1; then
-    local output_file status_file tmp_root rc
+  # A discovered Python may only be a developer-tools shim. Select a working
+  # runner before launching the command; never retry the command after an
+  # adapter has started it, even if its completion receipt is missing.
+  local native_runner="" runner_probe=""
+  if command -v python3 >/dev/null 2>&1 && \
+     runner_probe=$(python3 -c 'import os, signal, subprocess, time; os.killpg; signal.SIGKILL; subprocess.Popen; time.monotonic(); print("AM_INSTALLER_BOUNDED_RUNNER")' 7<&- 8<&- 2>/dev/null) && \
+     [ "$runner_probe" = AM_INSTALLER_BOUNDED_RUNNER ]; then
+    native_runner=python3
+  elif command -v perl >/dev/null 2>&1 && \
+       runner_probe=$(perl -MConfig -MPOSIX=:sys_wait_h,setsid,_exit -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC,sleep -MErrno=EINTR -e '
+         die "Native fork is required\n" unless $Config{d_fork} eq "define";
+         my $now = clock_gettime(CLOCK_MONOTONIC);
+         die "A monotonic clock is required\n" unless defined($now) && $now >= 0;
+         print "AM_INSTALLER_BOUNDED_RUNNER\n";
+       ' 7<&- 8<&- 2>/dev/null) && \
+       [ "$runner_probe" = AM_INSTALLER_BOUNDED_RUNNER ]; then
+    native_runner=perl
+  fi
+
+  if [ -n "$native_runner" ]; then
+    local output_file status_file tmp_root rc raw_status_size=""
     tmp_root="${TMP:-/tmp}"
     output_file=$(mktemp "${tmp_root%/}/am-install-capture.XXXXXX") || return 1
     status_file=$(mktemp "${tmp_root%/}/am-install-status.XXXXXX") || {
@@ -617,7 +636,8 @@ capture_command_with_timeout() {
 
     # Probes and the processes they launch must not keep installation locks
     # alive after this installer exits or is killed.
-    if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" 7<&- 8<&- <<'PY'
+    if [ "$native_runner" = python3 ]; then
+      if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" 7<&- 8<&- <<'PY'
 import subprocess
 import sys
 import time
@@ -673,10 +693,81 @@ with open(status_path, "w", encoding="utf-8") as handle:
 
 sys.exit(shell_status)
 PY
-    then
-      rc=0
+      then rc=0; else rc=$?; fi
     else
-      rc=$?
+      if perl - "$timeout_secs" "$output_file" "$status_file" "$@" 7<&- 8<&- <<'PERL'
+    use strict;
+    use warnings;
+    use POSIX qw(:sys_wait_h setsid _exit);
+    use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
+    use Errno qw(EINTR);
+
+    my ($timeout, $output_path, $status_path, @command) = @ARGV;
+    die "Invalid command deadline\n" unless defined($timeout) &&
+        $timeout =~ /\A(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\z/ && @command;
+    sub monotonic_time {
+        my $now = eval { clock_gettime(CLOCK_MONOTONIC) };
+        return defined($now) && $now >= 0 ? $now : undef;
+    }
+    my $start = monotonic_time();
+    die "A monotonic clock is required\n" unless defined($start);
+    my $deadline = $start + $timeout;
+    pipe(my $launch_reader, my $launch_writer) or die "Cannot create launch gate: $!\n";
+    $SIG{CHLD} = "DEFAULT";
+    my $pid = fork();
+    die "Cannot fork command: $!\n" unless defined($pid);
+    if ($pid == 0) {
+        close $launch_reader;
+        my $session = setsid();
+        _exit(125) unless defined($session) && $session >= 0;
+        open STDOUT, ">", $output_path or _exit(125);
+        open STDERR, ">&", \*STDOUT or _exit(125);
+        # A successful write proves that setsid preceded the parent's closing
+        # the gate. If the deadline won, never exec or create descendants.
+        my $written = syswrite($launch_writer, "1", 1);
+        close $launch_writer;
+        _exit(125) unless defined($written) && $written == 1;
+        exec { $command[0] } @command or _exit(127);
+    }
+    close $launch_writer;
+    my ($shell_status, $wait_status);
+    while (1) {
+        my $waited = waitpid($pid, WNOHANG);
+        if ($waited == $pid) { $wait_status = $?; last; }
+        if ($waited < 0) {
+            next if $! == EINTR;
+            $shell_status = 125;
+            last;
+        }
+        my $now = monotonic_time();
+        if (!defined($now) || $now >= $deadline) {
+            $shell_status = defined($now) ? 124 : 125;
+            # Keep the PID unreaped until both kills complete. Closing the
+            # gate first prevents a delayed setsid/exec from escaping killpg.
+            close $launch_reader;
+            kill "KILL", -$pid;
+            kill "KILL", $pid;
+            # Reaping is bounded even if the clock or a kernel task is stuck.
+            for (1 .. 100) {
+                my $reaped = waitpid($pid, WNOHANG);
+                last if $reaped == $pid || ($reaped < 0 && $! != EINTR);
+                sleep(0.01);
+            }
+            last;
+        }
+        sleep(0.05);
+    }
+    close $launch_reader if defined(fileno($launch_reader));
+    if (!defined($shell_status)) {
+        $shell_status = WIFEXITED($wait_status) ? WEXITSTATUS($wait_status) :
+            WIFSIGNALED($wait_status) ? 128 + WTERMSIG($wait_status) : 125;
+    }
+    open my $status, ">", $status_path or die "Cannot record command status: $!\n";
+    print {$status} $shell_status or die "Cannot write command status: $!\n";
+    close $status or die "Cannot finish command status: $!\n";
+    exit($shell_status);
+PERL
+      then rc=0; else rc=$?; fi
     fi
 
     if [ -f "$output_file" ]; then
@@ -695,25 +786,31 @@ PY
         CAPTURED_CMD_OUTPUT_LOSSLESS=0
       fi
     fi
-    [ -f "$status_file" ] && CAPTURED_CMD_STATUS=$(cat "$status_file")
+    CAPTURED_CMD_STATUS=""
+    if [ -f "$status_file" ]; then
+      CAPTURED_CMD_STATUS=$(cat "$status_file") || CAPTURED_CMD_STATUS=""
+      raw_status_size=$(LC_ALL=C wc -c <"$status_file" 2>/dev/null | tr -d '[:space:]') || raw_status_size=""
+    fi
     rm -f "$output_file" "$status_file" 2>/dev/null || true
 
-    if [ -z "${CAPTURED_CMD_STATUS:-}" ]; then
-      CAPTURED_CMD_STATUS="$rc"
+    if [[ ! "$CAPTURED_CMD_STATUS" =~ ^[0-9]{1,3}$ ]] || \
+       [ "$raw_status_size" != "${#CAPTURED_CMD_STATUS}" ] || \
+       [ "$CAPTURED_CMD_STATUS" -gt 255 ] || [ "$CAPTURED_CMD_STATUS" -ne "$rc" ]; then
+      CAPTURED_CMD_STATUS=125
     fi
     return "$CAPTURED_CMD_STATUS"
   fi
 
   # Never turn a bounded probe into an unbounded one merely because Python is
-  # absent. GNU timeout is common on Linux; Homebrew installs it as gtimeout on
-  # macOS. Hosts with neither receive a fail-closed, actionable result.
+  # unusable. GNU timeout is common on Linux; Homebrew installs it as gtimeout
+  # on macOS. Hosts without any working native runner or timeout fail closed.
   local timeout_bin=""
   if command -v timeout >/dev/null 2>&1; then
     timeout_bin="timeout"
   elif command -v gtimeout >/dev/null 2>&1; then
     timeout_bin="gtimeout"
   else
-    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires python3, timeout, or gtimeout)."
+    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires working Python 3, Perl, timeout, or gtimeout)."
     CAPTURED_CMD_OUTPUT_EXACT="$CAPTURED_CMD_OUTPUT"
     CAPTURED_CMD_OUTPUT_LOSSLESS=1
     CAPTURED_CMD_STATUS=125
