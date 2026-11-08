@@ -422,6 +422,43 @@ row count, project and holder IDs, timestamps, and requested active/history
 scope. A snapshot is bounded to 10,000 reservations and holder identities and
 4 MiB of JSON; exceeding a bound is an error, never a truncated success.
 
+**Large reservation histories (GH#377):** `am file_reservations list <project>
+--all` now handles that specific capacity refusal by requesting a materialized
+paged snapshot from the same authenticated endpoint. This also applies when
+the matching local daemon is selected automatically. The running server must
+contain the paged-snapshot implementation; upgrade and restart older servers.
+The CLI never substitutes an unverified local database after a server refusal.
+
+The server captures the entire bounded history in one database read scope and
+releases that connection before serving cached pages. Concurrent inserts,
+deletes, releases, and renewals cannot move page boundaries or change an
+already-captured row. The result is complete **as of that capture**, not as of
+the last HTTP request. A fresh read sees later changes. Project recreation,
+mailbox engine replacement, or changed project/agent authority still causes
+the read to fail closed.
+
+The larger snapshot is bounded to 100,000 reservations and holder identities,
+64 MiB of serialized pages (including repeated identity metadata), and at most
+250 reservations / 4 MiB per response. Pages may be short because of bytes;
+only `next_offset: null` signals the terminal page. One row or the required
+identity metadata that cannot fit a page is rejected explicitly. The server
+keeps at most four snapshots and 128 MiB of serialized cache data, counting
+in-progress captures against capacity. Tokens expire after 300 seconds without
+refresh and are lost on server restart. Capacity, expiry, authentication, or
+validation errors discard accumulated rows; retry the command from the start.
+The CLI also bounds the read to 1,024 page requests and a 300-second deadline.
+
+For a raw MCP client, start with
+`resource://file_reservations/<slug>?snapshot_pages=true&active_only=false&format=json`.
+Validate `schema_version: 1` and `consistency: "materialized_snapshot"`, then
+continue with the same URI plus `snapshot_token=<returned-token>` and
+`offset=<next_offset>`. The token, captured timestamp, project, full holder
+roster, history scope, and total count remain identical across every page.
+Check contiguous offsets, exact counts, and ascending `(created_ts, id)` order;
+do not publish a complete result until the terminal page accounts for the
+entire `total_count`. Each continuation passes normal server authentication.
+Neither `limit` nor `snapshot` is accepted alongside `snapshot_pages=true`.
+
 An already-running v0.3.39 server supports only ordinary resource pages and
 ignores the newer `snapshot` parameter. A newer client recognizes only a
 successful, well-formed array response as that older protocol. It discards
@@ -434,12 +471,16 @@ roster are still verified before and after the read. This path needs a client
 containing the server-read implementation, but no server restart or mailbox
 change. The released v0.3.39 CLI itself does not have `--server`.
 
-An authentication/transport/RPC error, an invalid envelope, or a malformed
-snapshot object never causes negotiation to the older protocol. The client
-does not combine independent OFFSET pages, change endpoints, or read local
-storage after a refusal. Keep automation blocked if it cannot establish a
-complete result. For larger sets on an older server, a successful direct read
-or snapshot-capable server is needed for a complete safety decision.
+An authentication/transport error, unrelated RPC error, invalid envelope, or
+malformed snapshot object never causes protocol negotiation. Only a recognized
+snapshot-capacity refusal enables the new history path. The client does not
+combine independent OFFSET pages, change endpoints, or read local storage
+after a refusal. Numeric JSON-RPC codes and bounded, sanitized server reasons
+remain visible; unrelated rejections no longer suggest checking authentication.
+Keep automation blocked if it cannot establish a complete result. Active-only
+safety reads retain the original single-snapshot limits; larger sets on an
+older server still require an upgraded server or an independently successful
+direct read for a complete safety decision.
 
 Navigation sorts the verified complete result into its existing newest-first
 order before applying `limit`/`offset`. These reads observe reservation state;

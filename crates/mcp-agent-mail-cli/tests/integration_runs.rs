@@ -5988,6 +5988,355 @@ fn reservation_reads_direct_and_real_server_preserve_output_without_local_admiss
     reservation_read_failed_closed(&offline);
 }
 
+fn reservation_history_fixture(count: i64, reason: &str) -> (TestEnv, String, String) {
+    use std::fmt::Write as _;
+
+    let (env, project, slug) = reservation_read_fixture();
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_agent(&conn, 3, 1, "RetiredVale", "test", "test");
+    conn.execute_raw("UPDATE agents SET retired_at=1704067500000000 WHERE id=3; BEGIN")
+        .unwrap();
+    // Batched inserts keep this real persisted >10,000-row fixture affordable.
+    for start in (7..=count).step_by(250) {
+        let end = count.min(start + 249);
+        let mut sql = String::from(
+            "INSERT INTO file_reservations \
+             (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES ",
+        );
+        let mut params = Vec::new();
+        for id in start..=end {
+            if id != start {
+                sql.push(',');
+            }
+            write!(
+                sql,
+                "({id}, 1, 3, 'history/{id:05}.rs', 1, ?, {}, 4102444800000000)",
+                1_704_067_200_000_000_i64 + id
+            )
+            .unwrap();
+            params.push(SqlValue::Text(reason.to_string()));
+        }
+        conn.execute_sync(&sql, &params).unwrap();
+    }
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts=1704067400000000 WHERE id>=7 AND id%2=0; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         SELECT id, 1704067400000000 FROM file_reservations WHERE id>=7 AND id%2=1; COMMIT",
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+    (env, project, slug)
+}
+
+fn reservation_read_http_rpc(port: u16, bearer: Option<&str>, request: &Value) -> (u16, Value) {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut socket =
+        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(45)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = request.to_string();
+    write!(
+        socket,
+        "POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: mcp_agent_mail_rust-agent\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    )
+    .unwrap();
+    if let Some(bearer) = bearer {
+        write!(socket, "Authorization: Bearer {bearer}\r\n").unwrap();
+    }
+    write!(socket, "\r\n{body}").unwrap();
+    let mut response = Vec::new();
+    socket
+        .take(12 * 1024 * 1024)
+        .read_to_end(&mut response)
+        .unwrap();
+    let split = response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap();
+    let headers = std::str::from_utf8(&response[..split]).unwrap();
+    let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = &response[split + 4..];
+    let payload = serde_json::from_slice(body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()));
+    (status, payload)
+}
+
+fn reservation_read_http_resource(port: u16, uri: &str) -> Value {
+    let request = json!({
+        "jsonrpc": "2.0", "id": "gh377-history", "method": "resources/read",
+        "params": {"uri": uri},
+    });
+    let (status, reply) =
+        reservation_read_http_rpc(port, Some(RESERVATION_READ_TEST_TOKEN), &request);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["id"], request["id"]);
+    assert!(reply.get("error").is_none(), "{reply}");
+    let contents = reply["result"]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0]["uri"], uri);
+    let text = contents[0]["text"].as_str().unwrap();
+    assert!(text.len() <= mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES);
+    serde_json::from_str(text).unwrap()
+}
+
+fn reservation_read_assert_snapshot_limit(port: u16, slug: &str) {
+    let (status, reply) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-limit", "method": "resources/read",
+            "params": {"uri": format!(
+                "resource://file_reservations/{slug}?snapshot=true&active_only=false&format=json"
+            )},
+        }),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(
+        reply.get("result").is_none(),
+        "bounded snapshot unexpectedly fit"
+    );
+    assert!(
+        reply["error"]
+            .to_string()
+            .contains("FILE_RESERVATION_SNAPSHOT_TOO_LARGE"),
+        "snapshot capacity refusal must retain a machine-readable reason: {reply}"
+    );
+}
+
+fn reservation_read_history_pages(port: u16, slug: &str, first: &Value) -> Vec<Value> {
+    let token = first["snapshot_token"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(first["schema_version"], 1);
+    assert_eq!(first["consistency"], "materialized_snapshot");
+    assert_eq!(first["active_only"], false);
+    let total = usize::try_from(first["total_count"].as_u64().unwrap()).unwrap();
+    let mut rows = Vec::with_capacity(total);
+    let mut page = first.clone();
+    loop {
+        for field in [
+            "schema_version",
+            "consistency",
+            "snapshot_token",
+            "project",
+            "agents",
+            "active_only",
+            "captured_ts",
+            "total_count",
+        ] {
+            assert_eq!(page[field], first[field], "page authority changed: {field}");
+        }
+        assert_eq!(page["offset"], rows.len());
+        let batch = page["reservations"].as_array().unwrap();
+        assert_eq!(page["count"], batch.len());
+        assert!(batch.len() <= 250);
+        rows.extend(batch.iter().cloned());
+        assert!(rows.len() <= total);
+        if page["next_offset"].is_null() {
+            assert_eq!(rows.len(), total, "terminal page lost reservations");
+            return rows;
+        }
+        assert!(!batch.is_empty(), "nonterminal page must advance");
+        assert_eq!(page["next_offset"], rows.len());
+        page = reservation_read_http_resource(
+            port,
+            &format!(
+                "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset={}&active_only=false&format=json",
+                rows.len()
+            ),
+        );
+    }
+}
+
+fn reservation_read_native_ids(out: &Output) -> Vec<i64> {
+    reservation_read_success(out)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+#[test]
+fn reservation_history_real_server_reads_over_snapshot_row_limit_without_local_admission() {
+    let (env, project, slug) = reservation_history_fixture(10_001, "retained-history");
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    reservation_read_assert_snapshot_limit(port, &slug);
+    let unavailable = env.tmp.path().join("gh377-unusable-client.sqlite3");
+    std::fs::write(
+        &unavailable,
+        b"History must come from the authenticated server.\n",
+    )
+    .unwrap();
+    let before = file_snapshot(&unavailable);
+    let vars = reservation_read_env(&env, port, &format!("sqlite:///{}", unavailable.display()));
+    let history = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&history),
+        (1..=10_001).collect::<Vec<_>>()
+    );
+    let history_text = reservation_read_success(&history);
+    for (id, holder) in [
+        (7, "RetiredVale"),
+        (250, "RetiredVale"),
+        (10_001, "RetiredVale"),
+    ] {
+        let id_text = id.to_string();
+        let line = history_text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(id_text.as_str()))
+            .unwrap();
+        assert!(
+            line.contains(holder),
+            "retired holder omitted from history: {line}"
+        );
+        assert!(line.contains(&format!("history/{id:05}.rs")));
+    }
+    let active = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--server"],
+    );
+    assert_eq!(reservation_read_native_ids(&active), [1, 2, 3]);
+    assert_eq!(file_snapshot(&unavailable), before);
+    for suffix in ["-wal", "-shm", ".fsqlite-shm", ".fsqlite-wal"] {
+        assert!(!PathBuf::from(format!("{}{suffix}", unavailable.display())).exists());
+    }
+
+    // The normal command must select the same authenticated daemon when the
+    // configured local mailbox matches, including when its history needs pages.
+    let automatic = run_am_hermetic(
+        &reservation_read_env(&env, port, &env.database_url()),
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&automatic),
+        (1..=10_001).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn reservation_history_real_server_byte_pages_remain_immutable_between_requests() {
+    let reason = "x".repeat(20_000);
+    let (env, project, slug) = reservation_history_fixture(301, &reason);
+    let writer = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    // Put the two leases that will change after page zero near the end of the
+    // captured order, beyond both the byte boundary and the usual row boundary.
+    writer.execute_raw(
+        "BEGIN; UPDATE file_reservations SET agent_id=1, released_ts=NULL WHERE id IN (300,301); \
+         DELETE FROM file_reservation_releases WHERE reservation_id IN (300,301); COMMIT",
+    ).unwrap();
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    reservation_read_assert_snapshot_limit(port, &slug);
+    let vars = reservation_read_env(&env, port, &env.database_url());
+    let history = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&history),
+        (1..=301).collect::<Vec<_>>()
+    );
+    assert!(history.stdout.len() > 4 * 1024 * 1024);
+    assert!(reservation_read_success(&history).contains(&reason));
+
+    let initial_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&active_only=false&format=json"
+    );
+    let first = reservation_read_http_resource(port, &initial_uri);
+    assert_eq!(first["total_count"], 301);
+    let offset = first["next_offset"].as_u64().unwrap();
+    assert!(
+        offset > 0 && offset < 250,
+        "byte-bound page must be short but nonterminal"
+    );
+    let token = first["snapshot_token"].as_str().unwrap();
+    let next_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset={offset}&active_only=false&format=json"
+    );
+
+    // Same total count, different membership and lease state: a count check or
+    // independent offset reads would silently mix these two database versions.
+    writer.execute_raw(
+        "BEGIN IMMEDIATE; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (300,1800000000000000); \
+         UPDATE file_reservations SET expires_ts=4102444860000000 WHERE id=301; \
+         DELETE FROM file_reservations WHERE id=250; \
+         INSERT INTO file_reservations \
+         (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+         VALUES (302,1,1,'inserted-between-pages.rs',1,'concurrent grant',1704067200000302,4102444800000000); \
+         COMMIT",
+    ).unwrap();
+
+    for bearer in [None, Some("wrong-history-token")] {
+        let (status, response) = reservation_read_http_rpc(
+            port,
+            bearer,
+            &json!({
+                "jsonrpc": "2.0", "id": "gh377-denied", "method": "resources/read",
+                "params": {"uri": next_uri},
+            }),
+        );
+        assert!(matches!(status, 401 | 403), "{status}: {response}");
+        assert!(
+            response.get("result").is_none(),
+            "snapshot token bypassed authentication"
+        );
+    }
+
+    let captured = reservation_read_history_pages(port, &slug, &first);
+    let ids = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&captured), (1..=301).collect::<Vec<_>>());
+    assert!(captured[299]["released_ts"].is_null());
+    assert_eq!(captured[300]["expires_ts"], "2100-01-01T00:00:00.000000Z");
+    let repeated = reservation_read_http_resource(
+        port,
+        &format!(
+            "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset=0&active_only=false&format=json"
+        ),
+    );
+    assert_eq!(
+        repeated, first,
+        "retrying an immutable page changed its contents"
+    );
+
+    let fresh = reservation_read_http_resource(port, &initial_uri);
+    assert_ne!(fresh["snapshot_token"], first["snapshot_token"]);
+    let current = reservation_read_history_pages(port, &slug, &fresh);
+    assert_eq!(
+        ids(&current),
+        (1..=302).filter(|id| *id != 250).collect::<Vec<_>>()
+    );
+    let released = current.iter().find(|row| row["id"] == 300).unwrap();
+    assert_eq!(
+        released["released_ts"],
+        mcp_agent_mail_db::micros_to_iso(1_800_000_000_000_000)
+    );
+    let renewed = current.iter().find(|row| row["id"] == 301).unwrap();
+    assert_eq!(renewed["expires_ts"], "2100-01-01T00:01:00.000000Z");
+    assert_eq!(
+        current.last().unwrap()["path_pattern"],
+        "inserted-between-pages.rs"
+    );
+    writer.close_sync().unwrap();
+}
+
 /// Scripted transport faults complement the real-server test above. The peer
 /// only accepts authenticated resources/read requests, never tools/call.
 struct ReservationReadPeer {

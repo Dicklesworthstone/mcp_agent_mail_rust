@@ -1119,9 +1119,43 @@ It includes `schema_version`, `complete`, `project`, `agents`, `captured_ts`,
 `active_only`, `count`, and `reservations`. Set `active_only=false` to include
 released and expired leases. Snapshot mode accepts no `limit` or `offset` and
 refuses results exceeding 10,000 reservations, 10,000 holder identities, or
-4 MiB of JSON. The CLI rejects incomplete snapshots and older servers that only
-return pages; it does not display a truncated set as complete. Explicit resource
-reads without `snapshot=true` retain their existing pagination behavior.
+4 MiB of JSON. For history reads (`active_only=false`), a CLI receiving this
+specific capacity refusal negotiates `snapshot_pages=true` with the same
+authenticated server. The server captures a larger bounded set once, then
+returns immutable pages of at most 250 rows and 4 MiB each. This supports
+`am file_reservations list <project> --all` beyond the single-response limits
+without opening another database connection in the CLI.
+
+Paged snapshots allow at most 100,000 reservations and holder identities and
+64 MiB of serialized pages, including repeated identity metadata. All rows,
+holder names, release states, and ordering (`created_ts`, then `id`) come from
+one database read snapshot. Changes after capture appear only in a new read.
+Each page includes `consistency: "materialized_snapshot"`, `snapshot_token`,
+`captured_ts`, `total_count`, `offset`, `count`, and an explicit `next_offset`
+(null on the terminal page), alongside `project`, `agents`, `active_only`, and
+`reservations`. Continue with the same URI plus `snapshot_token=<token>` and
+`offset=<next_offset>`; do not supply `snapshot` or `limit` in paged mode.
+
+Tokens expire 300 seconds after publication, do not survive server restart,
+and remain bound to the mailbox engine generation, project identity, and
+active/history scope. Every continuation requires normal server authentication.
+The server retains at most four snapshots within a 128 MiB serialized cache
+budget; in-progress captures reserve capacity too. A full cache, expired token,
+oversized individual row/identity metadata, or exceeded aggregate bound is an
+explicit error. The CLI validates every page, permits at most 1,024 requests
+within a 300-second history-read budget, and displays nothing until the entire
+set and final project identity checks succeed. Retry a failed read from the
+beginning; partial results are never reported as complete.
+
+This path requires both the updated CLI and server. Older servers that return
+only ordinary arrays cannot provide the paged snapshot guarantee; the CLI
+retains the original size refusal and gives an upgrade/restart hint. Existing
+small legacy reads still require a short explicit page to prove completeness.
+Active-only safety reads retain the original single-snapshot limits. Ordinary
+resource reads without either snapshot mode keep independent `limit`/`offset`
+pagination and are not a consistent snapshot. Server rejection diagnostics
+retain the numeric error code and sanitized reason; only actual HTTP
+authentication failures receive authentication guidance.
 
 ---
 
