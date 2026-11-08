@@ -106,7 +106,7 @@ impl From<StorageError> for Failure {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConflictEntry {
     id: i64,

@@ -267,6 +267,17 @@ impl Snapshot {
         Ok(())
     }
 
+    fn matches_schedule_without_retries(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.binding == other.binding
+            && self.retries.is_empty()
+            && other.retries.is_empty()
+            && self.after == other.after
+            && self.ceiling == other.ceiling
+            && self.next_lane_is_retry == other.next_lane_is_retry
+            && self.conflicts == other.conflicts
+    }
+
     fn restore(self, cursor: &mut AgentReconcileCursor, now: Instant, wall: i64) {
         let elapsed = u64::try_from(wall.saturating_sub(self.saved_at_us)).unwrap_or(0);
         cursor.after = self.after;
@@ -318,11 +329,75 @@ fn check_path(path: &Path) -> io::Result<()> {
 }
 
 #[derive(Debug)]
+struct CheckpointWitness {
+    // Keep the confirmed file open so a replacement cannot reuse its identity.
+    file: File,
+    digest: [u8; 32],
+    metadata: std::fs::Metadata,
+}
+
+impl CheckpointWitness {
+    fn capture(file: File, bytes: &[u8]) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        if metadata.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
+            return Err(invalid("checkpoint changed while its bytes were read"));
+        }
+        Ok(Self {
+            file,
+            digest: Sha256::digest(bytes).into(),
+            metadata,
+        })
+    }
+
+    fn matches_file(&self, file: &File) -> io::Result<bool> {
+        let retained = self.file.metadata()?;
+        let observed = file.metadata()?;
+        if !retained.is_file()
+            || !observed.is_file()
+            || self.metadata.len() != observed.len()
+            || self.metadata.modified()? != observed.modified()?
+        {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Ok(retained.nlink() == 1
+                && observed.nlink() == 1
+                && (retained.dev(), retained.ino()) == (observed.dev(), observed.ino())
+                && (self.metadata.ctime(), self.metadata.ctime_nsec())
+                    == (observed.ctime(), observed.ctime_nsec()))
+        }
+        #[cfg(windows)]
+        {
+            Ok(
+                mcp_agent_mail_core::disk::windows_file_link_count(&self.file)? == 1
+                    && mcp_agent_mail_core::disk::windows_file_link_count(file)? == 1
+                    && mcp_agent_mail_core::disk::windows_file_identity(&self.file)?
+                        == mcp_agent_mail_core::disk::windows_file_identity(file)?,
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            // Without a stable open-file identity, retain ordinary publication.
+            Ok(false)
+        }
+    }
+
+    fn matches(&self, observed: &Self) -> io::Result<bool> {
+        Ok(self.digest == observed.digest && self.matches_file(&observed.file)?)
+    }
+}
+
+#[derive(Debug)]
 struct Store {
     binding: Binding,
     path: PathBuf,
     lock_path: PathBuf,
     lock: File,
+    // Readable bytes alone do not prove a previous rename was synced. Only
+    // this store's successful durable publication can establish this witness.
+    confirmed: Option<CheckpointWitness>,
 }
 
 impl Store {
@@ -365,6 +440,7 @@ impl Store {
             path,
             lock_path,
             lock,
+            confirmed: None,
         };
         store.check_lock()?;
         Ok(store)
@@ -402,22 +478,39 @@ impl Store {
     }
 
     fn load(&self) -> io::Result<Option<Snapshot>> {
+        self.read_snapshot()
+            .map(|loaded| loaded.map(|(snapshot, _)| snapshot))
+    }
+
+    fn read_snapshot(&self) -> io::Result<Option<(Snapshot, CheckpointWitness)>> {
+        use std::io::Read as _;
+
         self.check_lock()?;
         check_path(&self.path)?;
-        let bytes = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
-            &self.path, MAX_BYTES,
-        ) {
-            Ok(bytes) => bytes,
+        let file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.path) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
+        if file.metadata()?.len() > MAX_BYTES {
+            return Err(invalid("checkpoint exceeds its byte limit"));
+        }
+        let mut bytes = Vec::new();
+        (&file).take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES {
+            return Err(invalid("checkpoint grew beyond its byte limit"));
+        }
         let snapshot: Snapshot =
             serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
         snapshot.validate(&self.binding)?;
-        Ok(Some(snapshot))
+        Ok(Some((snapshot, CheckpointWitness::capture(file, &bytes)?)))
     }
 
-    fn save(&self, cursor: &AgentReconcileCursor) -> io::Result<()> {
+    fn save(&mut self, cursor: &AgentReconcileCursor) -> io::Result<()> {
+        // Every failed save, including a failure AFTER rename, invalidates the
+        // durability witness. A later matching read must not certify that an
+        // earlier failed sync completed. A freshly opened store also writes once.
+        let confirmed = self.confirmed.take();
         self.check_lock()?;
         check_path(&self.path)?;
         // Ordinary data writes keep this binding; physical replacement does not.
@@ -438,6 +531,26 @@ impl Store {
             mcp_agent_mail_db::now_micros(),
         );
         snapshot.validate(&self.binding)?;
+        // Reuse only this store's confirmed publication, with freshly parsed
+        // bytes and a matching digest, metadata and retained file identity.
+        // An in-place overwrite or identical replacement is not a sync receipt.
+        // Retry delays remain on the ordinary save path so their wall-clock
+        // anchor stays paired with the captured remaining wait.
+        if snapshot.retries.is_empty()
+            && let Some(confirmed) = confirmed
+            && let Ok(Some((saved, observed))) = self.read_snapshot()
+            && saved.matches_schedule_without_retries(&snapshot)
+            && confirmed.matches(&observed).unwrap_or(false)
+        {
+            self.check_lock()?;
+            check_path(&self.path)?;
+            if let Ok(named) = mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.path)
+                && confirmed.matches_file(&named).unwrap_or(false)
+            {
+                self.confirmed = Some(confirmed);
+                return Ok(());
+            }
+        }
         let bytes = serde_json::to_vec(&snapshot).map_err(|error| invalid(error.to_string()))?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES {
             return Err(invalid("checkpoint exceeds its byte limit"));
@@ -451,11 +564,54 @@ impl Store {
             .tempfile_in(parent)?;
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
+        #[cfg(any(unix, windows))]
+        let synced = temporary.as_file().metadata()?;
         self.check_lock()?;
         check_path(&self.path)?;
-        temporary.persist(&self.path).map_err(|error| error.error)?;
+        let published = temporary.persist(&self.path).map_err(|error| error.error)?;
+        #[cfg(test)]
+        tests::after_checkpoint_persist()?;
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
+        #[cfg(any(unix, windows))]
+        {
+            self.confirm_publication(published, &bytes, &synced)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            drop(published);
+            Ok(())
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn confirm_publication(
+        &mut self,
+        published: File,
+        bytes: &[u8],
+        synced: &std::fs::Metadata,
+    ) -> io::Result<()> {
+        let confirmed = CheckpointWitness::capture(published, bytes)?;
+        if confirmed.metadata.len() != synced.len()
+            || confirmed.metadata.modified()? != synced.modified()?
+        {
+            return Err(invalid("checkpoint changed after file sync"));
+        }
+        // Rename can change Unix ctime. Pin its post-publication value, then
+        // verify actual bounded bytes and metadata before retaining a receipt.
+        let Some((_, observed)) = self.read_snapshot()? else {
+            return Err(invalid("published checkpoint disappeared"));
+        };
+        if !confirmed.matches(&observed)? {
+            return Err(invalid("checkpoint changed after publication"));
+        }
+        self.check_lock()?;
+        check_path(&self.path)?;
+        let named = mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.path)?;
+        if !confirmed.matches_file(&named)? {
+            return Err(invalid("published checkpoint identity changed"));
+        }
+        self.confirmed = Some(confirmed);
         Ok(())
     }
 }
@@ -574,7 +730,7 @@ impl AgentReconcileCursor {
         if self.source_identity == scope
             && checkpoint(cx, stop).is_ok()
             && !corruption_circuit_breaker().is_tripped()
-            && let Some(store) = &state.store
+            && let Some(store) = &mut state.store
         {
             let saved = (|| -> Result<(), String> {
                 {
@@ -609,6 +765,20 @@ mod tests {
     use super::*;
     use std::io::{Read as _, Seek as _, SeekFrom};
     use std::sync::atomic::Ordering;
+
+    std::thread_local! {
+        static FAIL_AFTER_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn after_checkpoint_persist() -> io::Result<()> {
+        if FAIL_AFTER_PERSIST.replace(false) {
+            Err(io::Error::other(
+                "injected checkpoint directory sync failure",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 
     fn binding(temp: &tempfile::TempDir) -> Binding {
         let database = temp.path().join("mail.sqlite3");
@@ -645,6 +815,26 @@ mod tests {
         cursor.conflicts.remember(403, "a".repeat(64));
         cursor.conflicts.remember(404, "b".repeat(64));
         cursor
+    }
+
+    fn conflict_schedule() -> AgentReconcileCursor {
+        let mut cursor = debt(Instant::now());
+        cursor.retries.entries.clear();
+        cursor
+    }
+
+    #[cfg(any(unix, windows))]
+    fn file_identity(file: &File) -> (u64, u64) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = file.metadata().unwrap();
+            (metadata.dev(), metadata.ino())
+        }
+        #[cfg(windows)]
+        {
+            mcp_agent_mail_core::disk::windows_file_identity(file).unwrap()
+        }
     }
 
     #[test]
@@ -826,7 +1016,7 @@ mod tests {
                 "a".repeat(64),
             ));
         }
-        let store = Store::open(binding.clone()).unwrap();
+        let mut store = Store::open(binding.clone()).unwrap();
         store.save(&cursor).unwrap();
         assert!(std::fs::metadata(&store.path).unwrap().len() <= MAX_BYTES);
         let loaded = store.load().unwrap().unwrap();
@@ -894,7 +1084,7 @@ mod tests {
             Some(std::path::Component::Prefix(prefix))
                 if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
         ));
-        let store = Store::open(binding.clone()).unwrap();
+        let mut store = Store::open(binding.clone()).unwrap();
         assert!(store.load().unwrap().is_none());
         let mut cursor = debt(Instant::now());
         store.save(&cursor).unwrap();
@@ -919,6 +1109,397 @@ mod tests {
         );
         assert!(resumed.conflicts.matches(403, &"a".repeat(64)));
         assert!(resumed.conflicts.matches(404, &"b".repeat(64)));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn unchanged_schedule_keeps_checkpoint_bytes_timestamp_and_file_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(&temp);
+        let mut store = Store::open(binding.clone()).unwrap();
+        let cursor = conflict_schedule();
+        store.save(&cursor).unwrap();
+        let saved_at_us = store.load().unwrap().unwrap().saved_at_us;
+        let retained = File::open(&store.path).unwrap();
+        let before = std::fs::read(&store.path).unwrap();
+        let modified = retained.metadata().unwrap().modified().unwrap();
+        for _ in 0..3 {
+            store.save(&cursor).unwrap();
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+            let named = File::open(&store.path).unwrap();
+            assert_eq!(named.metadata().unwrap().modified().unwrap(), modified);
+            // Keeping the old handle open prevents inode reuse from making a
+            // replaced checkpoint look like the same file on Unix.
+            #[cfg(any(unix, windows))]
+            assert_eq!(file_identity(&retained), file_identity(&named));
+        }
+        assert_eq!(store.load().unwrap().unwrap().saved_at_us, saved_at_us);
+        assert_eq!(
+            Store::open(binding).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fresh_store_or_identical_replacement_requires_a_new_durable_publication() {
+        for reopen in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let binding = binding(&temp);
+            let mut store = Store::open(binding.clone()).unwrap();
+            let cursor = conflict_schedule();
+            store.save(&cursor).unwrap();
+            let bytes = std::fs::read(&store.path).unwrap();
+            if reopen {
+                drop(store);
+                store = Store::open(binding).unwrap();
+                assert!(store.confirmed.is_none());
+            } else {
+                std::fs::rename(&store.path, temp.path().join("retained-checkpoint")).unwrap();
+                std::fs::write(&store.path, &bytes).unwrap();
+                assert!(store.confirmed.is_some());
+            }
+            let unconfirmed = File::open(&store.path).unwrap();
+            assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+            store.save(&cursor).unwrap();
+            let published = File::open(&store.path).unwrap();
+            assert_ne!(file_identity(&unconfirmed), file_identity(&published));
+            assert!(store.confirmed.is_some());
+            let saved = std::fs::read(&store.path).unwrap();
+            store.save(&cursor).unwrap();
+            assert_eq!(std::fs::read(&store.path).unwrap(), saved);
+            assert_eq!(
+                file_identity(&published),
+                file_identity(&File::open(&store.path).unwrap())
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn in_place_matching_new_state_cannot_inherit_an_older_durable_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(&temp);
+        let mut store = Store::open(binding.clone()).unwrap();
+        let mut cursor = conflict_schedule();
+        store.save(&cursor).unwrap();
+        let retained = File::open(&store.path).unwrap();
+        let modified = retained.metadata().unwrap().modified().unwrap();
+        let saved_at_us = store.load().unwrap().unwrap().saved_at_us;
+        cursor.conflicts.entries.front_mut().unwrap().fingerprint = "c".repeat(64);
+        let external = Snapshot::capture(binding, &cursor, Instant::now(), saved_at_us);
+        std::fs::write(&store.path, serde_json::to_vec(&external).unwrap()).unwrap();
+        let overwritten = OpenOptions::new().write(true).open(&store.path).unwrap();
+        overwritten
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(file_identity(&retained), file_identity(&overwritten));
+        let (_, observed) = store.read_snapshot().unwrap().unwrap();
+        let confirmed = store.confirmed.as_mut().unwrap();
+        assert_ne!(confirmed.digest, observed.digest);
+        // Model a filesystem whose metadata stamp cannot distinguish these
+        // writes. The real same-inode replacement still has different bytes;
+        // its digest must not borrow the old publication's durability proof.
+        confirmed.metadata = observed.metadata;
+        assert!(confirmed.matches_file(&overwritten).unwrap());
+        store.save(&cursor).unwrap();
+        assert_ne!(
+            file_identity(&retained),
+            file_identity(&File::open(&store.path).unwrap())
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().conflicts[0].fingerprint,
+            "c".repeat(64)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_directory_sync_cannot_certify_matching_named_checkpoint_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(binding(&temp)).unwrap();
+        let mut cursor = conflict_schedule();
+        store.save(&cursor).unwrap();
+        assert!(store.confirmed.is_some());
+        cursor.conflicts.entries.front_mut().unwrap().fingerprint = "c".repeat(64);
+        FAIL_AFTER_PERSIST.set(true);
+        let error = store.save(&cursor).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "injected checkpoint directory sync failure"
+        );
+        assert!(!FAIL_AFTER_PERSIST.get());
+        assert!(store.confirmed.is_none());
+        assert_eq!(
+            store.load().unwrap().unwrap().conflicts[0].fingerprint,
+            "c".repeat(64),
+            "rename succeeded before the injected directory sync failure"
+        );
+        let unconfirmed = File::open(&store.path).unwrap();
+        store.save(&cursor).unwrap();
+        let published = File::open(&store.path).unwrap();
+        assert_ne!(file_identity(&unconfirmed), file_identity(&published));
+        assert!(store.confirmed.is_some());
+        let bytes = std::fs::read(&store.path).unwrap();
+        store.save(&cursor).unwrap();
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        assert_eq!(
+            file_identity(&published),
+            file_identity(&File::open(&store.path).unwrap())
+        );
+    }
+
+    #[test]
+    fn changed_watermark_lane_or_ordered_conflicts_replace_the_checkpoint() {
+        for change in [
+            "after",
+            "ceiling",
+            "completed",
+            "lane",
+            "fingerprint",
+            "id",
+            "order",
+            "removed",
+            "added",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(binding(&temp)).unwrap();
+            let mut cursor = conflict_schedule();
+            store.save(&cursor).unwrap();
+            let before = std::fs::read(&store.path).unwrap();
+            match change {
+                "after" => cursor.after = 433,
+                "ceiling" => cursor.ceiling = Some(481),
+                "completed" => cursor.ceiling = None,
+                "lane" => cursor.next_lane_is_retry = false,
+                "fingerprint" => {
+                    cursor.conflicts.entries.front_mut().unwrap().fingerprint = "c".repeat(64);
+                }
+                "id" => cursor.conflicts.entries.front_mut().unwrap().id = 405,
+                "order" => cursor.conflicts.entries.swap(0, 1),
+                "removed" => cursor.conflicts.forget(403),
+                "added" => {
+                    cursor.conflicts.remember(405, "c".repeat(64));
+                }
+                _ => unreachable!(),
+            }
+            store.save(&cursor).unwrap();
+            assert_ne!(std::fs::read(&store.path).unwrap(), before, "{change}");
+            let saved = store.load().unwrap().unwrap();
+            assert_eq!(saved.after, cursor.after, "{change}");
+            assert_eq!(saved.ceiling, cursor.ceiling, "{change}");
+            assert_eq!(
+                saved.next_lane_is_retry, cursor.next_lane_is_retry,
+                "{change}"
+            );
+            assert!(saved.retries.is_empty(), "{change}");
+            assert_eq!(
+                saved.conflicts,
+                cursor.conflicts.entries.iter().cloned().collect::<Vec<_>>(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_new_or_removed_retry_debt_never_uses_the_unchanged_shortcut() {
+        for change in ["pending", "new", "removed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(binding(&temp)).unwrap();
+            let now = Instant::now();
+            let mut cursor = debt(now);
+            if change == "new" {
+                cursor.retries.entries.clear();
+            }
+            store.save(&cursor).unwrap();
+            #[cfg(any(unix, windows))]
+            assert!(store.confirmed.is_some());
+            #[cfg(any(unix, windows))]
+            let retained = File::open(&store.path).unwrap();
+            match change {
+                "new" => {
+                    cursor.retries.defer(401, now);
+                    cursor.retries.defer(401, now);
+                    cursor.retries.defer(402, now);
+                }
+                "removed" => cursor.retries.entries.clear(),
+                _ => {}
+            }
+            let live_debt = cursor
+                .retries
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                .collect::<Vec<_>>();
+            store.save(&cursor).unwrap();
+            #[cfg(any(unix, windows))]
+            assert_ne!(
+                file_identity(&retained),
+                file_identity(&File::open(&store.path).unwrap()),
+                "{change}"
+            );
+            let saved = store.load().unwrap().unwrap();
+            assert_eq!(
+                saved
+                    .retries
+                    .iter()
+                    .map(|retry| (retry.id, retry.attempts))
+                    .collect::<Vec<_>>(),
+                if change == "removed" {
+                    vec![]
+                } else {
+                    vec![(401, 1), (402, 0)]
+                },
+                "{change}"
+            );
+            assert_eq!(
+                cursor
+                    .retries
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.attempts, entry.ready_at))
+                    .collect::<Vec<_>>(),
+                live_debt,
+                "saving must not rebase live retry deadlines: {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_memory_replaces_missing_stale_corrupt_or_obsolete_disk_hints() {
+        for change in [
+            "missing",
+            "stale",
+            "conflict",
+            "corrupt",
+            "oversized",
+            "generation",
+            "version",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(binding(&temp)).unwrap();
+            let cursor = conflict_schedule();
+            store.save(&cursor).unwrap();
+            match change {
+                "missing" => {
+                    std::fs::rename(&store.path, temp.path().join("retained-checkpoint")).unwrap();
+                }
+                "corrupt" => std::fs::write(&store.path, b"{corrupt").unwrap(),
+                "oversized" => {
+                    std::fs::write(
+                        &store.path,
+                        vec![b'x'; usize::try_from(MAX_BYTES).unwrap() + 1],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    let mut saved = store.load().unwrap().unwrap();
+                    saved.saved_at_us = 1;
+                    match change {
+                        "stale" => saved.after = 431,
+                        "conflict" => saved.conflicts[0].fingerprint = "c".repeat(64),
+                        "generation" => saved.binding.generation = "ccdd".into(),
+                        "version" => saved.version += 1,
+                        _ => unreachable!(),
+                    }
+                    std::fs::write(&store.path, serde_json::to_vec(&saved).unwrap()).unwrap();
+                }
+            }
+            // No in-memory last-save marker can certify what is now at the
+            // named path, even though this cursor has not changed at all.
+            store.save(&cursor).unwrap();
+            let saved = store.load().unwrap().unwrap();
+            assert_ne!(saved.saved_at_us, 1, "{change}");
+            assert_eq!(saved.after, 432, "{change}");
+            assert_eq!(saved.ceiling, Some(480), "{change}");
+            assert!(saved.next_lane_is_retry, "{change}");
+            assert!(saved.retries.is_empty(), "{change}");
+            assert_eq!(saved.conflicts[0].fingerprint, "a".repeat(64), "{change}");
+            assert_eq!(saved.conflicts[1].fingerprint, "b".repeat(64), "{change}");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn equal_checkpoint_does_not_bypass_source_or_lock_identity_changes() {
+        for changed_source in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let binding = binding(&temp);
+            let mut store = Store::open(binding.clone()).unwrap();
+            let cursor = conflict_schedule();
+            store.save(&cursor).unwrap();
+            let before = std::fs::read(&store.path).unwrap();
+            let path = if changed_source {
+                binding.database.clone()
+            } else {
+                store.lock_path.clone()
+            };
+            #[cfg(windows)]
+            let original = File::open(&path).unwrap();
+            std::fs::rename(&path, temp.path().join("retained-authority")).unwrap();
+            std::fs::write(&path, b"replacement authority").unwrap();
+            #[cfg(windows)]
+            match_creation_time(&path, &original);
+            let _new_owner = (!changed_source).then(|| Store::open(binding.clone()).unwrap());
+            assert_eq!(
+                store.save(&cursor).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(store.confirmed.is_none());
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), b"replacement authority");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn equal_hardlinked_checkpoint_is_rejected_without_touching_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(binding(&temp)).unwrap();
+        let cursor = conflict_schedule();
+        store.save(&cursor).unwrap();
+        let before = std::fs::read(&store.path).unwrap();
+        let evidence = temp.path().join("retained-checkpoint-evidence");
+        std::fs::hard_link(&store.path, &evidence).unwrap();
+        assert_eq!(
+            store.save(&cursor).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(store.confirmed.is_none());
+        assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        assert_eq!(std::fs::read(&evidence).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn equal_symlinked_checkpoint_and_directory_obstruction_are_not_replaced() {
+        for linked in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(binding(&temp)).unwrap();
+            let cursor = conflict_schedule();
+            store.save(&cursor).unwrap();
+            let before = std::fs::read(&store.path).unwrap();
+            let evidence = temp.path().join("retained-checkpoint-evidence");
+            std::fs::rename(&store.path, &evidence).unwrap();
+            if linked {
+                std::os::unix::fs::symlink(&evidence, &store.path).unwrap();
+            } else {
+                std::fs::create_dir(&store.path).unwrap();
+            }
+            assert_eq!(
+                store.save(&cursor).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(store.confirmed.is_none());
+            assert_eq!(std::fs::read(&evidence).unwrap(), before);
+            assert_eq!(
+                std::fs::symlink_metadata(&store.path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                linked
+            );
+        }
     }
 
     #[test]
@@ -965,14 +1546,14 @@ mod tests {
     fn windows_replaced_lock_with_equal_creation_time_cannot_publish() {
         let temp = tempfile::tempdir().unwrap();
         let binding = binding(&temp);
-        let original = Store::open(binding.clone()).unwrap();
+        let mut original = Store::open(binding.clone()).unwrap();
         let mut cursor = debt(Instant::now());
         original.save(&cursor).unwrap();
         let previous = std::fs::read(&original.path).unwrap();
         std::fs::rename(&original.lock_path, temp.path().join("retained-lock")).unwrap();
         std::fs::write(&original.lock_path, b"replacement owner").unwrap();
         match_creation_time(&original.lock_path, &original.lock);
-        let replacement = Store::open(binding).unwrap();
+        let mut replacement = Store::open(binding).unwrap();
         assert!(original.load().is_err());
         cursor.after = 433;
         assert!(original.save(&cursor).is_err());
@@ -998,7 +1579,7 @@ mod tests {
         std::fs::hard_link(&foreign, &path).unwrap();
         assert!(Store::open(binding.clone()).is_err());
         std::fs::rename(&path, temp.path().join("retained-hardlink")).unwrap();
-        let store = Store::open(binding.clone()).unwrap();
+        let mut store = Store::open(binding.clone()).unwrap();
         std::fs::rename(&store.lock_path, temp.path().join("retained-lock")).unwrap();
         std::fs::write(&store.lock_path, b"new lock identity").unwrap();
         assert!(store.save(&debt(Instant::now())).is_err());
@@ -1221,7 +1802,8 @@ mod tests {
     fn gh369_competing_checkpoint_owner_defers_agent_repair_without_memory_fallback() {
         with_mailbox(|cx, pool, config, _| {
             let stop = AtomicBool::new(false);
-            let owner = Store::open(Binding::capture(cx, pool, config, &stop).unwrap()).unwrap();
+            let mut owner =
+                Store::open(Binding::capture(cx, pool, config, &stop).unwrap()).unwrap();
             owner.save(&AgentReconcileCursor::default()).unwrap();
             let saved = std::fs::read(&owner.path).unwrap();
             let profile_path = config
@@ -1867,14 +2449,9 @@ mod tests {
             assert_eq!((report.deferred, report.conflict_len), (1, 1));
             let binding = cursor.retries.persistence.binding.clone().unwrap();
             cursor.retries.defer(999_999, Instant::now() + MAX_BACKOFF);
-            cursor
-                .retries
-                .persistence
-                .store
-                .as_ref()
-                .unwrap()
-                .save(&cursor)
-                .unwrap();
+            let mut store = cursor.retries.persistence.store.take().unwrap();
+            store.save(&cursor).unwrap();
+            cursor.retries.persistence.store = Some(store);
             let generation = if binding.generation == "ccdd" {
                 "eeff"
             } else {
