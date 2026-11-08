@@ -2127,6 +2127,18 @@ pub enum MailCommand {
     Status {
         project_path: PathBuf,
     },
+    /// Count a project's messages in the configured mailbox without changing it.
+    Count {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Send a message to one or more agents.
     Send {
         /// Project key (slug or human_key).
@@ -3862,6 +3874,7 @@ fn mail_command_is_read_only(action: &MailCommand) -> bool {
         action,
         // `Read` is absent: it marks a message read, a write like `Ack`.
         MailCommand::Status { .. }
+            | MailCommand::Count { .. }
             | MailCommand::Inbox { .. }
             | MailCommand::Search { .. }
             | MailCommand::SummarizeThread { .. }
@@ -39700,6 +39713,24 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 
 fn handle_mail(action: MailCommand) -> CliResult<()> {
     match action {
+        MailCommand::Count {
+            project_key,
+            format,
+            json,
+        } => {
+            let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+            let config = Config::from_env();
+            let opened = open_db_sync_canonical_read_with_database_url(
+                &cfg.database_url,
+                Some(&config.storage_root),
+                "mail count",
+            )?;
+            handle_mail_count_sync(
+                opened.conn(),
+                &project_key,
+                output::CliOutputFormat::resolve(format, json),
+            )
+        }
         MailCommand::Status { .. } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             let config = Config::from_env();
@@ -39712,6 +39743,34 @@ fn handle_mail(action: MailCommand) -> CliResult<()> {
         }
         _ => context::run_async(async move { handle_mail_async(action).await }),
     }
+}
+
+fn handle_mail_count_sync(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    project_key: &str,
+    format: output::CliOutputFormat,
+) -> CliResult<()> {
+    let project = crate::context::resolve_project(conn, project_key)?;
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ?",
+            &[sqlmodel_core::Value::BigInt(project.id)],
+        )
+        .map_err(|error| CliError::Other(format!("message count query failed: {error}")))?;
+    let count: i64 = rows
+        .first()
+        .ok_or_else(|| CliError::Other("message count query returned no row".into()))?
+        .get_named("cnt")
+        .map_err(|error| CliError::Other(format!("invalid message count: {error}")))?;
+    if count < 0 {
+        return Err(CliError::Other("message count must not be negative".into()));
+    }
+    let data = serde_json::json!({"project": project.slug, "count": count});
+    output::emit_output(&data, format, || {
+        output::kv("Project", &project.slug);
+        output::kv("Messages", &count.to_string());
+    });
+    Ok(())
 }
 
 fn archive_mail_status_counts(storage_root: &Path, slug: &str) -> Option<(i64, i64)> {
@@ -40536,7 +40595,9 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
     let bearer = local_server_bearer_token(&server_config);
 
     match action {
-        MailCommand::Status { .. } => unreachable!("handled in sync path"),
+        MailCommand::Status { .. } | MailCommand::Count { .. } => {
+            unreachable!("handled in sync path")
+        }
 
         MailCommand::Send {
             project_key,
@@ -73818,6 +73879,22 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn clap_parses_read_only_mail_count_and_requires_project() {
+        let cli = Cli::try_parse_from(["am", "mail", "count", "--project", "/tmp/proj", "--json"])
+            .expect("mail count arguments");
+        let Commands::Mail { action } = cli.command.expect("mail command") else {
+            panic!("expected mail command");
+        };
+        assert!(mail_command_is_read_only(&action));
+        assert!(matches!(
+            action,
+            MailCommand::Count { project_key, format: None, json: true }
+                if project_key == "/tmp/proj"
+        ));
+        assert!(Cli::try_parse_from(["am", "mail", "count"]).is_err());
+    }
+
+    #[test]
     fn clap_parses_mail_send_hyphen_prefixed_sender_token() {
         for token in ["-F_native-token", "--native-token", "ordinary_native-token"] {
             let cli = Cli::try_parse_from([
@@ -78724,6 +78801,46 @@ startup_timeout_sec = 42
         });
 
         conn
+    }
+
+    #[test]
+    fn integration_mail_count_scopes_projects_and_rejects_unknown_projects() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("mail count fixture");
+        let project_path = "/tmp/mail-count-project";
+        let conn = seed_mail_status_db(&dir.path().join("count.sqlite3"), project_path);
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                sqlmodel_core::Value::BigInt(2),
+                sqlmodel_core::Value::Text("empty-project".into()),
+                sqlmodel_core::Value::Text("/tmp/empty-project".into()),
+                sqlmodel_core::Value::BigInt(1),
+            ],
+        )
+        .expect("empty project");
+        let capture = ftui_runtime::StdioCapture::install().expect("capture count output");
+        let slug = resolve_project_identity(project_path).slug;
+        for (key, expected) in [(project_path, 3), (slug.as_str(), 3), ("empty-project", 0)] {
+            handle_mail_count_sync(&conn, key, output::CliOutputFormat::Json)
+                .expect("count existing project");
+            let value: serde_json::Value =
+                serde_json::from_str(capture.drain_to_string().trim()).expect("count JSON");
+            assert_eq!(value["count"], expected);
+        }
+        let result = handle_mail_count_sync(
+            &conn,
+            "/tmp/missing-count-project' OR 1=1 --",
+            output::CliOutputFormat::Json,
+        );
+        assert!(result.is_err(), "unknown projects must not look empty");
+        assert!(capture.drain_to_string().is_empty());
+        let projects = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("project inventory");
+        assert_eq!(projects[0].get_named::<i64>("cnt").unwrap(), 2);
     }
 
     #[test]

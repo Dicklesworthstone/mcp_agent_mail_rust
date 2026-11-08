@@ -1,5 +1,131 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 7 fresh review and message-count wiring — EmeraldEagle
+
+Continue original `br-kp1in.5`; no new task, closure, scope split or performance
+claim. Prior J publication and all six lease releases are verified in
+`/data/tmp/am-fresh-bench-review-20261107.X0h2EI/combined-j-final-handoff.json`.
+This pass uses `/data/tmp/am-fresh-review3-20261107.6rNqNo/` for retained evidence.
+
+- [x] Verify README and repository instructions are unchanged since the complete
+  read; reread suite rules, the complete latest source diff and affected readers.
+- [x] Recheck ready Beads. Release P0s retain their external DSR/public-artifact
+  acceptance and owner-policy decision; do not turn obsolete workflow-only
+  checks into closure. Continue the concrete operational benchmark gap.
+- [x] Run all ten operational catalog cases on the verified J executable with
+  private HOME/config/TMP/database/archive and no-server route. Nine pass;
+  `message_count` fails all four child invocations because `am mail count`
+  does not exist. The diagnostic controller completes but its failure remains
+  a failure. No latency comparison follows from these functional samples.
+- [x] Trace the existing canonical query-only reader and project resolver.
+  Wire `mail count --project ... [--json|--format ...]` through that lane;
+  parameterize the project ID, reject unknown projects and invalid count rows,
+  classify the command read-only, and avoid creating an async runtime.
+- [x] Add parser/read-only classification and real-database tests covering
+  human key, slug, empty project and missing/injection-shaped project input
+  without project creation. Extend the existing real HTTP isolation test with
+  independent count60 readback and the formerly failing benchmark route.
+- [x] Complete formatting and two source rereads; freeze matching main and
+  isolated qualifier K inputs (all3,160 compiled records), preserving peer work.
+- [x] Preserve a separate fresh-local-session failure (pool exhaustion at10.27s)
+  and its metadata-only HTTP bootstrap control (then3.58s success). A second
+  untouched J executable/new-mailbox trial succeeds in5.88s, so the proposed
+  eager-bootstrap change and its test are withdrawn. Keep the failure and
+  provisional patch; do not claim a deterministic cause or a session fix.
+  Two further J trials using the original layout and environment both pass
+  (8.53s and7.18s; each1project/1agent/0messages). The initial failure remains
+  unresolved; these controls do not justify a startup-fix claim.
+- [x] Run separate production, all-target and strict Clippy checks via ordinary
+  strict-remote RCH admission; scan both changed Rust files without suppressions.
+  K production0 on hz2/build10057/receipt5863f2b8 in1,436.7s; all3,917
+  hash/size/executable records match the frozen qualifier. Both K file scans
+  complete0/status ok/no failed modules/zero critical findings. Warnings remain
+  (lib10,330; HTTP66), and the unchanged benchmark scanner finding remains red.
+  The first all-target attempt expires103 in the queue without Cargo execution;
+  the normally admitted retry finishes0 in649.8s on hz2/build10058/
+  receipta63256f6. Strict Clippy finishes0 on hz2/build10062/receipt074da24a.
+  All three complete3,917-file vectors agree and freshly match the qualifier.
+  No gate is waived. The withdrawn-L diagnostic scans have no qualification
+  role; retained K source bytes exactly match the earlier completed K scans.
+- [x] Build the full default CLI and bind its complete source vector plus
+  worker/returned/retained executable hashes before any runtime claim.
+  Build10059/receipt7c6e08c5 finishes0 in3,890.2s on worker115. All3,917
+  records match the three compiler vectors and the qualifier; all3,160 selected
+  main inputs match. Worker/returned/retained ELF305,408,040bytes agree on
+  SHA256d0dd8d4c3bb90b55aa3541be4863a5d98ce67379c228a78943704e8626ad9105.
+- [x] Execute the frozen four-input Count evaluator against the same real
+  2-project/60-message mailbox; verify its database hash and inventory afterward.
+  K passes4/4 versus J0/4: human key60, slug60, existing empty project0,
+  unknown/injection-shaped project error1 with no stdout. Main-file hash and
+  the2-project/60-message inventory remain unchanged.
+- [x] Execute the parameterized paired operational-catalog evaluator unchanged
+  on K. Its fresh J run confirms9/10 cases pass and `message_count` fails;
+  no comparative latency or full-catalog claim includes the unsupported stubs.
+  K passes all10 operational cases (7 filter groups); no failed or skipped
+  command and3 successful measurement samples per case. This is functional
+  command coverage, not ATC-mode, model, loaded-performance or release proof.
+- [x] Rerun all original13 CLI controls (8failure/report controls +5baseline
+  controls), preserving original assertions and planted negatives.
+  Both unchanged controllers finish0, with8/8 and5/5 checks passing.
+- [x] Rerun both frozen real-mailbox oracles: inherited endpoint and inherited
+  owned archive, each with independent persisted agent/message readback.
+  Both finish0 with actual2agents/60messages,3 successful samples and reported
+  local route. Each private server is stopped by its owned cleanup path.
+- [ ] Rerun canonical18 stdio assertions after other local fixtures stop;
+  preserve the original5000ms whole invalid-JSON case bound and report unknown
+  zero-assertion observation rows separately.
+  K finishes17pass/1fail/0skip: invalid JSON produces the correct parse error,
+  but whole-case5,141ms exceeds5,000ms; timeout=true and forced exit143 fail
+  the original contract. This remains red. A fresh unchanged old-J control
+  passes18/0/0, whole malformed case2,391ms; one control cannot attribute the
+  candidate timeout. Full candidate strace is diagnostic only (14/4 under
+  instrumentation), not acceptance. Main-thread waits occur during startup;
+  no safe causal source fix is established and no deadline is relaxed.
+- [ ] Execute original35 plus the two new count tests with unchanged ordinary
+  reservations. Initial inventory fits none;
+  later worker14 has57,170,190,336free bytes and two dead reservation leaders.
+  Ordinary RCH admits the unchanged30GiB/10GiB lane, with no manual ledger edit
+  or foreign cleanup. The retained invocation names an unregistered HTTP test
+  target and fails101 before compilation; correct it to the manifest's `it`
+  aggregator while preserving every selected case. The corrected37-case request
+  reaches the unchanged1,800s SSH/build timeout before test execution.
+  Exact recovery of wrapper118e764a acknowledges exit120 (daemon earlier130),
+  releases sources and retires its ownership. Cache inspection finds531
+  completed rlibs/581,815,782bytes and54,806,016,000free bytes. One identical
+  warm retry is now admitted; no timeout, assertion or resource fence changes.
+  No native bodies or release clearance are inferred yet.
+  The warm build10063 also reaches1,800s before test execution. Exact wrapper
+  2422cd00 recovers120/acktrue with source ownership released. Its cache had719
+  rlibs/928,007,796bytes before recovery, but the old pooled target later no
+  longer exists. Worker14 then has15,351,160,832free bytes versus the unchanged
+  42,949,672,960byte physical minimum. No invented warm-cache retry, cleanup,
+  budget/profile/feature cut, foreign signal or local compile fallback.
+- [ ] Execute the original separate lifecycle30 plus six fresh repeats when
+  ordinary admission fits. The00:03UTC enabled-Linux-worker inventory still
+  fits none alongside the two admitted builds. Reuse the existing selection,
+  preserve quiet/loaded ownership/restart/durability criteria and failed receipts.
+  Before execution, declare a superset for the repeats: run the same33-case
+  selection (original30 plus3 existing storage controls) twice with nextest
+  `--stress-count 2`, still `-j1`. This repeats every original case in a fresh
+  process, including all six required repeats; report the66 runs and unique
+  case names explicitly. The installed nextest's own help confirms this option.
+- [x] Revisit the three unsupported `stub-encode` catalog entries through the
+  existing encoder path. Keep the R2 stub lane explicit; do not add fake success
+  or remove cases to make the catalog green. Original broader `.5` route/corpus/
+  load/null/comparability/budget acceptance and `.90` loaded failure stay open.
+  The existing script deliberately returns simplified fixed TOON; adding a
+  public command around it would not qualify real encoder behavior. The three
+  declared CLI entries remain unsupported and the original acceptance stays open.
+- [x] Record final evidence on both original Beads, flush/check cycles and
+  diffs, verify all seven owned remote jobs are terminal/acknowledged with
+  sources released, and reread the complete final source/test diff.
+
+Publication and release of the five exact owned reservations are the final
+handoff actions. Their observed commit/remote refs and release results go in
+the retained `handoff.json` after execution; no pre-publication checkbox or
+second tracking-only commit is treated as proof. Original acceptance remains
+open, including the failed untraced K stdio gate and unexecuted native cases.
+
 ## November 7 combined-source follow-through — EmeraldEagle
 
 Main now contains parent-archive candidate I plus incoming peer commit9eae1660

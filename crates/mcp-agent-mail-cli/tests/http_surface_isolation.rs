@@ -393,4 +393,58 @@ fn seeded_bench_uses_its_private_database_with_an_inherited_server_endpoint() {
         .collect();
     names.sort_unstable();
     assert_eq!(names, ["BlueLake", "RedFox"]);
+
+    let count = command()
+        .env("AGENT_MAIL_URL", "http://127.0.0.1:0/mcp/")
+        .env("HTTP_PORT", "0")
+        .env(
+            "DATABASE_URL",
+            format!("sqlite:///{}", fixture.join("bench.sqlite3").display()),
+        )
+        .env("STORAGE_ROOT", fixture.join("archive"))
+        .args(["mail", "count", "--project", "/tmp/bench", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        count.status.success(),
+        "{}",
+        String::from_utf8_lossy(&count.stderr)
+    );
+    let count: serde_json::Value = serde_json::from_slice(&count.stdout).unwrap();
+    assert_eq!(count["count"], 60);
+
+    let count_benchmark = command()
+        .args([
+            "bench",
+            "--filter",
+            "message_count",
+            "--warmup",
+            "1",
+            "--runs",
+            "3",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        count_benchmark.status.success(),
+        "message-count benchmark: {}",
+        String::from_utf8_lossy(&count_benchmark.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&count_benchmark.stdout).unwrap();
+    assert_eq!(report["failures"], serde_json::json!([]));
+    assert_eq!(report["skipped"], serde_json::json!([]));
+    assert_eq!(report["seeded_database_route"], "local");
+    assert_eq!(report["timings"]["message_count"]["warmup_failures"], 0);
+    assert_eq!(
+        report["timings"]["message_count"]["measurement_failures"],
+        0
+    );
+    assert_eq!(
+        report["timings"]["message_count"]["samples_seconds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
 }
