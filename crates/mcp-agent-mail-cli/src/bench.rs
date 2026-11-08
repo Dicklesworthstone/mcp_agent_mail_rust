@@ -1014,7 +1014,14 @@ pub struct BenchResult {
 
 fn round_to(value: f64, decimals: i32) -> f64 {
     let factor = 10_f64.powi(decimals);
-    (value * factor).round() / factor
+    let scaled = value * factor;
+    if scaled.is_finite() {
+        scaled.round() / factor
+    } else {
+        // A finite value this large already has no fractional digits at the
+        // requested precision. Scaling must not turn its reference into inf.
+        value
+    }
 }
 
 fn percentile(sorted_values: &[f64], p: f64) -> f64 {
@@ -1062,13 +1069,14 @@ impl BenchResult {
             return Err(BenchValidationError::EmptySamples);
         }
 
-        let mut samples_ms: Vec<f64> = samples_seconds
+        let timeseries_ms: Vec<f64> = samples_seconds
             .iter()
             .map(|s| round_to(s * 1000.0, 4))
             .collect();
+        let mut samples_ms = timeseries_ms.clone();
         samples_ms.sort_by(|a, b| a.total_cmp(b));
 
-        let mean_ms = round_to(samples_ms.iter().sum::<f64>() / samples_ms.len() as f64, 2);
+        let mean_ms = samples_ms.iter().sum::<f64>() / samples_ms.len() as f64;
         let variance_ms2 = samples_ms
             .iter()
             .map(|sample| {
@@ -1084,7 +1092,7 @@ impl BenchResult {
 
         Ok(Self {
             name: name.into(),
-            mean_ms,
+            mean_ms: round_to(mean_ms, 2),
             stddev_ms,
             variance_ms2: round_to(variance_ms2, 4),
             min_ms: round_to(*samples_ms.first().unwrap_or(&0.0), 2),
@@ -1092,7 +1100,7 @@ impl BenchResult {
             median_ms: round_to(percentile(&samples_ms, 50.0), 2),
             p95_ms,
             p99_ms: percentile(&samples_ms, 99.0),
-            timeseries_ms: samples_ms,
+            timeseries_ms,
             command: command.into(),
             fixture_signature: fixture_signature.into(),
             baseline: BaselineComparison {
@@ -1150,7 +1158,9 @@ pub enum BenchBaselineError {
     },
     #[error("baseline root must be a JSON object at '{path}'")]
     InvalidRoot { path: String },
-    #[error("baseline entry for '{benchmark}' must be a number or object with numeric p95_ms")]
+    #[error(
+        "baseline entry for '{benchmark}' must be a finite, non-negative number or an object with such a p95_ms"
+    )]
     InvalidEntry { benchmark: String },
 }
 
@@ -1226,6 +1236,7 @@ pub fn load_baseline(path: &Path) -> Result<BaselineData, BenchBaselineError> {
         let p95_ms = value
             .as_f64()
             .or_else(|| value.get("p95_ms").and_then(serde_json::Value::as_f64))
+            .filter(|p95_ms| p95_ms.is_finite() && *p95_ms >= 0.0)
             .ok_or_else(|| BenchBaselineError::InvalidEntry {
                 benchmark: benchmark.clone(),
             })?;
@@ -1500,7 +1511,7 @@ mod tests {
         let result = BenchResult::from_samples(
             "help",
             "--help",
-            &[0.001, 0.002, 0.004, 0.010],
+            &[0.010, 0.001, 0.004, 0.002],
             "sig",
             Some(7.0),
         )
@@ -1512,6 +1523,7 @@ mod tests {
         assert!((result.p95_ms - 10.0).abs() < 0.001);
         assert!(result.baseline.regression);
         assert_eq!(result.baseline.delta_p95_ms, Some(3.0));
+        assert_eq!(result.timeseries_ms, vec![10.0, 1.0, 4.0, 2.0]);
     }
 
     #[test]
@@ -1546,6 +1558,19 @@ mod tests {
         assert_eq!(result.p99_ms, 12.0);
         assert_eq!(result.stddev_ms, 0.0);
         assert_eq!(result.variance_ms2, 0.0);
+
+        for sample_seconds in [0.063_205, 0.033_095, 0.055_635, 0.055_235] {
+            let fractional = BenchResult::from_samples(
+                "fractional-single",
+                "single",
+                &[sample_seconds],
+                "sig-single",
+                None,
+            )
+            .expect("fractional result");
+            assert_eq!(fractional.stddev_ms, 0.0, "sample {sample_seconds}");
+            assert_eq!(fractional.variance_ms2, 0.0, "sample {sample_seconds}");
+        }
     }
 
     #[test]
@@ -1564,6 +1589,17 @@ mod tests {
         assert_eq!(result.variance_ms2, 0.0);
         assert_eq!(result.p95_ms, 7.0);
         assert_eq!(result.p99_ms, 7.0);
+
+        let fractional = BenchResult::from_samples(
+            "fractional-identical",
+            "identical",
+            &[0.063_205; 4],
+            "sig-identical",
+            None,
+        )
+        .expect("fractional result");
+        assert_eq!(fractional.stddev_ms, 0.0);
+        assert_eq!(fractional.variance_ms2, 0.0);
     }
 
     #[test]
@@ -1612,26 +1648,39 @@ mod tests {
         let baseline_path = temp.path().join("legacy.json");
         fs::write(
             &baseline_path,
-            r#"{"help":{"p95_ms":12.34},"lint":{"p95_ms":99.0}}"#,
+            r#"{"help":{"p95_ms":12.34},"lint":{"p95_ms":99.0},"large":1e308,"large_nested":{"p95_ms":1.79e308},"zero":0.0,"signed_zero":{"p95_ms":-0.0}}"#,
         )
         .expect("write baseline");
 
         let loaded = load_baseline(&baseline_path).expect("load baseline");
         assert_eq!(loaded.get("help").copied(), Some(12.34));
         assert_eq!(loaded.get("lint").copied(), Some(99.0));
+        assert_eq!(loaded.get("large").copied(), Some(1e308));
+        assert_eq!(loaded.get("large_nested").copied(), Some(1.79e308));
+        assert_eq!(loaded.get("zero").copied(), Some(0.0));
+        assert_eq!(loaded.get("signed_zero").copied(), Some(0.0));
+        let json = serde_json::to_value(&loaded).expect("serialize finite baseline");
+        assert_eq!(json["large"].as_f64(), Some(1e308));
+        assert_eq!(json["large_nested"].as_f64(), Some(1.79e308));
     }
 
     #[test]
     fn load_baseline_rejects_invalid_entry_shape() {
         let temp = tempfile::tempdir().expect("tempdir");
         let baseline_path = temp.path().join("invalid.json");
-        fs::write(&baseline_path, r#"{"help":{"unexpected":1}}"#).expect("write baseline");
-
-        let err = load_baseline(&baseline_path).expect_err("invalid baseline shape");
-        assert!(matches!(
-            err,
-            BenchBaselineError::InvalidEntry { benchmark } if benchmark == "help"
-        ));
+        for (input, invalid_benchmark) in [
+            (r#"{"help":{"unexpected":1}}"#, "help"),
+            (r#"{"help":-1.0}"#, "help"),
+            (r#"{"help":{"p95_ms":-0.004}}"#, "help"),
+            (r#"{"help":12.34,"unselected":-1.0}"#, "unselected"),
+        ] {
+            fs::write(&baseline_path, input).expect("write baseline");
+            let err = load_baseline(&baseline_path).expect_err("invalid baseline entry");
+            assert!(matches!(
+                err,
+                BenchBaselineError::InvalidEntry { benchmark } if benchmark == invalid_benchmark
+            ));
+        }
     }
 
     #[test]
@@ -1670,6 +1719,16 @@ mod tests {
         assert_eq!(lint.delta_p95_ms, Some(-10.0));
         assert_eq!(lint.delta_pct, Some(-50.0));
         assert!(!lint.regression);
+
+        baseline.insert("help".to_string(), f64::MAX);
+        let help = compare_baseline(&results, &baseline, 0.10)
+            .into_iter()
+            .find(|entry| entry.name == "help")
+            .expect("large reference comparison");
+        assert_eq!(help.baseline_p95_ms, Some(f64::MAX));
+        assert_eq!(help.delta_p95_ms, Some(-f64::MAX));
+        assert_eq!(help.delta_pct, Some(-100.0));
+        assert!(!help.regression);
     }
 
     #[test]
