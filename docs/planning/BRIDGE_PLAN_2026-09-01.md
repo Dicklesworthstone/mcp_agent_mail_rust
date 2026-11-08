@@ -1,5 +1,456 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 8 evening native qualification — EmeraldEagle
+
+Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split.
+
+- [x] Reverify governing-document/main patch identity and ready Beads; health
+  probe reports only leaked-page accounting on a private copy, no live repair.
+  At19:03UTC, all but115 are below the original40GiB physical minimum. Worker115
+  has45,392,822,272bytes available; the remaining ledger group629821 has no
+  surviving members in a complete procfs census. Normal RCH owns stale reaping.
+- [ ] Reverify all3,917 frozen U source records and actual-Q timeout config;
+  submit original37-case compile-only preparation through strict RCH on115.
+  Both timeout buckets must be14400 for --no-run; no runner-only flags there.
+  Original source/features/profile/build-jobs2,30GiB growth/10GiB floor remain.
+- [ ] If preparation passes, execute the unchanged original37-body population
+  with test-jobs1/no-fail-fast and both deadline buckets1800. Record every
+  outcome; do not infer body credit from preparation or old CLI controls.
+- [ ] Execute remaining original66 lifecycle runs when their unchanged
+  admission conditions permit. Preserve previous SLO failures and counters.
+- [ ] Freshly reread the complete patch and consumers, fix any confirmed defect,
+  and requalify any new source separately. Finish exact receipts/Beads/source,
+  export/graph/diff checks and release only this session's reservations.
+
+Creation worksheet: minimal invocation/source/capacity receipts serve the
+operator's requested review and the original .5/.90 qualification decisions.
+They prevent the observed stale-source/admission-versus-execution confusion;
+they are evidence, not capability credit. No additional evaluator or gate.
+Retire the TODO into existing acceptance history when those gates settle;
+preserve receipts until user-approved cleanup. The next action is the actual
+native preparation, not further policy or report design.
+
+## November 8 clean-source dependency and stdio review — EmeraldEagle
+
+Continue original `.5`/`.90` qualification and execute ready `br-kp1in.45`.
+Evidence: `/data/tmp/am-clean-source-review8-20261108.Rkrsf387/`.
+
+- [x] Reverify governing-document/source identities and reread the complete
+  benchmark diff and real timing consumers. No additional confirmed defect.
+  Existing U compiler/99 functional-control evidence remains scoped to U.
+- [x] Check the live crates.io sparse index instead of assuming the newest
+  Beads release is compatible. There is no published 0.3 engine newer than
+  0.3.18. Beads0.7.5/0.7.6 pin 0.4.10, whereas published0.7.0 accepts ^0.4.4
+  and Asupersync=0.5.0. Investigate0.7.0 with the mailbox's exact0.4.13;
+  preserve the qualified engine fixes and DSR's submodule refusal.
+- [x] Verify candidate crate checksum, used API signatures and dependency
+  resolution; inspect release changes before choosing a source modification.
+  A resolver-only probe is not workspace, embedded-Beads or release proof.
+  Beads0.7.0 checksum68f6685c matches the live registry. Its minimal resolver
+  selects all20 registry engine crates0.4.13, but the actual workspace exits101:
+  Beads rustix=1.1.4 conflicts with qualified search rustix=1.1.5. Beads0.7.6
+  actual workspace exits101 because its engine=0.4.10 conflicts with exact0.4.13.
+  Neither candidate reaches compilation. Live upstream main117f81de still pins
+  mixed engine0.4.10/0.4.12, not a compatible replacement. Retain both resolver
+  stderr files; manually restore Q's manifest byte-identically, lock unchanged.
+  No main dependency edit, engine downgrade, search-pin change or gate weakening.
+- [x] Run a fixed population of exactly three original stdio suites on the
+  retained current U executable, with private storage/HOME/temp and all
+  artifacts retained. Keep the original18 assertions/5000ms bound unchanged,
+  preserve every failure and report all three outcomes without extra retries.
+  This adds real wire-path evidence, not original37/66 native-body credit,
+  comparative performance credit or release clearance.
+  All3 suites pass18/18 each,54/54 total, no failures/skips/retries. Original
+  malformed-input whole-case times3791/4610/2991ms satisfy unchanged5000ms.
+  Each actual executable agrees with retained U SHA2565081fe1c; no compilation.
+- [x] Execute one real public v0.3.40 Unix binary install with the current
+  installer, private HOME/destination/database, normal network downloads and
+  mandatory cryptographic verification. Run --verify and compare both installed
+  digests with independently authenticated public artifacts. Disable service,
+  migration and MCP-client configuration so this receipt covers binary install
+  only. Preserve failures; no fixture, source fallback or verification waiver.
+  This is partial `br-8tszv` evidence, not native Windows/publisher closure.
+  Exit0 in34.14s, --verify issues0, installerSHA2563de2d65d. Real public musl
+  amSHA256eb4a7cc9/serverSHA256f36bb50e match independently authenticated
+  public members byte-for-byte. The readiness line probes the preexisting
+  localhost8765 endpoint; it does not prove this private install started a
+  service. No live mailbox write or client migration/configuration claim.
+- [x] Run one original stdio suite and one macro suite on the installed public
+  binaries, retaining package hashes, exact executable identities and every
+  result. These are public-package smoke checks, distinct from current U and
+  the still-unexecuted original native37/66 populations. No retries on failure.
+  Original stdio18/18 and macros20/20 pass,38/38 total, no failures/skips.
+  Both runner and tested CLI are the installed public musl artifact. Retain
+  the old public smoke archive's four FAIL receipts separately, without reset.
+- [ ] Obtain a qualified compatible dependency source, implement it manually, run the
+  required separate compiler gates and original embedded-Beads tests through
+  strict RCH, and retain source/lockfile/toolchain/executable identities.
+- [ ] Preserve `.45`'s full clean-private-Cargo-home/all-target DSR acceptance
+  and negative submodule-source control. Leave unexecuted acceptance open.
+- [x] Refresh all ten enabled Linux workers and recheck the one worker above
+  40GiB against its authoritative ledger/full process-group census. At14:16UTC
+  worker115 has48,781,225,984bytes free beside live foreign30GiB group2530400,
+  all14 members non-zombie. Original own30GiB growth +10GiB floor now needs70GiB
+  beside that reservation. All other workers are physically below40GiB. Do not
+  submit an unchanged request, alter budgets or touch foreign jobs/ledgers.
+  Original37 native bodies and66 lifecycle repeats remain0; old failures retained.
+- [x] Re-read edits, update existing Beads with exact evidence, flush/import,
+  and verify graph/export/diff integrity.
+  Full3,917 frozen U records still match Q; main differs only at this TODO.
+  Formatting passes0, unchanged benchSHA2567b8f8f66. `.45` stays in progress;
+  `.8tszv` claim correctly refuses4 behind original quq4r/r1say dependency holds,
+  so attach partial evidence without changing its status/edges. `.5` and nq2kb
+  receive scoped runtime receipts. No new Beads, closures, commits or publication.
+  Both JSONL stores contain2,867 unique records, SHA25606df4f8e; only the
+  known earlier z369z addition and10 expected existing records differ from HEAD.
+  All original dependency lists remain identical, cycles0 and diff-check0.
+  Release exact own leases1175–1181 after this final document write; the retained
+  `review8/lease-release-final.json` must confirm7/7 before reporting handoff.
+
+Creation/work worksheet: the temporary dependency receipt answers whether the
+published candidate can eliminate the specific release-source blocker. The fixed
+stdio population exercises the real transport on an already qualified binary.
+No new project framework, reporting surface, gate, budget or test threshold.
+Retire this review section into the existing acceptance history when those named
+gates settle; retain failed and successful receipts until user-approved cleanup.
+
+## November 8 release-policy and fresh statistics review — EmeraldEagle
+
+Continue the original `.5`/`.90` acceptance; separately execute ready policy
+task `br-kp1in.22`. This is policy maintenance, not publication enforcement or
+a performance win. Evidence: `/data/tmp/am-fresh-review7-20261108.0Qi5fnJK/`.
+
+- [x] Reverify governing-document and tested T source identity, reread the
+  changed benchmark construction and its consumers, and refresh ready Beads.
+  No confirmed regression in the chronology repair. Native resource admission
+  remains separate from production/all-target/Clippy checks already passed on T.
+- [x] Trace installed DSR's actual quality/release entrypoints and local registry.
+  DSR is already the accepted policy. This dispatcher's Agent Mail registration
+  has no required quality checks or retained Agent Mail release manifest; its
+  direct release contract does not consume the Agent Mail scorecard. Ask which
+  machine/command actually publishes; do not wire an unconsumed helper and claim
+  the live publication transition is gated. No publication or Actions dispatch.
+- [x] Claim `.22`; retarget all six named existing release tasks to DSR/strict
+  RCH with positive/adversarial execution and original public/native requirements.
+  Preserve previous acceptance verbatim in notes, existing owners and all edges.
+- [x] Finish real Minisign/installer regression rerun with retained temporary
+  artifacts; distinguish real crypto from fixture binary-version checks and
+  absent native Windows/public publisher execution. Full existing artifact-fallback
+  harness exits0 at12:03UTC; all scenarios pass, retained log
+  `/data/tmp/am-installer-review7-20261108.log` and tmpWiChS3Pcdl. No native
+  Windows/public DSR transition claim from its static PowerShell assertions.
+- [x] Verify the two closed signing-task scopes against original execution bounds;
+  reopen `br-l8z1h` and `br-8tszv` for original complete-public-asset/native
+  acceptance while retaining landed Minisign/exact-tag and bounded-test credit.
+  Review each revised scope three times with `br show`/comments and `bv` between
+  reviews. This is a targeted evidence-boundary correction, not a scored full
+  compliance audit; no audit framework, score, dashboard or recurring job added.
+- [x] Review revised scopes for omitted obligations, unwanted expansion and graph
+  cycles; verify `br-bx73n` directly depends on `br-nq2kb` and `.45`; close only
+  `.22` when its policy/retarget acceptance is satisfied. Close `.22` at12:02UTC:
+  all six old acceptance texts preserved, owners/edge sets unchanged, direct
+  parent gates verified and cycles empty. Only `br-nq2kb` is newly unblocked;
+  downstream enforcement remains open, with no capability/release credit.
+- [x] Probe the existing rounded-mean variance calculation through a frozen
+  64-case real-CLI singleton population (evaluator SHA2561dbd970b). A singleton
+  must have zero spread; retain all outcomes before deciding on a source change.
+  T passes60/64. Four real singleton durations63.205/33.095/55.635/55.235ms
+  incorrectly report standard deviation0.01ms; all exits/report checks pass.
+- [x] Repair the reproduced defect manually in the existing constructor: use
+  unrounded mean for variance and round only the reported mean. Strengthen the
+  existing singleton and repeated-identical tests, preserving all assertions
+  and the original native37 case population. U benchSHA2567b8f8f66; all3,917
+  frozen inputs differ from T only at bench.rs. Main differs only at this TODO.
+  Formatting0. Whole-file UBS1/statusok/no failed modules/1critical/213warnings/
+  36info; six added warnings are intentional test assertions/expectations. The
+  only critical is still the unchanged generic subprocess constructor at718.
+- [x] Requalify U through exact separate production/all-target/strict-Clippy
+  checks and complete CLI build via strict RCH, bind source/toolchain/ELF and
+  replay the frozen64-case probe plus prior35 functional controls. No native-body
+  credit from CLI controls. All-target1156319/build10124 exits0 in823s and strict
+  Clippy1156319/build10125 exits0 in259s. Both complete3,917-record receipts
+  match frozen U (roots7f7492ad and3121aae6). Effective compiler, Cargo,
+  rust-toolchain and lockfile identities match on all three actual workers.
+  Exact production11673/build10122 exits0 in1,916.1s; receipt1505c831 matches
+  the same3,917 U records. All three required compiler checks pass separately;
+  FullCLIhz2/build10123 exits0 in2,993.9s with the same complete input vector.
+  Worker, returned and private retained305,529,072-byte ELF agree at SHA256
+  5081fe1c4e69cb25975b4c33252ab26e9494d105e4a5f7824090ec699c380f14.
+  Its inherited return root `/data/tmp/cargo-target` was absent at12:31UTC;
+  retain the verified private review7/qualified-U copy for all controls.
+  Unchanged singleton evaluator improves T60/64 to U64/64; all prior35 controls
+  pass,99 functional CLI controls total. Native2-project/60-message Count fixture
+  remains byte-identical. These controls earn zero original native-body credit.
+  All4 compiler/CLI jobs are terminal/acknowledged/source-released/wrapper-dead;
+  global inventory still has117 unrelated journal errors, not global health.
+- [ ] Execute original37 native bodies and66 lifecycle repeats when unchanged
+  admission terms are met; preserve prior stdio/load failures and zero counters.
+  Fresh12:25UTC ten-worker census: only115 exceeds40GiB physical free,
+  at43,141,877,760bytes. Its old30GiB owner/group796807 is gone, but an
+  authoritative ledger/full-group census finds a different live8GiB reservation
+  (group1681069/start179169467). Thus original30GiB growth +10GiB floor needs
+  51,539,607,552bytes beside that live reservation. No native request is admitted
+  or retried, and no ledger, foreign process, artifact or budget is changed.
+  At12:51UTC a changed-capacity ten-worker census finds115 at50,437,566,464bytes
+  and both ledger groups (8GiB1681069 and10GiB1851651) completely absent from
+  the full process-group census. Submit the original37-case compile-only nextest
+  preparation through ordinary strict RCH at12:54UTC, same full filter, features,
+  profile, build-jobs2/test-jobs1,30GiB growth and10GiB floor. Normal RCH alone
+  owns stale-record reaping. Request14,400s only for this --no-run compiler phase;
+  the effective-config mistake and correction are retained below. Eventual test
+  execution retains1,800s and configured per-test bounds. Selected
+  worker is115; this initial preparation earns zero body credit.
+  Initial build10126 exits2 at nextest argument validation: `--no-fail-fast`
+  conflicts with `--no-run`. Retain the failure/complete U receipt. Correct the
+  compile-only invocation by omitting runner-only --no-fail-fast/-j1 and the
+  redundant client source-env prefix already injected by RCH; no feature,
+  filter, profile, compiler jobs, budget or deadline change. Installed nextest
+  0.9.143 help and official running documentation confirm the phase distinction.
+  Corrected ordinary preparation10127 then reaches compilation. Actual execution
+  restores original --no-fail-fast/-j1 and1,800s; original body counters stay0.
+  Corrected build10127 subsequently times out at1,800s before any body. My
+  effective-config check used main's cwd; qualifier Q overrides the test bucket
+  to1,800s, and nextest uses that bucket. Retain client1/daemon130/recovered
+  delivery120 separately. Exact wrapper2d96d2e2 is recovered/acknowledged with
+  sources released, never replayed. Check the actual Q cwd explicitly: compiler
+  preparation needs both RCH_BUILD_TIMEOUT_SEC and RCH_TEST_TIMEOUT_SEC=14400;
+  actual test execution sets both1800. Both proposed configs are now captured
+  and verified, with no global config, source, feature, resource or body-bound
+  change. Earlier claims of an effective14,400s native compiler allowance were
+  incorrect; this timeout is not product/test failure evidence or a pass.
+  Distinct corrected-config10128 refuses120 before compilation at
+  49,043,312,640free bytes. The13:38UTC full census finds a new live foreign
+  30GiB group2377287/start179678728; original admission now needs70GiB beside
+  that reservation, versus50,348,642,304physical free bytes. No unchanged retry,
+  cleanup, foreign signal, ledger edit or reduced budget. All7 owned requests
+  are terminal/acknowledged/source-released/wrapper-dead;37/66 counters stay0.
+  Final13:42UTC ten-worker survey confirms the hold: only115 exceeds40GiB,
+  at48,492,171,264bytes beside that live30GiB reservation. hz2 has
+  41,981,206,528bytes, below the original42,949,672,960-byte minimum; all other
+  workers are lower. Retain `final-capacity-hold-U.json`, no unchanged retry.
+- [ ] Resolve actual DSR publisher identity before implementing its zero-failure
+  consumer. Keep downstream enforcement and public/native verification open.
+- [x] Verify current public v0.3.40 assets directly: download all15 assets, use
+  real pinned-key Minisign to authenticate the exact-tag manifest and trusted
+  comment, and verify all6 binary archives plus6 sidecar consistencies. Retain
+  exact archive inventories for every build path. Public artifact checks supply
+  partial signing-task evidence; no native Mac/Windows execution or U claim.
+  The public smoke-evidence archive is absent from the authenticated manifest.
+  All4 contained smoke receipts report `FAIL`; its README identifies smoke-host
+  own builds rather than shipped archives. Record those distinct gaps on existing
+  `br-l8z1h`/`br-nq2kb`; preserve public assets and every failed result. Host
+  thinkstation2 is only a smoke-host lead, not established publisher identity.
+  After authenticating the GNU/musl archives, materialize only exact regular
+  members privately and execute both published binaries per libc:4/4 native
+  Linux version checks report exact0.3.40. Retain executable hashes and output;
+  these are version checks, not full installer/native Windows/U qualification.
+- [x] Check the configured enabled Windows worker for potential native artifact
+  verification. RCH wsurf probe completes diagnostics but reports connection
+  failureRCH-E100 (healthy0/failed1); zero Windows cases execute. Retain the raw
+  envelope rather than treating its outer success/exit0 as native proof. No
+  host/key/worker-policy change or substitute platform; `br-8tszv` stays open.
+- [x] Flush/import Beads and finish export/graph/diff/source checks. Both stores
+  have2,867 valid unique IDs and identical SHA256e1c1a18c; HEAD has2,866 plus
+  the known earlier installer taskz369z. Nine expected existing records change,
+  none are removed. Correct the preliminary assertion that wrongly assumed
+  HEAD already contained2,867. Active cycles0, git diff --check0, all3,917 frozen
+  qualifier records unchanged, main differs only at this operator TODO. Governing
+  AGENTS/README hashes still match complete prior reads; bench remains7b8f8f66.
+  Four tracked paths and seven preexisting untracked roots remain preserved.
+  Whole-file UBS1 still holds publication; no scoped waiver or commit.
+
+Release exact own reservations1171/1172/1173/1174 after this final document write.
+The handoff receipt at the evidence root, `lease-release-final.json`, must confirm4/4 before
+reporting completion of that handoff. Remaining unchecked items above retain
+their original acceptance; no whole-project or release clearance is claimed.
+
+## November 8 sample chronology review — EmeraldEagle
+
+Continue original `br-kp1in.5`; retain its full acceptance and `.90` holds.
+Evidence: `/data/tmp/am-fresh-review6-20261108.Sj431N/`.
+
+- [x] Verify governing documents and patch identity against complete prior reads;
+  refresh42 ready Beads and shared health. No live repair. The three encoder
+  entries point at an unsupported command and the available script is an R2
+  test substitute; do not wrap that stub and call it real encoder capability.
+  TUI contact-stats/macOS compile Beads already contain landed fixes and retain
+  their distinct production/native-host verification requirements.
+- [x] Trace result construction and identify the measured-sample order defect:
+  `from_samples` sorts the vector later serialized as `timeseries_ms`.
+- [x] Freeze a real-CLI evaluator before editing: final0bfc2a35, two pidfd-bound
+  deliberate slow-iteration controls plus a native60-message Count control.
+  Independently check statistics, retained reports and saved baseline p95.
+  Initial draftf8a11148 incorrectly expects rounded p95/p99, unlike the actual
+  existing contract. Preserve that script/run, correct only those expectations
+  and saved-baseline rounding before any product edit; do not count its failures
+  as product evidence. Final evaluator keeps population, delays and deadlines.
+- [x] Execute the frozen evaluator against retained source-bound S. All3 cases
+  fail only chronology: the independently checked statistics are correct, but
+  serialized time series are sorted. Native control independently reads60 real
+  messages. Both delayed controls observe only identity-verified own children.
+- [x] Preserve measured ordering while keeping sorted statistics unchanged;
+  strengthen an existing unsorted-input test without changing native case count.
+- [x] Re-read the complete repair and affected callers, format, scan full changed
+  files with UBS, and bind the final source before remote qualification.
+  Both formatting checks0; final T differs from S only at bench.rs, SHA256c301e32a,
+  with all3,917 records frozen and main differing only at this operator TODO.
+  Whole bench.rs UBS1/statusok/no failed modules/1critical/207warnings/36info;
+  only critical remains the unchanged generic runner. The new copy is needed
+  for separate ordering/statistics; the new assertion strengthens the old test.
+- [x] Run required separate production/all-target/strict-Clippy checks and build
+  a complete CLI through strict RCH; bind all inputs and executable identity.
+  Initial explicit-feature/job/profile production proposal refuses103 before
+  compilation because11673 has one slot versus the two-core request. Exclude it
+  from required-gate evidence; the exact default production command subsequently
+  runs separately. Full CLI3651 is admitted with unchanged original flags.
+  Exact production11673/build10117 subsequently finishes0 in1,885.5s;
+  receipt235d902d matches all3,917 frozen T records. Separate exact all-target
+  check follows. A read-only hz2 census finds zero live members for all three
+  old ledger groups; its distinct ordinary full CLI request is admitted with
+  identical flags. Do not remove ledger records or cancel the original build
+  until a successful replacement is source/executable-bound and tested.
+  All-target11673/build10120 finishes0 in850.8s; receiptd853ecd6 matches all
+  3,917 T records and production. Strict Clippy runs separately. Effective
+  toolchain reads from all three actual source directories agree on Rust
+  1.100-nightly90850177/Cargo e8cb624d/LLVM23.1. No dev-only feature substitutes
+  for the already-passed default production graph.
+  Strict Clippy11673/build10121 finishes0 in424.5s; receipt0bd25494 matches
+  all3,917 T records. Full CLIhz2/build10119 finishes0 in2,723.7s with the
+  identical complete input vector, receipta9de8816. Worker, returned and retained
+  305,528,144-byte ELF agree at SHA256
+  42f5346c390dc01b8c00dc46c7629ed907ef164eaeffaf5614e10541045dc796.
+- [x] Replay the unchanged chronology evaluator and prior32 CLI controls.
+  Final frozen evaluator0bfc2a35 changes S0/3 to T3/3. First/middle deliberate
+  slow samples stay in their measured positions; native Count also preserves
+  order and independently reads60 messages. All statistics/report/baseline
+  counterchecks pass. Prior duration6, numeric3, coverage4, original13 and
+  Count4 pass; separate supplemental seeding2 passes:35 functional controls.
+  The existing2-project/60-message Count database remains byte-identical.
+- [x] Refresh original native/lifecycle capacity with unchanged budgets, features,
+  profile and deadlines; retain refusals and every unmet original acceptance.
+  Final survey: only115 exceeds40GiB physical free;49,628,979,200bytes coexist
+  with a live matching30GiB reservation(group796807/start178632958). All other
+  workers remain below40GiB, including hz2 at37,196,378,112bytes. No unchanged
+  native request, reduced fence, cleanup or foreign signal. Original37 native
+  bodies and66 lifecycle repeats remain zero; prior stdio/load failures stay red.
+- [x] Complete the second review and original Bead comments. No further confirmed
+  defect in the full Rust diff, constructors, timing producer, baseline callers
+  or field consumers. Both original Beads remain in_progress. All5 admitted
+  owned jobs are terminal/acknowledged/source-released/wrapper-dead. Redundant
+  3651/build10118 is canceled only after full replacement qualification; retain
+  client143, daemon130 and recovery120 separately, with no pass credit. Global
+  inventory still has117 unrelated journal errors.
+- [ ] Execute original37 native CLI bodies under their original terms; zero.
+- [ ] Execute original66 lifecycle repeats and satisfy original stdio/load/
+  persistence acceptance; zero, with prior failed SLOs retained.
+- [ ] Resolve the unchanged UBS publication gate; the prior scoped exception
+  remains unanswered. Code and coupled tracking remain uncommitted.
+- [x] Finish graph/export/diff checks. Both JSONL stores have2,867 valid unique
+  IDs and identical SHA256e304fe46; only .5/.90/z369z differ from HEAD. Export
+  has no dirty issues, active cycles are empty and git diff --check0. Governing
+  documents still match complete prior reads; bench.rs remains testedc301e32a.
+  Release exact own leases1167/1168/1169/1170 after this final document write;
+  retained handoff receipt must confirm4/4 before reporting completion.
+
+## November 8 additional fresh review — baseline durations
+
+Continue original `br-kp1in.5`; no reset of native, lifecycle, SLO or release
+acceptance. Evidence: `/data/tmp/am-fresh-review5-20261108.rdn4qz/`.
+
+- [x] Verify complete prior AGENTS/README reads still match current bytes, read
+  all2,097 bench.rs lines and its current CLI admission/execution/report path,
+  revisit published timeout selection and refresh all42 ready Beads.
+- [x] Freeze a six-case real-CLI duration evaluator before implementation.
+  Retained O ELF2d21c331 passes3/6: flat-negative and small nested-negative
+  references both create native fixtures/reports before returning regression3;
+  an unrelated negative reference even returns0 and overwrites planted output.
+  Malformed-shape, valid-positive-with-extra and valid signed-zero controls pass.
+  Positive controls independently verify2agents/60messages and native namespace
+  markers; no actual shared mailbox is changed.
+- [x] Reject nonfinite/negative p95 values while loading, before rounding, seeding
+  or command execution. Preserve zero/signed-zero and valid extra entries.
+  Strengthen the existing invalid-shape and legacy-format tests; retain every
+  original assertion, threshold, skip condition and native test name/count.
+- [x] Re-read the manual repair and affected callers, run formatting and full
+  changed-file UBS without suppressions, and freeze exact S qualifier inputs.
+  Both formatting checks0; whole bench.rs UBS1/statusok/no failed modules/
+  1critical/206warnings/35info. The critical is still the unchanged generic
+  command runner, so no commit-gate waiver. A failed absolute-path patch left
+  Q unchanged; its accidentally started check finishes0/build10106 but all
+  3,917 inputs match R, not S. Retain it only as old-source diagnostic evidence.
+  After terminal/ack/source-release, normalize the patch header manually and
+  apply its checked exact delta. Frozen S changes only bench.rs versus R;
+  all3,917 main records match except this operator TODO document.
+- [x] Run separate production, all-target and strict-Clippy checks through strict
+  RCH with source receipts; build a complete CLI and bind its worker/returned
+  executable identity. Preserve all refusals and source ownership boundaries.
+  Production11673/build10107 finishes0 in88.1s; receiptfb593158 matches all
+  3,917 S inputs. All-target11673 finishes0 in105.0s and strict Clippy11673
+  finishes0 in125.9s, both with the identical complete input vector.
+  Earlier full CLI on hz3 refuses120 before Cargo:28,245,606,400free bytes
+  against active reservations, ordinary9GiB growth and10GiB floor. A fresh
+  fleet survey permits a distinct normally admitted3651 request; no resource,
+  feature or profile term changes and no manual ledger pruning.
+  Full CLI3651/build10110 finishes0 in5,113.5s. Receipt9ea6b8c2
+  matches all3,917 S records and every check vector. Worker, returned and retained
+  305,541,168-byte ELF agree at SHA256
+  ba24d7cba7e3262484781e2aaf52f879a2a83b391d96d46cee2099a777d34228.
+- [x] Replay the identical six-case evaluator, previous numeric3/coverage4/
+  original13/Count4 controls and supplemental native-seeding control on S.
+  Frozen duration evaluator0ae48066 improves O3/6 to S6/6. All four invalid
+  inputs exit1 before any fixture/report and preserve input/output bytes.
+  Valid-extra and signed-zero controls seed2agents/60messages; zero still
+  reports regression3 and preserves output. Numeric3, coverage4, original13 and
+  Count4 all pass; separate supplemental seeding2 also passes:32 functional
+  controls total, with the existing2-project/60-message database hash unchanged.
+  These are real CLI controls, not original37 native bodies or lifecycle repeats.
+- [x] Refresh capacity for original37 native cases and lifecycle repeats without
+  reducing30GiB growth/10GiB floor or changing original test-run deadlines.
+  At08:48 worker115 has47,134,613,504free bytes and a leader-absent30GiB ledger
+  record; its old full CLI pool is now absent. Submit the already-planned
+  compile-only nextest preparation there: same --lib/--test it, complete original
+  filter, features, -j1 and build-jobs2/profile. Only this --no-run compiler phase
+  has14,400s allowance; it earns zero body credit. Normal RCH admission must
+  resolve process-group liveness. The actual run retains1,800s and per-test limits.
+  Preparation refuses120 before Cargo at46,862,635,008free bytes: the protected
+  floor plus full30GiB allowance and authoritative active reservations do not
+  fit. Preserve this distinct receipt; no compile phase or native body passed.
+  Ordinary source-receipt nextest uses a per-build source tree, but its forwarded
+  CARGO_TARGET_DIR is rewritten to an absolute pooled worker directory. Absence
+  of an inline managed build-dir does not prove cache reuse fails; actual reuse
+  remains untested because admission stopped compilation. Correct the earlier
+  stronger inference. A separate clean-overlay preparation with base49866939
+  and explicit Q bench.rs/operator-TODO overlays reproduces all3,917 frozen S
+  records offline, but refuses103 before compilation: RCH reports an owned
+  runtime namespace collision or changed namespace skeleton. The precise cause
+  is unproven. Preserve both refusals, do not modify RCH or remove its namespaces,
+  and award zero native/lifecycle test credit.
+  Final10-worker Linux survey: only115 exceeds40GiB physical free. Its later
+  49,546,936,320free bytes coexist with a live matching30GiB reservation
+  (group347422/start178398305), so the original30GiB request plus10GiB floor
+  cannot fit. All other workers are below40GiB. No unchanged retry or cleanup.
+- [ ] Execute the original37 native CLI bodies under their unchanged filter,
+  features, profile, resource fences and1,800s test-run deadline; currently zero.
+- [ ] Execute the original66 lifecycle repeats and satisfy the original quiet/
+  loaded stdio and persistence controls; currently zero, with prior SLO failures
+  retained. The32 CLI functional controls do not replace these populations.
+- [x] Perform a second fresh review and update original Beads with exact results.
+  Re-read the complete owned Rust diff and loader/comparison/caller boundaries
+  after runtime controls; no further confirmed defect. Both original Beads have
+  exact source/runtime/refusal comments and remain in_progress. All8 owned
+  admitted wrappers are terminal/acknowledged/source-released/dead; the global
+  inventory still has117 unrelated journal errors. Clean-overlay10115 retains
+  both client103 and durable lease1, never a successful compilation or test.
+  Preserve the unanswered UBS exception: repeated general work requests do not
+  explicitly override the existing scanner commit gate; no red gate becomes a pass.
+- [ ] Resolve the unchanged UBS commit gate before publishing the baseline repair
+  and coupled tracking; the prior scoped exception request remains unanswered.
+- [x] Finish honest graph/diff/export checks. Both JSONL stores contain2,867 valid
+  unique IDs with identical SHA256275dbfde; only .5/.90/z369z differ from HEAD.
+  Export has no dirty issues, active cycles are empty and git diff --check0.
+  The four exact own leases1158/1159/1160/1161 are released after this final
+  document write; the handoff requires their retained tool receipt to confirm4/4.
+
 ## November 8 fresh review and baseline coverage — EmeraldEagle
 
 Continue original `br-kp1in.5` and `br-kp1in.90`; their full acceptance remains
@@ -38,11 +489,20 @@ open. Retained evidence: `/data/tmp/am-fresh-review4-20261108.CQcX6K/`.
   a distinct hz3 request reuses that completed cache and finishes0 in295.1s,
   build10070/receiptbfaee776. Its complete3,917 records match production,
   Clippy and the frozen qualifier. Retain the earlier refusal separately.
-- [ ] Build the complete CLI, verify source/executable identity, and execute the
+- [x] Build the complete M CLI, verify source/executable identity, and execute the
   unchanged four-case evaluator plus original13 failure/report/baseline controls.
   First CLI request10066 refuses120 on worker115 disk reservations. Its old K
   pool is now absent, so no imaginary warm retry. A separate normally admitted
   hz2 build compiles from a fresh cache with unchanged features/profile/settings.
+  Replacement worker115/build10073 finishes0 in3,840.4s. Receiptb5d88ded
+  matches all3,917 qualifier records and the three source-check vectors. Worker,
+  returned and retained ELF305,417,280bytes all have SHA256
+  7b381a01fbb9db2bd942d8db31dbd2541d503dc9f64f5a3a70c1e0ca600fe5d1.
+  The frozen evaluator improves from K2/4 to M4/4: both missing-reference
+  cases exit1, preserve both baseline paths and produce no report; both valid
+  cases execute and save. Original13 controls pass8+5; Count4/4 retains the
+  unchanged2-project/60-message database. These are functional controls, not a
+  performance or latest-main verdict.
 - [x] Complete the whole changed-library UBS scan. The first unchanged default
   module allowance expires300s/exit2 with an explicitly partial result. Read-only
   doctor verifies the AST engine/module checksums and reports a healthy scanner.
@@ -59,22 +519,241 @@ open. Retained evidence: `/data/tmp/am-fresh-review4-20261108.CQcX6K/`.
   3,160 count used a narrower tracked selection; this is an explicit wider check.
   Source receipt vectors describe Q's complete3,917 inputs, not current main's
   later tracker/planning bytes. Preserve the separate qualifier Git stamp.
-- [ ] Finish executable qualification. hz2's compiler runs at SCHED_IDLE/nice19
+- [x] Finish M executable qualification. hz2's compiler runs at SCHED_IDLE/nice19
   and its Asupersync frontend shows55s CPU versus roughly700s runnable delay;
   leave scheduler policy intact. One alternate hz3 request expires103 in queue
   without Cargo. A fresh read-only census finds worker115 now has25,321,496,576
   bytes after reservations/floor and load2.35 on10 CPUs; a new ordinary full CLI
   request there compiles, with the same source/features/profile. Keep hz2 until
   a successful replacement is bound; then cancel only the exact owned wrapper.
+  After the replacement is bound and21 actual CLI checks pass, exact wrapper
+  fcf9df4a cancellation is acknowledged; its original client exits143. Recovery
+  settlement and source release must complete before changing the qualifier.
+- [x] Detect later peer commits through803a927a and preserve them. A full
+  main/qualifier comparison now differs at the installer/workflow, reservation
+  readers/query/resource code and tests, README/cookbook and planning file.
+  The earlier matching snapshot and its M passes remain historical, not proof
+  for the newer main. Import current Beads JSONL after the shared advance.
+- [x] Read all4,039 lines of the captured five-file reservation/test patch and
+  all472 lines of the installer/workflow/README/cookbook patch. No additional
+  confirmed defect found; page counts, continuity, authority, encoded budgets,
+  permit drops and explicit scoped cleanup are retained. Both installer shell
+  syntax checks finish0. No exact installer-commit workflow run was returned;
+  this is not native macOS or signed-release proof.
+- [x] After both M builds settle, apply the exact reviewed peer changes to the
+  isolated qualifier and freeze N. Keep M's receipts and executable identity
+  separate; do not change a qualifier while its source ownership is active.
+  All seven admitted M jobs are now terminal/acknowledged with sources released;
+  the canceled69 settles120 while its original client143 remains retained.
+  The two checked patches apply cleanly. Frozen N through803a927a differs from
+  M at exactly nine reviewed paths; all3,917 source-manifest records agree with
+  main except the explicitly operator-only planning file. N formatting0.
+  N production finishes0 in2,947.0s, hz2/build10083/receipt74e9ef85;
+  separate all-target check0 in484.2s, hz2/build10088/receipt0601dc52.
+  Both complete3,917 records freshly match the qualifier and each other.
+  First N CLI request on worker115
+  refuses120 before Cargo at25,697,710,080free bytes against existing reservations
+  and unchanged9GiB build growth/10GiB floor. No N executable or runtime pass yet.
+  Alternate paths on115 are the same filesystem; hz3's separate /tmp is memory
+  backed and is not adopted as a persistent-build/durability workaround.
+- [x] N strict Clippy runs and fails101 on two reservation query documentation
+  first paragraphs. Repair those paragraphs in main, preserving their
+  snapshot/budget contract and keeping -Dwarnings. No lint suppression;
+  final O must rerun the strict gate. Whole repaired queries UBS0/statusok/no
+  failed modules/zero critical; final source formatting0.
+- [x] Finish the normally admitted N CLI build10085 on worker115. The completed
+  old M pool is absent, so this is a cold build. Keep Q unchanged: RCH explicitly
+  re-enumerates and hashes local source after remote execution, and its receipt
+  refuses lasting edits. N finishes0 in3,864.9s; all3,917 records match N's
+  production/all-target/failed-Clippy vectors. Worker/returned ELF SHA256a5b2eda9,
+  305,513,560bytes. All five N jobs are terminal/acknowledged/sources-released;
+  preserve their101/120 failures. Only then apply the exact four-path O overlay.
+- [x] A further numeric review reproduces a second defect on the retained M
+  executable: finite flat1e308 and nested1.79e308 references overflow during
+  decimal rounding, report null baseline/delta, return0 and replace the baseline.
+  Freeze a separate three-case evaluator before editing: M1/3, including the
+  unchanged ordinary-reference positive control. Keep the earlier four-case
+  coverage evaluator unchanged; its M4/4 remains a different bounded result.
+- [x] Fix the shared rounding helper to retain the original value when decimal
+  scaling is nonfinite. A finite value this large already has no fractional
+  digits at that precision. Extend existing load/serialization and comparison
+  tests through the largest finite reference; preserve all threshold assertions,
+  catalog cases and resource fences. Formatting0; native test bodies pending.
+- [x] Complete the O evaluation after N source ownership settles. Apply its
+  numeric, GNU-fallback/test and two doc-paragraph repairs only after settlement.
+  Production/all-target/full CLI and numeric3/coverage4/original13/Count4 pass;
+  strict Clippy101 exposes another mutex-lifetime warning, so O is not cleared.
+- [x] Freeze O: all3,917 records agree with main except the operator-only planning
+  file; exactly bench.rs, queries.rs, install.sh and its existing test differ
+  from N. Main and qualifier formatting0. O full CLI worker115/build10093
+  finishes0 in575.7s; receipte0503cd0 freshly matches all3,917 frozen inputs.
+  Worker/returned/retained ELF305,516,064bytes have SHA256
+  2d21c331fc94def4d0f9386507f97884b9f2340d29af56bc8387734609c247df.
+- [x] Execute the unchanged numeric3/coverage4/original13/Count4 evaluators on
+  that O ELF:24/24 actual functional controls. Replaying numeric3 on the
+  source-bound prior N ELF gives1/3, versus O3/3; both large references/deltas
+  remain finite. A separate real CLI boundary also preserves f64::MAX and its
+  negative delta. None is a comparative-performance or native-test-body claim.
+- [x] Add a supplemental real native-seeding control after implementation and
+  replay the identical controller on retained K and O: K1/2, O2/2. K's missing
+  message_count reference creates the native fixture and overwrites the output;
+  O refuses1 before creating any fixture/report and preserves both baselines.
+  Both valid controls seed2agents/60messages and independently read count60
+  without changing the main DB hash. FrankenSQLite namespace gate/use markers
+  are present. This adds real producer coverage; it does not replace original37.
+- [x] Finish O source checks, retaining strict-Clippy101 alongside the separate
+  production/all-target passes.
+  Production worker1167313/build10094 finishes0 in2,012.2s, receipt234ec543;
+  all-target build10095 finishes0 in829.6s, receipt9a2eceb8. Both complete
+  3,917 records freshly match the O freeze and full CLI vector. Normal RCH
+  admission performs its own authoritative process-group census before reusing
+  the completed cache; no manual ledger pruning or foreign signaling.
+  The first O production
+  request on hz2 refuses120 before Cargo at34,927,648,768free bytes against
+  existing reservations and ordinary6GiB growth/10GiB floor; its old N pool
+  subsequently is absent. Do not invent cache reuse. A fresh ledger read finds
+  worker1167313 can fit the ordinary allowance. No manual budget/profile/feature
+  change or foreign cleanup. Keep the earlier refusal independently red.
+- [x] Review the Clippy finding at resources.rs6266 and release the cache mutex
+  after snapshot insertion, builder accounting and the reservation flag update,
+  before returning the first page. No suppressed lint or changed cache policy.
+  The complete resources UBS scan finishes0/statusok/no failed modules/
+  0critical/1,297warnings/461info. Both main and qualifier formatting0.
+- [x] Finish the separate P production check after the one-line mutex release. All five
+  O jobs are terminal/acknowledged/source-released before applying the checked
+  patch to Q; P differs from O only at resources.rs. Freeze all3,917 inputs and
+  retain the distinct9d4ab4fb-dirty qualifier stamp. Strict Clippy uses the
+  completed11673 cache but finishes101 on unchecked Instant subtraction in an
+  existing expiry test. Use checked_sub with the identical one-nanosecond
+  boundary in main. P production runs separately on worker115/pool393a;
+  do not assume it shares O's full-CLI target pool.
+  Production worker115/build10099 finishes0 in531.4s; its complete3,917 inputs
+  match P's failed-Clippy101 receipt4a9edfbbe and frozen vector. Both jobs are
+  terminal/acknowledged/source-released before Q changes again.
+- [x] Qualify final combined R after P source ownership settles: preserve both
+  upstream commits and the GNU-timeout fix, retain the mutex release, use checked
+  test-time subtraction, then rerun the required strict compiler checks. The
+  complete incoming three-Rust-file scan finishes0 with0critical/no failed
+  modules; the merged installer and those real checkout files also scan0.
+  R strict Clippy worker1167313/build10101 finishes0 in276.2s, receipt1dca8f8d;
+  all3,917 records equal the final R freeze. The separate production request
+  on worker115 expires103 at queue selection before any remote build/Cargo;
+  preserve that refusal. The normally admitted all-target check now runs on
+  the completed11673 cache. Place the separate production check after that
+  job releases its reservation rather than lowering resource fences.
+  R all-target worker1167313/build10102 finishes0 in285.2s, receiptca86794f;
+  all3,917 input records match strict Clippy and the freeze. After settlement,
+  a distinct normal production request uses11673's completed cache. At08:03UTC
+  worker115 still has two live, start-identity-matched reservations of30GiB
+  and5GiB against50,788,458,496free bytes; original native lanes cannot fit.
+  The replacement production worker1167313/build10103 finishes0 in181.2s,
+  receipta7fcf472. Freshly verify all3,917 Q hash/size/executable records and
+  equality of all three R check vectors; main differs only at this TODO file.
+  Both final formatting checks0. Publish the zero-critical reservation
+  maintenance as49866939 and synchronize both remote source branches.
+- [ ] Publish the numerical-baseline repair only after the requested explicit
+  UBS exception. Its exact bench.rs SHA256cfcfe728 is unchanged from the tested
+  O ELF input and has only the preexisting generic Command::new critical. The
+  suite/repository Golden Rule requires exit0 before commit. Keep the complete
+  repair in the working tree while the user's answer is pending; no severity
+  weakening, suppression, API rewrite, inferred approval or native-gate waiver.
+- [x] Finish four full peer-file UBS scans without exclusions or suppressions.
+  Queries0/0critical/3,953warnings/647info; resources0/0critical/1,297warnings/
+  461info. Reservation reader exits1/statusok/6critical/366warnings/119info:
+  public JSON-RPC version, request-ID, content type and payload comparisons are
+  classified as secret comparisons (two are added lines). Integration exits1/
+  statusok/1critical/1,769warnings/424info on the unchanged process-ID-derived
+  private-asset test token. All scans have no failed module. Preserve these red
+  whole-file outcomes; tracing findings is not a waiver or project-wide clean
+  scan. The597 added-line records are retained for review, separate from M's
+  completed zero-critical changed-library scan.
+- [x] Finish the complete O bench.rs UBS scan: exit1/statusok/no failed modules,
+  1critical/204warnings/35info. Read all11 added-line records: test assertions
+  and expectations, plus division by the fixed finite10^2/10^4 factor. The
+  unchanged critical at718 is Command::new in the generic timing runner; its
+  CLI caller supplies current_exe plus the fixed catalog, not user executable
+  input. Preserve the red whole-file outcome; do not rewrite the API to appease
+  the scanner, suppress the finding or claim the commit gate is green.
+- [x] Run the unchanged Linux installer unit suite against N. It finishes1:
+  52exit/16lock/10destination/58identity/105kernel/11native cases complete;
+  capture stops after29 successes because timeout fallback returns124 where
+  the exact KILL-status assertion requires137. The host timeout is uutils0.10.0.
+  A separate real sleep probe reproduces124; --preserve-status returns137.
+- [x] Track the reproduced installer defect as br-z369z/in_progress. The
+  provisional preserve-status-only attempt still fails the unchanged descendant
+  cleanup assertion: uutils leaves a process-group member alive. Retain that
+  failed attempt; replace it with GNU identification and gnutimeout discovery.
+- [x] Repair the GNU fixture to execute actual GNU coreutils, retaining original
+  exact status/output, single-execution, descriptor and descendant assertions.
+  Add Ubuntu gnutimeout and a non-GNU refusal-before-launch case; the native
+  lock fixture also admits that real alias. Do not accept124 for GNU KILL,
+  remove assertions, loosen deadlines or count unavailable gtimeout as passed.
+  O2's122 captures pass but its native alias fixture fails; retain that result.
+  Final O3 whole suite finishes0:52exit/16lock/10destination/58identity/
+  105kernel/122capture/11native =374cases. Actual GNU and non-GNU fixtures are
+  /usr/bin/gnutimeout and /usr/bin/timeout. Final Bash syntax and full two-file
+  UBS0/statusok/no failed modules/zero findings. No native-macOS or signed-release
+  installer verdict; the source/test overlay belongs in final O's input vector.
+- [x] Read ACFS's complete946-line instructions for the required installer digest
+  coordination. Its current mcp pin exactly matches published N6f17ca30.
+  Build its mandated checker through strict RCH: hz3/build10089,134.8s,
+  all153 source records match; returned executable SHA256141a8847.
+  Local current-policy validate/list/check--dry-run--local all0. Dry-run lists
+  48 installers but executes none; do not call it48 installed-app passes.
+- [x] Publish the installer-only fix d067ffb0 and preserve upstream history with
+  merge bc796a2d; relative to origin the published tree changes only installer
+  and existing tests. Repeat the whole expanded suite in a fresh verification
+  pass:470/470 including96 upstream config-guard cases. Full merge-file UBS0;
+  both source branches pushed without force. Rust working-tree fixes stay separate.
+- [x] Complete the required ACFS checksum coordination. Canonical live report
+  observes45matches/3mismatches/0errors/0skips; defer the independently observed
+  Atuin/Grok mismatches and build/validate the target-only candidate from that
+  bound report. Public MCP installer SHA2563de2d65d exactly matches merged Git.
+  Regenerate existing metadata; final policy ec9afc27 changes only the target
+  and timestamp, with two derived hash literals. Required local checker
+  validate/list/check--dry-run--local all0; drift0/121internal files/461contract
+  checks; generated-shell ShellCheck0 and changed-file UBS0. ACFS63a9bac2
+  publishes these three paths. No installer is executed by the downstream
+  checker, no stronger external-checker live mode is claimed, and br-quq4r's
+  release-blocking automation acceptance stays open.
+  Public ACFS policy SHA256ec9afc27 matches local bytes, and both remote source
+  branches are synchronized. Close br-z369z on the470-case fresh solo pass and
+  both published revisions; do not call this independent verification.
+- [x] Investigate the canonical preflight's changed public installer digest.
+  MCP origin advanced two commits through b6158b53, including an overlapping
+  installer config-admission repair; its exact public bytes hash4b8d85d2.
+  ACFS origin76c58935 already pins those exact bytes. ACFS fast-forwards cleanly
+  and imports unchanged Beads. Preserve the dirty MCP overlay and both histories;
+  combine reviewed nonoverlapping installer functions only after qualified
+  local work is committed. Unrelated atuin/grok updater differences are not
+  authorization to change their pins. GitHub Actions is disabled on ACFS.
 - [ ] Execute original37 CLI native cases and original lifecycle30 plus required
   repeats when ordinary capacity fits. If preparation is needed, keep compilation
   separate, then retain the original1,800s test-run and per-test deadlines.
+  Final fleet survey after R settles still cannot fit the unchanged30GiB growth
+  plus10GiB floor: worker115 has49,817,976,832free bytes and a live matching
+  30GiB reservation; every other Linux worker has less than40GiB physical free.
+  No fresh test admission is fabricated and no original native body is credited.
 - [ ] Resolve the prior quiet stdio5,141ms versus5,000ms failure through an actual
   causal repair; another unmodified run cannot erase it. Preserve old-J control,
   diagnostic strace and loaded-send p99 6.011s versus5.000s failure.
-- [ ] Complete a second source review, record exact outcomes on original Beads,
-  flush/cycle/diff checks, and publish only the owned qualified work. Keep missing
-  host/corpus/load/null controls, unsupported stubs and release acceptance open.
+- [x] Complete a second owned-source review and record exact outcomes on both
+  original Beads; preserve .5/.90 in_progress, original SLO failures, missing
+  host/corpus/load/null controls and unsupported stubs. Close only br-z369z on its
+  actual fresh runtime evidence. Separate the numerical commit hold from the
+  qualified installer/checksum/reservation publication.
+- [x] Finish final Beads flush/cycle/diff checks. All three final R wrappers are
+  terminal/acknowledged/source-released with no live wrapper. Global RCH inventory
+  remains incomplete because of117 unrelated journal errors; no fleet-clean claim.
+- [ ] Publish numerical repair and associated tracking together after the pending
+  UBS exception. The tracking-only scan returns3/no supported languages, not a
+  pass. Preserve it; do not enable UBS_ALLOW_NO_SCAN or claim JSONL/Markdown was
+  scanned. Validate both JSONL files and the Beads graph independently. No user
+  silence is treated as approval; keep the complete owned changes reviewable.
+- [x] Release exact remaining MCP leases after final checks:1111/1112/1113/
+  1138/1144/1152. Installer1140/1142 and ACFS1153/1154/1155 are already released.
+  Preserve unrelated untracked files and all failed receipts. Tracking and the
+  complete numerical repair remain local while the exception request is pending.
 
 ## November 7 fresh review and message-count wiring — EmeraldEagle
 
