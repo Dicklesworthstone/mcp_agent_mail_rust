@@ -45,7 +45,9 @@ for fn in info ok warn err error_support_hint init_verbose_log verbose \
     capture_command_with_timeout installed_am_db_query_scalar installed_am_db_exec \
     installed_am_db_backup ensure_remote_http_client_readiness activate_mac_python_cli_compat_shell \
     handle_binary_transaction_signal ensure_rust update_mcp_configs configure_mcp_clients \
-    configure_mcp_clients_for_install; do
+    configure_mcp_clients_for_install path_resolves_within_directory \
+    config_target_is_hardlink_aliased mcp_config_must_skip_shell_write \
+    setup_claude_code_mcp_via_cli setup_mcp_configs resolve_setup_http_bearer_token; do
     extract_function "$fn" >> "$unit_library" \
         || { echo "Cannot extract installer function: $fn" >&2; exit 2; }
 done
@@ -1224,6 +1226,189 @@ else
     failures=$((failures + 1))
 fi
 
+# The external Claude CLI cannot inherit write authority from a missing or
+# failed metadata check. Exercise the real guard and caller after the native
+# credential phase, with no other client candidates and a harmless CLI witness.
+config_guard_probe="$scratch/config-guard-probe.sh"
+cat > "$config_guard_probe" <<'PROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1" backend="$2" mode="$3" target="$4"
+source "$5"
+QUIET=0 VERBOSE=0 HAS_GUM=0 NO_GUM=1 LOG_INITIALIZED=0
+LOG_FILE="$root/verbose.log" DRY_RUN=0
+HTTP_BEARER_TOKEN=guard-fixture-token
+export HTTP_BEARER_TOKEN
+real_python=$(type -P python3) || real_python=''
+real_perl=$(type -P perl) || real_perl=''
+command() {
+    if [ "${FUNCNAME[1]:-}" = config_target_is_hardlink_aliased ] && [ "${1:-}" = -v ]; then
+        case "$backend:${2:-}" in
+            python:python3|perl:perl|broken-python:*|failing:*|noop:*|malformed:*|nonzero-safe:*|unsafe-first:*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    builtin command "$@"
+}
+metadata_helper() {
+    local helper="$1" executable=''
+    shift
+    if [ "${FUNCNAME[2]:-}" = config_target_is_hardlink_aliased ]; then
+        printf '%s:%s\n' "$stage" "$helper" >> "$root/providers"
+        if ( : <&7 ) 2>/dev/null || ( : <&8 ) 2>/dev/null; then
+            printf 'leaked\n' > "$root/helper-fd-leak"
+            return 96
+        fi
+        case "$backend:$helper" in
+            failing:*|broken-python:python3) return 71 ;;
+            noop:*) return 0 ;;
+            malformed:*) printf 'safe\nextra\n'; return 0 ;;
+            nonzero-safe:*) printf 'safe\n'; return 71 ;;
+            unsafe-first:perl) printf 'safe\n'; return 0 ;;
+        esac
+    fi
+    case "$helper" in python3) executable="$real_python" ;; perl) executable="$real_perl" ;; esac
+    [ -n "$executable" ] || return 127
+    "$executable" "$@"
+}
+python3() { metadata_helper python3 "$@"; }
+perl() { metadata_helper perl "$@"; }
+# Other client kinds and service discovery are outside this admission seam.
+detect_mcp_configs() { return 0; }
+desired_mcp_http_url() { printf 'http://127.0.0.1:8765/mcp/'; }
+printf 'before\nafter\n' > "$root/fd3-sentinel"
+exec 3< "$root/fd3-sentinel"
+exec 7< "$root"; exec 8< "$root"
+cd "$root/project"
+stage=direct
+rc=0
+config_target_is_hardlink_aliased "$target" || rc=$?
+printf '%s\n' "$rc" > "$root/guard-status"
+IFS= read -r witness <&3
+[ "$witness" = before ] || exit 95
+if [ "$mode" != device ]; then
+    containment=0
+    path_resolves_within_directory "$target" "$PWD" || containment=$?
+    printf '%s\n' "$containment" > "$root/containment-status"
+    stage=caller
+    setup_mcp_configs /unused/mcp-agent-mail
+fi
+IFS= read -r witness <&3
+[ "$witness" = after ] || exit 95
+: <&7; : <&8
+PROBE
+
+config_guard_cases=0
+if python3 - "$config_guard_probe" "$unit_library" "$scratch/config-guard" "$ARTIFACT_DIR" "$BASH" <<'PY'
+import errno
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+
+probe, library, scratch, artifacts, bash = sys.argv[1:]
+completed = 0
+unavailable = []
+cases = []
+for backend, executable, providers in (("python", "python3", ["python3"]),
+        ("perl", "perl", ["perl"]), ("broken-python", "perl", ["python3", "perl"])):
+    if shutil.which(executable) is None:
+        unavailable.append(backend)
+        continue
+    for mode in ("regular", "absent", "hardlink", "symlink", "dangling", "loop", "directory", "fifo",
+                 "missing-parent", "parent-file", "symlink-parent", "dangling-parent", "loop-parent", "device"):
+        cases.append((backend, mode, providers, mode in ("regular", "absent")))
+for backend, mode in (("missing", "regular"), ("failing", "hardlink"), ("noop", "regular"),
+                      ("malformed", "regular"), ("nonzero-safe", "hardlink"), ("unsafe-first", "hardlink")):
+    providers = [] if backend == "missing" else ["python3"] if backend == "unsafe-first" else ["python3", "perl"]
+    cases.append((backend, mode, providers, False))
+
+def snapshot(path):
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        assert error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP), error
+        return ("error", error.errno)
+    content = path.read_bytes() if stat.S_ISREG(metadata.st_mode) else (
+        os.readlink(path) if stat.S_ISLNK(metadata.st_mode) else None)
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink, content)
+
+for delivery in ("file", "stdin"):
+    for backend, mode, providers, admitted in cases:
+        root = Path(scratch) / (backend + "-" + mode + "-" + delivery)
+        for directory in (root / "project", root / "bin"):
+            directory.mkdir(parents=True)
+        home = root / "home"
+        if mode == "parent-file":
+            home.write_bytes(b"parent is a regular file\n")
+        elif mode == "symlink-parent":
+            (root / "real-home").mkdir()
+            home.symlink_to(root / "real-home", target_is_directory=True)
+        elif mode in ("dangling-parent", "loop-parent"):
+            home.symlink_to(home if mode == "loop-parent" else root / "missing-home")
+        elif mode != "missing-parent":
+            home.mkdir()
+        target = Path("/dev/null") if mode == "device" else home / ".claude.json"
+        victim = root / ("outside.json" if mode == "symlink" else "project/protected.json")
+        victim.write_bytes(b'{"preserve":"original bytes"}\n')
+        if mode == "regular":
+            target.write_bytes(b'{"preserve":"client bytes"}\n')
+        elif mode == "hardlink":
+            os.link(victim, target)
+        elif mode in ("symlink", "dangling", "loop"):
+            target.symlink_to(victim if mode == "symlink" else target if mode == "loop" else root / "absent-victim")
+        elif mode == "directory":
+            target.mkdir()
+        elif mode == "fifo":
+            os.mkfifo(target, 0o600)
+        before = (snapshot(target), snapshot(home), snapshot(victim))
+        cli = root / "bin/claude"
+        cli.write_text("#!" + bash + r'''
+if ( : <&7 ) 2>/dev/null || ( : <&8 ) 2>/dev/null; then
+    printf 'leaked\n' > "$CLAUDE_GUARD_ROOT/cli-fd-leak"
+    exit 96
+fi
+[ "${1:-}" = mcp ] || exit 97
+printf '%s\n' "${2:-}" >> "$CLAUDE_GUARD_ROOT/cli-calls"
+if [ "${2:-}" = add ]; then
+    printf 'admitted\n' > "$CLAUDE_GUARD_ROOT/cli-write"
+fi
+exit 0
+''')
+        cli.chmod(0o700)
+        log_path = Path(artifacts) / ("config-guard-" + root.name + ".log")
+        args = [bash] + ([probe] if delivery == "file" else ["-s", "--"])
+        args += [str(root), backend, mode, str(target), library]
+        with log_path.open("wb") as log:
+            result = subprocess.run(args, input=Path(probe).read_bytes() if delivery == "stdin" else b"",
+                                    stdout=log, stderr=subprocess.STDOUT, timeout=15,
+                                    env=dict(os.environ, HOME=str(home), CLAUDE_GUARD_ROOT=str(root),
+                                             PATH=str(root / "bin") + os.pathsep + os.environ["PATH"]))
+        assert result.returncode == 0, log_path.read_text(errors="replace")
+        assert int((root / "guard-status").read_text()) == int(admitted), (backend, mode)
+        assert not (root / "helper-fd-leak").exists() and not (root / "cli-fd-leak").exists()
+        expected_providers = ["direct:" + provider for provider in providers]
+        if mode != "device" and (root / "containment-status").read_text().strip() == "1":
+            expected_providers += ["caller:" + provider for provider in providers]
+        actual_providers = (root / "providers").read_text().splitlines() if (root / "providers").exists() else []
+        assert actual_providers == expected_providers, (backend, mode, actual_providers)
+        calls = (root / "cli-calls").read_text().splitlines() if (root / "cli-calls").exists() else []
+        assert calls == (["remove", "add"] if admitted else []), (backend, mode, calls)
+        assert (root / "cli-write").exists() == admitted
+        assert (snapshot(target), snapshot(home), snapshot(victim)) == before, "admission changed protected bytes or object identity"
+        completed += 1
+        print("config-guard", backend, mode, delivery, "metadata, writer admission, and descriptor lifetime verified")
+print(f"Config guard cases: {completed} passed; unavailable providers: {','.join(unavailable) or 'none'}")
+Path(artifacts, "config-guard-count").write_text(str(completed))
+PY
+then
+    config_guard_cases=$(cat "$ARTIFACT_DIR/config-guard-count")
+else
+    failures=$((failures + 1))
+fi
+
 # Native commands can start processes that outlive the installer. Exercise the
 # real launch functions with harmless executables that inspect their inherited
 # descriptors and independently test the parent's two kernel locks. Service
@@ -1454,7 +1639,7 @@ else
     failures=$((failures + 1))
 fi
 
-printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s identity cases, %s kernel cases, %s capture cases, %s native cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$identity_cases" "$kernel_cases" "$capture_cases" "$native_cases" "$failures"
+printf 'Installer boundary regressions: %s exit cases, %s lock cases, %s destination cases, %s identity cases, %s kernel cases, %s capture cases, %s config guard cases, %s native cases, %s failure(s)\n' "$unit_cases" "$lock_cases" "$destination_cases" "$identity_cases" "$kernel_cases" "$capture_cases" "$config_guard_cases" "$native_cases" "$failures"
 if [ "${1:-}" = --unit ]; then
     [ "$failures" -eq 0 ]
     exit $?

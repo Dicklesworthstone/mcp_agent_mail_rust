@@ -7070,28 +7070,55 @@ PY
 # cannot be established.
 config_target_is_hardlink_aliased() {
   local path="$1"
+  local verdict=""
   [ -n "$path" ] || return 0
-  if [ ! -e "$path" ]; then
-    return 1
-  fi
-  command -v python3 >/dev/null 2>&1 || return 0
-  if python3 - "$path" <<'PY'
+  # Only a successful, explicit admission from a native metadata provider may
+  # authorize the external writer. `test -e` cannot distinguish an absent leaf
+  # from a dangling symlink, and interpreter errors are not safe verdicts.
+  if command -v python3 >/dev/null 2>&1 && \
+     verdict=$(python3 - "$path" 7<&- 8<&- 2>/dev/null <<'PY'
+import errno
 import os
 import stat
 import sys
 
+path = sys.argv[1]
+safe = False
 try:
-    metadata = os.lstat(sys.argv[1])
-except OSError:
-    raise SystemExit(1)
-if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
-    raise SystemExit(0)
-raise SystemExit(1)
+    metadata = os.lstat(path)
+except OSError as error:
+    if error.errno == errno.ENOENT:
+        # A fresh leaf is writable only beneath a known real parent. Missing
+        # or symlink parents require native setup to establish their authority.
+        try:
+            parent = os.lstat(os.path.dirname(path) or ".")
+            safe = stat.S_ISDIR(parent.st_mode)
+        except OSError:
+            pass
+else:
+    safe = stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+print("safe" if safe else "unsafe")
 PY
+  )
   then
-    return 0
+    case "$verdict" in safe) return 1 ;; unsafe) return 0 ;; esac
   fi
-  return 1
+  if command -v perl >/dev/null 2>&1 && \
+     verdict=$(perl -MFcntl=:mode -MErrno=ENOENT -MFile::Basename -e '
+       my $safe = 0;
+       my @metadata = lstat($ARGV[0]);
+       if (@metadata) {
+         $safe = S_ISREG($metadata[2]) && $metadata[3] == 1;
+       } elsif ($! == ENOENT) {
+         my @parent = lstat(File::Basename::dirname($ARGV[0]));
+         $safe = @parent && S_ISDIR($parent[2]);
+       }
+       print $safe ? "safe\n" : "unsafe\n";
+     ' "$path" 7<&- 8<&- 2>/dev/null)
+  then
+    case "$verdict" in safe) return 1 ;; unsafe) return 0 ;; esac
+  fi
+  return 0
 }
 
 # The shell writers embed bearer credentials but cannot establish the native
