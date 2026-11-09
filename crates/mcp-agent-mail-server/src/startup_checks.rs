@@ -1736,7 +1736,7 @@ const STARTUP_PRIMARY_FAILURE_PRIORITY: &[&str] = &[
     "integrity",
     "port",
     "auth",
-    "http_path",
+    "http-path",
 ];
 
 fn startup_failure_priority(name: &str) -> usize {
@@ -3539,6 +3539,182 @@ mod tests {
         ]);
     }
 
+    fn persisted_startup_fixture(dir: &Path, message_count: i64) -> Config {
+        let mut config = default_config();
+        config.http_host = "127.0.0.1".into();
+        config.http_port = 0;
+        config.database_url = format!("sqlite:///{}", dir.join("storage.sqlite3").display());
+        config.storage_root = dir.join("archive");
+        config.boot_check_mode = "abort".into();
+        let archive = mcp_agent_mail_storage::ensure_archive(&config, "startup-timing")
+            .expect("initialize private Git archive");
+        std::fs::write(
+            archive.root.join("project.json"),
+            r#"{"slug":"startup-timing","human_key":"/startup-timing","created_at":0}"#,
+        )
+        .expect("project identity");
+        for name in ["BlueLake", "GreenCedar"] {
+            let agent_dir = archive.root.join("agents").join(name);
+            std::fs::create_dir_all(&agent_dir).expect("agent directory");
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                serde_json::json!({"agent_name": name, "program": "test", "model": "test"})
+                    .to_string(),
+            )
+            .expect("agent profile");
+        }
+        let messages_dir = archive.root.join("messages/2026/11");
+        std::fs::create_dir_all(&messages_dir).expect("canonical messages directory");
+
+        // Canonical SQLite only constructs the retained fixture. The measured
+        // preparation below still executes the production FrankenSQLite path.
+        let db_path = dir.join("storage.sqlite3");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("fixture database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("full base mailbox schema");
+        conn.execute_raw(
+            "BEGIN; \
+             INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (1, 'startup-timing', '/startup-timing', 0); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 0, 0), \
+                    (2, 1, 'GreenCedar', 'test', 'test', 0, 0);",
+        )
+        .expect("fixture identities");
+        let body = "retained startup timing message ".repeat(16);
+        for id in 1..=message_count {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES ({id}, 1, 1, 'Startup timing', '{body}', 1793577600000000); \
+                 INSERT INTO message_recipients (message_id, agent_id) VALUES ({id}, 2);"
+            ))
+            .expect("persist message and recipient");
+            let metadata = serde_json::json!({
+                "id": id,
+                "from": "BlueLake",
+                "to": ["GreenCedar"],
+                "subject": "Startup timing",
+                "created_ts": "2026-11-02T00:00:00Z",
+                "importance": "normal"
+            });
+            std::fs::write(
+                messages_dir.join(format!("2026-11-02T00-00-00Z__startup-timing__{id}.md")),
+                format!("---json\n{metadata}\n---\n\n{body}\n"),
+            )
+            .expect("canonical archive message");
+        }
+        conn.execute_raw("COMMIT").expect("commit retained mailbox");
+        drop(conn);
+        commit_startup_fixture_archive(&config.storage_root);
+        config
+    }
+
+    fn commit_startup_fixture_archive(root: &Path) {
+        let repo = git2::Repository::open(root).expect("open fixture Git repo");
+        let mut index = repo.index().expect("fixture index");
+        index
+            .add_all(["projects"], git2::IndexAddOption::DEFAULT, None)
+            .expect("stage retained archive");
+        index.write().expect("persist fixture index");
+        let tree_id = index.write_tree().expect("archive tree");
+        let tree = repo.find_tree(tree_id).expect("find archive tree");
+        let parent = repo
+            .head()
+            .expect("initialized archive HEAD")
+            .peel_to_commit()
+            .expect("initial archive commit");
+        let signature = git2::Signature::now("Startup Fixture", "startup@example.invalid")
+            .expect("fixture Git signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Retained startup fixture",
+            &tree,
+            &[&parent],
+        )
+        .expect("commit retained archive files");
+    }
+
+    #[test]
+    fn startup_phase_attribution_for_persisted_mailbox_sizes() {
+        const TEST: &str =
+            "startup_checks::tests::startup_phase_attribution_for_persisted_mailbox_sizes";
+        if crate::tests::run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        // This attributes the preparation window, not listener readiness or an
+        // incumbent-relative speedup. Fixture construction warms OS caches.
+        for message_count in [100_i64, 10_000] {
+            let dir = tempfile::tempdir().expect("private retained mailbox");
+            let config = persisted_startup_fixture(dir.path(), message_count);
+            let db_path = dir.path().join("storage.sqlite3");
+            let database_bytes = std::fs::metadata(&db_path).expect("fixture size").len();
+            let capture = StartupPhaseCapture::default();
+            let started = std::time::Instant::now();
+            let result = tracing::subscriber::with_default(capture.clone(), || {
+                crate::prepare_http_startup(&config)
+            });
+            let prepare_us = started.elapsed().as_micros();
+            for event in capture.0.lock().expect("phase measurements").iter() {
+                if let Some(duration_us) = event.duration_us {
+                    println!(
+                        "startup_size_attribution messages={message_count} database_bytes={database_bytes} prepare_us={prepare_us} phase={} duration_us={duration_us}",
+                        event.phase
+                    );
+                }
+            }
+            let _startup = result.expect("full retained-mail startup must succeed");
+            capture.assert_phases(&[
+                "listener-detection",
+                "backup-rotation",
+                "http-path",
+                "auth",
+                "database",
+                "db-lock",
+                "storage",
+                "integrity",
+                "fd-limit",
+                "port",
+                "archive-preflight",
+            ]);
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("runtime engine reads retained mailbox after preparation");
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS count, MAX(id) AS max_id, SUM(length(body_md)) AS body_bytes FROM messages",
+                    &[],
+                )
+                .expect("retained messages");
+            assert_eq!(rows[0].get_named::<i64>("count").unwrap(), message_count);
+            assert_eq!(rows[0].get_named::<i64>("max_id").unwrap(), message_count);
+            let body_bytes = i64::try_from("retained startup timing message ".len() * 16).unwrap();
+            assert_eq!(
+                rows[0].get_named::<i64>("body_bytes").unwrap(),
+                message_count * body_bytes
+            );
+            let recipients = conn
+                .query_sync("SELECT COUNT(*) AS count FROM message_recipients", &[])
+                .expect("retained recipients");
+            assert_eq!(
+                recipients[0].get_named::<i64>("count").unwrap(),
+                message_count
+            );
+            drop(conn);
+            let drift =
+                mcp_agent_mail_db::inspect_mailbox_archive_drift(&db_path, &config.storage_root);
+            assert_eq!(
+                drift.state,
+                mcp_agent_mail_db::MailboxArchiveDriftState::Aligned
+            );
+            assert_eq!(
+                i64::try_from(drift.archive_messages).unwrap(),
+                message_count
+            );
+        }
+    }
+
     fn sidecar_diagnosis_config(db: &Path) -> Config {
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", db.display());
@@ -4110,6 +4286,31 @@ mod tests {
         assert!(
             errors.contains("Secondary findings: 1 additional failing probe(s)."),
             "expected secondary summary in output:\n{errors}"
+        );
+
+        let report = StartupReport {
+            results: vec![
+                ProbeResult::Fail(ProbeFailure {
+                    name: "fd-limit",
+                    problem: "descriptor limit too low".into(),
+                    fix: "Raise the descriptor limit.".into(),
+                }),
+                ProbeResult::Fail(ProbeFailure {
+                    name: "http-path",
+                    problem: "HTTP path must start with '/'".into(),
+                    fix: "Use /mcp/.".into(),
+                }),
+            ],
+        };
+        assert_eq!(
+            report.primary_failure().expect("primary HTTP issue").name,
+            "http-path",
+            "the named probe priority must apply regardless of report order"
+        );
+        assert!(
+            report
+                .format_errors()
+                .contains("Primary issue: [http-path]")
         );
     }
 

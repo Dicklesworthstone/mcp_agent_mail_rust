@@ -1,5 +1,80 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 persisted startup attribution continuation — EmeraldEagle / br-asldx
+
+- [x] Verify unchanged governing-doc hashes and clean tracked baseline24b873d5;
+  reread the complete timing diff, production logging and actual startup
+  callers. Initial reread finds no further timing defect. Preserve seven peer roots.
+- [x] Read current ready work and linked .eru3j mitigation. Its healthy-verdict
+  reuse already exists; do not duplicate it or bypass the runtime-engine check.
+- [x] Reserve the existing startup source, TODO and exact tracker paths;
+  comment4213 keeps .asldx in_progress. Previous scratch logs are absent here;
+  comment4212 remains historical, not freshly available verification evidence.
+- [x] Add real persisted fixtures of100 and10000 messages with full base schema,
+  recipient rows, matching canonical archive files and a real Git commit.
+  Canonical SQLite seeds only the fixtures; actual startup uses the runtime
+  engine and original checks. Keep all fixture paths private.
+- [ ] Exercise actual prepare_http_startup, including abort-mode archive
+  preflight, and capture every phase plus total preparation time. Verify
+  message/recipient/body totals and archive parity after each preparation.
+- [ ] Run the original10 focused cases plus the new attribution case through
+  strict RCH. Keep command1800s/per-test240s and default feature/resource
+  fences; separate any compile-only preparation from executed bodies.
+- [ ] Use measured phase costs to select the next source optimization. Fixture
+  construction warms OS caches; this measures preparation, not listener
+  readiness, the original ts2 workload or an incumbent-relative speedup.
+- [x] Fresh-read the fixture and consumer twice; formatting0 and stock full-file
+  UBS0 (critical0/warning561/info296, failed modules0; baseline0/518/283).
+  No suppression or exclusion. Source startup977ba38a, unchanged server-lib64993695
+  and lock208ea862; base458c5dd6 plus the two server-file overlays binds V1.
+- [x] Deeper adjacent review catches the HTTP-path priority key typo:
+  http_path never matches the probe's http-path name. Correct the table and
+  extend the existing error-summary regression with reordered fd-limit/path
+  failures, preserving its original database-root-cause assertions.
+  Final formatted sourcea9d49efc passes fmt0/UBS0 (critical0/warning563/info297,
+  failed modules0) and all-targets0/138.3s on vmi1227854, overlay9b21c21bdcb86a638246f36cd5cd9b540a8a8e691a7bbf337ecd79b7d7f4d880.
+  Earlier977ba38a passes remain intermediate. Native selection adds the error-summary
+  case to the original10 plus attribution case:12 bodies expected.
+- [x] Review catches new fixture process-state isolation: prepare_http_startup
+  installs global startup state, so private paths alone do not isolate parallel
+  cargo test. Reuse the existing prepared-startup child runner from the sibling
+  test module, with its original exact-one-test assertion; preserve successful
+  child stderr too. Final V4 startup5e2c4458/libf4eab0ff/lock208ea862, fmt0.
+  These final bytes require their own gates; V3 production0/574.8s and
+  all-targets0/138.3s remain intermediate. V4 native compile preparation is
+  submitted on the now-finished production worker; all-targets submitted on
+  the other finished worker, with all original resource fences unchanged.
+- [x] V4 full two-file UBS0: critical0/warning3990/info2093, failed modules0;
+  formatting0, production lib/bins0/134.1s and all-targets0/545.8s on vmi1152480,
+  all at overlay27e62a27db18036a39c36b5ea6a973281fff695d0d8c4c5d85e30d7d8c14bf38.
+  The receipt tree33bc7029 is the base tree, not a merged-overlay tree.
+- [ ] Final strict Clippy: initial vmi1293453 scheduler refusal103 requires37GiB
+  but reports26GiB free. Submit the unchanged command to the finished V4
+  compiler worker. No guard/config/resource changes or local fallback.
+- [ ] V4 native bodies remain0: compile preparation on vmi1152480 refuses120
+  at disk admission; actual normal1800s run on hz4 refuses120 before Cargo
+  because the disk monitor cannot complete its probe. started:false/growth0;
+  its free_bytes:0 is an unavailable-probe sentinel, not measured free space.
+  Preserve30GiB growth/10GiB floor and240s per-test limits. No more unchanged
+  native attempts or claims of measured phase costs in this work block.
+- [ ] Complete required all-targets/production/strict-Clippy compiler gates.
+  Initial native hz4 and all-targets vmi1153651 requests refuse120 before Cargo
+  at protected disk admission, started:false/growth0. Keep both receipts.
+  Production queue expires103 with no execution. Strict Clippy0/730.4s on
+  vmi1227854 binds overlay512013d11979a2fa13a3a8a2e2eb1f0753af15a30443ef9489fc089e6dd5cb83.
+  V1 all-targets runs on that worker. Separate hz2 native compile preparation
+  also queue-expires103 without Cargo/bodies. Keep14400s preparation deadlines
+  distinct from actual1800s/per-test240s; no unchanged placement retry.
+  V1 all-targets finishes0/250.0s. Final V3 Clippy refuses120 at protected disk
+  admission; final production is actually compiling on vmi1152480. Keep the
+  final-byte all-targets pass separate from the earlier-source Clippy pass.
+- [ ] Record terminal source-bound results on the original Bead; flush and
+  verify matching unique tracker records and no cycles. Publish normally and
+  release only owned reservations; record actual outcomes at handoff.
+- [ ] Remaining original acceptance: safely bounded size-proportional work
+  and the original two-size/control readiness benchmark. No closure on an
+  attribution fixture, selected tests or compiler receipts.
+
 ## November 9 startup latency attribution — EmeraldEagle / br-asldx
 
 - [x] Verify governing-doc hashes, current diff and ready Beads. Do not

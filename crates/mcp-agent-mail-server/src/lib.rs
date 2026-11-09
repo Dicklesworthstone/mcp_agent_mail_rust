@@ -20484,7 +20484,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("primary after refusal"), before);
     }
 
-    fn run_prepared_http_test_in_child(test_name: &str) -> bool {
+    pub fn run_prepared_http_test_in_child(test_name: &str) -> bool {
         const CHILD_TEST: &str = "AM_PREPARED_HTTP_STARTUP_TEST_CHILD";
         if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
             return false;
@@ -20522,6 +20522,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
         true
     }
 
