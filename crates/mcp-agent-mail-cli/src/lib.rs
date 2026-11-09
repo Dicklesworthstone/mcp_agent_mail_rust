@@ -105282,26 +105282,36 @@ fn sqlite_message_stats(path: &Path) -> (i64, i64) {
 }
 
 #[cfg(test)]
-fn try_generate_age_recipient(dir: &Path) -> Option<String> {
+fn generate_age_recipient(dir: &Path) -> String {
     let identity_path = dir.join("age_identity.txt");
     let output = std::process::Command::new("age-keygen")
         .arg("-o")
         .arg(&identity_path)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        .expect("encrypted-export test requires real age-keygen in PATH");
+    assert!(
+        output.status.success(),
+        "age-keygen fixture creation failed: {}",
+        output.status
     );
-    combined
-        .lines()
-        .find(|line| line.contains("public key:"))
-        .and_then(|line| line.split_whitespace().last())
-        .map(str::to_string)
+    let output = std::process::Command::new("age-keygen")
+        .arg("-y")
+        .arg(&identity_path)
+        .output()
+        .expect("run age-keygen to derive the fixture's public recipient");
+    assert!(
+        output.status.success(),
+        "age-keygen public recipient derivation failed: {}",
+        output.status
+    );
+    let recipient = String::from_utf8(output.stdout).expect("age-keygen recipient must be UTF-8");
+    let recipient = recipient.trim();
+    assert!(
+        recipient.starts_with("age1"),
+        "age-keygen did not produce an age recipient"
+    );
+    eprintln!("encrypted-export prerequisites: real age-keygen fixture and recipient created");
+    recipient.to_owned()
 }
 
 #[test]
@@ -105441,20 +105451,27 @@ fn run_share_export_reports_encrypted_archive_as_final_output() {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
 
-    if std::process::Command::new("age")
+    let age_version = std::process::Command::new("age")
         .arg("--version")
         .output()
-        .is_err()
-    {
-        eprintln!("Skipping: age CLI not available");
-        return;
-    }
+        .expect("encrypted-export test requires real age in PATH");
+    assert!(
+        age_version.status.success(),
+        "age --version failed: {}",
+        age_version.status
+    );
+    let version = if age_version.stdout.is_empty() {
+        &age_version.stderr
+    } else {
+        &age_version.stdout
+    };
+    eprintln!(
+        "encrypted-export prerequisites: age {}",
+        String::from_utf8_lossy(version).trim()
+    );
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let Some(recipient) = try_generate_age_recipient(temp.path()) else {
-        eprintln!("Skipping: age-keygen not available");
-        return;
-    };
+    let recipient = generate_age_recipient(temp.path());
 
     let source_db = temp.path().join("share-export-source.sqlite3");
     let storage_root = temp.path().join("storage");
