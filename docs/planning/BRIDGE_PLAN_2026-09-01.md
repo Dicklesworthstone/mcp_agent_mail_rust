@@ -1,5 +1,74 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 source-container dependency closure — EmeraldEagle
+
+Continue the highest-ranked ready `br-ku0kl`; preserve its full acceptance.
+
+- [x] Fresh-read latest diagnostic/test changes; no additional bug found there.
+  Inspect ready Beads and actual dependency consumers before choosing work.
+- [x] Trace installed DSR quality to its registry reader: actual MCP dry-run
+  refuses4 with zero checks, while checks in repos.d are not consumed. Keep
+  actual publisher enforcement open; this discovery does not identify the
+  maintainer's publication machine or prove a release transition.
+- [x] Claim .ku0kl and reserve Dockerfile, workflow, existing regression tests,
+  TODO and exact tracker paths. Current Cargo sources use no sibling checkout.
+- [x] Remove both unused source-container sibling fetches and stale workflow
+  inputs. Use locked Cargo builds; preserve the existing missing-path refusal.
+- [x] Fresh review catches unnecessary duplication: remove the Docker pin,
+  Python validator and added Python dependency. Cargo.toml/Cargo.lock already
+  select dependencies. Retain all intermediate controls and the reproduced
+  ASCII-locale failure in scratch evidence; they do not qualify the final code.
+- [x] Replace the obsolete must-clone assertion with actual offline Cargo
+  metadata inspection of workspace declarations against dist's immutable pin.
+  This inspects declarations, not a resolved transitive graph. Extend the
+  existing container contract guard with locked-build and obsolete-input
+  requirements, including causal mutations dropping --locked or adding an ARG.
+- [x] actionlint1.7.12 passes0 on unchanged workflowb4e7b12c. Existing shell
+  path guard passes valid metadata and refuses a missing-sibling fixture.
+  Read-only containers and every failed/intermediate receipt are retained.
+  No complete Rust image build or image publication is claimed.
+- [x] Final formatting, BuildKit check (no warnings), all-targets0 (42.9s),
+  production lib/bins0 (17.4s), strict Clippy0 (64.4s). Compiler commands run
+  through strict RCH on vmi1153651/hz3/vmi1227854 respectively, against exact
+  final overlayf3ddaa878158cbdfeab2bef99bbb89b1545aa565fe58317c432d2725d7c79bd0.
+  Final full-file UBS remains red1: critical3/warning45/info112, failed modules0.
+  Critical rule/message multiset equals baseline; no suppressions or weakened
+  test assertions. This is not a clean scanner gate or project-wide pass.
+- [ ] Execute the complete existing docs_drift_ci native gate. Compiler
+  preparation/blocked admission are not executed tests.
+  Initial-source all-targets/production/Clippy finish0 at overlay16a35ef6;
+  native preparation finishes0 but executes no bodies. Intermediate V2
+  all-targets/production finish0; Clippy refuses120 before Cargo. Initial
+  Clippy hz2 attempt queues out103. Formatting corrections during first V3
+  admission cause three fail-closed103 refusals; those are not executions.
+  Both final-source native attempts refuse120 at disk admission, started:false,
+  growth0. Native body count0, no fixture/control credit. Preserve actual-run
+  build/test1800s, per-test240s, growth30GiB/floor10GiB; no placement experiments,
+  resource reductions, local fallback or cleanup. Final Docker6d3b95a9/testf6a29970,
+  workflowb4e7b12c, unchanged lock208ea862.
+  Source basee7ffb20f plus Docker/workflow/test overlays only. Evidence
+  `/data/tmp/am-dsr-quality-20261109.peMouTLD/`. A shared process committed
+  intermediate implementation da2da72d during validation; do not attribute
+  that Git operation here. Final source deliberately removes its redundant
+  validator. Intermediate pre-format production0 (490.2s, overlay6b427ee2)
+  remains separate from the final-byte production result above.
+- [x] Fresh-read the complete final diff twice, preserve source identities and
+  failed attempts; keep source patch byte-identical through final checks.
+- [x] Record terminal evidence as owned comments4206/4207 on .ku0kl and4205
+  on .nq2kb. Both stores match2867 unique records and cycles0; only the .ku0kl
+  claim/status/comments and .nq2kb comments changed. No closures or graph edits.
+- [ ] Publish the reviewable source/tracker patch. Own commit is
+  held by suite/repository UBS Golden Rule: scan1 requires fix/re-run, so the
+  three unchanged deliberate test-failure panics need an explicit narrow
+  exception before committing. Do not modify them just to green the scanner.
+  Exact owned leases are released at handoff; preserve seven untracked peer roots.
+- [ ] Original source-installer/DSR/every-platform/native and publication
+  obligations remain open until their actual named probes pass.
+  dist.yml still fetches three siblings, including Beads explicitly retained
+  for installer receipts; install.sh still clones/records those unused sources.
+  This cross-path contract needs real source-install/receipt coverage before
+  changing it; Docker-only validation does not close it.
+
 ## November 9 native encrypted-export prerequisite — EmeraldEagle
 
 Continue original `br-qpacg` part2; no new issue or configuration switch.

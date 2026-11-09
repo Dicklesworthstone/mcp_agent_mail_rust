@@ -114,8 +114,22 @@ mod container_release_contract {
             "if printf '%s' \"${AM_REF}\" | grep -Eq '^[0-9a-f]{40}$'; then",
             "git fetch --depth 1 origin \"${AM_REF}\";",
             "git checkout -q FETCH_HEAD;",
+            "    cargo build --release --locked \\\n",
         ] {
             require_exactly_once(source_dockerfile, needle)?;
+        }
+        for obsolete in [
+            "SIBLING_REF",
+            "FRANKENSEARCH_COMMIT",
+            "/build/frankensearch-rel-0332",
+            "/build/beads_rust",
+        ] {
+            if source_dockerfile.contains(obsolete) {
+                return Err(format!("obsolete container dependency input: {obsolete}"));
+            }
+        }
+        if workflow.contains("sibling_ref") {
+            return Err("obsolete sibling_ref workflow input remains".to_string());
         }
 
         let release_instructions = release_dockerfile
@@ -144,8 +158,7 @@ mod container_release_contract {
 
     /// Extract the value assigned on the first line starting with `prefix`.
     ///
-    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a
-    /// workflow or `ARG FRANKENSEARCH_COMMIT=<sha>` in a Dockerfile.
+    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a workflow.
     fn assigned_value<'a>(text: &'a str, prefix: &str, separator: char) -> Option<&'a str> {
         text.lines().map(str::trim).find_map(|line| {
             line.strip_prefix(prefix)
@@ -154,111 +167,56 @@ mod container_release_contract {
         })
     }
 
-    /// The source Dockerfile must build against the frankensearch revision
-    /// dist.yml pins.
-    ///
-    /// Cargo must consume the declared pin. An unused sibling clone does not
-    /// bind the manifest or lockfile to that revision.
+    /// Check Cargo's actual workspace declarations against the release pin.
+    /// The source container consumes these declarations with `--locked`.
     #[test]
-    fn source_dockerfile_pins_frankensearch_to_the_dist_commit() {
+    fn cargo_frankensearch_declarations_match_the_dist_commit() {
         let dist = read(".github/workflows/dist.yml");
-        let dockerfile = read("Dockerfile");
-
         let dist_commit = assigned_value(&dist, "FRANKENSEARCH_COMMIT", ':')
             .expect("dist.yml declares FRANKENSEARCH_COMMIT");
-        let dockerfile_commit = assigned_value(&dockerfile, "ARG FRANKENSEARCH_COMMIT", '=')
-            .expect("Dockerfile declares ARG FRANKENSEARCH_COMMIT");
-
         assert_eq!(dist_commit.len(), 40, "dist.yml commit must be a full SHA");
         assert!(
-            dist_commit.bytes().all(|b| b.is_ascii_hexdigit()),
-            "dist.yml commit must be hex"
+            dist_commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "dist.yml commit must be lowercase hex"
         );
-        assert_eq!(
-            dockerfile_commit, dist_commit,
-            "Dockerfile ARG FRANKENSEARCH_COMMIT drifted from dist.yml"
-        );
-        assert!(!dockerfile.contains("/build/frankensearch-rel-0332"));
-        assert!(!dockerfile.contains("/build/beads_rust"));
-        assert!(dockerfile.contains("cargo build --release --locked"));
-
-        // Real metadata and the actual Docker RUN body, without any siblings.
-        let temp = tempfile::tempdir().expect("metadata fixture");
-        let root = temp.path();
-        let manifest = read("Cargo.toml");
-        let lock = read("Cargo.lock");
-        fs::write(root.join("Cargo.toml"), &manifest).expect("write real manifest");
-        fs::write(root.join("Cargo.lock"), &lock).expect("write real lockfile");
-        let result = run_source_dependency_preflight(&dockerfile, root, dist_commit);
+        let result = std::process::Command::new("cargo")
+            .args([
+                "metadata",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+                "--no-deps",
+            ])
+            .current_dir(workspace_root())
+            .output()
+            .expect("Cargo must be available for workspace dependency inspection");
         assert!(
             result.status.success(),
-            "valid source metadata rejected: {}",
+            "Cargo metadata failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-
-        let wrong_pin = "0".repeat(40);
-        assert_ne!(dist_commit, wrong_pin);
-        assert_source_dependency_refusal(&dockerfile, root, &wrong_pin, "Cargo.toml");
-        assert_source_dependency_refusal(&dockerfile, root, "short", "full lowercase Git SHA");
-
-        let changed = manifest.replacen(
-            &format!("rev = \"{dist_commit}\""),
-            &format!("rev = \"{wrong_pin}\""),
-            1,
-        );
-        assert_ne!(changed, manifest, "manifest mutation must apply");
-        fs::write(root.join("Cargo.toml"), changed).expect("change manifest pin");
-        assert_source_dependency_refusal(&dockerfile, root, dist_commit, "Cargo.toml");
-        fs::write(root.join("Cargo.toml"), &manifest).expect("restore manifest fixture");
-
-        let old_source = format!("?rev={dist_commit}#{dist_commit}");
-        let wrong_source = format!("?rev={wrong_pin}#{wrong_pin}");
-        let changed = lock.replacen(&old_source, &wrong_source, 1);
-        assert_ne!(changed, lock, "lockfile mutation must apply");
-        fs::write(root.join("Cargo.lock"), changed).expect("change lock pin");
-        assert_source_dependency_refusal(&dockerfile, root, dist_commit, "Cargo.lock");
-
-        let (before, quill) = lock
-            .split_once("name = \"frankensearch-quill\"")
-            .expect("real lockfile includes transitive quill");
-        let changed = quill.replacen(&old_source, &wrong_source, 1);
-        assert_ne!(changed, quill, "transitive lock mutation must apply");
-        fs::write(
-            root.join("Cargo.lock"),
-            format!("{before}name = \"frankensearch-quill\"{changed}"),
-        )
-        .expect("change transitive pin");
-        assert_source_dependency_refusal(&dockerfile, root, dist_commit, "frankensearch-quill");
-        fs::write(root.join("Cargo.lock"), &lock).expect("restore lock fixture");
-        let result = run_source_dependency_preflight(&dockerfile, root, dist_commit);
-        assert!(result.status.success(), "restored metadata must pass");
-    }
-
-    fn run_source_dependency_preflight(
-        dockerfile: &str,
-        root: &Path,
-        pin: &str,
-    ) -> std::process::Output {
-        let script = dockerfile
-            .split_once("RUN python3 - \"$FRANKENSEARCH_COMMIT\" <<'PY'\n")
-            .and_then(|(_, rest)| rest.split_once("\nPY\n"))
-            .map(|(script, _)| script)
-            .expect("Dockerfile must execute the dependency preflight before Cargo");
-        std::process::Command::new("python3")
-            .args(["-c", script, pin])
-            .current_dir(root)
-            .output()
-            .expect("real Python 3.11+ is required for the container metadata preflight")
-    }
-
-    fn assert_source_dependency_refusal(dockerfile: &str, root: &Path, pin: &str, diagnostic: &str) {
-        let result = run_source_dependency_preflight(dockerfile, root, pin);
-        assert!(!result.status.success(), "invalid metadata must fail");
-        assert!(
-            String::from_utf8_lossy(&result.stderr).contains(diagnostic),
-            "expected {diagnostic:?}, got {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&result.stdout).expect("Cargo emits valid metadata JSON");
+        let expected =
+            format!("git+https://github.com/Dicklesworthstone/frankensearch?rev={dist_commit}");
+        let mut declarations = 0;
+        for package in metadata["packages"].as_array().expect("workspace packages") {
+            for dependency in package["dependencies"].as_array().expect("dependencies") {
+                let name = dependency["name"].as_str().expect("dependency name");
+                if name == "frankensearch" || name.starts_with("frankensearch-") {
+                    assert_eq!(
+                        dependency["source"].as_str(),
+                        Some(expected.as_str()),
+                        "Cargo declaration for {name} drifted from dist.yml"
+                    );
+                    declarations += 1;
+                }
+            }
+        }
+        assert!(declarations > 0, "no FrankenSearch declarations inspected");
     }
 
     #[test]
@@ -372,16 +330,25 @@ mod container_release_contract {
             );
         }
 
-        let source_dockerfile_mutation =
-            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1);
-        assert_ne!(
-            source_dockerfile_mutation, source_dockerfile,
-            "source Dockerfile mutation anchor must exist"
-        );
-        assert!(
-            validate(&workflow, &release_dockerfile, &source_dockerfile_mutation).is_err(),
-            "source Dockerfile checkout mutation unexpectedly passed"
-        );
+        let source_dockerfile_mutations = [
+            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1),
+            source_dockerfile.replacen(
+                "cargo build --release --locked",
+                "cargo build --release",
+                1,
+            ),
+            format!("{source_dockerfile}\nARG SIBLING_REF=main\n"),
+        ];
+        for mutation in source_dockerfile_mutations {
+            assert_ne!(
+                mutation, source_dockerfile,
+                "source Dockerfile mutation anchor must exist"
+            );
+            assert!(
+                validate(&workflow, &release_dockerfile, &mutation).is_err(),
+                "source Dockerfile contract mutation unexpectedly passed"
+            );
+        }
     }
 }
 

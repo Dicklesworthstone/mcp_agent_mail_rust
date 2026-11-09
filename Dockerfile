@@ -9,12 +9,6 @@
 # ---------------
 #   AM_REF       Git ref of mcp_agent_mail_rust to build (default: main).
 #                Pass a tag, branch, or commit SHA.
-#   FRANKENSEARCH_COMMIT
-#                Immutable frankensearch revision this workspace builds
-#                against. Cargo and container builds must use the same
-#                reviewed source, so its default here must stay identical to
-#                `FRANKENSEARCH_COMMIT` in .github/workflows/dist.yml
-#                (tests/docs_drift_ci.rs pins the two together).
 #
 # Examples
 # --------
@@ -23,8 +17,6 @@
 #
 #   # Build the exact current source commit:
 #   docker build --build-arg AM_REF="$(git rev-parse HEAD)" -t mcp-agent-mail-rust:dev .
-#
-# For another ref, pass its matching FRANKENSEARCH_COMMIT from Cargo.toml.
 #
 # Runtime
 # -------
@@ -58,7 +50,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         clang \
         libssl-dev \
-        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf \
@@ -69,8 +60,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf \
 WORKDIR /build
 
 ARG AM_REF=main
-# Keep in lock-step with FRANKENSEARCH_COMMIT in .github/workflows/dist.yml.
-ARG FRANKENSEARCH_COMMIT=616c9a7a6bdada97d81f760808996911ba3be294
 
 # Clone the requested source independently of the local working tree. Full
 # commit SHAs pin the project source; Cargo.lock binds dependency selection.
@@ -89,41 +78,6 @@ RUN set -eu; \
     fi
 
 WORKDIR /build/mcp_agent_mail_rust
-
-# The declared container pin must identify the dependencies Cargo will use.
-# An unused sibling clone cannot establish that agreement.
-RUN python3 - "$FRANKENSEARCH_COMMIT" <<'PY'
-import pathlib
-import re
-import sys
-import tomllib
-
-pin = sys.argv[1]
-if not re.fullmatch(r"[0-9a-f]{40}", pin):
-    sys.exit("FRANKENSEARCH_COMMIT must be one full lowercase Git SHA")
-repo = "https://github.com/Dicklesworthstone/frankensearch"
-manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-lock = tomllib.loads(pathlib.Path("Cargo.lock").read_text())
-dependencies = {
-    name: value for name, value in manifest["workspace"]["dependencies"].items()
-    if name == "frankensearch" or name.startswith("frankensearch-")
-}
-if "frankensearch" not in dependencies:
-    sys.exit("Cargo.toml has no frankensearch dependency to validate")
-source = f"git+{repo}?rev={pin}#{pin}"
-for name, dependency in dependencies.items():
-    if (not isinstance(dependency, dict) or dependency.get("git") != repo
-            or dependency.get("rev") != pin or "path" in dependency):
-        sys.exit(f"Cargo.toml {name} does not use FRANKENSEARCH_COMMIT")
-    package = dependency.get("package", name)
-    matches = [entry for entry in lock["package"] if entry["name"] == package]
-    if len(matches) != 1 or matches[0].get("source") != source:
-        sys.exit(f"Cargo.lock {package} does not use FRANKENSEARCH_COMMIT")
-for entry in lock["package"]:
-    if (entry["name"] == "frankensearch" or entry["name"].startswith("frankensearch-")) and entry.get("source") != source:
-        sys.exit(f"Cargo.lock {entry['name']} uses another frankensearch revision")
-print(f"+ Cargo.toml and Cargo.lock agree on frankensearch {pin}")
-PY
 
 # GH#256 drift guard: reject missing out-of-tree paths before Cargo starts.
 # Otherwise the failure mode is cargo dying deep into the build
