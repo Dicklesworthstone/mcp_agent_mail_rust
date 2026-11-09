@@ -81,6 +81,14 @@ which overrides the working-directory `.env`.
 instead of killing the existing server. If you expect auth to be enabled, drop
 `--no-auth` and make sure `HTTP_BEARER_TOKEN` resolves from your env file.
 
+For a slow headless start (`--no-tui`), use `LOG_LEVEL=info` in the launching
+environment. Look for `startup_phase_started` and `startup_phase_finished`.
+The `phase` field identifies listener detection,
+backup rotation, individual probes and archive preflight; `duration_us` records
+elapsed work. A finish event means the call returned; use the probe report to
+determine success. A start with no finish identifies an interrupted or still
+running phase. Work deferred during listener handoff has no phase events.
+
 For a slow boot-time integrity probe, `INTEGRITY_CHECK_ON_STARTUP=false` skips
 only that startup probe. The background guard remains enabled and starts its
 first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300 seconds,

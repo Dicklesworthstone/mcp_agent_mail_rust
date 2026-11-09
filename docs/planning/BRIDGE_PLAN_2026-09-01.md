@@ -11,20 +11,59 @@
   static phase and measured duration_us around real HTTP/stdio probes, listener
   detection, cold-start backup rotation and archive preflight. Finish means
   returned, not healthy. Preserve order, results, handoff skips and budgets.
-- [ ] Test elapsed work and error preservation; real cold-start probe order
+- [x] Add tests for elapsed work and error preservation; real cold-start probe order
   after a failed auth probe; listener handoff must emit no fake timings for
   deferred DB-lock/integrity/rotation work. Preserve existing assertions.
-- [ ] Fresh-read implementation and callers twice; check formatting before
-  freezing the exact source overlay. Run focused native tests under strict RCH;
-  distinguish compile preparation from actual body counts and retain failures.
-- [ ] Run both required workspace compiler graphs, strict Clippy and final
-  full-file UBS. No suppression, golden update, feature or resource relaxation.
-- [ ] Record exact results on .asldx and keep original acceptance open: this
-  attribution step does not establish constant startup cost or a speedup.
-  Mailbox-size attribution, a bounded readiness implementation and the original
-  two-size/control benchmark remain required before closing the task.
-- [ ] Synchronize source/tracker normally, verify graph consistency and release
-  only owned reservations. Evidence path is recorded with terminal results.
+- [x] Isolate the existing listener-handoff test's default mailbox paths; all
+  its original assertions remain. Add timing checks to the existing stdio case.
+- [x] Document phase fields and finish/error semantics in the existing operator
+  cookbook, before advice about skipping startup checks.
+- [x] Fresh integration review catches a new wiring error: the initial custom
+  trace target falls outside the production LOG_LEVEL crate-prefix filter,
+  and RUST_LOG alone does not override that policy. Correct the target to
+  mcp_agent_mail_server::startup, use LOG_LEVEL=info in the headless recipe,
+  and derive the test subscriber's expected target from CARGO_CRATE_NAME so
+  the original wrong target cannot pass through a permissive capture.
+  Both executable entrypoints initialize their stderr logger before probes;
+  the actual production crate-prefix filter admits the corrected INFO target.
+- [x] Fresh-read implementation and callers twice; fmt0 before freezing the
+  source overlay. A shared process commits identical source228898de while this
+  pass runs; do not attribute that Git operation here. Startup SHA8b96cef6,
+  server-lib64993695, unchanged lock208ea862; base458c5dd6 plus only those two
+  Rust file overlays bind the checks. Evidence
+  `/data/tmp/am-startup-timings-20261109.JldsIK9W/`.
+  Those first compiler/preparation requests cover the initial target and are
+  intermediate; final corrected bytes require their own compiler/native gates.
+- [x] Strict Clippy catches the new fixed-size chunks_exact call. Use
+  as_chunks::<2>() without a lint suppression; final startup SHAad3619dc,
+  server-lib64993695 and lock208ea862. Final overlay8b831e5389617721e17f7722a1884456a6544c211c1a51b0065f2ef5549754a5
+  binds base458c5dd6 plus the two Rust files. Keep the initial Clippy101 receipt.
+- [x] Final-byte all-targets0 (135.2s, vmi1153651), production lib/bins0
+  (48.4s, hz3), fmt0. Initial-source all-targets0/758.5s and production0/393.5s,
+  corrected-target pre-lint-fix production0/54.7s remain separate evidence.
+- [x] Final-source strict RCH native run0 (288.7s, hz4), same overlay8b831e53:
+  10 selected bodies pass, 5517 other server-library tests filtered out. Includes
+  six startup/timing/handoff cases and four existing archive-preflight modes.
+  This is focused regression evidence, not a full workspace or release gate.
+- [x] Final full-file UBS0: critical0/warning3945/info2079, failed modules0;
+  baseline0/3922/2072. Corrected and final-v3 scans also exit0 with the same
+  totals. No exclusions, suppression or assertion weakening.
+- [x] Final strict Clippy0 (263.4s, vmi1153651) after a vmi1227854 disk-admission
+  refusal120. The same command on the finished all-targets worker passes;
+  no guard changes. All three final compiler receipts bind overlay8b831e53.
+- [x] Initial-source native preparation finishes0 (2130.8s, hz4), zero bodies.
+  No golden, feature or resource relaxation. The actual final-source run passes
+  with the normal1800s command and240s per-test limits unchanged.
+- [x] Record exact results as comment4212 on .asldx; keep it in_progress.
+  This attribution step does not establish constant startup cost or a speedup.
+- [ ] Remaining original acceptance: mailbox-size attribution, a bounded
+  readiness implementation and the original two-size/control benchmark.
+  Do not close the task on the selected native tests or compiler receipts.
+- [x] Prepare the exact source/docs/tracker checkpoint: both JSONL stores
+  match2867 unique records, only .asldx claim/comments/timestamps changed since
+  base458c5dd6, cycles0 and whitespace0. Final source hashes still match the
+  compiler/native receipts. Normal Git publication and exact owned-lease
+  release outcomes are recorded in the retained audit and final handoff.
 
 ## November 9 fresh verification continuation — EmeraldEagle
 

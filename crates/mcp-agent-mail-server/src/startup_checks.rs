@@ -3294,7 +3294,7 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 /// A start with no finish also identifies a phase that stalls or panics.
 pub(crate) fn timed_startup_phase<T>(phase: &'static str, run: impl FnOnce() -> T) -> T {
     tracing::info!(
-        target: "mcp_agent_mail::startup",
+        target: "mcp_agent_mail_server::startup",
         phase,
         "startup_phase_started"
     );
@@ -3302,7 +3302,7 @@ pub(crate) fn timed_startup_phase<T>(phase: &'static str, run: impl FnOnce() -> 
     let result = run();
     let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     tracing::info!(
-        target: "mcp_agent_mail::startup",
+        target: "mcp_agent_mail_server::startup",
         phase,
         duration_us,
         "startup_phase_finished"
@@ -3441,7 +3441,9 @@ mod tests {
 
     impl tracing::Subscriber for StartupPhaseCapture {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.target() == "mcp_agent_mail::startup"
+            // Production enables this crate's prefix through LOG_LEVEL.
+            // Opting in an arbitrary custom target here would hide a wiring bug.
+            metadata.target() == concat!(env!("CARGO_CRATE_NAME"), "::startup")
         }
 
         fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -3467,7 +3469,7 @@ mod tests {
         fn assert_phases(&self, expected: &[&str]) {
             let events = self.0.lock().expect("startup phase events");
             assert_eq!(events.len(), 2 * expected.len(), "{events:?}");
-            for (pair, phase) in events.chunks_exact(2).zip(expected) {
+            for (pair, phase) in events.as_chunks::<2>().0.iter().zip(expected) {
                 assert_eq!(&pair[0].phase, phase);
                 assert_eq!(&pair[1].phase, phase);
                 assert!(pair[0].message.contains("startup_phase_started"));
