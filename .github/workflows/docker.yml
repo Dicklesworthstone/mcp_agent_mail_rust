@@ -8,7 +8,7 @@
 #                          Dockerfile.release. Publishes :<tag>, :latest, and
 #                          the SemVer aliases.
 #   workflow_dispatch    — non-release source build. Accepts inputs.am_ref and
-#                          inputs.sibling_ref and publishes only source-*
+#                          publishes only source-*
 #                          tags, which cannot overwrite release tags.
 #
 # The tag path never recompiles the project. The binaries in the container are
@@ -25,10 +25,6 @@ on:
     inputs:
       am_ref:
         description: 'Git ref of mcp_agent_mail_rust to build (tag, branch, or full 40-char SHA — short SHAs are not accepted by GitHub upload-pack).'
-        required: false
-        default: 'main'
-      sibling_ref:
-        description: 'Git ref for the beads_rust sibling (frankensearch is pinned by FRANKENSEARCH_COMMIT in the Dockerfile) — tag, branch, or full 40-char SHA only.'
         required: false
         default: 'main'
       tag_suffix:
@@ -67,8 +63,6 @@ jobs:
       revision: ${{ steps.refs.outputs.revision }}
       release_tag: ${{ steps.refs.outputs.release_tag }}
       am_ref: ${{ steps.refs.outputs.am_ref }}
-      sibling_ref: ${{ steps.refs.outputs.sibling_ref }}
-      sibling_fallback_ref: ${{ steps.refs.outputs.sibling_fallback_ref }}
       tag_suffix: ${{ steps.refs.outputs.tag_suffix }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
@@ -96,7 +90,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GITHUB_REF_VALUE: ${{ github.ref }}
           INPUT_AM_REF: ${{ inputs.am_ref }}
-          INPUT_SIBLING_REF: ${{ inputs.sibling_ref }}
           INPUT_TAG_SUFFIX: ${{ inputs.tag_suffix }}
           REF_NAME: ${{ github.ref_name }}
         run: |
@@ -146,7 +139,6 @@ jobs:
             # The release lane consumes published binaries; these source-build
             # refs are intentionally inert in Dockerfile.release.
             am_ref="$revision"
-            sibling_ref="$revision"
             tag_suffix=""
           else
             mode="source"
@@ -154,9 +146,8 @@ jobs:
             release_tag=""
             version="manual"
             requested_am_ref="${INPUT_AM_REF:-main}"
-            sibling_ref="${INPUT_SIBLING_REF:-main}"
             tag_suffix="${INPUT_TAG_SUFFIX:-manual}"
-            for input_ref in "$requested_am_ref" "$sibling_ref" "$tag_suffix"; do
+            for input_ref in "$requested_am_ref" "$tag_suffix"; do
               if [[ "$input_ref" == *$'\n'* || "$input_ref" == *$'\r'* ]]; then
                 echo "Manual source inputs must be single-line values" >&2
                 exit 1
@@ -219,8 +210,6 @@ jobs:
             printf 'revision=%s\n' "$revision"
             printf 'release_tag=%s\n' "$release_tag"
             printf 'am_ref=%s\n' "$am_ref"
-            printf 'sibling_ref=%s\n' "$sibling_ref"
-            printf 'sibling_fallback_ref=%s\n' "main"
             printf 'tag_suffix=%s\n' "$tag_suffix"
           } >> "$GITHUB_OUTPUT"
           {
@@ -550,8 +539,6 @@ jobs:
             AM_VERSION=${{ needs.prepare.outputs.version }}
             AM_REVISION=${{ needs.prepare.outputs.revision }}
             AM_REF=${{ needs.prepare.outputs.am_ref }}
-            SIBLING_REF=${{ needs.prepare.outputs.sibling_ref }}
-            SIBLING_FALLBACK_REF=${{ needs.prepare.outputs.sibling_fallback_ref }}
           # Max provenance records the immutable AM_REF build argument rather
           # than leaving a manual source build identified only by github.sha.
           provenance: mode=max

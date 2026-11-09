@@ -2,22 +2,13 @@
 #
 # Multi-stage Dockerfile for MCP Agent Mail (Rust).
 #
-# Mirrors the sibling-clone build pattern from .github/workflows/dist.yml.
-# The current workspace has exactly two out-of-tree path authorities:
-# frankensearch through workspace dependencies and beads_rust through
-# `[patch.crates-io]`. The build clones both as siblings of
-# /build/mcp_agent_mail_rust so Cargo resolves those paths correctly.
+# Cargo.lock and immutable Git revisions select the dependency sources.
+# No sibling checkout is required by the current workspace.
 #
 # Build arguments
 # ---------------
 #   AM_REF       Git ref of mcp_agent_mail_rust to build (default: main).
 #                Pass a tag, branch, or commit SHA.
-#   SIBLING_REF  Preferred Git ref for the beads_rust sibling (default: main).
-#                Release builds pass the release tag here first, so a sibling
-#                repo with a matching tag is pinned instead of floating.
-#   SIBLING_FALLBACK_REF
-#                Fallback ref when SIBLING_REF is a branch/tag that a sibling
-#                repo does not publish yet (default: main).
 #   FRANKENSEARCH_COMMIT
 #                Immutable frankensearch revision this workspace builds
 #                against. Cargo and container builds must use the same
@@ -30,11 +21,10 @@
 #   # Build the current tip of main:
 #   docker build -t mcp-agent-mail-rust:dev .
 #
-#   # Build a tagged release:
-#   docker build --build-arg AM_REF=v0.3.6 -t mcp-agent-mail-rust:v0.3.6 .
+#   # Build the exact current source commit:
+#   docker build --build-arg AM_REF="$(git rev-parse HEAD)" -t mcp-agent-mail-rust:dev .
 #
-#   # Build a specific commit (e.g. between releases):
-#   docker build --build-arg AM_REF=abc1234 -t mcp-agent-mail-rust:dev .
+# For another ref, pass its matching FRANKENSEARCH_COMMIT from Cargo.toml.
 #
 # Runtime
 # -------
@@ -68,99 +58,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         clang \
         libssl-dev \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+RUN curl --proto '=https' --tlsv1.2 -sSf \
+    --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain none --no-modify-path \
     && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
 
 WORKDIR /build
 
 ARG AM_REF=main
-ARG SIBLING_REF=main
-ARG SIBLING_FALLBACK_REF=main
 # Keep in lock-step with FRANKENSEARCH_COMMIT in .github/workflows/dist.yml.
 ARG FRANKENSEARCH_COMMIT=616c9a7a6bdada97d81f760808996911ba3be294
 
-# Clone the sibling checkouts that /Cargo.toml still resolves through a `path`,
-# so they're cached separately from the project source layer.
-#
-# GH#256: this list must track the out-of-tree `path` entries in /Cargo.toml and
-# nothing else. It used to clone ten repos, which is how the image went stale at
-# v0.3.13 — most of that universe moved to crates.io (asupersync, the sqlmodel
-# and fsqlite families, fastmcp, ftui, franken-agent-detection, tru, rich_rust),
-# but the clone list kept trying to satisfy patches that no longer existed while
-# the two that *do* still need a sibling failed for unrelated reasons. As of the
-# 2026-08-22 registry adoption exactly two remain:
-#
-#   frankensearch  — [workspace.dependencies] path = "../frankensearch-rel-0332/..."
-#                    (gated clone name; the pinned commit is cloned under it)
-#   beads_rust     — [patch.crates-io] path = "../beads_rust"
-#                    (registry 0.3.2 pins asupersync =0.4.4, unsatisfiable in
-#                     the =0.4.9 universe; drops out when 0.4.x publishes)
-#
-# The `sibling path deps` guard below fails the build the next time that
-# invariant breaks, naming the sibling, instead of letting cargo fail late with
-# a bare "No such file or directory (os error 2)".
-#
-# `git clone --depth 1 --branch <ref>` only accepts branch/tag names — passing
-# a commit SHA fails with "Remote branch <sha> not found in upstream origin".
-# `clone_at` detects full 40-char SHAs and falls back to init+fetch+checkout.
-# GitHub's smart-http upload-pack honors full SHAs (via
-# uploadpack.allowReachableSHA1InWant) but NOT abbreviated/short SHAs —
-# `git fetch origin abc1234` errors out with "couldn't find remote ref".
-# Pass the full 40-char SHA, a branch, or a tag; short SHAs are rejected.
-#
-# `--sparse` is a clone-only flag; the SHA path explicitly initializes
-# sparse-checkout before the fetch instead of passing it through `git fetch`
-# (which doesn't accept `--sparse`).
-#
-# `set -eu` (no `x`) keeps logs readable; per-clone `echo` provides progress.
-# Any failure aborts the build immediately rather than silently dropping a
-# dependency (same guarantee as dist.yml).
-RUN set -eu; \
-    clone_at() { \
-      url="$1"; ref="$2"; dest="$3"; shift 3; \
-      echo "+ clone_at $url @ $ref -> $dest $*"; \
-      sparse=0; \
-      pass_args=""; \
-      for arg in "$@"; do \
-        case "$arg" in \
-          --sparse) sparse=1 ;; \
-          *) pass_args="$pass_args $arg" ;; \
-        esac; \
-      done; \
-      if printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then \
-        git init -q "$dest"; \
-        ( cd "$dest" \
-          && git remote add origin "$url" \
-          && if [ "$sparse" = 1 ]; then git sparse-checkout init --no-cone; fi \
-          && git fetch --depth 1 $pass_args origin "$ref" \
-          && git checkout -q FETCH_HEAD ); \
-      else \
-        selected_ref="$ref"; \
-        if ! git ls-remote --exit-code "$url" "refs/heads/$ref" "refs/tags/$ref" >/dev/null 2>&1; then \
-          if [ -n "${SIBLING_FALLBACK_REF:-}" ] && [ "$ref" != "$SIBLING_FALLBACK_REF" ]; then \
-            echo "+ sibling ref $ref not found for $url; falling back to $SIBLING_FALLBACK_REF"; \
-            selected_ref="$SIBLING_FALLBACK_REF"; \
-          else \
-            echo "sibling ref $ref not found for $url and no fallback is available" >&2; \
-            exit 1; \
-          fi; \
-        fi; \
-        git clone --depth 1 --branch "$selected_ref" "$@" "$url" "$dest"; \
-      fi; \
-    }; \
-    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${FRANKENSEARCH_COMMIT}" /build/frankensearch-rel-0332; \
-    clone_at https://github.com/Dicklesworthstone/beads_rust.git    "${SIBLING_REF}" /build/beads_rust
-
-# Clone the project source at the requested ref. We clone (rather than COPY
-# the build context) so the image is reproducible from `docker build .` with
-# no local working tree: passing AM_REF=v0.3.6 produces the exact same image
-# from any checkout. CI passes ${{ github.sha }} for tagged releases.
-#
-# Same SHA-vs-ref handling as the sibling clones above — see the `clone_at`
-# helper for why `--branch <sha>` doesn't work and what we do instead.
+# Clone the requested source independently of the local working tree. Full
+# commit SHAs pin the project source; Cargo.lock binds dependency selection.
+# Git's --branch accepts branches/tags, so full SHAs use fetch + checkout.
 RUN set -eu; \
     if printf '%s' "${AM_REF}" | grep -Eq '^[0-9a-f]{40}$'; then \
       git init -q /build/mcp_agent_mail_rust; \
@@ -176,12 +90,47 @@ RUN set -eu; \
 
 WORKDIR /build/mcp_agent_mail_rust
 
-# GH#256 drift guard: every out-of-tree `path` in /Cargo.toml must have been
-# cloned above. Without this the failure mode is cargo dying deep into the build
+# The declared container pin must identify the dependencies Cargo will use.
+# An unused sibling clone cannot establish that agreement.
+RUN python3 - "$FRANKENSEARCH_COMMIT" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
+
+pin = sys.argv[1]
+if not re.fullmatch(r"[0-9a-f]{40}", pin):
+    sys.exit("FRANKENSEARCH_COMMIT must be one full lowercase Git SHA")
+repo = "https://github.com/Dicklesworthstone/frankensearch"
+manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+lock = tomllib.loads(pathlib.Path("Cargo.lock").read_text())
+dependencies = {
+    name: value for name, value in manifest["workspace"]["dependencies"].items()
+    if name == "frankensearch" or name.startswith("frankensearch-")
+}
+if "frankensearch" not in dependencies:
+    sys.exit("Cargo.toml has no frankensearch dependency to validate")
+source = f"git+{repo}?rev={pin}#{pin}"
+for name, dependency in dependencies.items():
+    if (not isinstance(dependency, dict) or dependency.get("git") != repo
+            or dependency.get("rev") != pin or "path" in dependency):
+        sys.exit(f"Cargo.toml {name} does not use FRANKENSEARCH_COMMIT")
+    package = dependency.get("package", name)
+    matches = [entry for entry in lock["package"] if entry["name"] == package]
+    if len(matches) != 1 or matches[0].get("source") != source:
+        sys.exit(f"Cargo.lock {package} does not use FRANKENSEARCH_COMMIT")
+for entry in lock["package"]:
+    if (entry["name"] == "frankensearch" or entry["name"].startswith("frankensearch-")) and entry.get("source") != source:
+        sys.exit(f"Cargo.lock {entry['name']} uses another frankensearch revision")
+print(f"+ Cargo.toml and Cargo.lock agree on frankensearch {pin}")
+PY
+
+# GH#256 drift guard: reject missing out-of-tree paths before Cargo starts.
+# Otherwise the failure mode is cargo dying deep into the build
 # with "failed to load source for dependency <x>: No such file or directory
 # (os error 2)", which is what kept the published image at v0.3.13 across five
 # tagged releases. Fail here instead, naming the missing sibling and the line
-# that wants it, so the fix is one clone_at away.
+# that wants it. Dependencies must resolve within this checkout or through Cargo.
 #
 # Matches `path = "../..."` anywhere in the manifest (both
 # [workspace.dependencies] and [patch.crates-io] use the same spelling), then
@@ -204,8 +153,7 @@ RUN set -eu; \
       echo "Cargo.toml declares out-of-tree path dependencies this image does not clone:" >&2; \
       printf '%s\n' "$missing" | sed 's/^/  - /' >&2; \
       echo "" >&2; \
-      echo "Add a matching clone_at line to the sibling-clone step above, or move the" >&2; \
-      echo "dependency to crates.io. See GH#256." >&2; \
+      echo "Use a registry dependency or an immutable Cargo Git revision. See GH#256." >&2; \
       exit 1; \
     fi; \
     echo "+ every out-of-tree path dependency is present"
@@ -226,7 +174,7 @@ RUN rustup show active-toolchain || rustup show
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/mcp_agent_mail_rust/target,sharing=locked \
-    cargo build --release \
+    cargo build --release --locked \
         -p mcp-agent-mail -p mcp-agent-mail-cli \
         --no-default-features --features portable \
     && mkdir -p /out \
