@@ -2,6 +2,12 @@
 
 ## November 9 persisted startup attribution continuation — EmeraldEagle / br-asldx
 
+Final V5 source passes both workspace compiler graphs, strict Clippy, formatting
+and the full two-file UBS scan. Native qualification remains open:12 cases
+selected,0 executed, no mailbox fixtures constructed and no timing measurements.
+Source changes were committed by another process asf8ee1195 (notes8034bca7);
+their file hashes match the receipts, and publication does not clear acceptance.
+
 - [x] Verify unchanged governing-doc hashes and clean tracked baseline24b873d5;
   reread the complete timing diff, production logging and actual startup
   callers. Initial reread finds no further timing defect. Preserve seven peer roots.
@@ -10,14 +16,15 @@
 - [x] Reserve the existing startup source, TODO and exact tracker paths;
   comment4213 keeps .asldx in_progress. Previous scratch logs are absent here;
   comment4212 remains historical, not freshly available verification evidence.
-- [x] Add real persisted fixtures of100 and10000 messages with full base schema,
+- [x] Author persisted fixtures of100 and10000 messages with full base schema,
   recipient rows, matching canonical archive files and a real Git commit.
   Canonical SQLite seeds only the fixtures; actual startup uses the runtime
   engine and original checks. Keep all fixture paths private.
 - [ ] Exercise actual prepare_http_startup, including abort-mode archive
   preflight, and capture every phase plus total preparation time. Verify
   message/recipient/body totals and archive parity after each preparation.
-- [ ] Run the original10 focused cases plus the new attribution case through
+- [ ] Run the original10 cases, attribution and extended error-summary case
+  (12 total) through
   strict RCH. Keep command1800s/per-test240s and default feature/resource
   fences; separate any compile-only preparation from executed bodies.
 - [ ] Use measured phase costs to select the next source optimization. Fixture
@@ -31,7 +38,7 @@
   http_path never matches the probe's http-path name. Correct the table and
   extend the existing error-summary regression with reordered fd-limit/path
   failures, preserving its original database-root-cause assertions.
-  Final formatted sourcea9d49efc passes fmt0/UBS0 (critical0/warning563/info297,
+  V3 formatted sourcea9d49efc passes fmt0/UBS0 (critical0/warning563/info297,
   failed modules0) and all-targets0/138.3s on vmi1227854, overlay9b21c21bdcb86a638246f36cd5cd9b540a8a8e691a7bbf337ecd79b7d7f4d880.
   Earlier977ba38a passes remain intermediate. Native selection adds the error-summary
   case to the original10 plus attribution case:12 bodies expected.
@@ -39,8 +46,8 @@
   installs global startup state, so private paths alone do not isolate parallel
   cargo test. Reuse the existing prepared-startup child runner from the sibling
   test module, with its original exact-one-test assertion; preserve successful
-  child stderr too. Final V4 startup5e2c4458/libf4eab0ff/lock208ea862, fmt0.
-  These final bytes require their own gates; V3 production0/574.8s and
+  child stderr too. V4 startup5e2c4458/libf4eab0ff/lock208ea862, fmt0.
+  These intermediate bytes get their own gates; V3 production0/574.8s and
   all-targets0/138.3s remain intermediate. V4 native compile preparation is
   submitted on the now-finished production worker; all-targets submitted on
   the other finished worker, with all original resource fences unchanged.
@@ -48,18 +55,19 @@
   formatting0, production lib/bins0/134.1s and all-targets0/545.8s on vmi1152480,
   all at overlay27e62a27db18036a39c36b5ea6a973281fff695d0d8c4c5d85e30d7d8c14bf38.
   The receipt tree33bc7029 is the base tree, not a merged-overlay tree.
-- [ ] Final strict Clippy: initial vmi1293453 scheduler refusal103 requires37GiB
-  but reports26GiB free. Submit the unchanged command to the finished V4
-  compiler worker. No guard/config/resource changes or local fallback.
+- [x] Final strict Clippy eventually passes below; retain the initial
+  vmi1293453 scheduler refusal103 (requires37GiB, reports26GiB free).
+  No guard/config/resource changes or local fallback.
 - [x] Strict V4 Clippy actually runs and catches redundant_pub_crate on the
   new helper visibility. Use pub inside the private cfg(test) module, with no
   production API exposure or lint suppression. Final V5 startup5e2c4458,
   lib88ca3c0a and lock208ea862; fmt0/full two-file UBS0 (0/3990/2093, modules0)
   and strict Clippy0/124.4s on vmi1152480, overlay7383d49892d9330bfd7ce855953613b89060d6ed8fc04014a694cd475136bcfb.
   Preserve the V4 Clippy101 receipt and do not credit V4 compiler passes to V5.
-- [ ] V5 all-targets is actually compiling. V5 production recheck refuses120
-  at protected disk admission, started:false/growth0. The V4 production pass
-  remains earlier-source evidence, despite the final edit being test-only.
+- [x] V5 all-targets0/537.4s and separate production lib/bins0/505.8s on
+  vmi1227854 bind the same final overlay7383d498. The first V5 production
+  recheck refuses120 at protected disk admission, started:false/growth0;
+  retain it. V4 passes remain earlier-source evidence.
 - [ ] V4 native bodies remain0: compile preparation on vmi1152480 refuses120
   at disk admission; actual normal1800s run on hz4 refuses120 before Cargo
   because the disk monitor cannot complete its probe. started:false/growth0;
@@ -71,7 +79,7 @@
   Cargo (free54,348,029,952 bytes; unchanged30GiB/10GiB fences). No bodies or
   timing measurements. Stop further unchanged native retries; original runtime
   qualification and performance acceptance remain open.
-- [ ] Complete required all-targets/production/strict-Clippy compiler gates.
+- [x] Complete required V5 compiler gates; retain all intermediate receipts.
   Initial native hz4 and all-targets vmi1153651 requests refuse120 before Cargo
   at protected disk admission, started:false/growth0. Keep both receipts.
   Production queue expires103 with no execution. Strict Clippy0/730.4s on
@@ -82,9 +90,15 @@
   V1 all-targets finishes0/250.0s. Final V3 Clippy refuses120 at protected disk
   admission; final production is actually compiling on vmi1152480. Keep the
   final-byte all-targets pass separate from the earlier-source Clippy pass.
-- [ ] Record terminal source-bound results on the original Bead; flush and
-  verify matching unique tracker records and no cycles. Publish normally and
-  release only owned reservations; record actual outcomes at handoff.
+- [x] Record terminal source-bound results as comment4214 on the original
+  Bead; keep it in_progress. This is partial source work and compiler proof,
+  not new positive runtime qualification. One bounded connected-mail search
+  yields no new DSR publication-command input; no new publisher helper.
+- [x] Flush and verify both tracker stores match2867 unique records and
+  cycles0; only .asldx comments/timestamps changed since24b873d5. Prepare
+  only the remaining notes/tracker checkpoint. Source already matches both
+  remote branches before that checkpoint. Actual normal Git and exact
+  owned-lease release outcomes are recorded in the retained audit/handoff.
 - [ ] Remaining original acceptance: safely bounded size-proportional work
   and the original two-size/control readiness benchmark. No closure on an
   attribution fixture, selected tests or compiler receipts.
