@@ -4,6 +4,25 @@
 
 Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split.
 
+Current candidate is AA: the last change distinguishes real br's explicit
+no-workspace null from malformed output. Q was promoted manually only after
+the superseded Z job was cancelled143, recovered120, acknowledged and source-
+released. All3917 AAQ records are frozen; only the CLI library differs from Z.
+AA all-target10179, strict-Clippy10180 and production10182 finish0 with exact
+matching3917-file vectors. Formatting passes on main and Q. Full CLI10181
+finishes0 with the same vector. Worker/returned/private ELF SHA7f9fb36b match;
+three predeclared real CLI controls pass3/3 and final quiet stdio passes18/0/0
+(malformed3885ms under unchanged5000ms). Native preparation10183 finishes0,
+but actual AA superset10184 refuses120 before Cargo; final AA native bodies0.
+The follow-up observes the prepared pool absent and exits3; no cold retry or
+resource/profile/feature/deadline reduction. All four original Beads stay open.
+Z's37 native and18 CLI/18 stdio results remain Z evidence.
+The full AA two-file scan finishes0 with critical0, and its frozen inputs still
+match main. A separate full bench scan retains one
+critical configurable-command finding at bench.rs:718; the production caller
+supplies current_exe plus catalog arguments, but the scanner finding is not
+suppressed or waived. No project-wide clean-scan or release claim.
+
 - [x] Reverify governing-document/main patch identity and ready Beads; health
   probe reports only leaked-page accounting on a private copy, no live repair.
   Initial19:03UTC ten-host census reused the earlier worker list and omitted
@@ -35,11 +54,77 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   original source/features/profile/build-jobs2 and normal disk guards unchanged.
   Earlier V attempts retained: hz4 disk refusal120,115 queue refusal103. These
   are admission results, never compiler/test failures or passing bodies.
-- [ ] If preparation passes, execute the unchanged original37-body population
+- [x] After preparation passes, execute the unchanged original37-body population
   with test-jobs1/no-fail-fast and both deadline buckets1800. Record every
   outcome; do not infer body credit from preparation or old CLI controls.
+  Z preparation10172 finishes0 after37m03s. Actual run10174 reuses that pool,
+  compiles0.46s, and executes37/37 passing bodies across two binaries in8.566s;
+  unselected3524 cases remain unqualified. Complete3,917-file receipt equals
+  frozen ZQ. Both wrappers finish0/acknowledged/source-released. No retries.
+  This closes the native execution gap for this selection, not .5's full
+  measurement capability, any performance win, or .90's lifecycle acceptance.
 - [ ] Execute remaining original66 lifecycle runs when their unchanged
   admission conditions permit. Preserve previous SLO failures and counters.
+- [ ] Execute the fixed Beads/br/HTTP-asset predicate on the final source;
+  retain these earlier Z attempts without promoting them to AA results.
+  First actual request10175 refuses120 before Cargo:57,334,145,024free bytes
+  cannot cover a live competing30GiB reservation plus unchanged own30GiB and
+  floor10GiB. Terminal acknowledgment/source release confirmed; no Beads body
+  runs in this request. The worker's real br0.7.6 hashc605cb68 is distinct from
+  the local control executable and is recorded separately. A fresh all12-host
+  physical census leaves only hz4/1152480 above40GiB, both with live competing
+  30GiB groups; no unchanged request to either. Wait read-only for changed
+  capacity, without foreign signals, cleanup, lower budgets or profile cuts.
+  The bounded watcher observes the competing group gone23:04:26; submit the
+  same predicate through normal RCH as10176. It reaches Cargo but recompiles
+  dependencies despite the same configured target pool; earlier cache reuse
+  is not a guarantee. Actual invocation keeps both1800s limits; no body credit
+  before nextest execution. Separate lifecycle preparation10177 on1152480 also
+  refuses120 before Cargo at46,734,385,152free bytes after a new reservation
+  wins the race. Its predicate exactly equals all33 original clauses.
+- [x] Fresh actual negative control finds a third adapter error: real br
+  returns success with project_config:null outside a workspace, while Z am
+  reports malformed output. Preserve the before-control and distinguish that
+  explicit null from missing/non-string malformed fields. Main-only AA now
+  reports no beads directory and br init guidance; the existing real-directory
+  assertion remains unchanged. Active Q remains frozen Z until10176 settles.
+- [x] Requalify AA compiler/executable/scan/real-CLI surfaces after the final Z
+  job is terminal/acknowledged and source-released. Never edit Q during an
+  invocation. All required compiler vectors, formatting, full CLI and the
+  declared real positive/negative controls now pass on final AA. The separate
+  benchmark scanner critical remains red, not waived by the two-file scan.
+  Z10176 was cancelled before any bodies ran:143 original,120 exact recovery,
+  terminal acknowledgment and source release verified. AA was then promoted
+  manually, source3917 frozen. First AA preparation refuses120; after a real
+  capacity change at23:26:26, AA preparation10183 reaches Cargo on hz4 and
+  resumes compilation. Both preparation timeout buckets14400; actual bodies
+  still require both1800. No original assertion or scanner rule changed.
+- [ ] Execute the fixed final-AA native CLI superset containing ALL original37
+  plus ALL Beads/br/HTTP-asset cases, then original33 lifecycle clauses twice.
+  Keep separate population counts, default lifecycle features, both1800s body
+  limits and all original assertions/budgets. CLI-only preparation10183 passes
+  with the exact frozen vector; actual superset10184 refuses120 before Cargo
+  at57,231,065,088free bytes with a competing reservation. It is acknowledged
+  and source-released. Follow-up read-only watch exits3 at00:01:17UTC because
+  the prepared pool is absent:51,598,946,304free versus75,161,927,680needed,
+  live32,212,254,720byte group1473491. No unchanged retry, helper substitute,
+  non-compilation reclassification, guard reduction or test-body credit.
+- [x] Bind the returned AA executable to its actual source, worker/toolchain
+  and private-copy hash. Predeclare three real CLI controls: no-workspace
+  null produces exit1 plus no-beads-directory/br-init guidance without opening
+  a database; the same real show-mpp issue retains ID/title/description/P1/open
+  in table output; its full JSON equals a fresh real-br response. Then execute
+  one original quiet stdio suite on AA with every original deadline intact.
+  Report AA counts separately from the earlier Z18/18/37 populations.
+  All3 controls pass, including exact full JSON equality and a complete strace
+  child census with zero database opens on the absent-workspace path. All18
+  stdio assertions pass, failures0/skips0; malformed3885ms. ELF296,617,488bytes,
+  SHA7f9fb36b9e507b7a0e2b178dc9cb6207813dc9d85fe862e8c29c132941db7965;
+  actual worker Cargo compiler cache records pinned rustc908501772/LLVM23.1.0.
+- [ ] Within .45's existing acceptance, review the stale embedded-Beads sibling
+  checkout assumptions in CI and provision the external br needed by real
+  workspace tests. This review did not execute or clear GitHub CI. Preserve the
+  separate installer source-receipt pin contract when changing workflow setup.
 - [x] Inspect the actual embedded Beads consumers: only name/discovery/redirect
   helpers use the Rust library; all data operations already use external br.
   Reject `br where` because prefix discovery can inspect SQLite even in no-DB
@@ -72,11 +157,11 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   refusals are retained. V1156319/build10147 is superseded after finding the
   two concrete defects: exact wrapper5160afc4 cancelled143, recovery120,
   acknowledged/source-released. No guard or worker-policy override.
-- [ ] Execute original Beads integration tests and a real CLI before/after
-  positive plus poisoned-authority controls. Requalify final source through
-  separate production/all-target/strict-Clippy/fmt gates and original37/66 runs.
-  Build a production-feature V CLI and bind executable/toolchain/source identity;
-  old U/public-package binaries cannot validate this new code.
+- [x] Complete the final-source CLI before/after and poisoned-authority controls,
+  separate production/all-target/strict-Clippy/fmt gates, and full CLI build.
+  Bind executable/toolchain/source identity to Z as recorded below; old
+  U/public-package binaries cannot validate this code. Original native Beads
+  tests and37/66 populations remain separately unchecked.
 - [x] Fresh consumer review reproduces an additional real display defect:
   installed br returns an array for show, but am's table renderer reads it as
   an object. Real private before-control exits0 printing only `show-mpp:`;
@@ -111,11 +196,10 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   pass. X CLI onhz2 can likewise fail its final barrier; rerun final Y normally
   after exact recovery, without bypassing the gate or manually fetching a pass.
   Bind each result to its actual receipt, never to intended source identity.
-- [ ] Finish full Y changed-file scan and all required final Y compiler/native
-  checks, production CLI build and real display before/after control. Y Clippy
-  and complete same-rule scan are running. X production/CLI builds use
-  previously qualified worker pools under
-  normal guards. X native hz4 attempt refuses120 before Cargo because foreign
+- [x] Settle the intermediate Y scans/compiler checks and supersede executable
+  qualification with final Z below. X production/CLI builds used previously
+  qualified worker pools under normal guards. X native hz4 attempt refuses120
+  before Cargo because foreign
   reservations change again (62,286,622,720bytes available); no body credit.
 - [x] Final Y full-file UBS completes802s, exit0/status ok, failed modules0,
   critical0, warnings12,134 across both complete changed Rust files. Both frozen
@@ -136,8 +220,8 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   removed; Linux gains one named test, and Unix retains its portable checks.
   This is Z, a test-layout correction only; production behavior is unchanged.
   Native macOS acceptance remains unexecuted, not inferred from documentation.
-- [ ] Finish final Z full-file scan (running on main-only changes), then all
-  three compiler gates and executable qualification after exact X CLI recovery.
+- [x] Finish final Z full-file scan, all three compiler gates and executable
+  qualification after exact X CLI recovery, as recorded below.
   X CLI has reached its expected source-consistency refusal1 after compilation;
   no stale-source artifact earns a final-Z pass. Q stays Y until that owned
   wrapper is acknowledged/source-released; then promote Z manually and freeze.
@@ -160,7 +244,7 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   No original37/66 native-body, performance-SLO or native-platform release credit.
 - [x] Final Z all-target check10170 exits0 with exact frozen3,917-file vector.
   All three required final Z compiler gates, formatting and full scan pass.
-- [ ] Execute original37 preparation and bodies on the newly available hz4
+- [x] Execute original37 preparation and bodies on the newly available hz4
   window. At21:54UTC all12 enabled Linux workers receive a physical/complete
   procfs reservation census: hz4 has62,039,117,824bytes free and no live competing
   reservation. Original30GiB growth +10GiB floor fits; normal RCH owns reaping.
@@ -173,17 +257,27 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
   that execution step entirely, use no override, and issue the full literal
   RCH command separately. The22:10 retry actually reaches Cargo and compiles
   final Z native targets. No body credit before native execution/results.
-- [ ] Finish Y production graph and executable build under normal guards;
-  retain actual worker/toolchain/returned and private-copy binary identities.
-  Current X production on116 and CLI onhz2 keep their transferred X snapshots;
-  final Y production on1156319 runs separately, no cross-frame pass claim.
-- [ ] Execute a fixed18-case real CLI control population: help/version;
+  Final preparation10172 and actual37-case execution10174 later finish0,
+  as recorded above; these are Z results, not evidence for the later AA fix.
+- [x] Settle Y production and both superseded X wrappers; complete final Z
+  production and executable builds under normal guards. Retain actual
+  worker/toolchain/returned and private-copy identities, no cross-frame pass.
+- [x] Execute a fixed18-case real CLI control population: help/version;
   explicit status/list/ready; complete show table/JSON/TOON; poisoned ambient
   directory+database authority; explicit-child refusal and nested discovery;
   explicit symlink refusal; self/foreign redirects; exact _beads versus sibling
   .beads; lossy implicit refusal with no beads.db opens; explicit valid Unicode
   replacement-character positive; explicit non-UTF-8 refusal. Preserve all
   outcomes without retry; these controls do not replace original native37/66.
+- [x] Commit final Z repairs as9ba8eede and push ordinary fast-forwards to main
+  and its legacy mirror. The qualifier remains9d4ab4fb-dirty and immutable;
+  this Git commit does not relabel it a clean-commit qualification build.
+- [x] Execute one fixed original quiet stdio suite on the retained Z executable
+  in a private mailbox, preserving every case and the original5000ms bound.
+  All18 assertions pass, failures0/skips0; malformed JSON finishes3730ms.
+  Executable SHA7341a841 remains unchanged before/after. Evidence is retained
+  under review9/stdio-Z. This fresh-source control does not erase old failures
+  or establish in-process lifecycle or loaded/durability acceptance.
 - [x] Execute cold-source component positive and paired old-graph negative.
   Fresh private Cargo fetch succeeds; offline reconstruction uses only those
   new archives/index/bare Git databases, with no host checkout copying. Installed
@@ -196,9 +290,18 @@ Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split
 - [ ] Verify .45's original strict clean-source EVERY-release-target builds
   and native Beads tests; keep unmet public/all-platform acceptance open.
   Do not weaken the DSR source gate or erase either rejected upgrade.
-- [ ] Freshly reread the complete patch and consumers, fix any confirmed defect,
-  and requalify any new source separately. Finish exact receipts/Beads/source,
-  export/graph/diff checks and release only this session's reservations.
+- [x] Freshly reread the complete patch and consumers, fix confirmed defects,
+  and qualify the final AA repair separately. Preserve the avoidable X caller-
+  freeze error, late missing-workspace control, admission/cancellation losses,
+  scanner critical and original SLO failures. Complete existing audit supplement;
+  no independent verifier or release clearance. All own AA remote wrappers are
+  terminal/acknowledged/source-released; no active native body or watcher remains.
+- [x] Finish final tracker export/graph/diff/source checks:2867 unique records,
+  both JSONL stores equal, only the four owned records' comments/timestamps
+  changed, and dependency cycles0. Main code matches all3917 frozen AA inputs;
+  only the operator TODO differs. Final handoff uses the four exact owned
+  paths and retains all seven preexisting untracked roots. Commit/push and
+  release of the ten exact owned reservations are reported in the session reply.
 
 Creation worksheet: minimal invocation/source/capacity receipts serve the
 operator's requested review and the original .5/.90 qualification decisions.

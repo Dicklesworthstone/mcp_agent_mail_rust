@@ -22760,10 +22760,15 @@ fn discover_beads_dir_via_cli(start: &Path, pinned: Option<&Path>) -> CliResult<
             command
         };
         let value = br_command_json(command)?;
-        let config_path = value
-            .get("project_config")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "br reported no project config path".to_string())?;
+        let config_path = match value.get("project_config") {
+            Some(serde_json::Value::String(path)) => path.as_str(),
+            Some(serde_json::Value::Null) => {
+                return Err(
+                    "no beads directory found; run br init in the project directory".to_string(),
+                );
+            }
+            _ => return Err("br reported no project config path".to_string()),
+        };
         // br prints paths with Path::display(), which loses invalid UTF-8.
         // Implicit discovery cannot distinguish that spelling from a different
         // real workspace. Exact mode can verify even a literal U+FFFD name
