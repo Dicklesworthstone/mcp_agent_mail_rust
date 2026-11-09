@@ -4,6 +4,46 @@
 
 Continue original `br-qpacg` part2; no new issue or configuration switch.
 
+- [x] Fresh continuation at committed a0db1a73: reread the complete recent
+  Rust/workflow diffs and actual consumers; no additional defect found there.
+  Cross-check graph recommendations against real Beads; existing contact-stats
+  and reservation reconciliation repairs are already implemented, so do not
+  reimplement them. Live health still reports leaked-page/stale-backup findings.
+- [x] Provision official checksum-pinned age1.3.2 tools privately on vmi1152480:
+  archive SHA cbe24006, age eb7dd1b5, keygen0a0009db. Both tools reportv1.3.2;
+  real keygen `-y` plus encryption/decryption roundtrip passes byte comparison.
+  Fixture directory700 and identity600. This proves the tools only, not the
+  original compiled Agent Mail test. Exact task PATH is retained in the log.
+- [x] Fix an incidental operator-health diagnostic under existing .5: the
+  obsolete `proactive backup refresh failed` warning no longer exists. Point
+  to current integrity-guard diagnostics and `automatic backup failed`; allow
+  blocked as well as failed refreshes, and describe companion presence without
+  claiming it blocks every refresh (some companions are quarantined). No
+  status, age threshold, test assertion or backup safety decision changes.
+- [x] Final-source compiler checks pass using fixed base a0db1a73 and the
+  owned doctor/mod.rs overlay262f309d876219dc5b862cf698f8ab2f63ae672244d951fd524db61d54fcd49c:
+  all-targets0 on vmi1153651 (105.4s), production lib/bins0 on hz3 (43.6s).
+  Final doctor SHA7c1e4d7d; lib2514d5c0/lock208ea862 unchanged. The earlier
+  d889fa9d production/all-target checks also finish0, but only final-source
+  receipts above qualify the finished wording. Receipt treecf5be435 is the
+  baseline Git tree; overlay fingerprints bind the additional file bytes.
+- [ ] Strict Clippy and native execution remain unqualified.
+  One hz4 actual-unit attempt times out in the worker queue (exit103), before
+  Cargo. Sequential vmi1152480 Clippy and tool-populated native preparation
+  each refuse120 at disk admission, started:false. Final-source Clippy on hz3
+  likewise refuses120 before Cargo. No new Agent Mail native body or negative
+  plant ran. Preserve all prior limits/receipts; no further placement
+  investigation, guard reduction, source fallback or foreign cleanup.
+  Current evidence: `/data/tmp/am-fresh-native-20261109.dQP7L2Pf/`.
+- [x] Final-source formatting and full-file stock UBS pass (critical0,
+  warning402, info259, failed modules0). Fresh-read the whole changed function,
+  its caller/tests, real guard warning and companion quarantine path; no
+  remaining functional change needed. Existing health assertions remain intact.
+- [x] Record fresh results in owned comments4202 (.qpacg) and4203 (.5), keep
+  both in_progress, and verify only their comments/timestamps changed. Both
+  JSONL stores match2867 unique records; graph cycles0 and diff check0.
+  Current handoff: publish source/tracker/TODO normally, then release only
+  reservations1263-1265 and1271; final reply records terminal outcomes.
 - [x] Review latest CI wiring and actual unit-test consumers; confirm the
   encrypted-export test returns success on missing/failed age/keygen. Existing
   share-crate crypto tests already require the real tools. Reserve exact paths.

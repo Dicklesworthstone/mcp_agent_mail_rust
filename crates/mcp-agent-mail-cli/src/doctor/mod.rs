@@ -646,9 +646,8 @@ struct DoctorLiveProbeTarget {
 }
 
 /// A proactive backup older than this, while the live owner has run past
-/// [`PROACTIVE_BACKUP_GRACE_SECS`], means its refreshes are failing: a running
-/// integrity guard refreshes the backup once it is an hour old, retrying at
-/// most six hours apart after failures.
+/// [`PROACTIVE_BACKUP_GRACE_SECS`], requires attention. Failed verification
+/// or backup admission can prevent the guard from publishing a fresh backup.
 const STALE_PROACTIVE_BACKUP_SECS: u64 = 24 * 60 * 60;
 /// Owner uptime after which the integrity guard has had cycles to refresh.
 const PROACTIVE_BACKUP_GRACE_SECS: u64 = 2 * 60 * 60;
@@ -659,7 +658,8 @@ const PROACTIVE_BACKUP_GRACE_SECS: u64 = 2 * 60 * 60;
 /// integrity guard runs and `guard_enabled` is the CLI's own setting; a stale
 /// backup is then only a warning. `backup_age_secs` is `None` when no backup
 /// exists; `standalone` is false when the backup carries `-wal`/`-shm`/sidecar
-/// companions, which block every refresh.
+/// companions. The guard diagnostics determine whether those companions
+/// prevent a refresh or can be quarantined automatically.
 fn proactive_backup_health(
     guard_enabled: bool,
     guard_attested: bool,
@@ -683,20 +683,20 @@ fn proactive_backup_health(
     let companions = if standalone {
         ""
     } else {
-        "; the backup has -wal/-shm or other companion files, which block every refresh"
+        "; backup companion files are present"
     };
     match backup_age_secs {
         None if settled => (
             "warn",
             format!(
-                "no proactive backup after {} of server uptime; check the server log for 'proactive backup refresh failed'",
+                "no proactive backup after {} of server uptime; check the server's integrity guard diagnostics and 'automatic backup failed' warnings",
                 hours(owner_age_secs.unwrap_or_default())
             ),
         ),
         None => ("ok", "no proactive backup yet".to_string()),
         Some(age) if age > STALE_PROACTIVE_BACKUP_SECS && settled => {
             let detail = format!(
-                "proactive backup is {} old although the server has run {}: refreshes are failing{companions}; check the server log for 'proactive backup refresh failed'",
+                "proactive backup is {} old although the server has run {}: automatic backups are blocked or failing{companions}; check the server's integrity guard diagnostics and 'automatic backup failed' warnings",
                 hours(age),
                 hours(owner_age_secs.unwrap_or_default())
             );
