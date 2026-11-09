@@ -2985,8 +2985,9 @@ fn ensure_boot_archive_preflight_pass(
     config: &mcp_agent_mail_core::Config,
 ) -> std::io::Result<mcp_agent_mail_storage::boot_check::BootCheckReport> {
     let mode = boot_check_mode_from_config(config);
-    let report =
-        mcp_agent_mail_storage::boot_check::preflight_archive_integrity(&config.storage_root, mode);
+    let report = startup_checks::timed_startup_phase("archive-preflight", || {
+        mcp_agent_mail_storage::boot_check::preflight_archive_integrity(&config.storage_root, mode)
+    });
     record_boot_archive_preflight_report(&report);
     if !report.should_abort() {
         return Ok(report);

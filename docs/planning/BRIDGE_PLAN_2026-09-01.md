@@ -1,5 +1,31 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 startup latency attribution — EmeraldEagle / br-asldx
+
+- [x] Verify governing-doc hashes, current diff and ready Beads. Do not
+  reimplement already-present recovery or memory-health repairs. Claim the
+  actual missing first step of .asldx: per-phase startup timing.
+- [x] Reserve the two existing server files, TODO and exact tracker paths;
+  baseline full-file UBS0, no critical findings. No new repository file.
+- [x] Add structured startup_phase_started/startup_phase_finished events with
+  static phase and measured duration_us around real HTTP/stdio probes, listener
+  detection, cold-start backup rotation and archive preflight. Finish means
+  returned, not healthy. Preserve order, results, handoff skips and budgets.
+- [ ] Test elapsed work and error preservation; real cold-start probe order
+  after a failed auth probe; listener handoff must emit no fake timings for
+  deferred DB-lock/integrity/rotation work. Preserve existing assertions.
+- [ ] Fresh-read implementation and callers twice; check formatting before
+  freezing the exact source overlay. Run focused native tests under strict RCH;
+  distinguish compile preparation from actual body counts and retain failures.
+- [ ] Run both required workspace compiler graphs, strict Clippy and final
+  full-file UBS. No suppression, golden update, feature or resource relaxation.
+- [ ] Record exact results on .asldx and keep original acceptance open: this
+  attribution step does not establish constant startup cost or a speedup.
+  Mailbox-size attribution, a bounded readiness implementation and the original
+  two-size/control benchmark remain required before closing the task.
+- [ ] Synchronize source/tracker normally, verify graph consistency and release
+  only owned reservations. Evidence path is recorded with terminal results.
+
 ## November 9 fresh verification continuation — EmeraldEagle
 
 - [x] Governing docs retain their fully read hashes. Fresh-read the complete
