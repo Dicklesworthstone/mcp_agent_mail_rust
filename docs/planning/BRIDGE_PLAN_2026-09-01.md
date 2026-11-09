@@ -28,6 +28,21 @@ Continue existing `br-qpacg`; original release-run acceptance stays intact.
   with that initial script/log retained. Missing-age preflight exits127;
   an am outside this build directory exits1; damaged archive exits1 before
   extraction or PATH publication. Seven jobs now publish their built binaries.
+  A final full-share reread finds its exit0 skip for absent sqlite3/Python:
+  both workspace/share jobs now preflight those tools too. Final guards pass
+  with real tools; targeted missing-sqlite3 and missing-python controls each
+  fail127 with the correct named diagnostic. One private source-v2 extraction
+  used the wrong cwd and its missing-script127 results are invalidated; retain
+  those logs, then use absolute source paths and diagnostic-checked source-v3
+  controls. A dynamic-log-path DCG refusal was resolved with literal scratch
+  paths, without override or approval bypass.
+  The shared checkout committed the implementation as081d6625 while validation
+  continued. Final source-v3 guards match that exact committed workflow
+  (SHA352c7112), and comparison against the fixed starting e0663f86 preserves
+  all prior test commands/conditions/limits. A comparison against moving HEAD
+  briefly saw zero differences after that shared commit; use the fixed base,
+  never treat a moving-HEAD comparison as evidence. Four final negative controls
+  and two real preflight successes are retained in source-v3/final-result.json.
   Both complete `--crypto-only all` runs pass the same18 case records,0 failed,
   0 skipped. The15 dispatch selectors expand corruption/truncation and two
   existing-output modes into18 records; an initial summary-count assumption
@@ -41,6 +56,8 @@ Continue existing `br-qpacg`; original release-run acceptance stays intact.
   setup/real-crypto evidence, not a dispatched Actions or full native run.
   CASS status finds no local database/index, so no older indexed-history audit
   is claimed. The preceding retained audit remains the available history.
+- [ ] Add/qualify original fail-loud unit-test handling for missing or failed
+  age/keygen outside these CI preflights; preserve existing real-path assertions.
 - [ ] Original populated native release run and per-step early-return counts
   still gate .qpacg closure. No selected CLI lane or setup pass replaces them.
   Publish the bounded patch and release only reservations1221-1224; report
