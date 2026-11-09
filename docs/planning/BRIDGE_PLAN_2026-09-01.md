@@ -51,12 +51,26 @@
 - [ ] Final strict Clippy: initial vmi1293453 scheduler refusal103 requires37GiB
   but reports26GiB free. Submit the unchanged command to the finished V4
   compiler worker. No guard/config/resource changes or local fallback.
+- [x] Strict V4 Clippy actually runs and catches redundant_pub_crate on the
+  new helper visibility. Use pub inside the private cfg(test) module, with no
+  production API exposure or lint suppression. Final V5 startup5e2c4458,
+  lib88ca3c0a and lock208ea862; fmt0/full two-file UBS0 (0/3990/2093, modules0)
+  and strict Clippy0/124.4s on vmi1152480, overlay7383d49892d9330bfd7ce855953613b89060d6ed8fc04014a694cd475136bcfb.
+  Preserve the V4 Clippy101 receipt and do not credit V4 compiler passes to V5.
+- [ ] V5 all-targets is actually compiling. V5 production recheck refuses120
+  at protected disk admission, started:false/growth0. The V4 production pass
+  remains earlier-source evidence, despite the final edit being test-only.
 - [ ] V4 native bodies remain0: compile preparation on vmi1152480 refuses120
   at disk admission; actual normal1800s run on hz4 refuses120 before Cargo
   because the disk monitor cannot complete its probe. started:false/growth0;
   its free_bytes:0 is an unavailable-probe sentinel, not measured free space.
   Preserve30GiB growth/10GiB floor and240s per-test limits. No more unchanged
   native attempts or claims of measured phase costs in this work block.
+- [ ] A newly freed hz2 worker allows one V5 compile-preparation submission
+  after an observed slot-state change; its disk guard still refuses120 before
+  Cargo (free54,348,029,952 bytes; unchanged30GiB/10GiB fences). No bodies or
+  timing measurements. Stop further unchanged native retries; original runtime
+  qualification and performance acceptance remain open.
 - [ ] Complete required all-targets/production/strict-Clippy compiler gates.
   Initial native hz4 and all-targets vmi1153651 requests refuse120 before Cargo
   at protected disk admission, started:false/growth0. Keep both receipts.
