@@ -10,7 +10,15 @@
   implementation; do not duplicate it or close their retained qualification.
 - [ ] Execute the frozen .ku0kl full docs_drift_ci native gate with strict RCH,
   basee7ffb20f/overlayf3ddaa87, both actual-run deadlines1800s and unchanged disk
-  fences. A fresh attempt after two hours is admitted and compiling on hz4.
+  fences. A fresh attempt after two hours is admitted on hz4 and reaches the
+  server crate but exceeds the configured deadline: terminal137
+  after1803.2s, native body count0. Retain that failed receipt. Finish a separate
+  --no-run preparation for the identical source/selection, both preparation
+  deadlines14400s and the same feature/profile/disk fences; preparation never
+  earns body credit. Then execute with both original1800s limits unchanged.
+  Follow-up preparation also refuses120 at disk admission, started:false/growth0,
+  free68,144,254,976 bytes. No further unchanged retry, placement experiment,
+  resource reduction or native pass. Both selections still have zero bodies.
 - [ ] Continue .qpacg's existing encrypted-export native unit qualification:
   compile-only preparation on vmi1152480, default features/build-jobs2/dev.debug0,
   both preparation deadlines14400s. Preparation earns zero body credit; actual
@@ -26,8 +34,26 @@
   pass. Docker6d3b95a9/testf6a29970/lib2514d5c0 remain unchanged. Do not attribute
   that Git operation here, amend it, or infer an answer to the pending UBS
   exception question. Current native request retains its exact frozen inputs.
-- [ ] Record terminal results, second fresh review and exact tracker updates;
-  retain failed attempts, update this list and release only owned leases.
+- [x] Reread the full Dockerfile/workflow, changed test module and earlier
+  doctor diagnostic diff. Fresh fmt0; full test-file UBS1 retains exactly the
+  previous critical3/warning45/info112 with failed modules0 and identical critical
+  rule/message pairs. No suppression, assertion or source change.
+- [x] Two bounded read-only local history queries supply no publication-command
+  evidence. Initial dynamic subprocess wrapper is blocked by DCG before any
+  execution; explicit metadata-only queries need no bypass and return no entries.
+  This does not identify the actual publisher or satisfy either release P0.
+- [x] Second fresh review finds no additional functional bug; no source edit
+  is justified by this pass. Preserve the frozen Docker/test/lib/lock bytes.
+- [x] Record terminal comments4209 (.ku0kl)/4210 (.qpacg), retain failed attempts
+  in `/data/tmp/am-fresh-review-20261109.KyjLiOdI/`. Both stores match2867 unique
+  records; only those two Beads' comments/timestamps changed since915b4cf8,
+  cycles0. Exact leases1307-1311 released at handoff; peer roots untouched.
+- [x] Prepare the data-only verification checkpoint: exactly this TODO and
+  both matching JSONL stores, no supported code changed. Fresh fetch confirms
+  the shared source/notes commits already match both remote branches. This
+  checkpoint does not clear the source UBS findings or infer an answer to the
+  prior source-commit exception. Native/full-image/installer/publication
+  acceptance remains open; final handoff records the actual Git outcome.
 
 ## November 9 source-container dependency closure — EmeraldEagle
 
