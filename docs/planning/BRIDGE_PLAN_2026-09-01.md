@@ -10,17 +10,46 @@ Continue original `br-qpacg` part2; no new issue or configuration switch.
 - [x] Replace both silent skips with mandatory launch/status checks, derive
   the public recipient using age-keygen's existing `-y` surface, and emit actual
   prerequisite-execution evidence. Preserve every export/output assertion.
-- [ ] Fresh-read the source diff and pass formatting before freezing inputs.
-- [ ] Run required production/all-target/strict-Clippy checks through strict
-  RCH against a fixed Git base plus the exact owned Rust-file overlay.
+- [x] Fresh-read the complete source diff twice and pass `cargo fmt --check`.
+  All original export/output assertions remain; no runtime or lockfile change.
+- [x] Pass both required compiler graphs through strict RCH: workspace
+  all-targets on vmi1153651 (628.7s), production lib/bins on vmi1152480
+  (576.3s). Both exit0 against fixed base663201cf plus the owned lib.rs
+  overlay21bfd80f, tree636bf676. Current lib SHA2514d5c0, lock208ea862.
+  These are clean-overlay receipts, not the earlier full content-vector lane.
+- [x] Run stock full-file Rust UBS without cache/exclusions/suppressions:
+  exit0, critical0, warning10360, info5052, failed modules0. This covers only
+  CLI lib.rs; the existing separate bench critical/full-project gate stays red.
+- [ ] Strict workspace all-target Clippy remains unqualified. Attempts on
+  vmi1156319/hz2 exit103; hz4/vmi1152480 exit120 with admission started:false.
+  No Clippy compiler execution is credited. Preserve all four receipts.
 - [ ] Prepare and execute the original named encrypted-export unit test with
   real age/keygen, unchanged features/profile and original disk guards. Keep
   compile-only preparation separate from actual native body counts.
 - [ ] Execute missing/broken-tool plants against that exact compiled test
   executable; require a real failed test and the intended tool diagnostic,
   never a missing-script or zero-test result. Retain all attempt outputs.
-- [ ] Recheck the final diff, record exact results on the owned Bead, synchronize
-  source/tracker, and release only this block's leases after publication.
+  Native preparation twice and actual execution once all exit120 at remote
+  disk admission, started:false, growth0. No test executable or body exists
+  from these attempts; no negative plant or early-return count is credited.
+  The original 30GiB growth/10GiB floor, features/profile and actual-run
+  build/test1800s limits remain intact. A session-private transfer-root change
+  then documented per-job target placement moved outputs to hz4 tmpfs, but
+  worker-isolated Cargo caches still require admission on the constrained
+  volume with competing reservations. Stop placement experiments; preserve
+  refusal logs. Managed RCH config/workers remain byte-identical. Exact actual
+  wrapper rchw-a99ad9d2-b9e4-434d-a5ab-b002b313d976 is finished, terminal
+  acknowledged, exit120. Global job listing is incomplete and is not clearance.
+  Evidence: `/data/tmp/am-qpacg-native-20261109.jnn1wUAF/`.
+  Another process committed the frozen source as0ee76997 and initial TODO
+  as2457fcc1 during validation; do not attribute those Git operations here.
+- [x] Recheck the frozen source and record exact results as owned Bead
+  comment4199; .qpacg stays in_progress. Both JSONL stores match2867 unique
+  records; only its comments/timestamp changed. Graph cycles0, diff check0.
+  Anti-ceremony audit in the existing scratch review is DRIFTING: no native
+  test executed, and placement investigation consumed too much time.
+  Publish this evidence handoff, then release only reservations1228-1231;
+  the final reply records actual terminal publication/release outcomes.
 - [ ] Original full native release execution and per-step early-return counts
   still gate .qpacg closure; this focused body and negative plants do not close
   them. Existing .5/.90/.45 release/native gaps and red receipts stay open.
