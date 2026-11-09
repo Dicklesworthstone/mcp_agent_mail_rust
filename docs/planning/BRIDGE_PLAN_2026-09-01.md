@@ -1,5 +1,30 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 native encrypted-export prerequisite — EmeraldEagle
+
+Continue original `br-qpacg` part2; no new issue or configuration switch.
+
+- [x] Review latest CI wiring and actual unit-test consumers; confirm the
+  encrypted-export test returns success on missing/failed age/keygen. Existing
+  share-crate crypto tests already require the real tools. Reserve exact paths.
+- [x] Replace both silent skips with mandatory launch/status checks, derive
+  the public recipient using age-keygen's existing `-y` surface, and emit actual
+  prerequisite-execution evidence. Preserve every export/output assertion.
+- [ ] Fresh-read the source diff and pass formatting before freezing inputs.
+- [ ] Run required production/all-target/strict-Clippy checks through strict
+  RCH against a fixed Git base plus the exact owned Rust-file overlay.
+- [ ] Prepare and execute the original named encrypted-export unit test with
+  real age/keygen, unchanged features/profile and original disk guards. Keep
+  compile-only preparation separate from actual native body counts.
+- [ ] Execute missing/broken-tool plants against that exact compiled test
+  executable; require a real failed test and the intended tool diagnostic,
+  never a missing-script or zero-test result. Retain all attempt outputs.
+- [ ] Recheck the final diff, record exact results on the owned Bead, synchronize
+  source/tracker, and release only this block's leases after publication.
+- [ ] Original full native release execution and per-step early-return counts
+  still gate .qpacg closure; this focused body and negative plants do not close
+  them. Existing .5/.90/.45 release/native gaps and red receipts stay open.
+
 ## November 9 real test prerequisites — EmeraldEagle
 
 Continue existing `br-qpacg`; original release-run acceptance stays intact.
