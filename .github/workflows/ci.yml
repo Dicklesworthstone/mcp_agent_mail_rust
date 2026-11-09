@@ -90,11 +90,27 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+
+      # Beads discovery and fixture queries execute br; cloning its source does
+      # not provide that dependency. Pin the release bytes before executing it.
+      - name: Install pinned external Beads CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          br_dir="$(mktemp -d "${RUNNER_TEMP}/am-br.XXXXXXXX")"
+          archive="${br_dir}/br.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+            --retry 3 --connect-timeout 10 --max-time 120 \
+            --user-agent 'mcp_agent_mail_rust-ci (+https://github.com/Dicklesworthstone/mcp_agent_mail_rust)' \
+            --output "$archive" \
+            https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.7.6/br-0.7.6-linux_amd64.tar.gz
+          printf '%s  %s\n' \
+            56baae2df5e7cc6f6537e05fd5f560192a9d5ceb02659c61b10b9610b45eb3ef \
+            "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$br_dir" --no-same-owner br
+          test "$("${br_dir}/br" --version)" = 'br 0.7.6'
+          printf '%s\n' "$br_dir" >> "$GITHUB_PATH"
+          printf 'AM_BR_BIN=%s\n' "${br_dir}/br" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -180,11 +196,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -195,7 +206,7 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Mode matrix harness (Rust)
-        run: cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
+        run: 'cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture'
         env:
           DATABASE_URL: "sqlite:///tmp/ci_matrix.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -242,11 +253,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -419,11 +425,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -432,7 +433,7 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Semantic conformance suite
-        run: cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
+        run: 'cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture'
         env:
           DATABASE_URL: "sqlite:///tmp/ci_conform.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -475,11 +476,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -490,7 +486,7 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Perf + security regression suite
-        run: cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
+        run: 'cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture'
         env:
           DATABASE_URL: "sqlite:///tmp/ci_perf.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -639,11 +635,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -709,11 +700,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -923,11 +909,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -1006,11 +987,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -1019,7 +995,7 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Verify help snapshots
-        run: cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
+        run: 'cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture'
         env:
           COLUMNS: "120"
           DATABASE_URL: "sqlite:///tmp/ci_snap.sqlite3"
@@ -1065,11 +1041,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -1174,11 +1145,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -1303,11 +1269,6 @@ jobs:
           # full workspace (cargo build -p X can skip it, but workspace-wide
           # commands cannot).
           git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -1326,7 +1287,7 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Fault injection integration tests
-        run: cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
+        run: 'cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture'
         env:
           DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
           STORAGE_ROOT: "/tmp/ci_chaos_storage"

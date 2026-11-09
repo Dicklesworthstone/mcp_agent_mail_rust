@@ -1,5 +1,45 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 fresh-eyes Beads handoff — EmeraldEagle
+
+Continue `br-kp1in.45`; no new issue, release claim, or Actions dispatch.
+
+- [x] Reread all suite/repository AGENTS and README; inspect recent Beads
+  adapter changes, real fixture consumers and graph triage. The existing
+  mailbox full-integrity failure remains red; do not repair the live mailbox.
+- [x] Confirm workspace tests require a real external br, while CI only clones
+  its unused source. Preserve dist.yml's separate installer receipt pins.
+- [x] Reserve the workflow and existing tracker/TODO paths; keep .45 in progress.
+- [x] Provision the official br 0.7.6 Linux x86_64 release with an in-source
+  SHA-256 pin; export both PATH and AM_BR_BIN before workspace tests.
+- [x] Remove all twelve obsolete CI Beads source clones and their stale
+  path-patch comments. Preserve test commands, assertions and release policy.
+- [x] Execute the exact setup step in private runner directories, verify its
+  exports select the pinned executable, and exercise real create/show through
+  the already qualified AA am. Verify damaged bytes fail before publication.
+- [x] Validate workflow syntax and shell; reread the final diff and check all
+  actual Beads consumers. Report local setup evidence separately from CI.
+- [x] Repair the five preexisting YAML-invalid unquoted commands containing
+  `:: `, verify their parsed commands preserve every argument, and retain the
+  committed workflow's parser failure as the negative control.
+  Exact setup executes twice successfully in fresh directories. Official
+  archive SHA56baae2d and executable SHA73cbef7f are verified; both exports
+  select that executable. Real private issue ci-fha renders all five declared
+  table fields; full JSON equals real br and the fresh pass is byte-identical.
+  The damaged-archive control exits1 before extraction or either publication.
+  PyYAML, actionlint1.7.12, bash syntax and cargo fmt pass. Original five test
+  commands are identical after parsing; no tests, assertions or limits changed.
+  Evidence: `/data/tmp/am-beads-ci-review-20261109.yLx8dJRN/` (exact step,
+  identity, original YAML failure, positive controls, tamper control, recheck).
+  This is local CI setup proof using the unchanged AA runtime source, not a
+  dispatched Actions run, native nextest execution or release qualification.
+- [x] Flush the owned Bead evidence and check graph cycles and exact edit scope.
+  Publication handoff follows validation: commit/push main and mirror, then
+  release only reservations1217-1220. The final reply records terminal outcomes.
+- [ ] Original final-AA native superset, 66 lifecycle bodies, full operational
+  benchmarks, every-platform strict DSR and actual publisher enforcement stay
+  open until their original acceptance is met. Prior failed receipts remain.
+
 ## November 8 evening native qualification — EmeraldEagle
 
 Continue original `br-kp1in.5`/`.90` acceptance; no new framework or scope split.
@@ -121,10 +161,11 @@ suppressed or waived. No project-wide clean-scan or release claim.
   stdio assertions pass, failures0/skips0; malformed3885ms. ELF296,617,488bytes,
   SHA7f9fb36b9e507b7a0e2b178dc9cb6207813dc9d85fe862e8c29c132941db7965;
   actual worker Cargo compiler cache records pinned rustc908501772/LLVM23.1.0.
-- [ ] Within .45's existing acceptance, review the stale embedded-Beads sibling
+- [x] Within .45's existing acceptance, review the stale embedded-Beads sibling
   checkout assumptions in CI and provision the external br needed by real
-  workspace tests. This review did not execute or clear GitHub CI. Preserve the
-  separate installer source-receipt pin contract when changing workflow setup.
+  workspace tests. November9's bounded follow-through pins and locally executes
+  the external CLI setup; it does not execute or clear GitHub CI. The separate
+  installer source-receipt pin contract is preserved.
 - [x] Inspect the actual embedded Beads consumers: only name/discovery/redirect
   helpers use the Rust library; all data operations already use external br.
   Reject `br where` because prefix discovery can inspect SQLite even in no-DB
