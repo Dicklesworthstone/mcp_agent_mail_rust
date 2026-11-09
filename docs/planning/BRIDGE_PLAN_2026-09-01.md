@@ -1,5 +1,51 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 real test prerequisites — EmeraldEagle
+
+Continue existing `br-qpacg`; original release-run acceptance stays intact.
+
+- [x] Fresh-review the previous workflow patch and unchanged Rust consumers;
+  inspect ready graph and actual tool availability. No local age/keygen exists.
+  The historical bench unit-test am-PATH skip has already been removed; do not
+  invent another fix for it. Existing full-integrity health remains red.
+- [x] Claim .qpacg and reserve the exact workflow/TODO/JSONL paths.
+- [x] Install a checksum-pinned real age/keygen release in workspace and share
+  E2E jobs; preserve the separately pinned br installation.
+- [x] Publish the freshly built am/server directory to dependent test/E2E
+  steps and verify the workspace test job selects that exact am before tests.
+- [x] Require the three existing HTTP/share/TUI harness pass switches so an
+  adapter failure cannot be counted as a passing native gate in this job.
+  Keep HTTP's focused sub-suites explicitly enabled: strict mode otherwise
+  changes their default. No existing command, assertion or limit is removed.
+- [x] Execute exact installation and prerequisite steps using real binaries;
+  check missing-age and wrong-am refusal and archive tamper rejection.
+- [x] Run the existing real-age interoperability/publication matrix with
+  unchanged assertions, explicit candidate identity and retained private data.
+- [x] Recheck workflow syntax, formatting, untouched test argv/limits and final
+  source identity; update the owned Bead with bounded actual observations.
+  Final exact installation succeeds twice. Pinned age1.3.2/keygen report
+  v1.3.2; the initial unprefixed-version assertion failed and is corrected,
+  with that initial script/log retained. Missing-age preflight exits127;
+  an am outside this build directory exits1; damaged archive exits1 before
+  extraction or PATH publication. Seven jobs now publish their built binaries.
+  Both complete `--crypto-only all` runs pass the same18 case records,0 failed,
+  0 skipped. The15 dispatch selectors expand corruption/truncation and two
+  existing-output modes into18 records; an initial summary-count assumption
+  of15 was wrong, while the unchanged matrix itself passed. All18 names and
+  tool hashes match on fresh execution. Five publication-race cases pass,
+  including parent substitution and exactly one complete concurrent winner.
+  Actual am SHA7f9fb36b, age SHAeb7dd1b5 and keygen SHA0a0009db are retained.
+  Actionlint/PyYAML/bash/fmt/diff checks pass. Rust sources, lock, crypto
+  harness, CI triggers, test commands, conditions and time limits are unchanged.
+  Evidence: `/data/tmp/am-real-test-tools-20261109.wneUBrYI/`; this is local
+  setup/real-crypto evidence, not a dispatched Actions or full native run.
+  CASS status finds no local database/index, so no older indexed-history audit
+  is claimed. The preceding retained audit remains the available history.
+- [ ] Original populated native release run and per-step early-return counts
+  still gate .qpacg closure. No selected CLI lane or setup pass replaces them.
+  Publish the bounded patch and release only reservations1221-1224; report
+  actual terminal handoff results after those operations complete.
+
 ## November 9 fresh-eyes Beads handoff — EmeraldEagle
 
 Continue `br-kp1in.45`; no new issue, release claim, or Actions dispatch.
