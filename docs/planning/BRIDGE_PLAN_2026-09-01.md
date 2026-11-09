@@ -1,5 +1,34 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 fresh verification continuation — EmeraldEagle
+
+- [x] Governing docs retain their fully read hashes. Fresh-read the complete
+  source-container/test diff and earlier encrypted-export helper/test; no new
+  functional defect found. Preserve the pending UBS commit exception.
+- [x] Triage current ready work: highest P0 publication work still requires the
+  actual publisher command. Recovery/reservation tasks already cite source
+  implementation; do not duplicate it or close their retained qualification.
+- [ ] Execute the frozen .ku0kl full docs_drift_ci native gate with strict RCH,
+  basee7ffb20f/overlayf3ddaa87, both actual-run deadlines1800s and unchanged disk
+  fences. A fresh attempt after two hours is admitted and compiling on hz4.
+- [ ] Continue .qpacg's existing encrypted-export native unit qualification:
+  compile-only preparation on vmi1152480, default features/build-jobs2/dev.debug0,
+  both preparation deadlines14400s. Preparation earns zero body credit; actual
+  execution retains both1800s, per-test240s and growth30GiB/floor10GiB. Require
+  real age/age-keygen and preserve original export/output assertions. The full
+  original native release populations and early-return counts remain open.
+- [x] That fresh encrypted-export preparation refuses120 before Cargo,
+  started:false/growth0 at45,245,517,824 free bytes; preserve the original
+  30GiB/10GiB fences and do not retry unchanged. No tool installation or native
+  body follows this refusal. Official age1.3.2 asset metadata was read only;
+  the archive was not downloaded and its presence is not project proof.
+- [x] A shared process commits the already-frozen patch as915b4cf8 during this
+  pass. Docker6d3b95a9/testf6a29970/lib2514d5c0 remain unchanged. Do not attribute
+  that Git operation here, amend it, or infer an answer to the pending UBS
+  exception question. Current native request retains its exact frozen inputs.
+- [ ] Record terminal results, second fresh review and exact tracker updates;
+  retain failed attempts, update this list and release only owned leases.
+
 ## November 9 source-container dependency closure — EmeraldEagle
 
 Continue the highest-ranked ready `br-ku0kl`; preserve its full acceptance.
