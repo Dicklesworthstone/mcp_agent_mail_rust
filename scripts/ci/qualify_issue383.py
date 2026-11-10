@@ -84,14 +84,25 @@ def run_gate(evidence, name, command, *, deadline, tests=False, required=(), tim
         or bool(re.match(r"test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;", final or ""))
     )
     cpu = None
+    cpu_error = None
     if name == "archive-maintenance" and passed:
         matches = re.findall(r"GH383 populated maintenance receipt: (\{[^\n]+\})", output)
-        cpu = json.loads(matches[-1]) if matches else None
+        try:
+            cpu = json.loads(matches[-1]) if matches else None
+        except json.JSONDecodeError as error:
+            cpu_error = str(error)
+        timing_valid = isinstance(cpu, dict) and all(
+            type(cpu.get(key)) is int
+            for key in ("wall_ms", "index_bytes", "thread_cpu_ms")
+        )
+        if not timing_valid and cpu_error is None:
+            cpu_error = "missing or invalid populated-worker receipt"
         passed = bool(
-            cpu and cpu["source_messages"] == 256 and cpu["committed_messages"] == 256
+            timing_valid
+            and cpu.get("source_messages") == 256 and cpu.get("committed_messages") == 256
             and cpu["wall_ms"] >= 30_000 and cpu["index_bytes"] > 30 * 1024 * 1024
-            and cpu["thread_cpu_ms"] * 100 <= cpu["wall_ms"] * 35
-            and cpu["reporting_enabled"] is False and cpu["quota_enabled"] is False
+            and 0 <= cpu["thread_cpu_ms"] * 100 <= cpu["wall_ms"] * 35
+            and cpu.get("reporting_enabled") is False and cpu.get("quota_enabled") is False
         )
     receipt = {
         "gate": name,
@@ -102,6 +113,7 @@ def run_gate(evidence, name, command, *, deadline, tests=False, required=(), tim
         "required_tests": list(required),
         "missing_tests": missing,
         "populated_worker": cpu,
+        "populated_worker_error": cpu_error,
         "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
         "passed": passed,
     }
