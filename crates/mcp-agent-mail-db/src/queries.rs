@@ -5059,8 +5059,8 @@ where
     if !include_orphan_placeholders {
         return Outcome::Ok(None);
     }
-    // Orphan placeholders second: this runs the anti-join scans over every
-    // referencing table, so callers only opt in when the identifier could
+    // Orphan placeholders second: this scans references from every source,
+    // so callers only opt in when the identifier could
     // actually match a placeholder (or when matching by raw project id).
     match list_orphan_project_placeholders_with_tracked(cx, tracked).await {
         Outcome::Ok(placeholders) => {
@@ -5118,8 +5118,10 @@ async fn list_projects_with_tracked(
 /// Placeholder rows for project ids that are referenced by messages, agents,
 /// active file reservations, or product links but have no `projects` row.
 ///
-/// This is the expensive half of the project inventory: one anti-join scan
-/// per referencing table plus a MIN() aggregate per orphaned id.
+/// Deduplicate project references before joining to `projects`. The runtime
+/// engine otherwise probes the join for every message/agent even when a large
+/// mailbox has only a few projects. Keeping the join in the same statement
+/// preserves its snapshot and affinity rules, including during recovery.
 async fn list_orphan_project_placeholders_with_tracked(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
@@ -5130,36 +5132,37 @@ async fn list_orphan_project_placeholders_with_tracked(
     let mut orphan_project_ids = std::collections::BTreeSet::new();
     let orphan_sources: Vec<(String, Vec<Value>)> = vec![
         (
-            "SELECT DISTINCT m.project_id AS project_id \
-                     FROM messages m \
-                     LEFT JOIN projects p ON p.id = m.project_id \
+            "SELECT refs.project_id AS project_id \
+                     FROM (SELECT DISTINCT project_id FROM messages) refs \
+                     LEFT JOIN projects p ON p.id = refs.project_id \
                      WHERE p.id IS NULL"
                 .to_string(),
             vec![],
         ),
         (
-            "SELECT DISTINCT a.project_id AS project_id \
-                     FROM agents a \
-                     LEFT JOIN projects p ON p.id = a.project_id \
+            "SELECT refs.project_id AS project_id \
+                     FROM (SELECT DISTINCT project_id FROM agents) refs \
+                     LEFT JOIN projects p ON p.id = refs.project_id \
                      WHERE p.id IS NULL"
                 .to_string(),
             vec![],
         ),
         (
             format!(
-                "SELECT DISTINCT file_reservations.project_id AS project_id \
-                         FROM file_reservations \
-                         LEFT JOIN projects p ON p.id = file_reservations.project_id \
-                         WHERE p.id IS NULL \
-                           AND ({ACTIVE_RESERVATION_PREDICATE}) \
-                           AND file_reservations.expires_ts > ?"
+                "SELECT refs.project_id AS project_id \
+                         FROM (SELECT DISTINCT file_reservations.project_id AS project_id \
+                               FROM file_reservations \
+                               WHERE ({ACTIVE_RESERVATION_PREDICATE}) \
+                                 AND file_reservations.expires_ts > ?) refs \
+                         LEFT JOIN projects p ON p.id = refs.project_id \
+                         WHERE p.id IS NULL"
             ),
             vec![Value::BigInt(now_us)],
         ),
         (
-            "SELECT DISTINCT ppl.project_id AS project_id \
-                     FROM product_project_links ppl \
-                     LEFT JOIN projects p ON p.id = ppl.project_id \
+            "SELECT refs.project_id AS project_id \
+                     FROM (SELECT DISTINCT project_id FROM product_project_links) refs \
+                     LEFT JOIN projects p ON p.id = refs.project_id \
                      WHERE p.id IS NULL"
                 .to_string(),
             vec![],
@@ -40580,6 +40583,90 @@ mod tests {
                 orphaned_project.human_key,
                 format!("[unknown-project-{project_id}]")
             );
+        });
+    }
+
+    #[test]
+    fn project_inventory_deduplicates_references_without_losing_orphan_sources() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build project inventory runtime");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs project inventory context");
+            let conn = crate::DbConn::open_memory().expect("open project inventory fixture");
+            // Deliberately omit foreign keys to represent a partially restored
+            // mailbox. A real empty project must stay visible alongside orphans.
+            conn.execute_raw(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER); \
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, created_ts INTEGER); \
+                 CREATE INDEX idx_messages_project_created ON messages(project_id, created_ts); \
+                 CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, inception_ts INTEGER); \
+                 CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, created_ts INTEGER, expires_ts INTEGER, released_ts); \
+                 CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER); \
+                 CREATE TABLE product_project_links (id INTEGER PRIMARY KEY, project_id INTEGER, created_at INTEGER); \
+                 INSERT INTO projects VALUES (1, 'healthy', '/healthy', 50), (2, 'empty', '/empty', 25); \
+                 INSERT INTO messages VALUES (1, 1, 100), (2, 10, 500), (3, 10, 300), (4, 10, 400); \
+                 INSERT INTO agents VALUES (1, 1, 10), (2, 10, 20), (3, 11, 600), (4, 11, 700); \
+                 INSERT INTO product_project_links VALUES (1, 1, 1), (2, 10, 1), (3, 11, 2), (4, 12, 10), (5, 13, 800), (6, 13, 900); \
+                 INSERT INTO file_reservations VALUES \
+                     (1, 12, 700, 9000000000000000000, NULL), \
+                     (2, 14, 800, 0, NULL), \
+                     (3, 15, 800, 9000000000000000000, 1), \
+                     (4, 16, 800, 9000000000000000000, NULL), \
+                     (5, 17, 900, 9000000000000000000, 'none'), \
+                     (6, 18, 950, 9000000000000000000, -1); \
+                 INSERT INTO file_reservation_releases VALUES (4, 1);",
+            )
+            .expect("seed all project reference sources and release states");
+            for id in 5..261 {
+                conn.execute_sync(
+                    "INSERT INTO messages VALUES (?, ?, ?)",
+                    &[
+                        Value::BigInt(id),
+                        Value::BigInt(if id % 2 == 0 { 1 } else { 10 }),
+                        Value::BigInt(5_000 + id),
+                    ],
+                )
+                .expect("seed repeated healthy and orphan project references");
+            }
+            let inventory = list_projects_with_tracked(&cx, &tracked(&conn))
+                .await
+                .into_result()
+                .expect("read project inventory");
+            let actual: BTreeMap<i64, i64> = inventory
+                .iter()
+                .map(|project| (project.id.unwrap(), project.created_at))
+                .collect();
+            assert_eq!(inventory.len(), actual.len(), "one row per project identity");
+            assert_eq!(
+                actual,
+                BTreeMap::from([
+                    (1, 50), (2, 25), (10, 300), (11, 600),
+                    (12, 700), (13, 800), (17, 900), (18, 950),
+                ]),
+                "preserve source priority, active legacy sentinels, and release-ledger exclusion"
+            );
+            for project in inventory.iter().filter(|project| project.id.unwrap() >= 10) {
+                assert_eq!(
+                    project.slug,
+                    format!("[unknown-project-{}]", project.id.unwrap())
+                );
+            }
+            conn.execute_raw(
+                "INSERT INTO projects VALUES (10, 'restored', '/restored', 60); \
+                 DELETE FROM projects WHERE id = 1;",
+            )
+            .expect("change recovery state between inventories");
+            let next = list_projects_with_tracked(&cx, &tracked(&conn))
+                .await
+                .into_result()
+                .expect("read current recovery state");
+            let restored = next.iter().find(|project| project.id == Some(10)).unwrap();
+            assert_eq!(restored.slug, "restored");
+            assert_eq!(restored.created_at, 60);
+            let newly_orphaned = next.iter().find(|project| project.id == Some(1)).unwrap();
+            assert_eq!(newly_orphaned.slug, "[unknown-project-1]");
+            assert_eq!(newly_orphaned.created_at, 100);
         });
     }
 
