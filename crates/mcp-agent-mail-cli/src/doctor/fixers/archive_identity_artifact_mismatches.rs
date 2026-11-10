@@ -12,8 +12,11 @@
 //!   archive profile path
 //!   (`<storage_root>/projects/<slug>/agents/<name>/profile.json`)
 //!   that is missing on disk, OR the on-disk `profile.json`
-//!   disagrees with the DB identity fields (name, program, model,
-//!   capabilities). `whois`, `register_agent` validation, and
+//!   disagrees with the DB identity fields (name, program, model),
+//!   surviving inception/registration timestamps, retirement, or
+//!   permanent deregistration. Legacy tombstones are checked
+//!   against the live deregistration ledger. `whois`,
+//!   `register_agent` validation, and
 //!   `am robot agents` rely on this artifact for human-auditable
 //!   identity provenance.
 //! - **FileReservationArtifactMismatch** — a `file_reservations`
@@ -54,14 +57,19 @@
 //! 1. Run `am doctor archive-verify --json` and preserve the
 //!    current DB/archive before mutating either side.
 //! 2. For each affected entry: compare the on-disk artifact (if
-//!    present) with the DB row. Pick the authoritative side.
-//! 3. If archive is authoritative: `am doctor reconstruct --yes`
-//!    rebuilds the SQLite rows from the archive artifacts.
-//! 4. If DB is authoritative: restore the missing archive
-//!    artifacts from a known-good backup, OR manually regenerate
-//!    them by re-running `register_agent` / re-issuing the file
-//!    reservation. There is no broad DB-to-archive rewrite
-//!    command.
+//!    present) with the DB row and deregistration ledger. An
+//!    absent or unreadable ledger does not authorize clearing an
+//!    archive tombstone. Preserve explicit and legacy markers;
+//!    never re-register an agent to erase a lifecycle conflict.
+//! 3. Establish authority from the working/committed archive and
+//!    known-good backups. `am doctor reconstruct --dry-run --json`
+//!    previews a rebuild; apply only after preserving evidence
+//!    and obeying the supervised-owner safety guard.
+//! 4. For ordinary missing/non-lifecycle artifacts, restore a
+//!    known-good backup once authority is established. Re-run
+//!    `register_agent` only after excluding identity-timestamp
+//!    and lifecycle conflicts; re-issue file reservations only
+//!    when the live lease is authoritative.
 //! 5. Re-run this detector to confirm zero residual mismatches.
 
 #![forbid(unsafe_code)]
@@ -123,13 +131,13 @@ impl ArchiveIdentityArtifactFinding {
                 "manual_remediation": {
                     "steps": [
                         "Run `am doctor archive-verify --json` and preserve the current DB/archive before mutating either side.",
-                        "For each entry: compare the on-disk artifact (if present) with the DB row. Pick the authoritative side.",
-                        "If archive is authoritative: `am doctor reconstruct --dry-run --json` previews the SQLite rebuild; `am doctor reconstruct --yes` applies it after preserving forensics/backups.",
-                        "If DB is authoritative for an agent profile: restore the profile from a backup, OR re-run `register_agent` to write a fresh profile from current DB state.",
+                        "Compare each artifact with the DB row and deregistration ledger. Preserve explicit and legacy tombstones; an absent or unreadable ledger does not authorize clearing them. Never re-register an agent to erase an identity-timestamp or lifecycle conflict.",
+                        "Establish authority using the working and committed archive history and known-good backups. `am doctor reconstruct --dry-run --json` previews the SQLite rebuild; apply only after preserving evidence and obeying the supervised-owner safety guard.",
+                        "For an ordinary missing/non-lifecycle agent profile, restore a known-good backup after establishing authority. Re-run `register_agent` only after excluding identity-timestamp and lifecycle conflicts.",
                         "If DB is authoritative for a file reservation: restore the artifact from a backup, OR re-issue the reservation (`file_reservation_paths` MCP tool) to regenerate the artifact.",
                         "Re-run `am doctor fix --only fm-archive-state-files-archive-identity-artifact-mismatches --list` to confirm zero residual mismatches.",
                     ],
-                    "warning": "Auto-fix is intentionally NOT implemented — picking the wrong authoritative side either over-blocks pre-commit (false positive) or under-blocks (silent reservation bypass). Inspect both sides before reconstructing.",
+                    "warning": "Auto-fix is intentionally NOT implemented. Permanent deregistration is lifecycle evidence; an absent or unreadable live ledger is not authority to clear archive tombstones. Picking the wrong side can resurrect an identity or change reservation enforcement. Preserve and inspect both sides before reconstructing.",
                     "pre_commit_guard_impact": "FileReservationArtifactMismatch directly affects the pre-commit guard. A drifted artifact can either reject legitimate commits (over-block) or allow conflicting writes that should have been rejected (under-block). Treat as P1.",
                     "common_causes": [
                         "Half-flushed commit coalescer write — DB row landed but the JSON artifact didn't, or vice versa.",

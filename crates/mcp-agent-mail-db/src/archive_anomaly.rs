@@ -1498,6 +1498,17 @@ struct DbAgentProfileExpectation {
     agent_name: String,
     program: String,
     model: String,
+    inception_ts: DbProfileTimestamp,
+    retired_at: DbProfileTimestamp,
+    deregistered_at: DbProfileTimestamp,
+}
+
+/// Missing or malformed lifecycle evidence never proves an identity is active.
+#[derive(Debug, Clone, Copy)]
+enum DbProfileTimestamp {
+    Unavailable,
+    Unreadable,
+    Known(Option<i64>),
 }
 
 #[derive(Debug)]
@@ -1890,21 +1901,72 @@ fn query_db_mailbox_copy_expectations(
 fn query_db_agent_profile_expectations(
     conn: &crate::pool::GuardedReadOnlyConn,
 ) -> Result<Vec<DbAgentProfileExpectation>, String> {
+    // Diagnostics also inspect restored, unmigrated databases. Do not let
+    // absent lifecycle columns disable the existing identity checks, and do
+    // not mistake an unavailable ledger for a known, empty live ledger.
+    let columns = |sql: &str| -> Result<HashSet<String>, String> {
+        conn.query_sync(sql, &[])
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                row.get_named::<String>("name")
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    };
+    let agent_columns = columns("PRAGMA table_info(agents)")?;
+    let ledger_columns = columns("PRAGMA table_info(agent_deregistrations)")?;
+    let has_inception = agent_columns.contains("inception_ts");
+    let has_retirement = agent_columns.contains("retired_at");
+    let has_ledger =
+        ledger_columns.contains("agent_id") && ledger_columns.contains("deregistered_at");
+    let inception = if has_inception {
+        "a.inception_ts"
+    } else {
+        "NULL"
+    };
+    let retirement = if has_retirement {
+        "a.retired_at"
+    } else {
+        "NULL"
+    };
+    let (deregistration, ledger_join) = if has_ledger {
+        (
+            "d.deregistered_at",
+            "LEFT JOIN agent_deregistrations d ON d.agent_id = a.id",
+        )
+    } else {
+        ("NULL", "")
+    };
     let rows = conn
         .query_sync(
-            "SELECT p.slug AS project_slug,
+            &format!(
+                "SELECT p.slug AS project_slug,
                     a.name AS agent_name,
                     a.program AS program,
-                    a.model AS model
+                    a.model AS model,
+                    {inception} AS inception_ts,
+                    {retirement} AS retired_at,
+                    {deregistration} AS deregistered_at
              FROM agents a
              JOIN projects p ON p.id = a.project_id
-             ORDER BY p.slug, a.name",
+             {ledger_join}
+             ORDER BY p.slug, a.name"
+            ),
             &[],
         )
         .map_err(|error| error.to_string())?;
 
     rows.into_iter()
         .map(|row| {
+            let timestamp = |field: &str, available: bool| {
+                if available {
+                    row.get_named::<Option<i64>>(field)
+                        .map_or(DbProfileTimestamp::Unreadable, DbProfileTimestamp::Known)
+                } else {
+                    DbProfileTimestamp::Unavailable
+                }
+            };
             Ok(DbAgentProfileExpectation {
                 project_slug: row
                     .get_named::<String>("project_slug")
@@ -1918,6 +1980,9 @@ fn query_db_agent_profile_expectations(
                 model: row
                     .get_named::<String>("model")
                     .map_err(|error| error.to_string())?,
+                inception_ts: timestamp("inception_ts", has_inception),
+                retired_at: timestamp("retired_at", has_retirement),
+                deregistered_at: timestamp("deregistered_at", has_ledger),
             })
         })
         .collect()
@@ -1968,6 +2033,117 @@ fn json_string_field(json: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn profile_timestamp_mismatch_detail(
+    json: &serde_json::Value,
+    field: &str,
+    expected: DbProfileTimestamp,
+) -> Option<String> {
+    if matches!(expected, DbProfileTimestamp::Unreadable) {
+        return Some(format!(
+            "{field} cannot be verified: invalid database timestamp; preserve lifecycle evidence"
+        ));
+    }
+    let Some(value) = json.get(field).filter(|value| !value.is_null()) else {
+        return match expected {
+            DbProfileTimestamp::Known(Some(timestamp)) => {
+                Some(format!("{field} archive=null db={timestamp}"))
+            }
+            DbProfileTimestamp::Known(None)
+            | DbProfileTimestamp::Unavailable
+            | DbProfileTimestamp::Unreadable => None,
+        };
+    };
+    // Match reconciliation/reconstruction: integer microseconds, numeric
+    // strings and ISO-8601 strings describe the same timestamp. A malformed
+    // non-null marker must never be treated as an active identity.
+    let actual = match value {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(value) => value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .or_else(|| mcp_agent_mail_core::iso_to_micros(value.trim())),
+        _ => None,
+    };
+    if let DbProfileTimestamp::Known(expected) = expected
+        && actual.is_some()
+        && actual == expected
+    {
+        return None;
+    }
+    let expected = match expected {
+        DbProfileTimestamp::Known(Some(timestamp)) => timestamp.to_string(),
+        DbProfileTimestamp::Known(None) => "null".to_string(),
+        DbProfileTimestamp::Unavailable => {
+            "unavailable (timestamp missing from source schema)".to_string()
+        }
+        DbProfileTimestamp::Unreadable => "invalid database timestamp".to_string(),
+    };
+    Some(match actual {
+        Some(actual) => format!("{field} archive={actual} db={expected}"),
+        // Arbitrary invalid payloads may contain private data; never echo them.
+        None => format!("{field} has an invalid archive timestamp; db={expected}"),
+    })
+}
+
+fn profile_lifecycle_mismatch_details(
+    expected: &DbAgentProfileExpectation,
+    json: &serde_json::Value,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    // Legacy profiles may omit inception or use registered_ts. Reconciliation
+    // validates every non-null identity timestamp that survives.
+    for field in ["inception_ts", "registered_ts"] {
+        let has_marker = json.get(field).is_some_and(|value| !value.is_null());
+        let invalid_source = field == "inception_ts"
+            && matches!(expected.inception_ts, DbProfileTimestamp::Unreadable);
+        if (has_marker || invalid_source)
+            && let Some(detail) =
+                profile_timestamp_mismatch_detail(json, field, expected.inception_ts)
+        {
+            mismatches.push(detail);
+        }
+    }
+    if let Some(detail) = profile_timestamp_mismatch_detail(json, "retired_at", expected.retired_at)
+    {
+        mismatches.push(detail);
+    }
+    let legacy_tombstone = json
+        .get("task_description")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(crate::models::task_description_uses_reserved_deregistered_prefix)
+        && json
+            .get("contact_policy")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|policy| policy.eq_ignore_ascii_case("block_all"));
+    // A legacy tombstone already represents permanent deregistration when a
+    // live ledger entry exists. Do not require a newly introduced JSON field
+    // in that case, but validate an explicit marker whenever one is present.
+    let legacy_matches_ledger = legacy_tombstone
+        && matches!(expected.deregistered_at, DbProfileTimestamp::Known(Some(_)))
+        && json
+            .get("deregistered_at")
+            .is_none_or(serde_json::Value::is_null);
+    if !legacy_matches_ledger
+        && let Some(detail) =
+            profile_timestamp_mismatch_detail(json, "deregistered_at", expected.deregistered_at)
+    {
+        mismatches.push(detail);
+    }
+    if legacy_tombstone {
+        match expected.deregistered_at {
+            DbProfileTimestamp::Known(None) => mismatches.push(
+                "legacy deregistration tombstone conflicts with the absent live ledger entry; preserve the tombstone".to_string(),
+            ),
+            DbProfileTimestamp::Unavailable | DbProfileTimestamp::Unreadable => mismatches.push(
+                "legacy deregistration tombstone cannot be verified because the live ledger is unavailable; preserve the tombstone".to_string(),
+            ),
+            DbProfileTimestamp::Known(Some(_)) => {}
+        }
+    }
+    mismatches
+}
+
 fn profile_mismatch_detail(
     expected: &DbAgentProfileExpectation,
     artifact: &ArchiveJsonArtifact,
@@ -1994,6 +2170,7 @@ fn profile_mismatch_detail(
         }
     }
 
+    mismatches.extend(profile_lifecycle_mismatch_details(expected, json));
     (!mismatches.is_empty()).then(|| mismatches.join("; "))
 }
 
@@ -2460,6 +2637,165 @@ mod tests {
         assert_eq!(reservation.tag(), "file_reservation_artifact_mismatch");
     }
 
+    fn profile_expectation() -> DbAgentProfileExpectation {
+        DbAgentProfileExpectation {
+            project_slug: "demo-project".to_string(),
+            agent_name: "BlueLake".to_string(),
+            program: "codex-cli".to_string(),
+            model: "gpt-5".to_string(),
+            inception_ts: DbProfileTimestamp::Known(Some(1_000_000)),
+            retired_at: DbProfileTimestamp::Known(None),
+            deregistered_at: DbProfileTimestamp::Known(None),
+        }
+    }
+
+    fn profile_artifact(profile: serde_json::Value) -> ArchiveJsonArtifact {
+        ArchiveJsonArtifact {
+            path: PathBuf::from("/archive/projects/demo-project/agents/BlueLake/profile.json"),
+            json: Some(profile),
+            parse_error: None,
+        }
+    }
+
+    #[test]
+    fn profile_lifecycle_timestamps_accept_equivalent_archive_encodings() {
+        let mut expected = profile_expectation();
+        expected.retired_at = DbProfileTimestamp::Known(Some(1_000_000));
+        expected.deregistered_at = DbProfileTimestamp::Known(Some(1_000_000));
+        for timestamp in [
+            serde_json::json!(1_000_000),
+            serde_json::json!(" 1000000 "),
+            serde_json::json!("1970-01-01T00:00:01Z"),
+            serde_json::json!("1970-01-01T01:00:01+01:00"),
+        ] {
+            let artifact = profile_artifact(serde_json::json!({
+                "name": "BlueLake",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "inception_ts": timestamp,
+                "registered_ts": timestamp,
+                "retired_at": timestamp,
+                "deregistered_at": timestamp,
+                "last_active_ts": 99,
+            }));
+            assert_eq!(profile_mismatch_detail(&expected, &artifact), None);
+        }
+    }
+
+    #[test]
+    fn profile_lifecycle_timestamps_distinguish_missing_markers_and_live_state() {
+        for field in ["retired_at", "deregistered_at"] {
+            for (live, archived, mismatch) in [
+                (None, None, false),
+                (None, Some(serde_json::Value::Null), false),
+                (None, Some(serde_json::json!(2_000_000)), true),
+                (Some(2_000_000), None, true),
+                (Some(2_000_000), Some(serde_json::Value::Null), true),
+                (Some(2_000_000), Some(serde_json::json!(2_000_000)), false),
+                (Some(2_000_000), Some(serde_json::json!(3_000_000)), true),
+            ] {
+                let mut expected = profile_expectation();
+                if field == "retired_at" {
+                    expected.retired_at = DbProfileTimestamp::Known(live);
+                } else {
+                    expected.deregistered_at = DbProfileTimestamp::Known(live);
+                }
+                let mut profile = serde_json::json!({
+                    "name": "BlueLake", "program": "codex-cli", "model": "gpt-5",
+                });
+                if let Some(value) = archived {
+                    profile[field] = value;
+                }
+                let detail = profile_mismatch_detail(&expected, &profile_artifact(profile));
+                assert_eq!(
+                    detail.is_some(),
+                    mismatch,
+                    "{field} live={live:?}: {detail:?}"
+                );
+                if let Some(detail) = detail {
+                    assert!(detail.contains(field));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn profile_lifecycle_timestamps_never_treat_malformed_markers_as_active() {
+        let expected = profile_expectation();
+        for field in [
+            "inception_ts",
+            "registered_ts",
+            "retired_at",
+            "deregistered_at",
+        ] {
+            for timestamp in [
+                serde_json::json!("private-invalid-timestamp"),
+                serde_json::json!(""),
+                serde_json::json!(false),
+                serde_json::json!(1.5),
+                serde_json::json!(u64::MAX),
+                serde_json::json!([]),
+                serde_json::json!({"timestamp": 1_000_000}),
+            ] {
+                let mut profile = serde_json::json!({
+                    "name": "BlueLake", "program": "codex-cli", "model": "gpt-5",
+                });
+                profile[field] = timestamp;
+                let detail = profile_mismatch_detail(&expected, &profile_artifact(profile))
+                    .expect("non-null malformed lifecycle marker must be reported");
+                assert!(detail.contains(field));
+                assert!(detail.contains("invalid archive timestamp"));
+                assert!(!detail.contains("private-invalid-timestamp"));
+            }
+        }
+    }
+
+    #[test]
+    fn profile_identity_timestamp_aliases_and_legacy_tombstones_remain_visible() {
+        let mut expected = profile_expectation();
+        for field in ["inception_ts", "registered_ts"] {
+            let mut profile = serde_json::json!({
+                "name": "BlueLake", "program": "codex-cli", "model": "gpt-5",
+            });
+            assert_eq!(
+                profile_mismatch_detail(&expected, &profile_artifact(profile.clone())),
+                None
+            );
+            profile[field] = serde_json::Value::Null;
+            assert_eq!(
+                profile_mismatch_detail(&expected, &profile_artifact(profile.clone())),
+                None
+            );
+            profile[field] = serde_json::json!(2_000_000);
+            let detail = profile_mismatch_detail(&expected, &profile_artifact(profile))
+                .expect("surviving identity timestamps must agree");
+            assert!(detail.contains(field));
+        }
+
+        let mut profile = serde_json::json!({
+            "name": "BlueLake", "program": "codex-cli", "model": "gpt-5",
+            "task_description": "[DEREGISTERED at 1970-01-01T00:00:02Z] retired task",
+            "contact_policy": "BLOCK_ALL",
+        });
+        let detail = profile_mismatch_detail(&expected, &profile_artifact(profile.clone()))
+            .expect("legacy tombstone without a ledger is a conflict");
+        assert!(detail.contains("legacy deregistration tombstone"));
+        assert!(detail.contains("preserve the tombstone"));
+        expected.deregistered_at = DbProfileTimestamp::Known(Some(2_000_000));
+        assert_eq!(
+            profile_mismatch_detail(&expected, &profile_artifact(profile.clone())),
+            None,
+            "legacy tombstones do not require an explicit timestamp field"
+        );
+        expected.deregistered_at = DbProfileTimestamp::Known(None);
+        profile["contact_policy"] = serde_json::json!("auto");
+        assert_eq!(
+            profile_mismatch_detail(&expected, &profile_artifact(profile)),
+            None,
+            "the reserved prefix alone is not the legacy deregistration contract"
+        );
+    }
+
     fn init_archive_verifier_db(db_path: &Path) -> crate::DbConn {
         let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
         conn.execute_raw(&crate::schema::init_schema_sql_base())
@@ -2606,6 +2942,274 @@ mod tests {
         assert_eq!(report.by_tag("message_recipient_copy_mismatch").len(), 1);
         assert_eq!(report.by_tag("agent_profile_mismatch").len(), 1);
         assert_eq!(report.by_tag("file_reservation_artifact_mismatch").len(), 1);
+    }
+
+    fn write_verifier_profile(
+        storage_root: &Path,
+        name: &str,
+        fields: &serde_json::Value,
+    ) -> (PathBuf, Vec<u8>) {
+        let project = storage_root.join("projects").join("demo-project");
+        let path = project.join("agents").join(name).join("profile.json");
+        std::fs::create_dir_all(path.parent().expect("profile parent")).expect("mkdir profile");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/data/projects/demo-project"}"#,
+        )
+        .expect("project metadata");
+        let mut profile = serde_json::json!({
+            "name": name, "program": "codex-cli", "model": "gpt-5",
+        });
+        profile
+            .as_object_mut()
+            .expect("profile object")
+            .extend(fields.as_object().expect("field object").clone());
+        let bytes = serde_json::to_vec_pretty(&profile).expect("serialize profile");
+        std::fs::write(&path, &bytes).expect("write profile");
+        (path, bytes)
+    }
+
+    fn profile_details(report: &ArchiveAnomalyReport) -> BTreeMap<String, String> {
+        report
+            .by_tag("agent_profile_mismatch")
+            .into_iter()
+            .map(|anomaly| {
+                assert_eq!(anomaly.remediation_class(), RemediationClass::ReportOnly);
+                let ArchiveAnomalyKind::AgentProfileMismatch {
+                    agent_name, detail, ..
+                } = &anomaly.kind
+                else {
+                    panic!("agent profile tag must retain its typed finding");
+                };
+                (agent_name.clone(), detail.clone())
+            })
+            .collect()
+    }
+
+    fn init_lifecycle_verifier_db(db_path: &Path) {
+        let conn = init_archive_verifier_db(db_path);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'demo-project', '/data/projects/demo-project', 0);
+             INSERT INTO agents
+                (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at)
+             VALUES
+                (10, 1, 'BlueLake', 'codex-cli', 'gpt-5', 1000000, 1000000, NULL),
+                (11, 1, 'GreenField', 'codex-cli', 'gpt-5', 1000000, 1000000, NULL),
+                (12, 1, 'SilverStone', 'codex-cli', 'gpt-5', 1000000, 1000000, 2000000),
+                (13, 1, 'AmberFox', 'codex-cli', 'gpt-5', 1000000, 1000000, NULL),
+                (14, 1, 'CopperLake', 'codex-cli', 'gpt-5', 1000000, 1000000, NULL),
+                (15, 1, 'GoldenWolf', 'codex-cli', 'gpt-5', 1000000, 1000000, NULL),
+                (16, 1, 'QuietLake', 'codex-cli', 'gpt-5', 1000000, 1000000, 2000000),
+                (17, 1, 'ColdLake', 'codex-cli', 'gpt-5', 1000000, 1000000, NULL);
+             INSERT INTO agent_deregistrations (agent_id, deregistered_at)
+             VALUES (11, 2000000), (16, 3000000);",
+        )
+        .expect("seed lifecycle ledger");
+        crate::close_db_conn(conn, "settle lifecycle verifier fixture");
+    }
+
+    fn lifecycle_profile_cases() -> [(&'static str, serde_json::Value, Option<&'static str>); 8] {
+        [
+            (
+                "BlueLake",
+                serde_json::json!({"deregistered_at": 2_000_000}),
+                Some("deregistered_at archive=2000000 db=null"),
+            ),
+            (
+                "GreenField",
+                serde_json::json!({}),
+                Some("deregistered_at archive=null db=2000000"),
+            ),
+            (
+                "SilverStone",
+                serde_json::json!({"retired_at": null}),
+                Some("retired_at archive=null db=2000000"),
+            ),
+            (
+                "AmberFox",
+                serde_json::json!({"registered_ts": 2_000_000}),
+                Some("registered_ts archive=2000000 db=1000000"),
+            ),
+            (
+                "CopperLake",
+                serde_json::json!({"deregistered_at": "private-invalid-timestamp"}),
+                Some("deregistered_at has an invalid archive timestamp"),
+            ),
+            (
+                "GoldenWolf",
+                serde_json::json!({
+                    "task_description": "[DEREGISTERED at 1970-01-01T00:00:02Z] old task",
+                    "contact_policy": "block_all",
+                }),
+                Some("legacy deregistration tombstone"),
+            ),
+            (
+                "QuietLake",
+                serde_json::json!({
+                    "inception_ts": "1000000",
+                    "registered_ts": "1970-01-01T00:00:01Z",
+                    "retired_at": "1970-01-01T00:00:02Z",
+                    "deregistered_at": "1970-01-01T00:00:03Z",
+                }),
+                None,
+            ),
+            (
+                "ColdLake",
+                serde_json::json!({"retired_at": null, "deregistered_at": null}),
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn scan_archive_profile_lifecycle_reports_conflicts_without_mutating_evidence() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("mail.sqlite3");
+        init_lifecycle_verifier_db(&db_path);
+        let profiles = lifecycle_profile_cases();
+        let originals: Vec<_> = profiles
+            .iter()
+            .map(|(name, fields, _)| write_verifier_profile(&storage_root, name, fields))
+            .collect();
+        let database_before = std::fs::read(&db_path).expect("read database before diagnosis");
+        let report = scan_archive_anomalies_with_db(&storage_root, &db_path);
+        let details = profile_details(&report);
+        assert_eq!(details.len(), 6, "{details:#?}");
+        for (name, _, expected_detail) in &profiles {
+            if let Some(expected_detail) = expected_detail {
+                assert!(
+                    details
+                        .get(*name)
+                        .is_some_and(|detail| detail.contains(*expected_detail)),
+                    "{name}: {details:#?}"
+                );
+            } else {
+                assert!(!details.contains_key(*name), "equivalent lifecycle: {name}");
+            }
+        }
+        assert!(
+            details
+                .values()
+                .all(|detail| !detail.contains("private-invalid-timestamp"))
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("database after diagnosis"),
+            database_before
+        );
+        for (path, before) in originals {
+            assert_eq!(
+                std::fs::read(path).expect("profile after diagnosis"),
+                before
+            );
+        }
+    }
+
+    fn init_restored_profile_db(
+        db_path: &Path,
+        agent_columns: &str,
+        ledger_columns: &str,
+        invalid_retirement: bool,
+    ) {
+        let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open restored db");
+        conn.execute_raw(&format!(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, model TEXT{agent_columns});
+             INSERT INTO projects VALUES (1, 'demo-project', '/data/projects/demo-project', 0);
+             INSERT INTO agents (id, project_id, name, program, model) VALUES
+                (10, 1, 'BlueLake', 'codex-cli', 'gpt-5'),
+                (11, 1, 'GreenField', 'codex-cli', 'gpt-5'),
+                (12, 1, 'SilverStone', 'codex-cli', 'gpt-5');"
+        ))
+        .expect("seed restored schema");
+        if !ledger_columns.is_empty() {
+            conn.execute_raw(&format!(
+                "CREATE TABLE agent_deregistrations {ledger_columns};"
+            ))
+            .expect("create ledger schema");
+        }
+        if invalid_retirement {
+            conn.execute_raw(
+                "UPDATE agents SET retired_at = 'private-invalid-db-timestamp' WHERE id = 10;",
+            )
+            .expect("seed damaged lifecycle value");
+        }
+    }
+
+    #[test]
+    fn scan_archive_profiles_keep_identity_checks_with_old_or_invalid_lifecycle_schema() {
+        for (label, agent_columns, ledger_columns, invalid_retirement, ledger_detail) in [
+            ("old", "", "", false, "db=unavailable"),
+            (
+                "partial ledger",
+                ", inception_ts INTEGER DEFAULT 1000000, retired_at INTEGER",
+                "(agent_id INTEGER PRIMARY KEY)",
+                false,
+                "db=unavailable",
+            ),
+            (
+                "malformed timestamp",
+                ", inception_ts INTEGER DEFAULT 1000000, retired_at INTEGER",
+                "(agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER)",
+                true,
+                "db=null",
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let storage_root = temp.path().join("storage");
+            let db_path = temp.path().join("restored.sqlite3");
+            init_restored_profile_db(&db_path, agent_columns, ledger_columns, invalid_retirement);
+            let originals = [
+                write_verifier_profile(
+                    &storage_root,
+                    "BlueLake",
+                    &serde_json::json!({"model": "wrong-model"}),
+                ),
+                write_verifier_profile(
+                    &storage_root,
+                    "GreenField",
+                    &serde_json::json!({"deregistered_at": 2_000_000}),
+                ),
+                write_verifier_profile(&storage_root, "SilverStone", &serde_json::json!({})),
+            ];
+            let database_before = std::fs::read(&db_path).expect("read restored database");
+            let report = scan_archive_anomalies_with_db(&storage_root, &db_path);
+            let details = profile_details(&report);
+            assert_eq!(details.len(), 2, "{label}: {details:#?}");
+            let blue = details
+                .get("BlueLake")
+                .expect("identity mismatch remains visible");
+            assert!(
+                blue.contains("model archive='wrong-model' db='gpt-5'"),
+                "{label}: {blue}"
+            );
+            if invalid_retirement {
+                assert!(blue.contains("retired_at"));
+                assert!(blue.contains("invalid database timestamp"));
+                assert!(!blue.contains("private-invalid-db-timestamp"));
+            }
+            let green = details
+                .get("GreenField")
+                .expect("surviving tombstone is not treated as active");
+            assert!(green.contains("deregistered_at"));
+            assert!(green.contains(ledger_detail), "{label}: {green}");
+            assert!(
+                !details.contains_key("SilverStone"),
+                "{label}: old active profiles remain valid"
+            );
+            assert_eq!(
+                std::fs::read(&db_path).expect("database after diagnosis"),
+                database_before
+            );
+            for (path, before) in originals {
+                assert_eq!(
+                    std::fs::read(path).expect("profile after diagnosis"),
+                    before
+                );
+            }
+        }
     }
 
     #[test]

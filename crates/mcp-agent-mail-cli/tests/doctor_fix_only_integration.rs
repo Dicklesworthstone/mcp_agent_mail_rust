@@ -872,6 +872,82 @@ fn detect_only_archive_identity_artifact_uses_db_aware_scan() {
 }
 
 #[test]
+fn detect_only_archive_identity_reports_lifecycle_conflicts_without_rewriting_tombstones() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let (storage_root, db_path) = seed_db_only_message_fixture(&td);
+    let project = storage_root.join("projects").join("demo-project");
+    let mut originals = Vec::new();
+    for name in ["BlueLake", "GreenField"] {
+        let path = project.join("agents").join(name).join("profile.json");
+        fs::create_dir_all(path.parent().expect("profile parent")).expect("mkdir profile");
+        let mut profile = serde_json::json!({
+            "name": name, "program": "codex-cli", "model": "gpt-5",
+        });
+        if name == "BlueLake" {
+            profile["deregistered_at"] = serde_json::json!("1970-01-01T00:00:02Z");
+        }
+        let bytes = serde_json::to_vec_pretty(&profile).expect("serialize profile");
+        fs::write(&path, &bytes).expect("write profile");
+        originals.push((path, bytes));
+    }
+    fs::write(
+        project.join("project.json"),
+        r#"{"slug":"demo-project","human_key":"/data/projects/demo-project"}"#,
+    )
+    .expect("project metadata");
+    let before_database = fs::read(&db_path).expect("database before diagnosis");
+    let mut inputs = empty_inputs(&td);
+    inputs.storage_root = Some(storage_root);
+    inputs.db_file_candidates = vec![db_path.clone()];
+
+    let outcome = fixers::detect_only(fixers::archive_identity_artifact_mismatches::FM_ID, &inputs)
+        .expect("detect_only lifecycle mismatch");
+    assert_eq!(outcome.findings_count, 1);
+    let finding = &outcome.findings[0];
+    assert!(!finding.remediation.auto_fixable);
+    let profiles = finding.evidence["agent_profile_mismatches"]
+        .as_array()
+        .expect("profile mismatch evidence");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0]["agent_name"], "BlueLake");
+    assert!(
+        profiles[0]["detail"]
+            .as_str()
+            .expect("mismatch detail")
+            .contains("deregistered_at archive=2000000 db=null")
+    );
+    assert_eq!(
+        fs::read(&db_path).expect("database after diagnosis"),
+        before_database
+    );
+    for (path, before) in &originals {
+        assert_eq!(&fs::read(path).expect("profile after diagnosis"), before);
+    }
+
+    {
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open live ledger");
+        conn.execute_raw(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (10, 2000000);",
+        )
+        .expect("record matching live deregistration");
+    }
+    let matching_database = fs::read(&db_path).expect("database with matching ledger");
+    let matching =
+        fixers::detect_only(fixers::archive_identity_artifact_mismatches::FM_ID, &inputs)
+            .expect("detect_only matching lifecycle");
+    assert_eq!(matching.findings_count, 0);
+    assert_eq!(
+        fs::read(&db_path).expect("database after matching diagnosis"),
+        matching_database
+    );
+    for (path, before) in originals {
+        assert_eq!(fs::read(path).expect("profile after diagnosis"), before);
+    }
+}
+
+#[test]
 fn dispatch_only_handles_every_registered_id() {
     // Pass-26 invariant: for every FM in fixers::registry(),
     // `dispatch_only` must recognize the id — i.e. return either
