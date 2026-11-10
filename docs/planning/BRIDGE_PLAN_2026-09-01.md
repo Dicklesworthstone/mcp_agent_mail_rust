@@ -1,10 +1,176 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 10 production deadline follow-through — EmeraldEagle / br-asldx
+
+- [x] Verify governing-file hashes unchanged, preserve the seven peer roots and
+  inspect the ready Beads queue. The top checksum P0 requires the canonical DSR
+  publisher and committed/pushed ACFS raw-installer authority, beyond optional
+  Actions dispatch. Leave it open; no release, tag or downstream change here.
+- [x] Fresh-review the previous archive/fixture fixes and the incoming serving
+  readiness code. Strict production check of committed 87cc2575 fails 101 on
+  three new Budget::with_deadline_secs calls. The name exists on mail_ui's local
+  helper, not on the imported Asupersync 0.5 Budget. Preserve the failed receipt;
+  an initial clean-overlay invocation also refused before work for its missing
+  explicit --no-overlay argument.
+- [x] Use the actual pinned Budget::new().with_timeout(wall_now(), duration)
+  API at all three production call sites. Keep the original 1s serving probe,
+  2s lexical observation and 2s quick-startup limits, default budget dimensions
+  and caller-owned runtime context. The suggested with_deadline_at_secs API is
+  absolute process time and would expire immediately in a long-lived server.
+- [x] Run separate production and all-targets workspace checks, strict
+  Clippy, formatting and stock full-file UBS on the repaired source.
+  Final formatted source ebd8ba3f / lock208ea862 passes default production
+  0/93.8s on vmi1227854, fingerprint ccdd59d5323f0d992923dc738d69a49857eaaca696ef142eb1f0262e2a00ff2d.
+  Standalone fmt0 and full-file stock UBS0/status ok/no failed modules,
+  0 critical/3560 warning/1839 info. All-targets first refuses disk admission120
+  before Cargo on vmi1153651; fresh accounting finds vmi1152480 unreserved and
+  admits an unchanged retry, which passes 0/614.1s. Strict Clippy exposes eight
+  DB errors, then four server errors after the DB corrections; retain both
+  actual 101 receipts. These earlier successes qualify their recorded bytes,
+  not the following expanded four-file repair.
+- [x] Read every Clippy finding before editing. Preserve short-circuit lexical
+  maintenance, write notification data directly into its String, check the
+  test duration subtraction and move its last-used config. Separate four doc
+  opening paragraphs, preserve named cursor values and the benchmark count,
+  and retain the migration rerun's empty-result invariant. No suppression,
+  timeout, feature, ignored case, assertion relaxation or workload reduction.
+- [x] Tighten same_owned_creation_sql: distinct strings with two missing CREATE
+  prefixes cannot compare equal. Retain exact authored SQL and SQLite's narrow
+  IF NOT EXISTS normalization. Add a regression for the real owned sender
+  index, altered columns/uniqueness/predicate and the missing-prefix pair.
+  Current production callers already supply authored CREATE constants; do not
+  portray the helper boundary defect as a demonstrated live migration bypass.
+- [x] Run the final four-file static checks against base 87cc2575. The exact
+  hashes are retained in next-final-source-hashes.txt under the existing
+  /data/tmp/am-archive-reader-20261110.t7ueMuTt receipt root. Final fmt passes0;
+  full DB stock scans complete with no failed modules: schema0/944/105,
+  response0/250/20, service1/1120/295 (critical/warning/info). The service
+  critical is the preexisting query typo token "form:BlueLake", not a secret;
+  retain it without suppression, and do not claim all stock UBS scans green.
+  Final server stock scan0/3561/1838, no failed modules. Changed-line alerts
+  are test assertions and the checked duration's expect, reviewed in context.
+  Final exact-source all-targets0/218.8s, default production0/111.3s and strict
+  Clippy0/150.0s share fingerprint
+  c0cf66072498aa7e82475977a2e7f9d66af2be577d81c03ea8a2fbc133116ec8.
+  A prior expanded all-targets request refused120 on vmi1152480 before Cargo;
+  the successful final-source request used admissible vmi1227854. The stock
+  service scan remains non-green; running the scan does not waive its result.
+- [x] Check the actual portable production graph too: default-source success
+  does not establish that the no-default-features/portable release graph builds.
+  Preserve all existing default-graph gates and report the portable result
+  separately, without claiming packaged release or cross-platform qualification.
+  Final portable graph passes0/189.9s on vmi1227854, same c0cf6607 fingerprint.
+- [ ] Execute the real readiness/search/migration regressions plus the complete
+  previously selected population. Predeclare namespaces before execution, retain
+  existing ignored benchmarks as unqualified, and keep actual 1800s/per-test240s
+  and native30GiB growth/10GiB floor. Compile-only preparation earns zero bodies.
+  Old one-file preparation finishes0/1173.2s; the final four-file execution
+  request refuses120 before Cargo because another live worker reservation
+  consumes protected capacity. Preserve it, retry only when admissible, and
+  never claim preparation as test execution or relax native disk fencing.
+  Fresh accounting finds vmi1149989 unreserved with positive native headroom;
+  the unchanged final-source actual request is admitted and compiling there.
+  That cold run reaches its actual1800s deadline and terminates137/1803.672s
+  during compilation, zero bodies. Retain next-final-native-retry.log; disk
+  usage reports peak growth1126486016 bytes, incomplete, not a pass or OOM
+  diagnosis. Its last protected probe before termination showed free42775887872
+  bytes, below the fixed floor+growth threshold for another native request;
+  this is not a post-termination admission result. Fresh accounting finds vmi1227854
+  admissible (free94290767872, existing reservation19327352832 bytes); request
+  the same final four-file compile-only preparation there with14400s. This
+  longer preparation limit does not change actual1800s/per-test240s execution.
+  First preparation request exits2 before compilation: --no-fail-fast conflicts
+  with --no-run. Retain it and use the previously validated preparation flag
+  form, --no-run -E; execution-only flags stay on the eventual actual command.
+  Corrected preparation completes0/7636.9s, zero bodies. Actual execution then
+  finishes100: 805 executed, 785 passed, 20 failed, 8750 skipped, 330.607s;
+  next-final-native-vmi1227854.log retains run5867479e-bd34-4a24-a720-fd114f83dcf8.
+  Those failures keep this item open and supersede any inference from static
+  checks. No deadline, resource fence or selected case was reduced.
+- [x] Trace all 20 failures into five concrete groups. Preserve their receipts:
+  four pool assertions compare randomized HashMap Debug ordering; the migration
+  witness inserts unreferenced metadata intentionally excluded by v36; thirteen
+  readiness paths reject a legitimate absent lazy generation token; one repair
+  reuses a marker after index-prefix loss; one mail UI fixture lacks a running
+  executor for actual search work. The UI cause remains a hypothesis pending
+  its native replay; do not call it fixed on code inspection alone.
+- [x] Repair production readiness to preserve optional source identity without
+  minting a generation in a read-only probe. Keep actual file/memory identity,
+  lexical clocks and serving-pool ownership; assert the token stays unseeded
+  across the real probe. Recheck every changed observer/revoker call site.
+- [x] Verify committed prefix coverage before marker resume and final count/max
+  coverage before certification. Keep cancellation and proof revocation intact.
+  Strengthen failed-repair retry with actual searchable-content readback; add
+  paired intact/damaged-prefix cases with a real live-indexed tail masking loss.
+- [x] Repair defective test witnesses without losing state assertions: compare
+  ordered column metadata and typed cells, check both row lookup APIs, preserve
+  all original pool assertions, and add eleven real transactional mutations
+  with exact rollback checks. Keep the migration's positive projection witness
+  by inserting an actual message and separately assert irrelevant metadata
+  leaves revision zero. Drive synchronous UI fixtures with a real runtime;
+  preserve their 60s context budget and all existing link assertions.
+- [ ] Requalify the expanded seven-file source, frozen separately in
+  next-repaired-source-hashes.txt. Rerun required compiler graphs, strict
+  Clippy, fmt and stock scans, then all original805 cases plus both new real
+  regressions. Compare actual test identities to the prior338 and C0 population;
+  compile preparation, skipped benchmarks and historical passes cannot substitute.
+  This intermediate38d01b85 source passes production0/617.6s and all-targets
+  0/522.3s, but the next fresh review finds an additional production clock bug.
+  Preserve those receipts as historical source qualification, not final passes.
+- [x] Follow the cancelled UI search into request_budget_remaining_ms. The
+  speculative undriven-fixture diagnosis above was wrong: search compared
+  process-relative Asupersync deadlines against Unix epoch time and rejected
+  valid timed requests immediately. Read the exact pinned wall_now/Cx::now
+  implementation, use the caller's Cx clock, and restore the original UI helper
+  byte-for-byte. Add a real runtime deadline admission regression, preserving
+  expired-deadline tests, cost minima, zero-quota rejection and every timeout.
+- [ ] Freeze and requalify the resulting six-file clock repair separately in
+  next-clock-source-hashes.txt, including all original805 cases and three new
+  regressions. Do not overwrite the intermediate seven-file manifest/receipts.
+  Final fingerprint be2677f3526cd14122c711a433e7473f4fb2d11dd89ea95af0a970d099e7c0ef
+  passes production0/197.8s, all-targets0/207.1s and portable production0/259.2s.
+  The fmt0 claim here was later disproved (see correction below). Stock service
+  scan1/1129/295 still flags only the existing typo
+  fixture. The other five source files retain their individually scanned bytes.
+  First final Clippy request refuses103 before Cargo for a stale worker capacity
+  sample; probe succeeds and unchanged strict retry is admitted. Preserve both.
+  Retry then refuses disk admission120 before Cargo; no fence changed. Fresh
+  protected-capacity accounting and completion of the intermediate native job
+  allow strict Clippy on vmi1227854:0/286.0s, same final fingerprint.
+  Intermediate native preparation finishes0/2237.7s, zero bodies. A final hz2
+  preparation unexpectedly rebuilds dependencies despite its historical cache;
+  source/lock hashes match. Preserve the cold attempt and correct the unverified
+  warm-cache description. Preview the exact owned build, follow its wrapper
+  ownership guard, cooperatively cancel only rchw-a89644e2-01d3-41d5-a066-cc46e237d351
+  (terminal143, zero bodies), and start the identical final preparation on the
+  freshly refreshed vmi1227854 cache. No foreign job, artifact or ledger touched.
+- [x] Correct the masked formatting result: the chained clock-fmt/diff/diff-check
+  command returned the last command's0 while fmt actually emitted an import-order
+  diff. Standalone replay exits1. Acknowledge the inaccurate fmt0/all-static-green
+  report, retain both receipts, manually reorder only the two Asupersync imports,
+  and observe standalone formatted-source fmt0. The rebuild cost is our avoidable
+  diagnostic error, not an environment failure. No gate or assertion changes.
+- [ ] Qualify the actual formatted six-file source recorded separately in
+  next-formatted-source-hashes.txt. Positively identify our superseded preparation
+  by its exact command, timestamp, lease and process-birth identity; cooperatively
+  cancel only rchw-5c5b7d1f-0884-4e71-a0e6-31bd854ca4a0 (terminal143, zero bodies).
+  Preserve the117 preexisting malformed RCH journals. Re-run standalone compiler
+  gates and full original805+three native regressions on formatted bytes, without
+  treating the pre-format packets as final-source passes. Preparation is now on
+  vmi1227854; compiler checks use separately admissible hz2, same gate parameters.
+- [ ] Trace any native failures to their cause without weakening assertions,
+  fixture workloads, deadlines, resource fences or production guards.
+- [ ] Re-read the final source and failure paths again; record exact-source
+  evidence in br-asldx while leaving original readiness/control acceptance open.
+- [ ] Verify tracker equality and acyclic dependencies; prepare owned changes
+  for normal publication. Report actual push/reservation outcomes in handoff.
+
 ## November 10 mail UI fixture isolation — EmeraldEagle / br-asldx
 
-This is the current source checklist. Earlier qualification checklists below
-are retained historical checkpoints; their final-source/operational follow-through
-is superseded here. The reader repair and every originally selected test remain.
+This section records the earlier mail UI repair; the production deadline
+follow-through above is current. The qualification checklists below are retained
+historical checkpoints. The reader repair and every originally selected test
+remain in the current selection.
 
 - [x] Follow the real default-storage resolver: the generic mail UI helper
   creates distinct database files directly in the same temporary directory,
