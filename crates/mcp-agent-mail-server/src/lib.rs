@@ -1256,32 +1256,33 @@ impl StartupWorkers {
     }
 }
 
-static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static STARTUP_SEARCH_MAINTENANCE_RUNNING: AtomicBool = AtomicBool::new(false);
+static STARTUP_SEARCH_REFRESH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct StartupSearchRefreshGuard;
+
+impl StartupSearchRefreshGuard {
+    fn begin() -> Self {
+        // Only the single admitted maintenance worker owns refresh work.
+        STARTUP_SEARCH_REFRESH_ACTIVE.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for StartupSearchRefreshGuard {
+    fn drop(&mut self) {
+        STARTUP_SEARCH_REFRESH_ACTIVE.store(false, Ordering::Release);
+    }
+}
 const DEFAULT_STARTUP_SEARCH_BACKFILL_DELAY_SECS: u64 = 8;
+const SEARCH_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+const SEARCH_MAINTENANCE_MAX_RETRY: Duration = Duration::from_secs(60);
 
 struct StartupSearchBackfillResetGuard;
 
 impl Drop for StartupSearchBackfillResetGuard {
     fn drop(&mut self) {
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::SeqCst);
-    }
-}
-
-fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
-    // GH#261 / GH#296: completion is recorded under the database's own
-    // Search V3 identity (`<path>@<db_identity generation>`), which the
-    // request handlers' pools derive identically whatever pool cache
-    // generation they carry. The earlier attempt to "resolve the live pool"
-    // here minted a throwaway file-backed pool with its own generation, so
-    // the recorded key never matched the handlers' and the daemon reported
-    // its only database as foreign whenever this thread won the boot race.
-    if let Err(error) = mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed(
-        &config.database_url,
-    ) {
-        tracing::warn!(
-            error = %error,
-            "[startup-search] failed to record lexical bootstrap completion"
-        );
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1293,60 +1294,48 @@ fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> Stri
 
 fn run_startup_search_backfill(
     config: &mcp_agent_mail_core::Config,
+    pool: &mcp_agent_mail_db::DbPool,
     control: &StartupWorkerControl,
-) {
+) -> bool {
     if control.checkpoint().is_err() {
-        return;
+        return false;
     }
-    let backfill_database_url =
-        normalized_startup_search_backfill_database_url(&config.database_url);
-    match mcp_agent_mail_db::search_v3::backfill_from_db_cancellable(
-        &backfill_database_url,
+    let _active_refresh = StartupSearchRefreshGuard::begin();
+    if let Err(error) = mcp_agent_mail_db::search_service::refresh_lexical_index_cancellable(
+        pool,
         &control.stopped,
     ) {
-        Ok(_) if control.checkpoint().is_err() => {}
-        Ok((indexed, _skipped)) if indexed > 0 => {
-            record_startup_search_backfill_completion(config);
-            tracing::info!(
-                indexed,
-                "[startup-search] backfilled messages into Tantivy index"
+        if control.checkpoint().is_ok() {
+            tracing::warn!(%error, "owned lexical refresh failed; retrying with backoff");
+            let _ = recover_startup_search_backfill_db(config, &error.to_string());
+        }
+        return false;
+    }
+
+    // Certify coverage using the same serving pool after publication. Bind the
+    // native waiter to the existing startup cancellation owner.
+    let cx = runtime_request_cx(Budget::with_deadline_secs(2));
+    let Ok(_context_guard) = control.bind_native_context(&cx) else {
+        return false;
+    };
+    let observed = block_on(async {
+        timeout(
+            wall_now(),
+            Duration::from_secs(2),
+            mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, pool),
+        )
+        .await
+    });
+    match observed {
+        Ok(asupersync::Outcome::Ok(state)) if state.available => {
+            tracing::debug!(
+                fresh = state.verified,
+                catch_up_required = state.catch_up_required,
+                "owned lexical refresh completed"
             );
+            true
         }
-        Ok(_) => {
-            record_startup_search_backfill_completion(config);
-        } // nothing to backfill or already up-to-date
-        Err(err) => {
-            if control.checkpoint().is_err() {
-                return;
-            }
-            tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
-            if recover_startup_search_backfill_db(config, &err) {
-                match mcp_agent_mail_db::search_v3::backfill_from_db_cancellable(
-                    &backfill_database_url,
-                    &control.stopped,
-                ) {
-                    Ok(_) if control.checkpoint().is_err() => {}
-                    Ok((indexed, _)) if indexed > 0 => {
-                        record_startup_search_backfill_completion(config);
-                        tracing::warn!(
-                            indexed,
-                            "[startup-search] backfill succeeded after sqlite auto-recovery"
-                        );
-                    }
-                    Ok(_) => {
-                        record_startup_search_backfill_completion(config);
-                        tracing::warn!(
-                            "[startup-search] backfill completed after sqlite auto-recovery"
-                        );
-                    }
-                    Err(retry_err) => {
-                        tracing::warn!(
-                            "[startup-search] backfill retry failed after sqlite auto-recovery: {retry_err}"
-                        );
-                    }
-                }
-            }
-        }
+        _ => false,
     }
 }
 
@@ -1371,14 +1360,27 @@ fn spawn_startup_search_backfill_after(
     workers: &StartupWorkers,
     delay: Duration,
 ) {
-    if STARTUP_SEARCH_BACKFILL_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+    if STARTUP_SEARCH_MAINTENANCE_RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
-
-    let thread_config = config.clone();
-    // Capturing the guard also resets admission if spawning is refused or
-    // fails before the closure is ever run.
+    // Capturing the guard resets admission if configuration, pool creation,
+    // or worker spawning fails before the closure can run.
     let reset_guard = StartupSearchBackfillResetGuard;
+    let thread_config = match resolve_serving_config(config) {
+        Ok(config) => config,
+        Err(reason) => {
+            tracing::warn!(reason, "lexical maintenance refused mismatched serving configuration");
+            return;
+        }
+    };
+    let pool_config = DbPoolConfig::from_config(&thread_config);
+    let pool = match create_pool(&pool_config) {
+        Ok(pool) => pool,
+        Err(error) => {
+            tracing::warn!(%error, "lexical maintenance could not retain the serving pool");
+            return;
+        }
+    };
     let spawn = workers.spawn("am-search-backfill", move |control| {
         let _reset_guard = reset_guard;
         if !delay.is_zero() {
@@ -1390,7 +1392,54 @@ fn spawn_startup_search_backfill_after(
                 return;
             }
         }
-        run_startup_search_backfill(&thread_config, &control);
+        let mut pool = pool;
+        let mut retry_delay = SEARCH_MAINTENANCE_INTERVAL;
+        loop {
+            if control.checkpoint().is_err() {
+                return;
+            }
+            if !pool.is_initialized() {
+                // Recovery retires the old generation. Adopt only an actual
+                // initialized serving generation; this loop never initializes
+                // a new mailbox or repeats migrations.
+                if let Some(current) = mcp_agent_mail_db::get_cached_pool(&pool_config)
+                    .filter(mcp_agent_mail_db::DbPool::is_initialized)
+                {
+                    pool = current;
+                } else {
+                    if !control.wait_for_delay(SEARCH_MAINTENANCE_INTERVAL) {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            // Readiness/search observations invalidate this proof when the
+            // source changes. The idle loop performs no database query,
+            // archive inventory, or full index scan.
+            let state = mcp_agent_mail_db::search_service::lexical_readiness(&pool);
+            if !state.compiled {
+                return;
+            }
+            let delay = if state.available && !state.catch_up_required {
+                retry_delay = SEARCH_MAINTENANCE_INTERVAL;
+                SEARCH_MAINTENANCE_INTERVAL
+            } else if run_startup_search_backfill(&thread_config, &pool, &control) {
+                retry_delay = SEARCH_MAINTENANCE_INTERVAL;
+                SEARCH_MAINTENANCE_INTERVAL
+            } else {
+                let delay = retry_delay;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(SEARCH_MAINTENANCE_MAX_RETRY);
+                delay
+            };
+            // Condvar-backed wait: stop wakes both idle and retry backoff.
+            // StartupWorkers retains and joins this same worker before the
+            // server releases its mailbox activity lease.
+            if !control.wait_for_delay(delay) {
+                return;
+            }
+        }
     });
 
     if let Err(err) = spawn {
@@ -1402,14 +1451,69 @@ fn spawn_startup_search_backfill_after(
     }
 }
 
-fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
-    // Only initialize when lexical-capable modes are active.
-    // This avoids creating the index directory when lexical retrieval is disabled.
-    let rollout = &config.search_rollout;
-    let uses_v3 = rollout.engine.uses_lexical()
-        || rollout.surface_overrides.values().any(|e| e.uses_lexical());
+/// MCP tools and mail UI select their pool from the process configuration.
+/// An embedded server's pool-size fields do not currently change that request
+/// path. Observe the actual shape, but never initialize a different mailbox
+/// when its database/archive authority disagrees with the bound server.
+fn resolve_serving_config(
+    server: &mcp_agent_mail_core::Config,
+) -> Result<mcp_agent_mail_core::Config, &'static str> {
+    let actual = mcp_agent_mail_core::Config::from_env();
+    actual
+        .validate_user_env_authority()
+        .map_err(|_| "serving_configuration_invalid")?;
+    if actual.database_url != server.database_url {
+        let expected = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&server.database_url);
+        let selected = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&actual.database_url);
+        if !matches!(
+            (expected, selected),
+            (Ok(expected), Ok(selected)) if expected.canonical_path == selected.canonical_path
+        ) {
+            return Err("database_configuration_mismatch");
+        }
+    }
+    if actual.storage_root != server.storage_root {
+        let expected = std::fs::canonicalize(&server.storage_root);
+        let selected = std::fs::canonicalize(&actual.storage_root);
+        if !matches!(
+            (expected, selected),
+            (Ok(expected), Ok(selected)) if expected == selected
+        ) {
+            return Err("storage_configuration_mismatch");
+        }
+    }
+    Ok(actual)
+}
 
-    if !uses_v3 && !rollout.should_shadow() {
+fn serving_search_uses_lexical(config: &mcp_agent_mail_core::Config) -> bool {
+    use mcp_agent_mail_core::config::SearchEngine;
+    let rollout = &config.search_rollout;
+    // Actual deprecated Legacy/Shadow enum modes execute their ordinary SQL
+    // plan before lexical bootstrap. The "legacy"/"fts"/"sqlite" strings now
+    // parse as Lexical, so they do not invent a missing Tantivy fallback.
+    // Explicit lexical-only features still report their normal tool errors.
+    let requires_index = |engine| {
+        matches!(
+            rollout.allowed_engine(engine),
+            SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+        )
+    };
+    requires_index(rollout.engine)
+        || rollout.surface_overrides.values().any(|engine| requires_index(*engine))
+}
+
+fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    let config = match resolve_serving_config(config) {
+        Ok(config) => config,
+        Err(reason) => {
+            tracing::warn!(reason, "search startup refused mismatched serving configuration");
+            return;
+        }
+    };
+    // Include lexical fallback selected by the semantic kill switch.
+    let uses_v3 = serving_search_uses_lexical(&config);
+
+    if !uses_v3 && !config.search_rollout.should_shadow() {
         return;
     }
 
@@ -1431,7 +1535,7 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWor
             // Backfill on a dedicated worker to keep first-render startup latency low.
             // Backfill is idempotent; failures leave search to its lazy path.
             // Database recovery remains an explicit, supervised doctor operation.
-            spawn_startup_search_backfill(config, workers);
+            spawn_startup_search_backfill(&config, workers);
         }
         Err(err) => {
             tracing::warn!(
@@ -1442,6 +1546,7 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWor
     }
 }
 
+#[cfg(test)]
 fn normalized_startup_search_backfill_database_url(database_url: &str) -> String {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return database_url.to_string();
@@ -2765,7 +2870,48 @@ pub fn sd_notify(state: &str) {
 pub fn sd_notify(_state: &str) {}
 
 fn sd_notify_ready() {
-    sd_notify("READY=1");
+    sd_notify("READY=1\nSTATUS=Mailbox admission ready");
+}
+
+// The installed Type=notify unit permits 300s, while a large cold mailbox
+// can legitimately take longer. Once the listener starts, extend only while
+// owned initialization is active, for at most 30 minutes. Failures never
+// become READY, and the operator's systemd timeout resumes after this grace.
+const MAIL_STARTUP_NOTIFY_GRACE: Duration = Duration::from_secs(30 * 60);
+const MAIL_STARTUP_NOTIFY_EXTENSION: Duration = Duration::from_secs(15);
+static STARTUP_DATABASE_INITIALIZERS: AtomicU64 = AtomicU64::new(0);
+
+struct StartupDatabaseInitialization;
+
+impl StartupDatabaseInitialization {
+    fn begin() -> Self {
+        STARTUP_DATABASE_INITIALIZERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for StartupDatabaseInitialization {
+    fn drop(&mut self) {
+        STARTUP_DATABASE_INITIALIZERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn startup_readiness_notify_payload(
+    reason: &str,
+    elapsed: Duration,
+    owned_initialization: bool,
+) -> String {
+    let mut payload = format!("STATUS=Waiting for mailbox admission: {reason}");
+    if owned_initialization && elapsed < MAIL_STARTUP_NOTIFY_GRACE {
+        let extension = MAIL_STARTUP_NOTIFY_GRACE
+            .saturating_sub(elapsed)
+            .min(MAIL_STARTUP_NOTIFY_EXTENSION)
+            .as_micros();
+        if extension > 0 {
+            payload.push_str(&format!("\nEXTEND_TIMEOUT_USEC={extension}"));
+        }
+    }
+    payload
 }
 
 fn build_http_runtime() -> std::io::Result<Runtime> {
@@ -4224,7 +4370,7 @@ fn parse_startup_readiness_bind_deadline_secs(raw: Option<&str>) -> u64 {
 ///   * the listener binds within `startup_readiness_bind_deadline()` regardless,
 ///     so `/healthz` (liveness, DB-independent) is always reachable and the
 ///     installer's probe succeeds;
-///   * `/health` honestly reports `warming_up` / `service unavailable` (503)
+///   * `/health` reports unavailable capabilities (503) until admission succeeds
 ///     until the DB settles, then `ready` (200);
 ///   * if the warmup is still running at the deadline it is left to finish in
 ///     the background, still owned and joined by the server's shutdown scope.
@@ -4851,6 +4997,7 @@ mod tui_result_tests {
 }
 
 struct HttpServerInstance {
+    state: Arc<HttpState>,
     join: AsyncJoinHandle<std::io::Result<()>>,
     shutdown: asupersync::server::shutdown::ShutdownSignal,
     connection_manager: asupersync::server::connection::ConnectionManager,
@@ -5389,6 +5536,7 @@ async fn spawn_http_server_instance(
     Ok((
         updated_config,
         HttpServerInstance {
+            state,
             join,
             shutdown,
             connection_manager,
@@ -5590,8 +5738,9 @@ async fn run_http_server_supervisor(
     mut config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
-    on_ready: Option<HttpReadyCallback>,
+    mut on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
+    let readiness_started = Instant::now();
     let (updated_config, mut instance) =
         spawn_http_server_instance(&runtime_handle, config.clone()).await?;
     config = updated_config;
@@ -5629,16 +5778,13 @@ async fn run_http_server_supervisor(
     tracing::info!(
         host = %config.http_host,
         port = config.http_port,
-        "Startup readiness self-probe passed — server is accepting requests"
+        "Listener self-probe passed; mailbox admission is being verified"
     );
-    // The endpoint is confirmed serving; tell systemd (`Type=notify`) we are
-    // ready so `systemctl is-active` only reports `active` once clients can
-    // actually connect (#174). No-op for `Type=simple`/non-systemd launches.
-    sd_notify_ready();
-
-    if let Some(on_ready) = on_ready {
-        on_ready(&config);
-    }
+    // /healthz establishes transport liveness only. Keep serving it and
+    // processing shutdown/restart control while the actual mail pool and
+    // configured search backend finish initialization.
+    let mut ready_notified = false;
+    let mut readiness_status_at: Option<Instant> = None;
 
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
@@ -5708,6 +5854,35 @@ async fn run_http_server_supervisor(
             (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
             probe_client = build_probe_http_client();
             continue;
+        }
+
+        if !ready_notified {
+            match instance.state.mail_readiness().result() {
+                Ok(()) => {
+                    sd_notify_ready();
+                    tracing::info!(
+                        host = %config.http_host,
+                        port = config.http_port,
+                        "Mailbox admission ready"
+                    );
+                    if let Some(on_ready) = on_ready.take() {
+                        on_ready(&config);
+                    }
+                    ready_notified = true;
+                }
+                Err(reason) => {
+                    if readiness_status_at
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+                    {
+                        sd_notify(&startup_readiness_notify_payload(
+                            reason,
+                            readiness_started.elapsed(),
+                            instance.state.startup_initialization_active(reason),
+                        ));
+                        readiness_status_at = Some(Instant::now());
+                    }
+                }
+            }
         }
 
         let mut handled_control = false;
@@ -6101,6 +6276,146 @@ const HEALTH_ENRICHMENT_CACHE_TTL: Duration = Duration::from_secs(30);
 struct HealthSample<T> {
     observed_at: Instant,
     value: T,
+}
+
+// Mandatory admission checks use the serving pool. The listener never waits
+// for a checkout: one runtime-owned worker refreshes a short-lived sample.
+const MAIL_READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const MAIL_READINESS_MAX_SAMPLE_AGE: Duration = Duration::from_secs(6);
+const MAIL_READINESS_PROBE_BUDGET: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct MailReadinessCache {
+    // Keep the observed engine alive between probes. Only the owned worker
+    // replaces this owner, so native connection teardown cannot block health.
+    // generation is the desired target; samples are invalid while it changes.
+    pool: Option<mcp_agent_mail_db::DbPool>,
+    generation: Option<String>,
+    last_attempt: Option<Instant>,
+    refreshing: bool,
+    sample: Option<HealthSample<MailReadinessProbe>>,
+}
+
+struct MailReadinessProbe {
+    database: Result<(), String>,
+    lexical: LexicalReadiness,
+}
+
+struct MailReadinessRefreshGuard {
+    cache: Arc<Mutex<MailReadinessCache>>,
+    generation: String,
+}
+
+impl Drop for MailReadinessRefreshGuard {
+    fn drop(&mut self) {
+        let mut cache = lock_mutex(&self.cache);
+        cache.last_attempt =
+            (cache.generation.as_ref() == Some(&self.generation)).then(Instant::now);
+        cache.refreshing = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalReadiness {
+    Disabled,
+    Initializing,
+    Rebuilding,
+    Unverified,
+    Unavailable,
+    CatchUpRequired,
+    Ready,
+}
+
+impl LexicalReadiness {
+    fn from_index(state: mcp_agent_mail_db::search_service::LexicalReadiness) -> Self {
+        if !state.compiled {
+            Self::Unavailable
+        } else if !state.initialized {
+            Self::Initializing
+        } else if state.available {
+            if state.verified {
+                Self::Ready
+            } else {
+                Self::CatchUpRequired
+            }
+        } else if state.backfilling {
+            Self::Rebuilding
+        } else {
+            Self::Unverified
+        }
+    }
+
+    const fn available(self) -> bool {
+        matches!(self, Self::Ready | Self::CatchUpRequired)
+    }
+
+    const fn state(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Initializing => "initializing",
+            Self::Rebuilding => "rebuilding",
+            Self::Unverified => "unverified",
+            Self::Unavailable => "unavailable",
+            Self::CatchUpRequired => "catch_up_required",
+            Self::Ready => "ready",
+        }
+    }
+
+    const fn failure(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled | Self::Ready | Self::CatchUpRequired => None,
+            Self::Initializing => Some("lexical_initializing"),
+            Self::Rebuilding => Some("lexical_rebuilding"),
+            Self::Unverified => Some("lexical_unverified"),
+            Self::Unavailable => Some("lexical_unavailable"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MailReadinessSnapshot {
+    database: Result<(), &'static str>,
+    lexical: LexicalReadiness,
+    durability_degraded: bool,
+    disk_full: bool,
+}
+
+impl MailReadinessSnapshot {
+    fn result(self) -> Result<(), &'static str> {
+        self.database?;
+        if self.disk_full {
+            return Err("disk_full");
+        }
+        if self.durability_degraded {
+            return Err("durability_degraded");
+        }
+        self.lexical.failure().map_or(Ok(()), Err)
+    }
+
+    fn json(self) -> serde_json::Value {
+        let database_ready = self.database.is_ok();
+        let result = self.result();
+        let mut body = serde_json::json!({
+            "status": if result.is_ok() { "ready" } else { "unavailable" },
+            "capabilities": {
+                "mail_read": database_ready,
+                "mail_write": database_ready && !self.durability_degraded && !self.disk_full,
+                "lexical_search": database_ready && self.lexical.available(),
+            },
+            "lexical_state": self.lexical.state(),
+            "lexical_fresh": self.lexical == LexicalReadiness::Ready,
+            "durability_state": "not_probed",
+        });
+        if let Err(reason) = result {
+            body["reason"] = serde_json::json!(reason);
+        }
+        if self.disk_full {
+            body["writes_refused"] = serde_json::json!("DISK_FULL");
+        } else if self.durability_degraded {
+            body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
+        }
+        body
+    }
 }
 
 /// Owned by one HTTP state/configuration, never shared across mailboxes.
@@ -11638,6 +11953,7 @@ struct HttpState {
     /// Opt-in stateful MCP sessions (GH#279, `MESSAGING_SESSION_IDENTITY`).
     http_sessions: http_sessions::HttpSessionRegistry,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
+    mail_readiness: Arc<Mutex<MailReadinessCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
     /// Weak self-reference for async blocking dispatch.
@@ -11833,9 +12149,168 @@ impl HttpState {
             probe_rejection_log: HttpProbeRejectionLog::default(),
             http_sessions: http_sessions::HttpSessionRegistry::default(),
             health_enrichment,
+            mail_readiness: Arc::new(Mutex::new(MailReadinessCache::default())),
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
         }
+    }
+
+    fn startup_initialization_active(&self, reason: &str) -> bool {
+        match reason {
+            "database_initializing" => STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire) > 0,
+            "database_probe_failed" => {
+                // Initial lexical rebuilding can consume the constrained
+                // CPU/I/O budget before a source proof exists. A timed-out
+                // admission probe must not cause a 300s restart loop while
+                // actual owned work is still active. Idle retries alone do
+                // not extend this failure; the global grace remains finite.
+                STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire) > 0
+                    || STARTUP_SEARCH_REFRESH_ACTIVE.load(Ordering::Acquire)
+            }
+            "database_probe_pending" | "database_probe_stale" => {
+                lock_mutex(&self.mail_readiness).refreshing
+            }
+            reason if reason.starts_with("lexical_") => {
+                STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire)
+                    || lock_mutex(&self.mail_readiness).refreshing
+            }
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn mail_readiness(&self) -> MailReadinessSnapshot {
+        let durability_degraded = mcp_agent_mail_storage::durability_degraded();
+        let serving_config = match resolve_serving_config(&self.config) {
+            Ok(config) => config,
+            Err(reason) => {
+                return MailReadinessSnapshot {
+                    database: Err(reason),
+                    lexical: LexicalReadiness::Initializing,
+                    durability_degraded,
+                    disk_full: false,
+                };
+            }
+        };
+        // Shadow indexing is diagnostic; only an effective lexical serving
+        // mode is part of normal request admission.
+        let lexical_required = serving_search_uses_lexical(&serving_config);
+        let disk_full = serving_config.disk_space_monitor_enabled
+            && mcp_agent_mail_core::disk::DiskPressure::from_u64(
+                mcp_agent_mail_core::global_metrics().system.disk_pressure_level.load(),
+            ) == mcp_agent_mail_core::disk::DiskPressure::Fatal;
+        let unavailable = |reason| MailReadinessSnapshot {
+            database: Err(reason),
+            lexical: if lexical_required {
+                LexicalReadiness::Initializing
+            } else {
+                LexicalReadiness::Disabled
+            },
+            durability_degraded,
+            disk_full,
+        };
+        if startup_readiness_fast_path_active() {
+            return unavailable("database_initializing");
+        }
+
+        let db_config = DbPoolConfig::from_config(&serving_config);
+        let pool = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
+            &serving_config.database_url,
+        ) {
+            // Memory databases need the same compatible pool held by mail
+            // handlers. Opening a fresh memory connection proves nothing.
+            mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&db_config).ok()
+        } else {
+            // Health never starts migrations or recovery on a request thread.
+            // Startup owns initialization through the existing SqliteInitGate.
+            mcp_agent_mail_db::get_cached_pool(&db_config)
+                .filter(mcp_agent_mail_db::DbPool::is_initialized)
+        };
+        let Some(pool) = pool else {
+            return unavailable("database_initializing");
+        };
+        let generation = pool.engine_identity_key();
+        let (mut snapshot, refresh) = {
+            let mut cache = lock_mutex(&self.mail_readiness);
+            if cache.generation.as_ref() != Some(&generation) {
+                cache.generation = Some(generation.clone());
+                cache.sample = None;
+                cache.last_attempt = None;
+            }
+            let refresh = self.health_refresh_scheduler.is_some()
+                && !cache.refreshing
+                && cache.last_attempt.is_none_or(|attempt| {
+                    attempt.elapsed() >= MAIL_READINESS_REFRESH_INTERVAL
+                });
+            if refresh {
+                cache.refreshing = true;
+            }
+            let snapshot = match cache.sample.as_ref() {
+                Some(sample) if sample.observed_at.elapsed() <= MAIL_READINESS_MAX_SAMPLE_AGE => {
+                    MailReadinessSnapshot {
+                        database: sample
+                            .value
+                            .database
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|_| "database_probe_failed"),
+                        lexical: sample.value.lexical,
+                        durability_degraded,
+                        disk_full,
+                    }
+                }
+                Some(_) => unavailable("database_probe_stale"),
+                None => unavailable("database_probe_pending"),
+            };
+            (snapshot, refresh)
+        };
+
+        if snapshot.database.is_ok() {
+            if !pool.is_initialized() {
+                snapshot.database = Err("database_initializing");
+            } else if snapshot.lexical.available() {
+                // Revoke a sampled success immediately when a rewrite or
+                // failed/full rebuild makes the index unusable. This is
+                // a process-local check, with no SQL or filesystem inventory.
+                snapshot.lexical = LexicalReadiness::from_index(
+                    mcp_agent_mail_db::search_service::lexical_readiness(&pool),
+                );
+            }
+        }
+
+        if refresh {
+            let guard = MailReadinessRefreshGuard {
+                cache: Arc::clone(&self.mail_readiness),
+                generation,
+            };
+            let schedule = self.health_refresh_scheduler.as_ref().expect("scheduler checked");
+            schedule(Box::new(move || {
+                let retired_pool = {
+                    let mut cache = lock_mutex(&guard.cache);
+                    if cache.generation.as_ref() != Some(&guard.generation) {
+                        return;
+                    }
+                    cache.pool.replace(pool.clone())
+                };
+                // Native teardown belongs to this owned blocking worker,
+                // outside both the listener path and the admission mutex.
+                drop(retired_pool);
+                // Age the sample from before the work, so a slow probe
+                // cannot make an earlier successful checkout look fresh.
+                let observed_at = Instant::now();
+                let value = probe_serving_mail_pool(&pool, lexical_required);
+                if let Err(error) = &value.database {
+                    tracing::warn!(%error, "serving-pool readiness probe failed");
+                }
+                let mut cache = lock_mutex(&guard.cache);
+                if cache.generation.as_ref() == Some(&guard.generation) {
+                    cache.sample = Some(HealthSample { observed_at, value });
+                }
+                drop(cache);
+                drop(guard);
+            }));
+        }
+        snapshot
     }
 
     fn schedule_health_enrichment_refresh(&self) {
@@ -12315,40 +12790,19 @@ impl HttpState {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
                 }
-                // Freshly bound listeners should answer quickly even while the
-                // DB warm path is still settling. Report a transient warmup
-                // state instead of blocking readiness probes on immediate pool
-                // initialization right after bind.
-                if startup_readiness_fast_path_active() {
-                    return Some(self.health_json_response(
-                        req,
-                        503,
-                        &serde_json::json!({"status":"warming_up"}),
-                    ));
+                let readiness = self.mail_readiness();
+                let status = if readiness.result().is_ok() { 200 } else { 503 };
+                let mut body = readiness.json();
+                // Optional inventory/sidecar diagnostics never establish
+                // admission and are not scheduled ahead of pool startup.
+                if readiness.database.is_ok() {
+                    self.schedule_health_enrichment_refresh();
                 }
-                if let Err(_err) = readiness_check_request_path(&self.config) {
-                    tracing::warn!(error = %_err, "readiness check failed");
-                    return Some(self.error_response(req, 503, "service unavailable"));
-                }
-                let mut body = serde_json::json!({"status":"ready"});
-                // Enrich readiness response with database identity so
-                // operators can verify the correct DB file is active.
-                self.schedule_health_enrichment_refresh();
                 enrich_readiness_response(&self.config, &self.health_enrichment, &mut body);
-                // Keep generic readiness distinct from the heavier durability
-                // verdict. The dedicated /health/durability route still runs
-                // the mailbox verdict engine, while /health must not join
-                // archive or diagnostic scans and make a live listener look
-                // dead under contention.
-                body["durability_state"] = serde_json::json!("not_probed");
-                // The write-back latch is one atomic load, so it is cheap enough here.
-                // Still 200: the listener is alive and reads still work, and the
-                // archive reconciler lifts the latch once the failed write-backs
-                // are re-archived, so a supervisor restart loop would not help.
-                if mcp_agent_mail_storage::durability_degraded() {
-                    body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
-                }
-                return Some(self.health_json_response(req, 200, &body));
+                // /healthz remains the supervisor's liveness endpoint. A
+                // temporary write refusal or search rebuild must not cause
+                // a transport restart, but cannot advertise full readiness.
+                return Some(self.health_json_response(req, status, &body));
             }
             "/health/durability" => {
                 if !matches!(req.method, Http1Method::Get) {
@@ -16830,6 +17284,90 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
     readiness_check_cached_semantic_status(config, &conn)
 }
 
+fn probe_serving_mail_pool(
+    pool: &mcp_agent_mail_db::DbPool,
+    lexical_required: bool,
+) -> MailReadinessProbe {
+    let started = Instant::now();
+    let cx =
+        runtime_request_cx(Budget::with_deadline_secs(MAIL_READINESS_PROBE_BUDGET.as_secs()));
+    // This is the same nonblocking activity admission used by normal mail
+    // operations. A healthy connection cannot bypass an exclusive recovery
+    // owner. Retain the guard through the lexical source observation as well.
+    let activity = if pool.sqlite_path() == ":memory:" {
+        Ok(None)
+    } else {
+        acquire_mailbox_activity_lock_for_sqlite_path(
+            Path::new(pool.sqlite_path()),
+            MailboxActivityLockMode::Shared,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let database = (|| {
+        let _admitted = activity.as_ref().map_err(Clone::clone)?;
+        let acquired = block_on(async {
+            timeout(wall_now(), MAIL_READINESS_PROBE_BUDGET, pool.acquire(&cx)).await
+        });
+        let conn = match acquired {
+            Ok(asupersync::Outcome::Ok(conn)) => conn,
+            Ok(asupersync::Outcome::Err(error)) => return Err(error.to_string()),
+            Ok(asupersync::Outcome::Cancelled(_)) => {
+                return Err("serving-pool readiness cancelled".to_string());
+            }
+            Ok(asupersync::Outcome::Panicked(error)) => {
+                return Err(format!("serving-pool readiness panicked: {}", error.message()));
+            }
+            Err(_) => return Err("serving-pool readiness acquisition timed out".to_string()),
+        };
+        readiness_check_schema_status(&*conn)?;
+        conn.query_sync(
+            "SELECT id, project_id, sender_id FROM messages ORDER BY id DESC LIMIT 1",
+            &[],
+        )
+        .map_err(|error| format!("serving mail query failed: {error}"))?;
+        cx.checkpoint().map_err(|_| "serving-pool readiness expired".to_string())?;
+        if started.elapsed() > MAIL_READINESS_PROBE_BUDGET || !pool.is_initialized() {
+            return Err("serving-pool readiness expired or generation retired".to_string());
+        }
+        Ok(())
+    })();
+
+    let lexical = if !lexical_required {
+        LexicalReadiness::Disabled
+    } else if database.is_err() {
+        LexicalReadiness::Initializing
+    } else {
+        // The connection above has been returned before this acquisition.
+        // Validate source revision/coverage through the actual pool; this
+        // never starts a file-backed index rebuild or an archive scan.
+        let remaining = MAIL_READINESS_PROBE_BUDGET.saturating_sub(started.elapsed());
+        let observed = block_on(async {
+            timeout(
+                wall_now(),
+                remaining,
+                mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, pool),
+            )
+            .await
+        });
+        match observed {
+            Ok(asupersync::Outcome::Ok(state))
+                if started.elapsed() <= MAIL_READINESS_PROBE_BUDGET =>
+            {
+                LexicalReadiness::from_index(state)
+            }
+            Ok(asupersync::Outcome::Err(error)) => {
+                tracing::debug!(%error, "lexical readiness proof unavailable");
+                LexicalReadiness::Unverified
+            }
+            _ => LexicalReadiness::Unverified,
+        }
+    };
+    MailReadinessProbe { database, lexical }
+}
+
+// Retain the guarded raw opener regression separately from production
+// admission. A schema-only read-only connection cannot establish readiness.
+#[cfg(test)]
 fn readiness_check_request_path(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
     let sqlite_path = if is_memory {
@@ -16988,11 +17526,9 @@ fn readiness_check_schema_status(
 
 /// Emit a prominent startup log line showing which database file is active.
 ///
-/// This makes it trivially easy for operators to verify the correct DB when
-/// tailing logs after a restart or deployment. It also emits a best-effort
-/// warning when the canonical archive inventory is ahead of the SQLite index,
-/// which usually means the DB was recreated or left stale without a matching
-/// archive restore/reconcile.
+/// This only reports configuration metadata. Archive consistency checks are
+/// owned by startup preflight and the advisory worker; repeating a full archive
+/// inventory here can delay listener bind by minutes on a large mailbox.
 fn log_active_database(config: &mcp_agent_mail_core::Config) {
     let db_display: std::borrow::Cow<'_, str> =
         match resolve_server_database_url_sqlite_path(&config.database_url) {
@@ -17012,27 +17548,6 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
         "Active database"
     );
 
-    // Best-effort warning: archive inventory is ahead of the live SQLite index.
-    if let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url)
-        && let Some(observed) =
-            dashboard_open_connection(&config.database_url, config.storage_root.as_path())
-        && let Ok(Some(drift)) =
-            inspect_archive_db_drift(&config.storage_root, &sqlite_path, observed.conn())
-    {
-        tracing::warn!(
-            database = %db_display,
-            storage_root = %config.storage_root.display(),
-            archive_projects = drift.archive_projects,
-            archive_agents = drift.archive_agents,
-            archive_messages = drift.archive_messages,
-            db_projects = drift.db_projects,
-            db_agents = drift.db_agents,
-            db_messages = drift.db_messages,
-            missing_archive_projects = ?drift.missing_archive_projects,
-            "Canonical archive inventory is ahead of the SQLite index — \
-             the DB may have been recreated or left stale without archive restore/reconcile"
-        );
-    }
 }
 
 /// The mailbox verdict cannot see the write-back latch (#122), which refuses
@@ -17269,8 +17784,11 @@ fn readiness_check_with_integrity_and_startup_control(
     run_integrity_check: bool,
     control: Option<&StartupWorkerControl>,
 ) -> Result<(), String> {
+    let _initializing = StartupDatabaseInitialization::begin();
     let checkpoint = || control.map_or(Ok(()), StartupWorkerControl::checkpoint);
     checkpoint()?;
+    let serving_config = resolve_serving_config(config).map_err(str::to_string)?;
+    let db_config = DbPoolConfig::from_config(&serving_config);
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
     let sqlite_path = if is_memory {
         None
@@ -17307,35 +17825,19 @@ fn readiness_check_with_integrity_and_startup_control(
         }
     }
 
-    let pool_timeout_ms = if run_integrity_check {
-        config.database_pool_timeout.map_or(
-            mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS,
-            mcp_agent_mail_db::pool::pool_timeout_ms_from_setting,
-        )
-    } else {
-        // Quick check: use a much shorter timeout (2s) to avoid delaying startup
-        // if the DB is busy with a long backfill or migration.
-        2000
-    };
-    // Keep readiness initialization intentionally minimal: we only need one
-    // successful acquire/query path to force migration initialization. Building
-    // a large auto-sized pool here causes avoidable startup churn on big hosts.
-    let db_config = DbPoolConfig {
-        database_url: config.database_url.clone(),
-        storage_root: Some(config.storage_root.clone()),
-        min_connections: 1,
-        max_connections: 1,
-        acquire_timeout_ms: pool_timeout_ms,
-        max_lifetime_ms: mcp_agent_mail_db::pool::DEFAULT_POOL_RECYCLE_MS,
-        run_migrations: true,
-        warmup_connections: 0,
-        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
-    };
+    // Pool construction is lazy; this checkout owns the existing SqliteInitGate
+    // for the actual request shape selected above. A separate one-connection
+    // pool could finish while the serving pool still needed initialization.
 
     // Keep a request context whose cancellation registry outlives checkout.
     // An ambient root Cx escaped from a completed block_on has already had
     // its wakers retired, so shutdown cannot wake a later pending acquire.
-    let cx = runtime_request_cx(Budget::INFINITE);
+    // A quick probe limits its request, not the shared pool configuration.
+    let cx = runtime_request_cx(if run_integrity_check {
+        Budget::INFINITE
+    } else {
+        Budget::with_deadline_secs(2)
+    });
     let _context_guard = control
         .map(|control| control.bind_native_context(&cx))
         .transpose()?;
@@ -20568,6 +21070,8 @@ mod tests {
         let mut config = prepared_http_test_config();
         let expected_storage = config.storage_root.clone();
         let (control_tx, control_rx) = mpsc::channel(1);
+        let watchdog_control = control_tx.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let observed = Arc::new(std::sync::Mutex::new(None));
         let callback_observed = Arc::clone(&observed);
         startup_checks::take_startup_work_counts();
@@ -20578,23 +21082,44 @@ mod tests {
                 let connected =
                     std::net::TcpStream::connect((bound.http_host.as_str(), bound.http_port))
                         .is_ok();
+                let admitted = resolve_serving_config(bound).is_ok_and(|actual| {
+                    mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_config(&actual))
+                        .is_some_and(|pool| {
+                            let probe = probe_serving_mail_pool(
+                                &pool,
+                                serving_search_uses_lexical(&actual),
+                            );
+                            pool.is_initialized()
+                                && probe.database.is_ok()
+                                && probe.lexical.failure().is_none()
+                        })
+                });
                 *callback_observed.lock().expect("callback result") =
-                    Some((bound.storage_root.clone(), bound.http_port, connected));
+                    Some((bound.storage_root.clone(), bound.http_port, connected, admitted));
+                let _ = ready_tx.send(());
                 let _ = control_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
             });
         assert_eq!(startup_checks::take_startup_work_counts(), [1, 1, 1, 1]);
         // Mutation of the caller's config cannot retarget an existing token.
         config.storage_root = dir.path().join("different-archive");
         config.http_host = "invalid.invalid".to_string();
-        startup
-            .run_with_control(control_rx)
-            .expect("serve and drain");
+        std::thread::scope(|threads| {
+            let watchdog = threads.spawn(move || {
+                if ready_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+                    let _ = watchdog_control.try_send(tui_bridge::ServerControlMsg::Shutdown);
+                }
+            });
+            let result = startup.run_with_control(control_rx);
+            watchdog.join().expect("join readiness watchdog");
+            result.expect("serve and drain");
+        });
         assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
         let observation = observed.lock().expect("callback result");
-        let (storage, port, connected) = observation.as_ref().expect("ready callback ran");
+        let (storage, port, connected, admitted) = observation.as_ref().expect("ready callback ran");
         assert_eq!(storage, &expected_storage);
         assert_ne!(*port, 0, "callback must receive actual bound port");
         assert!(*connected, "callback must follow listener bind");
+        assert!(*admitted, "callback must follow real mail and lexical admission");
         assert!(
             !config.storage_root.exists(),
             "caller mutation must not retarget startup"
@@ -20826,7 +21351,7 @@ mod tests {
             ..mcp_agent_mail_core::Config::default()
         };
 
-        let result = readiness_check(&config);
+        let result = with_health_serving_env(&config, || readiness_check(&config));
         assert!(
             result.is_ok(),
             "missing DB should be auto-initialized/recovered before startup integrity check: {result:?}"
@@ -20848,6 +21373,7 @@ mod tests {
             integrity_check_on_startup: true,
             ..mcp_agent_mail_core::Config::default()
         };
+        with_health_serving_env(&config, || {
         let _ = integrity_guard::take_startup_probe_note_for_test();
 
         readiness_check(&config).expect("first readiness");
@@ -20859,6 +21385,7 @@ mod tests {
         // the guard must run its own first cycle.
         readiness_check(&config).expect("second readiness");
         assert!(!integrity_guard::take_startup_probe_note_for_test());
+        });
     }
 
     #[test]
@@ -20993,7 +21520,8 @@ mod tests {
         )
         .expect("acquire exclusive sqlite mailbox lock");
 
-        let error = readiness_check(&config).expect_err("busy mailbox should block readiness init");
+        let error = with_health_serving_env(&config, || readiness_check(&config))
+            .expect_err("busy mailbox should block readiness init");
         assert!(
             error.contains("mailbox activity lock is busy") || error.contains("temporarily busy"),
             "busy readiness error should mention mailbox contention: {error}"
@@ -21536,12 +22064,14 @@ first body
                 ..mcp_agent_mail_core::Config::default()
             };
 
-            let state = build_state(config);
+            with_health_serving_env(&config, || {
+            let state = build_state(config.clone());
             let req = make_request(Http1Method::Get, "/health/readiness", &[]);
             let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
+            assert_eq!(resp.status, 503);
             let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
+            assert_eq!(body["status"], "unavailable");
+            assert_eq!(body["reason"], "database_initializing");
             assert_eq!(body["durability_state"], "not_probed");
             assert!(body["project_count"].is_null());
             assert!(body["message_count"].is_null());
@@ -21561,38 +22091,45 @@ first body
             assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 0);
             assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 0);
             assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 0);
+            });
         });
     }
 
     #[test]
     fn health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive() {
+        if run_prepared_http_test_in_child("tests::health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive") {
+            return;
+        }
         with_serialized_health_route(|| {
             let temp = tempfile::tempdir().expect("tempdir");
-            let storage_root = temp.path().join("storage");
             let db_path = temp.path().join("locked-health.sqlite3");
-            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
-            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-                .expect("init schema");
-            drop(conn);
-
+            let config = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+                storage_root: temp.path().join("storage"),
+                integrity_check_on_startup: false,
+                ..Default::default()
+            };
+            with_ready_health_state(config, |state, _archive| {
+            let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
             let _exclusive = acquire_mailbox_activity_lock_for_sqlite_path(
                 &db_path,
                 MailboxActivityLockMode::Exclusive,
             )
             .expect("acquire exclusive sqlite activity lock");
+            let observed_at = Instant::now();
+            let value = probe_serving_mail_pool(&pool, serving_search_uses_lexical(&state.config));
+            assert!(value.database.is_err(), "pooled health bypassed recovery admission");
+            assert!(observed_at.elapsed() < Duration::from_secs(1));
+            lock_mutex(&state.mail_readiness).sample = Some(HealthSample { observed_at, value });
 
-            let config = mcp_agent_mail_core::Config {
-                database_url: format!("sqlite:///{}", db_path.display()),
-                storage_root,
-                integrity_check_on_startup: false,
-                ..Default::default()
-            };
-            let state = build_state(config);
             let req = make_request(Http1Method::Get, "/health/readiness", &[]);
             let resp = block_on(state.handle(req));
             assert_eq!(resp.status, 503);
             let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["detail"], "service unavailable");
+            assert_eq!(body["reason"], "database_probe_failed");
+            let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+            assert_eq!(live.status, 200);
+            });
         });
     }
 
@@ -21661,15 +22198,11 @@ first body
         }
         let mut config = prepared_http_test_config();
         config.integrity_check_on_startup = false;
-        let pool = create_pool(&DbPoolConfig {
-            database_url: config.database_url.clone(),
-            storage_root: Some(config.storage_root.clone()),
-            min_connections: 1,
-            max_connections: 1,
-            warmup_connections: 0,
-            ..Default::default()
-        })
-        .expect("one-connection readiness pool");
+        config.database_pool_size = Some(1);
+        config.database_max_overflow = Some(0);
+        with_health_serving_env(&config, || {
+        let pool = create_pool(&DbPoolConfig::from_env())
+            .expect("one-connection serving/readiness pool");
         let cx = runtime_request_cx(Budget::INFINITE);
 
         for tui in [false, true] {
@@ -21748,6 +22281,7 @@ first body
                 "shutdown waited for the foreign pool lease"
             );
             assert_eq!(pending_after_stop, 0, "cancelled native waiter leaked");
+            assert_eq!(STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire), 0);
             assert!(lock_mutex(&workers.state).workers.is_empty());
             assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Pending);
 
@@ -21763,9 +22297,11 @@ first body
             conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
                 .expect("mailbox still readable after cancelled readiness");
         }
+        });
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn startup_search_delay_is_owned_and_next_startup_indexes_retained_mail() {
         const TEST: &str =
             "tests::startup_search_delay_is_owned_and_next_startup_indexes_retained_mail";
@@ -21785,18 +22321,23 @@ first body
              (2, 2, 2, 'retainedstartupmail', 'second project', 2);",
         ).expect("seed retained mail in two projects");
         drop(conn);
-        mcp_agent_mail_db::search_v3::init_bridge(&config.storage_root.join("search_index"))
-            .expect("real Tantivy index");
+        let pool = create_pool(&DbPoolConfig::from_env()).expect("actual serving pool");
+        let cx = runtime_request_cx(Budget::INFINITE);
+        drop(block_on(pool.acquire(&cx)).into_result().expect("initialize serving generation"));
+        mcp_agent_mail_db::search_v3::init_or_switch_bridge(
+            &config.storage_root.join("search_index"),
+        )
+        .expect("real Tantivy index");
         let delayed = StartupWorkerScope::default();
         spawn_startup_search_backfill_after(&config, &delayed.workers, Duration::from_secs(8));
-        assert!(STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        assert!(STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
         let started = Instant::now();
         delayed.workers.shutdown();
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "shutdown slept through the startup delay"
         );
-        assert!(!STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        assert!(!STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
         let bridge = mcp_agent_mail_db::search_v3::get_bridge().unwrap();
         let query =
             mcp_agent_mail_db::search_planner::SearchQuery::messages("retainedstartupmail", 1);
@@ -21807,15 +22348,15 @@ first body
 
         let retry = StartupWorkerScope::default();
         spawn_startup_search_backfill_after(&config, &retry.workers, Duration::ZERO);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire)
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let completed = !STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire);
-        retry.workers.shutdown();
-        assert!(completed, "next startup backfill must complete");
+        let wait_for_verified = || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !mcp_agent_mail_db::search_service::lexical_readiness(&pool).verified {
+                assert!(Instant::now() < deadline, "owned maintenance did not certify its source");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for_verified();
+        assert!(STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
         let first = bridge.search(&query);
         let second = bridge.search(&mcp_agent_mail_db::search_planner::SearchQuery::messages(
             "retainedstartupmail",
@@ -21823,6 +22364,51 @@ first body
         ));
         assert_eq!(first.iter().map(|hit| hit.id).collect::<Vec<_>>(), [1]);
         assert_eq!(second.iter().map(|hit| hit.id).collect::<Vec<_>>(), [2]);
+
+        // Normal traffic can append after the initial pass without losing
+        // usable generation coverage. A bounded source observation asks the
+        // same owned worker to catch up; no search request performs the repair.
+        let conn = block_on(pool.acquire(&cx)).into_result().expect("serving append");
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (3, 1, 1, 'laterstartupmail', 'appended after readiness', 3);",
+        ).expect("append real message");
+        drop(conn);
+        let appended = block_on(
+            mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, &pool),
+        ).into_result().expect("observe append");
+        assert!(appended.available, "ordinary append must not flap service admission");
+        assert!(appended.catch_up_required || appended.verified);
+        wait_for_verified();
+        let appended_hits = bridge.search(
+            &mcp_agent_mail_db::search_planner::SearchQuery::messages("laterstartupmail", 1),
+        );
+        assert_eq!(appended_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), [3]);
+
+        let conn = block_on(pool.acquire(&cx)).into_result().expect("serving rewrite");
+        conn.execute_raw(
+            "UPDATE messages SET subject = 'repairedstartupmail', body_md = 'rewritten body' WHERE id = 1;",
+        ).expect("rewrite real message");
+        drop(conn);
+        let rewritten = block_on(
+            mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, &pool),
+        ).into_result().expect("observe rewrite");
+        assert!(
+            !rewritten.available || rewritten.verified,
+            "known rewrite cannot preserve stale usable coverage"
+        );
+        wait_for_verified();
+        let rewritten_hits = bridge.search(
+            &mcp_agent_mail_db::search_planner::SearchQuery::messages("repairedstartupmail", 1),
+        );
+        assert_eq!(rewritten_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), [1]);
+        assert!(bridge.search(&query).is_empty(), "old rewritten subject remains visible");
+
+        let stopped_at = Instant::now();
+        retry.workers.shutdown();
+        assert!(stopped_at.elapsed() < Duration::from_secs(2), "idle maintenance did not wake");
+        assert!(!STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
+        assert!(lock_mutex(&retry.workers.state).workers.is_empty());
     }
 
     #[test]
@@ -21937,7 +22523,7 @@ first body
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::Release);
 
         let temp = tempfile::tempdir().expect("tempdir");
         let config = mcp_agent_mail_core::Config {
@@ -21946,14 +22532,16 @@ first body
             ..mcp_agent_mail_core::Config::default()
         };
 
+        with_health_serving_env(&config, || {
         let startup_scope = StartupWorkerScope::default();
         init_search_bridge(&config, &startup_scope.workers);
 
         assert!(config.storage_root.join("search_index").exists());
         assert!(
-            !STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire),
+            !STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire),
             "memory-backed startup should not spawn lexical backfill worker"
         );
+        });
     }
 
     #[test]
@@ -21961,11 +22549,11 @@ first body
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::Release);
 
         let message = startup_search_backfill_spawn_failure_message(&std::io::Error::other("boom"));
         assert!(message.contains("leaving lexical backfill lazy"));
-        assert!(!STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        assert!(!STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
     }
 
     #[test]
@@ -22546,6 +23134,114 @@ first body
         )
     }
 
+    fn with_health_serving_env<T>(
+        config: &mcp_agent_mail_core::Config,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let storage_root = config.storage_root.to_string_lossy().into_owned();
+        let size = config.database_pool_size.map_or_else(String::new, |v| v.to_string());
+        let overflow = config.database_max_overflow.map_or_else(String::new, |v| v.to_string());
+        let timeout = config.database_pool_timeout.map_or_else(String::new, |v| v.to_string());
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", config.database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+                ("DATABASE_POOL_SIZE", size.as_str()),
+                ("DATABASE_MAX_OVERFLOW", overflow.as_str()),
+                ("DATABASE_POOL_TIMEOUT", timeout.as_str()),
+                ("AM_SEARCH_ENGINE", "lexical"),
+                ("AM_SEARCH_SURFACE_OVERRIDES", ""),
+                ("DISK_SPACE_MONITOR_ENABLED", "false"),
+            ],
+            f,
+        )
+    }
+
+    fn prime_health_admission(state: &HttpState, pool: &mcp_agent_mail_db::DbPool) {
+        let actual = resolve_serving_config(&state.config).expect("matching serving authority");
+        let observed_at = Instant::now();
+        let value = probe_serving_mail_pool(pool, serving_search_uses_lexical(&actual));
+        assert!(value.database.is_ok(), "real serving-pool probe: {:?}", value.database);
+        assert!(
+            matches!(value.lexical, LexicalReadiness::Ready | LexicalReadiness::Disabled),
+            "real lexical proof: {:?}",
+            value.lexical
+        );
+        let mut cache = lock_mutex(&state.mail_readiness);
+        cache.pool = Some(pool.clone());
+        cache.generation = Some(pool.engine_identity_key());
+        cache.last_attempt = Some(Instant::now());
+        cache.sample = Some(HealthSample { observed_at, value });
+    }
+
+    // The caller must retain with_health_serving_env for the whole state and
+    // worker lifetime: production requests select the process environment.
+    fn build_ready_health_state(config: mcp_agent_mail_core::Config) -> HttpState {
+        let actual = resolve_serving_config(&config).expect("matching serving authority");
+        let memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&actual.database_url);
+        let db_config = DbPoolConfig::from_config(&actual);
+        let pool = if memory {
+            mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&db_config)
+        } else {
+            create_pool(&db_config)
+        }
+        .expect("real serving pool");
+        let cx = runtime_request_cx(Budget::INFINITE);
+        let conn = block_on(pool.acquire(&cx)).into_result().expect("initialize actual pool");
+        conn.query_sync("SELECT id FROM messages LIMIT 1", &[])
+            .expect("real mailbox table");
+        drop(conn);
+        if serving_search_uses_lexical(&actual) {
+            if !memory {
+                mcp_agent_mail_db::search_v3::init_or_switch_bridge(
+                    &actual.storage_root.join("search_index"),
+                )
+                .expect("real lexical bridge");
+                mcp_agent_mail_db::search_service::refresh_lexical_index_cancellable(
+                    &pool,
+                    &AtomicBool::new(false),
+                )
+                .expect("real fixture backfill");
+            }
+            // Empty memory is certified from this actual pool. File-backed
+            // fixtures must have completed their real backfill above.
+            let lexical = block_on(
+                mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, &pool),
+            )
+            .into_result()
+            .expect("verify actual fixture source");
+            assert!(lexical.verified, "fixture index must cover its own database");
+        }
+        let state = build_state(config);
+        prime_health_admission(&state, &pool);
+        state
+    }
+
+    fn with_ready_health_state<T>(
+        mut config: mcp_agent_mail_core::Config,
+        f: impl FnOnce(&mut HttpState, &Path) -> T,
+    ) -> T {
+        let archive = tempfile::tempdir().expect("private health archive");
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+            config.storage_root = archive.path().to_path_buf();
+        }
+        config.database_pool_size = Some(1);
+        config.database_max_overflow = Some(0);
+        config.integrity_check_on_startup = false;
+        with_health_serving_env(&config, || {
+            let mut state = build_ready_health_state(config.clone());
+            f(&mut state, archive.path())
+        })
+    }
+
+    fn wait_for_mail_readiness_refresh(state: &HttpState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_mutex(&state.mail_readiness).refreshing {
+            assert!(Instant::now() < deadline, "owned readiness probe did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn isolated_health_config() -> mcp_agent_mail_core::Config {
         clear_startup_readiness_fast_path();
         mcp_agent_mail_core::Config {
@@ -22574,6 +23270,7 @@ first body
         shutdown: asupersync::server::shutdown::ShutdownSignal,
     ) -> HttpServerInstance {
         HttpServerInstance {
+            state: Arc::new(build_state(mcp_agent_mail_core::Config::default())),
             join,
             connection_manager: asupersync::server::connection::ConnectionManager::new(
                 None,
@@ -31762,10 +32459,361 @@ first body
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn health_readiness_uses_effective_search_backend() {
+        use mcp_agent_mail_core::config::SearchEngine;
+        let mut config = mcp_agent_mail_core::Config::default();
+        for (engine, semantic_enabled, requires_index) in [
+            (SearchEngine::Legacy, false, false),
+            (SearchEngine::Shadow, false, false),
+            (SearchEngine::parse("legacy"), false, true),
+            (SearchEngine::parse("sqlite"), false, true),
+            (SearchEngine::Lexical, false, true),
+            (SearchEngine::Hybrid, true, true),
+            (SearchEngine::Auto, true, true),
+            (SearchEngine::Semantic, false, true),
+            (SearchEngine::Semantic, true, false),
+        ] {
+            config.search_rollout.engine = engine;
+            config.search_rollout.semantic_enabled = semantic_enabled;
+            assert_eq!(serving_search_uses_lexical(&config), requires_index, "{engine:?}");
+        }
+        config.search_rollout.engine = SearchEngine::Shadow;
+        config.search_rollout.surface_overrides.insert(
+            "search_messages".to_string(),
+            SearchEngine::Lexical,
+        );
+        assert!(serving_search_uses_lexical(&config));
+        assert_eq!(
+            LexicalReadiness::from_index(
+                mcp_agent_mail_db::search_service::LexicalReadiness::default(),
+            ),
+            LexicalReadiness::Unavailable,
+            "a compiled-out index cannot authorize configured lexical search"
+        );
+    }
+
+    #[test]
+    fn startup_readiness_notifications_bound_owned_warmup_grace() {
+        const TEST: &str = "tests::startup_readiness_notifications_bound_owned_warmup_grace";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        for (elapsed, extension) in [
+            (Duration::ZERO, Some(15_000_000)),
+            (Duration::from_secs(695), Some(15_000_000)),
+            (MAIL_STARTUP_NOTIFY_GRACE - Duration::from_secs(2), Some(2_000_000)),
+            (MAIL_STARTUP_NOTIFY_GRACE, None),
+        ] {
+            let payload = startup_readiness_notify_payload("lexical_initializing", elapsed, true);
+            assert!(payload.starts_with("STATUS=Waiting for mailbox admission: "));
+            assert!(!payload.contains("READY=1"), "a timeout extension is not readiness");
+            match extension {
+                Some(micros) => assert!(payload.contains(&format!("EXTEND_TIMEOUT_USEC={micros}"))),
+                None => assert!(!payload.contains("EXTEND_TIMEOUT_USEC")),
+            }
+        }
+        let stopped = startup_readiness_notify_payload(
+            "database_initializing",
+            Duration::from_secs(100),
+            false,
+        );
+        assert!(!stopped.contains("EXTEND_TIMEOUT_USEC"), "cancelled work cannot extend startup");
+
+        let state = build_state(mcp_agent_mail_core::Config::from_env());
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        {
+            let _database = StartupDatabaseInitialization::begin();
+            assert!(state.startup_initialization_active("database_probe_failed"));
+        }
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        {
+            let _refresh = StartupSearchRefreshGuard::begin();
+            let active = state.startup_initialization_active("database_probe_failed");
+            assert!(active);
+            let payload = startup_readiness_notify_payload(
+                "database_probe_failed",
+                Duration::from_secs(695),
+                active,
+            );
+            assert!(payload.contains("EXTEND_TIMEOUT_USEC=15000000"));
+        }
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        // A surviving idle maintenance owner cannot extend a failed database
+        // admission indefinitely between actual work attempts.
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(true, Ordering::Release);
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn health_readiness_requires_serving_pool_initialization() {
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("schema-only.sqlite3");
+            let conn = DbConn::open_file(path.to_str().unwrap()).expect("fixture database");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("valid mail schema");
+            mcp_agent_mail_db::close_db_conn(conn, "schema-only health fixture");
+            let config = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&path),
+                storage_root: temp.path().join("archive"),
+                database_pool_size: Some(1),
+                database_max_overflow: Some(0),
+                integrity_check_on_startup: false,
+                http_bearer_token: Some("private".to_string()),
+                ..Default::default()
+            };
+            with_health_serving_env(&config, || {
+            let pool_config = DbPoolConfig::from_env();
+            let state = build_state(config.clone());
+            for lazy_pool in [false, true] {
+                let owner = lazy_pool.then(|| create_pool(&pool_config).expect("lazy pool"));
+                if let Some(pool) = owner.as_ref() {
+                    assert!(!pool.is_initialized(), "construction is not admission");
+                } else {
+                    assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                }
+                let started = Instant::now();
+                for route in ["/health", "/health/readiness"] {
+                    let response = block_on(state.handle(make_request(Http1Method::Get, route, &[])));
+                    assert_eq!(response.status, 503, "a schema-only connection is not ready");
+                    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                    assert_eq!(body["reason"], "database_initializing");
+                    assert_eq!(body["capabilities"]["mail_read"], false);
+                    assert_eq!(body["capabilities"]["mail_write"], false);
+                }
+                assert!(started.elapsed() < Duration::from_secs(1), "health joined initialization");
+                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                assert_eq!(live.status, 200, "liveness and auth bypass remain independent");
+                assert!(lock_mutex(&state.mail_readiness).sample.is_none());
+                if let Some(pool) = owner {
+                    assert!(!pool.is_initialized(), "health must not initialize a file mailbox");
+                }
+            }
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_fails_closed_on_pending_pool_acquisition() {
+        const TEST: &str = "tests::health_readiness_fails_closed_on_pending_pool_acquisition";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            with_ready_health_state(isolated_health_config(), |state, _archive| {
+            let pool = lock_mutex(&state.mail_readiness).pool.clone().expect("serving pool");
+            let runtime = RuntimeBuilder::new()
+                .worker_threads(1)
+                .blocking_threads(1, 1)
+                .build()
+                .expect("owned readiness runtime");
+            state.health_refresh_scheduler = Some(health_enrichment_scheduler(runtime.handle()));
+            let cx = runtime_request_cx(Budget::INFINITE);
+            let held = block_on(pool.acquire(&cx)).into_result().expect("hold sole live lease");
+            let old = Instant::now()
+                .checked_sub(MAIL_READINESS_MAX_SAMPLE_AGE + Duration::from_secs(1))
+                .unwrap();
+            {
+                let mut cache = lock_mutex(&state.mail_readiness);
+                cache.sample.as_mut().unwrap().observed_at = old;
+                cache.last_attempt = Some(old);
+            }
+            let started = Instant::now();
+            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+            assert_eq!(response.status, 503);
+            assert!(started.elapsed() < Duration::from_millis(500), "probe waited for the lease");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                pool.sample_pool_stats_now();
+                if mcp_agent_mail_core::global_metrics().db.pool_pending_requests.load() > 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "probe never queued on the actual pool");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::scope(|threads| {
+                for _ in 0..16 {
+                    threads.spawn(|| assert!(state.mail_readiness().result().is_err()));
+                }
+            });
+            pool.sample_pool_stats_now();
+            assert!(
+                mcp_agent_mail_core::global_metrics().db.pool_pending_requests.load() <= 1,
+                "repeated health calls created duplicate admission work"
+            );
+            let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+            assert_eq!(live.status, 200);
+            wait_for_mail_readiness_refresh(state);
+            assert!(
+                lock_mutex(&state.mail_readiness)
+                    .sample
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .database
+                    .is_err(),
+                "a timed-out acquisition refreshed a successful sample"
+            );
+            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(response.status, 503);
+            assert_eq!(body["reason"], "database_probe_failed");
+            drop(held);
+            lock_mutex(&state.mail_readiness).last_attempt = None;
+            assert!(state.mail_readiness().result().is_err());
+            wait_for_mail_readiness_refresh(state);
+            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+            assert_eq!(response.status, 200, "released serving pool must recover readiness");
+            state.health_refresh_scheduler = None;
+            assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_invalidates_another_pool_generation() {
+        const TEST: &str = "tests::health_readiness_invalidates_another_pool_generation";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            let mut config = prepared_http_test_config();
+            config.database_pool_size = Some(1);
+            config.database_max_overflow = Some(0);
+            config.integrity_check_on_startup = false;
+            let state = with_health_serving_env(&config, || {
+                let state = build_ready_health_state(config.clone());
+                assert!(state.mail_readiness().result().is_ok());
+                state
+            });
+            let first = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+            // Requests currently select their pool shape from the environment.
+            // A bound Config-only sizing override cannot authorize an old
+            // engine's proof for the different actual request pool.
+            let mut next_config = config.clone();
+            next_config.database_pool_size = Some(2);
+            with_health_serving_env(&next_config, || {
+                let second = create_pool(&DbPoolConfig::from_env()).expect("next serving pool");
+                let cx = runtime_request_cx(Budget::INFINITE);
+                drop(block_on(second.acquire(&cx)).into_result().expect("initialize next engine"));
+                assert_ne!(first.engine_identity_key(), second.engine_identity_key());
+                assert_eq!(state.config.database_pool_size, Some(1));
+                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "database_probe_pending");
+                assert!(lock_mutex(&state.mail_readiness).sample.is_none());
+                prime_health_admission(&state, &second);
+                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                assert_eq!(response.status, 200);
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_refuses_mismatched_serving_configuration() {
+        const TEST: &str = "tests::health_readiness_refuses_mismatched_serving_configuration";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("private mismatched authority");
+            let bound_path = temp.path().join("bound.sqlite3");
+            let serving_path = temp.path().join("serving.sqlite3");
+            let bound = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&bound_path),
+                storage_root: temp.path().join("bound-archive"),
+                integrity_check_on_startup: false,
+                ..Default::default()
+            };
+            let mut actual = bound.clone();
+            actual.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&serving_path);
+            with_health_serving_env(&actual, || {
+                let state = build_state(bound.clone());
+                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "database_configuration_mismatch");
+                assert!(
+                    readiness_check_with_integrity_and_startup_control(&bound, false, None)
+                        .unwrap_err()
+                        .contains("database_configuration_mismatch")
+                );
+                assert!(mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none());
+                assert!(!bound_path.exists() && !serving_path.exists());
+            });
+            actual.database_url = bound.database_url.clone();
+            actual.storage_root = temp.path().join("serving-archive");
+            with_health_serving_env(&actual, || {
+                let state = build_state(bound.clone());
+                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "storage_configuration_mismatch");
+                assert!(mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none());
+                assert!(!bound_path.exists() && !serving_path.exists());
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_reflects_real_archive_write_failure() {
+        const TEST: &str = "tests::health_readiness_reflects_real_archive_write_failure";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            with_ready_health_state(isolated_health_config(), |state, archive| {
+            let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+            assert!(state.mail_readiness().result().is_ok());
+            let blocked_root = archive.join("not-a-directory");
+            std::fs::write(&blocked_root, b"block archive creation").expect("real I/O failure");
+            let mut failing_config = state.config.clone();
+            failing_config.storage_root = blocked_root;
+            mcp_agent_mail_storage::wbq_start();
+            assert!(matches!(
+                mcp_agent_mail_storage::wbq_enqueue(mcp_agent_mail_storage::WriteOp::AgentProfile {
+                    project_slug: "failed-archive".to_string(),
+                    config: failing_config,
+                    agent_json: serde_json::json!({
+                        "name": "BlueLake", "program": "test", "model": "test"
+                    }),
+                }),
+                mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+            ));
+            assert!(matches!(
+                mcp_agent_mail_storage::wbq_flush_status(),
+                mcp_agent_mail_storage::WbqFlushOutcome::Drained
+            ));
+            mcp_agent_mail_storage::wbq_shutdown();
+            assert!(mcp_agent_mail_storage::durability_degraded());
+            // Re-probe reads so a slow CI filesystem cannot turn this into
+            // a sample-expiry test. This never clears the real write latch.
+            prime_health_admission(state, &pool);
+            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(response.status, 503);
+            assert_eq!(body["reason"], "durability_degraded");
+            assert_eq!(body["writes_refused"], "DURABILITY_DEGRADED");
+            assert_eq!(body["capabilities"]["mail_read"], true);
+            assert_eq!(body["capabilities"]["mail_write"], false);
+            assert_eq!(body["capabilities"]["lexical_search"], true);
+            let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+            assert_eq!(live.status, 200, "write refusal must not restart the listener");
+            });
+        });
+    }
+
+    #[test]
     fn health_readiness_returns_ready_json() {
+        if run_prepared_http_test_in_child("tests::health_readiness_returns_ready_json") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = isolated_health_config();
-            let state = build_state(config);
+            with_ready_health_state(config, |state, _archive| {
             let req = make_request(Http1Method::Get, "/health/readiness", &[]);
             let resp = block_on(state.handle(req));
             assert_eq!(resp.status, 200);
@@ -31800,6 +32848,7 @@ first body
             );
             assert_eq!(body["database_path"], ":memory:");
             assert_eq!(body["durability_state"], "not_probed");
+            });
         });
     }
 
@@ -31852,6 +32901,9 @@ first body
     #[test]
     #[allow(clippy::too_many_lines)]
     fn health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe() {
+        if run_prepared_http_test_in_child("tests::health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe") {
+            return;
+        }
         with_serialized_health_route(|| {
             let dir = tempfile::tempdir().expect("tempdir");
             let config = health_enrichment_fixture(dir.path());
@@ -31864,10 +32916,12 @@ first body
                 .handle()
                 .blocking_handle()
                 .expect("owned blocking pool");
-            let mut state = build_state(config);
+            with_ready_health_state(config, |state, _archive| {
             state.health_refresh_scheduler = Some(health_enrichment_scheduler(runtime.handle()));
+            let serving_pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
 
             for expired in [false, true] {
+                prime_health_admission(state, &serving_pool);
                 if expired {
                     let primary =
                         resolve_server_database_url_sqlite_path(&state.config.database_url)
@@ -31958,7 +33012,7 @@ first body
                 }
                 release_tx.send(()).expect("release pool");
                 assert!(blocker.wait_timeout(Duration::from_secs(5)));
-                wait_for_health_enrichment(&state);
+                wait_for_health_enrichment(state);
                 let mut body = serde_json::json!({});
                 enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
                 assert_eq!(body["project_count"], 1);
@@ -31980,6 +33034,7 @@ first body
                 );
                 assert_eq!(pool.pending_count(), 0);
             }
+            });
         });
     }
 
@@ -32157,12 +33212,15 @@ first body
 
     #[test]
     fn health_readiness_exposes_disabled_atc_population_without_changing_admission() {
+        if run_prepared_http_test_in_child("tests::health_readiness_exposes_disabled_atc_population_without_changing_admission") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = mcp_agent_mail_core::Config {
                 atc_enabled: false,
                 ..isolated_health_config()
             };
-            let state = build_state(config);
+            with_ready_health_state(config, |state, _archive| {
             let req = make_request(Http1Method::Get, "/health/readiness", &[]);
             let response = block_on(state.handle(req));
             assert_eq!(response.status, 200);
@@ -32171,14 +33229,18 @@ first body
             assert_eq!(body["atc_population_hydration"]["status"], "disabled");
             assert!(body["atc_population_hydration"]["progress"].is_null());
             assert!(body["atc_population_hydration"]["backlog_age_ms"].is_null());
+            });
         });
     }
 
     #[test]
     fn health_root_alias_returns_ready_json() {
+        if run_prepared_http_test_in_child("tests::health_root_alias_returns_ready_json") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = isolated_health_config();
-            let state = build_state(config);
+            with_ready_health_state(config, |state, _archive| {
             let req = make_request(Http1Method::Get, "/health", &[]);
             let resp = block_on(state.handle(req));
             assert_eq!(resp.status, 200);
@@ -32195,6 +33257,7 @@ first body
             );
             assert_eq!(body["database_path"], ":memory:");
             assert_eq!(body["durability_state"], "not_probed");
+            });
         });
     }
 
@@ -32467,33 +33530,41 @@ first body
 
     #[test]
     fn health_readiness_bypasses_bearer_auth() {
+        if run_prepared_http_test_in_child("tests::health_readiness_bypasses_bearer_auth") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = mcp_agent_mail_core::Config {
                 http_bearer_token: Some("secret-token".to_string()),
                 ..isolated_health_config()
             };
-            let state = build_state(config);
+            with_ready_health_state(config, |state, _archive| {
             let req = make_request(Http1Method::Get, "/health/readiness", &[]);
             let resp = block_on(state.handle(req));
             assert_eq!(resp.status, 200);
             let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
             assert_eq!(body["status"], "ready");
+            });
         });
     }
 
     #[test]
     fn health_root_alias_bypasses_bearer_auth() {
+        if run_prepared_http_test_in_child("tests::health_root_alias_bypasses_bearer_auth") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = mcp_agent_mail_core::Config {
                 http_bearer_token: Some("secret-token".to_string()),
                 ..isolated_health_config()
             };
-            let state = build_state(config);
+            with_ready_health_state(config, |state, _archive| {
             let req = make_request(Http1Method::Get, "/health", &[]);
             let resp = block_on(state.handle(req));
             assert_eq!(resp.status, 200);
             let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
             assert_eq!(body["status"], "ready");
+            });
         });
     }
 
