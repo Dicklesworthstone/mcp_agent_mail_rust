@@ -58,6 +58,32 @@
   case, bounded dispatch-summary case, lock-wait health boundaries and actual
   held-lock health route. Bind core/db/tools/server, profile.dev.debug=0,
   build-jobs1, actual1800s/per-test240s and native30GiB/floor10GiB unchanged.
+- [x] Retain the subsequent fleet refusals: hz4 exits103 because it is
+  administratively disabled; vmi1293453 exits103/queue_timeout before transfer
+  and is subsequently observed disabled too. The prepared vmi1153651 project
+  cache is no longer present when rechecked; its earlier executable hashes
+  remain historical build evidence, not an executable run. No operator state,
+  cache, foreign process or reservation ledger was changed to get admission.
+- [x] Add a nextest dev profile inheriting every default setting and override,
+  with global-timeout30m. Installed nextest0.9.143 accepts the configuration;
+  official global timeout support starts at0.9.100, inheritance at0.9.115.
+  This permits one ordinary build-and-run reservation instead of two admissions.
+  The outer14400s includes compilation and execution; test execution still
+  has its own1800s limit and inherited per-test240s watchdog. No test timeouts,
+  workloads, assertions, features, disk budget or protected floor are relaxed.
+  This runner-only configuration change does not change the qualified Rust
+  sources or Cargo graph; bind its new hash separately in the native receipt.
+  Config hashe44b8ab9 passes nextest show-config and TOML checks. The combined
+  invocation also terminates120 before Cargo, started:false/growth0,
+  free50437042176 bytes, with the original30GiB reservation and10GiB floor.
+  Its log is loss-final-native-combined-vmi1153651.log. Zero tests executed;
+  the profile has parser validation, not an observed passing native run.
+  Final comment corrections remove two obsolete claims that overrides do not
+  inherit; config hashda4c3904 has identical parsed TOML and passes show-config.
+- [x] Re-read the complete final source diff and proof-publication/failure
+  paths again. No further defect confirmed. Another process has committed
+  the exact reviewed source in1e55c348/e7b3cc60 and metadata in8c45db74;
+  preserve those commits. Fresh fetch exits0 and both origin refs are0/0.
 - [ ] Compare actual test identities with both the original338 and C0805 sets;
   confirm each added case executed, and retain failures/skipped benchmarks.
 - [ ] Re-read final integration and failure paths, record real results in both

@@ -143,6 +143,13 @@ filter = '''
 '''
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "10s" }
 
+# A bounded native run can compile and execute under one RCH reservation.
+# The outer build deadline includes compilation; this deadline starts with
+# test execution. Inherit every default watchdog and isolation override.
+[profile.dev]
+inherits = "default"
+global-timeout = "30m"
+
 # CI profile inherits the same protections with a shorter slow-warning cadence
 # and an automatic single retry for flakes, while keeping the same hard kill.
 [profile.ci]
@@ -151,7 +158,7 @@ leak-timeout = "1s"
 retries = 1
 fail-fast = false
 
-# Same known-slow exception under CI (per-profile; overrides do not inherit).
+# Repeat the known-slow exceptions explicitly for CI.
 [[profile.ci.overrides]]
 filter = 'test(refresh_rollups_conserves_counts)'
 slow-timeout = { period = "120s", terminate-after = 4, grace-period = "10s" }
@@ -164,7 +171,7 @@ slow-timeout = { period = "180s", terminate-after = 5, grace-period = "10s" }
 filter = 'test(create_message_with_recipients_rebuilds_inbox_stats_across_sqlite_bind_chunks)'
 slow-timeout = { period = "180s", terminate-after = 6, grace-period = "10s" }
 
-# Same load-lab isolation + watchdogs under CI (overrides do not inherit).
+# Explicit CI load-lab isolation and watchdogs.
 [[profile.ci.overrides]]
 filter = '''
 (binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline::/))

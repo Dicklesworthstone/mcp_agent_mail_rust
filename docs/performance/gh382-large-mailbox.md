@@ -25,6 +25,10 @@ executables have retained SHA-256 identities. Its first execution request is
 refused before Cargo starts because active disk reservations plus the protected
 floor prevent admission; it executes **zero tests**. The original case set,
 four added regressions and lock-diagnostic cases still require actual execution.
+An optional nextest `dev` profile now inherits the default watchdogs and
+isolation rules while bounding test execution to 30 minutes, allowing build
+and run to share one reservation. That combined retry is also refused before
+Cargo (exit 120); the profile is parser-validated, with no runtime pass claimed.
 No native pass, issue closure, startup speedup, or 2-CPU/4-GiB clearance follows
 from preparation. The [bridge plan](../planning/BRIDGE_PLAN_2026-09-01.md) records
 the exact source hashes, receipts and outstanding acceptance.
