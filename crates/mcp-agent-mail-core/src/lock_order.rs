@@ -395,8 +395,10 @@ pub fn lock_contention_reset() {
 }
 
 /// Observe an externally owned async lock without replacing its cancellation,
-/// fairness, or wakeup protocol. Unlike the ordered synchronous wrappers, this
-/// observer never puts a movable task's guards on a thread-local lock stack.
+/// fairness, or wakeup protocol.
+///
+/// Unlike the ordered synchronous wrappers, this observer never puts a
+/// movable task's guards on a thread-local lock stack.
 #[derive(Debug)]
 pub struct ObservedLock {
     level: LockLevel,
@@ -440,20 +442,23 @@ impl ObservedLock {
                     }
                     std::task::Poll::Pending
                 }
-                ready => ready,
+                ready @ std::task::Poll::Ready(_) => ready,
             })
             .await?;
             let acquired_at = Instant::now();
-            let activity = if let Some(waiting) = waiting {
-                Some(waiting.acquired(acquired_at))
-            } else if wait_started.is_none() {
-                self.activity
-                    .holding(self.level, LockAccess::Mutex, site, acquired_at)
-            } else {
-                // A refused registration stays explicitly incomplete. Do not
-                // invent a second identity for an unobserved pending wait.
-                None
-            };
+            let activity = waiting.map_or_else(
+                || {
+                    if wait_started.is_none() {
+                        self.activity
+                            .holding(self.level, LockAccess::Mutex, site, acquired_at)
+                    } else {
+                        // A refused registration stays explicitly incomplete. Do not
+                        // invent a second identity for an unobserved pending wait.
+                        None
+                    }
+                },
+                |waiting| Some(waiting.acquired(acquired_at)),
+            );
             global_lock_stats()[self.level.ordinal()].record_acquire(
                 wait_started.is_some(),
                 wait_started.map_or(0, |started| {
@@ -472,9 +477,11 @@ impl ObservedLock {
     }
 }
 
-/// The observation and the real owned guard share one lifetime. It remains
-/// Send exactly when the underlying guard is Send. Drop removes the observation
-/// before unlocking so an old owner cannot erase its successor's evidence.
+/// The observation and the real owned guard share one lifetime.
+///
+/// It remains Send exactly when the underlying guard is Send. Drop removes
+/// the observation before unlocking so an old owner cannot erase its
+/// successor's evidence.
 pub struct ObservedLockGuard<G> {
     level: LockLevel,
     acquired_at: Instant,
