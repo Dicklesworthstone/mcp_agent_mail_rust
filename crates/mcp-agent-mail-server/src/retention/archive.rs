@@ -29,6 +29,10 @@
 //! another message or changes read/ack state. Its per-pass result is not a
 //! whole-mailbox or attachment-durability certificate.
 //!
+//! Agent lifecycle profiles have a separate default-on pass. Set
+//! `AM_AGENT_ARCHIVE_RECONCILE_ENABLED=false` to pause it while leaving message
+//! durability repair enabled. Disabling message repair does not disable agents.
+//!
 //! Terminal reservation releases also converge without another client read.
 //! Set `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED=false` to disable this separate
 //! default-on pass. It preserves foreign-generation and conflicting artifacts.
@@ -56,7 +60,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, create_pool, now_micros, queries::count_prunable_messages,
 };
-use mcp_agent_mail_storage::recovery::agent_reconcile::AgentReconcileCursor;
+use mcp_agent_mail_storage::recovery::agent_reconcile::{self, AgentReconcileCursor};
 use mcp_agent_mail_storage::recovery::message_reconcile::database::{
     self as message_archive_reconcile, ArchivePruneCursor, ArchivePruneReport, ReconcileCursor,
 };
@@ -90,11 +94,13 @@ pub fn anchor_settled_writes() {
     let _ = SETTLED_BEFORE_US.get_or_init(mcp_agent_mail_db::now_micros);
 }
 
-const fn maintenance_worker_enabled(config: &Config, repair_enabled: bool) -> bool {
+fn maintenance_worker_enabled(config: &Config) -> bool {
     config.retention_report_enabled
         || config.quota_enabled
         || config.messages_retention_days > 0
-        || repair_enabled
+        || message_archive_reconcile::enabled(config)
+        || agent_reconcile::enabled(config)
+        || reservation_reconcile::enabled(config)
 }
 
 fn maintenance_poll_interval(report_interval: Duration, repair_enabled: bool) -> Duration {
@@ -133,10 +139,7 @@ fn next_poll_interval(poll_interval: Duration, repair_backlog: bool) -> Duration
 ///
 /// Must be called at most once. Subsequent calls are no-ops.
 pub fn start(config: &Config) {
-    if !maintenance_worker_enabled(
-        config,
-        message_archive_reconcile::enabled(config) || reservation_reconcile::enabled(config),
-    ) {
+    if !maintenance_worker_enabled(config) {
         return;
     }
 
@@ -247,12 +250,14 @@ fn create_retention_pool_if_admitted(
 fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Option<Instant>) {
     let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
     let message_repair_enabled = message_archive_reconcile::enabled(config);
+    let agent_repair_enabled = agent_reconcile::enabled(config);
     let reservation_repair_enabled = reservation_reconcile::enabled(config);
-    let repair_enabled = message_repair_enabled || reservation_repair_enabled;
+    let repair_enabled = message_repair_enabled || agent_repair_enabled || reservation_repair_enabled;
     let poll_interval = maintenance_poll_interval(interval, repair_enabled);
     let mut repair_schedule = schedule::RepairSchedule::new(
         poll_interval,
         message_repair_enabled,
+        agent_repair_enabled,
         reservation_repair_enabled,
     );
     let startup_delay = poll_interval.min(Duration::from_secs(10));
@@ -268,7 +273,8 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
     info!(
         interval_secs = interval.as_secs(),
         poll_interval_secs = poll_interval.as_secs(),
-        archive_reconcile_enabled = repair_enabled,
+        message_archive_reconcile_enabled = message_repair_enabled,
+        agent_archive_reconcile_enabled = agent_repair_enabled,
         reservation_release_reconcile_enabled = reservation_repair_enabled,
         retention_enabled = config.retention_report_enabled,
         quota_enabled = config.quota_enabled,
@@ -1450,8 +1456,38 @@ mod tests {
     #[test]
     fn archive_repair_starts_without_enabling_destructive_retention() {
         let config = Config::default();
-        assert!(maintenance_worker_enabled(&config, true));
-        assert!(!maintenance_worker_enabled(&config, false));
+        for messages in [false, true] {
+            for agents in [false, true] {
+                for reservations in [false, true] {
+                    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                        &[
+                            (
+                                "AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED",
+                                if messages { "true" } else { "false" },
+                            ),
+                            (
+                                "AM_AGENT_ARCHIVE_RECONCILE_ENABLED",
+                                if agents { "true" } else { "false" },
+                            ),
+                            (
+                                "AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED",
+                                if reservations { "true" } else { "false" },
+                            ),
+                        ],
+                        || {
+                            assert_eq!(message_archive_reconcile::enabled(&config), messages);
+                            assert_eq!(agent_reconcile::enabled(&config), agents);
+                            assert_eq!(reservation_reconcile::enabled(&config), reservations);
+                            assert_eq!(
+                                maintenance_worker_enabled(&config),
+                                messages || agents || reservations,
+                                "messages={messages}, agents={agents}, reservations={reservations}",
+                            );
+                        },
+                    );
+                }
+            }
+        }
         assert!(!message_retention_needs_db(&config));
         let selected = retention_pool_config(&config);
         assert_eq!(selected.database_url, config.database_url);
@@ -1461,6 +1497,36 @@ mod tests {
         );
         assert_eq!(selected.max_connections, 1);
         assert!(!selected.run_migrations);
+    }
+
+    #[test]
+    fn disabled_archive_repair_keeps_requested_retention_and_reporting() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "false"),
+                ("AM_AGENT_ARCHIVE_RECONCILE_ENABLED", "false"),
+                ("AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED", "false"),
+            ],
+            || {
+                assert!(!maintenance_worker_enabled(&Config::default()));
+                for config in [
+                    Config {
+                        retention_report_enabled: true,
+                        ..Config::default()
+                    },
+                    Config {
+                        quota_enabled: true,
+                        ..Config::default()
+                    },
+                    Config {
+                        messages_retention_days: 1,
+                        ..Config::default()
+                    },
+                ] {
+                    assert!(maintenance_worker_enabled(&config));
+                }
+            },
+        );
     }
 
     #[test]

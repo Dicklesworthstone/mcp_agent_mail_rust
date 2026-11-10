@@ -580,7 +580,7 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
     let mut agent_cursor = AgentReconcileCursor::default();
     let mut reservation_cursor = ReservationReconcileCursor::default();
     let start = Instant::now();
-    let mut schedule = RepairSchedule::new(Duration::from_mins(1), true, true);
+    let mut schedule = RepairSchedule::new(Duration::from_mins(1), true, true, true);
     let mut peer_turns = [0usize; 2];
     let mut peer_settled_at = [None; 2];
     let mut message_turns = 0usize;

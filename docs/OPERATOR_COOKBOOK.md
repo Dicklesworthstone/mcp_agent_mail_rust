@@ -670,6 +670,35 @@ If that reconciler is not running or has stopped making progress, health exits
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
 
+### Controlling background archive repair
+
+The daemon has three independent repair lanes for file-backed mailboxes. Each
+defaults to enabled and accepts a process environment override:
+
+| Environment variable | Repair lane |
+|----------------------|-------------|
+| `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED` | Missing message archive artifacts |
+| `AM_AGENT_ARCHIVE_RECONCILE_ENABLED` | Agent profiles, including retirement and deregistration state |
+| `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED` | Terminal reservation release artifacts |
+
+Set the agent flag to `false` in the service environment to pause agent-profile
+repair while keeping message durability repair and reservation convergence on.
+Disabling the message flag does not disable the agent lane. Apply environment
+changes through the service's normal restart procedure. Explicit `true`, `1`,
+`yes`, and `on` values enable a lane (case-insensitive, surrounding whitespace
+ignored); other explicit values disable it. In-memory mailboxes never run these
+repair lanes.
+
+The startup log reports `message_archive_reconcile_enabled`,
+`agent_archive_reconcile_enabled`, and `reservation_release_reconcile_enabled`
+separately. Each enabled lane retains its own scan deadline and bounded backlog
+retries. Enabling any one lane starts the maintenance worker even when retention
+and quota reporting are off. Disabling all three removes repair work; the worker
+still runs if `RETENTION_REPORT_ENABLED`, `QUOTA_ENABLED`, or a positive
+`MESSAGES_RETENTION_DAYS` requests it. Otherwise it is not started. Repair flags
+do not enable destructive message retention or accelerate the reporting and
+pruning schedule.
+
 ### Automatic backup retention and actual disk reclamation
 
 Successful automatic publication runs retention immediately, including during

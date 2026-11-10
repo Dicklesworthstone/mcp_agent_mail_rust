@@ -58,6 +58,7 @@ impl RepairSchedule {
     pub(super) fn new(
         idle_interval: Duration,
         messages_enabled: bool,
+        agents_enabled: bool,
         reservations_enabled: bool,
     ) -> Self {
         Self {
@@ -66,7 +67,7 @@ impl RepairSchedule {
             idle_interval: idle_interval.max(REPAIR_CATCH_UP_POLL_INTERVAL),
             lanes: [
                 LaneState::new(messages_enabled),
-                LaneState::new(messages_enabled),
+                LaneState::new(agents_enabled),
                 LaneState::new(reservations_enabled),
             ],
         }
@@ -121,7 +122,7 @@ mod tests {
     #[test]
     fn gh354_one_busy_lane_does_not_accelerate_healthy_peers() {
         for busy in LANES {
-            let mut schedule = RepairSchedule::new(IDLE, true, true);
+            let mut schedule = RepairSchedule::new(IDLE, true, true, true);
             let start = Instant::now();
             let mut calls = [0; 3];
             for second in 0..60 {
@@ -156,7 +157,7 @@ mod tests {
     #[test]
     fn gh354_short_retry_returns_to_idle_after_backlog_drains() {
         let start = Instant::now();
-        let mut schedule = RepairSchedule::new(IDLE, false, true);
+        let mut schedule = RepairSchedule::new(IDLE, false, false, true);
         assert_eq!(
             schedule.run_if_due(Lane::Reservations, || start, || Some(Ok::<_, ()>(true))),
             Some(Ok(true))
@@ -194,32 +195,52 @@ mod tests {
     #[test]
     fn gh354_disabled_lanes_do_not_run_or_schedule_wakes() {
         let start = Instant::now();
-        for (messages, reservations) in [(false, false), (false, true), (true, false)] {
-            let mut schedule = RepairSchedule::new(IDLE, messages, reservations);
-            for lane in LANES {
-                let enabled = if lane == Lane::Reservations {
-                    reservations
-                } else {
-                    messages
-                };
-                let result = schedule.run_if_due(
-                    lane,
-                    || start,
-                    || {
-                        assert!(enabled, "disabled lane touched its source");
-                        Some(Ok::<_, ()>(false))
-                    },
-                );
-                assert_eq!(result, enabled.then_some(Ok(false)));
+        for messages in [false, true] {
+            for agents in [false, true] {
+                for reservations in [false, true] {
+                    let enabled = [messages, agents, reservations];
+                    let mut schedule = RepairSchedule::new(IDLE, messages, agents, reservations);
+                    let mut calls = [0; 3];
+                    for second in 0..=60 {
+                        let now = start + Duration::from_secs(second);
+                        for lane in LANES {
+                            let result = schedule.run_if_due(
+                                lane,
+                                || now,
+                                || {
+                                    assert!(
+                                        enabled[lane.index()],
+                                        "disabled lane touched its source"
+                                    );
+                                    calls[lane.index()] += 1;
+                                    Some(Ok::<_, ()>(false))
+                                },
+                            );
+                            let due = enabled[lane.index()] && second % 60 == 0;
+                            assert_eq!(result, due.then_some(Ok(false)), "{enabled:?}: {lane:?}");
+                        }
+                        let remaining = if enabled.contains(&true) {
+                            IDLE - Duration::from_secs(second % 60)
+                        } else {
+                            IDLE
+                        };
+                        assert_eq!(schedule.next_delay(now), remaining, "{enabled:?}");
+                    }
+                    for lane in LANES {
+                        assert_eq!(
+                            calls[lane.index()],
+                            if enabled[lane.index()] { 2 } else { 0 }
+                        );
+                    }
+                }
             }
-            assert_eq!(schedule.next_delay(start), IDLE);
         }
     }
 
     #[test]
     fn gh354_errors_and_unavailable_sources_keep_real_backoff() {
         let start = Instant::now();
-        let mut schedule = RepairSchedule::new(IDLE, true, true);
+        let mut schedule = RepairSchedule::new(IDLE, true, true, true);
         assert_eq!(
             schedule.run_if_due(Lane::Messages, || start, || Some(Err("source replaced"))),
             Some(Err("source replaced"))
@@ -258,7 +279,7 @@ mod tests {
         for backlog in [false, true] {
             let start = Instant::now();
             let clock = Cell::new(start);
-            let mut schedule = RepairSchedule::new(IDLE, false, true);
+            let mut schedule = RepairSchedule::new(IDLE, false, false, true);
             assert_eq!(
                 schedule.run_if_due(
                     Lane::Reservations,
@@ -286,7 +307,7 @@ mod tests {
     #[test]
     fn gh354_slow_peer_does_not_postpone_an_already_due_lane() {
         let start = Instant::now();
-        let mut schedule = RepairSchedule::new(IDLE, true, true);
+        let mut schedule = RepairSchedule::new(IDLE, true, true, true);
         for lane in LANES {
             assert_eq!(
                 schedule.run_if_due(
@@ -324,7 +345,7 @@ mod tests {
     fn gh354_zero_and_extreme_intervals_never_spin_or_overflow() {
         let start = Instant::now();
         for interval in [Duration::ZERO, Duration::MAX] {
-            let mut schedule = RepairSchedule::new(interval, false, true);
+            let mut schedule = RepairSchedule::new(interval, false, false, true);
             assert_eq!(schedule.next_delay(start), Duration::from_secs(1));
             assert_eq!(
                 schedule.run_if_due(Lane::Reservations, || start, || Some(Ok::<_, ()>(false))),
@@ -340,7 +361,7 @@ mod tests {
     #[test]
     fn gh354_clock_regression_cannot_force_an_early_scan() {
         let start = Instant::now();
-        let mut schedule = RepairSchedule::new(IDLE, false, true);
+        let mut schedule = RepairSchedule::new(IDLE, false, false, true);
         let completed = start + Duration::from_secs(10);
         assert_eq!(
             schedule.run_if_due(

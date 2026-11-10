@@ -31,6 +31,26 @@ const IDS_PER_BATCH: i64 = 32;
 const MAX_REPAIRS_PER_BATCH: usize = 4;
 const MAX_PROFILE_BYTES: usize = 128 * 1024;
 
+/// Default-on for file-backed mailboxes, independently of message repair and
+/// destructive retention. Invalid overrides fail disabled.
+#[must_use]
+pub fn enabled(config: &Config) -> bool {
+    mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url).is_some()
+        && parse_enabled(
+            mcp_agent_mail_core::config::process_env_value("AM_AGENT_ARCHIVE_RECONCILE_ENABLED")
+                .as_deref(),
+        )
+}
+
+fn parse_enabled(raw: Option<&str>) -> bool {
+    raw.is_none_or(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 // Restrict both identity sources before their joins. The complete byte bound
 // spans agent/project fields and can prevent the runtime engine from pushing
 // an outer ID predicate down through the join. Keep duplicate-name authority
@@ -877,6 +897,37 @@ pub fn reconcile_agent_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_enable_override_defaults_on_and_invalid_values_fail_disabled() {
+        assert!(parse_enabled(None));
+        for raw in ["true", " 1 ", "YES", "on"] {
+            assert!(parse_enabled(Some(raw)), "{raw:?}");
+        }
+        for raw in ["false", "0", "off", "no", "", "typo"] {
+            assert!(!parse_enabled(Some(raw)), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn agent_enable_override_never_starts_repair_for_memory_mailboxes() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_AGENT_ARCHIVE_RECONCILE_ENABLED", "true")],
+            || {
+                for database_url in [
+                    "sqlite:///:memory:",
+                    "sqlite+aiosqlite:///:memory:",
+                    "sqlite://file:profile-repair?mode=memory&cache=shared",
+                ] {
+                    let config = Config {
+                        database_url: database_url.into(),
+                        ..Config::default()
+                    };
+                    assert!(!enabled(&config), "{database_url}");
+                }
+            },
+        );
+    }
 
     // The previous production statement is an equivalence oracle on the real
     // runtime engine. Independent expected fields/refusals below also guard
