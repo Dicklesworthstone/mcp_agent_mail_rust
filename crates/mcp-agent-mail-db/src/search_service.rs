@@ -515,21 +515,26 @@ fn generate_zero_result_guidance(
 /// Try executing a search via the Tantivy bridge. Returns `None` if the
 /// bridge is not initialized (`init_bridge` not called).
 fn try_tantivy_search(
+    cx: &Cx,
     pool: &DbPool,
     query: &SearchQuery,
+    canonical_candidates: bool,
 ) -> Result<Option<Vec<SearchResult>>, DbError> {
     #[cfg(feature = "tantivy-engine")]
     {
-        crate::search_v3::search_database(
+        crate::search_v3::search_database_with_cx(
+            cx,
+            pool,
             &lexical_backfill_database_url(pool),
             &direct_surface_index_dir(pool)?,
             query,
+            canonical_candidates,
         )
         .map_err(|error| map_bridge_bootstrap_error(&error))
     }
     #[cfg(not(feature = "tantivy-engine"))]
     {
-        let _ = (pool, query);
+        let _ = (cx, pool, query, canonical_candidates);
         Ok(None)
     }
 }
@@ -1199,6 +1204,214 @@ fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
     Ok(stable_direct_surface_index_dir(pool))
 }
 
+/// A cheap, process-local capability snapshot. `verified` means that the
+/// last actual serving-pool observation matches a successfully sealed lexical
+/// source. Requests still check freshness; this is not a lease on future writes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct LexicalReadiness {
+    pub compiled: bool,
+    pub initialized: bool,
+    pub backfilling: bool,
+    /// A sealed generation can admit work; requests still reconcile a
+    /// possible append tail before returning results.
+    pub available: bool,
+    /// Sampled source coverage is not established. Includes possible append
+    /// tails and unavailable generations needing repair.
+    pub catch_up_required: bool,
+    pub verified: bool,
+}
+
+#[cfg(feature = "tantivy-engine")]
+struct LexicalReadinessSource {
+    bridge: std::sync::Weak<crate::search_v3::TantivyBridge>,
+    path: String,
+    generation: String,
+}
+
+#[cfg(feature = "tantivy-engine")]
+fn lexical_readiness_sources() -> &'static Mutex<HashMap<String, LexicalReadinessSource>> {
+    static SOURCES: OnceLock<Mutex<HashMap<String, LexicalReadinessSource>>> = OnceLock::new();
+    SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// No database or filesystem work is performed here. Unknown pools and bridge
+/// replacements have no proof until the readiness worker samples the actual
+/// serving pool. The pool engine generation is part of this cache key.
+#[must_use]
+pub fn lexical_readiness(pool: &DbPool) -> LexicalReadiness {
+    let state = LexicalReadiness {
+        compiled: cfg!(feature = "tantivy-engine"),
+        ..LexicalReadiness::default()
+    };
+    #[cfg(feature = "tantivy-engine")]
+    {
+        let Some(bridge) = crate::search_v3::try_get_bridge() else {
+            return state;
+        };
+        let Ok(sources) = lexical_readiness_sources().try_lock() else {
+            return state;
+        };
+        let Some(source) = sources.get(&pool.engine_identity_key()) else {
+            return state;
+        };
+        if !source
+            .bridge
+            .upgrade()
+            .is_some_and(|observed| Arc::ptr_eq(&observed, &bridge))
+        {
+            return state;
+        }
+        let backfilling = bridge.backfill_in_progress();
+        let verified =
+            !backfilling && bridge.source_is_verified(&source.path, Some(&source.generation));
+        LexicalReadiness {
+            compiled: true,
+            initialized: true,
+            backfilling,
+            available: bridge.source_is_available(&source.path, Some(&source.generation)),
+            catch_up_required: !verified,
+            verified,
+        }
+    }
+    #[cfg(not(feature = "tantivy-engine"))]
+    {
+        let _ = pool;
+        state
+    }
+}
+
+/// Sample the actual serving pool with its caller's admission/cancellation
+/// budget. This reads one small snapshot and never launches a file-backed
+/// rebuild. The lifecycle-owned backfill worker owns that maintenance. Empty memory fixtures can be certified
+/// from this pool; a standalone :memory: connection cannot provide that proof.
+#[allow(clippy::too_many_lines)]
+pub async fn probe_lexical_readiness(cx: &Cx, pool: &DbPool) -> Outcome<LexicalReadiness, DbError> {
+    if let Err(error) = check_lexical_request(cx) {
+        return lexical_failure(cx, DbError::Sqlite(error));
+    }
+    #[cfg(feature = "tantivy-engine")]
+    {
+        let rows = {
+            let conn = match pool.acquire(cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+            // All four values come from one read snapshot. The existence
+            // probe reads at most one message, even on a large mailbox.
+            match conn
+                .query(
+                    cx,
+                    "SELECT \
+                     (SELECT generation_id FROM db_identity WHERE singleton = 0) AS generation_id, \
+                     (SELECT revision FROM lexical_change_clock WHERE id = 1) AS revision, \
+                     (SELECT rewrite_revision FROM lexical_change_clock WHERE id = 1) AS rewrite_revision, \
+                     EXISTS(SELECT 1 FROM messages LIMIT 1) AS has_messages",
+                    &[],
+                )
+                .await
+            {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+        };
+        let snapshot = (|| -> Result<(String, i64, i64, bool), DbError> {
+            let row = rows
+                .first()
+                .ok_or_else(|| DbError::Sqlite("lexical source identity row is missing".into()))?;
+            let generation = row
+                .get_named::<String>("generation_id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let revision = row
+                .get_named::<i64>("revision")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let rewrite_revision = row
+                .get_named::<i64>("rewrite_revision")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let has_messages = row
+                .get_named::<i64>("has_messages")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?
+                != 0;
+            Ok((generation, revision, rewrite_revision, has_messages))
+        })();
+        let (generation, revision, rewrite_revision, has_messages) = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Outcome::Err(error),
+        };
+        let memory = pool.sqlite_path() == ":memory:";
+        if memory
+            && !has_messages
+            && let Err(error) = ensure_lexical_bridge_initialized(Some(cx), pool)
+        {
+            return lexical_failure(cx, error);
+        }
+        let Some(bridge) = crate::search_v3::get_bridge() else {
+            return Outcome::Ok(lexical_readiness(pool));
+        };
+        let index_dir = match direct_surface_index_dir(pool) {
+            Ok(path) => path,
+            Err(error) => return Outcome::Err(error),
+        };
+        if !crate::search_v3::is_bridge_initialized_for(&index_dir) {
+            return Outcome::Ok(LexicalReadiness {
+                compiled: true,
+                ..LexicalReadiness::default()
+            });
+        }
+        let path = if memory {
+            pool.sqlite_identity_key()
+        } else {
+            if let Ok(mut cache) = lexical_generation_cache().lock() {
+                cache.insert(pool.engine_identity_key(), generation.clone());
+            }
+            pool.search_identity_path().to_string()
+        };
+        crate::search_v3::observe_pool_source(
+            &bridge,
+            &path,
+            &generation,
+            revision,
+            rewrite_revision,
+            memory,
+        );
+        if memory
+            && !has_messages
+            && let Err(error) = crate::search_v3::verify_empty_memory_source(
+                &bridge,
+                cx,
+                &path,
+                &generation,
+                revision,
+                rewrite_revision,
+            )
+        {
+            return lexical_failure(cx, map_bridge_bootstrap_error(&error));
+        }
+        match lexical_readiness_sources().lock() {
+            Ok(mut sources) => {
+                sources.insert(
+                    pool.engine_identity_key(),
+                    LexicalReadinessSource {
+                        bridge: Arc::downgrade(&bridge),
+                        path,
+                        generation,
+                    },
+                );
+            }
+            Err(error) => {
+                return Outcome::Err(DbError::Sqlite(format!(
+                    "lexical readiness source lock poisoned: {error}"
+                )));
+            }
+        }
+    }
+    Outcome::Ok(lexical_readiness(pool))
+}
+
 /// Read-only snapshot of the lexical Search V3 backfill/index state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LexicalBackfillHealth {
@@ -1835,7 +2048,111 @@ pub fn refresh_live_lexical_index(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
-fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
+/// Refresh the frozen serving mailbox from a lifecycle-owned worker. The
+/// caller keeps ownership until this function returns and joins the worker
+/// before releasing its mailbox lease. No ambient configuration is consulted.
+///
+/// Stop interrupts local mutex/backoff waits and scan/publication boundaries;
+/// an already-running native operation completes before the worker returns.
+///
+/// # Errors
+///
+/// Returns an error if the frozen mailbox/index authority no longer holds,
+/// native refresh fails, or the owner requests shutdown.
+pub fn refresh_lexical_index_cancellable(
+    pool: &DbPool,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> Result<(), DbError> {
+    #[cfg(feature = "tantivy-engine")]
+    {
+        let result = refresh_bound_lexical_index_cancellable(pool, stopped);
+        if result.is_err() {
+            // Even a preflight/open error revokes this pool's earlier proof.
+            // Never revoke an unrelated process-global bridge after a switch.
+            let bound_source = lexical_readiness_sources().lock().ok().and_then(|sources| {
+                sources.get(&pool.engine_identity_key()).and_then(|source| {
+                    source
+                        .bridge
+                        .upgrade()
+                        .map(|bridge| (bridge, source.path.clone(), source.generation.clone()))
+                })
+            });
+            if let Some((bridge, path, generation)) = bound_source {
+                bridge.revoke_source_proof_for(&path, &generation);
+            }
+        }
+        result
+    }
+    #[cfg(not(feature = "tantivy-engine"))]
+    {
+        let _ = (pool, stopped);
+        Err(DbError::Sqlite(
+            "lexical index maintenance is not compiled in".into(),
+        ))
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+fn refresh_bound_lexical_index_cancellable(
+    pool: &DbPool,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" || pool.search_identity_path() != pool.sqlite_path() {
+        return Err(DbError::Sqlite(
+            "owned lexical maintenance requires the actual file-backed serving mailbox".into(),
+        ));
+    }
+    let check_stopped = || {
+        if stopped.load(std::sync::atomic::Ordering::Acquire) {
+            Err(DbError::Sqlite(
+                "owned lexical maintenance cancelled".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let _guard = loop {
+        check_stopped()?;
+        match lexical_init_guard().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(DbError::Sqlite(format!(
+                    "search bootstrap lock poisoned: {error}"
+                )));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    };
+    check_stopped()?;
+    let index_dir = direct_surface_index_dir(pool)?;
+    pool.verify_sqlite_authority("owned lexical maintenance")?;
+    pool.verify_search_index_open_authority(&index_dir, "owned lexical maintenance")?;
+    crate::search_v3::init_or_switch_bridge(&index_dir)
+        .map_err(|error| map_bridge_bootstrap_error(&error))?;
+    let bridge = crate::search_v3::get_bridge()
+        .ok_or_else(|| DbError::Sqlite("lexical bridge disappeared".into()))?;
+    let sqlite_key = sqlite_key_for_pool(pool);
+    if let Err(error) = crate::search_v3::backfill_for_pool_cancellable(
+        pool,
+        &lexical_backfill_database_url(pool),
+        stopped,
+    ) {
+        bridge.revoke_source_proof();
+        lexical_bootstrap_state()
+            .lock()
+            .map_err(|error| {
+                DbError::Sqlite(format!("search bootstrap state lock poisoned: {error}"))
+            })?
+            .remove(&sqlite_key);
+        return Err(map_bridge_bootstrap_error(&error));
+    }
+    record_lexical_bootstrap_success(&sqlite_key)?;
+    Ok(())
+}
+
+fn run_lexical_backfill_for_pool(cx: Option<&Cx>, pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
     }
@@ -1845,36 +2162,66 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     let backfill = || {
         pool.verify_sqlite_authority("lexical search backfill")
             .map_err(|err| err.to_string())?;
+        #[cfg(feature = "tantivy-engine")]
+        if let Some(cx) = cx {
+            return crate::search_v3::backfill_for_request(
+                cx,
+                pool,
+                &db_url,
+                Some(pool.search_identity_path()),
+            );
+        }
         crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
     };
     #[cfg(feature = "tantivy-engine")]
-    let result = crate::search_v3::with_backfill_source_retry(backfill);
+    let result = match cx {
+        Some(cx) => crate::search_v3::with_backfill_source_retry_for_request(cx, backfill),
+        None => crate::search_v3::with_backfill_source_retry(backfill),
+    };
     // The feature-disabled bridge already defines a no-op backfill. It has no
     // native source connection to retry and no Tantivy retry helper to call.
     #[cfg(not(feature = "tantivy-engine"))]
-    let result = backfill();
+    let result = {
+        let _ = cx;
+        backfill()
+    };
     result.map_err(|err| map_bridge_bootstrap_error(&err))?;
     mark_lexical_backfill_ran(&sqlite_key)?;
     Ok(())
 }
 
-fn observe_live_lexical_source(pool: &DbPool) -> Result<(), DbError> {
+fn observe_live_lexical_source(cx: Option<&Cx>, pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
     }
     pool.verify_sqlite_authority("lexical source observation")?;
     #[cfg(feature = "tantivy-engine")]
-    crate::search_v3::observe_live_source_revision(&lexical_backfill_database_url(pool))
+    crate::search_v3::observe_live_source_revision(cx, &lexical_backfill_database_url(pool))
         .map_err(|err| map_bridge_bootstrap_error(&err))?;
+    #[cfg(not(feature = "tantivy-engine"))]
+    let _ = cx;
     Ok(())
 }
 
-fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
+fn ensure_lexical_bridge_initialized(cx: Option<&Cx>, pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = sqlite_key_for_pool(pool);
     let index_dir = direct_surface_index_dir(pool)?;
-    let _guard = lexical_init_guard()
-        .lock()
-        .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
+    let _guard = loop {
+        if let Some(cx) = cx {
+            check_lexical_request(cx).map_err(|error| map_bridge_bootstrap_error(&error))?;
+        }
+        match lexical_init_guard().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(DbError::Sqlite(format!(
+                    "search bootstrap init guard lock poisoned: {error}"
+                )));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    };
 
     let state_lock = lexical_bootstrap_state();
     let cached_state = state_lock
@@ -1901,7 +2248,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         // cached result sets before the cache is consulted. br-ekdk1: a full
         // catch-up here ran twice per query and serialized every search under
         // the init guard (search p50 ~2.8 s under sustained sends).
-        observe_live_lexical_source(pool)?;
+        observe_live_lexical_source(cx, pool)?;
         return Ok(());
     }
 
@@ -1918,8 +2265,16 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
             // a fresh empty memory DB forces a full rebuild to an empty index
             // whenever the active in-memory pool changes.
             if !bridge_ready || active_key.as_deref() != Some(sqlite_key.as_str()) {
-                crate::search_v3::backfill_from_db("sqlite:///:memory:")
-                    .map_err(|err| map_bridge_bootstrap_error(&err).to_string())?;
+                #[cfg(feature = "tantivy-engine")]
+                let cleared = match cx {
+                    Some(cx) => {
+                        crate::search_v3::backfill_for_request(cx, pool, "sqlite:///:memory:", None)
+                    }
+                    None => crate::search_v3::backfill_from_db("sqlite:///:memory:"),
+                };
+                #[cfg(not(feature = "tantivy-engine"))]
+                let cleared = crate::search_v3::backfill_from_db("sqlite:///:memory:");
+                cleared.map_err(|err| map_bridge_bootstrap_error(&err).to_string())?;
                 set_lexical_active_db_key(&sqlite_key).map_err(|err| err.to_string())?;
             }
             return Ok(false);
@@ -1933,7 +2288,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
             || active_key.as_deref() != Some(sqlite_key.as_str())
             || !has_run_lexical_backfill(&sqlite_key).map_err(|err| err.to_string())?;
         if should_backfill {
-            run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
+            run_lexical_backfill_for_pool(cx, pool).map_err(|err| err.to_string())?;
         }
         Ok(true)
     })();
@@ -3954,7 +4309,7 @@ fn deadline_remaining_budget_ms(budget: Budget) -> Option<u64> {
     )
 }
 
-fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
+pub(crate) fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
     let budget = cx.budget();
     let deadline_remaining_ms = deadline_remaining_budget_ms(budget);
     let cost_remaining_ms = budget.remaining_cost();
@@ -3964,6 +4319,36 @@ fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
         (Some(deadline), None) => Some(deadline),
         (None, Some(cost)) => Some(cost),
         (None, None) => None,
+    }
+}
+
+/// Foreground lexical work shares the task's original cancellation and budget.
+/// Native operations already in progress remain owned until they return.
+pub(crate) fn check_lexical_request(cx: &Cx) -> Result<(), String> {
+    if cx.checkpoint().is_err() {
+        return Err("lexical search request cancelled".to_string());
+    }
+    if request_budget_remaining_ms(cx) == Some(0) {
+        return Err("lexical search request budget exhausted".to_string());
+    }
+    Ok(())
+}
+
+fn lexical_failure<T>(cx: &Cx, error: DbError) -> Outcome<T, DbError> {
+    if check_lexical_request(cx).is_err() {
+        Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+            if deadline_remaining_budget_ms(cx.budget()) == Some(0) {
+                asupersync::CancelReason::deadline()
+                    .with_message("lexical search request deadline exhausted")
+            } else if cx.budget().remaining_cost() == Some(0) {
+                asupersync::CancelReason::cost_budget()
+                    .with_message("lexical search request cost budget exhausted")
+            } else {
+                asupersync::CancelReason::user("lexical search request cancelled")
+            }
+        }))
+    } else {
+        Outcome::Err(error)
     }
 }
 
@@ -5198,6 +5583,9 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+    if let Err(error) = check_lexical_request(cx) {
+        return lexical_failure(cx, DbError::Sqlite(error));
+    }
     // Hints become filters before routing, caching and planning see the query.
     let (hinted, assistance) = apply_query_hints(cx, pool, query).await;
     let query = hinted.as_ref().unwrap_or(query);
@@ -5316,11 +5704,12 @@ pub async fn execute_search(
             || semantic_index_is_foreign_to_pool(pool))
     {
         let raw_results = match crate::search_v3::search_private_snapshot(
+            Some(cx),
             &lexical_backfill_database_url(pool),
             query,
         ) {
             Ok(results) => results,
-            Err(error) => return Outcome::Err(map_bridge_bootstrap_error(&error)),
+            Err(error) => return lexical_failure(cx, map_bridge_bootstrap_error(&error)),
         };
         let raw_results =
             match canonicalize_message_results(cx, pool, query, raw_results, false).await {
@@ -5388,7 +5777,7 @@ pub async fn execute_search(
     if matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
-    ) && let Err(err) = ensure_lexical_bridge_initialized(pool)
+    ) && let Err(err) = ensure_lexical_bridge_initialized(Some(cx), pool)
     {
         let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
         record_legacy_error_metrics(
@@ -5396,7 +5785,7 @@ pub async fn execute_search(
             latency_us,
             options.track_telemetry,
         );
-        return Outcome::Err(err);
+        return lexical_failure(cx, err);
     }
 
     // Backfill can invalidate cached candidates after edits made by another
@@ -5422,9 +5811,9 @@ pub async fn execute_search(
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
-        let candidates = match try_tantivy_search(pool, query) {
+        let candidates = match try_tantivy_search(cx, pool, query, !explicit_lexical) {
             Ok(results) => results,
-            Err(error) => return Outcome::Err(error),
+            Err(error) => return lexical_failure(cx, error),
         };
         if let Some(mut raw_results) = candidates {
             if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
@@ -5434,7 +5823,7 @@ pub async fn execute_search(
                     Err(err) => return Outcome::Err(err),
                 };
                 if !backfill_ran {
-                    if let Err(err) = run_lexical_backfill_for_pool(pool) {
+                    if let Err(err) = run_lexical_backfill_for_pool(Some(cx), pool) {
                         let latency_us =
                             u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
                         record_legacy_error_metrics(
@@ -5442,12 +5831,12 @@ pub async fn execute_search(
                             latency_us,
                             options.track_telemetry,
                         );
-                        return Outcome::Err(err);
+                        return lexical_failure(cx, err);
                     }
-                    match try_tantivy_search(pool, query) {
+                    match try_tantivy_search(cx, pool, query, !explicit_lexical) {
                         Ok(Some(rerun_results)) => raw_results = rerun_results,
                         Ok(None) => {}
-                        Err(error) => return Outcome::Err(error),
+                        Err(error) => return lexical_failure(cx, error),
                     }
                 }
             }
@@ -5567,9 +5956,11 @@ pub async fn execute_search(
         // asupersync, and this crate does not enable the proc-macro helpers that
         // would replace it. Keep the hybrid orchestration behavior intact while
         // running candidate retrieval directly in the current task.
-        let lexical_results = match try_tantivy_search(pool, &lexical_query) {
+        // Both sources are hydrated and authorized from this pool before
+        // fusion and reranking, so stored snippets and total counts are unused.
+        let lexical_results = match try_tantivy_search(cx, pool, &lexical_query, true) {
             Ok(results) => results,
-            Err(error) => return Outcome::Err(error),
+            Err(error) => return lexical_failure(cx, error),
         };
         #[cfg(feature = "hybrid")]
         let (semantic_results, semantic_proof, two_tier_telemetry) =
@@ -6119,6 +6510,181 @@ mod tests {
 
     static SEARCH_BOOTSTRAP_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    #[test]
+    fn gh382_expired_search_stops_before_bootstrap_and_preserves_cancellation() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        #[cfg(feature = "tantivy-engine")]
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "expired.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_request_with_budget(Budget::new().with_deadline(Time::ZERO));
+        let outcome = runtime.block_on(execute_search(
+            &cx,
+            &pool,
+            &SearchQuery::messages("commonmail", 1),
+            &SearchOptions::default(),
+        ));
+        assert!(matches!(outcome, Outcome::Cancelled(_)), "{outcome:?}");
+        assert!(!lexical_readiness(&pool).initialized);
+        assert!(!root.path().join("search_index").exists());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gh382_default_tool_search_hydrates_payloads_and_proves_actual_pool_readiness() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "readiness.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/gh382-search")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let body = format!("commonmail {} canonical tail", "payload ".repeat(1024));
+            let conn = crate::guard_db_conn(
+                crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+                "gh382 service fixture",
+            );
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(1,?,?,'commonmail',?,1000000)",
+                &[
+                    Value::BigInt(project_id),
+                    Value::BigInt(sender.id.unwrap()),
+                    Value::Text(body.clone()),
+                ],
+            )
+            .unwrap();
+            let before = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(before.compiled);
+            assert!(
+                !before.verified,
+                "bridge existence alone cannot certify this pool"
+            );
+            let query = SearchQuery {
+                limit: Some(1),
+                explain: true,
+                ..SearchQuery::messages("commonmail", project_id)
+            };
+            let options = SearchOptions {
+                surface: Some("search_messages"),
+                ..SearchOptions::default()
+            };
+            let result = execute_search(&cx, &pool, &query, &options)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(result.results.len(), 1);
+            let message = &result.results[0].result;
+            assert_eq!(message.id, 1);
+            assert_eq!(
+                message.body, body,
+                "canonical hydration must retain the full message"
+            );
+            assert_eq!(message.from_agent.as_deref(), Some("BlueLake"));
+            assert_eq!(message.project_id, Some(project_id));
+            let ready = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(ready.initialized && ready.available && ready.verified && !ready.backfilling);
+            assert!(!ready.catch_up_required);
+            assert_eq!(lexical_readiness(&pool), ready);
+
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(2,?,?,'newmail','append body',2000000)",
+                &[Value::BigInt(project_id), Value::BigInt(sender.id.unwrap())],
+            )
+            .unwrap();
+            let lagging = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(
+                lagging.available && lagging.catch_up_required && !lagging.verified,
+                "ordinary sends retain a usable generation without claiming current coverage"
+            );
+            let stopped = std::sync::atomic::AtomicBool::new(false);
+            refresh_lexical_index_cancellable(&pool, &stopped).unwrap();
+            let caught_up = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(caught_up.available && caught_up.verified && !caught_up.catch_up_required);
+
+            conn.execute_sync(
+                "UPDATE messages SET subject='rewrittenmail',body_md='new body' WHERE id=2",
+                &[],
+            )
+            .unwrap();
+            let rewritten = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(
+                !rewritten.available && !rewritten.verified && rewritten.catch_up_required,
+                "a known rewrite requires a new sealed proof"
+            );
+            refresh_lexical_index_cancellable(&pool, &stopped).unwrap();
+            let rebuilt = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(rebuilt.available && rebuilt.verified && !rebuilt.catch_up_required);
+            let rewritten_results = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("rewrittenmail", project_id),
+                &options,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(rewritten_results.results[0].result.id, 2);
+            assert_eq!(rewritten_results.results[0].result.body, "new body");
+
+            let other_root = tempfile::tempdir().unwrap();
+            let other_pool = temp_file_pool(other_root.path(), "other.sqlite3");
+            assert!(
+                !lexical_readiness(&other_pool).verified,
+                "a process-global bridge cannot certify an unobserved serving pool"
+            );
+            crate::search_v3::reset_bridge_for_tests();
+            assert!(
+                !lexical_readiness(&pool).verified,
+                "a changed bridge invalidates the sampled proof"
+            );
+        });
+        reset_lexical_bootstrap_tracking();
+    }
+
     /// `AM_SEARCH_ENGINE_FOR_<TOOL>` and `AM_SEARCH_SEMANTIC_ENABLED` were
     /// parsed but never consulted: every query ran the global engine.
     #[test]
@@ -6222,6 +6788,11 @@ mod tests {
     }
 
     fn reset_lexical_bootstrap_tracking() {
+        #[cfg(feature = "tantivy-engine")]
+        lexical_readiness_sources()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         lexical_bootstrap_state()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6985,7 +7556,7 @@ mod tests {
                     .len()
             };
             let epoch_before = global_search_cache().current_epoch();
-            ensure_lexical_bridge_initialized(&pool).unwrap();
+            ensure_lexical_bridge_initialized(None, &pool).unwrap();
             assert_eq!(indexed(), 0, "readiness indexes nothing");
             assert!(
                 global_search_cache().current_epoch() > epoch_before,
@@ -8048,7 +8619,7 @@ mod tests {
         let pool = DbPool::new(&config).expect("pool");
         let sqlite_key = sqlite_key_for_pool(&pool);
 
-        run_lexical_backfill_for_pool(&pool).expect("memory no-op");
+        run_lexical_backfill_for_pool(None, &pool).expect("memory no-op");
 
         assert!(!has_run_lexical_backfill(&sqlite_key).expect("backfill marker"));
     }

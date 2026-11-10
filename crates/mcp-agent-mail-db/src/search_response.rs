@@ -405,6 +405,14 @@ fn current_cursor_boundary(
     Ok((score, cursor.id))
 }
 
+#[cfg(all(test, feature = "tantivy-engine"))]
+std::thread_local! {
+    // Count expensive operations, not wall time, so the small regression
+    // remains deterministic under constrained CPU and unrelated test load.
+    static LEXICAL_COLLECTION_WORK: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 #[cfg(feature = "tantivy-engine")]
 fn collect_ranked_page(
     searcher: &tantivy::Searcher,
@@ -412,7 +420,15 @@ fn collect_ranked_page(
     handles: &FieldHandles,
     limit: usize,
     pagination: LexicalPagination<'_>,
-) -> tantivy::Result<(usize, RankedDocuments)> {
+    count_matches: bool,
+) -> tantivy::Result<(Option<usize>, RankedDocuments)> {
+    #[cfg(test)]
+    if count_matches {
+        LEXICAL_COLLECTION_WORK.with(|work| {
+            let (counts, stored) = work.get();
+            work.set((counts + 1, stored));
+        });
+    }
     let (offset, boundary) = match pagination {
         LexicalPagination::Offset(offset) => (offset, None),
         LexicalPagination::Cursor(cursor) => (
@@ -426,9 +442,13 @@ fn collect_ranked_page(
     if limit == 0 || offset >= num_docs {
         // Preserve the exact matching count, including for count-only queries
         // and offsets far beyond the index, without allocating a top-K heap.
-        return searcher
-            .search(query, &Count)
-            .map(|count| (count, Vec::new()));
+        return if count_matches {
+            searcher
+                .search(query, &Count)
+                .map(|count| (Some(count), Vec::new()))
+        } else {
+            Ok((None, Vec::new()))
+        };
     }
 
     // Bound offset + limit by the immutable snapshot's size before Tantivy
@@ -465,7 +485,12 @@ fn collect_ranked_page(
                 Some(LexicalRank { score, doc_id })
             }
         });
-    let (count, ranked) = searcher.search(query, &(Count, collector))?;
+    let (count, ranked) = if count_matches {
+        let (count, ranked) = searcher.search(query, &(Count, collector))?;
+        (Some(count), ranked)
+    } else {
+        (None, searcher.search(query, &collector)?)
+    };
     // None sorts below every eligible rank. A short last page may retain some
     // excluded documents in the bounded heap; never hydrate or return them.
     Ok((
@@ -475,6 +500,34 @@ fn collect_ranked_page(
             .filter_map(|(rank, address)| rank.map(|rank| (rank, address)))
             .collect(),
     ))
+}
+
+/// Collect canonical message identities and scores without loading stored
+/// bodies or computing a total that the live service would discard. Live
+/// hydration and authorization remain mandatory after this step. Reader and
+/// collector failures propagate instead of becoming successful empty pages.
+#[cfg(feature = "tantivy-engine")]
+pub(crate) fn collect_message_candidates(
+    index: &Index,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    limit: usize,
+    cursor: Option<&crate::search_planner::SearchCursor>,
+) -> tantivy::Result<Vec<(i64, f64)>> {
+    let reader = manual_index_reader(index)?;
+    let searcher = reader.searcher();
+    let (_, ranked) = collect_ranked_page(
+        &searcher,
+        query,
+        handles,
+        limit,
+        LexicalPagination::Cursor(cursor),
+        false,
+    )?;
+    Ok(ranked
+        .into_iter()
+        .map(|(rank, _)| (rank.doc_id, f64::from(rank.score)))
+        .collect())
 }
 
 /// Execute a Tantivy search and assemble results with pagination, snippets,
@@ -559,11 +612,12 @@ fn execute_search_page(
     };
     let searcher = reader.searcher();
     let Ok((total_count, top_docs)) =
-        collect_ranked_page(&searcher, query, handles, limit, pagination)
+        collect_ranked_page(&searcher, query, handles, limit, pagination, true)
     else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
 
+    let total_count = total_count.expect("rich search requests an exact matching count");
     let composer_config = ExplainComposerConfig {
         verbosity: config.explain_verbosity,
         max_factors_per_stage: config.explain_max_factors,
@@ -574,6 +628,11 @@ fn execute_search_page(
     // The collector has already ranked and paginated using the complete key.
     // Do not load bodies, generate snippets, or explain skipped documents.
     for (rank, doc_addr) in top_docs {
+        #[cfg(test)]
+        LEXICAL_COLLECTION_WORK.with(|work| {
+            let (counts, stored) = work.get();
+            work.set((counts, stored + 1));
+        });
         let doc: TantivyDocument = match searcher.doc(doc_addr) {
             Ok(d) => d,
             Err(_) => continue,
@@ -1804,6 +1863,211 @@ mod tests {
                 let ids: Vec<_> = result.hits.iter().map(|hit| hit.doc_id).collect();
                 assert_eq!(ids, expected);
             }
+        }
+
+        #[test]
+        fn gh382_lean_candidates_preserve_deep_cursor_pages_without_counts_or_stored_loads() {
+            use crate::search_planner::SearchCursor;
+
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            let body = "commonmail ".repeat(1024);
+            for segment in (0..3_u64).rev() {
+                for id in (segment * 32 + 1..=segment * 32 + 32).rev() {
+                    writer
+                        .add_document(doc!(
+                            handles.id => id,
+                            handles.doc_kind => "message",
+                            handles.project_id => 1_u64,
+                            handles.subject => "commonmail",
+                            handles.body => body.as_str()
+                        ))
+                        .unwrap();
+                }
+                writer.commit().unwrap();
+            }
+            let query = QueryParser::for_index(&index, vec![handles.subject, handles.body])
+                .parse_query("commonmail")
+                .unwrap();
+            for limit in [1, 7, 20] {
+                let mut cursor = None;
+                let mut seen = Vec::new();
+                loop {
+                    LEXICAL_COLLECTION_WORK.with(|work| work.set((0, 0)));
+                    let rich = execute_search_with_cursor(
+                        &index,
+                        &*query,
+                        &handles,
+                        &["commonmail".into()],
+                        limit,
+                        cursor.as_ref(),
+                        true,
+                        &ResponseConfig::default(),
+                    );
+                    assert_eq!(rich.total_count, 96);
+                    let rich_work = LEXICAL_COLLECTION_WORK.with(std::cell::Cell::get);
+                    assert_eq!(rich_work, (1, u64::try_from(rich.hits.len()).unwrap()));
+                    let lean = collect_message_candidates(
+                        &index,
+                        &*query,
+                        &handles,
+                        limit,
+                        cursor.as_ref(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        LEXICAL_COLLECTION_WORK.with(std::cell::Cell::get),
+                        rich_work,
+                        "canonical candidate retrieval must not count or load stored bodies"
+                    );
+                    let expected = rich
+                        .hits
+                        .iter()
+                        .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        lean.iter()
+                            .map(|(id, score)| (*id, score.to_bits()))
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    let Some(&(id, score)) = lean.last() else {
+                        break;
+                    };
+                    seen.extend(lean.iter().map(|(id, _)| *id));
+                    cursor = Some(SearchCursor { id, score });
+                    assert!(seen.len() <= 96, "cursor must make progress");
+                }
+                assert_eq!(seen, (1..=96).collect::<Vec<_>>());
+            }
+        }
+
+        /// The qualification runner executes this under its CPU/memory cap.
+        /// This measures the real collector paths, not whole-mailbox service
+        /// latency; authorization/hydration are covered by service regressions.
+        #[test]
+        #[ignore = "large mailbox qualification: run under the explicit 2 CPU / 4 GiB budget"]
+        fn gh382_large_mailbox_lean_page_equivalence() {
+            let directory = tempfile::tempdir().unwrap();
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_dir(directory.path(), schema).unwrap();
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            let body = "commonmail payload ".repeat(32);
+            for id in 1..=203_498_u64 {
+                let sender = format!("Agent{}", (id - 1) % 12_236 + 1);
+                writer
+                    .add_document(doc!(
+                        handles.id => id,
+                        handles.doc_kind => "message",
+                        handles.project_id => (id - 1) % 242 + 1,
+                        handles.sender => sender.as_str(),
+                        handles.subject => "commonmail",
+                        handles.body => body.as_str()
+                    ))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+            drop(writer);
+            let query = QueryParser::for_index(&index, vec![handles.subject, handles.body])
+                .parse_query("commonmail")
+                .unwrap();
+            LEXICAL_COLLECTION_WORK.with(|work| work.set((0, 0)));
+            let start = std::time::Instant::now();
+            let rich = execute_search_with_cursor(
+                &index,
+                &*query,
+                &handles,
+                &["commonmail".into()],
+                20,
+                None,
+                true,
+                &ResponseConfig::default(),
+            );
+            let rich_elapsed = start.elapsed();
+            assert_eq!(rich.total_count, 203_498);
+            assert_eq!(LEXICAL_COLLECTION_WORK.with(std::cell::Cell::get), (1, 20));
+            LEXICAL_COLLECTION_WORK.with(|work| work.set((0, 0)));
+            let start = std::time::Instant::now();
+            let lean = collect_message_candidates(&index, &*query, &handles, 20, None).unwrap();
+            let lean_elapsed = start.elapsed();
+            assert_eq!(LEXICAL_COLLECTION_WORK.with(std::cell::Cell::get), (0, 0));
+            assert_eq!(
+                lean.iter()
+                    .map(|(id, score)| (*id, score.to_bits()))
+                    .collect::<Vec<_>>(),
+                rich.hits
+                    .iter()
+                    .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+            let expected = lean
+                .iter()
+                .map(|(id, score)| (*id, score.to_bits()))
+                .collect::<Vec<_>>();
+            let measure = |rich_path: bool| {
+                let start = std::time::Instant::now();
+                let actual = if rich_path {
+                    execute_search_with_cursor(
+                        &index,
+                        &*query,
+                        &handles,
+                        &["commonmail".into()],
+                        20,
+                        None,
+                        true,
+                        &ResponseConfig::default(),
+                    )
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+                } else {
+                    collect_message_candidates(&index, &*query, &handles, 20, None)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(id, score)| (id, score.to_bits()))
+                        .collect()
+                };
+                let elapsed = start.elapsed().as_micros();
+                assert_eq!(actual, expected);
+                elapsed
+            };
+            let mut rich_samples = Vec::new();
+            let mut lean_samples = Vec::new();
+            // Both paths are warm. Alternate their order to avoid assigning
+            // every colder first sample to the existing implementation.
+            for iteration in 0..6 {
+                if iteration % 2 == 0 {
+                    rich_samples.push(measure(true));
+                    lean_samples.push(measure(false));
+                } else {
+                    lean_samples.push(measure(false));
+                    rich_samples.push(measure(true));
+                }
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "benchmark": "gh382_lexical_collector",
+                    "projects": 242,
+                    "agents": 12236,
+                    "messages": 203498,
+                    "limit": 20,
+                    "scope": "collector_only",
+                    "warmup_rich_us": rich_elapsed.as_micros(),
+                    "warmup_lean_us": lean_elapsed.as_micros(),
+                    "rich_samples_us": rich_samples,
+                    "lean_samples_us": lean_samples,
+                    "rich_count_collectors": 1,
+                    "rich_stored_document_loads": 20,
+                    "lean_count_collectors": 0,
+                    "lean_stored_document_loads": 0,
+                })
+            );
         }
 
         #[test]

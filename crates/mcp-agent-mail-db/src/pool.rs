@@ -2931,8 +2931,16 @@ impl DbPoolConfig {
     ///    restore the legacy Python defaults (not recommended for production).
     #[must_use]
     pub fn from_env() -> Self {
-        let core_config = mcp_agent_mail_core::Config::from_env();
+        Self::from_config(&mcp_agent_mail_core::Config::from_env())
+    }
 
+    /// Build the serving pool from an already-resolved mailbox configuration.
+    ///
+    /// Startup and request admission must use the same mailbox authority and
+    /// pool shape. Re-reading ambient configuration during warmup can initialize
+    /// a different pool from the one the listener will actually serve.
+    #[must_use]
+    pub fn from_config(core_config: &mcp_agent_mail_core::Config) -> Self {
         // Config reads DATABASE_URL via infra_env_value (a project-local .env
         // cannot hijack the database path) and, when it is unset, derives the
         // storage-root-relative default.
@@ -2967,7 +2975,7 @@ impl DbPoolConfig {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0)
             .min(min_conn);
-        let storage_root = core_config.storage_root;
+        let storage_root = core_config.storage_root.clone();
         let cache_budget_kb = core_config.database_cache_budget_kb;
 
         Self {
@@ -8053,13 +8061,13 @@ async fn run_sqlite_init_once(
     }
 
     // Rebuild inbox_stats from ground truth, drop legacy triggers, and fix
-    // mixed-scale timestamps left by the Python server.
+    // mixed-scale timestamps left by the Python server. A rolled-back repair
+    // preserves the old data, but does not prove that mail is ready to serve.
+    // Keep the initialization gate retryable until the repair really succeeds.
     if let Err(err) = startup_data_repairs(&runtime_conn) {
-        tracing::warn!(
-            path = %sqlite_path,
-            error = %err,
-            "startup data repairs failed; some counters/timestamps may be stale"
-        );
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite init stage=startup_data_repairs failed: {err}"
+        )));
     }
 
     drop(runtime_conn);
@@ -40429,6 +40437,44 @@ mod tests {
     }
 
     #[test]
+    fn failed_startup_repair_prevents_successful_file_initialization() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let directory = tempfile::tempdir().expect("temporary mailbox");
+        let path = directory.path().join("rejected-repair.sqlite3");
+        let path_str = path.to_str().expect("UTF-8 fixture path");
+        let conn = DbConn::open_file(path_str).expect("open fixture");
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, created_ts INTEGER, ack_required INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             CREATE TABLE inbox_stats (agent_id INTEGER PRIMARY KEY, total_count INTEGER CHECK(total_count = 99), \
+                 unread_count INTEGER, ack_pending_count INTEGER, last_message_ts INTEGER); \
+             INSERT INTO messages VALUES (1, 2000000000, 1); \
+             INSERT INTO message_recipients VALUES (1, 1, NULL, NULL); \
+             INSERT INTO inbox_stats VALUES (1, 99, 98, 97, 96);",
+        )
+        .expect("seed repair that must roll back");
+        let before = startup_repair_snapshot(&conn);
+        drop(conn);
+
+        let outcome = runtime.block_on(run_sqlite_init_once(&Cx::for_testing(), path_str, false));
+        assert!(
+            matches!(outcome, Outcome::Err(ref error)
+                if error.to_string().contains("stage=startup_data_repairs")
+                    && error.to_string().contains("CHECK")),
+            "a failed data repair must not publish successful initialization: {outcome:?}"
+        );
+
+        let conn = DbConn::open_file(path_str).expect("inspect rejected mailbox");
+        assert_eq!(
+            startup_repair_snapshot(&conn),
+            before,
+            "failed admission must preserve the original messages and counters"
+        );
+    }
+
+    #[test]
     fn sqlite_init_missing_file_bootstraps_without_recovery_artifacts() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -40822,6 +40868,41 @@ mod tests {
     }
 
     // ── DbPoolConfig::from_env ──────────────────────────────────────────
+
+    #[test]
+    fn pool_config_from_resolved_config_preserves_the_serving_authority_and_shape() {
+        let directory = tempfile::tempdir().expect("serving storage root");
+        let resolved = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: directory.path().to_path_buf(),
+            database_pool_size: Some(1),
+            database_max_overflow: Some(0),
+            database_pool_timeout: Some(3),
+            database_cache_budget_kb: 16 * 1024,
+            ..Default::default()
+        };
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", "sqlite:///unrelated-mailbox.sqlite3"),
+                ("DATABASE_POOL_SIZE", "31"),
+                ("DATABASE_MAX_OVERFLOW", "7"),
+                ("DATABASE_POOL_TIMEOUT", "9"),
+            ],
+            || {
+                let config = DbPoolConfig::from_config(&resolved);
+                assert_eq!(config.database_url, resolved.database_url);
+                assert_eq!(config.storage_root.as_deref(), Some(directory.path()));
+                assert_eq!(config.min_connections, 1);
+                assert_eq!(config.max_connections, 1);
+                assert_eq!(config.acquire_timeout_ms, 3_000);
+                assert_eq!(config.cache_budget_kb, 16 * 1024);
+                let pool = get_or_create_pool(&config).expect("serving pool");
+                let same = get_cached_pool(&DbPoolConfig::from_config(&resolved))
+                    .expect("warmup must resolve the serving pool");
+                assert!(Arc::ptr_eq(&pool.pool, &same.pool));
+            },
+        );
+    }
 
     #[test]
     fn pool_config_from_env_has_defaults() {
