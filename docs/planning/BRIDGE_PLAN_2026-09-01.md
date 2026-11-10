@@ -1,5 +1,59 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 10 archive reader follow-through — EmeraldEagle / br-asldx
+
+- [x] Verify unchanged governing docs and tracked 91fb1340; preserve seven
+  peer roots. Re-read timing/fixture callers and measured inventory/floor paths.
+- [x] Find a concrete adjacent gap: capped archive reads still follow leaf
+  links and can block on a FIFO. Project identity inventory calls this seam
+  without even a prior leaf check. Existing regular-file/no-follow opener is
+  already implemented and used by the strict ID-floor reader.
+- [x] Wire that existing opener into the shared capped reader, preserving
+  the inclusive 64 MiB limit, UTF-8 validation, parsing and skip accounting.
+  This guards leaves only; ancestor/directory binding remains br-xzgcj scope.
+- [x] Execute real regular/empty/Unicode/missing/invalid-UTF8/cap-boundary,
+  linked-project identity and writerless-FIFO regressions. The FIFO case uses
+  an exact-one-test child and 5s watchdog; actual native 240s bounds stay intact.
+  All four new cases pass in the full V1 module run.
+- [x] Diagnose that full run's existing fixture failure: 133/134 pass;
+  pre-v33 rollback setup excludes v34 but accidentally installs dependent v35.
+  Truncate the fixture at v33's position, preserving every rollback/retry
+  assertion and the separate real mixed-epoch refusal control. No production
+  migration guard changes. V2 reruns the same full 134-case namespace.
+  V2 finishes 0/388.7s on hz2: 134/134 pass in 10.980s, 3823 outside the
+  selected namespace. Both migration controls and all four new cases pass.
+- [x] Run retained inventory/symlink recovery cases and the original 12 startup
+  cases on these new bytes. Old V5 green remains historical for the old source.
+  Final V2 startup 0/428.1s on hz4: 12/12 pass in 8.782s, 5516 outside the
+  selection. Persisted 100/10000 fixtures retain content/recipient/parity checks.
+- [x] Complete both required workspace compiler graphs, strict Clippy, fmt
+  and stock UBS; retain every failed/intermediate receipt without weakening.
+  V1 source f8a6eaee / lock 208ea862, base 91fb1340 plus only reconstruct.rs,
+  overlay9381d15d50a1e8d996dcb7c5c0ace10f6db48222c629dc07df4feb4c71eab9a5:
+  production 0/622.0s (vmi1149989), all-targets 0/723.8s and strict
+  Clippy 0/300.5s (vmi1153651), fmt 0.
+  Stock one-file UBS 0: critical 0 / warning 1906 / info 689, failed modules 0;
+  baseline 0/1875/670. Added warnings are test assertions/unwraps; no suppression.
+  V2 source 488302b3 changes only the historical test setup after V1;
+  overlay dea45c855b67385815c5a3427279ee1992f49f3f9e78f729e73ed04b04dcfd6a:
+  fmt and UBS pass unchanged counts; all-targets 0/240.4s on vmi1153651 and
+  production 0/546.8s on vmi1149989. Clippy queues out 103 before Cargo on
+  vmi1153651; unchanged retry passes 0/733.7s on vmi1149989.
+  First native preparation refuses 120 before Cargo on vmi1227854; hz2
+  preparation completes 0/2348.9s with zero bodies. Actual execution initially
+  refuses 120 because other live builds hold disk reservations. Recompute
+  protected headroom after one finishes, then run the unchanged population:
+  134 executed, 133 passed, one fixture failure above. Keep both refusals.
+  Preparation 14400s earns no bodies; actual 1800s / 240s remain unchanged.
+- [ ] Fresh-review reader, callers and tests again; mark actual Bead progress,
+  verify tracker/DAG, synchronize normally and release only owned leases.
+- [ ] Integrate seven incoming peer commits through a normal preserving merge.
+  Fresh fetch finds origin/main at a5571948, seven commits ahead of base 91fb1340;
+  peer frontmatter-only inventory reads complement the full-artifact reader fix.
+  Requalify the combined source before the final publication claim.
+- [ ] Original bounded-readiness and two-size/control benchmark remain open;
+  this is a reliability integration, not a measured speedup or combined scan.
+
 ## November 9 native startup follow-through — EmeraldEagle / br-asldx
 
 - [x] Verify unchanged governing docs and clean tracked348aded6; reread the

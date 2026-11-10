@@ -95,7 +95,10 @@ const MAX_ITEMIZED_WARNINGS: usize = 10_000;
 /// failure (so an oversized artifact is logged/counted rather than OOMing).
 fn read_archive_text_capped(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path)?;
+    // A prior directory-entry check cannot exclude a leaf swapped to a link
+    // or FIFO before open. Verify the opened handle and refuse without waiting
+    // for a writer on a non-regular archive artifact.
+    let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
     let mut buf = String::new();
     let read = file
         .by_ref()
@@ -7379,6 +7382,123 @@ fn collect_message_files_with_ids(
 mod tests {
     use super::*;
 
+    #[test]
+    fn capped_archive_reader_preserves_regular_text_and_missing_file_errors() {
+        let dir = tempfile::tempdir().expect("private archive reader fixture");
+        let path = dir.path().join("artifact.md");
+        for contents in ["", "---json\n{\"id\":7}\n---\n\nhéllo 📨\n"] {
+            std::fs::write(&path, contents).expect("write regular archive artifact");
+            assert_eq!(read_archive_text_capped(&path).unwrap(), contents);
+        }
+        let error = read_archive_text_capped(&dir.path().join("missing.md"))
+            .expect_err("missing archive artifact must remain an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn capped_archive_reader_preserves_byte_cap_and_utf8_errors() {
+        let dir = tempfile::tempdir().expect("private bounded reader fixture");
+        let invalid = dir.path().join("invalid.md");
+        std::fs::write(&invalid, [0xf0, 0x28, 0x8c, 0x28]).expect("write invalid UTF-8");
+        assert_eq!(
+            read_archive_text_capped(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let path = dir.path().join("bounded.md");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_ARCHIVE_ARTIFACT_BYTES)
+            .expect("extend sparse regular artifact to the inclusive cap");
+        let contents = read_archive_text_capped(&path).expect("exact cap is accepted");
+        assert_eq!(
+            u64::try_from(contents.len()).unwrap(),
+            MAX_ARCHIVE_ARTIFACT_BYTES
+        );
+        drop(contents);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+            .expect("extend artifact one byte beyond cap");
+        let error = read_archive_text_capped(&path).expect_err("oversized artifact must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("byte cap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_archive_reader_rejects_linked_project_identity() {
+        let dir = tempfile::tempdir().expect("private linked identity fixture");
+        let archive = dir.path().join("archive");
+        let project = archive.join("projects/inside");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside = dir.path().join("outside.json");
+        let contents = r#"{"slug":"foreign","human_key":"/foreign"}"#;
+        std::fs::write(&outside, contents).unwrap();
+        let link = project.join("project.json");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // The previous plain File::open reader follows this valid leaf link.
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), contents);
+        assert!(read_archive_text_capped(&link).is_err());
+        let inventory = scan_archive_message_inventory(&archive);
+        let expected = MailboxProjectIdentity::from_parts(Some("inside".into()), None, None)
+            .expect("directory identity fallback");
+        assert_eq!(inventory.projects, 1);
+        assert_eq!(inventory.project_identities, BTreeSet::from([expected]));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_archive_reader_rejects_fifo_without_waiting_for_a_writer() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_CAPPED_ARCHIVE_FIFO_PATH";
+        const TEST: &str =
+            "reconstruct::tests::capped_archive_reader_rejects_fifo_without_waiting_for_a_writer";
+        const WITNESS: &str = "capped-archive-fifo-refused";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            // Bound the regression itself: plain File::open blocks forever on
+            // this writerless FIFO. Only this private child is terminated.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                eprintln!("capped archive FIFO reader did not refuse within 5 seconds");
+                std::process::exit(3);
+            });
+            let error = read_archive_text_capped(Path::new(&path))
+                .expect_err("writerless FIFO must be refused at open");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            println!("{WITNESS}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("private FIFO fixture");
+        let fifo = dir.path().join("artifact.md");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create real writerless FIFO");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD_PATH_ENV, &fifo)
+            .current_dir(dir.path())
+            .output()
+            .expect("execute private bounded reader child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains(WITNESS)
+                && stdout.contains("test result: ok. 1 passed;"),
+            "FIFO reader child must execute and pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
     fn assert_compact_reconstruction_candidate(conn: &DbConn) {
         assert_eq!(
             conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
@@ -7568,10 +7688,10 @@ mod tests {
             .position(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
             .unwrap();
         let migration = legacy.remove(index);
-        // This fixture predates the v33 event representation. Installing v34
-        // first creates a mixed-epoch schema that the ownership guard refuses
-        // before the intended ledger-write rollback control can be reached.
-        legacy.retain(|migration| !migration.id.starts_with("v34_"));
+        // This fixture predates v33. Keep only its actual predecessors: later
+        // cursor migrations depend on each other and must not run before the
+        // intended ledger-write rollback control can be reached.
+        legacy.truncate(index);
         apply_snapshot_migrations(&conn, legacy, "legacy fixture").unwrap();
         conn.execute_raw(
             "PRAGMA foreign_keys = OFF; \
