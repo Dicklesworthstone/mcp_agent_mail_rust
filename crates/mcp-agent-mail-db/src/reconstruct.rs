@@ -113,6 +113,66 @@ fn read_archive_text_capped(path: &Path) -> std::io::Result<String> {
     Ok(buf)
 }
 
+/// Read only the metadata prefix needed by archive inventories. Message bodies
+/// can dominate mailbox size, but neither ID enumeration nor drift inspection
+/// consumes them. Full reconstruction still uses `read_archive_text_capped`.
+/// Keep the existing artifact limit and frontmatter grammar, including legacy
+/// preambles, CRLF and a closing marker at EOF. This best-effort inventory is
+/// not the descriptor-bound, authoritative allocator scan in `id_floor`.
+fn read_archive_frontmatter_capped(path: &Path) -> std::io::Result<Option<String>> {
+    let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+    if file.metadata()?.len() > MAX_ARCHIVE_ARTIFACT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive artifact exceeds {MAX_ARCHIVE_ARTIFACT_BYTES} byte cap: {}",
+                path.display()
+            ),
+        ));
+    }
+    read_archive_frontmatter_prefix(file)
+}
+
+fn read_archive_frontmatter_prefix(reader: impl std::io::Read) -> std::io::Result<Option<String>> {
+    use std::io::BufRead as _;
+
+    let mut reader = std::io::BufReader::new(reader.take(MAX_ARCHIVE_ARTIFACT_BYTES + 1));
+    let mut prefix = Vec::with_capacity(8 * 1024);
+    let mut found_header = false;
+    loop {
+        let line_start = prefix.len();
+        let read = reader.read_until(b'\n', &mut prefix)?;
+        if prefix.len() as u64 > MAX_ARCHIVE_ARTIFACT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("archive frontmatter exceeds {MAX_ARCHIVE_ARTIFACT_BYTES} byte cap"),
+            ));
+        }
+        if read == 0 {
+            return Ok(None);
+        }
+        let line = &prefix[line_start..];
+        // Decode the consumed prefix, never arbitrary body bytes that a
+        // BufReader may have prefetched after the closing marker.
+        let text = std::str::from_utf8(line)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if !found_header {
+            if let Some(start) = text.find("---json") {
+                // Match frontmatter_bounds: its first header candidate is
+                // decisive, even if a later line contains a valid header.
+                if !matches!(&text[start..], "---json\n" | "---json\r\n") {
+                    return Ok(None);
+                }
+                found_header = true;
+            }
+        } else if matches!(line, b"---\n" | b"---\r\n" | b"---") {
+            return String::from_utf8(prefix)
+                .map(Some)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+    }
+}
+
 #[cfg(test)]
 type SqliteDbConn = crate::CanonicalDbConn;
 
@@ -1495,8 +1555,11 @@ fn scan_project_archive_message_inventory(
 }
 
 fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
-    let content = read_archive_text_capped(file_path)
-        .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
+    let Some(content) = read_archive_frontmatter_capped(file_path)
+        .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?
+    else {
+        return Ok(None);
+    };
     let Some(frontmatter) = extract_json_frontmatter(&content) else {
         return Ok(None);
     };
@@ -14839,6 +14902,203 @@ archive body
         let (ids, errors) = scan_archive_message_ids(tmp.path());
         assert_eq!(errors, 0);
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn archive_frontmatter_prefix_preserves_inventory_grammar() {
+        let cases = [
+            "---json\n{\"id\":1}\n---\nbody\n---\n",
+            "---json\r\n{\"id\":2}\r\n---\r\nbody",
+            "---json\n{\"id\":3}\n---",
+            "legacy preamble\n\u{feff}---json\n{\"id\":4}\n---\nbody",
+            "---json\n{\"id\":5,\"subject\":\"--- markers ---\"}\n---\nbody",
+            "---json\n{\"id\":6}\n---suffix\n---\nbody",
+            "---json invalid\n---json\n{\"id\":7}\n---\nbody",
+            "---json\n{\"id\":8}\n",
+            "---json",
+            "plain text\n---\n",
+            "",
+        ];
+        for content in cases {
+            let prefix = read_archive_frontmatter_prefix(content.as_bytes()).unwrap();
+            assert_eq!(
+                prefix.as_deref().and_then(extract_json_frontmatter),
+                extract_json_frontmatter(content),
+                "inventory frontmatter grammar changed for {content:?}",
+            );
+        }
+
+        let invalid_header = b"---json\n{\"id\":\xff}\n---\nbody";
+        assert_eq!(
+            read_archive_frontmatter_prefix(invalid_header.as_slice())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+        );
+        // An inventory reports metadata only. Body validation remains on the
+        // full reconstruction path and must not make this scan read the body.
+        let invalid_body = b"---json\n{\"id\":9}\n---\n\xff";
+        let prefix = read_archive_frontmatter_prefix(invalid_body.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(extract_json_frontmatter(&prefix), Some("{\"id\":9}\n"));
+    }
+
+    #[test]
+    fn archive_frontmatter_prefix_reads_metadata_instead_of_large_bodies() {
+        use std::cell::Cell;
+        use std::io::{Read as _, Write as _};
+
+        struct CountedFile<'a> {
+            file: std::fs::File,
+            bytes: &'a Cell<usize>,
+        }
+        impl std::io::Read for CountedFile<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.file.read(buffer)?;
+                self.bytes.set(self.bytes.get() + read);
+                Ok(read)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large.md");
+        let header = b"---json\n{\"id\":42,\"subject\":\"large message\"}\n---\n";
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(header).unwrap();
+        let body_chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..128 {
+            file.write_all(&body_chunk).unwrap();
+        }
+        drop(file);
+
+        // Run the incumbent full-artifact read and the metadata reader on the
+        // same real file. Count actual Read bytes instead of a noisy timing
+        // assertion; both paths must identify exactly the same message.
+        let full_bytes = Cell::new(0);
+        let mut full = String::new();
+        CountedFile {
+            file: std::fs::File::open(&path).unwrap(),
+            bytes: &full_bytes,
+        }
+        .take(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+        .read_to_string(&mut full)
+        .unwrap();
+        assert_eq!(full, read_archive_text_capped(&path).unwrap());
+
+        let prefix_bytes = Cell::new(0);
+        let prefix = read_archive_frontmatter_prefix(CountedFile {
+            file: std::fs::File::open(&path).unwrap(),
+            bytes: &prefix_bytes,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            extract_json_frontmatter(&prefix),
+            extract_json_frontmatter(&full),
+        );
+        assert_eq!(scan_archive_message_id(&path).unwrap(), Some(42));
+        assert_eq!(prefix.len(), header.len());
+        assert_eq!(full_bytes.get(), 8 * 1024 * 1024 + header.len());
+        assert!(
+            prefix_bytes.get() <= 8 * 1024 + header.len(),
+            "body was read: {} bytes for {} metadata bytes",
+            prefix_bytes.get(),
+            header.len(),
+        );
+        eprintln!(
+            "archive inventory actual bytes: incumbent={}, metadata={}, retained_prefix={}",
+            full_bytes.get(),
+            prefix_bytes.get(),
+            prefix.len(),
+        );
+    }
+
+    #[test]
+    fn scan_archive_message_inventory_preserves_ids_duplicates_and_parse_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let directory = root.join("projects/alpha/messages/2026/11");
+        std::fs::create_dir_all(&directory).unwrap();
+        let cases = [
+            ("one.md", "---json\n{\"id\":1}\n---\nbody"),
+            ("duplicate.md", "---json\r\n{\"id\":1}\r\n---\r\nbody"),
+            ("two.md", "preamble\n---json\n{\"id\":2}\n---"),
+            ("zero.md", "---json\n{\"id\":0}\n---\nbody"),
+            ("negative.md", "---json\n{\"id\":-1}\n---\nbody"),
+            ("missing_id.md", "---json\n{}\n---\nbody"),
+            ("bad_json.md", "---json\nnot json\n---\nbody"),
+            ("missing_header.md", "plain text"),
+            ("incomplete.md", "---json\n{\"id\":99}\n"),
+        ];
+        for (name, content) in cases {
+            let path = directory.join(name);
+            std::fs::write(&path, content).unwrap();
+            let legacy = extract_json_frontmatter(content).map(|metadata| {
+                serde_json::from_str::<serde_json::Value>(metadata).map(|value| {
+                    value
+                        .get("id")
+                        .and_then(serde_json::Value::as_i64)
+                        .filter(|id| *id > 0)
+                })
+            });
+            match legacy {
+                Some(Ok(id)) => assert_eq!(scan_archive_message_id(&path).unwrap(), id),
+                Some(Err(_)) => assert!(scan_archive_message_id(&path).is_err()),
+                None => assert_eq!(scan_archive_message_id(&path).unwrap(), None),
+            }
+        }
+        let inventory = scan_archive_message_inventory(root);
+        assert_eq!(inventory.projects, 1);
+        assert_eq!(inventory.canonical_message_files, cases.len());
+        assert_eq!(inventory.unique_message_ids, 2);
+        assert_eq!(inventory.duplicate_canonical_message_files, 1);
+        assert_eq!(inventory.duplicate_canonical_message_ids, 1);
+        assert_eq!(inventory.latest_message_id, Some(2));
+        assert_eq!(inventory.parse_errors, 1);
+        let (ids, parse_errors) = scan_archive_message_ids(root);
+        assert_eq!(ids, BTreeSet::from([1, 2]));
+        assert_eq!(parse_errors, 1);
+    }
+
+    #[test]
+    fn archive_frontmatter_prefix_preserves_artifact_cap_and_bounds_missing_markers() {
+        use std::io::Read as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oversized.md");
+        std::fs::write(&path, "---json\n{\"id\":42}\n---\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read_archive_frontmatter_capped(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+        );
+        assert!(scan_archive_message_id(&path).is_err());
+
+        let never_closes = b"---json\n".as_slice().chain(std::io::repeat(b'x'));
+        assert_eq!(
+            read_archive_frontmatter_prefix(never_closes)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_frontmatter_prefix_refuses_symlink_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.md");
+        let alias = tmp.path().join("alias.md");
+        std::fs::write(&source, "---json\n{\"id\":42}\n---\nbody").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert_eq!(scan_archive_message_id(&source).unwrap(), Some(42));
+        assert!(scan_archive_message_id(&alias).is_err());
     }
 
     #[test]
