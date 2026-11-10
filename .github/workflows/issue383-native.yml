@@ -171,11 +171,12 @@ jobs:
             "$EVIDENCE_DIR/report.json" > "$EVIDENCE_DIR/summary.json"
           jq -e '
             .status == "ok"
-            and (.failed_modules | length) == 0
+            and .failed_modules == []
+            and (.scanners | length) == 2
             and .totals.files == 20
             and .totals.critical == 0
-            and ([.scanners[] | select(.language == "rust" and .files == 19 and (.status // "ok") == "ok")] | length) == 1
-            and ([.scanners[] | select(.language == "python" and .files == 1 and (.status // "ok") == "ok")] | length) == 1
+            and ([.scanners[] | select(.language == "rust" and .files == 19 and .status == "ok")] | length) == 1
+            and ([.scanners[] | select(.language == "python" and .files == 1 and .status == "ok")] | length) == 1
           ' "$EVIDENCE_DIR/report.json"
           exit "$scanner_status"
       - name: Retain complete static findings
