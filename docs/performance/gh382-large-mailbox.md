@@ -9,6 +9,29 @@ from the synthetic fixtures introduced here.
 
 ## Evidence status
 
+**Native follow-through, November 10, 2026:** the reviewed candidate based on
+`ce1fac7f` plus the two-source `4037b5cf` overlay passes both workspace compiler
+graphs (`--all-targets` and production `--lib --bins`), strict Clippy, standalone
+formatting, and the separate portable production graph. These are compiler
+results, not the constrained-host runtime qualification below. The stock scans
+retain the existing query-fixture token and debug-only invariant panic alerts;
+they are not uniformly green.
+
+An earlier native execution ran 805 cases: 785 passed and 20 failed. Those
+failures drove fixes to transactional snapshot comparisons, migration witnesses,
+optional source identity, caller-clock deadlines, and damaged-index repair.
+The corrected four-crate native preparation completes successfully and all four
+executables have retained SHA-256 identities. Its first execution request is
+refused before Cargo starts because active disk reservations plus the protected
+floor prevent admission; it executes **zero tests**. The original case set,
+four added regressions and lock-diagnostic cases still require actual execution.
+No native pass, issue closure, startup speedup, or 2-CPU/4-GiB clearance follows
+from preparation. The [bridge plan](../planning/BRIDGE_PLAN_2026-09-01.md) records
+the exact source hashes, receipts and outstanding acceptance.
+
+The original integration record follows; its outages and failed attempts remain
+part of the evidence history.
+
 The implementation and regression fixtures are committed independently of their
 qualification status. The execution host repeatedly disconnected during this
 work. The repository's exact pinned formatter passed for the inbox, pool,

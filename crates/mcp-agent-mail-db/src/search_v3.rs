@@ -1672,13 +1672,15 @@ fn marker_resume_plan(
         .search(&query, &Count)
         .map_err(|error| format!("backfill prefix count failed: {error}"))?;
     backfill_checkpoint(cancelled)?;
-    Ok(
-        (u64::try_from(indexed_prefix).ok() == Some(state.index_stats.count)).then_some(
-            BackfillPlan::Incremental {
-                start_after_id: marker_max_id,
-            },
-        ),
-    )
+    if u64::try_from(indexed_prefix).ok() != Some(state.index_stats.count) {
+        // Known index loss invalidates availability even when the fallback
+        // chooses incremental repair. Revoke before it waits for the writer.
+        bridge.revoke_source_proof();
+        return Ok(None);
+    }
+    Ok(Some(BackfillPlan::Incremental {
+        start_after_id: marker_max_id,
+    }))
 }
 
 /// Id windows below the index maximum searched for missing messages, nearest
@@ -2460,6 +2462,16 @@ fn backfill_into_bridge_locked_with_opener(
     let db_stats = fetch_db_message_stats(&conn, cancelled)?;
     let index_stats = fetch_index_message_stats(bridge)?;
     backfill_checkpoint(cancelled)?;
+    if previous_state.as_ref().is_some_and(|state| {
+        state.index_stats == state.db_stats
+            && (index_stats.count < state.index_stats.count
+                || index_stats.max_id < state.index_stats.max_id)
+    }) {
+        // A lost suffix can look like an ordinary append to the planner.
+        // Its count/max deficit still proves previously indexed content was
+        // lost, so it cannot retain availability while awaiting repair.
+        bridge.revoke_source_proof();
+    }
     // A marker written for another mailbox path or another generation of
     // this mailbox means the indexed documents belong to a database whose
     // numeric ids cannot be trusted against this one, however similar the
@@ -3169,7 +3181,7 @@ mod tests {
         );
         let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "gh382 repair fixture");
         gh382_install_lexical_clock(&conn);
-        let bridge = TantivyBridge::open(index.path()).unwrap();
+        let bridge = Arc::new(TantivyBridge::open(index.path()).unwrap());
         backfill_into_bridge(&bridge, &path, None).unwrap();
         assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
         let clock = lexical_change_clock(&conn).unwrap().unwrap();
@@ -3203,8 +3215,14 @@ mod tests {
         let writer_lock = bridge.writer.lock().unwrap();
         BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
             let cancelled = Arc::clone(&cancelled);
+            let bridge = Arc::clone(&bridge);
+            let path = path.clone();
             *observer.borrow_mut() = Some(Box::new(move |lock| {
                 assert_eq!(lock, "writer");
+                assert!(
+                    !bridge.source_is_available(&path, Some("gh382-generation")),
+                    "known prefix loss must revoke availability before writer admission"
+                );
                 cancelled.store(true, Ordering::Release);
             }));
         });
@@ -3260,6 +3278,73 @@ mod tests {
     }
 
     #[test]
+    fn gh382_lost_suffix_revokes_availability_before_incremental_writer_wait() {
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[
+                (1, "commonmail", "first body", "normal", "thread"),
+                (2, "commonmail", "second body", "normal", "thread"),
+            ],
+        );
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "gh382 lost suffix");
+        gh382_install_lexical_clock(&conn);
+        let bridge = Arc::new(TantivyBridge::open(index.path()).unwrap());
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (2, 0));
+        let clock = lexical_change_clock(&conn).unwrap();
+        with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, None, |writer| {
+            writer.delete_term(Term::from_field_u64(bridge.handles().id, 2));
+            writer.commit().map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(bridge.source_is_available(&path, Some("gh382-generation")));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let writer_lock = bridge.writer.lock().unwrap();
+        BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
+            let cancelled = Arc::clone(&cancelled);
+            let bridge = Arc::clone(&bridge);
+            let path = path.clone();
+            *observer.borrow_mut() = Some(Box::new(move |lock| {
+                assert_eq!(lock, "writer");
+                assert!(
+                    !bridge.source_is_available(&path, Some("gh382-generation")),
+                    "lost suffix must revoke availability before incremental writer admission"
+                );
+                cancelled.store(true, Ordering::Release);
+            }));
+        });
+        let result = backfill_into_bridge_locked_with_opener(
+            &bridge,
+            &path,
+            None,
+            open_backfill_conn,
+            WriterBusyPolicy::Retry,
+            Some(cancelled.as_ref()),
+        );
+        BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        drop(writer_lock);
+        assert_eq!(result.unwrap_err(), BACKFILL_CANCELLED);
+        assert!(!bridge.backfill_in_progress());
+        assert!(!bridge.source_is_available(&path, Some("gh382-generation")));
+        assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
+        assert_eq!(lexical_change_clock(&conn).unwrap(), clock);
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (1, 0));
+        let mut ids = bridge
+            .search(&PlannerQuery::messages("commonmail", 1))
+            .iter()
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+        assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+        assert_eq!(lexical_change_clock(&conn).unwrap(), clock);
+    }
+
+    #[test]
     fn gh382_tail_resume_checks_the_committed_index_prefix() {
         for damage_prefix in [false, true] {
             let source = tempfile::tempdir().unwrap();
@@ -3309,6 +3394,15 @@ mod tests {
                 fetch_index_message_stats(&bridge).unwrap().count,
                 if damage_prefix { 2 } else { 3 },
                 "a live tail can hide prefix loss behind the saved marker's count"
+            );
+            assert!(bridge.source_is_available(&path, Some("gh382-generation")));
+            let db_stats = fetch_db_message_stats(&conn, None).unwrap();
+            let state = read_backfill_state(&bridge);
+            marker_resume_plan(&conn, &bridge, db_stats, state.as_ref(), None).unwrap();
+            assert_eq!(
+                bridge.source_is_available(&path, Some("gh382-generation")),
+                !damage_prefix,
+                "prefix validation must revoke known loss and preserve intact coverage"
             );
             let (indexed, _) = backfill_into_bridge(&bridge, &path, None).unwrap();
             if damage_prefix {
