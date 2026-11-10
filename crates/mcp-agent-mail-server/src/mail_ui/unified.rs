@@ -31,6 +31,12 @@ const NEXT_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, import
 type Roster = BTreeMap<i64, BTreeSet<i64>>;
 type ProjectAgents = BTreeMap<i64, Vec<UnifiedAgent>>;
 
+struct RosterSnapshot {
+    selected: Roster,
+    agents: ProjectAgents,
+    profiles: BTreeMap<i64, Row>,
+}
+
 fn database_error(error: impl std::fmt::Display) -> DbError {
     let detail = error.to_string();
     if mcp_agent_mail_db::is_lock_error(&detail) {
@@ -149,6 +155,57 @@ struct Viewer {
     blocked: bool,
 }
 
+impl Viewer {
+    fn eligible_for_shared(&self) -> bool {
+        !self.retired && !self.deregistered && !self.blocked
+    }
+}
+
+/// The two earliest eligible viewers decide shared visibility without building
+/// every virtual receipt. At most one of them can be the message's sender.
+#[derive(Default)]
+struct SharedEligibility {
+    earliest: Option<(i64, i64)>,
+    next: Option<(i64, i64)>,
+}
+
+impl SharedEligibility {
+    fn include(&mut self, agent: i64, viewer: &Viewer) {
+        if !viewer.eligible_for_shared() {
+            return;
+        }
+        let key = (viewer.inception, agent);
+        if self.earliest.is_none_or(|earliest| key < earliest) {
+            self.next = self.earliest;
+            self.earliest = Some(key);
+        } else if self.next.is_none_or(|next| key < next) {
+            self.next = Some(key);
+        }
+    }
+
+    fn visible(&self, header: &Header) -> bool {
+        self.earliest
+            .iter()
+            .chain(self.next.iter())
+            .any(|&(inception, agent)| agent != header.sender && inception <= header.created)
+    }
+}
+
+fn shared_viewer_eligibility(
+    viewers: &BTreeMap<i64, BTreeMap<i64, Viewer>>,
+) -> BTreeMap<i64, SharedEligibility> {
+    viewers
+        .iter()
+        .map(|(&project, viewers)| {
+            let mut eligibility = SharedEligibility::default();
+            for (&agent, viewer) in viewers {
+                eligibility.include(agent, viewer);
+            }
+            (project, eligibility)
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct Header {
     id: i64,
@@ -170,6 +227,34 @@ struct Receipt {
 struct Candidate {
     header: Header,
     recipients: BTreeMap<i64, Receipt>,
+    shared: bool,
+}
+
+impl Candidate {
+    fn visible(&self, shared: &BTreeMap<i64, SharedEligibility>) -> bool {
+        !self.recipients.is_empty()
+            || self.shared
+                && shared
+                    .get(&self.header.project)
+                    .is_some_and(|eligibility| eligibility.visible(&self.header))
+    }
+}
+
+fn extend_visible_window(
+    window: &mut BTreeMap<(i64, i64), Candidate>,
+    candidates: BTreeMap<i64, Candidate>,
+    shared: &BTreeMap<i64, SharedEligibility>,
+    limit: usize,
+) {
+    for (_, candidate) in candidates {
+        if !candidate.visible(shared) {
+            continue;
+        }
+        window.insert((candidate.header.created, candidate.header.id), candidate);
+        if window.len() > limit {
+            window.pop_first();
+        }
+    }
 }
 
 struct SelectedMessage {
@@ -289,9 +374,18 @@ async fn fetch(
         interrupted: std::cell::Cell::new(false),
     };
     let result = in_snapshot(&checked, || {
-        let (roster, agents) = read_roster(&checked, project_ids)?;
-        let messages = read(&checked, &roster, limit, importance)?;
-        Ok(SelectedPage { messages, agents })
+        let roster = read_roster(&checked, project_ids)?;
+        let messages = read(
+            &checked,
+            &roster.selected,
+            &roster.profiles,
+            limit,
+            importance,
+        )?;
+        Ok(SelectedPage {
+            messages,
+            agents: roster.agents,
+        })
     });
     if checked.interrupted.get() || cx.checkpoint().is_err() {
         return cancelled(cx);
@@ -333,26 +427,24 @@ fn integer(row: &Row, column: &str) -> Result<i64, DbError> {
 }
 
 /// Select each project's legacy display roster without one checkout/query per
-/// project. Only display fields enter this projection; registration tokens and
-/// other unused profile data never need to be decoded for the unified inbox.
-fn read_roster(
-    conn: &impl SyncQuery,
-    project_ids: &[i64],
-) -> Result<(Roster, ProjectAgents), DbError> {
+/// project. Retain the selected rows' viewer fields from this same snapshot so
+/// rendering a small page does not re-read the entire agent roster in ID batches.
+/// Viewer fields are decoded only after legacy alias selection, just as before.
+fn read_roster(conn: &impl SyncQuery, project_ids: &[i64]) -> Result<RosterSnapshot, DbError> {
     let project_ids: Vec<_> = project_ids
         .iter()
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let mut profiles: BTreeMap<i64, Vec<(i64, UnifiedAgent)>> = BTreeMap::new();
+    let mut profiles: BTreeMap<i64, Vec<(i64, UnifiedAgent, Row)>> = BTreeMap::new();
     let mut seen_ids = BTreeSet::new();
     for chunk in project_ids.chunks(PAGE_SIZE) {
         for row in lookup(
             conn,
             "agents",
             "project_id",
-            "id, project_id, name, program, model, last_active_ts",
+            "id, project_id, name, program, model, last_active_ts, inception_ts, retired_at, contact_policy",
             chunk,
         )? {
             let project = integer(&row, "project_id")?;
@@ -379,12 +471,14 @@ fn read_roster(
                     model: display_text(4),
                     last_active: ts_display(last_active),
                 },
+                row,
             ));
         }
     }
 
     let mut roster = Roster::new();
     let mut project_agents = ProjectAgents::new();
+    let mut selected_profiles = BTreeMap::new();
     for (project, mut profiles) in profiles {
         // This is list_agents' legacy rule, not list_agent_roster's canonical
         // oldest-ID rule. Preserve retired/deregistered direct history, and
@@ -398,18 +492,29 @@ fn read_roster(
         let mut seen_names = BTreeSet::new();
         let agents: Vec<_> = profiles
             .into_iter()
-            .map(|(_, agent)| agent)
-            .filter(|agent| seen_names.insert(agent.name.to_ascii_lowercase()))
+            .filter_map(|(_, agent, row)| {
+                if seen_names.insert(agent.name.to_ascii_lowercase()) {
+                    selected_profiles.insert(agent.id, row);
+                    Some(agent)
+                } else {
+                    None
+                }
+            })
             .collect();
         roster.insert(project, agents.iter().map(|agent| agent.id).collect());
         project_agents.insert(project, agents);
     }
-    Ok((roster, project_agents))
+    Ok(RosterSnapshot {
+        selected: roster,
+        agents: project_agents,
+        profiles: selected_profiles,
+    })
 }
 
 fn current_viewers(
     conn: &impl SyncQuery,
     roster: &Roster,
+    profiles: &BTreeMap<i64, Row>,
     shared: bool,
 ) -> Result<BTreeMap<i64, BTreeMap<i64, Viewer>>, DbError> {
     let ids: Vec<_> = roster
@@ -431,21 +536,14 @@ fn current_viewers(
                 }
             }
         }
-        let mut seen = BTreeSet::new();
-        for row in lookup(
-            conn,
-            "agents",
-            "id",
-            "id, project_id, name, inception_ts, retired_at, contact_policy",
-            chunk,
-        )? {
-            let id = integer(&row, "id")?;
-            if chunk.binary_search(&id).is_err() || !seen.insert(id) {
-                return Err(DbError::Internal(
-                    "unrequested or duplicate unified inbox viewer".into(),
-                ));
+        for &id in chunk {
+            let Some(row) = profiles.get(&id) else {
+                continue;
+            };
+            if integer(row, "id")? != id {
+                return Err(DbError::Internal("unrequested unified inbox viewer".into()));
             }
-            let project = integer(&row, "project_id")?;
+            let project = integer(row, "project_id")?;
             if !roster.get(&project).is_some_and(|ids| ids.contains(&id)) {
                 continue;
             }
@@ -454,7 +552,7 @@ fn current_viewers(
                 .map_err(database_error)?;
             let viewer = Viewer {
                 name: row.get_named("name").map_err(database_error)?,
-                inception: integer(&row, "inception_ts")?,
+                inception: integer(row, "inception_ts")?,
                 retired: row
                     .get_named::<Option<i64>>("retired_at")
                     .map_err(database_error)?
@@ -473,6 +571,7 @@ fn current_viewers(
 fn read(
     conn: &impl SyncQuery,
     roster: &Roster,
+    profiles: &BTreeMap<i64, Row>,
     limit: usize,
     importance: Option<&str>,
 ) -> Result<Vec<SelectedMessage>, DbError> {
@@ -481,10 +580,11 @@ fn read(
     }
     i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
     let shared = ExplorerQuery::shared_mailbox_schema_available(conn)?;
-    let viewers = current_viewers(conn, roster, shared)?;
+    let viewers = current_viewers(conn, roster, profiles, shared)?;
     if viewers.is_empty() {
         return Ok(Vec::new());
     }
+    let shared_eligibility = shared_viewer_eligibility(&viewers);
     let mut window: BTreeMap<(i64, i64), Candidate> = BTreeMap::new();
     let mut ceiling = None;
     let mut skip_at_ceiling = 0_i64;
@@ -555,20 +655,13 @@ fn read(
                         importance: importance_value,
                     },
                     recipients: BTreeMap::new(),
+                    shared: false,
                 },
             );
         }
         if !candidates.is_empty() {
-            recipients(conn, &viewers, &mut candidates, shared)?;
-            for (_, candidate) in candidates {
-                if candidate.recipients.is_empty() {
-                    continue;
-                }
-                window.insert((candidate.header.created, candidate.header.id), candidate);
-                if window.len() > limit {
-                    window.pop_first();
-                }
-            }
+            candidate_deliveries(conn, &viewers, &mut candidates, shared)?;
+            extend_visible_window(&mut window, candidates, &shared_eligibility, limit);
         }
         // Later pages contain strictly smaller (timestamp, id) keys, including
         // within a timestamp cohort. A full visible window is already final.
@@ -578,10 +671,12 @@ fn read(
         ceiling = last_ts;
         skip_at_ceiling = trailing_count;
     }
-    hydrate(conn, window.into_values().rev().collect())
+    let mut selected: Vec<_> = window.into_values().rev().collect();
+    expand_shared_receipts(conn, &viewers, &mut selected)?;
+    hydrate(conn, selected)
 }
 
-fn recipients(
+fn candidate_deliveries(
     conn: &impl SyncQuery,
     viewers: &BTreeMap<i64, BTreeMap<i64, Viewer>>,
     candidates: &mut BTreeMap<i64, Candidate>,
@@ -622,7 +717,6 @@ fn recipients(
     if !shared {
         return Ok(());
     }
-    let mut shared_messages = BTreeSet::new();
     for row in lookup(
         conn,
         "project_mailbox_deliveries",
@@ -637,16 +731,29 @@ fn recipients(
         if integer(&row, "project_id")? != candidate.header.project {
             continue;
         }
-        if !shared_messages.insert(id) {
+        if candidate.shared {
             return Err(DbError::Internal(
                 "duplicate shared unified inbox delivery".into(),
             ));
         }
+        candidate.shared = true;
+    }
+    Ok(())
+}
+
+/// Shared delivery can fan out to thousands of viewers. Expand it only after
+/// the visible message window is final, and fetch read/ack state only for that
+/// window. Explicit delivery keeps precedence over the virtual receipt.
+fn expand_shared_receipts(
+    conn: &impl SyncQuery,
+    viewers: &BTreeMap<i64, BTreeMap<i64, Viewer>>,
+    selected: &mut [Candidate],
+) -> Result<(), DbError> {
+    let mut shared_messages = BTreeMap::new();
+    for candidate in selected.iter_mut().filter(|candidate| candidate.shared) {
         for (&agent, viewer) in &viewers[&candidate.header.project] {
             if agent == candidate.header.sender
-                || viewer.retired
-                || viewer.deregistered
-                || viewer.blocked
+                || !viewer.eligible_for_shared()
                 || viewer.inception > candidate.header.created
             {
                 continue;
@@ -662,42 +769,45 @@ fn recipients(
                     ack: None,
                 });
         }
+        shared_messages.insert(candidate.header.id, candidate);
     }
     if shared_messages.is_empty() {
         return Ok(());
     }
-    let shared_ids: Vec<_> = shared_messages.into_iter().collect();
+    let shared_ids: Vec<_> = shared_messages.keys().copied().collect();
     let mut seen = BTreeSet::new();
-    for row in lookup(
-        conn,
-        "project_mailbox_receipts",
-        "message_id",
-        "message_id, agent_id, read_ts, ack_ts",
-        &shared_ids,
-    )? {
-        let id = integer(&row, "message_id")?;
-        if shared_ids.binary_search(&id).is_err() {
-            return Err(DbError::Internal(
-                "unrequested shared unified inbox receipt".into(),
-            ));
+    for chunk in shared_ids.chunks(PAGE_SIZE) {
+        for row in lookup(
+            conn,
+            "project_mailbox_receipts",
+            "message_id",
+            "message_id, agent_id, read_ts, ack_ts",
+            chunk,
+        )? {
+            let id = integer(&row, "message_id")?;
+            if chunk.binary_search(&id).is_err() {
+                return Err(DbError::Internal(
+                    "unrequested shared unified inbox receipt".into(),
+                ));
+            }
+            let agent = integer(&row, "agent_id")?;
+            let Some(receipt) = shared_messages
+                .get_mut(&id)
+                .and_then(|candidate| candidate.recipients.get_mut(&agent))
+            else {
+                continue;
+            };
+            if !receipt.shared {
+                continue;
+            }
+            if !seen.insert((id, agent)) {
+                return Err(DbError::Internal(
+                    "duplicate shared unified inbox receipt".into(),
+                ));
+            }
+            receipt.read = row.get_named("read_ts").map_err(database_error)?;
+            receipt.ack = row.get_named("ack_ts").map_err(database_error)?;
         }
-        let agent = integer(&row, "agent_id")?;
-        let Some(receipt) = candidates
-            .get_mut(&id)
-            .and_then(|candidate| candidate.recipients.get_mut(&agent))
-        else {
-            continue;
-        };
-        if !receipt.shared {
-            continue;
-        }
-        if !seen.insert((id, agent)) {
-            return Err(DbError::Internal(
-                "duplicate shared unified inbox receipt".into(),
-            ));
-        }
-        receipt.read = row.get_named("read_ts").map_err(database_error)?;
-        receipt.ack = row.get_named("ack_ts").map_err(database_error)?;
     }
     Ok(())
 }
@@ -844,6 +954,35 @@ mod tests {
             .collect()
     }
 
+    // These focused visibility fixtures supply an explicit roster. The live
+    // collector instead obtains these rows together with the display roster.
+    fn read(
+        conn: &impl SyncQuery,
+        roster: &Roster,
+        limit: usize,
+        importance: Option<&str>,
+    ) -> Result<Vec<SelectedMessage>, DbError> {
+        let ids: Vec<_> = roster
+            .values()
+            .flat_map(|ids| ids.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut profiles = BTreeMap::new();
+        for chunk in ids.chunks(PAGE_SIZE) {
+            for row in lookup(
+                conn,
+                "agents",
+                "id",
+                "id, project_id, name, inception_ts, retired_at, contact_policy",
+                chunk,
+            )? {
+                profiles.insert(integer(&row, "id")?, row);
+            }
+        }
+        super::read(conn, roster, &profiles, limit, importance)
+    }
+
     fn page(
         conn: &impl SyncQuery,
         roster: &Roster,
@@ -964,6 +1103,25 @@ mod tests {
     }
 
     #[test]
+    fn shared_visibility_excludes_the_sender_and_respects_inception() {
+        let (_dir, conn) = fixture();
+        let scope = BTreeMap::from([(1, BTreeSet::from([10, 13]))]);
+        assert!(page(&*conn, &scope, 10, None).is_empty());
+        conn.execute_raw("UPDATE messages SET created_ts=10000 WHERE id=1")
+            .unwrap();
+        let rows = page(&*conn, &scope, 10, None);
+        assert_eq!(ids(&rows), [1]);
+        assert_eq!(rows[0].recipients.len(), 1);
+        assert_eq!(rows[0].recipients[0].name, "LateFox");
+        conn.execute_raw("UPDATE agents SET retired_at=1 WHERE id=10; UPDATE messages SET sender_id=13 WHERE id=1")
+            .unwrap();
+        assert!(
+            page(&*conn, &scope, 10, None).is_empty(),
+            "the sole eligible viewer cannot receive its own shared delivery"
+        );
+    }
+
+    #[test]
     fn order_uses_timestamps_and_id_ties_not_scan_or_delivery_order() {
         let (_dir, conn) = fixture();
         conn.execute_raw("UPDATE messages SET created_ts=100 WHERE id IN (1,2,3,4)")
@@ -997,13 +1155,103 @@ mod tests {
     }
 
     #[test]
+    fn shared_fanout_and_receipt_reads_are_limited_to_selected_messages() {
+        let (_dir, conn) = fixture();
+        conn.execute_raw("BEGIN").unwrap();
+        for agent in 1000..1032 {
+            conn.execute_raw(&format!(
+                "INSERT INTO agents VALUES({agent},1,'Viewer{agent}',0,NULL,'auto')"
+            ))
+            .unwrap();
+        }
+        for id in 100..400 {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages(id,project_id,sender_id,created_ts,importance) VALUES({id},1,10,{id}+1000,'normal'); \
+                 INSERT INTO project_mailbox_deliveries VALUES({id},1); \
+                 INSERT INTO project_mailbox_receipts VALUES({id},11,{id},{id}+1)"
+            ))
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT; PRAGMA query_only=ON").unwrap();
+        let mut scope = roster();
+        scope.get_mut(&1).unwrap().extend(1000..1032);
+        for limit in [3, 270] {
+            let traced = Traced {
+                conn: &conn,
+                statements: RefCell::new(Vec::new()),
+            };
+            let rows = page(&traced, &scope, limit, None);
+            let expected: Vec<_> = (100..400).rev().take(limit).collect();
+            assert_eq!(ids(&rows), expected);
+            assert!(rows.iter().all(|row| row.recipients.len() == 34));
+            for &id in &expected {
+                assert_eq!(receipt(&rows, id, "BlueLake").read, Some(id));
+                assert_eq!(receipt(&rows, id, "BlueLake").ack, Some(id + 1));
+                assert!(receipt(&rows, id, "GoldFox").shared);
+            }
+            let statements = traced.statements.borrow();
+            let receipt_reads: Vec<_> = statements
+                .iter()
+                .filter(|(sql, _)| sql.contains("FROM project_mailbox_receipts"))
+                .collect();
+            assert_eq!(receipt_reads.len(), limit.div_ceil(PAGE_SIZE));
+            assert_eq!(
+                receipt_reads
+                    .iter()
+                    .map(|(_, params)| params.len())
+                    .sum::<usize>(),
+                limit,
+                "discarded headers must not expand shared receipt state"
+            );
+            let mut requested: Vec<_> = receipt_reads
+                .iter()
+                .flat_map(|(_, params)| params.iter().map(|value| value_as_i64(value).unwrap()))
+                .collect();
+            requested.sort_unstable_by(|left, right| right.cmp(left));
+            assert_eq!(requested, expected);
+        }
+    }
+
+    #[test]
+    fn malformed_shared_receipt_fails_only_when_its_message_is_selected() {
+        let (_dir, conn) = fixture();
+        conn.execute_raw(
+            "UPDATE project_mailbox_receipts SET read_ts='invalid' WHERE message_id=1 AND agent_id=11",
+        )
+        .unwrap();
+        assert_eq!(ids(&page(&*conn, &roster(), 1, None)), [4]);
+        assert!(in_snapshot(&*conn, || read(&*conn, &roster(), 10, None)).is_err());
+    }
+
+    fn assert_viewers_reuse_roster_rows(
+        conn: &Traced<'_>,
+        roster: &RosterSnapshot,
+        expected_reads: usize,
+    ) {
+        let rows = in_snapshot(conn, || {
+            super::read(conn, &roster.selected, &roster.profiles, 10, None)
+        })
+        .expect("a discarded alias's malformed viewer field must not break the selected roster");
+        assert_eq!(ids(&rows), [4, 2, 3, 1]);
+        assert_eq!(
+            conn.statements
+                .borrow()
+                .iter()
+                .filter(|(sql, _)| sql.contains("inception_ts"))
+                .count(),
+            expected_reads,
+            "viewer validation must reuse the project-roster reads"
+        );
+    }
+
+    #[test]
     fn project_rosters_are_batched_and_keep_legacy_alias_and_scope_rules() {
         let (_dir, conn) = fixture();
         for sql in [
             "ALTER TABLE agents ADD COLUMN program TEXT NOT NULL DEFAULT 'test-program'",
             "ALTER TABLE agents ADD COLUMN model TEXT NOT NULL DEFAULT 'test-model'",
             "ALTER TABLE agents ADD COLUMN last_active_ts INTEGER NOT NULL DEFAULT 0",
-            "INSERT INTO agents(id,project_id,name,inception_ts,retired_at,contact_policy,last_active_ts) VALUES(16,1,'bluelake',0,NULL,'auto',10),(17,1,'BLUELAKE',0,9,'auto',10),(90000,999,'OtherProject',0,NULL,'auto',99)",
+            "INSERT INTO agents(id,project_id,name,inception_ts,retired_at,contact_policy,last_active_ts) VALUES(16,1,'bluelake','invalid',NULL,'auto',10),(17,1,'BLUELAKE',0,9,'auto',10),(90000,999,'OtherProject',0,NULL,'auto',99)",
             "INSERT INTO agent_deregistrations VALUES(21,1)",
             "BEGIN",
         ] {
@@ -1022,7 +1270,9 @@ mod tests {
             statements: RefCell::new(Vec::new()),
         };
         let projects: Vec<i64> = (1..=257).collect();
-        let (selected, agents) = in_snapshot(&traced, || read_roster(&traced, &projects)).unwrap();
+        let projection = in_snapshot(&traced, || read_roster(&traced, &projects)).unwrap();
+        let selected = &projection.selected;
+        let agents = &projection.agents;
         assert_eq!(selected.len(), 257);
         assert_eq!(
             selected[&1],
@@ -1054,9 +1304,10 @@ mod tests {
                 .all(|(_, params)| params.len() <= PAGE_SIZE)
         );
         drop(statements);
-        let (scoped, _) = in_snapshot(&*conn, || read_roster(&*conn, &[1, 1])).unwrap();
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[&1], selected[&1]);
+        assert_viewers_reuse_roster_rows(&traced, &projection, 2);
+        let scoped = in_snapshot(&*conn, || read_roster(&*conn, &[1, 1])).unwrap();
+        assert_eq!(scoped.selected.len(), 1);
+        assert_eq!(scoped.selected[&1], selected[&1]);
     }
 
     #[test]
@@ -1075,7 +1326,11 @@ mod tests {
         ] {
             conn.execute_raw(sql).unwrap();
         }
-        let (selected, agents) = in_snapshot(&*conn, || read_roster(&*conn, &[1])).unwrap();
+        let RosterSnapshot {
+            selected,
+            agents,
+            profiles,
+        } = in_snapshot(&*conn, || read_roster(&*conn, &[1])).unwrap();
         let agents = &agents[&1];
         assert_eq!(
             agents.iter().map(|agent| agent.id).collect::<Vec<_>>(),
@@ -1090,7 +1345,10 @@ mod tests {
         assert_eq!(agents.iter().find(|agent| agent.id == 17).unwrap().name, "");
         assert!(!selected[&1].contains(&16));
         assert!(
-            in_snapshot(&*conn, || read(&*conn, &selected, 1, None)).is_err(),
+            in_snapshot(&*conn, || {
+                super::read(&*conn, &selected, &profiles, 1, None)
+            })
+            .is_err(),
             "a selected malformed identity must still fail current_viewers validation"
         );
     }
