@@ -9930,7 +9930,194 @@ pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) 
     write_agent_profile_with_config(archive, &Config::get(), agent)
 }
 
+const MAX_AGENT_PROFILE_PUBLICATION_BYTES: u64 = 1024 * 1024;
+
+fn agent_profile_publication_conflict(message: &str) -> StorageError {
+    StorageError::InvalidPath(format!(
+        "agent profile publication refused: {message}; existing evidence retained"
+    ))
+}
+
+fn agent_profile_publication_inception(profile: &serde_json::Value) -> Result<Option<i64>> {
+    let mut inception = None;
+    for field in ["inception_ts", "registered_ts"] {
+        if let Some(value) = profile.get(field).filter(|value| !value.is_null()) {
+            let timestamp = archive_publication_timestamp(value).ok_or_else(|| {
+                agent_profile_publication_conflict("invalid agent inception timestamp")
+            })?;
+            if inception.is_some_and(|prior| prior != timestamp) {
+                return Err(agent_profile_publication_conflict(
+                    "agent inception timestamps disagree",
+                ));
+            }
+            inception = Some(timestamp);
+        }
+    }
+    Ok(inception)
+}
+
+fn agent_profile_publication_deregistration(profile: &serde_json::Value) -> Result<Option<i64>> {
+    if let Some(value) = profile
+        .get("deregistered_at")
+        .filter(|value| !value.is_null())
+    {
+        return archive_publication_timestamp(value)
+            .map(Some)
+            .ok_or_else(|| {
+                agent_profile_publication_conflict("invalid permanent deregistration timestamp")
+            });
+    }
+    // Reconstruction also recognizes this legacy permanent tombstone. A
+    // missing or null newer field must not turn its identity active again.
+    let legacy = profile
+        .get("task_description")
+        .and_then(serde_json::Value::as_str)
+        .filter(|description| {
+            mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
+                description,
+            )
+        })
+        .filter(|_| {
+            profile
+                .get("contact_policy")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|policy| policy.eq_ignore_ascii_case("block_all"))
+        });
+    legacy
+        .map(|description| {
+            mcp_agent_mail_db::models::deregistered_task_timestamp_micros(description).ok_or_else(
+                || {
+                    agent_profile_publication_conflict(
+                        "unverifiable legacy deregistration tombstone",
+                    )
+                },
+            )
+        })
+        .transpose()
+}
+
+/// Merge only evidence for the same identity. Ordinary queued writes carry a
+/// captured profile, not a lifecycle revision: archive lock order cannot prove
+/// they are newer than a surviving permanent tombstone. Refuse that conflict
+/// rather than silently making stale input appear authoritative. Retirement
+/// remains reversible; only deregistration is monotonic.
+fn merge_agent_profile_publication(
+    incoming: &serde_json::Value,
+    committed: Option<&serde_json::Value>,
+    working: Option<&serde_json::Value>,
+) -> Result<Vec<u8>> {
+    let fields = incoming.as_object().ok_or_else(|| {
+        agent_profile_publication_conflict("incoming profile must be a JSON object")
+    })?;
+    let name = incoming
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| agent_profile_publication_conflict("incoming profile lacks agent name"))?;
+    if incoming
+        .get("agent_name")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| value.as_str() != Some(name))
+    {
+        return Err(agent_profile_publication_conflict(
+            "incoming agent name aliases conflict",
+        ));
+    }
+    if fields.contains_key("registration_token") {
+        return Err(agent_profile_publication_conflict(
+            "registration credentials must not be archived",
+        ));
+    }
+    let inception = agent_profile_publication_inception(incoming)?;
+    let deregistered_at = agent_profile_publication_deregistration(incoming)?;
+    let mut merged = serde_json::Map::new();
+    for published in [committed, working].into_iter().flatten() {
+        let published_fields = published.as_object().ok_or_else(|| {
+            agent_profile_publication_conflict("archived profile must be a JSON object")
+        })?;
+        // Older archive profiles use agent_name. Every supplied identity
+        // spelling must agree before their extensions or lifecycle are merged.
+        let published_name = published
+            .get("name")
+            .filter(|value| !value.is_null())
+            .or_else(|| published.get("agent_name"));
+        if published_name.and_then(serde_json::Value::as_str) != Some(name)
+            || published
+                .get("agent_name")
+                .filter(|value| !value.is_null())
+                .is_some_and(|value| value.as_str() != Some(name))
+        {
+            return Err(agent_profile_publication_conflict(
+                "archived agent name conflicts with the incoming identity",
+            ));
+        }
+        let published_inception = agent_profile_publication_inception(published)?;
+        if published_inception.is_some() && published_inception != inception {
+            return Err(agent_profile_publication_conflict(
+                "archived agent inception conflicts with the incoming identity",
+            ));
+        }
+        let published_deregistration = agent_profile_publication_deregistration(published)?;
+        if published_deregistration.is_some() && published_deregistration != deregistered_at {
+            return Err(agent_profile_publication_conflict(
+                "permanent deregistration conflicts with the incoming profile",
+            ));
+        }
+        merged.extend(published_fields.clone());
+    }
+    // Working extensions supersede committed extensions; explicit incoming
+    // fields supersede both. Credentials are never carried into a new commit.
+    merged.extend(fields.clone());
+    merged.remove("registration_token");
+    let bytes = serde_json::to_vec_pretty(&merged)?;
+    if bytes.len() as u64 > MAX_AGENT_PROFILE_PUBLICATION_BYTES {
+        return Err(agent_profile_publication_conflict(
+            "merged profile exceeds the artifact byte bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn committed_agent_profile_publication(
+    repo_root: &Path,
+    relative: &str,
+) -> Result<Option<serde_json::Value>> {
+    let repo = Repository::open(repo_root)?;
+    let tree = match repo.head() {
+        Ok(head) => head.peel_to_tree()?,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let entry = match tree.get_path(Path::new(relative)) {
+        Ok(entry) => entry,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if entry.kind() != Some(git2::ObjectType::Blob)
+        || !matches!(entry.filemode(), 0o100644 | 0o100755)
+    {
+        return Err(agent_profile_publication_conflict(
+            "committed profile is not a regular file",
+        ));
+    }
+    let (size, kind) = repo.odb()?.read_header(entry.id())?;
+    if kind != git2::ObjectType::Blob || size as u64 > MAX_AGENT_PROFILE_PUBLICATION_BYTES {
+        return Err(agent_profile_publication_conflict(
+            "committed profile exceeds the artifact byte bound",
+        ));
+    }
+    let blob = repo.find_blob(entry.id())?;
+    serde_json::from_slice(blob.content())
+        .map(Some)
+        .map_err(StorageError::from)
+}
+
 /// Write an agent's profile.json using explicit config for author info.
+///
+/// Permanent lifecycle evidence in both the working file and Git HEAD is
+/// checked under the publication/project locks before replacement. A stale
+/// active write cannot erase a tombstone even when the working file is lost.
 pub fn write_agent_profile_with_config(
     archive: &ProjectArchive,
     config: &Config,
@@ -9939,7 +10126,7 @@ pub fn write_agent_profile_with_config(
     let name = agent
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
+        .ok_or_else(|| agent_profile_publication_conflict("incoming profile lacks agent name"))?;
     let name = validate_archive_component("agent name", name)?;
 
     let repo_root = archive_repo_root_checked(archive)?;
@@ -9950,11 +10137,26 @@ pub fn write_agent_profile_with_config(
     let rel = with_project_lock_inner(archive, true, false, || {
         let project_root = archive_project_root_checked(archive)?;
         let profile_dir = project_root.join("agents").join(name);
-        ensure_dir(&profile_dir)?;
-
         let profile_path = profile_dir.join("profile.json");
-        write_json(&profile_path, agent, true)?;
-        rel_path_cached(&archive.canonical_repo_root, &profile_path)
+        if path_existing_prefix_has_symlink(&profile_path)? {
+            return Err(agent_profile_publication_conflict(
+                "profile path contains a symlink",
+            ));
+        }
+        let relative = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
+        let committed = committed_agent_profile_publication(repo_root, &relative)?;
+        let working = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+            &profile_path,
+            MAX_AGENT_PROFILE_PUBLICATION_BYTES,
+        ) {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = merge_agent_profile_publication(agent, committed.as_ref(), working.as_ref())?;
+        ensure_dir(&profile_dir)?;
+        atomic_write_bytes(&profile_path, &bytes, true)?;
+        Ok(relative)
     })?;
     enqueue_async_commit(repo_root, config, &format!("agent: profile {name}"), &[rel]);
 
@@ -10067,7 +10269,7 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
     format!("{subject}\n\n{}", lines.join("\n"))
 }
 
-fn reservation_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
+fn archive_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         value.as_str().and_then(|text| {
             let text = text.trim();
@@ -10162,8 +10364,8 @@ fn validate_reservation_publication_version(
     }
     if let (Some(before), Some(after)) = (published.get("created_ts"), incoming.get("created_ts")) {
         let same = match (
-            reservation_publication_timestamp(before),
-            reservation_publication_timestamp(after),
+            archive_publication_timestamp(before),
+            archive_publication_timestamp(after),
         ) {
             (Some(before), Some(after)) => before == after,
             _ => before == after || before.is_null() || after.is_null(),
@@ -10186,8 +10388,8 @@ fn validate_reservation_publication_version(
     // concurrent renewal. Only two ACTIVE versions are ordered by expiry.
     if !incoming_released
         && let (Some(before), Some(after)) = (
-            reservation_publication_timestamp(&published["expires_ts"]),
-            reservation_publication_timestamp(&incoming["expires_ts"]),
+            archive_publication_timestamp(&published["expires_ts"]),
+            archive_publication_timestamp(&incoming["expires_ts"]),
         )
         && after < before
     {
@@ -18221,6 +18423,267 @@ mod tests {
 
         let profile_path = archive.root.join("agents/TestAgent/profile.json");
         assert!(profile_path.exists());
+    }
+
+    fn publication_agent_profile() -> serde_json::Value {
+        serde_json::json!({
+            "name": "BlueLake",
+            "program": "test",
+            "model": "test-model",
+            "task_description": "preserve this identity's history",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-02T00:00:00Z",
+            "attachments_policy": "auto",
+            "contact_policy": "auto",
+            "reaper_exempt": false,
+            "retired_at": null,
+            "deregistered_at": null,
+        })
+    }
+
+    fn publication_deregistered_profile() -> serde_json::Value {
+        let mut profile = publication_agent_profile();
+        profile["deregistered_at"] = serde_json::json!("2026-01-03T00:00:00Z");
+        profile["contact_policy"] = serde_json::json!("block_all");
+        profile["task_description"] =
+            serde_json::json!("[DEREGISTERED 2026-01-03T00:00:00Z] preserve history");
+        profile
+    }
+
+    fn committed_publication_profile(archive: &ProjectArchive) -> Vec<u8> {
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let relative = format!("projects/{}/agents/BlueLake/profile.json", archive.slug);
+        let entry = tree.get_path(Path::new(&relative)).unwrap();
+        repo.find_blob(entry.id()).unwrap().content().to_vec()
+    }
+
+    #[test]
+    fn agent_profile_publication_rejects_delayed_active_write_before_reconstruction() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp.path().join("archive"));
+        let archive = ensure_archive(&config, "profile-publication").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/profile-publication").unwrap();
+
+        // Capture the actual mutable WBQ operation before deregistration. Its
+        // producer can be delayed after committing SQLite but before enqueue,
+        // so acquisition order of the archive locks is not lifecycle order.
+        let delayed = WriteOp::AgentProfile {
+            project_slug: archive.slug.clone(),
+            config: config.clone(),
+            agent_json: publication_agent_profile(),
+        };
+        wbq_execute_op(&delayed, "profile publication regression").unwrap();
+        let deregistered = publication_deregistered_profile();
+        write_agent_profile_with_config(&archive, &config, &deregistered).unwrap();
+        flush_async_commits();
+        let path = archive.root.join("agents/BlueLake/profile.json");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(committed_publication_profile(&archive), before);
+
+        let result = wbq_execute_op(&delayed, "delayed profile publication regression");
+        assert!(
+            result.is_err(),
+            "an old active write must refuse to erase durable deregistration"
+        );
+        flush_async_commits();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(committed_publication_profile(&archive), before);
+
+        // Recovery has no live DB or queued lifecycle write to repair from.
+        // The retained artifact alone must prevent resurrection.
+        let recovered = tmp.path().join("reconstructed.sqlite3");
+        let stats = mcp_agent_mail_db::reconstruct::reconstruct_from_archive(
+            &recovered,
+            &config.storage_root,
+        )
+        .unwrap();
+        assert_eq!(stats.agents, 1);
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_file(recovered.to_string_lossy()).unwrap(),
+            "agent publication reconstruction regression",
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT a.name, d.deregistered_at FROM agents a \
+                 JOIN agent_deregistrations d ON d.agent_id = a.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "BlueLake");
+        assert_eq!(
+            rows[0].get_named::<i64>("deregistered_at").unwrap(),
+            mcp_agent_mail_core::iso_to_micros("2026-01-03T00:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_profile_publication_preserves_committed_tombstones_when_working_copy_regresses() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        for regressed in [false, true] {
+            let slug = if regressed { "regressed" } else { "missing" };
+            let archive = ensure_archive(&config, slug).unwrap();
+            write_agent_profile_with_config(&archive, &config, &publication_deregistered_profile())
+                .unwrap();
+            flush_async_commits();
+            let path = archive.root.join("agents/BlueLake/profile.json");
+            let committed = committed_publication_profile(&archive);
+            fs::rename(&path, path.with_file_name("retained-profile.json")).unwrap();
+            let working = regressed.then(|| {
+                let bytes = serde_json::to_vec(&publication_agent_profile()).unwrap();
+                fs::write(&path, &bytes).unwrap();
+                bytes
+            });
+
+            assert!(
+                write_agent_profile_with_config(&archive, &config, &publication_agent_profile())
+                    .is_err(),
+                "committed evidence survives a {slug} working profile"
+            );
+            flush_async_commits();
+            match working {
+                Some(bytes) => assert_eq!(fs::read(&path).unwrap(), bytes),
+                None => assert!(!path.exists()),
+            }
+            assert_eq!(committed_publication_profile(&archive), committed);
+        }
+        // A tombstone in another project is never authority over this one.
+        let separate = ensure_archive(&config, "separate").unwrap();
+        write_agent_profile_with_config(&separate, &config, &publication_agent_profile()).unwrap();
+        assert_eq!(
+            read_agent_profile(&separate, "BlueLake").unwrap(),
+            Some(publication_agent_profile())
+        );
+    }
+
+    #[test]
+    fn agent_profile_publication_upgrades_legacy_name_without_merging_alias_conflicts() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        for null_name in [false, true] {
+            let slug = if null_name {
+                "legacy-null-name"
+            } else {
+                "legacy-name"
+            };
+            let archive = ensure_archive(&config, slug).unwrap();
+            let canonical = publication_deregistered_profile();
+            let mut legacy = canonical.clone();
+            let fields = legacy.as_object_mut().unwrap();
+            let inception = fields.remove("inception_ts").unwrap();
+            fields.remove("name");
+            fields.remove("deregistered_at");
+            fields.insert("agent_name".to_string(), serde_json::json!("BlueLake"));
+            fields.insert("registered_ts".to_string(), inception);
+            fields.insert("extension".to_string(), serde_json::json!({"note": "retain"}));
+            if null_name {
+                fields.insert("name".to_string(), serde_json::Value::Null);
+            }
+            let path = archive.root.join("agents/BlueLake/profile.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+            fs::write(&path, &legacy_bytes).unwrap();
+            let relative = format!("projects/{slug}/agents/BlueLake/profile.json");
+            enqueue_async_commit(
+                &archive.repo_root,
+                &config,
+                "legacy profile fixture",
+                &[relative],
+            );
+            flush_async_commits();
+            assert_eq!(committed_publication_profile(&archive), legacy_bytes);
+
+            let error =
+                write_agent_profile_with_config(&archive, &config, &publication_agent_profile())
+                    .unwrap_err();
+            assert!(error.to_string().contains("permanent deregistration"));
+            assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+            assert_eq!(committed_publication_profile(&archive), legacy_bytes);
+
+            write_agent_profile_with_config(&archive, &config, &canonical).unwrap();
+            flush_async_commits();
+            let before = fs::read(&path).unwrap();
+            let stored: serde_json::Value = serde_json::from_slice(&before).unwrap();
+            assert_eq!(stored["name"], "BlueLake");
+            assert_eq!(stored["agent_name"], "BlueLake");
+            assert_eq!(stored["registered_ts"], legacy["registered_ts"]);
+            assert_eq!(stored["extension"], legacy["extension"]);
+            assert_eq!(stored["deregistered_at"], canonical["deregistered_at"]);
+            assert_eq!(committed_publication_profile(&archive), before);
+
+            for alias in [serde_json::json!("RedStone"), serde_json::json!(false)] {
+                let mut incoming = canonical.clone();
+                incoming["agent_name"] = alias;
+                assert!(write_agent_profile_with_config(&archive, &config, &incoming).is_err());
+                assert_eq!(fs::read(&path).unwrap(), before);
+                assert_eq!(committed_publication_profile(&archive), before);
+            }
+            for alias in [serde_json::json!("RedStone"), serde_json::json!(false)] {
+                let mut foreign = stored.clone();
+                foreign["agent_name"] = alias;
+                let foreign_bytes = serde_json::to_vec_pretty(&foreign).unwrap();
+                fs::write(&path, &foreign_bytes).unwrap();
+                assert!(write_agent_profile_with_config(&archive, &config, &canonical).is_err());
+                assert_eq!(fs::read(&path).unwrap(), foreign_bytes);
+                assert_eq!(committed_publication_profile(&archive), before);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_profile_publication_preserves_extensions_and_allows_reversible_retirement() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "profile-updates").unwrap();
+        let mut original = publication_agent_profile();
+        original["extension"] = serde_json::json!({"operator_note": "retain", "values": [1, 2]});
+        write_agent_profile_with_config(&archive, &config, &original).unwrap();
+        flush_async_commits();
+
+        let mut update = publication_agent_profile();
+        update["inception_ts"] = serde_json::json!(
+            mcp_agent_mail_core::iso_to_micros("2026-01-01T00:00:00Z")
+                .unwrap()
+                .to_string()
+        );
+        update["program"] = serde_json::json!("updated-client");
+        update["retired_at"] = serde_json::json!("2026-01-03T00:00:00Z");
+        for retired_at in [update["retired_at"].clone(), serde_json::Value::Null] {
+            update["retired_at"] = retired_at.clone();
+            write_agent_profile_with_config(&archive, &config, &update).unwrap();
+            flush_async_commits();
+            let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+            assert_eq!(stored["retired_at"], retired_at);
+            assert_eq!(stored["program"], "updated-client");
+            assert_eq!(stored["extension"], original["extension"]);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&committed_publication_profile(
+                    &archive
+                ))
+                .unwrap(),
+                stored
+            );
+        }
+
+        let deregistered = publication_deregistered_profile();
+        write_agent_profile_with_config(&archive, &config, &deregistered).unwrap();
+        flush_async_commits();
+        let mut equivalent = deregistered.clone();
+        equivalent["deregistered_at"] =
+            serde_json::json!(mcp_agent_mail_core::iso_to_micros("2026-01-03T00:00:00Z").unwrap());
+        equivalent["reaper_exempt"] = serde_json::Value::Bool(true);
+        write_agent_profile_with_config(&archive, &config, &equivalent).unwrap();
+        flush_async_commits();
+        let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+        assert_eq!(stored["reaper_exempt"], true);
+        assert_eq!(stored["extension"], original["extension"]);
+        assert_eq!(stored["deregistered_at"], equivalent["deregistered_at"]);
     }
 
     #[test]
