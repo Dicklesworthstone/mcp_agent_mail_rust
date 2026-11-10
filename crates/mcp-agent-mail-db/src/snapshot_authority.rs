@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use fs2::FileExt as _;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -17,6 +18,137 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
+
+const MAX_RETENTION_SEARCH_CANDIDATES: usize = 128;
+const MAX_RETENTION_SEARCH_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RETENTION_SEARCH_WITNESSES: usize = 16_384;
+
+/// A maintenance slice ended before snapshot selection could finish. This is
+/// not missing verification and must never authorize a repair publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotRetentionDeferred {
+    Deadline,
+    Candidates,
+    Bytes,
+    InventoryChanged,
+}
+
+impl std::fmt::Display for SnapshotRetentionDeferred {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "snapshot retention search deferred: {self:?}")
+    }
+}
+
+impl std::error::Error for SnapshotRetentionDeferred {}
+
+impl SnapshotRetentionDeferred {
+    #[must_use]
+    pub fn from_io_error(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
+
+struct RetentionSearchBudget {
+    deadline: Instant,
+    candidates: usize,
+    bytes: u64,
+    candidate_limit: usize,
+    byte_limit: u64,
+}
+
+impl RetentionSearchBudget {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            candidates: 0,
+            bytes: 0,
+            candidate_limit: MAX_RETENTION_SEARCH_CANDIDATES,
+            byte_limit: MAX_RETENTION_SEARCH_BYTES,
+        }
+    }
+
+    fn admit(&mut self, bytes: u64) -> io::Result<()> {
+        let refused = if Instant::now() >= self.deadline {
+            Some(SnapshotRetentionDeferred::Deadline)
+        } else if self.candidates >= self.candidate_limit {
+            Some(SnapshotRetentionDeferred::Candidates)
+        } else if self.candidates > 0 && self.bytes.saturating_add(bytes) > self.byte_limit {
+            Some(SnapshotRetentionDeferred::Bytes)
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            return Err(io::Error::other(reason));
+        }
+        // One oversized source may finish, so a large real pin can eventually
+        // be verified. A slice is a cooperative bound, not syscall preemption.
+        self.candidates = self.candidates.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RetentionSearchHint {
+    metadata: Vec<u8>,
+    path: PathBuf,
+    selected: bool,
+    witnesses: Vec<RetentionCandidateWitness>,
+    remaining: Vec<PathBuf>,
+    reader_refusal: Option<(io::ErrorKind, String)>,
+}
+
+/// A completed part of a search may be resumed only while the entire source
+/// set is unchanged. These witnesses never grant positive verification or
+/// deletion authority; completion without a pin can only reach the existing
+/// one-shot, fully verified repair-publication admission.
+#[derive(Clone, PartialEq, Eq)]
+struct RetentionCandidateWitness {
+    path: PathBuf,
+    identity: (u64, u64, u64, u64),
+    owner_and_mode: (u32, u32, u32),
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn retention_candidate_witnesses(
+    candidates: &[PathBuf],
+) -> io::Result<Vec<RetentionCandidateWitness>> {
+    if candidates.len() > MAX_RETENTION_SEARCH_WITNESSES {
+        return Err(io::Error::other(
+            "retention search inventory exceeds its entry bound",
+        ));
+    }
+    let mut witnesses = Vec::with_capacity(candidates.len());
+    for path in candidates {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() {
+            return Err(invalid("retention search candidate changed its file type"));
+        }
+        witnesses.push(RetentionCandidateWitness {
+            path: path.clone(),
+            identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.len(),
+            ),
+            owner_and_mode: (metadata.uid(), metadata.gid(), metadata.mode()),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        });
+    }
+    witnesses.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(witnesses)
+}
+
+fn retention_search_hints()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, RetentionSearchHint>> {
+    static HINTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<PathBuf, RetentionSearchHint>>,
+    > = std::sync::OnceLock::new();
+    HINTS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
 
 pub(super) struct SnapshotAuthority {
     file: File,
@@ -40,6 +172,7 @@ pub struct SnapshotRetentionGuard {
     metadata: RetentionMetadata,
     selected: Option<super::SelectedVerifiedSnapshot>,
     selected_identity: Option<std::fs::Metadata>,
+    completed_search_without_pin: bool,
     // Drop recovery last, after releasing the snapshot authority and source.
     recovery: crate::recovery_breaker::RecoveryBreakerFileLock,
 }
@@ -75,7 +208,7 @@ impl SnapshotRetentionGuard {
     /// Refuses recovery, live readers/publishers, pending recovery intents,
     /// unsafe lock paths, or changed authority.
     pub fn acquire(primary: &Path) -> io::Result<Self> {
-        Self::acquire_with_parent(primary, None)
+        Self::acquire_with_parent(primary, None, None)
     }
 
     /// Bind retention to the directory already held by an exporter admission.
@@ -87,10 +220,35 @@ impl SnapshotRetentionGuard {
     /// snapshot authority in another directory, and every refusal of
     /// [`Self::acquire`]. Concurrent namespace changes remain a refusal.
     pub fn acquire_for_parent(primary: &Path, expected_parent: &File) -> io::Result<Self> {
-        Self::acquire_with_parent(primary, Some(expected_parent))
+        Self::acquire_with_parent(primary, Some(expected_parent), None)
     }
 
-    fn acquire_with_parent(primary: &Path, expected_parent: Option<&File>) -> io::Result<Self> {
+    /// Admit bounded background work without treating an unfinished pin search
+    /// as an absent pin. Process-local progress can resume an unchanged source
+    /// set, but every selected pin rechecks the recorded bytes and full
+    /// integrity. A completed search without a pin grants no deletion rights.
+    /// A source already being checked may finish after the cooperative deadline.
+    ///
+    /// # Errors
+    /// Returns [`SnapshotRetentionDeferred`] inside the I/O error when work is
+    /// deferred, and preserves every refusal of [`Self::acquire_for_parent`].
+    pub fn acquire_for_parent_until(
+        primary: &Path,
+        expected_parent: &File,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        Self::acquire_with_parent(
+            primary,
+            Some(expected_parent),
+            Some(RetentionSearchBudget::new(deadline)),
+        )
+    }
+
+    fn acquire_with_parent(
+        primary: &Path,
+        expected_parent: Option<&File>,
+        mut budget: Option<RetentionSearchBudget>,
+    ) -> io::Result<Self> {
         let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
         let expected_parent = expected_parent.map(File::try_clone).transpose()?;
         // Recovery owns this election before selecting a snapshot. Use the
@@ -101,32 +259,177 @@ impl SnapshotRetentionGuard {
         ensure_no_recovery_references(&primary)?;
         let metadata_path = super::snapshot_meta_path(&primary);
         let metadata = retention_metadata(&metadata_path);
-        #[cfg(target_os = "linux")]
-        let mut reader_refusal = None;
-        let selected = if matches!(metadata, RetentionMetadata::Bytes(_)) {
+        let reader_refusal = std::cell::RefCell::<Option<io::Error>>::new(None);
+        let bounded = budget.is_some();
+        let mut completed_search_without_pin = false;
+        let selected = if let RetentionMetadata::Bytes(metadata_bytes) = &metadata {
+            let hint = budget.as_ref().and_then(|_| {
+                retention_search_hints()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&primary)
+                    .filter(|hint| hint.metadata == *metadata_bytes)
+                    .cloned()
+            });
+            let mut last_attempted = None;
+            let mut witnesses = Vec::new();
+            let mut ordered_candidates = Vec::new();
+            let mut inventoried = false;
             // Already exclusive: reacquiring the public selector's shared lock
             // would reject our own admission and discard a valid pin.
-            super::select_verified_snapshot_inner(&primary, |candidate, inventoried| {
-                #[cfg(target_os = "linux")]
-                {
-                    match crate::recovery_retention::preflight_current_thread_file_locks(
-                        candidate,
-                        inventoried,
-                    ) {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            let refusal = io::Error::new(error.kind(), error.to_string());
-                            reader_refusal.get_or_insert(error);
-                            Err(refusal)
+            let mut selected = super::select_verified_snapshot_with_work_admission(
+                &primary,
+                |candidates| {
+                    if bounded {
+                        witnesses = retention_candidate_witnesses(candidates)?;
+                        inventoried = true;
+                        if let Some(hint) = hint {
+                            if hint.selected {
+                                if let Some(index) =
+                                    candidates.iter().position(|path| path == &hint.path)
+                                {
+                                    let path = candidates.remove(index);
+                                    candidates.insert(0, path);
+                                }
+                            } else if hint.witnesses == witnesses {
+                                // Continue only the unfinished suffix of this
+                                // exact source set. Rotating the whole set
+                                // would never complete an all-invalid backlog.
+                                *candidates = hint.remaining;
+                                *reader_refusal.borrow_mut() = hint
+                                    .reader_refusal
+                                    .map(|(kind, message)| io::Error::new(kind, message));
+                            }
+                        }
+                        ordered_candidates.clone_from(candidates);
+                    }
+                    Ok(())
+                },
+                |candidate, inventoried| {
+                    #[cfg(target_os = "linux")]
+                    {
+                        match crate::recovery_retention::preflight_current_thread_file_locks(
+                            candidate,
+                            inventoried,
+                        ) {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                let refusal = io::Error::new(error.kind(), error.to_string());
+                                reader_refusal.borrow_mut().get_or_insert(error);
+                                Err(refusal)
+                            }
                         }
                     }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = (candidate, inventoried);
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = (candidate, inventoried);
+                        Ok(())
+                    }
+                },
+                |candidate, inventoried| {
+                    if let Some(budget) = budget.as_mut() {
+                        // A matching pin requires a hash and full integrity
+                        // scan. Charge both before admitting the candidate.
+                        budget.admit(inventoried.len().saturating_mul(2))?;
+                        last_attempted = Some(candidate.to_path_buf());
+                    }
                     Ok(())
+                },
+            );
+            if bounded && inventoried && matches!(selected, Ok(None)) {
+                // A completed search is not an authority to delete anything.
+                // It may reach the separately bounded repair-export path,
+                // but only after rechecking every source witness: a new or
+                // changed earlier candidate invalidates the entire sweep.
+                let current = crate::pool::sqlite_backup_candidates(&primary);
+                if retention_candidate_witnesses(&current)? == witnesses {
+                    completed_search_without_pin = true;
+                } else {
+                    selected = Err(io::Error::other(
+                        SnapshotRetentionDeferred::InventoryChanged,
+                    ));
                 }
-            })
+            }
+            if bounded {
+                let next = match &selected {
+                    Ok(Some(selected)) => Some(RetentionSearchHint {
+                        metadata: metadata_bytes.clone(),
+                        path: selected.actual_path.clone(),
+                        selected: true,
+                        witnesses: Vec::new(),
+                        remaining: Vec::new(),
+                        reader_refusal: None,
+                    }),
+                    Ok(None)
+                        if completed_search_without_pin && reader_refusal.borrow().is_none() =>
+                    {
+                        // Keep completion available to a later producer even
+                        // when a cleanup-only continuation finished the sweep.
+                        // Its whole source set is re-witnessed on every reuse,
+                        // and it cannot supply a pin to any deletion method.
+                        Some(RetentionSearchHint {
+                            metadata: metadata_bytes.clone(),
+                            path: primary.clone(),
+                            selected: false,
+                            witnesses,
+                            remaining: Vec::new(),
+                            reader_refusal: None,
+                        })
+                    }
+                    Err(error)
+                        if matches!(
+                            SnapshotRetentionDeferred::from_io_error(error),
+                            Some(
+                                SnapshotRetentionDeferred::Deadline
+                                    | SnapshotRetentionDeferred::Candidates
+                                    | SnapshotRetentionDeferred::Bytes
+                            )
+                        ) && inventoried =>
+                    {
+                        let start = last_attempted
+                            .as_ref()
+                            .and_then(|last| {
+                                ordered_candidates.iter().position(|path| path == last)
+                            })
+                            .map_or(0, |index| index + 1);
+                        ordered_candidates
+                            .get(start)
+                            .map(|path| RetentionSearchHint {
+                                metadata: metadata_bytes.clone(),
+                                path: path.clone(),
+                                selected: false,
+                                witnesses,
+                                remaining: ordered_candidates[start..].to_vec(),
+                                reader_refusal: reader_refusal
+                                    .borrow()
+                                    .as_ref()
+                                    .map(|error| (error.kind(), error.to_string())),
+                            })
+                    }
+                    _ => None,
+                };
+                let mut hints = retention_search_hints()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Bound process-local progress across mailboxes as well as
+                // within one mailbox. Eviction only restarts work; it never
+                // bypasses a check or creates persistent authority.
+                hints.remove(&primary);
+                if let Some(next) = next {
+                    while hints.len() >= 128
+                        || hints
+                            .values()
+                            .map(|hint| hint.witnesses.len())
+                            .sum::<usize>()
+                            .saturating_add(next.witnesses.len())
+                            > MAX_RETENTION_SEARCH_WITNESSES
+                    {
+                        hints.pop_first();
+                    }
+                    hints.insert(primary.clone(), next);
+                }
+            }
+            selected?
         } else {
             None
         };
@@ -135,7 +438,7 @@ impl SnapshotRetentionGuard {
         // pin as missing verification could authorize a repair export.
         #[cfg(target_os = "linux")]
         if selected.is_none()
-            && let Some(error) = reader_refusal
+            && let Some(error) = reader_refusal.into_inner()
         {
             return Err(error);
         }
@@ -151,6 +454,7 @@ impl SnapshotRetentionGuard {
             metadata,
             selected,
             selected_identity,
+            completed_search_without_pin,
             recovery,
         };
         guard.revalidate()?;
@@ -169,6 +473,23 @@ impl SnapshotRetentionGuard {
         self.selected
             .as_ref()
             .map(|selected| selected.actual_path.as_path())
+    }
+
+    /// Verified pin length for charging repeated verification work, never a
+    /// substitute for revalidating its identity or contents before an unlink.
+    #[must_use]
+    pub fn verified_source_size_bytes(&self) -> Option<u64> {
+        self.selected
+            .as_ref()
+            .map(|selected| selected.metadata.snapshot_size_bytes)
+    }
+
+    /// A complete bounded sweep found no verified pin in its unchanged source
+    /// set. This is only a completion signal for repair publication; all
+    /// deletion methods still require a freshly verified positive pin.
+    #[must_use]
+    pub const fn completed_search_without_pin(&self) -> bool {
+        self.completed_search_without_pin
     }
 
     /// Reclaim a strict, dated periodic generation only when a newer, fully
@@ -1136,6 +1457,247 @@ mod tests {
         assert!(SnapshotRetentionGuard::acquire(&primary).is_err());
         crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
         assert!(!crate::recovery_breaker::breaker_sidecar_path(&primary).exists());
+    }
+
+    fn retention_search_fixture(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let primary = root.join("mail.sqlite3");
+        let connection = crate::CanonicalDbConn::open_file(primary.display().to_string()).unwrap();
+        connection
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .unwrap();
+        drop(connection);
+        let backup = super::super::snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        super::super::record_snapshot_metadata(&primary, 2_000_000_000_000_000).unwrap();
+        let original = std::fs::read(&backup).unwrap();
+        let pin = root.join("mail.sqlite3.bak.20000101_000000");
+        std::fs::rename(&backup, &pin).unwrap();
+        let mut different = original.clone();
+        *different.last_mut().unwrap() ^= 0xff;
+        std::fs::write(backup, different).unwrap();
+        (primary, pin, original)
+    }
+
+    #[test]
+    fn bounded_retention_search_resumes_and_reverifies_the_last_successful_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (primary, pin, original) = retention_search_fixture(&root);
+        let current = super::super::snapshot_bak_path(&primary);
+        for day in [2, 3] {
+            std::fs::copy(
+                &current,
+                root.join(format!("mail.sqlite3.bak.2000010{day}_000000")),
+            )
+            .unwrap();
+        }
+        let metadata_path = super::super::snapshot_meta_path(&primary);
+        let metadata = std::fs::read(&metadata_path).unwrap();
+        let one_candidate = || RetentionSearchBudget {
+            candidate_limit: 1,
+            byte_limit: u64::MAX,
+            ..RetentionSearchBudget::new(Instant::now() + std::time::Duration::from_secs(60))
+        };
+        for _ in 0..3 {
+            let error =
+                SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(one_candidate()))
+                    .err()
+                    .expect("the first three images have different bytes");
+            assert_eq!(
+                SnapshotRetentionDeferred::from_io_error(&error),
+                Some(SnapshotRetentionDeferred::Candidates)
+            );
+            // A deferred search releases both real locks. It does not pin
+            // generations indefinitely while the maintenance worker sleeps.
+            crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
+            assert_eq!(std::fs::read(&pin).unwrap(), original);
+        }
+        for _ in 0..2 {
+            let guard =
+                SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(one_candidate()))
+                    .unwrap();
+            assert_eq!(guard.verified_source_path(), Some(pin.as_path()));
+            guard.revalidate().unwrap();
+        }
+        // The successful path hint avoids repeatedly searching the earlier
+        // images, but never caches verification. Changed bytes must fail.
+        std::fs::copy(&current, &pin).unwrap();
+        let error =
+            SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(one_candidate()))
+                .err()
+                .expect("a path hint cannot authorize changed snapshot bytes");
+        assert_eq!(
+            SnapshotRetentionDeferred::from_io_error(&error),
+            Some(SnapshotRetentionDeferred::Candidates)
+        );
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), metadata);
+        assert_eq!(std::fs::read(&primary).unwrap(), original);
+    }
+
+    #[test]
+    fn retention_search_defers_time_count_and_bytes_without_losing_recovery_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (primary, pin, original) = retention_search_fixture(&root);
+        let fresh =
+            || RetentionSearchBudget::new(Instant::now() + std::time::Duration::from_secs(60));
+        for (budget, expected) in [
+            (
+                RetentionSearchBudget::new(Instant::now()),
+                SnapshotRetentionDeferred::Deadline,
+            ),
+            (
+                RetentionSearchBudget {
+                    candidate_limit: 0,
+                    ..fresh()
+                },
+                SnapshotRetentionDeferred::Candidates,
+            ),
+            (
+                RetentionSearchBudget {
+                    byte_limit: 0,
+                    ..fresh()
+                },
+                SnapshotRetentionDeferred::Bytes,
+            ),
+        ] {
+            let error = SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(budget))
+                .err()
+                .expect("an incomplete search must be typed deferral");
+            assert_eq!(
+                SnapshotRetentionDeferred::from_io_error(&error),
+                Some(expected)
+            );
+            crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
+            assert_eq!(std::fs::read(&pin).unwrap(), original);
+        }
+        let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+        assert_eq!(guard.verified_source_path(), Some(pin.as_path()));
+    }
+
+    #[test]
+    fn bounded_search_completes_more_than_one_hundred_twenty_eight_nonmatching_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (primary, pin, original) = retention_search_fixture(&root);
+        std::fs::rename(&pin, root.join("preserved-verified-bytes")).unwrap();
+        let current = super::super::snapshot_bak_path(&primary);
+        for index in 1..=130 {
+            std::fs::copy(
+                &current,
+                root.join(format!(
+                    "mail.sqlite3.bak.200001{:02}_{:02}0000",
+                    index / 24 + 1,
+                    index % 24,
+                )),
+            )
+            .unwrap();
+        }
+        let budget =
+            || RetentionSearchBudget::new(Instant::now() + std::time::Duration::from_secs(60));
+        let first = SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(budget()))
+            .err()
+            .expect("131 same-sized images require multiple bounded slices");
+        assert_eq!(
+            SnapshotRetentionDeferred::from_io_error(&first),
+            Some(SnapshotRetentionDeferred::Candidates)
+        );
+        let complete =
+            SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(budget())).unwrap();
+        assert!(complete.completed_search_without_pin());
+        assert!(complete.verified_source_path().is_none());
+        assert!(
+            complete
+                .delete_superseded_generation(
+                    &primary,
+                    &current,
+                    &std::fs::metadata(&current).unwrap()
+                )
+                .is_err()
+        );
+        drop(complete);
+        // A later exporter can observe completion without redoing the entire
+        // search, but the result still contains no deletion authority.
+        let complete = SnapshotRetentionGuard::acquire_with_parent(
+            &primary,
+            None,
+            Some(RetentionSearchBudget {
+                candidate_limit: 0,
+                ..budget()
+            }),
+        )
+        .unwrap();
+        assert!(complete.completed_search_without_pin());
+        assert!(complete.verified_source_path().is_none());
+        drop(complete);
+        // An earlier source now matches. Its changed witness invalidates the
+        // completed sweep and the real byte/integrity checks discover it.
+        std::fs::write(&current, &original).unwrap();
+        let restored = SnapshotRetentionGuard::acquire_with_parent(
+            &primary,
+            None,
+            Some(RetentionSearchBudget {
+                candidate_limit: 1,
+                ..budget()
+            }),
+        )
+        .unwrap();
+        assert_eq!(restored.verified_source_path(), Some(current.as_path()));
+        assert!(!restored.completed_search_without_pin());
+    }
+
+    #[test]
+    fn pending_search_restarts_when_earlier_or_new_candidates_change() {
+        for change in ["rewrite", "replacement", "new"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let (primary, pin, original) = retention_search_fixture(&root);
+            std::fs::rename(&pin, root.join("preserved-verified-bytes")).unwrap();
+            let current = super::super::snapshot_bak_path(&primary);
+            let wrong = std::fs::read(&current).unwrap();
+            std::fs::write(root.join("mail.sqlite3.bak.20000102_000000"), &wrong).unwrap();
+            let budget = || RetentionSearchBudget {
+                candidate_limit: 1,
+                ..RetentionSearchBudget::new(Instant::now() + std::time::Duration::from_secs(60))
+            };
+            let first = SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(budget()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                SnapshotRetentionDeferred::from_io_error(&first),
+                Some(SnapshotRetentionDeferred::Candidates)
+            );
+            match change {
+                "rewrite" => {
+                    let modified = std::fs::metadata(&current).unwrap().modified().unwrap();
+                    std::fs::write(&current, &original).unwrap();
+                    File::open(&current)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
+                }
+                "replacement" => {
+                    std::fs::rename(&current, root.join("preserved-nonmatching-image")).unwrap();
+                    std::fs::write(&current, &wrong).unwrap();
+                }
+                _ => std::fs::write(root.join("mail.sqlite3.bak.20000103_000000"), &wrong).unwrap(),
+            }
+            let resumed =
+                SnapshotRetentionGuard::acquire_with_parent(&primary, None, Some(budget()));
+            if change == "rewrite" {
+                let guard = resumed.unwrap();
+                assert_eq!(guard.verified_source_path(), Some(current.as_path()));
+                assert!(!guard.completed_search_without_pin());
+            } else {
+                let error = resumed
+                    .err()
+                    .expect("a changed source set must restart, not complete an old suffix");
+                assert_eq!(
+                    SnapshotRetentionDeferred::from_io_error(&error),
+                    Some(SnapshotRetentionDeferred::Candidates)
+                );
+            }
+        }
     }
 
     #[test]

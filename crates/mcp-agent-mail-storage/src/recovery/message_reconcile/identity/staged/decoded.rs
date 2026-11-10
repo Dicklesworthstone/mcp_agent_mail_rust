@@ -3,7 +3,8 @@
 //! This caches serialized index interpretation, never message IDs, object bytes,
 //! HEAD observations, budgets, or a successful repair verdict. All authority
 //! checks still run against the caller's current repository and current message.
-//! The native `Index` is neither `Send` nor `Sync`; only owned fields cross threads.
+//! The native `Index` is neither `Send` nor `Sync`; only owned bytes and
+//! native-validated interpretations cross threads.
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -16,8 +17,9 @@ use super::{CanonicalScanBudget, invalid};
 
 const MAX_CACHED_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 // The encoded input and decoded fields share one unchanged retention bound.
-// A large index can fit when its paths already live in the retained v2/v3
-// bytes; duplicating those paths needlessly excluded production-sized inputs.
+// Compact v2/v3 observations retain entry offsets into these same bytes. A
+// repository-sized index must not be copied to a temporary file and decoded
+// again for every healthy message merely because duplicated fields do not fit.
 const MAX_CACHED_INPUT_BYTES: usize = MAX_CACHED_RETAINED_BYTES;
 
 #[derive(Clone)]
@@ -107,21 +109,155 @@ impl EncodedPaths {
     }
 }
 
+/// A candidate v2/v3 layout, never an independent index decoder. Before an
+/// offset is retained, every field exposed to callers (and the extended flags
+/// that move its path) must agree with libgit2's interpretation of the exact
+/// same private snapshot. Unknown/unproved layouts keep the existing fallback.
+struct EncodedEntry<'a> {
+    path: &'a [u8],
+    oid: &'a [u8],
+    mode: u32,
+    flags: u16,
+    flags_extended: u16,
+    next: usize,
+}
+
+impl<'a> EncodedEntry<'a> {
+    fn read(encoded: &'a [u8], start: usize, oid_bytes: usize) -> Option<Self> {
+        if !matches!(oid_bytes, 20 | 32) {
+            return None;
+        }
+        let mode_start = start.checked_add(24)?;
+        let mode_end = mode_start.checked_add(4)?;
+        let mode = u32::from_be_bytes(encoded.get(mode_start..mode_end)?.try_into().ok()?);
+        let oid_start = start.checked_add(40)?;
+        let oid_end = oid_start.checked_add(oid_bytes)?;
+        let oid = encoded.get(oid_start..oid_end)?;
+        let flags_end = oid_end.checked_add(2)?;
+        let flags = u16::from_be_bytes(encoded.get(oid_end..flags_end)?.try_into().ok()?);
+        let (flags_extended, path_start) = if flags & 0x4000 == 0 {
+            (0, flags_end)
+        } else {
+            let end = flags_end.checked_add(2)?;
+            (
+                u16::from_be_bytes(encoded.get(flags_end..end)?.try_into().ok()?),
+                end,
+            )
+        };
+        let recorded_len = usize::from(flags & 0x0fff);
+        let path_len = if recorded_len == 0x0fff {
+            encoded
+                .get(path_start..)?
+                .iter()
+                .position(|byte| *byte == 0)?
+        } else {
+            recorded_len
+        };
+        let path_end = path_start.checked_add(path_len)?;
+        let path = encoded.get(path_start..path_end)?;
+        if path.contains(&0) || *encoded.get(path_end)? != 0 {
+            return None;
+        }
+        let used = path_end.checked_add(1)?.checked_sub(start)?;
+        let next = start.checked_add(used.checked_add(7)? & !7)?;
+        if encoded.get(path_end..next)?.iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        Some(Self {
+            path,
+            oid,
+            mode,
+            flags,
+            flags_extended,
+            next,
+        })
+    }
+
+    fn matches(&self, native: &git2::IndexEntry) -> bool {
+        self.path == native.path
+            && Oid::from_bytes(self.oid).is_ok_and(|oid| oid == native.id)
+            && self.mode == native.mode
+            && self.flags == native.flags
+            && self.flags_extended == native.flags_extended
+    }
+}
+
+struct CompactEntries {
+    offsets: Box<[u32]>,
+    oid_bytes: usize,
+}
+
+impl CompactEntries {
+    fn get<'a>(&self, encoded: &'a [u8], position: usize) -> Option<EncodedEntry<'a>> {
+        self.offsets.get(position).map(|offset| {
+            EncodedEntry::read(encoded, *offset as usize, self.oid_bytes)
+                .expect("immutable index entry was validated against the native snapshot")
+        })
+    }
+}
+
+enum CachedEntries {
+    Compact(CompactEntries),
+    Expanded(Box<[CachedEntry]>),
+}
+
+impl CachedEntries {
+    fn len(&self) -> usize {
+        match self {
+            Self::Compact(entries) => entries.offsets.len(),
+            Self::Expanded(entries) => entries.len(),
+        }
+    }
+
+    fn path<'a>(&'a self, encoded: &'a [u8], position: usize) -> Option<&'a [u8]> {
+        match self {
+            Self::Compact(entries) => entries.get(encoded, position).map(|entry| entry.path),
+            Self::Expanded(entries) => entries.get(position).map(|entry| entry.path(encoded)),
+        }
+    }
+
+    fn get<'a>(&'a self, encoded: &'a [u8], position: usize) -> Option<Entry<'a>> {
+        match self {
+            Self::Compact(entries) => entries.get(encoded, position).map(|entry| Entry {
+                path: Cow::Borrowed(entry.path),
+                id: Oid::from_bytes(entry.oid)
+                    .expect("native-validated object width remains supported"),
+                mode: entry.mode,
+                flags: entry.flags,
+            }),
+            Self::Expanded(entries) => entries.get(position).map(|entry| Entry {
+                path: Cow::Borrowed(entry.path(encoded)),
+                id: entry.id,
+                mode: entry.mode,
+                flags: entry.flags,
+            }),
+        }
+    }
+}
+
 struct Decoded {
     encoded: Box<[u8]>,
     format: ObjectFormat,
-    entries: Box<[CachedEntry]>,
+    entries: CachedEntries,
 }
 
 impl Decoded {
     fn find_prefix(&self, prefix: &str) -> Option<usize> {
         let prefix = prefix.as_bytes();
-        let start = self
-            .entries
-            .partition_point(|entry| entry.path(&self.encoded) < prefix);
+        let start = match &self.entries {
+            CachedEntries::Compact(entries) => entries.offsets.partition_point(|offset| {
+                EncodedEntry::read(&self.encoded, *offset as usize, entries.oid_bytes)
+                    .expect("immutable index entry was validated against the native snapshot")
+                    .path
+                    < prefix
+            }),
+            CachedEntries::Expanded(entries) => {
+                entries.partition_point(|entry| entry.path(&self.encoded) < prefix)
+            }
+        };
         self.entries
-            .get(start)
-            .filter(|entry| entry.path(&self.encoded).starts_with(prefix))
+            .path(&self.encoded, start)
+            .filter(|path| path.starts_with(prefix))
             .map(|_| start)
     }
 }
@@ -169,9 +305,12 @@ impl Cache {
         index: &Index,
         encoded: &[u8],
         budget: &CanonicalScanBudget<'_>,
-    ) -> crate::Result<Option<Box<[CachedEntry]>>> {
+    ) -> crate::Result<Option<CachedEntries>> {
         if encoded.len() > self.max_input_bytes {
             return Ok(None);
+        }
+        if let Some(entries) = self.compact_entries(index, encoded, budget)? {
+            return Ok(Some(CachedEntries::Compact(entries)));
         }
         let Some(mut retained) = index
             .len()
@@ -218,7 +357,54 @@ impl Cache {
                 flags: entry.flags,
             });
         }
-        Ok(Some(entries.into_boxed_slice()))
+        Ok(Some(CachedEntries::Expanded(entries.into_boxed_slice())))
+    }
+
+    fn compact_entries(
+        &self,
+        index: &Index,
+        encoded: &[u8],
+        budget: &CanonicalScanBudget<'_>,
+    ) -> crate::Result<Option<CompactEntries>> {
+        let mut layout = EncodedPaths::new(encoded);
+        if layout.next.is_none()
+            || index
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|bytes| bytes.checked_add(encoded.len()))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Decoded>()))
+                .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+                .is_none_or(|bytes| bytes > self.max_retained_bytes)
+        {
+            return Ok(None);
+        }
+        let oid_bytes = index.get(0).map_or(20, |entry| entry.id.as_bytes().len());
+        let mut offsets = Vec::with_capacity(index.len());
+        let mut previous_path: Option<&[u8]> = None;
+        for native in index.iter() {
+            budget.checkpoint("staged index cache entry")?;
+            let Some(start) = layout.next.take() else {
+                return Ok(None);
+            };
+            let Some(entry) = EncodedEntry::read(encoded, start, oid_bytes) else {
+                return Ok(None);
+            };
+            let Ok(offset) = u32::try_from(start) else {
+                return Ok(None);
+            };
+            if !entry.matches(&native)
+                || previous_path.is_some_and(|previous| previous > entry.path)
+            {
+                return Ok(None);
+            }
+            previous_path = Some(entry.path);
+            layout.next = Some(entry.next);
+            offsets.push(offset);
+        }
+        Ok(Some(CompactEntries {
+            offsets: offsets.into_boxed_slice(),
+            oid_bytes,
+        }))
     }
 }
 
@@ -247,12 +433,7 @@ impl ObservedIndex {
 
     pub(super) fn get(&self, position: usize) -> Option<Entry<'_>> {
         match &self.view {
-            View::Cached(decoded) => decoded.entries.get(position).map(|entry| Entry {
-                path: Cow::Borrowed(entry.path(&decoded.encoded)),
-                id: entry.id,
-                mode: entry.mode,
-                flags: entry.flags,
-            }),
+            View::Cached(decoded) => decoded.entries.get(&decoded.encoded, position),
             View::Native { index, .. } => index.get(position).map(Entry::from),
         }
     }
@@ -386,7 +567,7 @@ mod tests {
                 mtime: git2::IndexTime::new(0, 0),
                 dev: 0,
                 ino: 0,
-                mode: 0o100644,
+                mode: 0o100_644,
                 uid: 0,
                 gid: 0,
                 file_size: 0,
@@ -494,12 +675,16 @@ mod tests {
                 panic!("small supported native indexes must remain cacheable");
             };
             assert_native_entries(&observed, &native);
-            for entry in decoded.entries.iter() {
-                assert_eq!(
-                    matches!(entry.path, CachedPath::Encoded(_)),
-                    version != 4,
-                    "v2/v3 ranges and v4 owned fallback must use their proven layouts"
-                );
+            match &decoded.entries {
+                CachedEntries::Compact(_) => assert_ne!(version, 4),
+                CachedEntries::Expanded(entries) => {
+                    assert_eq!(version, 4, "native v2/v3 entries must fit compact offsets");
+                    assert!(
+                        entries
+                            .iter()
+                            .all(|entry| matches!(entry.path, CachedPath::Owned(_)))
+                    );
+                }
             }
             for prefix in ["A", "alpha", "folder/", "merged/", "missing"] {
                 assert_eq!(
@@ -529,6 +714,206 @@ mod tests {
             assert!(matches!(warm.get(0).unwrap().path, Cow::Borrowed(_)));
             assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn reporter_sized_index_reuses_decoding_without_raising_the_retention_bound() {
+        const ENTRY_COUNT: usize = 154_845;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut native = repo.index().unwrap();
+        let original_id = repo.blob(b"reporter-scale native index fixture").unwrap();
+        for number in 0..ENTRY_COUNT {
+            let prefix = format!("projects/gh383/messages/2026/11/{number:06}_");
+            let path = format!("{prefix}{}.md", "x".repeat(140 - prefix.len() - 3));
+            add_index_entry(&mut native, path.as_bytes(), original_id, 0, 0);
+        }
+        native.set_version(2).unwrap();
+        native.write().unwrap();
+        let index_path = repo.path().join("index");
+        let bytes = std::fs::read(&index_path).unwrap();
+        assert_eq!(count(&bytes), ENTRY_COUNT);
+        assert_eq!(bytes.len(), 32_207_792);
+        assert_eq!(MAX_CACHED_RETAINED_BYTES, 32 * 1024 * 1024);
+        let cache = Cache::new();
+        let budget = CanonicalScanBudget::default();
+        let first = open_with_cache(&repo, bytes.clone(), count(&bytes), &budget, &cache).unwrap();
+        let View::Cached(decoded) = &first.view else {
+            panic!("reporter-scale input must not repeatedly write/decode private snapshots");
+        };
+        let CachedEntries::Compact(entries) = &decoded.entries else {
+            panic!("duplicated decoded fields cannot fit the existing memory bound");
+        };
+        let retained = decoded.encoded.len()
+            + entries.offsets.len() * std::mem::size_of::<u32>()
+            + std::mem::size_of::<Decoded>()
+            + 2 * std::mem::size_of::<usize>();
+        assert!(retained <= MAX_CACHED_RETAINED_BYTES);
+        assert_native_entries(&first, &native);
+        for _ in 0..3 {
+            let fresh = std::fs::read(&index_path).unwrap();
+            let observed = open_with_cache(&repo, fresh, ENTRY_COUNT, &budget, &cache).unwrap();
+            let View::Cached(warm) = &observed.view else {
+                panic!("identical fresh bytes must reuse native-validated interpretation");
+            };
+            assert!(Arc::ptr_eq(decoded, warm));
+            assert_eq!(cache.decodes.load(Ordering::Relaxed), 1);
+            assert_native_entries(&observed, &native);
+        }
+        // A same-length native replacement still invalidates the entire exact
+        // input. Existing readers retain their own immutable observation.
+        let replacement_id = repo.blob(b"changed reporter-scale object").unwrap();
+        let mut changed_entry = native.get(ENTRY_COUNT / 2).unwrap();
+        changed_entry.id = replacement_id;
+        changed_entry.mode = 0o100_755;
+        native.add(&changed_entry).unwrap();
+        native.write().unwrap();
+        let changed = std::fs::read(&index_path).unwrap();
+        assert_eq!(changed.len(), bytes.len());
+        let next = open_with_cache(&repo, changed, ENTRY_COUNT, &budget, &cache).unwrap();
+        assert_eq!(cache.decodes.load(Ordering::Relaxed), 2);
+        assert_native_entries(&next, &native);
+        assert_eq!(first.get(ENTRY_COUNT / 2).unwrap().id, original_id);
+        assert_eq!(next.get(ENTRY_COUNT / 2).unwrap().id, replacement_id);
+    }
+
+    #[test]
+    fn compact_fields_preserve_long_raw_names_modes_and_extended_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        // Test index layout independently of worktree filesystem path limits.
+        let repo = Repository::init_bare(dir.path()).unwrap();
+        let mut native = repo.index().unwrap();
+        let id = repo.blob(b"native field witness").unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::new(
+            "Index Fixture",
+            "index-fixture@example.test",
+            &git2::Time::new(0, 0),
+        )
+        .unwrap();
+        let gitlink_id = repo
+            .commit(None, &signature, &signature, "gitlink fixture", &tree, &[])
+            .unwrap();
+        for (name, mode, flags, extended) in [
+            (b"raw/\xff\xfe".to_vec(), 0o100_644, 0, 0),
+            (vec![b'x'; 4096], 0o100_755, 0, 0),
+            // Both long names exceed the 0x0fff length sentinel, but remain
+            // below libgit2's 8 KiB per-entry serialization buffer.
+            (vec![b'y'; 4097], 0o100_644, 0x4000, 0x4000),
+            (b"symlink".to_vec(), 0o120_000, 0, 0),
+            (b"gitlink".to_vec(), 0o160_000, 0, 0),
+            (b"assume-valid".to_vec(), 0o100_644, 0x8000, 0),
+            (b"extended/intent".to_vec(), 0o100_644, 0x4000, 0x2000),
+        ] {
+            add_index_entry(&mut native, &name, id, flags, extended);
+            // Raw paths have no portable Path representation; retrieve every
+            // entry by its exact bytes without normalizing it through UTF-8.
+            let mut entry = native.iter().find(|entry| entry.path == name).unwrap();
+            entry.mode = mode;
+            if mode == 0o160_000 {
+                entry.id = gitlink_id;
+            }
+            native.add(&entry).unwrap();
+        }
+        native.set_version(3).unwrap();
+        native.write().unwrap();
+        let bytes = std::fs::read(repo.path().join("index")).unwrap();
+        let native = Index::open_ext(&repo.path().join("index"), repo.object_format()).unwrap();
+        let cache = Cache::new();
+        for _ in 0..2 {
+            let observed = open_with_cache(
+                &repo,
+                bytes.clone(),
+                count(&bytes),
+                &CanonicalScanBudget::default(),
+                &cache,
+            )
+            .unwrap();
+            let View::Cached(decoded) = &observed.view else {
+                panic!("small native v3 fixture must remain cacheable");
+            };
+            assert!(matches!(&decoded.entries, CachedEntries::Compact(_)));
+            assert_native_entries(&observed, &native);
+            for prefix in ["", "raw/", "x", "y", "extended/", "symlink", "gitlink"] {
+                assert_eq!(
+                    observed.find_prefix(prefix).unwrap(),
+                    native.find_prefix(prefix).ok()
+                );
+            }
+        }
+        assert_eq!(cache.decodes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn compact_layout_requires_every_observed_field_to_match_the_native_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        let id = repo.blob(b"native equivalence witness").unwrap();
+        add_index_entry(&mut index, b"extended/entry", id, 0x4000, 0x4000);
+        index.set_version(3).unwrap();
+        index.write().unwrap();
+        let bytes = std::fs::read(repo.path().join("index")).unwrap();
+        let native = Index::open_ext(&repo.path().join("index"), repo.object_format()).unwrap();
+        let cache = Cache::new();
+        let budget = CanonicalScanBudget::default();
+        assert!(
+            cache
+                .compact_entries(&native, &bytes, &budget)
+                .unwrap()
+                .is_some()
+        );
+        let flags_start = 12 + 40 + id.as_bytes().len();
+        let path_start = flags_start + 4;
+        // Deliberately pair mismatched candidate bytes with the original
+        // native observation at this internal comparison boundary. Production
+        // always obtains both from one captured private snapshot. A candidate
+        // offset must never replace any of these native values on disagreement.
+        for offset in [
+            12 + 24,                              // mode
+            12 + 40,                              // object ID
+            flags_start,                          // merge/extended flags
+            flags_start + 1,                      // recorded name length
+            flags_start + 2,                      // extended flags
+            path_start,                           // exact raw name
+            path_start + b"extended/entry".len(), // NUL / padding
+        ] {
+            let mut changed = bytes.clone();
+            changed[offset] ^= 1;
+            assert!(
+                cache
+                    .compact_entries(&native, &changed, &budget)
+                    .unwrap()
+                    .is_none(),
+                "offset {offset}"
+            );
+        }
+        for end in 0..bytes.len() - 20 {
+            assert!(
+                cache
+                    .compact_entries(&native, &bytes[..end], &budget)
+                    .unwrap()
+                    .is_none(),
+                "truncated at {end}"
+            );
+        }
+        for version in [0_u32, 1, 4, 5, u32::MAX] {
+            let mut changed = bytes.clone();
+            changed[4..8].copy_from_slice(&version.to_be_bytes());
+            assert!(
+                cache
+                    .compact_entries(&native, &changed, &budget)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // Rejected compact layouts leave ordinary native observations usable;
+        // cache capacity/layout is not a new recovery admission requirement.
+        assert_native_entries(
+            &open_with_cache(&repo, bytes.clone(), count(&bytes), &budget, &cache).unwrap(),
+            &native,
+        );
     }
 
     fn encoded_path_fixture(

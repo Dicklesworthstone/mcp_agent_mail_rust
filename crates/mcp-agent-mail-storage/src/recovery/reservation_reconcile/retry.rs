@@ -31,11 +31,15 @@ pub(super) struct RetryQueue {
 }
 
 impl RetryQueue {
+    pub(super) fn next_ready_at(&self) -> Option<Instant> {
+        self.pending.iter().map(|retry| retry.ready_at).min()
+    }
+
     fn contains(&self, id: i64) -> bool {
         self.pending.iter().any(|retry| retry.id == id)
     }
 
-    fn is_full(&self) -> bool {
+    pub(super) fn is_full(&self) -> bool {
         self.pending.len() >= MAX_RETRY_IDS
     }
 
@@ -494,6 +498,7 @@ fn run_batch(
             }
         };
         discovery_progress |= before_selection != (position.after, position.ceiling);
+        report.scan_advanced |= before_selection != (position.after, position.ceiling);
         #[cfg(test)]
         tests::observe_boundary(tests::Boundary::Selection(unexpired_only));
         selected_count += i64::try_from(ids.len()).expect("bounded selection");
@@ -507,6 +512,7 @@ fn run_batch(
             if seen.contains(&id) || cursor.retries.contains(id) {
                 advance(position, id);
                 discovery_progress = true;
+                report.scan_advanced = true;
                 continue;
             }
             if report.attempted >= repair_limit || cursor.retries.is_full() {
@@ -535,6 +541,7 @@ fn run_batch(
             }
             seen.insert(id);
             advance(position, id);
+            report.scan_advanced = true;
         }
     }
     // Consuming a healthy page is discovery progress, not proof that the
@@ -546,7 +553,10 @@ fn run_batch(
     // one round while the other ends, hot-scanning a fully healthy mailbox.
     // Conflicts do not accelerate discovery, and history completion returns
     // to idle unless actual publication limits or retry debt require more work.
-    if report.deferred == 0 && report.scanned > 0 && cursor.history.ceiling.is_some() {
+    if report.deferred == 0
+        && (report.scanned > 0 || report.scan_advanced)
+        && cursor.history.ceiling.is_some()
+    {
         report.budget_exhausted = true;
     }
     Ok(finish(report, &cursor.retries))
@@ -1642,6 +1652,8 @@ mod tests {
             assert_eq!(report.attempted, 0);
             assert_eq!(report.retry_len, MAX_RETRY_IDS);
             assert!(report.budget_exhausted);
+            assert!(!cursor.has_retry_capacity());
+            assert_eq!(cursor.next_retry_at(), Some(now + MAX_BACKOFF));
             assert_eq!(cursor.history.after, 0);
             assert!(!config.storage_root.join("projects").exists());
         });

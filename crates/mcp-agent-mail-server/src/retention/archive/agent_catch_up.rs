@@ -6,7 +6,10 @@
 //! storage cursor's generation-bound checkpoint, never through cached profiles.
 //! Critical disk pressure pauses before source/checkpoint admission. A paused
 //! turn retains the same cursor and pool and resumes on the normal worker poll.
+//! The three lanes share a cooperative time quantum and measured rest. Cooling
+//! retry debt uses its earliest deadline; repeated contention backs off.
 
+use super::schedule::{ACTIVE_QUANTUM, MaintenanceTurn, WorkHint};
 use asupersync::Cx;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::DbPool;
@@ -22,7 +25,7 @@ const CHECKPOINT_OWNED: &str =
     "agent reconciliation deferred: checkpoint is owned by another worker";
 const DISK_PRESSURE_DEFERRED: &str = "agent reconciliation deferred: critical disk pressure";
 const MAX_BATCHES_PER_TURN: usize = 8;
-const MAX_ACTIVE_PER_TURN: Duration = Duration::from_millis(250);
+const MAX_ACTIVE_PER_TURN: Duration = ACTIVE_QUANTUM;
 
 /// Run productive storage batches in a bounded turn. Every batch retains its
 /// original four-repair/32-candidate bounds. The time target is checked between
@@ -36,23 +39,53 @@ pub(super) fn run(
     config: &Config,
     cursor: &mut AgentReconcileCursor,
     stop: &AtomicBool,
-    observe: impl FnMut(&AgentReconcileReport),
-) -> Result<bool, String> {
-    let started = Instant::now();
-    run_with(
+    turn: &MaintenanceTurn,
+    mut observe: impl FnMut(&AgentReconcileReport),
+) -> Result<WorkHint, String> {
+    let mut blocked = None;
+    let mut scan_pending = false;
+    let mut progressed = false;
+    let follow_up = run_with(
         || {
-            with_disk_admission(
+            let result = with_disk_admission(
                 mcp_agent_mail_core::global_metrics()
                     .system
                     .disk_pressure_level
                     .load(),
                 || cursor.reconcile_checkpointed(cx, pool, config, stop),
-            )
+            );
+            if let Err(error) = &result {
+                blocked = match error.as_str() {
+                    DISK_PRESSURE_DEFERRED => Some(WorkHint::ResourcePaused),
+                    ADMISSION_DEFERRED | CHECKPOINT_OWNED => {
+                        Some(WorkHint::Contended { progressed: false })
+                    }
+                    _ => None,
+                };
+            }
+            result
         },
         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
-        || started.elapsed(),
-        observe,
-    )
+        || turn.elapsed(Instant::now()),
+        |report| {
+            scan_pending = report.budget_exhausted;
+            progressed |= report.repaired > 0 || report.unchanged > 0 || report.scan_advanced;
+            observe(report);
+        },
+    )?;
+    if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+        return Ok(WorkHint::Interrupted);
+    }
+    if let Some(hint) = blocked {
+        return Ok(match hint {
+            WorkHint::Contended { .. } => WorkHint::Contended { progressed },
+            other => other,
+        });
+    }
+    Ok(WorkHint::after_report(
+        follow_up && scan_pending && cursor.has_retry_capacity(),
+        cursor.next_retry_at(),
+    ))
 }
 
 fn with_disk_admission(
@@ -89,8 +122,8 @@ fn run_with(
                 && report.budget_exhausted
                 && report.deferred == 0
                 && report.deferred_transient == 0
-                && report.retry_len == 0
-                && (report.repaired > 0 || report.unchanged > 0);
+                && (report.retry_len == 0 || report.scan_advanced)
+                && (report.repaired > 0 || report.unchanged > 0 || report.scan_advanced);
             observe(report);
         })?;
         if interrupted() || !follow_up {
@@ -111,8 +144,9 @@ fn finish(
         Ok(report) => {
             // Preserve storage's four-repair/32-candidate bounds. Conflicts
             // alone must not turn into repeated whole-root scans every second.
-            // Retained transient debt needs short polls even when no repair
-            // budget was exhausted; storage still owns every per-ID cooldown.
+            // Retained transient debt needs a later attempt even when no repair
+            // budget was exhausted. The typed hint uses the earliest stored
+            // retry deadline, while storage still owns every per-ID cooldown.
             let follow_up = !report.interrupted
                 && (report.budget_exhausted
                     || report.retry_len > 0
@@ -149,6 +183,28 @@ mod tests {
     use std::cell::Cell;
     use std::io::{Read as _, Seek as _, SeekFrom};
     use std::time::{Duration, Instant};
+
+    // Single-lane storage fixtures drive a fresh aggregate turn each time.
+    // Scheduler tests separately assert the typed deadline and duty behavior.
+    fn run(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        cursor: &mut AgentReconcileCursor,
+        stop: &AtomicBool,
+        observe: impl FnMut(&AgentReconcileReport),
+    ) -> Result<bool, String> {
+        super::run(
+            cx,
+            pool,
+            config,
+            cursor,
+            stop,
+            &MaintenanceTurn::new(Instant::now()),
+            observe,
+        )
+        .map(WorkHint::needs_follow_up)
+    }
 
     #[test]
     fn disk_pressure_refuses_before_storage_and_does_not_mask_source_errors() {
@@ -684,6 +740,39 @@ mod tests {
             assert_eq!(calls, expected_calls);
             assert_eq!(observed, expected_calls);
         }
+    }
+
+    #[test]
+    fn gh383_cursor_only_pages_preserve_cooling_debt_and_reach_later_profiles() {
+        let mut pending = std::collections::VecDeque::from([
+            AgentReconcileReport {
+                scan_advanced: true,
+                retry_len: 7,
+                budget_exhausted: true,
+                ..Default::default()
+            },
+            AgentReconcileReport {
+                scanned: 1,
+                repaired: 1,
+                scan_advanced: true,
+                retry_len: 7,
+                ..Default::default()
+            },
+        ]);
+        let mut observed = Vec::new();
+        assert!(
+            run_with(
+                || Ok(pending
+                    .pop_front()
+                    .expect("no speculative round or early retry")),
+                || false,
+                || Duration::ZERO,
+                |report| observed.push((report.scanned, report.repaired, report.retry_len)),
+            )
+            .unwrap()
+        );
+        assert_eq!(observed, [(0, 0, 7), (1, 1, 7)]);
+        assert!(pending.is_empty());
     }
 
     #[test]

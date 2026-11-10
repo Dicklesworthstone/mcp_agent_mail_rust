@@ -862,12 +862,20 @@ mod tests {
             "a hint cannot restore pool authority"
         );
         assert!(resumed.retries.persistence.store.is_none());
+        assert_eq!(resumed.next_retry_at(), Some(now));
+        assert!(resumed.has_retry_capacity());
         assert_eq!(resumed.retries.ready_ids(now), [402]);
         assert_eq!(
             resumed.retries.ready_ids(now + Duration::from_millis(500)),
             [401, 402]
         );
         assert_eq!(resumed.retries.entries[0].attempts, 1);
+        resumed.retries.forget(402);
+        assert_eq!(
+            resumed.next_retry_at(),
+            Some(now + Duration::from_millis(500))
+        );
+        assert!(resumed.retries.ready_ids(now).is_empty());
         assert_eq!(resumed.conflicts.len(), 2);
         assert!(resumed.conflicts.matches(403, &"a".repeat(64)));
         assert!(resumed.conflicts.matches(404, &"b".repeat(64)));
@@ -903,6 +911,15 @@ mod tests {
                     .entries
                     .iter()
                     .all(|entry| { entry.ready_at >= now && entry.ready_at <= now + MAX_BACKOFF })
+            );
+            assert_eq!(
+                resumed.next_retry_at(),
+                resumed
+                    .retries
+                    .entries
+                    .iter()
+                    .map(|entry| entry.ready_at)
+                    .min()
             );
             if wall >= 70_000_000 {
                 assert_eq!(resumed.retries.ready_ids(now), [402, 401]);

@@ -1599,6 +1599,13 @@ mod tests {
                 now + Duration::from_secs(wait)
             );
             assert_eq!(cursor.retries.pending[1].attempts, 6);
+            assert_eq!(cursor.next_retry_at(), Some(now));
+            assert!(cursor.has_retry_capacity());
+            cursor.retries.pending.pop_front();
+            assert_eq!(
+                cursor.next_retry_at(),
+                Some(now + Duration::from_secs(wait))
+            );
         }
     }
 
