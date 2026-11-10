@@ -1313,7 +1313,7 @@ fn run_startup_search_backfill(
 
     // Certify coverage using the same serving pool after publication. Bind the
     // native waiter to the existing startup cancellation owner.
-    let cx = runtime_request_cx(Budget::with_deadline_secs(2));
+    let cx = runtime_request_cx(Budget::new().with_timeout(wall_now(), Duration::from_secs(2)));
     let Ok(_context_guard) = control.bind_native_context(&cx) else {
         return false;
     };
@@ -1422,10 +1422,9 @@ fn spawn_startup_search_backfill_after(
             if !state.compiled {
                 return;
             }
-            let delay = if state.available && !state.catch_up_required {
-                retry_delay = SEARCH_MAINTENANCE_INTERVAL;
-                SEARCH_MAINTENANCE_INTERVAL
-            } else if run_startup_search_backfill(&thread_config, &pool, &control) {
+            let delay = if (state.available && !state.catch_up_required)
+                || run_startup_search_backfill(&thread_config, &pool, &control)
+            {
                 retry_delay = SEARCH_MAINTENANCE_INTERVAL;
                 SEARCH_MAINTENANCE_INTERVAL
             } else {
@@ -2909,6 +2908,8 @@ fn startup_readiness_notify_payload(
     elapsed: Duration,
     owned_initialization: bool,
 ) -> String {
+    use std::fmt::Write as _;
+
     let mut payload = format!("STATUS=Waiting for mailbox admission: {reason}");
     if owned_initialization && elapsed < MAIL_STARTUP_NOTIFY_GRACE {
         let extension = MAIL_STARTUP_NOTIFY_GRACE
@@ -2916,7 +2917,7 @@ fn startup_readiness_notify_payload(
             .min(MAIL_STARTUP_NOTIFY_EXTENSION)
             .as_micros();
         if extension > 0 {
-            payload.push_str(&format!("\nEXTEND_TIMEOUT_USEC={extension}"));
+            let _ = write!(payload, "\nEXTEND_TIMEOUT_USEC={extension}");
         }
     }
     payload
@@ -17390,9 +17391,8 @@ fn probe_serving_mail_pool(
     lexical_required: bool,
 ) -> MailReadinessProbe {
     let started = Instant::now();
-    let cx = runtime_request_cx(Budget::with_deadline_secs(
-        MAIL_READINESS_PROBE_BUDGET.as_secs(),
-    ));
+    let cx =
+        runtime_request_cx(Budget::new().with_timeout(wall_now(), MAIL_READINESS_PROBE_BUDGET));
     // This is the same nonblocking activity admission used by normal mail
     // operations. A healthy connection cannot bypass an exclusive recovery
     // owner. Retain the guard through the lexical source observation as well.
@@ -17941,7 +17941,7 @@ fn readiness_check_with_integrity_and_startup_control(
     let cx = runtime_request_cx(if run_integrity_check {
         Budget::INFINITE
     } else {
-        Budget::with_deadline_secs(2)
+        Budget::new().with_timeout(wall_now(), Duration::from_secs(2))
     });
     let _context_guard = control
         .map(|control| control.bind_native_context(&cx))
@@ -32750,7 +32750,9 @@ first body
             (Duration::ZERO, Some(15_000_000)),
             (Duration::from_secs(695), Some(15_000_000)),
             (
-                MAIL_STARTUP_NOTIFY_GRACE - Duration::from_secs(2),
+                MAIL_STARTUP_NOTIFY_GRACE
+                    .checked_sub(Duration::from_secs(2))
+                    .expect("startup grace exceeds two seconds"),
                 Some(2_000_000),
             ),
             (MAIL_STARTUP_NOTIFY_GRACE, None),
@@ -32990,7 +32992,7 @@ first body
             // Requests currently select their pool shape from the environment.
             // A bound Config-only sizing override cannot authorize an old
             // engine's proof for the different actual request pool.
-            let mut next_config = config.clone();
+            let mut next_config = config;
             next_config.database_pool_size = Some(2);
             with_health_serving_env(&next_config, || {
                 let second = create_pool(&DbPoolConfig::from_env()).expect("next serving pool");

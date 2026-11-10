@@ -5,6 +5,7 @@
 //! search engine in `mcp-agent-mail-search-core`.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
@@ -19,7 +20,7 @@ use sha2::{Digest, Sha256};
 use sqlmodel_core::Value;
 use tantivy::Order;
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{AllQuery, Query, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Query, RangeQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::{Index, IndexReader, ReloadPolicy, Term};
 
@@ -207,14 +208,15 @@ impl TantivyBridge {
             }
     }
 
-    pub(crate) fn revoke_source_proof_for(&self, path: &str, generation: &str) {
+    pub(crate) fn revoke_source_proof_for(&self, path: &str, generation: Option<&str>) {
         let observed = self
             .observed_source
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if observed.as_ref().is_some_and(|source| {
-            source.path == path && source.generation.as_deref() == Some(generation)
-        }) {
+        if observed
+            .as_ref()
+            .is_some_and(|source| source.path == path && source.generation.as_deref() == generation)
+        {
             // Keep observation locked through revocation: the same Arc may
             // be rebound to another mailbox in the same index directory.
             self.revoke_source_proof();
@@ -868,7 +870,7 @@ fn record_verified_source(bridge: &TantivyBridge, source: ObservedLexicalSource)
 pub(crate) fn observe_pool_source(
     bridge: &TantivyBridge,
     path: &str,
-    generation: &str,
+    generation: Option<&str>,
     revision: i64,
     rewrite_revision: i64,
     memory: bool,
@@ -877,7 +879,7 @@ pub(crate) fn observe_pool_source(
         bridge,
         ObservedLexicalSource {
             path: path.to_string(),
-            generation: Some(generation.to_string()),
+            generation: generation.map(str::to_string),
             clock: Some(LexicalChangeClock {
                 revision,
                 rewrite_revision,
@@ -898,7 +900,7 @@ pub(crate) fn verify_empty_memory_source(
     bridge: &TantivyBridge,
     cx: &asupersync::Cx,
     path: &str,
-    generation: &str,
+    generation: Option<&str>,
     revision: i64,
     rewrite_revision: i64,
 ) -> Result<(), String> {
@@ -909,7 +911,7 @@ pub(crate) fn verify_empty_memory_source(
     }
     let source = ObservedLexicalSource {
         path: path.to_string(),
-        generation: Some(generation.to_string()),
+        generation: generation.map(str::to_string),
         clock: Some(LexicalChangeClock {
             revision,
             rewrite_revision,
@@ -1626,6 +1628,7 @@ fn only_appends_outside_scanned_range(
 /// Callers must already have proven the source append-only since the marker.
 fn marker_resume_plan(
     conn: &DbConn,
+    bridge: &TantivyBridge,
     db: MessageStats,
     state: Option<&BackfillState>,
     cancelled: Option<&dyn BackfillCancellation>,
@@ -1642,10 +1645,39 @@ fn marker_resume_plan(
     let rows_through_marker =
         db.count
             .saturating_sub(fetch_db_tail_count(conn, marker_max_id, cancelled)?);
+    if rows_through_marker != state.db_stats.count {
+        return Ok(None);
+    }
+    // The marker records earlier coverage, not the survival of that prefix
+    // after index damage. A live-indexed tail can mask missing prefix rows
+    // in the total count; inspect the committed message prefix itself.
+    backfill_checkpoint(cancelled)?;
+    let reader = manual_index_reader(bridge.index())
+        .map_err(|error| format!("backfill prefix reader error: {error}"))?;
+    let query = BooleanQuery::intersection(vec![
+        Box::new(TermQuery::new(
+            Term::from_field_text(bridge.handles().doc_kind, "message"),
+            IndexRecordOption::Basic,
+        )),
+        Box::new(RangeQuery::new(
+            Bound::Unbounded,
+            Bound::Included(Term::from_field_u64(
+                bridge.handles().id,
+                state.db_stats.max_id,
+            )),
+        )),
+    ]);
+    let indexed_prefix = reader
+        .searcher()
+        .search(&query, &Count)
+        .map_err(|error| format!("backfill prefix count failed: {error}"))?;
+    backfill_checkpoint(cancelled)?;
     Ok(
-        (rows_through_marker == state.db_stats.count).then_some(BackfillPlan::Incremental {
-            start_after_id: marker_max_id,
-        }),
+        (u64::try_from(indexed_prefix).ok() == Some(state.index_stats.count)).then_some(
+            BackfillPlan::Incremental {
+                start_after_id: marker_max_id,
+            },
+        ),
     )
 }
 
@@ -2385,6 +2417,8 @@ fn backfill_into_bridge_locked_with_opener(
         && change_clock.is_some()
         && state.change_clock == change_clock
         && state.message_watermark == message_watermark
+        && state.index_stats == state.db_stats
+        && current_index_fingerprint.is_some()
         && state.index_meta_fingerprint == current_index_fingerprint
     {
         // Counters establish unchanged contents within the same source file.
@@ -2468,12 +2502,18 @@ fn backfill_into_bridge_locked_with_opener(
                 // deliveries live and skipped others (source lock busy) have
                 // holes above the marker that the tail count reads as damage.
                 // Rows up to the marker are unchanged (append-only clock) and
-                // were fully indexed when it was written, so re-ingesting
-                // everything after it repairs the holes; upserts make overlap
-                // harmless. A delivery that commits after a higher id was
+                // were fully indexed when it was written. Verify that prefix
+                // still survives before resuming after it; upserts make tail
+                // overlap harmless. A delivery that commits after a higher id was
                 // already indexed leaves a hole below the marker instead,
                 // which the recent-hole plan repairs.
-                match marker_resume_plan(&conn, db_stats, previous_state.as_ref(), cancelled)? {
+                match marker_resume_plan(
+                    &conn,
+                    bridge,
+                    db_stats,
+                    previous_state.as_ref(),
+                    cancelled,
+                )? {
                     Some(plan) => plan,
                     None => {
                         recent_hole_repair_plan(&conn, bridge, db_stats, index_stats, cancelled)?
@@ -2721,6 +2761,11 @@ fn backfill_into_bridge_locked_with_opener(
 
     let final_index_stats = fetch_index_message_stats(bridge)?;
     backfill_checkpoint(cancelled)?;
+    if final_index_stats != db_stats {
+        return Err(format!(
+            "backfill index coverage differs from its source snapshot: source={db_stats:?}, index={final_index_stats:?}"
+        ));
+    }
     if let Some(fingerprint) = sqlite_file_backfill_fingerprint(identity_path) {
         write_backfill_state(
             bridge,
@@ -2990,7 +3035,7 @@ mod tests {
         observe_pool_source(
             &bridge,
             &path,
-            "gh382-generation",
+            Some("gh382-generation"),
             changed.revision,
             changed.rewrite_revision,
             false,
@@ -3024,17 +3069,17 @@ mod tests {
         let bridge = TantivyBridge::open(index.path()).unwrap();
         backfill_into_bridge(&bridge, &path, None).unwrap();
         assert!(bridge.source_is_available(&path, Some("gh382-generation")));
-        bridge.revoke_source_proof_for("/unrelated-mailbox", "gh382-generation");
-        bridge.revoke_source_proof_for(&path, "another-generation");
+        bridge.revoke_source_proof_for("/unrelated-mailbox", Some("gh382-generation"));
+        bridge.revoke_source_proof_for(&path, Some("another-generation"));
         assert!(bridge.source_is_available(&path, Some("gh382-generation")));
         assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
-        bridge.revoke_source_proof_for(&path, "gh382-generation");
+        bridge.revoke_source_proof_for(&path, Some("gh382-generation"));
         assert!(!bridge.source_is_available(&path, Some("gh382-generation")));
         assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
         assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (0, 1));
-        observe_pool_source(&bridge, &path, "gh382-generation", 4, 1, false);
+        observe_pool_source(&bridge, &path, Some("gh382-generation"), 4, 1, false);
         assert!(!bridge.source_is_available(&path, Some("gh382-generation")));
-        observe_pool_source(&bridge, &path, "gh382-generation", 6, 1, false);
+        observe_pool_source(&bridge, &path, Some("gh382-generation"), 6, 1, false);
         assert!(bridge.source_is_available(&path, Some("gh382-generation")));
         assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
         let missing = source
@@ -3043,7 +3088,7 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        observe_pool_source(&bridge, &missing, "gh382-generation", 6, 1, false);
+        observe_pool_source(&bridge, &missing, Some("gh382-generation"), 6, 1, false);
         assert!(!bridge.source_is_available(&missing, Some("gh382-generation")));
     }
 
@@ -3136,7 +3181,7 @@ mod tests {
         observe_pool_source(
             &bridge,
             &path,
-            "gh382-generation",
+            Some("gh382-generation"),
             clock.revision,
             clock.rewrite_revision,
             false,
@@ -3182,6 +3227,15 @@ mod tests {
         assert_eq!(lexical_change_clock(&conn).unwrap(), Some(clock));
         assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (1, 0));
         assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+        assert_eq!(
+            bridge
+                .search(&PlannerQuery::messages("commonmail", 1))
+                .iter()
+                .map(|result| result.id)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the retried repair must restore searchable source content"
+        );
 
         #[cfg(unix)]
         {
@@ -3196,12 +3250,81 @@ mod tests {
             observe_pool_source(
                 &bridge,
                 &path,
-                "gh382-generation",
+                Some("gh382-generation"),
                 clock.revision,
                 clock.rewrite_revision,
                 false,
             );
             assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
+        }
+    }
+
+    #[test]
+    fn gh382_tail_resume_checks_the_committed_index_prefix() {
+        for damage_prefix in [false, true] {
+            let source = tempfile::tempdir().unwrap();
+            let index = tempfile::tempdir().unwrap();
+            let path = create_test_db(
+                source.path(),
+                &[
+                    (1, "commonmail", "first body", "normal", "thread"),
+                    (2, "commonmail", "second body", "normal", "thread"),
+                ],
+            );
+            let conn = crate::guard_db_conn(
+                DbConn::open_file(&path).unwrap(),
+                "gh382 committed prefix fixture",
+            );
+            gh382_install_lexical_clock(&conn);
+            let bridge = TantivyBridge::open(index.path()).unwrap();
+            assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (2, 0));
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,thread_id,subject,body_md,created_ts) \
+                 VALUES(3,1,1,'thread','commonmail','tail body',3000000)",
+                &[],
+            )
+            .unwrap();
+            let clock = lexical_change_clock(&conn).unwrap();
+            let tail = IndexableMessage {
+                id: 3,
+                project_id: 1,
+                project_slug: "test-proj".to_string(),
+                sender_name: "BlueLake".to_string(),
+                subject: "commonmail".to_string(),
+                body_md: "tail body".to_string(),
+                thread_id: Some("thread".to_string()),
+                importance: "normal".to_string(),
+                created_ts: 3_000_000,
+            };
+            with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, None, |writer| {
+                if damage_prefix {
+                    writer.delete_term(Term::from_field_u64(bridge.handles().id, 1));
+                }
+                upsert_indexable_message(writer, bridge.handles(), &tail)?;
+                writer.commit().map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                fetch_index_message_stats(&bridge).unwrap().count,
+                if damage_prefix { 2 } else { 3 },
+                "a live tail can hide prefix loss behind the saved marker's count"
+            );
+            let (indexed, _) = backfill_into_bridge(&bridge, &path, None).unwrap();
+            if damage_prefix {
+                assert!(indexed > 0, "damaged coverage must be repaired");
+            } else {
+                assert_eq!(indexed, 0, "complete live coverage needs no reindexing");
+            }
+            let mut ids = bridge
+                .search(&PlannerQuery::messages("commonmail", 1))
+                .iter()
+                .map(|result| result.id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![1, 2, 3]);
+            assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+            assert_eq!(lexical_change_clock(&conn).unwrap(), clock);
         }
     }
 

@@ -1938,7 +1938,7 @@ mod tests {
                         break;
                     };
                     seen.extend(lean.iter().map(|(id, _)| *id));
-                    cursor = Some(SearchCursor { id, score });
+                    cursor = Some(SearchCursor { score, id });
                     assert!(seen.len() <= 96, "cursor must make progress");
                 }
                 assert_eq!(seen, (1..=96).collect::<Vec<_>>());
@@ -2055,7 +2055,7 @@ mod tests {
                     "benchmark": "gh382_lexical_collector",
                     "projects": 242,
                     "agents": 12236,
-                    "messages": 203498,
+                    "messages": 203_498,
                     "limit": 20,
                     "scope": "collector_only",
                     "warmup_rich_us": rich_elapsed.as_micros(),

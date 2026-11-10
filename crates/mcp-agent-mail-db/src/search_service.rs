@@ -53,7 +53,9 @@ use crate::search_two_tier::{
 };
 #[cfg(feature = "hybrid")]
 use crate::search_vector_index::{VectorFilter, VectorIndex, VectorIndexConfig};
-use asupersync::{Budget, Cx, Outcome, Time};
+#[cfg(test)]
+use asupersync::{Budget, Time};
+use asupersync::{Cx, Outcome};
 #[cfg(feature = "hybrid")]
 use frankensearch as fs;
 #[cfg(feature = "hybrid")]
@@ -1204,9 +1206,11 @@ fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
     Ok(stable_direct_surface_index_dir(pool))
 }
 
-/// A cheap, process-local capability snapshot. `verified` means that the
-/// last actual serving-pool observation matches a successfully sealed lexical
-/// source. Requests still check freshness; this is not a lease on future writes.
+/// A cheap, process-local capability snapshot.
+///
+/// `verified` means that the last actual serving-pool observation matches a
+/// successfully sealed lexical source. Requests still check freshness; this is
+/// not a lease on future writes.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct LexicalReadiness {
@@ -1226,7 +1230,7 @@ pub struct LexicalReadiness {
 struct LexicalReadinessSource {
     bridge: std::sync::Weak<crate::search_v3::TantivyBridge>,
     path: String,
-    generation: String,
+    generation: Option<String>,
 }
 
 #[cfg(feature = "tantivy-engine")]
@@ -1235,9 +1239,11 @@ fn lexical_readiness_sources() -> &'static Mutex<HashMap<String, LexicalReadines
     SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// No database or filesystem work is performed here. Unknown pools and bridge
-/// replacements have no proof until the readiness worker samples the actual
-/// serving pool. The pool engine generation is part of this cache key.
+/// No database or filesystem work is performed here.
+///
+/// Unknown pools and bridge replacements have no proof until the readiness
+/// worker samples the actual serving pool. The pool engine generation is part
+/// of this cache key.
 #[must_use]
 pub fn lexical_readiness(pool: &DbPool) -> LexicalReadiness {
     let state = LexicalReadiness {
@@ -1264,12 +1270,12 @@ pub fn lexical_readiness(pool: &DbPool) -> LexicalReadiness {
         }
         let backfilling = bridge.backfill_in_progress();
         let verified =
-            !backfilling && bridge.source_is_verified(&source.path, Some(&source.generation));
+            !backfilling && bridge.source_is_verified(&source.path, source.generation.as_deref());
         LexicalReadiness {
             compiled: true,
             initialized: true,
             backfilling,
-            available: bridge.source_is_available(&source.path, Some(&source.generation)),
+            available: bridge.source_is_available(&source.path, source.generation.as_deref()),
             catch_up_required: !verified,
             verified,
         }
@@ -1282,9 +1288,12 @@ pub fn lexical_readiness(pool: &DbPool) -> LexicalReadiness {
 }
 
 /// Sample the actual serving pool with its caller's admission/cancellation
-/// budget. This reads one small snapshot and never launches a file-backed
-/// rebuild. The lifecycle-owned backfill worker owns that maintenance. Empty memory fixtures can be certified
-/// from this pool; a standalone :memory: connection cannot provide that proof.
+/// budget.
+///
+/// This reads one small snapshot and never launches a file-backed rebuild.
+/// The lifecycle-owned backfill worker owns that maintenance. Empty memory
+/// fixtures can be certified from this pool; a standalone :memory: connection
+/// cannot provide that proof.
 #[allow(clippy::too_many_lines)]
 pub async fn probe_lexical_readiness(cx: &Cx, pool: &DbPool) -> Outcome<LexicalReadiness, DbError> {
     if let Err(error) = check_lexical_request(cx) {
@@ -1319,13 +1328,17 @@ pub async fn probe_lexical_readiness(cx: &Cx, pool: &DbPool) -> Outcome<LexicalR
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             }
         };
-        let snapshot = (|| -> Result<(String, i64, i64, bool), DbError> {
+        let snapshot = (|| -> Result<(Option<String>, i64, i64, bool), DbError> {
             let row = rows
                 .first()
                 .ok_or_else(|| DbError::Sqlite("lexical source identity row is missing".into()))?;
+            // Legacy and fresh mailboxes may not have lazily seeded their
+            // generation token. Keep that absence: observation remains bound
+            // to the actual source file (or memory pool) and lexical clock.
             let generation = row
-                .get_named::<String>("generation_id")
-                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+                .get_named::<Option<String>>("generation_id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?
+                .filter(|generation| !generation.is_empty());
             let revision = row
                 .get_named::<i64>("revision")
                 .map_err(|error| DbError::Sqlite(error.to_string()))?;
@@ -1366,14 +1379,18 @@ pub async fn probe_lexical_readiness(cx: &Cx, pool: &DbPool) -> Outcome<LexicalR
             pool.sqlite_identity_key()
         } else {
             if let Ok(mut cache) = lexical_generation_cache().lock() {
-                cache.insert(pool.engine_identity_key(), generation.clone());
+                if let Some(generation) = generation.as_ref() {
+                    cache.insert(pool.engine_identity_key(), generation.clone());
+                } else {
+                    cache.remove(&pool.engine_identity_key());
+                }
             }
             pool.search_identity_path().to_string()
         };
         crate::search_v3::observe_pool_source(
             &bridge,
             &path,
-            &generation,
+            generation.as_deref(),
             revision,
             rewrite_revision,
             memory,
@@ -1384,7 +1401,7 @@ pub async fn probe_lexical_readiness(cx: &Cx, pool: &DbPool) -> Outcome<LexicalR
                 &bridge,
                 cx,
                 &path,
-                &generation,
+                generation.as_deref(),
                 revision,
                 rewrite_revision,
             )
@@ -2048,8 +2065,9 @@ pub fn refresh_live_lexical_index(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Refresh the frozen serving mailbox from a lifecycle-owned worker. The
-/// caller keeps ownership until this function returns and joins the worker
+/// Refresh the frozen serving mailbox from a lifecycle-owned worker.
+///
+/// The caller keeps ownership until this function returns and joins the worker
 /// before releasing its mailbox lease. No ambient configuration is consulted.
 ///
 /// Stop interrupts local mutex/backoff waits and scan/publication boundaries;
@@ -2078,7 +2096,7 @@ pub fn refresh_lexical_index_cancellable(
                 })
             });
             if let Some((bridge, path, generation)) = bound_source {
-                bridge.revoke_source_proof_for(&path, &generation);
+                bridge.revoke_source_proof_for(&path, generation.as_deref());
             }
         }
         result
@@ -4287,21 +4305,16 @@ struct HybridExecutionPlan {
     governor: HybridBudgetGovernorState,
 }
 
-fn wall_clock_now_time() -> Time {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
-    Time::from_nanos(nanos_u64)
-}
-
 fn saturating_duration_millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn deadline_remaining_budget_ms(budget: Budget) -> Option<u64> {
+fn deadline_remaining_budget_ms(cx: &Cx) -> Option<u64> {
+    let budget = cx.budget();
     budget.deadline?;
-    let now = wall_clock_now_time();
+    // Deadlines belong to this caller's clock. Unix time makes every
+    // process-relative deadline appear expired and bypasses virtual clocks.
+    let now = cx.now();
     Some(
         budget
             .remaining_time(now)
@@ -4311,7 +4324,7 @@ fn deadline_remaining_budget_ms(budget: Budget) -> Option<u64> {
 
 pub(crate) fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
     let budget = cx.budget();
-    let deadline_remaining_ms = deadline_remaining_budget_ms(budget);
+    let deadline_remaining_ms = deadline_remaining_budget_ms(cx);
     let cost_remaining_ms = budget.remaining_cost();
 
     match (deadline_remaining_ms, cost_remaining_ms) {
@@ -4337,7 +4350,7 @@ pub(crate) fn check_lexical_request(cx: &Cx) -> Result<(), String> {
 fn lexical_failure<T>(cx: &Cx, error: DbError) -> Outcome<T, DbError> {
     if check_lexical_request(cx).is_err() {
         Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
-            if deadline_remaining_budget_ms(cx.budget()) == Some(0) {
+            if deadline_remaining_budget_ms(cx) == Some(0) {
                 asupersync::CancelReason::deadline()
                     .with_message("lexical search request deadline exhausted")
             } else if cx.budget().remaining_cost() == Some(0) {
@@ -6578,10 +6591,15 @@ mod tests {
                 ],
             )
             .unwrap();
+            assert!(crate::queries::db_generation_id_conn(&conn).is_none());
             let before = probe_lexical_readiness(&cx, &pool)
                 .await
                 .into_result()
                 .unwrap();
+            assert!(
+                crate::queries::db_generation_id_conn(&conn).is_none(),
+                "readiness observation must not mint a database identity"
+            );
             assert!(before.compiled);
             assert!(
                 !before.verified,
@@ -10507,6 +10525,27 @@ mod tests {
             assert_eq!(response.results[0].result.id, visible);
             assert_eq!(response.audit_summary.unwrap().denied_count, 1);
         });
+    }
+
+    #[test]
+    fn request_budget_remaining_ms_uses_the_callers_runtime_clock() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let budget = Budget::new().with_timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(30),
+        );
+        let cx = runtime.request_cx_with_budget(budget);
+        let remaining = request_budget_remaining_ms(&cx).unwrap();
+        assert!(remaining > 0 && remaining <= 30_000);
+        assert!(check_lexical_request(&cx).is_ok());
+
+        let cost_limited = runtime.request_cx_with_budget(budget.with_cost_quota(7));
+        assert_eq!(request_budget_remaining_ms(&cost_limited), Some(7));
+        let exhausted = runtime.request_cx_with_budget(budget.with_cost_quota(0));
+        assert_eq!(request_budget_remaining_ms(&exhausted), Some(0));
+        assert!(check_lexical_request(&exhausted).is_err());
     }
 
     #[test]
