@@ -8126,76 +8126,81 @@ async fn initialize_in_memory_connection(
 
 /// One-shot data repairs run at startup before pool connections are handed out.
 ///
-/// 1. Drop legacy `inbox_stats` triggers (redundant with explicit rebuilds).
-/// 2. Rebuild `inbox_stats` from ground truth.
-/// 3. Fix mixed-scale timestamps (seconds/millis → microseconds).
+/// Normalize legacy timestamps before rebuilding their derived inbox counters.
+/// Publish the repair atomically: a failed recount must not leave an empty
+/// `inbox_stats` table, partially normalized messages, or removed triggers.
 #[allow(clippy::result_large_err)]
 fn startup_data_repairs(conn: &DbConn) -> Result<(), SqlError> {
-    // ── inbox_stats rebuild ──────────────────────────────────────────
-    let has_inbox_stats = !conn
-        .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='inbox_stats'",
-            &[],
-        )?
-        .is_empty();
-
-    if has_inbox_stats {
-        // Drop legacy triggers to prevent double-counting.
-        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_insert")?;
-        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read")?;
-        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_ack")?;
-
-        // Full rebuild from ground truth.
-        conn.execute_raw("DELETE FROM inbox_stats")?;
-        conn.execute_raw(
-            "INSERT INTO inbox_stats \
-                (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-            SELECT \
-                r.agent_id, \
-                COUNT(*) AS total_count, \
-                SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-                SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-                MAX(m.created_ts) AS last_message_ts \
-            FROM message_recipients r \
-            JOIN messages m ON m.id = r.message_id \
-            GROUP BY r.agent_id",
-        )?;
+    // A savepoint also preserves any caller-owned transaction. Only release
+    // it after the timestamp and counter views describe the same data.
+    conn.execute_raw("SAVEPOINT am_startup_data_repairs")?;
+    let repaired: Result<(), SqlError> = (|| {
+        let has_messages = !conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
+                &[],
+            )?
+            .is_empty();
+        if has_messages {
+            // The Python server occasionally wrote seconds or milliseconds.
+            // Normalize millis [10^12, 10^15), then seconds (0, 10^12), so
+            // inbox_stats.last_message_ts is computed in microseconds too.
+            conn.execute_raw(
+                "UPDATE messages SET created_ts = created_ts * 1000 \
+                 WHERE created_ts >= 1000000000000 AND created_ts < 1000000000000000",
+            )?;
+            conn.execute_raw(
+                "UPDATE messages SET created_ts = created_ts * 1000000 \
+                 WHERE created_ts > 0 AND created_ts < 1000000000000",
+            )?;
+        }
+        let has_inbox_stats = !conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='inbox_stats'",
+                &[],
+            )?
+            .is_empty();
+        if has_inbox_stats {
+            // Drop legacy triggers to prevent double-counting after startup.
+            conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_insert")?;
+            conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read")?;
+            conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_ack")?;
+            conn.execute_raw("DELETE FROM inbox_stats")?;
+            conn.execute_raw(
+                "INSERT INTO inbox_stats \
+                    (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+                SELECT \
+                    r.agent_id, \
+                    COUNT(*) AS total_count, \
+                    SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+                    SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+                    MAX(m.created_ts) AS last_message_ts \
+                FROM message_recipients r \
+                JOIN messages m ON m.id = r.message_id \
+                GROUP BY r.agent_id",
+            )?;
+        }
+        conn.execute_raw("RELEASE SAVEPOINT am_startup_data_repairs")?;
+        Ok(())
+    })();
+    if let Err(error) = repaired {
+        // Never release after a failed rollback: that could commit precisely
+        // the partial repair we are trying to preserve against. The caller
+        // drops this initialization connection after the returned error.
+        conn.execute_raw("ROLLBACK TO SAVEPOINT am_startup_data_repairs")
+            .map_err(|rollback| {
+                SqlError::Custom(format!(
+                    "startup data repairs failed: {error}; rollback failed: {rollback}"
+                ))
+            })?;
+        conn.execute_raw("RELEASE SAVEPOINT am_startup_data_repairs")
+            .map_err(|release| {
+                SqlError::Custom(format!(
+                    "startup data repairs failed: {error}; savepoint release failed: {release}"
+                ))
+            })?;
+        return Err(error);
     }
-
-    // ── Fix mixed-scale timestamps ───────────────────────────────────
-    // The Python server occasionally wrote created_ts in seconds or
-    // milliseconds instead of microseconds.  Detect and upscale:
-    //   seconds  (< 1e13)  → × 1_000_000
-    //   millis   (< 1e16)  → × 1_000
-    let has_messages = !conn
-        .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
-            &[],
-        )?
-        .is_empty();
-
-    if has_messages {
-        // Magnitude-based detection (non-overlapping ranges):
-        //   2026 seconds  ≈ 1.77 × 10⁹   →  < 10¹² is definitely seconds
-        //   2026 millis   ≈ 1.77 × 10¹²   →  [10¹², 10¹⁵) is definitely millis
-        //   2026 micros   ≈ 1.77 × 10¹⁵   →  ≥ 10¹⁵ is already correct
-        //
-        // Order matters: handle millis FIRST to avoid seconds check catching
-        // millis values that happen to be < 10¹² (they can't — millis are ≥ 10¹²).
-        // But we still process millis first as a safety measure.
-
-        // Milliseconds → microseconds  [10^12, 10^15)
-        conn.execute_raw(
-            "UPDATE messages SET created_ts = created_ts * 1000 \
-             WHERE created_ts >= 1000000000000 AND created_ts < 1000000000000000",
-        )?;
-        // Seconds → microseconds  (0, 10^12)
-        conn.execute_raw(
-            "UPDATE messages SET created_ts = created_ts * 1000000 \
-             WHERE created_ts > 0 AND created_ts < 1000000000000",
-        )?;
-    }
-
     Ok(())
 }
 
@@ -21891,6 +21896,119 @@ mod tests {
             ..Default::default()
         };
         assert!(config.sqlite_path().is_err());
+    }
+
+    fn startup_repair_fixture(reject_recount: bool) -> DbConn {
+        let conn = DbConn::open_memory().expect("open startup repair fixture");
+        let constraint = if reject_recount {
+            "CHECK(total_count = 99)"
+        } else {
+            ""
+        };
+        conn.execute_raw(&format!(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, created_ts INTEGER, ack_required INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             CREATE TABLE inbox_stats (agent_id INTEGER PRIMARY KEY, total_count INTEGER {constraint}, \
+                 unread_count INTEGER, ack_pending_count INTEGER, last_message_ts INTEGER); \
+             INSERT INTO messages VALUES (1, 2000000000, 1), (2, 1700000000000, 0), (3, 1800000000000000, 1); \
+             INSERT INTO message_recipients VALUES (1, 1, NULL, NULL), (2, 1, 7, NULL), (3, 1, NULL, 9); \
+             INSERT INTO inbox_stats VALUES (1, 99, 98, 97, 96);"
+        ))
+        .expect("seed mixed-scale messages and previous counters");
+        for (name, event) in [
+            ("trg_inbox_stats_insert", "INSERT"),
+            ("trg_inbox_stats_mark_read", "UPDATE OF read_ts"),
+            ("trg_inbox_stats_ack", "UPDATE OF ack_ts"),
+        ] {
+            conn.execute_raw(&format!(
+                "CREATE TRIGGER {name} AFTER {event} ON message_recipients BEGIN SELECT 1; END"
+            ))
+            .expect("seed legacy trigger rollback witness");
+        }
+        conn
+    }
+
+    fn startup_repair_snapshot(conn: &DbConn) -> Vec<String> {
+        [
+            "SELECT id, created_ts, ack_required FROM messages ORDER BY id",
+            "SELECT agent_id, total_count, unread_count, ack_pending_count, last_message_ts FROM inbox_stats ORDER BY agent_id",
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' ORDER BY name",
+        ]
+        .iter()
+        .map(|sql| format!("{:?}", conn.query_sync(sql, &[]).unwrap()))
+        .collect()
+    }
+
+    #[test]
+    fn startup_repairs_recount_normalized_timestamps_on_the_first_pass() {
+        let conn = startup_repair_fixture(false);
+        startup_data_repairs(&conn).expect("repair legacy timestamps and counters");
+        let rows = conn
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count, last_message_ts FROM inbox_stats WHERE agent_id=1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get_named::<i64>("total_count").unwrap(), 3);
+        assert_eq!(row.get_named::<i64>("unread_count").unwrap(), 2);
+        assert_eq!(row.get_named::<i64>("ack_pending_count").unwrap(), 1);
+        assert_eq!(
+            row.get_named::<i64>("last_message_ts").unwrap(),
+            2_000_000_000_000_000,
+            "MAX must use normalized timestamps, including a seconds-based newest message"
+        );
+        assert!(
+            conn.query_sync("SELECT name FROM sqlite_master WHERE type='trigger'", &[])
+                .unwrap()
+                .is_empty()
+        );
+        let repaired = startup_repair_snapshot(&conn);
+        startup_data_repairs(&conn).expect("repeat an already completed repair");
+        assert_eq!(startup_repair_snapshot(&conn), repaired);
+        conn.execute_raw("BEGIN; ROLLBACK")
+            .expect("repair must release its own transaction");
+    }
+
+    #[test]
+    fn startup_repair_failure_preserves_timestamps_counters_triggers_and_parent_writes() {
+        for outer_transaction in [false, true] {
+            let conn = startup_repair_fixture(true);
+            let original = startup_repair_snapshot(&conn);
+            if outer_transaction {
+                conn.execute_raw("BEGIN; INSERT INTO messages VALUES (4, 123, 0)")
+                    .expect("seed a caller-owned transaction");
+            }
+            let before_repair = startup_repair_snapshot(&conn);
+            let error = startup_data_repairs(&conn).expect_err("reject the rebuilt counter");
+            assert!(error.to_string().contains("CHECK"), "{error}");
+            assert_eq!(
+                startup_repair_snapshot(&conn),
+                before_repair,
+                "failed repair must restore its exact prior data and trigger definitions"
+            );
+            if outer_transaction {
+                conn.execute_raw("ROLLBACK")
+                    .expect("repair must leave the caller's transaction open");
+                assert_eq!(startup_repair_snapshot(&conn), original);
+            } else {
+                conn.execute_raw("BEGIN; ROLLBACK")
+                    .expect("failed repair must release its own savepoint");
+            }
+        }
+    }
+
+    #[test]
+    fn successful_startup_repair_does_not_commit_the_callers_transaction() {
+        let conn = startup_repair_fixture(false);
+        let original = startup_repair_snapshot(&conn);
+        conn.execute_raw("BEGIN").unwrap();
+        startup_data_repairs(&conn).expect("repair inside the caller's transaction");
+        assert_ne!(startup_repair_snapshot(&conn), original);
+        conn.execute_raw("ROLLBACK")
+            .expect("caller must retain rollback authority");
+        assert_eq!(startup_repair_snapshot(&conn), original);
     }
 
     #[test]
