@@ -220,7 +220,9 @@ mod tests {
                             assert_eq!(result, due.then_some(Ok(false)), "{enabled:?}: {lane:?}");
                         }
                         let remaining = if enabled.contains(&true) {
-                            IDLE - Duration::from_secs(second % 60)
+                            IDLE.checked_sub(Duration::from_secs(second % 60)).expect(
+                                "the second within a minute is shorter than the idle interval",
+                            )
                         } else {
                             IDLE
                         };
