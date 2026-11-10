@@ -1,5 +1,63 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 10 fresh-eyes follow-through, 22:30 UTC — EmeraldEagle
+
+- [x] Verify c393f89d and the clean tracked checkout; preserve seven existing
+  untracked roots. Governing-document hashes and Cargo.lock match the prior
+  full read and qualification packet; re-read the applicable rules.
+- [x] Recheck Beads and graph triage. Continue owned br-asldx/br-kp1in.29;
+  original acceptance remains unchanged. Other release P0s need canonical
+  DSR/public transitions and cannot close from source inspection alone.
+- [ ] Execute the complete predeclared core/db/tools/server native population
+  on immutable c393f89d, default features/profile.dev.debug0/build-jobs1,
+  nextest dev global1800s and inherited per-test240s, outer14400s,
+  native30GiB/floor10GiB. A local argument refusal omitted --no-overlay;
+  corrected immediately with a separate retained receipt, no remote work.
+  hz4 exits103/queue_timeout before transfer; unchanged c393 execution is
+  now compiling on admissible vmi1149989. No administrative override.
+- [ ] Compare every actual identity with both retained original338 and805
+  populations, all four added regressions and the additive lock cases.
+  Diagnose real failures without reducing assertions, workload or limits.
+- [x] Re-read the source fixes and their callers: observed-lock lifecycle,
+  optional source identity, committed prefix/suffix repair, caller-clock
+  deadlines, transactional snapshot and migration witnesses.
+- [x] Implement a nonblocking archive-lag diagnostic on the actual backlog,
+  coalescer map, queue, spill and progress mutexes. Missing ages serialize as
+  null, convergence is at least yellow, and known WBQ/earlier-queue lower bounds
+  retain stronger verdicts. Unknown queues cannot establish an idle-gap age.
+  Ordinary blocking accounting retains its original post-wait WBQ timing.
+- [x] Add actual-global-held-mutex controls, retain the real in-flight WBQ
+  fence test and add incomplete-sample lower-bound assertions, strengthen
+  queued-age/progress-lock coverage, and add known-zero/unknown/red-preservation
+  response controls. These are not an executed health-under-global-wedge proof.
+- [x] Fix the new diagnostic Result signatures after production101 reveals
+  this crate's fixed-error Result alias; use std::result::Result explicitly.
+  Retain the failed draft: production101/483.817s and draft Clippy101/685.165s.
+- [x] Preserve shared merge8c4fa856 (22 files, no deletions, lock unchanged),
+  import tracker truth, and inspect the relevant incoming admission/scheduling
+  paths. Original c393 runs remain scoped historical evidence after the merge.
+- [x] Merged Clippy101/96.527s exposes five incoming diagnostics. Keep strict
+  lints: typed rotation budget state preserves all four deadline/deferral pairs;
+  fix the literal and semicolon, keep the empty-failure assertion, and use
+  checked subtraction for the unchanged exact one-nanosecond boundary. A helper
+  handles only integrity_guard mechanical edits; parent reads the full diff.
+- [ ] Qualify merged8c4 plus the exact five-file packet in
+  review3-integrated-h5-hashes.txt. Whole-workspace fmt0; required compiler,
+  production, Clippy, portable and native runs still need terminal results.
+  hz4's next Clippy request refuses120/monitor_unavailable before Cargo;
+  never reinterpret its unknown free_bytes0 as measured full-disk evidence.
+- [ ] Execute the expanded five-package native population, retaining every
+  original338/805 case and four earlier regressions, adding archive-lag and
+  health/rotation/integrity/retention controls. For the new packet, use four
+  compile jobs on hz4's observed64 CPUs/128545MiB available memory. This changes
+  compilation parallelism only, not test threads, assertions, features,
+  global1800s/per-test240s, outer14400s, native30GiB or floor10GiB. No performance
+  ratio or constrained-host qualification follows from these functional runs.
+- [ ] Run required compiler/scanner checks for any further source correction,
+  review it again, record bounded results in both Beads, and publish only the
+  reviewed owned changes. Original scaling/liveness/overhead gates stay open
+  until their populated probes execute successfully.
+
 ## November 10 shared-commit integration — EmeraldEagle / br-asldx / br-kp1in.29
 
 - [x] Observe the shared checkout advance to ce1fac7f40fabd48732e80b9bc540c4e0accce3d
