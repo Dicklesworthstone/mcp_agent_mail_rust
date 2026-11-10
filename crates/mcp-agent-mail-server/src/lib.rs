@@ -6719,11 +6719,77 @@ const fn micros_to_millis_ceil(micros: u64) -> u64 {
     micros.saturating_add(999).saturating_div(1_000)
 }
 
+const DISPATCH_LOCK_SUMMARY_MAX_BYTES: usize = 4096;
+const DISPATCH_LOCK_SUMMARY_MAX_INSTANCES: usize = 4;
+
+/// Keep timeout replies usable while retaining the complete bounded observation
+/// in structured logs. These are process-wide waits, not proof that one of them
+/// caused the timed-out request. Missing samples never mean "no blockers".
+fn dispatch_lock_wait_summary(
+    snapshot: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
+) -> String {
+    let participant = |value: Option<&mcp_agent_mail_core::lock_order::LockParticipant>| {
+        value.map_or_else(
+            || "unobserved".to_string(),
+            |value| {
+                format!(
+                    "{:?} ({}) at {:?}:{}:{}",
+                    value.thread_name.as_deref().unwrap_or("unnamed"),
+                    value.thread_id,
+                    value.file,
+                    value.line,
+                    value.column,
+                )
+            },
+        )
+    };
+    let mut details = String::new();
+    let mut reported = 0;
+    let blocked = snapshot
+        .locks
+        .iter()
+        .filter(|lock| snapshot.available && lock.waiter_count > 0)
+        .count();
+    for lock in snapshot
+        .locks
+        .iter()
+        .filter(|lock| snapshot.available && lock.waiter_count > 0)
+        .take(DISPATCH_LOCK_SUMMARY_MAX_INSTANCES)
+    {
+        let entry = format!(
+            " [{}#{}: waiters={}, oldest_wait_ms={}, holders={}, owner={}, waiter={}, omitted_participants={}]",
+            lock.lock_name,
+            lock.instance_id,
+            lock.waiter_count,
+            lock.oldest_observed_wait_ns / 1_000_000,
+            lock.holder_count,
+            participant(lock.holders.first()),
+            participant(lock.waiters.first()),
+            lock.omitted_participants,
+        );
+        if details.len().saturating_add(entry.len()) > DISPATCH_LOCK_SUMMARY_MAX_BYTES - 512 {
+            break;
+        }
+        details.push_str(&entry);
+        reported += 1;
+    }
+    format!(
+        "lock_observation_available={}; lock_observation_complete={}; busy_instances={}; omitted_active_instances={}; registrations_dropped={}; observed_blocked_locks={blocked}; summary_omitted_locks={};{details} (process-wide instrumented lock evidence; not request attribution; absent or partial evidence does not establish no blockers)",
+        snapshot.available,
+        snapshot.is_complete(),
+        snapshot.busy_instances,
+        snapshot.omitted_active_instances,
+        snapshot.registrations_dropped,
+        blocked.saturating_sub(reported),
+    )
+}
+
 fn dispatch_timeout_error_text(
     method: &str,
     dispatch_timeout_secs: u64,
     diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
     fence_holder: Option<&mcp_agent_mail_storage::ArchiveFenceHolder>,
+    lock_activity: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
 ) -> String {
     let dispatch = &diagnostics.blocking_dispatch;
     let fence_holder = fence_holder.map_or_else(|| "none".to_string(), ToString::to_string);
@@ -6741,7 +6807,7 @@ fn dispatch_timeout_error_text(
          path since ack-fast, and archive_commit_queue is enqueue-to-durable \
          queue latency, not pure git work; reservation artifacts are written \
          on the request path and wait for the archive publication fence, \
-         whose oldest live wait is archive_fence_wait_ms.)",
+         whose oldest live wait is archive_fence_wait_ms.) {}",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
@@ -6756,10 +6822,15 @@ fn dispatch_timeout_error_text(
         dispatch.zombies,
         dispatch.zombies_expired,
         dispatch.timeouts_total,
+        dispatch_lock_wait_summary(lock_activity),
     )
 }
 
-fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError {
+fn dispatch_timeout_error(
+    method: &str,
+    dispatch_timeout_secs: u64,
+    lock_activity: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
+) -> McpError {
     let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
     let diagnostics =
         mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
@@ -6771,6 +6842,7 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
             dispatch_timeout_secs,
             &diagnostics,
             fence_holder.as_ref(),
+            lock_activity,
         ),
     )
 }
@@ -6958,10 +7030,18 @@ where
                             let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
                             metrics.inflight.sub_saturating(1);
                             metrics.zombies.add(1);
+                            // Publication of the accounting transition is done.
+                            // Do not retain the permit mutex during diagnostic
+                            // allocation/logging or delay a finishing worker.
+                            drop(guard);
+                            let lock_activity =
+                                mcp_agent_mail_core::lock_order::lock_activity_snapshot();
                             tracing::error!(
                                 method = %grace_method,
                                 grace_secs,
                                 zombies,
+                                lock_activity = ?lock_activity,
+                                lock_observation_complete = lock_activity.is_complete(),
                                 "hard grace timeout: blocking work ignored cancellation; \
                                  accounting it as a zombie that occupies admission capacity \
                                  until its thread exits or the zombie admission TTL elapses \
@@ -6973,17 +7053,24 @@ where
                 })
                 .ok();
 
+            let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
             tracing::error!(
                 method = %method,
                 dispatch_timeout_secs,
                 grace_secs,
+                lock_activity = ?lock_activity,
+                lock_observation_complete = lock_activity.is_complete(),
                 "blocking dispatch timed out; cancellation requested, \
                  permit will be force-released after {grace_secs}s grace"
             );
             mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
                 .timeouts_total
                 .inc();
-            Err(dispatch_timeout_error(&method, dispatch_timeout_secs))
+            Err(dispatch_timeout_error(
+                &method,
+                dispatch_timeout_secs,
+                &lock_activity,
+            ))
         }
     }
 }
@@ -20102,7 +20189,13 @@ mod tests {
             },
         };
 
-        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics, None);
+        let text = dispatch_timeout_error_text(
+            "send_message",
+            30,
+            &diagnostics,
+            None,
+            &mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
+        );
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
@@ -20112,6 +20205,9 @@ mod tests {
         assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
+        assert!(text.contains("lock_observation_available=false"));
+        assert!(text.contains("lock_observation_complete=false"));
+        assert!(text.contains("not request attribution"));
         assert!(!text.contains("database may be under heavy contention"));
     }
 
@@ -20145,8 +20241,13 @@ mod tests {
             held_for: Duration::from_millis(29_500),
         };
 
-        let text =
-            dispatch_timeout_error_text("file_reservation_paths", 30, &diagnostics, Some(&holder));
+        let text = dispatch_timeout_error_text(
+            "file_reservation_paths",
+            30,
+            &diagnostics,
+            Some(&holder),
+            &mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
+        );
         assert!(text.contains("stage=archive_publication_fence"), "{text}");
         assert!(text.contains("archive_fence_wait_ms=29400"), "{text}");
         assert!(
@@ -20160,6 +20261,63 @@ mod tests {
             !text.contains("archive lag cannot cause a tool timeout"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn dispatch_lock_wait_summary_bounds_evidence_and_discloses_omissions() {
+        use mcp_agent_mail_core::lock_order::{
+            LockAccess, LockActivity, LockActivitySnapshot, LockParticipant,
+        };
+
+        let participant = LockParticipant {
+            thread_id: "ThreadId(27)".into(),
+            thread_name: Some("archive-worker".into()),
+            access: LockAccess::Mutex,
+            file: "crates/mcp-agent-mail-storage/src/lib.rs".into(),
+            line: 17,
+            column: 9,
+            elapsed_ns: 31_000_000_000,
+            labels_truncated: false,
+        };
+        let mut snapshot = LockActivitySnapshot {
+            available: true,
+            locks: (1..=8)
+                .map(|instance_id| LockActivity {
+                    instance_id,
+                    lock_name: "StorageCommitQueue".into(),
+                    rank: 60,
+                    holder_count: 1,
+                    waiter_count: 1,
+                    oldest_observed_wait_ns: 31_000_000_000,
+                    holders: vec![participant.clone()],
+                    waiters: vec![participant.clone()],
+                    omitted_participants: 0,
+                })
+                .collect(),
+            ..LockActivitySnapshot::default()
+        };
+        let summary = dispatch_lock_wait_summary(&snapshot);
+        assert!(summary.len() <= DISPATCH_LOCK_SUMMARY_MAX_BYTES);
+        assert!(summary.contains("observed_blocked_locks=8"));
+        assert!(summary.contains("summary_omitted_locks=4"));
+        assert!(summary.contains("StorageCommitQueue#1"));
+        assert!(!summary.contains("StorageCommitQueue#5"));
+        assert!(summary.contains("archive-worker"));
+        assert!(summary.contains("oldest_wait_ms=31000"));
+        assert!(summary.contains("not request attribution"));
+
+        // Even an unexpected overlong public value cannot expand a timeout
+        // response beyond its independent budget; the full snapshot is logged.
+        snapshot.locks[0].lock_name = "large".repeat(DISPATCH_LOCK_SUMMARY_MAX_BYTES);
+        let bounded = dispatch_lock_wait_summary(&snapshot);
+        assert!(bounded.len() <= DISPATCH_LOCK_SUMMARY_MAX_BYTES);
+        assert!(bounded.contains("summary_omitted_locks=8"));
+        snapshot.available = false;
+        let unavailable = dispatch_lock_wait_summary(&snapshot);
+        assert!(unavailable.contains("lock_observation_available=false"));
+        assert!(unavailable.contains("lock_observation_complete=false"));
+        assert!(!unavailable.contains("archive-worker"));
+        assert!(unavailable.contains("does not establish no blockers"));
     }
 
     #[test]

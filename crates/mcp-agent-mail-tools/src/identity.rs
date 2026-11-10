@@ -563,6 +563,59 @@ fn coalescer_latency_health_level(
     }
 }
 
+/// Unfinished acquisitions are evidence that completed-wait histograms cannot
+/// provide. A partial observation cannot establish that all observed locks are
+/// healthy, but a known stalled waiter remains red even when other evidence is
+/// missing. This does not diagnose a deadlock or attribute any particular call.
+fn lock_wait_health_verdict(
+    snapshot: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
+) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel;
+    use mcp_agent_mail_core::lock_order::LOCK_WAIT_STALL_THRESHOLD;
+
+    let stalled = snapshot
+        .locks
+        .iter()
+        .filter(|lock| snapshot.available && lock.is_stalled(LOCK_WAIT_STALL_THRESHOLD))
+        .count();
+    let complete = snapshot.is_complete();
+    let level = if stalled > 0 {
+        HealthLevel::Red
+    } else if complete {
+        HealthLevel::Green
+    } else {
+        HealthLevel::Yellow
+    };
+    let detail = if stalled > 0 {
+        let names = snapshot
+            .locks
+            .iter()
+            .filter(|lock| lock.is_stalled(LOCK_WAIT_STALL_THRESHOLD))
+            .take(4)
+            .map(|lock| format!("{}#{}", lock.lock_name, lock.instance_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{stalled} instrumented lock(s) have an observed waiter blocked for at least {} s: {names}; inspect lock_activity holders and waiters; coverage_complete={complete}; this is not a deadlock proof",
+            LOCK_WAIT_STALL_THRESHOLD.as_secs(),
+        )
+    } else if complete {
+        format!(
+            "no instrumented lock waiter observed at or above {} s; uninstrumented engine and filesystem waits are outside this observation",
+            LOCK_WAIT_STALL_THRESHOLD.as_secs(),
+        )
+    } else {
+        format!(
+            "lock observation incomplete: available={}, busy_instances={}, omitted_active_instances={}, registrations_dropped={}; no clean lock-wait verdict established; inspect lock_activity for retained evidence",
+            snapshot.available,
+            snapshot.busy_instances,
+            snapshot.omitted_active_instances,
+            snapshot.registrations_dropped,
+        )
+    };
+    HealthVerdict::new(level, true, detail)
+}
+
 /// Build the `health_check` retention block (GH#210).
 ///
 /// Read-only: enumerates the same recovery-debris / direct-backup / staging
@@ -1779,6 +1832,10 @@ pub struct HealthCheckResponse {
     /// gauges are idle so a blocking-dispatch stall is never hidden behind an
     /// all-zero pool utilization report.
     pub timeout_diagnostics: TimeoutDiagnosticsResponse,
+    /// Bounded live holders and unfinished waiters from the serving process.
+    /// Missing/partial observations never certify the absence of blocked work.
+    #[serde(default)]
+    pub lock_activity: mcp_agent_mail_core::lock_order::LockActivitySnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queues: Option<QueuesHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2526,10 +2583,15 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         archive_pending,
         idle_gap_age,
     );
-    let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
+    let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
+    let lock_wait_verdict = lock_wait_health_verdict(&lock_activity);
+    let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red
+        || lock_wait_verdict.level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
     // verdict (or the live pressure level).
-    let mut effective_level = pressure_level.max(verdicts.rollup_level());
+    let mut effective_level = pressure_level
+        .max(verdicts.rollup_level())
+        .max(lock_wait_verdict.level());
     // GH#166: a deleted/replaced executable owning the mailbox locks blocks direct
     // reservation/recovery paths even while mail still flows through the stale
     // process. Never report fully green readiness in that state (status stays
@@ -2629,6 +2691,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             level: retention_verdict.status,
             detail: retention_verdict.detail,
         },
+        HealthLevelContributor {
+            name: "lock_waits".to_string(),
+            level: lock_wait_verdict.status,
+            detail: lock_wait_verdict.detail,
+        },
     ];
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
         health_level_contributors.push(HealthLevelContributor {
@@ -2676,6 +2743,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             &timeout_diagnostics,
             config.health_commit_coalescer_p99_degraded_ms,
         ),
+        lock_activity,
         queues: Some({
             let wbq_over_80_for_s = if metrics.storage.wbq_over_80_since_us == 0 {
                 0
@@ -6062,6 +6130,7 @@ mod tests {
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
+            lock_activity: mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
             queues: None,
             disk: None,
             retention: None,
@@ -6621,6 +6690,7 @@ mod tests {
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
+            lock_activity: mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
             queues: None,
             disk: None,
             retention: None,
@@ -6692,6 +6762,171 @@ mod tests {
         assert!(detail.contains("possible descriptor leak"), "{detail}");
         let steady = descriptor_health_detail(&snapshot, None);
         assert!(steady.ends_with("floor not rising"), "{steady}");
+    }
+
+    #[test]
+    fn lock_wait_health_uses_live_wait_age_and_never_clears_partial_evidence() {
+        use mcp_agent_mail_core::HealthLevel;
+        use mcp_agent_mail_core::lock_order::{
+            LOCK_WAIT_STALL_THRESHOLD, LockActivity, LockActivitySnapshot,
+        };
+
+        let threshold_ns = u64::try_from(LOCK_WAIT_STALL_THRESHOLD.as_nanos()).unwrap();
+        let mut snapshot = LockActivitySnapshot {
+            available: true,
+            locks: vec![LockActivity {
+                instance_id: 71,
+                lock_name: "StorageCommitQueue".into(),
+                rank: 60,
+                holder_count: 0,
+                waiter_count: 1,
+                oldest_observed_wait_ns: threshold_ns - 1,
+                holders: vec![],
+                waiters: vec![],
+                omitted_participants: 1,
+            }],
+            ..LockActivitySnapshot::default()
+        };
+        // Missing participant detail is not a green certificate, even when
+        // the observed wait has not yet crossed the critical threshold.
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.locks[0].oldest_observed_wait_ns = threshold_ns;
+        let stalled = lock_wait_health_verdict(&snapshot);
+        assert_eq!(stalled.level(), HealthLevel::Red);
+        assert!(stalled.critical);
+        assert!(stalled.detail.contains("StorageCommitQueue#71"));
+        assert!(stalled.detail.contains("coverage_complete=false"));
+        snapshot.busy_instances = 1;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Red
+        );
+
+        snapshot.locks[0].waiter_count = 0;
+        snapshot.locks[0].oldest_observed_wait_ns = u64::MAX;
+        snapshot.locks[0].omitted_participants = 0;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.busy_instances = 0;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Green
+        );
+        snapshot.available = false;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.available = true;
+        snapshot.omitted_active_instances = 1;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.omitted_active_instances = 0;
+        snapshot.registrations_dropped = 1;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+    }
+
+    #[test]
+    fn health_check_exposes_real_blocked_lock_without_acquiring_it() {
+        use mcp_agent_mail_core::lock_order::{LockLevel, OrderedMutex, lock_activity_snapshot};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite:///{}", root.path().join("health.sqlite3").display());
+        let storage_root = root.path().join("archive");
+        std::fs::create_dir(&storage_root).unwrap();
+        let response = with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                // Acquire the test's environment authority before starting
+                // the bounded held-lock interval. Parallel fixture setup must
+                // not spend that interval waiting for the environment lock.
+                let lock = Arc::new(OrderedMutex::new(
+                    LockLevel::StorageCommitQueue,
+                    "protected data must not appear in health",
+                ));
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let owner_lock = Arc::clone(&lock);
+                let owner = std::thread::Builder::new()
+                    .name("health-lock-owner".into())
+                    .spawn(move || {
+                        let _held = owner_lock.lock();
+                        ready_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(Duration::from_secs(20));
+                    })
+                    .unwrap();
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let waiter = std::thread::Builder::new()
+                    .name("health-lock-waiter".into())
+                    .spawn(move || drop(lock.lock()))
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let observed = loop {
+                    if lock_activity_snapshot().locks.iter().any(|activity| {
+                        activity.waiters.iter().any(|participant| {
+                            participant.thread_name.as_deref() == Some("health-lock-waiter")
+                        })
+                    }) {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let response = health_check(&McpContext::new(Cx::for_testing(), 1));
+                let _ = release_tx.send(());
+                owner.join().unwrap();
+                waiter.join().unwrap();
+                assert!(observed, "real waiter never entered live lock tracking");
+                response
+            },
+        );
+        let response = response.expect("health must return while the application lock is held");
+        assert!(!response.contains("protected data must not appear in health"));
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let activity = value["lock_activity"]["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|lock| {
+                lock["waiters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|waiter| waiter["thread_name"] == "health-lock-waiter")
+            })
+            .expect("health must carry the real waiter");
+        assert_eq!(activity["holder_count"], 1);
+        assert_eq!(activity["waiter_count"], 1);
+        assert_eq!(activity["holders"][0]["thread_name"], "health-lock-owner");
+        assert!(
+            value["health_level_contributors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|contributor| contributor["name"] == "lock_waits")
+        );
     }
 
     #[test]

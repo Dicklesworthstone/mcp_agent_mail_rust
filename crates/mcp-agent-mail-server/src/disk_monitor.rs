@@ -12,7 +12,10 @@
 
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::DiskPressure;
-use mcp_agent_mail_core::lock_order::{LockActivity, LockActivitySnapshot, lock_activity_snapshot};
+use mcp_agent_mail_core::lock_order::{
+    LOCK_WAIT_STALL_THRESHOLD as LOCK_WAIT_THRESHOLD, LockActivity, LockActivitySnapshot,
+    lock_activity_snapshot,
+};
 use mcp_agent_mail_core::memory::MemoryPressure;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +30,6 @@ static LOCK_WORKER: std::sync::LazyLock<Mutex<Option<LockWatchdogWorker>>> =
 const STARTUP_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1GiB
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 const LOCK_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
-const LOCK_WAIT_THRESHOLD: Duration = Duration::from_secs(30);
 const LOCK_WAIT_REMINDER_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TRACKED_LOCK_WAITS: usize = 128;
 const MAX_LOCK_REPORTS_PER_SAMPLE: usize = 4;
@@ -72,9 +74,7 @@ impl LockWaitWatchdog {
                 !no_waiters
             });
             for lock in &snapshot.locks {
-                if lock.waiter_count == 0
-                    || Duration::from_nanos(lock.oldest_observed_wait_ns) < threshold
-                {
+                if !lock.is_stalled(threshold) {
                     continue;
                 }
                 let previous = self.reported.get(&lock.instance_id);
