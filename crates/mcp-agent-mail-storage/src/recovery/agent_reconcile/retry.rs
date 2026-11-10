@@ -182,6 +182,14 @@ pub(super) struct RetryQueue {
 }
 
 impl RetryQueue {
+    pub(super) fn next_ready_at(&self) -> Option<Instant> {
+        self.entries.iter().map(|entry| entry.ready_at).min()
+    }
+
+    pub(super) fn has_capacity(&self) -> bool {
+        self.entries.len() < MAX_RETRY_IDS
+    }
+
     pub(super) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -194,7 +202,7 @@ impl RetryQueue {
     /// The single cursor owner cannot consume this slot concurrently. A full
     /// queue stops new scan work, not retries, and never evicts unresolved debt.
     pub(super) fn can_admit(&self, id: i64) -> bool {
-        self.entries.len() < MAX_RETRY_IDS || self.contains(id)
+        self.has_capacity() || self.contains(id)
     }
 
     /// Select without removing. Cancellation, exhausted repair budgets, and

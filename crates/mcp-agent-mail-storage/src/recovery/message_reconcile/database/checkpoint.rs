@@ -3262,6 +3262,10 @@ mod tests {
             assert!(cursor.retries.iter().all(|retry| {
                 retry.ready_at >= now && retry.ready_at <= now + MAX_RETRY_BACKOFF
             }));
+            assert_eq!(
+                cursor.next_retry_at(),
+                cursor.retries.iter().map(|retry| retry.ready_at).min()
+            );
             if wall_us == i64::MAX {
                 assert!(cursor.retries.iter().all(|retry| retry.ready_at == now));
                 assert!(cursor.conflict_backoff.is_empty());

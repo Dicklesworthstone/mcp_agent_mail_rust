@@ -564,10 +564,11 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
         &fixture.config,
         &mut cursor,
         &stop,
+        &MaintenanceTurn::new(Instant::now()),
         |_| reports += 1,
     )
     .expect("checkpoint contention must not retire the live source pool");
-    assert!(backlog);
+    assert_eq!(backlog, WorkHint::Contended { progressed: false });
     assert_eq!(reports, 0);
     assert_eq!(std::fs::read(&checkpoint_path).unwrap(), before_checkpoint);
     assert_source_untouched(&fixture);
@@ -597,11 +598,16 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
                     &fixture.config,
                     &mut cursor,
                     &stop,
+                    &MaintenanceTurn::new(Instant::now()),
                     |_| reports += 1,
                 ))
             },
         );
-        assert_eq!(result, Some(Ok(true)));
+        if [0, 1, 3, 7, 15, 31].contains(&second) {
+            assert_eq!(result, Some(Ok(WorkHint::Contended { progressed: false })));
+        } else {
+            assert_eq!(result, None);
+        }
         let agent = schedule.run_if_due(
             Lane::Agents,
             || now,
@@ -613,6 +619,7 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
                     &fixture.config,
                     &mut agent_cursor,
                     &stop,
+                    &MaintenanceTurn::new(Instant::now()),
                     |report| {
                         assert!(!report.interrupted);
                         assert_eq!(report.deferred, 0);
@@ -631,6 +638,7 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
                     &fixture.config,
                     &mut reservation_cursor,
                     &stop,
+                    &MaintenanceTurn::new(Instant::now()),
                     |report| {
                         assert!(!report.interrupted);
                         assert_eq!(report.deferred, 0);
@@ -640,13 +648,13 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
         );
         for (index, result) in [agent, reservation].into_iter().enumerate() {
             match result {
-                Some(Ok(false)) => {
+                Some(Ok(WorkHint::Idle)) => {
                     assert!(
                         peer_settled_at[index].replace(second).is_none(),
                         "healthy peer ran again before its minute deadline"
                     );
                 }
-                Some(Ok(true)) => {
+                Some(Ok(hint)) if hint.needs_follow_up() => {
                     // A slow first profile publication may legitimately
                     // consume its turn budget. Let that real backlog drain;
                     // never assume the fixture's Git writes fit in 250 ms.
@@ -654,11 +662,17 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
                 }
                 None => assert!(peer_settled_at[index].is_some()),
                 Some(Err(error)) => panic!("peer source failed: {error}"),
+                Some(Ok(other)) => panic!("unexpected healthy-peer scheduling result: {other:?}"),
             }
         }
-        assert_eq!(schedule.next_delay(now), Duration::from_secs(1));
+        assert!(
+            (Duration::from_secs(1)..=Duration::from_secs(60)).contains(&schedule.next_delay(now))
+        );
     }
-    assert_eq!(message_turns, 60);
+    assert_eq!(
+        message_turns, 6,
+        "persistent admission contention must back off"
+    );
     for (turns, settled_at) in peer_turns.into_iter().zip(peer_settled_at) {
         let settled_at = settled_at.expect("finite peer fixture must become healthy");
         assert_eq!(turns, usize::try_from(settled_at).unwrap() + 1);
@@ -677,30 +691,29 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
     let mut repaired = 0;
     for second in 60..92 {
         let now = start + Duration::from_secs(second);
-        let backlog = schedule
-            .run_if_due(
-                Lane::Messages,
-                || now,
-                || {
-                    Some(super::run(
-                        &fixture.cx,
-                        &fixture.pool,
-                        &fixture.config,
-                        &mut cursor,
-                        &stop,
-                        |report| {
-                            assert!(!report.interrupted);
-                            assert_eq!(report.deferred, 0);
-                            assert_eq!(report.checkpoint_saved, Some(true));
-                            assert!(report.repaired <= 4);
-                            repaired += report.repaired;
-                        },
-                    ))
-                },
-            )
-            .expect("a retained message backlog must be due after the short pause")
-            .unwrap();
-        if !backlog {
+        let outcome = schedule.run_if_due(
+            Lane::Messages,
+            || now,
+            || {
+                Some(super::run(
+                    &fixture.cx,
+                    &fixture.pool,
+                    &fixture.config,
+                    &mut cursor,
+                    &stop,
+                    &MaintenanceTurn::new(Instant::now()),
+                    |report| {
+                        assert!(!report.interrupted);
+                        assert_eq!(report.deferred, 0);
+                        assert_eq!(report.checkpoint_saved, Some(true));
+                        assert!(report.repaired <= 4);
+                        repaired += report.repaired;
+                    },
+                ))
+            },
+        );
+        let Some(outcome) = outcome else { continue };
+        if !outcome.unwrap().needs_follow_up() {
             finished = true;
             break;
         }
@@ -841,10 +854,11 @@ fn gh354_idle_database_workers_park_and_serve_after_idle() {
             &fixture.config,
             &mut cursor,
             &stop,
+            &MaintenanceTurn::new(Instant::now()),
             |report| repaired += report.repaired,
         )
         .unwrap();
-        if !backlog {
+        if !backlog.needs_follow_up() {
             finished = true;
             break;
         }
@@ -860,6 +874,279 @@ fn gh354_idle_database_workers_park_and_serve_after_idle() {
             "wall_ms": wall_ms,
             "first_read_ms": first_read_ms,
             "recovered_messages": repaired,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// Keep the real worker's Linux counters separate from parallel libtest cases.
+/// The child receipt also proves that the exact filter actually ran this test.
+#[cfg(target_os = "linux")]
+fn run_populated_maintenance_child(receipt: &std::path::Path) {
+    struct OwnedChild(Option<std::process::Child>);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let (_, module) = module_path!().split_once("::").expect("nested test module");
+    let name = format!("{module}::gh383_populated_maintenance_paces_cpu_and_reaches_old_orphan");
+    let mut child = OwnedChild(Some(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env("AM_GH383_MAINTENANCE_CPU_RECEIPT", receipt)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+            drop(child.0.take());
+            assert!(
+                status.success(),
+                "populated maintenance child failed: {status}"
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_mins(5),
+            "populated maintenance child exceeded its bounded lifetime"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+    assert_eq!(receipt["source_messages"], json!(256));
+    assert_eq!(receipt["committed_messages"], json!(256));
+    assert!(receipt["index_bytes"].as_u64().unwrap() > 30 * 1024 * 1024);
+    println!("GH383 populated maintenance receipt: {receipt}");
+}
+
+#[cfg(target_os = "linux")]
+fn maintenance_thread_stat() -> std::path::PathBuf {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            std::fs::read_to_string(path.join("comm"))
+                .is_ok_and(|name| name.trim() == "retention-quota")
+        })
+        .expect("the production maintenance worker must exist")
+        .join("stat")
+}
+
+#[cfg(target_os = "linux")]
+fn thread_cpu_ticks(stat_path: &std::path::Path) -> u64 {
+    let stat = std::fs::read_to_string(stat_path).unwrap();
+    let (_, fields) = stat.rsplit_once(')').unwrap();
+    let fields: Vec<_> = fields.split_whitespace().collect();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+/// Make a native, committed v2 index of approximately the reported size. These
+/// are synthetic Git entries sharing one blob, not 154,845 fabricated messages.
+/// Real messages and their three committed copies remain a separate oracle.
+#[cfg(target_os = "linux")]
+fn add_large_native_index(fixture: &Fixture) -> u64 {
+    let conn = match block_on(fixture.pool.acquire(&fixture.cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => panic!("acquire for index fixture failed: {error}"), // ubs:ignore — cfg(test)-only fixture must reject failed acquisition
+        _ => panic!("index fixture acquisition was cancelled or panicked"), // ubs:ignore — cfg(test)-only fixture must reject cancellation/panic
+    };
+    let rows = conn.query_sync("SELECT slug FROM projects", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
+    let slug = rows[0].get_named::<String>("slug").unwrap();
+    drop(conn);
+    let archive = mcp_agent_mail_storage::ensure_archive(&fixture.config, &slug).unwrap();
+    let repo = git2::Repository::open(&archive.repo_root).unwrap();
+    let blob = repo.blob(b"synthetic index-size witness\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.set_version(2).unwrap();
+    for id in 0..154_845 {
+        let mut path = format!("maintenance-fixture/{id:06}-").into_bytes();
+        path.resize(144, b'x');
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                file_size: 29,
+                id: blob,
+                flags: 0,
+                flags_extended: 0,
+                path,
+            })
+            .unwrap();
+    }
+    let tree_id = index.write_tree().unwrap();
+    index.write().unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    let signature =
+        git2::Signature::now("Maintenance test", "maintenance@example.invalid").unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "Seed synthetic index-size witness",
+        &repo.find_tree(tree_id).unwrap(),
+        &[&parent],
+    )
+    .unwrap();
+    std::fs::metadata(repo.path().join("index")).unwrap().len()
+}
+
+/// Measure the production retention-quota thread with reporting/quota disabled,
+/// a populated archive, a reporter-sized native index and real forward scan
+/// debt. Low CPU is insufficient: an old crash orphan behind healthy pages must
+/// acquire canonical, inbox and outbox bytes in committed Git without a client
+/// read or changes to accepted messages/receipts. This is a component workload,
+/// not a whole-daemon or deployment-specific CPU certificate.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the workload, CPU window and convergence oracles together.
+fn gh383_populated_maintenance_paces_cpu_and_reaches_old_orphan() {
+    let Some(receipt) = std::env::var_os("AM_GH383_MAINTENANCE_CPU_RECEIPT") else {
+        let temp = tempfile::tempdir().unwrap();
+        run_populated_maintenance_child(&temp.path().join("maintenance-cpu.json"));
+        return;
+    };
+    let mut fixture = fixture();
+    fixture.config.retention_report_enabled = false;
+    fixture.config.quota_enabled = false;
+    fixture.config.messages_retention_days = 0;
+    let stop = AtomicBool::new(false);
+    let mut cursor = ReconcileCursor::settled_before(now_micros());
+    let mut repaired = 0;
+    for _ in 0..16 {
+        let report = reconcile_message_batch(
+            &fixture.cx,
+            &fixture.pool,
+            &fixture.config,
+            &mut cursor,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(report.deferred, 0);
+        assert_eq!(report.checkpoint_saved, Some(true));
+        repaired += report.repaired;
+        if repaired == 9 {
+            break;
+        }
+    }
+    assert_eq!(repaired, 9);
+    // Leave the durable forward cursor at 9009. Prepare healthy later archive
+    // rows with the ordinary non-checkpointed entrypoint, then accept the hole.
+    insert_tail_messages(&fixture, (9010..=9256).filter(|id| *id != 9128));
+    let mut preparation = ReconcileCursor::default();
+    let mut prepared = 0;
+    for _ in 0..256 {
+        let report = reconcile_message_batch(
+            &fixture.cx,
+            &fixture.pool,
+            &fixture.config,
+            &mut preparation,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(report.deferred, 0);
+        assert_eq!(report.checkpoint_saved, None);
+        prepared += report.repaired;
+        if prepared == 246 {
+            break;
+        }
+    }
+    assert_eq!(prepared, 246);
+    insert_tail_messages(&fixture, std::iter::once(9128));
+    let source_before = source_snapshot(&fixture);
+    assert_eq!(source_before[0].len(), 256);
+    let index_bytes = add_large_native_index(&fixture);
+    assert!(index_bytes > 30 * 1024 * 1024);
+
+    let output = Command::new("getconf").arg("CLK_TCK").output().unwrap();
+    assert!(output.status.success());
+    let ticks_per_second: u64 = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(ticks_per_second > 0);
+    let (cpu_ms, wall_ms, convergence_ms) =
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "true"),
+                ("AM_AGENT_ARCHIVE_RECONCILE_ENABLED", "true"),
+                ("AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED", "true"),
+            ],
+            || {
+                struct Worker;
+                impl Drop for Worker {
+                    fn drop(&mut self) {
+                        super::super::shutdown();
+                    }
+                }
+                super::super::start(&fixture.config);
+                let worker = Worker;
+                let stat = maintenance_thread_stat();
+                // Start just before the worker's ten-second startup admission;
+                // the measured interval includes actual catch-up and its rest.
+                std::thread::sleep(Duration::from_secs(9));
+                let started = Instant::now();
+                let before = thread_cpu_ticks(&stat);
+                std::thread::sleep(Duration::from_secs(30));
+                let after = thread_cpu_ticks(&stat);
+                let wall_ms = started.elapsed().as_millis();
+                assert!(after >= before);
+                let cpu_ms = u128::from(after - before) * 1_000 / u128::from(ticks_per_second);
+                // The scheduler targets 20% active wall time. Allow a boundary
+                // batch overrun and timing noise; the counters are thread CPU,
+                // not the caller's sleep or the process's independent DB work.
+                assert!(
+                    cpu_ms * 100 <= wall_ms * 35,
+                    "populated retention thread exceeded 35% of one core: {cpu_ms} / {wall_ms} ms"
+                );
+                loop {
+                    let copies = walkdir::WalkDir::new(&fixture.config.storage_root)
+                        .follow_links(false)
+                        .into_iter()
+                        .map(Result::unwrap)
+                        .filter(|entry| entry.file_type().is_file())
+                        .filter(|entry| entry.file_name().to_string_lossy().ends_with("__9128.md"))
+                        .count();
+                    if copies == 3 {
+                        break;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(120),
+                        "paced worker did not reach the old orphan behind healthy pages"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let convergence_ms = started.elapsed().as_millis();
+                drop(worker);
+                (cpu_ms, wall_ms, convergence_ms)
+            },
+        );
+    assert_eq!(source_snapshot(&fixture), source_before);
+    assert_committed_bundles_in_range(&fixture, 9001..=9256, 256);
+    std::fs::write(
+        receipt,
+        serde_json::to_vec(&json!({
+            "thread_cpu_ms": cpu_ms,
+            "wall_ms": wall_ms,
+            "convergence_ms": convergence_ms,
+            "index_bytes": index_bytes,
+            "source_messages": 256,
+            "committed_messages": 256,
+            "reporting_enabled": false,
+            "quota_enabled": false,
         }))
         .unwrap(),
     )

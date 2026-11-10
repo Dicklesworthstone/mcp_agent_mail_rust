@@ -90,6 +90,18 @@ pub struct AgentReconcileCursor {
 }
 
 impl AgentReconcileCursor {
+    /// Scheduling only: source and checkpoint generation checks still precede
+    /// every retry. A restart reconstructs these deadlines from retained debt.
+    #[must_use]
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        self.retries.next_ready_at()
+    }
+
+    #[must_use]
+    pub fn has_retry_capacity(&self) -> bool {
+        self.retries.has_capacity()
+    }
+
     fn advance(&mut self, id: i64) {
         self.after = id;
         if self.ceiling == Some(id) {
@@ -107,6 +119,7 @@ pub struct AgentReconcileReport {
     pub deferred: usize,
     pub deferred_transient: usize,
     pub retry_len: usize,
+    pub scan_advanced: bool,
     /// Still-conflicting profiles whose exact authority has not changed.
     /// These are not healthy/unchanged profiles or productive retry debt.
     pub suppressed_conflicts: usize,
@@ -783,6 +796,7 @@ pub fn reconcile_agent_batch(
         select_ids(cx, pool, cursor)?
     };
     let selected_identity = cursor.source_identity.clone();
+    let scan_started_after = cursor.after;
     let mut attempted = HashSet::new();
     let mut scan_blocked = false;
     for candidate in candidates {
@@ -884,12 +898,15 @@ pub fn reconcile_agent_batch(
         }
     }
     report.retry_len = cursor.retries.len();
+    report.scan_advanced = cursor.after != scan_started_after;
     report.conflict_len = cursor.conflicts.len();
     // A full healthy page can hide a much older lifecycle change. Continue
     // this finite round at catch-up cadence rather than sleeping a minute per
     // page. A conflicting-only pass does not manufacture productive progress.
     report.budget_exhausted |= cursor.ceiling.is_some()
-        && (report.repaired > 0 || report.unchanged > 0)
+        && (report.repaired > 0
+            || report.unchanged > 0
+            || (report.scan_advanced && report.scanned == 0))
         && report.deferred == 0;
     Ok(report)
 }
@@ -2845,6 +2862,57 @@ mod tests {
     }
 
     #[test]
+    fn gh383_cooling_roster_page_advances_without_consuming_debt() {
+        with_mailbox(|cx, pool, config, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 102_i64..=133 {
+                conn.execute_sync(
+                    "INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(?, 101, ?, 'test', 'test', 'coordination', 1000000, 2000000)",
+                    &[id.into(), format!("Agent{id}").into()],
+                )
+                .unwrap();
+            }
+            drop(conn);
+            let future = Instant::now() + std::time::Duration::from_secs(60);
+            let mut cursor = AgentReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                ..Default::default()
+            };
+            for id in 101..133 {
+                cursor.retries.defer(id, future);
+            }
+            let stop = AtomicBool::new(false);
+            let cooling = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (cooling.scanned, cooling.repaired, cooling.retry_len),
+                (0, 0, 32)
+            );
+            assert!(cooling.scan_advanced && cooling.budget_exhausted);
+            assert_eq!((cursor.after, cursor.ceiling), (132, Some(133)));
+            assert_eq!(cursor.next_retry_at(), Some(future));
+            assert!(!profile_path(config).exists());
+
+            let tail = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((tail.scanned, tail.repaired, tail.retry_len), (1, 1, 32));
+            assert!(!tail.budget_exhausted);
+            assert_eq!(cursor.next_retry_at(), Some(future));
+            assert_eq!((cursor.after, cursor.ceiling), (133, None));
+            assert!(
+                !profile_path(config).exists(),
+                "cooling ID was retried early"
+            );
+            let relative = "projects/project/agents/Agent133/profile.json";
+            let bytes = fs::read(config.storage_root.join(relative)).unwrap();
+            let profile: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(profile["name"], "Agent133");
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            let entry = tree.get_path(Path::new(relative)).unwrap();
+            assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+        });
+    }
+
+    #[test]
     fn full_retry_queue_does_not_advance_past_unadmitted_roster_work() {
         with_mailbox(|cx, pool, config, _| {
             let mut cursor = AgentReconcileCursor {
@@ -2855,11 +2923,15 @@ mod tests {
             for id in 10_000..11_024 {
                 cursor.retries.defer(id, future);
             }
+            assert!(!cursor.has_retry_capacity());
+            assert_eq!(cursor.next_retry_at(), Some(future));
             let stop = AtomicBool::new(false);
             let report = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
             assert_eq!((report.scanned, report.retry_len), (0, 1024));
             assert!(report.budget_exhausted);
             assert_eq!((cursor.after, cursor.ceiling), (0, Some(101)));
+            assert!(!report.scan_advanced);
+            assert_eq!(cursor.next_retry_at(), Some(future));
             assert!(!profile_path(config).exists());
             stop.store(true, Ordering::Release);
             let cancelled = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
@@ -2867,6 +2939,7 @@ mod tests {
             assert_eq!(cancelled.retry_len, 1024);
             assert_eq!(cursor.after, 0);
             cursor.retries.forget(10_000);
+            assert!(cursor.has_retry_capacity());
             stop.store(false, Ordering::Release);
             let resumed = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
             assert_eq!(resumed.repaired, 1);

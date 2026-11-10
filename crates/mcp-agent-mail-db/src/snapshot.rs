@@ -21,7 +21,7 @@ mod authority;
 #[cfg(unix)]
 use authority::SnapshotAuthority;
 #[cfg(unix)]
-pub use authority::SnapshotRetentionGuard;
+pub use authority::{SnapshotRetentionDeferred, SnapshotRetentionGuard};
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _};
@@ -1019,13 +1019,31 @@ fn select_verified_snapshot_checked(primary: &Path) -> DbResult<Option<SelectedV
 
 fn select_verified_snapshot_inner(
     primary: &Path,
-    mut before_open: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
+    before_open: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
 ) -> Option<SelectedVerifiedSnapshot> {
-    let primary = normalized_snapshot_primary(primary).ok()?;
-    let meta = read_snapshot_metadata(&primary)?;
+    select_verified_snapshot_with_work_admission(primary, |_| Ok(()), before_open, |_, _| Ok(()))
+        .ok()
+        .flatten()
+}
+
+/// Work admission can stop a retention search without converting an unfinished
+/// search into evidence that no verified replacement exists. Ordering is only
+/// a hint: every selected source still passes all byte and integrity checks.
+fn select_verified_snapshot_with_work_admission(
+    primary: &Path,
+    order: impl FnOnce(&mut Vec<PathBuf>) -> std::io::Result<()>,
+    mut before_open: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
+    mut admit: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
+) -> std::io::Result<Option<SelectedVerifiedSnapshot>> {
+    let Ok(primary) = normalized_snapshot_primary(primary) else {
+        return Ok(None);
+    };
+    let Some(meta) = read_snapshot_metadata(&primary) else {
+        return Ok(None);
+    };
     let canonical_bak = snapshot_bak_path(&primary);
     if !metadata_matches_snapshot_namespace(&meta, &primary, &canonical_bak) {
-        return None;
+        return Ok(None);
     }
 
     let mut candidates = crate::pool::sqlite_backup_candidates(&primary);
@@ -1036,6 +1054,7 @@ fn select_verified_snapshot_inner(
         let bak = candidates.remove(pos);
         candidates.insert(0, bak);
     }
+    order(&mut candidates)?;
 
     for candidate in candidates {
         if !crate::pool::sqlite_recovery_candidate_is_standalone(&candidate) {
@@ -1049,6 +1068,12 @@ fn select_verified_snapshot_inner(
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
+        // A different length cannot match the recorded hash. Avoid opening
+        // unrelated generations (and disturbing their POSIX locks) at all.
+        if inventoried.len() != meta.snapshot_size_bytes {
+            continue;
+        }
+        admit(&candidate, &inventoried)?;
         if before_open(&candidate, &inventoried).is_err() {
             continue;
         }
@@ -1091,15 +1116,15 @@ fn select_verified_snapshot_inner(
         if retained_identity != current_identity || source.rewind().is_err() {
             continue;
         }
-        return Some(SelectedVerifiedSnapshot {
+        return Ok(Some(SelectedVerifiedSnapshot {
             metadata: meta,
             actual_path: candidate,
             source,
             #[cfg(unix)]
             authority: None,
-        });
+        }));
     }
-    None
+    Ok(None)
 }
 
 /// Return the latest verified snapshot's metadata for a primary path. The

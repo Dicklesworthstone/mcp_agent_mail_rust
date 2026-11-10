@@ -20,9 +20,12 @@
 //! File-backed mailboxes enable it by default; set
 //! `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED=false` to disable it. Bounded recent
 //! catch-up and rotating history passes run once per minute in steady state.
-//! Successful, uncontended catch-up batches run in finite bursts before the
-//! one-second backlog pause; each batch retains its original limits and
-//! checkpoint. Neither accelerates the configured reporting/pruning cadence.
+//! Successful, uncontended catch-up batches run in finite bursts. All three
+//! lanes share a cooperative 250 ms quantum; actual active wall time, including
+//! slow batches and observers, earns four times as much rest for a 20% worker
+//! duty target. This is not a hard I/O deadline or a limit on other threads.
+//! Each batch retains its original limits and checkpoint. Reporting/pruning
+//! retain their configured cadence.
 //! Each repair lane keeps its own deadline: a retry or backlog in one lane
 //! must not turn healthy peer lanes into once-per-second database scans.
 //! Repair never sends
@@ -36,9 +39,11 @@
 //! Terminal reservation releases also converge without another client read.
 //! Set `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED=false` to disable this separate
 //! default-on pass. It preserves foreign-generation and conflicting artifacts.
-//! Reservation retry debt also requests the short follow-up, independently of
-//! message repair. Successful release batches run in bounded turns; contention
-//! yields immediately without bypassing per-ID cooldown or publication locks.
+//! Runnable scans request a short follow-up; cooling retry debt uses its
+//! earliest deadline, bounded by the normal discovery interval. Repeated
+//! no-progress contention backs off. Round-robin lane admission prevents a
+//! slow lane from monopolizing every turn without bypassing per-ID cooldowns
+//! or publication locks.
 //!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
@@ -115,18 +120,14 @@ fn report_is_due(elapsed: Option<Duration>, interval: Duration) -> bool {
     elapsed.is_none_or(|elapsed| elapsed >= interval)
 }
 
-/// Pause before the next message-repair pass while a pass keeps exhausting its
-/// repair budget (a real DB-ahead backlog, e.g. archive writes that were still
-/// queued when the process was killed).
+/// Minimum pause for runnable repair or scan work. The worker's aggregate
+/// elapsed-time rest can increase it; cooling debt has a separate deadline.
 const REPAIR_CATCH_UP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Delay before this lane's next pass. A pass that exhausted its repair budget
-/// left known work behind, so the next one follows after
-/// [`REPAIR_CATCH_UP_POLL_INTERVAL`] instead of the steady-state poll: at 4
-/// repairs per pass, a once-per-minute cadence healed ~20 messages in five
-/// minutes, so a crash that lost a busy queue's archive writes stayed
-/// DB-ahead for tens of minutes. Reporting and pruning keep their own
-/// `report_is_due` schedule.
+/// Base delay for runnable scan work. The typed scheduler handles cooled retry
+/// debt, contention and source/resource pauses separately. Reporting/pruning
+/// keep their own `report_is_due` schedule, and aggregate duty pacing applies
+/// after every worker turn.
 fn next_poll_interval(poll_interval: Duration, repair_backlog: bool) -> Duration {
     if repair_backlog {
         REPAIR_CATCH_UP_POLL_INTERVAL.min(poll_interval)
@@ -299,6 +300,7 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
             info!("retention/quota report worker shutting down");
             return;
         }
+        let turn = schedule::MaintenanceTurn::new(Instant::now());
 
         // Retry admission on a later tick instead of permanently disabling
         // healing after a transient startup failure or a retired pool.
@@ -329,97 +331,119 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
         // deadline before borrowing the pool, creating a Cx or reading SQL.
         // Missing pools and errors get the normal retry delay, without a
         // fabricated successful storage report or a discarded repair cursor.
-        if let Some(Err(error)) =
-            repair_schedule.run_if_due(schedule::Lane::Messages, Instant::now, || {
-                if SHUTDOWN.load(Ordering::Acquire) {
-                    return None;
+        // All three lanes spend one shared quantum. Rotate the starting lane
+        // after actual admission so a slow message/Git operation cannot starve
+        // profiles or releases. Skipped deadlines consume no turn or source I/O.
+        for lane in repair_schedule.lane_order() {
+            if SHUTDOWN.load(Ordering::Acquire) || turn.exhausted(Instant::now()) {
+                break;
+            }
+            match lane {
+                schedule::Lane::Messages => {
+                    if let Some(Err(error)) = repair_schedule.run_in_turn_if_due(
+                        &turn,
+                        schedule::Lane::Messages,
+                        Instant::now,
+                        || {
+                            if SHUTDOWN.load(Ordering::Acquire) {
+                                return None;
+                            }
+                            let live_pool = pool.as_ref()?;
+                            let cx = worker_cx();
+                            Some(catch_up::run(
+                                &cx,
+                                live_pool,
+                                config,
+                                &mut cursor,
+                                &SHUTDOWN,
+                                &turn,
+                                |report| {
+                                    if report.scanned > 0 || report.interrupted {
+                                        info!(
+                                            target: "maintenance",
+                                            event = "message_archive_reconcile",
+                                            scanned = report.scanned,
+                                            unchanged = report.unchanged,
+                                            repaired = report.repaired,
+                                            files_created = report.files_created,
+                                            deferred = report.deferred,
+                                            deferred_transient = report.deferred_transient,
+                                            deferred_conflict = report.deferred_conflict,
+                                            retry_len = report.retry_len,
+                                            payload_bytes = report.payload_bytes,
+                                            interrupted = report.interrupted,
+                                            budget_exhausted = report.budget_exhausted,
+                                            "bounded message archive reconciliation pass completed"
+                                        );
+                                    }
+                                },
+                            ))
+                        },
+                    ) {
+                        warn!(
+                            target: "maintenance",
+                            event = "message_archive_reconcile_source_unavailable",
+                            error = %error,
+                            "message archive reconciliation refused; preserving source and retrying next cycle"
+                        );
+                        // A verified recovery may have replaced the live generation.
+                        // Reacquire through ordinary pool admission on the next tick.
+                        pool = None;
+                    }
                 }
-                let live_pool = pool.as_ref()?;
-                let cx = worker_cx();
-                Some(catch_up::run(
-                    &cx,
-                    live_pool,
-                    config,
-                    &mut cursor,
-                    &SHUTDOWN,
-                    |report| {
-                        if report.scanned > 0 || report.interrupted {
-                            info!(
-                                target: "maintenance",
-                                event = "message_archive_reconcile",
-                                scanned = report.scanned,
-                                unchanged = report.unchanged,
-                                repaired = report.repaired,
-                                files_created = report.files_created,
-                                deferred = report.deferred,
-                                deferred_transient = report.deferred_transient,
-                                deferred_conflict = report.deferred_conflict,
-                                retry_len = report.retry_len,
-                                payload_bytes = report.payload_bytes,
-                                interrupted = report.interrupted,
-                                budget_exhausted = report.budget_exhausted,
-                                "bounded message archive reconciliation pass completed"
-                            );
-                        }
-                    },
-                ))
-            })
-        {
-            warn!(
-                target: "maintenance",
-                event = "message_archive_reconcile_source_unavailable",
-                error = %error,
-                "message archive reconciliation refused; preserving source and retrying next cycle"
-            );
-            // A verified recovery may have replaced the live generation.
-            // Reacquire through ordinary pool admission on the next tick.
-            pool = None;
-        }
 
-        if let Some(Err(error)) =
-            repair_schedule.run_if_due(schedule::Lane::Agents, Instant::now, || {
-                if SHUTDOWN.load(Ordering::Acquire) {
-                    return None;
+                schedule::Lane::Agents => {
+                    if let Some(Err(error)) = repair_schedule.run_in_turn_if_due(
+                        &turn,
+                        schedule::Lane::Agents,
+                        Instant::now,
+                        || {
+                            if SHUTDOWN.load(Ordering::Acquire) {
+                                return None;
+                            }
+                            let live_pool = pool.as_ref()?;
+                            let cx = worker_cx();
+                            Some(agent_catch_up::run(
+                                &cx,
+                                live_pool,
+                                config,
+                                &mut agent_cursor,
+                                &SHUTDOWN,
+                                &turn,
+                                |report| {
+                                    if report.scanned > 0 || report.interrupted {
+                                        info!(
+                                            target: "maintenance",
+                                            event = "agent_archive_reconcile",
+                                            scanned = report.scanned,
+                                            unchanged = report.unchanged,
+                                            repaired = report.repaired,
+                                            deferred = report.deferred,
+                                            suppressed_conflicts = report.suppressed_conflicts,
+                                            conflict_len = report.conflict_len,
+                                            conflict_evicted = report.conflict_evicted,
+                                            interrupted = report.interrupted,
+                                            budget_exhausted = report.budget_exhausted,
+                                            "bounded agent profile reconciliation pass completed"
+                                        );
+                                    }
+                                },
+                            ))
+                        },
+                    ) {
+                        warn!(
+                            target: "maintenance",
+                            event = "agent_archive_reconcile_source_unavailable",
+                            error = %error,
+                            "agent profile reconciliation refused; retrying next cycle"
+                        );
+                        pool = None;
+                    }
                 }
-                let live_pool = pool.as_ref()?;
-                let cx = worker_cx();
-                Some(agent_catch_up::run(
-                    &cx,
-                    live_pool,
-                    config,
-                    &mut agent_cursor,
-                    &SHUTDOWN,
-                    |report| {
-                        if report.scanned > 0 || report.interrupted {
-                            info!(
-                                target: "maintenance",
-                                event = "agent_archive_reconcile",
-                                scanned = report.scanned,
-                                unchanged = report.unchanged,
-                                repaired = report.repaired,
-                                deferred = report.deferred,
-                                suppressed_conflicts = report.suppressed_conflicts,
-                                conflict_len = report.conflict_len,
-                                conflict_evicted = report.conflict_evicted,
-                                interrupted = report.interrupted,
-                                budget_exhausted = report.budget_exhausted,
-                                "bounded agent profile reconciliation pass completed"
-                            );
-                        }
-                    },
-                ))
-            })
-        {
-            warn!(
-                target: "maintenance",
-                event = "agent_archive_reconcile_source_unavailable",
-                error = %error,
-                "agent profile reconciliation refused; retrying next cycle"
-            );
-            pool = None;
-        }
 
-        if let Some(Err(error)) = repair_schedule.run_if_due(
+                schedule::Lane::Reservations => {
+                    if let Some(Err(error)) = repair_schedule.run_in_turn_if_due(
+            &turn,
             schedule::Lane::Reservations,
             Instant::now,
             || {
@@ -434,6 +458,7 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
                     config,
                     &mut reservation_cursor,
                     &SHUTDOWN,
+                    &turn,
                     |report| {
                         if report.scanned > 0 || report.interrupted || report.retry_len > 0 {
                             info!(target: "maintenance", event = "reservation_release_archive_reconcile",
@@ -476,6 +501,9 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
                 error = %error, "reservation release reconciliation refused; retrying next cycle");
             pool = None;
         }
+                }
+            }
+        }
 
         if SHUTDOWN.load(Ordering::Acquire) {
             return;
@@ -514,7 +542,19 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
             }
         }
 
-        if sleep_with_shutdown(repair_schedule.next_delay(Instant::now())) {
+        // Charge pool admission, every repair lane, observers and reporting to
+        // the same measured turn. A non-preemptible operation that overruns the
+        // quantum receives proportionally longer rest, not another immediate
+        // round. The existing interruptible sleep keeps shutdown responsive.
+        let completed = Instant::now();
+        let delay = repair_schedule
+            .next_delay(completed)
+            .max(turn.rest(completed));
+        tracing::debug!(target: "maintenance", event = "archive_maintenance_turn",
+            active_ms = turn.elapsed(completed).as_millis(),
+            rest_ms = delay.as_millis(),
+            "archive maintenance turn completed with aggregate duty pacing");
+        if sleep_with_shutdown(delay) {
             return;
         }
     }
@@ -625,13 +665,25 @@ fn message_retention_would_prune(config: &Config, pool: &DbPool) -> Result<u64, 
 }
 
 fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
+    sleep_interruptibly(
+        duration,
+        || SHUTDOWN.load(Ordering::Acquire),
+        std::thread::sleep,
+    )
+}
+
+fn sleep_interruptibly(
+    duration: Duration,
+    mut stopped: impl FnMut() -> bool,
+    mut sleep: impl FnMut(Duration),
+) -> bool {
     let mut remaining = duration;
     while !remaining.is_zero() {
-        if SHUTDOWN.load(Ordering::Acquire) {
+        if stopped() {
             return true;
         }
-        let chunk = remaining.min(std::time::Duration::from_secs(1));
-        std::thread::sleep(chunk);
+        let chunk = remaining.min(Duration::from_secs(1));
+        sleep(chunk);
         remaining = remaining.saturating_sub(chunk);
     }
     false
@@ -1544,6 +1596,26 @@ mod tests {
         assert!(!report_is_due(
             Some(REPAIR_CATCH_UP_POLL_INTERVAL),
             Duration::from_secs(3600)
+        ));
+    }
+
+    #[test]
+    fn gh383_shutdown_interrupts_even_a_long_compensating_rest() {
+        use std::cell::Cell;
+        let slept = Cell::new(Duration::ZERO);
+        assert!(sleep_interruptibly(
+            Duration::from_secs(3_600),
+            || slept.get() >= Duration::from_secs(2),
+            |chunk| {
+                assert!(chunk <= Duration::from_secs(1));
+                slept.set(slept.get() + chunk);
+            },
+        ));
+        assert_eq!(slept.get(), Duration::from_secs(2));
+        assert!(sleep_interruptibly(
+            Duration::from_secs(3_600),
+            || true,
+            |_| panic!("shutdown before rest must not sleep")
         ));
     }
 

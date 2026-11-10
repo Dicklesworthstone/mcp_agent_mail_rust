@@ -3,8 +3,11 @@
 //! A busy mailbox must not pay a one-second sleep after every four recovered
 //! messages or every healthy page hiding an older crash orphan. Each batch still
 //! owns its source checks, retry fairness, payload limit and durable checkpoint.
-//! This scheduler removes sleeps only while bounded repair or scan progress is
-//! reported. Storage ends startup catch-up after the current history round.
+//! Productive batches share the worker's cooperative 250 ms quantum with other
+//! repair lanes. Actual elapsed work, including overruns and observers, earns
+//! compensating rest. Storage ends startup catch-up after the history round;
+//! retained retry debt supplies its earliest deadline, not an unconditional
+//! one-second scan.
 
 #[cfg(test)]
 mod integration_tests;
@@ -12,6 +15,7 @@ mod integration_tests;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use super::schedule::{ACTIVE_QUANTUM, MaintenanceTurn, WorkHint};
 use asupersync::Cx;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::DbPool;
@@ -20,7 +24,7 @@ use mcp_agent_mail_storage::recovery::message_reconcile::database::{
 };
 
 const MAX_BATCHES_PER_TURN: usize = 8;
-const MAX_TURN_ACTIVE_TIME: Duration = Duration::from_millis(250);
+const MAX_TURN_ACTIVE_TIME: Duration = ACTIVE_QUANTUM;
 // Admission target, checked BETWEEN batches. A final batch retains storage's
 // independent 16 MiB bound, so a turn admits less than 32 MiB in total. This is
 // not a resident-memory allocation or permission to enlarge a storage batch.
@@ -28,7 +32,7 @@ const TURN_PAYLOAD_TARGET: usize = 16 * 1024 * 1024;
 const DISK_PRESSURE_DEFERRED: &str = "message reconciliation deferred: critical disk pressure";
 
 /// Run one finite repair turn, observing each real storage report separately.
-/// The returned backlog hint controls only the worker's next sleep, never
+/// The returned scheduling hint controls only this lane's next attempt, never
 /// reporting/pruning cadence or authority to publish an archive artifact.
 /// The time target is cooperative: a single filesystem/SQL/Git call can exceed
 /// it, but no further batch is started once it has elapsed.
@@ -38,25 +42,56 @@ pub(super) fn run(
     config: &Config,
     cursor: &mut ReconcileCursor,
     stop: &AtomicBool,
-    observe: impl FnMut(&ReconcileReport),
-) -> Result<bool, String> {
-    let started = Instant::now();
+    turn: &MaintenanceTurn,
+    mut observe: impl FnMut(&ReconcileReport),
+) -> Result<WorkHint, String> {
+    let mut blocked = None;
+    let mut scan_pending = false;
+    let mut progressed = false;
     let result = run_with(
         || {
-            with_disk_admission(
+            let result = with_disk_admission(
                 mcp_agent_mail_core::global_metrics()
                     .system
                     .disk_pressure_level
                     .load(),
                 || reconcile_message_batch(cx, pool, config, cursor, stop),
-            )
+            );
+            if let Err(error) = &result {
+                blocked = match error.as_str() {
+                    DISK_PRESSURE_DEFERRED => Some(WorkHint::ResourcePaused),
+                    "message reconciliation deferred: recovery promotion or admission contention"
+                    | "message reconciliation deferred: checkpoint is owned by another worker" => {
+                        Some(WorkHint::Contended { progressed: false })
+                    }
+                    _ => None,
+                };
+            }
+            result
         },
-        observe,
-        || started.elapsed(),
+        |report| {
+            scan_pending = report.budget_exhausted;
+            progressed |= report.repaired > 0 || report.unchanged > 0 || report.scan_advanced;
+            observe(report);
+        },
+        || turn.elapsed(Instant::now()),
     );
-    finish_turn(result, || {
+    let follow_up = finish_turn(result, || {
         stop.load(Ordering::Acquire) || cx.checkpoint().is_err()
-    })
+    })?;
+    if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+        return Ok(WorkHint::Interrupted);
+    }
+    if let Some(hint) = blocked {
+        return Ok(match hint {
+            WorkHint::Contended { .. } => WorkHint::Contended { progressed },
+            other => other,
+        });
+    }
+    Ok(WorkHint::after_report(
+        follow_up && scan_pending && cursor.has_retry_capacity(),
+        cursor.next_retry_at(),
+    ))
 }
 
 fn with_disk_admission(
@@ -74,8 +109,8 @@ fn with_disk_admission(
 }
 
 /// Admission refusal is not a broken source pool. Let the worker retain its
-/// pool and cursor and use the ordinary one-second follow-up instead of
-/// retiring the pool and sleeping for the full idle interval. Do not retry
+/// pool and cursor. The outer scheduler backs off repeated no-progress
+/// contention, bounded by the ordinary discovery interval. Do not retry
 /// inside this turn, synthesize a successful storage report, or hide source,
 /// generation, corruption, or checkpoint-I/O failures behind this hint.
 fn finish_turn(
@@ -104,7 +139,7 @@ fn finish_turn(
                 target: "maintenance",
                 event = "message_archive_reconcile_admission_deferred",
                 reason = %error,
-                "message archive admission busy; retaining source pool and retrying next short cycle"
+                "message archive admission busy; retaining source pool for a bounded retry"
             );
             Ok(true)
         }
@@ -114,9 +149,9 @@ fn finish_turn(
 
 fn needs_follow_up(report: &ReconcileReport) -> bool {
     // A deferred ID can be the only item in a pass: no work budget need be
-    // exhausted. Sleeping a full minute in that case defeats the retry lane's
-    // immediate first retry. Keep polling, but do not force another same-turn
-    // batch or bypass storage's per-ID backoff. Conflict-only scans stay idle.
+    // exhausted. Preserve that obligation for the typed hint; the cursor's
+    // earliest retry deadline determines when it is runnable. This boolean
+    // neither forces another same-turn batch nor bypasses per-ID backoff.
     if report.interrupted {
         return false;
     }
@@ -133,7 +168,8 @@ fn continue_turn(
     // repair. Requiring repaired > 0 would repeatedly sleep before reaching
     // old orphans. Only count a fully non-deferred scan as that progress;
     // errors, conflict-only pages and empty/cooldown-only passes still yield.
-    let progressed = report.repaired > 0 || (report.unchanged > 0 && report.deferred == 0);
+    let progressed = report.repaired > 0
+        || ((report.unchanged > 0 || report.scan_advanced) && report.deferred == 0);
     batches < MAX_BATCHES_PER_TURN
         && payload_bytes < TURN_PAYLOAD_TARGET
         && elapsed < MAX_TURN_ACTIVE_TIME
@@ -548,6 +584,37 @@ mod tests {
             Duration::ZERO,
             &report
         ));
+    }
+
+    #[test]
+    fn gh383_cursor_only_pages_reach_an_orphan_without_retrying_cooling_ids() {
+        let mut pending = VecDeque::from([
+            ReconcileReport {
+                scan_advanced: true,
+                retry_len: 7,
+                budget_exhausted: true,
+                ..Default::default()
+            },
+            ReconcileReport {
+                scanned: 1,
+                repaired: 1,
+                retry_len: 7,
+                ..Default::default()
+            },
+        ]);
+        let mut observed = Vec::new();
+        assert!(
+            run_with(
+                || Ok(pending
+                    .pop_front()
+                    .expect("no speculative round or early retry")),
+                |report| observed.push((report.scanned, report.repaired, report.retry_len)),
+                || Duration::ZERO,
+            )
+            .unwrap()
+        );
+        assert_eq!(observed, [(0, 0, 7), (1, 1, 7)]);
+        assert!(pending.is_empty());
     }
 }
 

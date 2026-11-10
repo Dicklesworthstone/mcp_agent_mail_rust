@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
@@ -57,6 +58,19 @@ pub struct ReservationReconcileCursor {
     retries: retry::RetryQueue,
 }
 
+impl ReservationReconcileCursor {
+    /// Earliest retained retry, not permission to reuse an earlier source read.
+    #[must_use]
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        self.retries.next_ready_at()
+    }
+
+    #[must_use]
+    pub fn has_retry_capacity(&self) -> bool {
+        !self.retries.is_full()
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScanPosition {
     after: i64,
@@ -76,6 +90,7 @@ pub struct ReservationReconcileReport {
     pub deferred_transient: usize,
     /// Pending IDs, including those whose per-ID cooldown has not elapsed.
     pub retry_len: usize,
+    pub scan_advanced: bool,
     pub interrupted: bool,
     pub budget_exhausted: bool,
 }

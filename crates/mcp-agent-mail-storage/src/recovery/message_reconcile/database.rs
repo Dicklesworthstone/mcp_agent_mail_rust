@@ -221,6 +221,17 @@ impl ReconcileCursor {
         }
     }
 
+    /// Earliest retained retry, not permission to reuse an earlier source read.
+    #[must_use]
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        self.retries.iter().map(|retry| retry.ready_at).min()
+    }
+
+    #[must_use]
+    pub fn has_retry_capacity(&self) -> bool {
+        self.retries.len() < MAX_RETRY_IDS
+    }
+
     fn advance(&mut self, id: i64, tail: bool) {
         if tail {
             self.tail_after = Some(self.tail_after.unwrap_or(0).max(id));
@@ -294,6 +305,8 @@ pub struct ReconcileReport {
     pub deferred_transient: usize,
     pub deferred_conflict: usize,
     pub retry_len: usize,
+    /// A scan watermark advanced, including a page of cooling retry IDs.
+    pub scan_advanced: bool,
     /// Serialized payload bytes admitted to archive work, excluding rejected
     /// oversized projections (whose SQL input has a separate byte bound).
     pub payload_bytes: usize,
@@ -1472,6 +1485,7 @@ fn reconcile_message_batch_at(
     // cancelled or wholly blocked pass does not request extra polling here.
     let startup_scan_advanced = cursor.backfill_ceiling != history_started_at
         || cursor.startup_tail.as_ref().map(|range| range.ceiling) != startup_started_at;
+    report.scan_advanced = startup_scan_advanced || cursor.tail_after != tail_started_after;
     if cursor.persist_progress
         && (!cursor.startup_backfill_complete || cursor.startup_tail.is_some())
         && (report.scanned > 0 || startup_scan_advanced)
@@ -3828,6 +3842,7 @@ mod tests {
             assert_eq!(cooling.deferred, 0);
             assert_eq!(cooling.retry_len, 0);
             assert!(cooling.budget_exhausted);
+            assert!(cooling.scan_advanced);
             assert_eq!(cursor.tail_after, Some(916));
 
             // The unconsumed sentinel is an actual DB-only message, not proof
@@ -3856,6 +3871,62 @@ mod tests {
                 retained_message_ids(cx, pool),
                 (901..918).collect::<Vec<_>>()
             );
+        });
+    }
+
+    #[test]
+    fn gh383_cooling_retry_survives_checkpoint_restart_while_new_tail_converges() {
+        retention_fixture(2, |cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let ready_at = Instant::now() + MAX_RETRY_BACKOFF;
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(900);
+            cursor.backfill_ceiling = Some(900);
+            cursor.retries.push_back(DeferredRetry {
+                id: 901,
+                attempts: 6,
+                ready_at,
+            });
+
+            let first = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(first.repaired, 1);
+            assert!(first.scan_advanced);
+            assert_eq!(first.retry_len, 1);
+            assert_eq!(first.checkpoint_saved, Some(true));
+            assert_eq!(cursor.next_retry_at(), Some(ready_at));
+            assert!(cursor.has_retry_capacity());
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let repaired = prepare_message(cx, pool, 902).unwrap();
+            assert!(
+                verify_retention_archive(&archive, &repaired, &mut 0)
+                    .unwrap()
+                    .is_some()
+            );
+            let cooling = prepare_message(cx, pool, 901).unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &cooling.message,
+                &cooling.sender,
+                &cooling.recipients,
+            )
+            .unwrap()
+            .0;
+            assert!(!paths.canonical.exists());
+            drop(cursor);
+
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let resumed = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(resumed.checkpoint_restored);
+            assert_eq!(resumed.checkpoint_saved, Some(true));
+            assert_eq!(resumed.repaired, 0);
+            assert_eq!(resumed.retry_len, 1);
+            assert_eq!(restarted.retries[0].id, 901);
+            assert_eq!(restarted.retries[0].attempts, 6);
+            assert!(restarted.next_retry_at().unwrap() > Instant::now());
+            assert!(restarted.has_retry_capacity());
+            assert!(!paths.canonical.exists());
+            assert_eq!(retained_message_ids(cx, pool), [901, 902]);
         });
     }
 
@@ -3889,6 +3960,9 @@ mod tests {
                 assert_eq!(blocked.scanned, 0);
                 assert_eq!(blocked.repaired, 0);
                 assert_eq!(blocked.retry_len, MAX_RETRY_IDS);
+                assert!(!cursor.has_retry_capacity());
+                assert!(cursor.next_retry_at().is_some());
+                assert!(!blocked.scan_advanced);
                 assert!(!blocked.budget_exhausted);
                 assert_eq!(cursor.tail_after, Some(900));
             }

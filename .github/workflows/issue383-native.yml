@@ -1,0 +1,188 @@
+name: Issue 383 retention and maintenance qualification
+
+on:
+  push:
+    branches: [main, 'validation/gh383-*']
+    paths:
+      - '.github/workflows/issue383-native.yml'
+      - 'scripts/ci/qualify_issue383.py'
+      - 'crates/mcp-agent-mail-db/**'
+      - 'crates/mcp-agent-mail-storage/**'
+      - 'crates/mcp-agent-mail-server/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue383-native-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '1'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  RUST_TEST_THREADS: '1'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  qualification:
+    name: ${{ matrix.component }} native qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [checks, db, storage, server]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Install the source-pinned compiler
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+      - name: Validate exact source with real dependencies
+        timeout-minutes: 270
+        env:
+          COMPONENT: ${{ matrix.component }}
+          EXPECTED_SOURCE: ${{ github.sha }}
+          EVIDENCE_DIR: ${{ runner.temp }}/gh383-${{ matrix.component }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/gh383-target-${{ matrix.component }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python3 scripts/ci/qualify_issue383.py \
+            --component "$COMPONENT" \
+            --expected-source "$EXPECTED_SOURCE" \
+            --evidence "$EVIDENCE_DIR"
+      - name: Retain completed and failed validation receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue383-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gh383-${{ matrix.component }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  static:
+    name: Pinned UBS source review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Scan the exact changed source with pinned tools
+        timeout-minutes: 40
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/gh383-static
+          EXPECTED_SOURCE: ${{ github.sha }}
+          UBS_KEEP_TEMP: '1'
+          UBS_NO_AUTO_UPDATE: '1'
+          ENABLE_UV_TOOLS: '0'
+          PYTHONDONTWRITEBYTECODE: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          scan_root="$RUNNER_TEMP/gh383-scanner"
+          mkdir -p "$scan_root/source" "$scan_root/ast" "$scan_root/tools" "$scan_root/cache" "$scan_root/tmp"
+          curl --user-agent mcp-agent-mail-gh383-validation --fail --location --retry 3 \
+            https://github.com/Dicklesworthstone/ultimate_bug_scanner/archive/76d857de41b4da314b0be2f4022e0f5878710513.tar.gz \
+            --output "$scan_root/ubs.tar.gz"
+          tar -xzf "$scan_root/ubs.tar.gz" --strip-components=1 -C "$scan_root/source"
+          printf '%s  %s\n' \
+            1d43725c8b23b12ab9cb7efbc90a12897a5a3990ae66c1b203f7b3a8d7361336 "$scan_root/source/ubs" \
+            2ae1c3895c44eac54acf010af39b15e4971891377166802777877691a4832e6e "$scan_root/source/modules/ubs-rust.sh" \
+            > "$EVIDENCE_DIR/tool-checksums.txt"
+          curl --user-agent mcp-agent-mail-gh383-validation --fail --location --retry 3 \
+            https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip \
+            --output "$scan_root/ast.zip"
+          printf '%s  %s\n' \
+            f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8 "$scan_root/ast.zip" \
+            >> "$EVIDENCE_DIR/tool-checksums.txt"
+          sha256sum --check "$EVIDENCE_DIR/tool-checksums.txt"
+          unzip -q "$scan_root/ast.zip" -d "$scan_root/ast"
+          printf '%s  %s\n' \
+            7a5ab30160186184c0bf8bffc87da4af25123c183964cd98c11b0b354137db0a "$scan_root/ast/ast-grep" \
+            > "$EVIDENCE_DIR/ast-binary-checksum.txt"
+          sha256sum --check "$EVIDENCE_DIR/ast-binary-checksum.txt"
+          chmod +x "$scan_root/ast/ast-grep"
+          export PATH="$scan_root/ast:$PATH"
+          export UBS_TOOLS_DIR="$scan_root/tools" UBS_CACHE_DIR="$scan_root/cache" TMPDIR="$scan_root/tmp"
+          files=(
+            crates/mcp-agent-mail-db/src/snapshot.rs
+            crates/mcp-agent-mail-db/src/snapshot_authority.rs
+            crates/mcp-agent-mail-server/src/backup_rotation.rs
+            crates/mcp-agent-mail-server/src/integrity_guard.rs
+            crates/mcp-agent-mail-server/src/retention/archive.rs
+            crates/mcp-agent-mail-server/src/retention/archive/agent_catch_up.rs
+            crates/mcp-agent-mail-server/src/retention/archive/catch_up.rs
+            crates/mcp-agent-mail-server/src/retention/archive/catch_up/integration_tests.rs
+            crates/mcp-agent-mail-server/src/retention/archive/reservation_catch_up.rs
+            crates/mcp-agent-mail-server/src/retention/archive/schedule.rs
+            crates/mcp-agent-mail-storage/src/recovery/agent_reconcile.rs
+            crates/mcp-agent-mail-storage/src/recovery/agent_reconcile/retry.rs
+            crates/mcp-agent-mail-storage/src/recovery/agent_reconcile/retry/checkpoint.rs
+            crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database.rs
+            crates/mcp-agent-mail-storage/src/recovery/message_reconcile/database/checkpoint.rs
+            crates/mcp-agent-mail-storage/src/recovery/message_reconcile/identity/staged/decoded.rs
+            crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile.rs
+            crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry.rs
+            crates/mcp-agent-mail-storage/src/recovery/reservation_reconcile/retry/checkpoint.rs
+            scripts/ci/qualify_issue383.py
+          )
+          sha256sum "${files[@]}" > "$EVIDENCE_DIR/source-before.sha256"
+          file_list=$(IFS=,; printf '%s' "${files[*]}")
+          printf 'source=%s\nubs_commit=%s\npython_optional_uv_tools=disabled\n' \
+            "$EXPECTED_SOURCE" 76d857de41b4da314b0be2f4022e0f5878710513 \
+            > "$EVIDENCE_DIR/environment.txt"
+          ast-grep --version >> "$EVIDENCE_DIR/environment.txt"
+          python3 --version >> "$EVIDENCE_DIR/environment.txt"
+          set +e
+          bash "$scan_root/source/ubs" --only=rust,python --ci --no-color \
+            --no-auto-update --no-cache --no-cargo \
+            --module-dir="$scan_root/source/modules" --format=json \
+            --files="$file_list" "$GITHUB_WORKSPACE" \
+            > "$EVIDENCE_DIR/report.json" 2> "$EVIDENCE_DIR/scanner.stderr"
+          scanner_status=$?
+          set -e
+          printf '%s\n' "$scanner_status" > "$EVIDENCE_DIR/exit-status.txt"
+          sha256sum "${files[@]}" > "$EVIDENCE_DIR/source-after.sha256"
+          diff -u "$EVIDENCE_DIR/source-before.sha256" "$EVIDENCE_DIR/source-after.sha256"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          jq '{status, failed_modules, totals, scanners: [.scanners[] | {language, status, files, critical, warning, info}]}' \
+            "$EVIDENCE_DIR/report.json" > "$EVIDENCE_DIR/summary.json"
+          jq -e '
+            .status == "ok"
+            and (.failed_modules | length) == 0
+            and .totals.files == 20
+            and .totals.critical == 0
+            and ([.scanners[] | select(.language == "rust" and .files == 19 and (.status // "ok") == "ok")] | length) == 1
+            and ([.scanners[] | select(.language == "python" and .files == 1 and (.status // "ok") == "ok")] | length) == 1
+          ' "$EVIDENCE_DIR/report.json"
+          exit "$scanner_status"
+      - name: Retain complete static findings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue383-static-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gh383-static/
+          if-no-files-found: error
+          retention-days: 14
