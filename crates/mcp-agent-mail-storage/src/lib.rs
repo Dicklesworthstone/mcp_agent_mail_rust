@@ -4969,25 +4969,176 @@ fn quarantine_startup_artifact_if_exists(
     path: &Path,
     fallback_name: &str,
     context: &str,
+    absent_counterpart: &Path,
 ) -> Option<PathBuf> {
-    if !path_is_occupied(path) {
-        return None;
-    }
-
-    let quarantine = next_startup_quarantine_path(path, fallback_name);
-    match fs::rename(path, &quarantine) {
-        Ok(()) => Some(quarantine),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
-                quarantine = %quarantine.display(),
                 error = %error,
-                "[startup-heal] failed to quarantine {context}"
+                "[startup-heal] failed to inspect {context}; preserving it"
             );
-            None
+            return None;
+        }
+    };
+    quarantine_startup_artifact_with_witness(
+        path,
+        fallback_name,
+        context,
+        &file,
+        Some(absent_counterpart),
+    )
+}
+
+/// Bind cleanup to an opened regular file, not a pathname that another owner
+/// may have replaced while we inspected its metadata or waited for its lock.
+fn startup_artifact_matches_file(path: &Path, file: &fs::File) -> std::io::Result<bool> {
+    if path_existing_prefix_has_symlink(path)? || !file.metadata()?.file_type().is_file() {
+        return Ok(false);
+    }
+    let observed = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let expected = file.metadata()?;
+        Ok(expected.dev() == observed.dev() && expected.ino() == observed.ino())
+    }
+    #[cfg(windows)]
+    {
+        let _ = observed;
+        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+        Ok(mcp_agent_mail_core::disk::windows_file_identity(file)?
+            == mcp_agent_mail_core::disk::windows_file_identity(&current)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = observed;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "startup quarantine requires a stable file identity",
+        ))
+    }
+}
+
+fn move_startup_artifact_noreplace(
+    path: &Path,
+    quarantine: &Path,
+    file: &fs::File,
+) -> std::io::Result<bool> {
+    move_startup_artifact_noreplace_with_parent_sync(
+        path,
+        quarantine,
+        file,
+        sync_startup_artifact_move_parents,
+    )
+}
+
+fn sync_startup_artifact_move_parents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fn parent(path: &Path) -> &Path {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+        }
+        let source_parent = parent(source);
+        let destination_parent = parent(destination);
+        fs::File::open(destination_parent)?.sync_all()?;
+        if destination_parent != source_parent {
+            fs::File::open(source_parent)?.sync_all()?;
         }
     }
+    // The Windows no-replace primitive uses MOVEFILE_WRITE_THROUGH. Portable
+    // File::open cannot open Windows directories; match recovery's Unix-only
+    // additional parent-directory durability barrier.
+    #[cfg(not(unix))]
+    let _ = (source, destination);
+    Ok(())
+}
+
+fn move_startup_artifact_noreplace_with_parent_sync(
+    path: &Path,
+    quarantine: &Path,
+    file: &fs::File,
+    sync_parents: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    if !startup_artifact_matches_file(path, file)? {
+        return Ok(false);
+    }
+    mcp_agent_mail_db::pool::rename_noreplace_preserving_source(path, quarantine)?;
+    // A replacement that wins after the pre-move check is not our evidence.
+    // Restore it without overwriting a subsequently installed source path.
+    if !matches!(startup_artifact_matches_file(quarantine, file), Ok(true)) {
+        let mut detail = match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(
+            quarantine, path,
+        ) {
+            Ok(()) => "startup artifact changed during quarantine; restored raced file".to_string(),
+            Err(error) => format!(
+                "startup artifact changed during quarantine; retained {} because restoring {} without replacement failed: {error}",
+                quarantine.display(),
+                path.display(),
+            ),
+        };
+        // Sync the final namespace even when restoration failed and the raced
+        // artifact must remain at the quarantine name for recovery.
+        if let Err(error) = sync_parents(path, quarantine) {
+            detail.push_str(&format!(
+                "; failed to sync affected parent directories: {error}"
+            ));
+        }
+        return Err(std::io::Error::other(detail));
+    }
+    sync_parents(path, quarantine).map_err(|error| {
+        // The move already happened. Do not let a NotFound or AlreadyExists
+        // sync error look like a harmless pre-publication race to the caller.
+        std::io::Error::other(format!(
+            "startup artifact remains at {} after moving from {}, but parent directory sync failed: {error}",
+            quarantine.display(),
+            path.display(),
+        ))
+    })?;
+    Ok(true)
+}
+
+fn quarantine_startup_artifact_with_witness(
+    path: &Path,
+    fallback_name: &str,
+    context: &str,
+    file: &fs::File,
+    absent_counterpart: Option<&Path>,
+) -> Option<PathBuf> {
+    for _ in 0..1024 {
+        // A new lock owner may have installed its metadata after the old lock
+        // moved. Do not quarantine that owner's sidecar as an orphan.
+        if absent_counterpart.is_some_and(path_is_occupied) {
+            return None;
+        }
+        let quarantine = next_startup_quarantine_path(path, fallback_name);
+        match move_startup_artifact_noreplace(path, &quarantine, file) {
+            Ok(true) => return Some(quarantine),
+            Ok(false) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    quarantine = %quarantine.display(),
+                    error = %error,
+                    "[startup-heal] failed to quarantine {context}; preserving evidence"
+                );
+                return None;
+            }
+        }
+    }
+    tracing::warn!(path = %path.display(), "[startup-heal] no unoccupied quarantine destination for {context}");
+    None
 }
 
 static FILE_LOCK_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicU64>>>> =
@@ -5331,10 +5482,11 @@ impl FileLock {
             return Ok(false);
         }
 
-        let file = match fs::OpenOptions::new().write(true).open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return Ok(false),
-        };
+        let file =
+            match mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&self.path) {
+                Ok(f) => f,
+                Err(_) => return Ok(false),
+            };
         if file.try_lock_exclusive().is_err() {
             return Ok(false);
         }
@@ -5383,25 +5535,29 @@ impl FileLock {
             return Ok(false);
         }
 
-        // Try quarantining while lock is held (best race safety).
-        let quarantine = next_startup_quarantine_path(&self.path, "archive-lock-artifact");
-        let quarantined = match fs::rename(&self.path, &quarantine) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Windows can require closing/unlocking first before renaming.
-                let _ = file.unlock();
-                drop(file);
-                fs::rename(&self.path, &quarantine).is_ok()
-            }
-            Err(_) => false,
-        };
+        let metadata_file =
+            mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.metadata_path).ok();
+        // Retain the exclusive lock through publication. An unlock-and-retry
+        // fallback would let a live owner acquire the inode before we move it.
+        let quarantined = quarantine_startup_artifact_with_witness(
+            &self.path,
+            "archive-lock-artifact",
+            "stale archive lock",
+            &file,
+            None,
+        )
+        .is_some();
 
         if quarantined {
-            let _ = quarantine_startup_artifact_if_exists(
-                &self.metadata_path,
-                "archive-lock-artifact",
-                "stale lock owner metadata",
-            );
+            if let Some(metadata_file) = metadata_file {
+                let _ = quarantine_startup_artifact_with_witness(
+                    &self.metadata_path,
+                    "archive-lock-artifact",
+                    "stale lock owner metadata",
+                    &metadata_file,
+                    Some(&self.path),
+                );
+            }
             return Ok(true);
         }
 
@@ -8744,12 +8900,15 @@ fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
             .join(format!("{}.lock", refname.replace('/', "-"))),
         "stale-ref-lock",
     );
+    let Ok(file) = mcp_agent_mail_core::disk::open_regular_file_no_follow(&lock_path) else {
+        return false;
+    };
     // The decision was made on this exact file; a replaced lock is left alone.
     if git_lock_identity(&lock_path).as_ref() != Some(&identity) {
         return false;
     }
-    match fs::rename(&lock_path, &quarantine) {
-        Ok(()) => {
+    match move_startup_artifact_noreplace(&lock_path, &quarantine, &file) {
+        Ok(true) => {
             tracing::warn!(
                 lock = %lock_path.display(),
                 quarantine = %quarantine.display(),
@@ -8758,6 +8917,7 @@ fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
             );
             true
         }
+        Ok(false) => false,
         Err(error) => {
             tracing::warn!(
                 lock = %lock_path.display(),
@@ -9169,37 +9329,34 @@ fn heal_archive_locks_with_checkpoint(
 
         // Try to acquire exclusive lock. If successful, it means no one else
         // is holding it, so we can treat it as a stale artifact from a previous run.
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        if let Ok(f) = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path) {
             use fs2::FileExt;
             if f.try_lock_exclusive().is_ok() {
                 checkpoint()?;
-                let quarantine = next_startup_quarantine_path(path, "archive-lock-artifact");
-                let mut quarantined = false;
-                match fs::rename(path, &quarantine) {
-                    Ok(()) => quarantined = true,
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        // Windows can require closing/unlocking first before renaming.
-                        let _ = f.unlock();
-                        drop(f);
-                        checkpoint()?;
-                        quarantined = fs::rename(path, &quarantine).is_ok();
-                    }
-                    Err(_) => {}
-                }
-
-                if quarantined {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let meta_path = path.with_file_name(format!("{name}.owner.json"));
+                let metadata_file =
+                    mcp_agent_mail_core::disk::open_regular_file_no_follow(&meta_path).ok();
+                if let Some(quarantine) = quarantine_startup_artifact_with_witness(
+                    path,
+                    "archive-lock-artifact",
+                    "stale archive lock",
+                    &f,
+                    None,
+                ) {
                     result
                         .locks_quarantined
                         .push(quarantine.display().to_string());
-                    // Try to quarantine corresponding metadata file.
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    let meta_path = path.with_file_name(format!("{name}.owner.json"));
                     checkpoint()?;
-                    if let Some(meta_quarantine) = quarantine_startup_artifact_if_exists(
-                        &meta_path,
-                        "archive-lock-artifact",
-                        "archive lock owner metadata",
-                    ) {
+                    if let Some(metadata_file) = metadata_file
+                        && let Some(meta_quarantine) = quarantine_startup_artifact_with_witness(
+                            &meta_path,
+                            "archive-lock-artifact",
+                            "archive lock owner metadata",
+                            &metadata_file,
+                            Some(path),
+                        )
+                    {
                         result
                             .metadata_quarantined
                             .push(meta_quarantine.display().to_string());
@@ -9330,6 +9487,7 @@ fn heal_archive_locks_with_checkpoint(
                 &path,
                 "archive-lock-artifact",
                 "orphan archive lock owner metadata",
+                &lock_candidate,
             )
         {
             result
@@ -23316,6 +23474,163 @@ mod tests {
     // -----------------------------------------------------------------------
     // Heal archive locks tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn startup_quarantine_preserves_destination_created_after_allocation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("stale.lock");
+        fs::write(&path, "source evidence").unwrap();
+        let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path).unwrap();
+        let occupied = next_startup_quarantine_path(&path, "lock");
+        // A competing publisher wins after the allocation's occupancy check.
+        fs::write(&occupied, "competing evidence").unwrap();
+        let error = move_startup_artifact_noreplace(&path, &occupied, &file).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "source evidence");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "competing evidence");
+
+        let published =
+            quarantine_startup_artifact_with_witness(&path, "lock", "test evidence", &file, None)
+                .unwrap();
+        assert_ne!(published, occupied);
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&published).unwrap(), "source evidence");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "competing evidence");
+    }
+
+    #[test]
+    fn startup_quarantine_preserves_moved_evidence_on_parent_sync_failure() {
+        for error_kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let source_parent = tmp.path().join("refs/heads");
+            fs::create_dir_all(&source_parent).unwrap();
+            let source = source_parent.join("main.lock");
+            let quarantine = tmp.path().join("retained-ref-lock");
+            fs::write(&source, "ref lock evidence").unwrap();
+            let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&source).unwrap();
+            let sync_attempted = std::cell::Cell::new(false);
+            let error = move_startup_artifact_noreplace_with_parent_sync(
+                &source,
+                &quarantine,
+                &file,
+                |from, to| {
+                    assert_eq!(from, source);
+                    assert_eq!(to, quarantine);
+                    assert!(!source.exists(), "sync follows the actual move");
+                    assert_eq!(
+                        fs::read_to_string(&quarantine).unwrap(),
+                        "ref lock evidence"
+                    );
+                    sync_attempted.set(true);
+                    Err(std::io::Error::new(
+                        error_kind,
+                        "injected directory sync failure",
+                    ))
+                },
+            )
+            .unwrap_err();
+            assert!(sync_attempted.get());
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(error.to_string().contains("parent directory sync failed"));
+            assert!(!source.exists());
+            assert_eq!(
+                fs::read_to_string(&quarantine).unwrap(),
+                "ref lock evidence"
+            );
+            assert!(startup_artifact_matches_file(&quarantine, &file).unwrap());
+            // A later durability retry can sync both real parent directories
+            // without moving or replacing the preserved evidence again.
+            sync_startup_artifact_move_parents(&source, &quarantine).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_quarantine_refuses_replaced_inode_and_rebound_owner_metadata() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("stale.lock");
+        fs::write(&path, "equal bytes").unwrap();
+        let file =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path).unwrap();
+        file.try_lock_exclusive().unwrap();
+        let retained = path.with_file_name("retained-old-lock");
+        fs::rename(&path, &retained).unwrap();
+        fs::write(&path, "equal bytes").unwrap();
+        let owner =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path).unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let destination = next_startup_quarantine_path(&path, "lock");
+        assert!(!move_startup_artifact_noreplace(&path, &destination, &file).unwrap());
+        assert!(!destination.exists());
+        assert!(startup_artifact_matches_file(&path, &owner).unwrap());
+        assert!(startup_artifact_matches_file(&retained, &file).unwrap());
+
+        let metadata = path.with_extension("lock.owner.json");
+        fs::write(&metadata, "new owner metadata").unwrap();
+        assert!(
+            quarantine_startup_artifact_if_exists(
+                &metadata,
+                "metadata",
+                "new owner metadata",
+                &path,
+            )
+            .is_none()
+        );
+        assert_eq!(fs::read_to_string(&metadata).unwrap(), "new owner metadata");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "equal bytes");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "equal bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_healer_preserves_replacement_while_old_inode_is_locked() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = tmp.path().join("projects/raced-heal");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join(".archive.lock");
+        let metadata = project.join(".archive.lock.owner.json");
+        let retained = project.join("retained-old-lock");
+        fs::write(&path, "old lock evidence").unwrap();
+        fs::write(&metadata, "old owner metadata").unwrap();
+        let replacement = std::cell::RefCell::new(None);
+        let report = heal_archive_locks_with_checkpoint(&config, &|| {
+            if replacement.borrow().is_none() {
+                let probe =
+                    mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path)?;
+                // Synchronize with the real exclusive lock, rather than
+                // assuming a directory order or replacing any I/O operation.
+                if probe.try_lock_exclusive().is_err() {
+                    fs::rename(&path, &retained)?;
+                    fs::write(&path, "new lock evidence")?;
+                    fs::write(&metadata, "new owner metadata")?;
+                    let owner =
+                        mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path)?;
+                    owner.try_lock_exclusive()?;
+                    *replacement.borrow_mut() = Some(owner);
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            replacement.borrow().is_some(),
+            "the locked-inode race must run"
+        );
+        assert!(report.locks_quarantined.is_empty());
+        assert!(report.metadata_quarantined.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new lock evidence");
+        assert_eq!(fs::read_to_string(&metadata).unwrap(), "new owner metadata");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "old lock evidence");
+    }
 
     #[test]
     fn test_heal_archive_locks_empty() {
