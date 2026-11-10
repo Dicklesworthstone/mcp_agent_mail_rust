@@ -27,6 +27,9 @@ use crate::tool_util::{
 };
 
 static LEASE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Leases are small control records, like archived profiles and reservations.
+// Bound every reader and writer alike so a successful write remains readable.
+const MAX_BUILD_SLOT_LEASE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSlotLease {
@@ -114,51 +117,54 @@ fn existing_agent_lease_path(
     slot_path: &Path,
     agent_name: &str,
     branch: Option<&str>,
-) -> Option<PathBuf> {
+) -> std::io::Result<Option<PathBuf>> {
     let mut same_agent_paths = Vec::new();
-    let entries = std::fs::read_dir(slot_path).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let entries = match std::fs::read_dir(slot_path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(lease) = serde_json::from_str::<BuildSlotLease>(&text) else {
-            continue;
-        };
+        let lease = read_lease_json(&path)?;
         if lease.agent != agent_name {
             continue;
         }
         if lease.branch.as_deref() == branch {
-            return Some(path);
+            return Ok(Some(path));
         }
         same_agent_paths.push(path);
     }
-    if same_agent_paths.len() == 1 {
+    Ok(if same_agent_paths.len() == 1 {
         same_agent_paths.pop()
     } else {
         None
-    }
+    })
 }
 
-fn resolve_holder_lease_path(slot_path: &Path, agent_name: &str, branch: Option<&str>) -> PathBuf {
+fn resolve_holder_lease_path(
+    slot_path: &Path,
+    agent_name: &str,
+    branch: Option<&str>,
+) -> std::io::Result<PathBuf> {
     let preferred = lease_path_for_holder(slot_path, agent_name, branch);
     if preferred.exists() {
-        return preferred;
+        return Ok(preferred);
     }
 
     let legacy = legacy_lease_path_for_holder(slot_path, agent_name, branch);
     if legacy.exists() {
-        return legacy;
+        return Ok(legacy);
     }
 
-    if let Some(existing) = existing_agent_lease_path(slot_path, agent_name, branch) {
-        return existing;
+    if let Some(existing) = existing_agent_lease_path(slot_path, agent_name, branch)? {
+        return Ok(existing);
     }
 
-    preferred
+    Ok(preferred)
 }
 
 fn compute_branch(repo_path: &str) -> Option<String> {
@@ -184,6 +190,29 @@ struct ActiveSlotLease {
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Never wait on a FIFO or follow a lease symlink while holding the slot lock.
+/// The shared opener verifies the opened handle, and the bounded read catches
+/// both oversized metadata and growth during reading. Invalid evidence is an
+/// error even when it might have described an expired or released lease.
+fn read_lease_json(path: &Path) -> std::io::Result<BuildSlotLease> {
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        path,
+        MAX_BUILD_SLOT_LEASE_BYTES,
+    )
+    .map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot read build slot lease {}: {error}", path.display()),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid build slot lease {}: {error}", path.display()),
+        )
+    })
+}
+
 /// Retain the exact path alongside the validated record. A second filename
 /// resolution can choose a stale preferred file instead of this active lease,
 /// or even a different holder's file. Callers keep the slot lock throughout.
@@ -202,15 +231,7 @@ fn read_active_lease_entries(
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let text = std::fs::read_to_string(&path).map_err(|error| {
-            std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-        })?;
-        let lease: BuildSlotLease = serde_json::from_str(&text).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid build slot lease {}: {error}", path.display()),
-            )
-        })?;
+        let lease = read_lease_json(&path)?;
         let exp = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -301,16 +322,8 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
     // Production callers hold the slot lock. A preferred or legacy filename
     // is not ownership evidence, including for an expired or released lease.
     // Refuse before staging so a failed acquisition preserves the incumbent.
-    match mcp_agent_mail_core::disk::open_regular_file_no_follow(path) {
-        Ok(mut file) => {
-            let mut text = String::new();
-            std::io::Read::read_to_string(&mut file, &mut text)?;
-            let existing: BuildSlotLease = serde_json::from_str(&text).map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid build slot lease {}: {error}", path.display()),
-                )
-            })?;
+    match read_lease_json(path) {
+        Ok(existing) => {
             if !lease_matches_holder(&existing, &lease.agent, lease.branch.as_deref()) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -325,11 +338,20 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
         Err(error) => return Err(error),
     }
 
+    let text =
+        serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
+    if text.len() as u64 > MAX_BUILD_SLOT_LEASE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "build slot lease {} exceeds the {MAX_BUILD_SLOT_LEASE_BYTES}-byte limit",
+                path.display(),
+            ),
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let text =
-        serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Write atomically to prevent race conditions during read_active_leases
     let tmp_path = unique_tmp_lease_path(path);
@@ -471,7 +493,7 @@ fn acquire_slot_lease(
     let now = chrono::Utc::now();
     let active = read_active_leases(slot_path, now)?;
     let conflicts = collect_slot_conflicts(active, agent_name, branch.as_deref(), is_exclusive);
-    let lease_path = resolve_holder_lease_path(slot_path, agent_name, branch.as_deref());
+    let lease_path = resolve_holder_lease_path(slot_path, agent_name, branch.as_deref())?;
     let granted = BuildSlotLease {
         slot: slot.to_string(),
         agent: agent_name.to_string(),
@@ -820,7 +842,8 @@ mod tests {
             legacy_lease_path_for_holder(slot_dir.path(), "BlueLake", Some("feature/x"));
         std::fs::write(&legacy_path, "{}").unwrap();
 
-        let resolved = resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x"));
+        let resolved =
+            resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x")).unwrap();
         assert_eq!(resolved, legacy_path);
     }
 
@@ -831,7 +854,8 @@ mod tests {
         let lease = make_lease("BlueLake", Some("main"), true);
         std::fs::write(&existing_path, serde_json::to_string(&lease).unwrap()).unwrap();
 
-        let resolved = resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x"));
+        let resolved =
+            resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x")).unwrap();
         assert_eq!(resolved, existing_path);
     }
 
@@ -1403,6 +1427,190 @@ mod tests {
         assert!(!lease_path_for_holder(dir.path(), "BlueLake", None).exists());
         assert_eq!(std::fs::read_to_string(&corrupt).unwrap(), "{ incomplete");
         let _lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+    }
+
+    #[test]
+    fn lease_reader_accepts_bounded_extensions_and_the_exact_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease.json");
+        let mut value =
+            serde_json::to_value(make_lease("BlueLake", Some("fêature"), true)).unwrap();
+        value["extension"] = serde_json::json!({"description": "保留"});
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.resize(usize::try_from(MAX_BUILD_SLOT_LEASE_BYTES).unwrap(), b' ');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let lease = read_lease_json(&path).unwrap();
+        assert_eq!(lease.agent, "BlueLake");
+        assert_eq!(lease.branch.as_deref(), Some("fêature"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        bytes.push(b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        let error = read_lease_json(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("lease.json"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_or_oversized_evidence_blocks_acquire_renew_release_and_resolution() {
+        for invalid in ["json", "utf8", "expired-oversize", "released-oversize"] {
+            let dir = tempfile::tempdir().unwrap();
+            acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap();
+            let owned = lease_path_for_holder(dir.path(), "BlueLake", None);
+            let before = std::fs::read(&owned).unwrap();
+            let obstacle = dir.path().join("unknown-lease.json");
+            let bytes = match invalid {
+                "json" => b"{ invalid".to_vec(),
+                "utf8" => vec![0xff, 0xfe],
+                _ => {
+                    let mut value = serde_json::to_value(make_lease("RedFox", None, true)).unwrap();
+                    if invalid == "expired-oversize" {
+                        value["expires_ts"] = serde_json::json!("2020-01-01T00:00:00Z");
+                    } else {
+                        value["released_ts"] = serde_json::json!("2020-01-01T00:00:00Z");
+                    }
+                    value["extension"] = serde_json::json!(
+                        "x".repeat(usize::try_from(MAX_BUILD_SLOT_LEASE_BYTES).unwrap())
+                    );
+                    serde_json::to_vec(&value).unwrap()
+                }
+            };
+            std::fs::write(&obstacle, &bytes).unwrap();
+
+            assert!(
+                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, true).is_err()
+            );
+            assert!(renew_slot_lease(dir.path(), "BlueLake", None, 600).is_err());
+            assert!(release_slot_lease(dir.path(), "BlueLake", None).is_err());
+            assert!(resolve_holder_lease_path(dir.path(), "GreenPeak", None).is_err());
+            assert!(write_lease_json(&obstacle, &make_lease("RedFox", None, true)).is_err());
+            assert_eq!(std::fs::read(&owned).unwrap(), before, "case {invalid}");
+            assert_eq!(std::fs::read(&obstacle).unwrap(), bytes, "case {invalid}");
+            assert!(!lease_path_for_holder(dir.path(), "GreenPeak", None).exists());
+            let _lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn oversized_publication_preserves_incumbent_and_does_not_stage_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap();
+        let _lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+        let path = lease_path_for_holder(dir.path(), "BlueLake", None);
+        let before = std::fs::read(&path).unwrap();
+        let mut lease = read_lease_json(&path).unwrap();
+        lease.branch = Some("x".repeat(usize::try_from(MAX_BUILD_SLOT_LEASE_BYTES).unwrap()));
+
+        let error = write_lease_json(&path, &lease).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        let absent_parent = dir.path().join("not-created");
+        assert!(write_lease_json(&absent_parent.join("lease.json"), &lease).is_err());
+        assert!(!absent_parent.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_lease_evidence_blocks_every_mutation_and_preserves_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        acquire_slot_lease(&slot, "slot-a", "BlueLake", None, 3600, true).unwrap();
+        let owned = lease_path_for_holder(&slot, "BlueLake", None);
+        let before = std::fs::read(&owned).unwrap();
+        let target = dir.path().join("foreign.json");
+        let contents = serde_json::to_vec(&make_lease("RedFox", None, true)).unwrap();
+        std::fs::write(&target, &contents).unwrap();
+        let linked = slot.join("linked.json");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+
+        assert!(acquire_slot_lease(&slot, "slot-a", "GreenPeak", None, 3600, true).is_err());
+        assert!(renew_slot_lease(&slot, "BlueLake", None, 600).is_err());
+        assert!(release_slot_lease(&slot, "BlueLake", None).is_err());
+        assert!(resolve_holder_lease_path(&slot, "GreenPeak", None).is_err());
+        assert!(write_lease_json(&linked, &make_lease("RedFox", None, true)).is_err());
+        assert_eq!(std::fs::read_link(&linked).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+        assert_eq!(std::fs::read(&owned).unwrap(), before);
+        assert!(!lease_path_for_holder(&slot, "GreenPeak", None).exists());
+        let _lock = try_lock_slot(&slot, false).unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_slot_operations_reject_fifo_without_waiting_for_a_writer() {
+        const CHILD_PATH: &str = "MCP_AGENT_MAIL_SLOT_FIFO_TEST_PATH";
+        const CHILD_OPERATION: &str = "MCP_AGENT_MAIL_SLOT_FIFO_TEST_OPERATION";
+        const TEST: &str =
+            "build_slots::tests::build_slot_operations_reject_fifo_without_waiting_for_a_writer";
+        const WITNESS: &str = "build-slot-fifo-refused";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            // The regression used to block in open while holding the slot
+            // flock. Bound only this private child, never the test runner.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                eprintln!("build-slot operation waited on a writerless FIFO");
+                std::process::exit(3);
+            });
+            let slot = Path::new(&path).parent().unwrap();
+            let operation = std::env::var(CHILD_OPERATION).unwrap();
+            let result = match operation.as_str() {
+                "acquire" => {
+                    acquire_slot_lease(slot, "slot-a", "GreenPeak", None, 3600, true).map(|_| ())
+                }
+                "renew" => renew_slot_lease(slot, "BlueLake", None, 600).map(|_| ()),
+                "release" => release_slot_lease(slot, "BlueLake", None).map(|_| ()),
+                "write" => write_lease_json(Path::new(&path), &make_lease("RedFox", None, true)),
+                _ => panic!("unexpected FIFO test operation"),
+            };
+            assert!(result.is_err(), "writerless FIFO must be refused");
+            let _lock = try_lock_slot(slot, false).unwrap().unwrap();
+            println!("{WITNESS}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap();
+        let owned = lease_path_for_holder(dir.path(), "BlueLake", None);
+        let before = std::fs::read(&owned).unwrap();
+        let fifo = dir.path().join("blocked.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .expect("create real writerless FIFO")
+                .success()
+        );
+        for operation in ["acquire", "renew", "release", "write"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_PATH, &fifo)
+                .env(CHILD_OPERATION, operation)
+                .current_dir(dir.path())
+                .output()
+                .expect("run private bounded build-slot child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && stdout.contains(WITNESS)
+                    && stdout.contains("test result: ok. 1 passed;"),
+                "{operation} child must pass exactly one test: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&owned).unwrap(), before);
+            assert!(!lease_path_for_holder(dir.path(), "GreenPeak", None).exists());
+        }
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
     }
 
     #[test]
