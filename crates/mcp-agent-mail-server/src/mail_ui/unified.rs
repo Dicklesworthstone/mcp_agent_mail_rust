@@ -1316,7 +1316,13 @@ mod tests {
                 // this invocation, including every lifecycle-ledger lookup.
                 let projects: Vec<_> = (1..=242).collect();
                 let roster = read_roster(&traced, &projects)?;
-                super::read(&traced, &roster.selected, &roster.profiles, limit, importance)?
+                super::read(
+                    &traced,
+                    &roster.selected,
+                    &roster.profiles,
+                    limit,
+                    importance,
+                )?
             };
             let projects = read_message_projects(&traced, &rows)?;
             Ok(aggregate(rows, &projects).unwrap())
@@ -1347,8 +1353,10 @@ mod tests {
         let (_dir, conn) = reported_mailbox_fixture();
         for retired in [false, true] {
             if retired {
-                conn.execute_raw("PRAGMA query_only=OFF; UPDATE agents SET retired_at=1 WHERE id<=6393")
-                    .unwrap();
+                conn.execute_raw(
+                    "PRAGMA query_only=OFF; UPDATE agents SET retired_at=1 WHERE id<=6393",
+                )
+                .unwrap();
             }
             conn.execute_raw("PRAGMA query_only=ON").unwrap();
             for (limit, importance) in [(20, None), (1000, None), (20, Some("normal"))] {

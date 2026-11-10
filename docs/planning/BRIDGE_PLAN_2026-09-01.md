@@ -1,5 +1,112 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 10 mail UI fixture isolation — EmeraldEagle / br-asldx
+
+This is the current source checklist. Earlier qualification checklists below
+are retained historical checkpoints; their final-source/operational follow-through
+is superseded here. The reader repair and every originally selected test remain.
+
+- [x] Follow the real default-storage resolver: the generic mail UI helper
+  creates distinct database files directly in the same temporary directory,
+  but leaves storage_root unset. Ephemeral rerouting hashes that common parent,
+  so even the isolated-home wrapper can give unrelated fixtures one archive.
+  The earlier 12s acquire failure cannot be attributed solely to runtime context.
+- [x] Bind each helper pool to an explicit archive path derived from its unique
+  database filename. Add a two-real-pool regression with auto ephemeral mode
+  and a private ephemeral base, so the old namespace collision is deterministic
+  and the regression itself cannot touch an operator archive. Retain real pool
+  initialization and all existing fixture data, comparisons and timeouts.
+- [x] Repair two incoming benchmark formatting hunks manually; standalone fmt
+  now exits 0. No benchmark body, assertion or ignore attribute changed.
+- [x] Collect old af110866 compile-only preparation: 0/7542.5s on vmi1149989,
+  fingerprint fe0d5151, zero bodies. Disable its automatic actual run before
+  execution after discovering the shared fixture namespace. This preparation
+  is useful compilation evidence only, not a pass for 180 cases.
+- [x] Freeze the repaired integration graph at base af110866 plus seven explicit
+  source overlays (the later peer changes plus the helper repair). Exact paths
+  and SHA-256 values are retained in isolation-source-hashes.txt under
+  /data/tmp/am-archive-reader-20261110.t7ueMuTt. Parent mail_ui 827e1ea3,
+  unified afb330f1, unchanged reconstruction 6bb15508 / schedule 3d1b2dbc /
+  lock 208ea862. The pool is pinned Git c9967106, not its registry namesake;
+  verify its actual constructor/acquire implementation before using that review.
+- [x] Expand the native selection before execution to the entire mail_ui
+  namespace because the changed helper serves all its callers. Keep full
+  reconstruction, original startup 12, full schedule 8, error classification
+  and orphan inventory. Source attributes predict 338 active cases before
+  platform cfg; the compiled runner count is authoritative. The existing
+  ignored issue-382 large benchmark remains unqualified, not counted as a pass.
+- [x] Run stock UBS on all seven overlaid files, no failed modules or suppression.
+  Pool 0/4847/2306; queries 0/4159/652; mail_ui 5/826/342 (exit 1, the same
+  timestamp-based fixture-name alerts); unified 0/277/31; storage 0/4916/1236;
+  build_slots 0/421/157; messaging 0/1314/439. Counts are critical/warning/info;
+  this is not an expanded-UBS-green or release-clearance claim.
+- [x] Complete both required workspace graphs and strict Clippy for these new
+  bytes. Initial requests used an unsupported --overlay spelling and exited 2
+  before work; correct to the documented --overlay-path, retaining both logs.
+  All-targets compiles on vmi1152480. Production refuses disk admission 120 on
+  vmi1153651 before Cargo, started:false; retry on newly admissible vmi1227854.
+  Repaired all-targets passes 0/570.5s and production retry passes 0/628.6s.
+  Both bind identical overlay fingerprint
+  933965b51d27906b4ae2661b4c2cd0e858d08ede883f0a0cf462c2bb605a2b09.
+  Clippy first refuses disk admission 120 before Cargo on vmi1152480; after
+  production finishes, request unchanged strict Clippy on vmi1227854.
+  That retry passes 0/524.3s with the same 933965b5 fingerprint. All three
+  required static graphs and standalone fmt now pass for the repaired packet.
+- [x] Prepare then execute the full repaired native selection under strict RCH.
+  Default features, dev.debug=0, one compiler job (within previous maximum 2),
+  native 30 GiB growth / 10 GiB floor, actual 1800s / per-test 240s unchanged.
+  The vmi1149989 preparation request refuses 103 for occupied slots; fresh
+  protected accounting finds hz2 healthy with zero reservations and positive
+  headroom, so request the same compile-only 14400s preparation there.
+  Preparation completes 0/5240.0s with zero test bodies. Actual execution runs
+  all 338 selected cases in 70.540s: 337 pass, one existing cancellation fixture
+  fails its readback with 503. Both the isolation regression and previously
+  failing real migrated-mailbox collector pass. Retain the native exit 100;
+  9194 outside/ignored cases are not passes.
+- [x] Trace that remaining failure through the pinned SQLModel acquire path:
+  its timer intentionally observes the ambient cancellation context. The test
+  cancels its write request, then tries to read with another explicit Cx while
+  leaving the cancelled request installed. Use a fresh runtime request and a
+  scoped ambient guard for the actual readback, restoring the cancelled write
+  context before the existing ambient-identity assertions. Preserve the write,
+  cancellation, persisted-row and context assertions; no production guard or
+  timeout changed. Updated parent mail_ui hash aeb3ffa0; other source paths/lock
+  unchanged. context-source-hashes.txt records the exact bytes.
+- [x] Re-execute the same 338-case native selection after this correction, with
+  the original actual 1800s / per-test 240s bounds. hz2 passes 0/642.3s overall:
+  338/338 in 68.915s, 9194 outside/ignored cases not claimed. Both fixture cases,
+  real migrated-mailbox collector, migration controls and four leaf cases pass.
+  Final fingerprint b3f65fdad8e36facb069125a60c237d2d3754d9f8d2b28781f7bb4f2fdfd80e6.
+  Keep the 933965b5 receipts historical, including the real native failure.
+- [x] Finish both workspace graphs and strict Clippy on these final bytes.
+  Standalone fmt is 0; changed mail_ui stock UBS is 1, status ok/no failed
+  modules, 5/826/343. The five unchanged test-name alerts remain reported;
+  the added info finding is the required scoped context clone. Other six
+  source files retain their unchanged full-file scan results above.
+  All-targets passes 0/745.6s on vmi1153651 with fingerprint b3f65fda.
+  An unnecessary one-job/debug=0 production-check variant caused a cold
+  rebuild; restore the exact standard command rather than spend more time on
+  that variant. The first standard request refuses 103 before Cargo for
+  critical memory pressure. Cooperatively cancel only the verified owned
+  variant wrapper rchw-299c52cf-5411-45e7-9074-c9fe26b34514, build
+  30097323753210610: local 143, daemon earlier 130, recovered delivery 120,
+  terminal acknowledged. None is a check pass. Standard production retry now
+  uses its previous worker/cache on vmi1227854; strict Clippy runs on vmi1149989.
+  Collect both terminal results: standard production 0/118.5s, strict Clippy
+  0/659.1s. Both bind the same b3f65fda packet as all-targets and native 338/338.
+- [x] Fresh-review the final bytes/outcomes and record Bead comment 4221 without
+  closing original readiness/control acceptance. Both tracker stores contain
+  2867 unique equal records; only br-asldx comments/updated_at differ from HEAD.
+  Status remains in_progress and the active dependency graph has zero cycles.
+  Hashes and diff checks pass; prepare only the five owned source/tracker/TODO
+  paths for publication. No peer untracked root is staged or removed.
+- [x] Inspect incoming publication overlap: four peer commits through b7c57e1b
+  add readiness/search/large-mailbox qualification work, with no file deletions.
+  The only dirty overlap is unified.rs, whose two formatting hunks are identical.
+  Preserve those commits through a normal merge; the frozen b3f65fda results
+  do not qualify their newer source. Publication and exact lease-release outcomes
+  are reported after they happen in the session handoff.
+
 ## November 10 final source qualification — EmeraldEagle / br-asldx
 
 Frozen target: af110866db204319191a24c8e50c80a320c15eea, lock 208ea862.
@@ -43,6 +150,8 @@ The older receipts below retain their original source scope.
   Both exact owned obsolete wrappers are now recovered. Fresh protected disk
   accounting permits a new preparation on vmi1149989; af110-prepare-180.log
   records that request, with no execution credit until bodies actually run.
+  Terminal preparation is 0/7542.5s, zero bodies. Actual execution is superseded
+  by the discovered helper-isolation defect and broader repaired selection above.
 - [x] Complete af110866 production graph, all-targets graph and strict Clippy.
   Production retry passes 0/592.3s on vmi1152480; all-targets passes 0/641.0s
   on vmi1153651. Both bind clean base af110866, fingerprint

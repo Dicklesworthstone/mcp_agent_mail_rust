@@ -175,6 +175,10 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
         .expect("test sqlite journal mode should initialize");
     let cfg = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        // All these database files have the same temporary parent. Default
+        // ephemeral rerouting hashes that parent, so it would give unrelated
+        // fixtures one shared archive despite their distinct database paths.
+        storage_root: Some(db_path.with_extension("archive")),
         ..DbPoolConfig::default()
     };
     get_or_create_pool(&cfg).expect("test pool should initialize")
@@ -183,6 +187,31 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
 #[cfg(test)]
 mod request_budget_tests {
     use super::*;
+
+    #[test]
+    fn initialized_test_pools_do_not_share_archive_authority() {
+        let ephemeral_base = tempfile::tempdir().expect("private ephemeral archive base");
+        let ephemeral_base_text = ephemeral_base.path().to_string_lossy();
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[
+                ("AM_EPHEMERAL_MODE", "auto"),
+                ("ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE", "false"),
+                ("AM_EPHEMERAL_ROOT", ephemeral_base_text.as_ref()),
+            ],
+            |_| {
+                let runtime = message_fixture_runtime();
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let _guard = Cx::set_current(Some(cx));
+                let first = initialized_test_pool("mail-ui-archive-isolation");
+                let second = initialized_test_pool("mail-ui-archive-isolation");
+                assert_ne!(
+                    first.storage_root(),
+                    second.storage_root(),
+                    "distinct test mailboxes must never reconcile through the same archive"
+                );
+            },
+        );
+    }
 
     #[test]
     fn mail_ui_request_budget_deadline_is_relative_to_now() {
@@ -240,9 +269,14 @@ mod request_budget_tests {
         .expect("completed write outcome must survive a concurrent cancellation");
         assert!(cx.is_cancel_requested());
 
-        let read_cx = Cx::for_testing();
-        let projects = block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
-            .expect("read back committed database row");
+        let read_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let projects = {
+            // The pool's timer also observes the ambient request. Read back
+            // through a fresh request, then restore the cancelled write context.
+            let _read_guard = Cx::set_current(Some(read_cx.clone()));
+            block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
+                .expect("read back committed database row")
+        };
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, project.id);
         assert_eq!(projects[0].human_key, "/mail-ui-ready-cancel");
