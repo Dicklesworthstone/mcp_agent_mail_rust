@@ -1,5 +1,78 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 10 shared-commit integration — EmeraldEagle / br-asldx / br-kp1in.29
+
+- [x] Observe the shared checkout advance to ce1fac7f40fabd48732e80b9bc540c4e0accce3d
+  (tree bf724feb194aaadfaee155d7a89422fc09f8ed78). Another process committed the
+  reviewed fixes in 92c6d5de/39178885 alongside additive peer lock diagnostics.
+  Preserve that history; no duplicate source commit, reset, revert or merge.
+  Standalone fetch succeeds and both origin refs are0/0; no incoming deletion.
+- [x] Verify all five DB source hashes and Cargo.lock still match the frozen
+  packet; the server hash changes because of the incoming timeout diagnostics.
+  Read every incoming lock observer, live registry, serializer, watchdog,
+  timeout and health hunk. No additional defect confirmed from inspection.
+  Governing docs are unchanged; tracker import reports current JSONL truth.
+- [x] Check immutable committed ce1fac7f before the next correction: all-targets
+  0/611.4s and production0/541.9s on vmi1152480, standalone fmt0.
+  Strict Clippy refuses120 before Cargo: started:false/growth0, protected
+  disk reservations prevent admission. Preserve that refusal, not a lint pass.
+- [x] Follow prefix-loss fallback into readiness publication. A detected missing
+  committed prefix can choose incremental repair and retain old availability
+  while waiting for the writer. Revoke both proofs when prefix validation
+  detects loss, before that wait. Strengthen the real blocked-writer observer
+  and paired damaged/intact-prefix assertions; preserve retry/search readback,
+  unchanged clocks, healthy no-reindex assertion and all original workloads.
+  This new defect is confirmed by source tracing, not a fabricated failed run.
+- [x] Cover a lost suffix too: ordinary append planning can bypass marker
+  validation. A count/max deficit against the saved complete generation
+  revokes availability before that incremental writer wait. Add a real suffix
+  deletion/cancel/retry/search regression; preserve all earlier controls.
+  The intermediate prefix-only source passes production0/214.3s, but is
+  historical after this refinement. Strict Clippy exposes four incoming
+  core lock-observer errors; preserve the failure and fix paragraph boundaries,
+  explicit Poll::Ready matching and lazy Option handling without suppression
+  or changes to acquisition/cancellation/guard lifetimes.
+- [x] Qualify ce1fac7f plus only lock_order.rs hashb873f454 and search_v3.rs
+  hashddc9dcb0, recorded in loss-final-source-hashes.txt under the existing
+  receipt root. Exact overlay4037b5cf passes all-targets0/279.9s, default
+  production0/186.9s and strict Clippy0/838.1s; portable production passes0/638.3s
+  separately. Standalone fmt0. Full-file stock scans finish/statusok/no failed
+  modules: v3 exit0/0critical839warning136info; lock exit1/1critical120warning16info.
+  The lock alert is the existing debug-only corruption panic, retained without
+  suppression. No all-stock-green, native, performance or release claim.
+  Earlier ce1/base87 receipts remain historical.
+- [x] Let the healthy old two-crate preparation finish without replaying or
+  cancelling it: old base87+5cda exits0/8695.8s on vmi1153651. Zero test bodies;
+  historical preparation cannot qualify the corrected or integrated source.
+- [ ] Prepare and execute the integrated
+  four-crate default-feature native selection on that exact corrected source.
+  Current4037 preparation exits0/2933.1s, with all four native executables
+  independently hashed and worker source/toolchain/config identities retained.
+  The first execution request exits120 before Cargo: started:false/growth0,
+  free51692163072 bytes, fixed native30GiB/floor10GiB and active reservations.
+  Zero bodies; preserve that refusal and retry only after genuine admission
+  capacity appears. No cleanup, smaller reservation, wrapper or classifier
+  bypass, synthetic metadata, shortened test run or historical-pass substitution.
+  Retain every original805 case and all four new regressions; additionally
+  select all lock_order and disk_monitor tests, the real serializer cancellation
+  case, bounded dispatch-summary case, lock-wait health boundaries and actual
+  held-lock health route. Bind core/db/tools/server, profile.dev.debug=0,
+  build-jobs1, actual1800s/per-test240s and native30GiB/floor10GiB unchanged.
+- [ ] Compare actual test identities with both the original338 and C0805 sets;
+  confirm each added case executed, and retain failures/skipped benchmarks.
+- [ ] Re-read final integration and failure paths, record real results in both
+  Beads, verify tracker consistency/cycles and normal main/mirror publication.
+  Preserve all peer work and release only the owned reservations at handoff.
+- [ ] Original acceptance remains open: br-asldx needs its size/control proof;
+  br-kp1in.29 needs remaining slope/projection/smoke coverage and measured
+  release overhead<=1%. Functional regression passes cannot close those gates.
+- [ ] Follow through on the confirmed actual-queue health gap under br-kp1in.29:
+  health_check calls archive_lag_snapshot before sampling live lock evidence;
+  backlog_state and coalescer lag_state block on real queue mutexes. Use
+  nonblocking sampling with explicit unavailable evidence and real held-global-
+  queue controls. Unknown lag cannot become zero, green, or an idle-gap age.
+  This is recorded source evidence, not a correction or an end-to-end pass.
+
 ## November 10 production deadline follow-through — EmeraldEagle / br-asldx
 
 - [x] Verify governing-file hashes unchanged, preserve the seven peer roots and
