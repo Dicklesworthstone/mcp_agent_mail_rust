@@ -341,23 +341,120 @@ fn snapshot_file_identity_from_reader(
     file: &mut std::fs::File,
     path: &Path,
 ) -> DbResult<(u64, String)> {
+    transfer_stable_snapshot(file, path, None, &mut std::io::sink()).map_err(|error| {
+        DbError::Sqlite(format!(
+            "snapshot identity: cannot verify {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Hash and optionally copy one observed snapshot generation. Snapshot locks
+/// serialize cooperating publishers, but do not make an externally modified
+/// file immutable. Bound every read to its captured length and refuse changed
+/// bytes/identity witnesses instead of hashing a mixed generation or following
+/// an ever-growing file while holding publication admission.
+fn transfer_stable_snapshot(
+    file: &mut std::fs::File,
+    path: &Path,
+    expected_size: Option<u64>,
+    destination: &mut impl std::io::Write,
+) -> std::io::Result<(u64, String)> {
+    transfer_stable_snapshot_with(file, path, expected_size, destination, |_| {})
+}
+
+fn transfer_stable_snapshot_with(
+    file: &mut std::fs::File,
+    path: &Path,
+    expected_size: Option<u64>,
+    destination: &mut impl std::io::Write,
+    mut observed: impl FnMut(u64),
+) -> std::io::Result<(u64, String)> {
+    let before = file.metadata()?;
+    if !before.is_file() || expected_size.is_some_and(|expected| expected != before.len()) {
+        return Err(std::io::Error::other(
+            "snapshot source is not a regular file of the expected length",
+        ));
+    }
+    // Keep the inode alive across all lookups; a recycled pathname or matching
+    // creation timestamp is not a substitute for the opened file's identity.
+    let identity = same_file::Handle::from_file(file.try_clone()?)?;
+    verify_snapshot_read_source(file, path, &before, &identity)?;
+    file.rewind()?;
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            DbError::Sqlite(format!(
-                "snapshot identity: cannot read {}: {error}",
-                path.display()
-            ))
-        })?;
+    observed(0);
+    while size < before.len() {
+        let remaining = usize::try_from(before.len() - size).unwrap_or(usize::MAX);
+        let capacity = remaining.min(buffer.len());
+        let read = match file.read(&mut buffer[..capacity]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if read == 0 {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "snapshot source was truncated while streaming",
+            ));
         }
-        size = size.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        destination.write_all(&buffer[..read])?;
+        size += u64::try_from(read).map_err(std::io::Error::other)?;
         hasher.update(&buffer[..read]);
+        observed(size);
     }
+    verify_snapshot_read_source(file, path, &before, &identity)?;
     Ok((size, hex::encode(hasher.finalize())))
+}
+
+fn verify_snapshot_read_source(
+    file: &std::fs::File,
+    path: &Path,
+    before: &std::fs::Metadata,
+    identity: &same_file::Handle,
+) -> std::io::Result<()> {
+    let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+    if !snapshot_read_metadata_matches(before, &file.metadata()?)?
+        || !snapshot_read_metadata_matches(before, &current.metadata()?)?
+        || same_file::Handle::from_file(current)? != *identity
+    {
+        return Err(std::io::Error::other(
+            "snapshot source changed while streaming; evidence was preserved",
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_read_metadata_matches(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    if !after.is_file() || before.len() != after.len() || before.modified()? != after.modified()? {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // ctime catches in-place rewrites even when mtime is restored. Access
+        // time deliberately does not participate: reading can update it.
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Ok(false);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if before.file_attributes() != after.file_attributes()
+            || before.creation_time() != after.creation_time()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn existing_snapshot_metadata_authority(
@@ -780,12 +877,13 @@ fn inspect_and_record_snapshot_metadata(
                 staged_path.display()
             ))
         })?;
-    std::io::copy(&mut source, &mut staged).map_err(|error| {
-        DbError::Sqlite(format!(
-            "snapshot metadata: cannot stage {} for immutable inspection: {error}",
-            bak.display()
-        ))
-    })?;
+    let identity_before =
+        transfer_stable_snapshot(&mut source, bak, None, &mut staged).map_err(|error| {
+            DbError::Sqlite(format!(
+                "snapshot metadata: cannot stage {} for immutable inspection: {error}",
+                bak.display()
+            ))
+        })?;
     staged.sync_all().map_err(|error| {
         DbError::Sqlite(format!(
             "snapshot metadata: cannot sync private inspection stage for {}: {error}",
@@ -795,7 +893,6 @@ fn inspect_and_record_snapshot_metadata(
     drop(source);
     drop(staged);
 
-    let identity_before = snapshot_file_identity(staged_path)?;
     if !crate::pool::sqlite_recovery_candidate_passes_full_integrity_check(staged_path).map_err(
         |error| {
             DbError::Sqlite(format!(
@@ -1083,13 +1180,26 @@ pub fn restore_from_verified_snapshot(
             ))
         },
     )?;
-    std::io::copy(&mut selected.source, &mut destination).map_err(|e| {
+    let copied_identity = transfer_stable_snapshot(
+        &mut selected.source,
+        &actual_snapshot_path,
+        Some(meta.snapshot_size_bytes),
+        &mut destination,
+    )
+    .map_err(|e| {
         DbError::Sqlite(format!(
             "snapshot restore: copy {} -> {}: {e}",
             actual_snapshot_path.display(),
             staged.display()
         ))
     })?;
+    if copied_identity.0 != meta.snapshot_size_bytes || copied_identity.1 != meta.snapshot_sha256 {
+        return Err(DbError::Sqlite(format!(
+            "snapshot restore: source {} no longer matches recorded snapshot identity; stage {} was preserved for inspection",
+            actual_snapshot_path.display(),
+            staged.display()
+        )));
+    }
     destination.sync_all().map_err(|e| {
         DbError::Sqlite(format!(
             "snapshot restore: sync staged copy {}: {e}",
@@ -1213,6 +1323,202 @@ mod tests {
             .collect();
         stages.sort();
         stages
+    }
+
+    #[test]
+    fn stable_snapshot_transfer_hashes_and_copies_exact_bytes_from_the_start() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bak");
+        for bytes in [Vec::new(), b"abc".to_vec(), vec![b'x'; 131_073]] {
+            std::fs::write(&path, &bytes).unwrap();
+            let mut source = std::fs::File::open(&path).unwrap();
+            source.seek(std::io::SeekFrom::End(0)).unwrap();
+            let mut destination = Vec::new();
+            let identity = transfer_stable_snapshot(
+                &mut source,
+                &path,
+                Some(u64::try_from(bytes.len()).unwrap()),
+                &mut destination,
+            )
+            .unwrap();
+            assert_eq!(destination, bytes);
+            assert_eq!(identity.0, u64::try_from(bytes.len()).unwrap());
+            assert_eq!(identity.1, hex::encode(Sha256::digest(&bytes)));
+            assert_eq!(snapshot_file_identity(&path).unwrap(), identity);
+        }
+
+        let mut source = std::fs::File::open(&path).unwrap();
+        let mut destination = Vec::new();
+        destination.write_all(b"prior evidence").unwrap();
+        assert!(transfer_stable_snapshot(&mut source, &path, Some(1), &mut destination).is_err());
+        assert_eq!(destination, b"prior evidence");
+    }
+
+    #[test]
+    fn stable_snapshot_transfer_bounds_a_continuously_growing_source() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bak");
+        let stage = dir.path().join("restore.tmp");
+        let original = vec![b'a'; 2 * 64 * 1024];
+        std::fs::write(&path, &original).unwrap();
+        let mut source = std::fs::File::open(&path).unwrap();
+        let mut destination = std::fs::File::create_new(&stage).unwrap();
+        let mut turns = 0;
+        let result =
+            transfer_stable_snapshot_with(&mut source, &path, None, &mut destination, |read| {
+                if read > 0 {
+                    turns += 1;
+                    let mut writer = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    writer.write_all(&vec![b'b'; 64 * 1024]).unwrap();
+                }
+            });
+        assert!(result.is_err(), "growth cannot become verified authority");
+        assert_eq!(turns, 2, "the original length, not EOF, bounds the work");
+        assert_eq!(std::fs::read(&stage).unwrap(), original);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4 * 64 * 1024);
+    }
+
+    #[test]
+    fn stable_snapshot_transfer_refuses_truncation_and_preserves_partial_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bak");
+        let stage = dir.path().join("restore.tmp");
+        std::fs::write(&path, vec![b'a'; 2 * 64 * 1024]).unwrap();
+        let mut source = std::fs::File::open(&path).unwrap();
+        let mut destination = std::fs::File::create_new(&stage).unwrap();
+        let result =
+            transfer_stable_snapshot_with(&mut source, &path, None, &mut destination, |read| {
+                if read == 64 * 1024 {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(64 * 1024 + 7)
+                        .unwrap();
+                }
+            });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(std::fs::read(&stage).unwrap(), vec![b'a'; 64 * 1024 + 7]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 * 1024 + 7);
+    }
+
+    #[test]
+    fn stable_snapshot_transfer_refuses_a_same_length_rewrite() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bak");
+        std::fs::write(&path, vec![b'a'; 2 * 64 * 1024]).unwrap();
+        let mut source = std::fs::File::open(&path).unwrap();
+        let mut destination = Vec::new();
+        let result =
+            transfer_stable_snapshot_with(&mut source, &path, None, &mut destination, |read| {
+                if read == 64 * 1024 {
+                    let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    writer.write_all(&vec![b'b'; 2 * 64 * 1024]).unwrap();
+                    writer
+                        .set_times(std::fs::FileTimes::new().set_modified(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+                        ))
+                        .unwrap();
+                }
+            });
+        assert!(result.is_err(), "a mixed generation cannot acquire a hash");
+        assert_eq!(&destination[..64 * 1024], vec![b'a'; 64 * 1024]);
+        assert_eq!(&destination[64 * 1024..], vec![b'b'; 64 * 1024]);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![b'b'; 2 * 64 * 1024]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_snapshot_transfer_refuses_a_rewrite_with_restored_mtime() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bak");
+        std::fs::write(&path, vec![b'a'; 2 * 64 * 1024]).unwrap();
+        let mut source = std::fs::File::open(&path).unwrap();
+        let modified = source.metadata().unwrap().modified().unwrap();
+        let mut destination = Vec::new();
+        let result =
+            transfer_stable_snapshot_with(&mut source, &path, None, &mut destination, |read| {
+                if read == 64 * 1024 {
+                    let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    writer.write_all(&vec![b'b'; 2 * 64 * 1024]).unwrap();
+                    writer
+                        .set_times(std::fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
+                }
+            });
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(
+            result.is_err(),
+            "ctime must detect an mtime-preserving rewrite"
+        );
+    }
+
+    #[test]
+    fn stable_snapshot_transfer_refuses_path_replacement_without_touching_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bak");
+        let retained = dir.path().join("snapshot.retained");
+        let original = vec![b'a'; 2 * 64 * 1024];
+        let replacement = vec![b'b'; 2 * 64 * 1024];
+        std::fs::write(&path, &original).unwrap();
+        let mut source = std::fs::File::open(&path).unwrap();
+        let mut destination = Vec::new();
+        let result =
+            transfer_stable_snapshot_with(&mut source, &path, None, &mut destination, |read| {
+                if read == 64 * 1024 {
+                    std::fs::rename(&path, &retained).unwrap();
+                    std::fs::write(&path, &replacement).unwrap();
+                }
+            });
+        assert!(
+            result.is_err(),
+            "a reused path cannot inherit old authority"
+        );
+        assert_eq!(destination, original);
+        assert_eq!(std::fs::read(&retained).unwrap(), original);
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_snapshot_transfer_refuses_symlink_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bak");
+        let retained = dir.path().join("snapshot.retained");
+        let foreign = dir.path().join("foreign.db");
+        let original = vec![b'a'; 2 * 64 * 1024];
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&foreign, b"foreign evidence").unwrap();
+        let mut source = std::fs::File::open(&path).unwrap();
+        let mut destination = Vec::new();
+        let result =
+            transfer_stable_snapshot_with(&mut source, &path, None, &mut destination, |read| {
+                if read == 64 * 1024 {
+                    std::fs::rename(&path, &retained).unwrap();
+                    std::os::unix::fs::symlink(&foreign, &path).unwrap();
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_link(&path).unwrap(), foreign);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign evidence");
+        assert_eq!(std::fs::read(&retained).unwrap(), original);
     }
 
     #[test]
