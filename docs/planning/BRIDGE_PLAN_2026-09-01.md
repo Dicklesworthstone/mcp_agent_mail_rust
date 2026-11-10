@@ -51,6 +51,74 @@
   Fresh fetch finds origin/main at a5571948, seven commits ahead of base 91fb1340;
   peer frontmatter-only inventory reads complement the full-artifact reader fix.
   Requalify the combined source before the final publication claim.
+  Source commit 1c2bb22c is preserved; normal merge has no conflict or deletion.
+  Combined source 6bb15508 / unchanged lock 208ea862, base a5571948 plus only
+  reconstruct.rs, overlay 01f5e0b97b4e74ecf544d2341f0969be6b938b754737a60c18daaf5239e0e81f.
+  Combined production 0/196.5s and all-targets 0/206.6s; fmt 0; stock UBS 0,
+  critical 0 / warning 1956 / info 708, failed modules 0. New production
+  findings are bounded append-only slicing, bounded usize-to-u64 length and
+  error-only formatting; remaining additions are the peer tests, no suppression.
+  Combined native 139-case attempt refuses 103 before Cargo on hz2 at critical
+  memory pressure; read-only disk accounting is also negative. After the
+  12-case server job finishes, use that worker for the same full namespace.
+  Combined startup finishes 0/456.5s on hz4: 12/12 pass in 25.132s, 5519
+  outside the selection. Combined Clippy initially refuses disk admission 120
+  on vmi1153651, started:false; unchanged retry compiles on vmi1149989.
+- [x] Fix the combined Clippy 101's four real test lints without suppression:
+  three empty-value assertions in unified inbox tests become diagnostic equality
+  assertions; retention's test-only minute remainder uses checked subtraction
+  with the same expected delay. Production behavior and assertions are preserved.
+  Reserve only those two additional files; retain the failed receipt and the
+  initial formatting diff, then manually match rustfmt (final fmt 0).
+- [ ] Qualify final server test files (unified f07deff5, schedule 3d1b2dbc) with
+  unchanged reconstruction 6bb15508 / lock 208ea862: both workspace graphs,
+  strict Clippy, full-file UBS and the original 12 startup cases plus all 17
+  unified-inbox and 8 retention-schedule tests (37 expected). The earlier
+  33-case estimate missed four entries in a truncated listing; corrected from
+  the full source before execution, with whole-module filters unchanged.
+  Final production 0/100.1s, all-targets 0/154.8s and strict Clippy 0/109.9s,
+  three-file overlay f5dc3b4812a3bf13815b0798c80edbb5d5df4d7e0009ad4b09829c4229843506.
+  Full-file UBS: reconstruction 0/1956/708, unified 0/175/19, schedule 0/41/5;
+  all status ok / failed modules 0 / no suppression. Unified baseline has
+  identical counts; schedule gains one expected test-only checked-sub expect.
+  Reconstruction's
+  same 139-case module/source continues on hz4; the server tests are downstream.
+  That native module finishes 0/1441.6s: 139/139 pass in 12.146s, 3845 outside
+  the namespace. All four new reader cases, both migration controls and the
+  peer prefix-reader cases pass. Original 1800s/240s limits remain intact.
+  First 37-case request refuses disk admission 120 before Cargo; zero executed.
+  A progress update initially described executable preparation too early;
+  corrected explicitly. Fresh read-only accounting then finds hz4 reservations
+  gone and positive protected headroom; retry the unchanged 37-case selection.
+- [x] Execute that selection: 37 ran, 36 passed, one live-collector case failed
+  before seeding while acquiring its first real pool connection (12s timeout).
+  Retain final-server-37-retry.log. Its runtime existed, but the caller used a
+  detached Cx::for_testing and fastmcp polling instead of the native owner.
+- [ ] Qualify the runtime-context repair in that same real-mailbox test:
+  mint the context from its existing runtime, install it for synchronous UI DB
+  calls, and drive first acquire with runtime.block_on. Keep all mailbox data,
+  original/reference comparisons, pool timeout and native 1800s/240s limits.
+  Registry Asupersync 0.5 Cx::for_testing already uses Budget::INFINITE; the
+  explicit native budget does not widen it. Final unified source b96821de;
+  reconstruction 6bb15508, schedule 3d1b2dbc and lock 208ea862 are unchanged.
+  Native request refuses disk admission 120 before Cargo; final fmt 0 and
+  UBS 0/175/20 pass (no suppression). All-targets refuses critical-memory
+  admission 103 on vmi1153651. Production starts on vmi1149989; read-only
+  accounting finds vmi1152480 admissible and strict Clippy is requested there.
+  Final context revision: production 0/650.0s (vmi1149989), strict Clippy
+  0/572.6s (vmi1152480), three-file overlay
+  1f970db6ddc1ee18d87393099a650e3b8bb22a1543652796fbc6de02a8c4dce9.
+  All-targets retry is requested on the now-freed Clippy worker. Native remains
+  pending: fresh accounting still finds no admissible tested native worker;
+  hz4 now has one other project's live reservation. No guard/ledger/cache change.
+  All-targets retry finishes 0/205.8s on vmi1152480. Thus all mandatory static
+  checks pass for this context revision. Compile-only preparation of the exact
+  37-case selection starts on newly admissible vmi1149989, preparation 14400s
+  only; actual 1800s/240s remains required. It earns zero bodies. Later headroom
+  improves on hz4; the unchanged actual run is queued there, not yet executing.
+  Exact fallback wrapper rchw-edf9f82c-5ce9-4e93-aba0-3bb7854815b1 was matched
+  to its live PID, project, worker and full --no-run argv. If actual proof
+  succeeds first, cancel only that redundant owned preparation through RCH.
 - [ ] Original bounded-readiness and two-size/control benchmark remain open;
   this is a reliability integration, not a measured speedup or combined scan.
 
