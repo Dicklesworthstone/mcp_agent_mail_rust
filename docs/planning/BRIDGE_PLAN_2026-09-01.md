@@ -1,10 +1,83 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 9 native startup follow-through — EmeraldEagle / br-asldx
+
+- [x] Verify unchanged governing docs and clean tracked348aded6; reread the
+  timing producer, retained-mail fixture, child runner and error-priority fix.
+  No additional functional defect identified; preserve seven peer roots.
+- [x] Read the actual RCH disk-admission implementation. It protects every
+  live process-group reservation as well as the floor; raw free disk alone
+  does not establish admission. No policy, worker config or ledger mutation.
+- [x] Observe materially increased hz2 headroom (about84GiB versus the prior
+  54,348,029,952-byte refusal). Reserve only the two source files, existing
+  TODO and exact tracker paths. Frozen V5 startup5e2c4458/lib88ca3c0a/lock208ea862
+  is unchanged; retain its completed compiler/Clippy/fmt/UBS evidence.
+- [x] Complete strict RCH compile-only preparation of the unchanged12-case
+  selection, default features/build-jobs2/dev.debug0, preparation14400s and
+  original30GiB growth/10GiB floor. Preparation earns zero executed bodies.
+  hz2's queue expired before Cargo. Read-only live-reservation accounting
+  identified vmi1227854; its unchanged request passed disk admission and
+  began compiling at22:47UTC. It completed0/3655.1s at23:47UTC, with zero
+  executed bodies and final overlay7383d498. Retain both preparation logs in
+  /data/tmp/am-startup-native-20261109.qSAd95rF.
+- [x] Execute that exact selection with actual-run1800s/per-test240s unchanged.
+  Preserve every refusal or failure; fix actual defects without narrowing the
+  selection, fixture sizes, assertions or resource fences.
+  Actual execution0/69.7s on vmi1227854:12 tests ran and passed in10.106s;
+  5516 filtered. native-v5.log binds the same final overlay7383d498.
+- [x] Verify persisted100/10000 retained totals/parity and every phase before
+  interpreting costs. Record source-bound results; no listener-readiness or
+  speedup claim. A safe source optimization still needs qualification below.
+  Both fixtures pass all11 phases and runtime-engine message/body/recipient
+  totals plus archive parity. Initial preparation104835/2235756us; integrity
+  103180/2232474us; archive-preflight657/1540us. Integrity is the measured
+  target, not the boot archive check. Its DB check, drift inventory and strict
+  ID-floor scan still need internal attribution before choosing a safe change.
+- [x] Repeat the persisted case20 times, unchanged source and1800s/240s
+  fences:20/20 pass,138.580s test time,215.8s RCH total. At100/10000 messages,
+  median preparation108551.5/1819366.5us; ranges82659–284701/1601539–2419713us.
+  Median integrity fractions98.31%/99.91%. Preserve baseline-summary.json
+  and raw attribution-baseline-20.log. High variance and observed worker I/O
+  pressure prevent a stable latency-comparison or speedup claim; tails at
+  n=20 are descriptive/conservative, not service SLOs or release evidence.
+- [x] Inspect a separately labelled syscall diagnostic, with data buffers
+  suppressed and the original1800s/240s fences. Separate fixture construction
+  from preparation; do not use tracer overhead as production latency.
+  Traced case passes0/163.8s RCH,93.758s test time; syscall-summary.json aligns
+  approximate preparation windows from the unique child stdout-write lengths
+  and measured elapsed times. The100/10000 windows contain100+100/10000+10000
+  canonical message opens: best-effort inventory and strict descriptor-relative
+  floor scan. Both have4 clone3 calls. These are observed operation counts,
+  not a native-wall attribution or reproduction/refutation of the old ts2 run.
+  Keep the249535105-byte raw trace; read/write buffers were suppressed.
+- [x] Bind actual executed ELF5dc219b2e4bdbc091c06807f803ff1a94ff3ca57a54634e7d068a8c20e78bb0b
+  (351548544 bytes) via the running baseline's /proc/exe. Its .comment gives
+  rustc1.100.0-nightly908501772/2026-08-30, matching declared nightly2026-08-31.
+  fingerprint-host.json records hardware only: its default host compiler
+  6eeff9a52/2026-09-23 is NOT the build compiler, and its root-directory
+  git_sha:unknown/git_dirty:false says nothing about source cleanliness.
+- [ ] Implement and qualify a safe readiness optimization. Candidate: share
+  a complete strict archive traversal across inventory/floor consumers while
+  preserving all directory/file generation, incomplete-read and ID-allocation
+  protections. Never reuse the best-effort inventory as an authoritative floor.
+  No source change or speedup has been earned by the diagnostic counts.
+- [x] Fresh-review the frozen producer, fixture, child runner and adjacent
+  consumers. No further source defect found or source edited in this turn;
+  all original assertions and required final-byte checks remain intact.
+- [x] Update the original Bead as4216, keepin_progress, flush tracker data and
+  verify both stores equal2867 unique rows, cycles0; only .asldx comments and
+  updated_at changed. Fresh fetch before the data-only checkpoint shows0/0
+  against both remote branches. Ordinary Git and exact owned-lease outcomes
+  finish after this checkpoint and are recorded in the retained audit/handoff.
+- [ ] Original .asldx bounded-readiness and two-size/control acceptance stays
+  open until its original positive conditions are actually met.
+
 ## November 9 persisted startup attribution continuation — EmeraldEagle / br-asldx
 
-Final V5 source passes both workspace compiler graphs, strict Clippy, formatting
-and the full two-file UBS scan. Native qualification remains open:12 cases
-selected,0 executed, no mailbox fixtures constructed and no timing measurements.
+Historical pre-execution checkpoint below; superseded by the native run above.
+Final V5 source passed both workspace compiler graphs, strict Clippy, formatting
+and the full two-file UBS scan. At that checkpoint12 cases were selected but
+none had executed; the persisted fixtures and measurements were still pending.
 Source changes were committed by another process asf8ee1195 (notes8034bca7);
 their file hashes match the receipts, and publication does not clear acceptance.
 
@@ -20,14 +93,16 @@ their file hashes match the receipts, and publication does not clear acceptance.
   recipient rows, matching canonical archive files and a real Git commit.
   Canonical SQLite seeds only the fixtures; actual startup uses the runtime
   engine and original checks. Keep all fixture paths private.
-- [ ] Exercise actual prepare_http_startup, including abort-mode archive
+- [x] Exercise actual prepare_http_startup, including abort-mode archive
   preflight, and capture every phase plus total preparation time. Verify
   message/recipient/body totals and archive parity after each preparation.
-- [ ] Run the original10 cases, attribution and extended error-summary case
+- [x] Run the original10 cases, attribution and extended error-summary case
   (12 total) through
   strict RCH. Keep command1800s/per-test240s and default feature/resource
   fences; separate any compile-only preparation from executed bodies.
-- [ ] Use measured phase costs to select the next source optimization. Fixture
+- [ ] Use measured phase costs to select and qualify the next source optimization.
+  Integrity is the measured target; duplicate archive reads are a candidate,
+  with strict archive-floor semantics still requiring a preservation proof. Fixture
   construction warms OS caches; this measures preparation, not listener
   readiness, the original ts2 workload or an incumbent-relative speedup.
 - [x] Fresh-read the fixture and consumer twice; formatting0 and stock full-file
@@ -68,17 +143,18 @@ their file hashes match the receipts, and publication does not clear acceptance.
   vmi1227854 bind the same final overlay7383d498. The first V5 production
   recheck refuses120 at protected disk admission, started:false/growth0;
   retain it. V4 passes remain earlier-source evidence.
-- [ ] V4 native bodies remain0: compile preparation on vmi1152480 refuses120
+- [x] Preserve the V4 zero-body checkpoint: preparation on vmi1152480 refuses120
   at disk admission; actual normal1800s run on hz4 refuses120 before Cargo
   because the disk monitor cannot complete its probe. started:false/growth0;
   its free_bytes:0 is an unavailable-probe sentinel, not measured free space.
   Preserve30GiB growth/10GiB floor and240s per-test limits. No more unchanged
-  native attempts or claims of measured phase costs in this work block.
-- [ ] A newly freed hz2 worker allows one V5 compile-preparation submission
+  native attempts or claims of measured phase costs in that earlier work block.
+- [x] Preserve the earlier hz2 V5 refusal: a newly freed worker allows one submission
   after an observed slot-state change; its disk guard still refuses120 before
   Cargo (free54,348,029,952 bytes; unchanged30GiB/10GiB fences). No bodies or
-  timing measurements. Stop further unchanged native retries; original runtime
-  qualification and performance acceptance remain open.
+  timing measurements at that checkpoint. It prohibited further unchanged
+  retries until capacity changed. The positive12-case result above supersedes
+  runtime-pending status; original performance acceptance remains open.
 - [x] Complete required V5 compiler gates; retain all intermediate receipts.
   Initial native hz4 and all-targets vmi1153651 requests refuse120 before Cargo
   at protected disk admission, started:false/growth0. Keep both receipts.
