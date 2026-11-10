@@ -21936,15 +21936,112 @@ mod tests {
         conn
     }
 
-    fn startup_repair_snapshot(conn: &DbConn) -> Vec<String> {
+    #[derive(Debug, PartialEq)]
+    struct StartupRepairSnapshotRow {
+        columns: Vec<String>,
+        values: Vec<sqlmodel_core::Value>,
+    }
+
+    fn startup_repair_snapshot(conn: &DbConn) -> Vec<Vec<StartupRepairSnapshotRow>> {
         [
             "SELECT id, created_ts, ack_required FROM messages ORDER BY id",
             "SELECT agent_id, total_count, unread_count, ack_pending_count, last_message_ts FROM inbox_stats ORDER BY agent_id",
             "SELECT name, sql FROM sqlite_master WHERE type='trigger' ORDER BY name",
         ]
         .iter()
-        .map(|sql| format!("{:?}", conn.query_sync(sql, &[]).unwrap()))
+        .map(|sql| {
+            conn.query_sync(sql, &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    // HashMap Debug iteration order is not persisted state.
+                    // Keep ordered metadata and typed cells, checking both
+                    // lookup interfaces before discarding that internal map.
+                    let info = row.column_info();
+                    let columns = info.names().to_vec();
+                    let values: Vec<_> = row.values().cloned().collect();
+                    assert_eq!(columns.len(), values.len());
+                    assert_eq!(row.len(), values.len());
+                    for (index, (name, value)) in columns.iter().zip(&values).enumerate() {
+                        assert_eq!(info.name_at(index), Some(name.as_str()));
+                        assert_eq!(info.index_of(name), Some(index));
+                        assert_eq!(row.get(index), Some(value));
+                        assert_eq!(row.get_by_name(name), Some(value));
+                    }
+                    StartupRepairSnapshotRow { columns, values }
+                })
+                .collect()
+        })
         .collect()
+    }
+
+    #[test]
+    fn startup_repair_snapshot_is_stable_and_detects_state_changes() {
+        let conn = startup_repair_fixture(false);
+        let original = startup_repair_snapshot(&conn);
+        for _ in 0..8 {
+            assert_eq!(startup_repair_snapshot(&conn), original);
+        }
+        for (description, mutation) in [
+            (
+                "message timestamp",
+                "UPDATE messages SET created_ts=created_ts+1 WHERE id=1",
+            ),
+            (
+                "message acknowledgement",
+                "UPDATE messages SET ack_required=0 WHERE id=1",
+            ),
+            ("message identity", "UPDATE messages SET id=4 WHERE id=1"),
+            (
+                "message cardinality",
+                "INSERT INTO messages VALUES (4, 2000000000, 1)",
+            ),
+            (
+                "inbox identity",
+                "UPDATE inbox_stats SET agent_id=2 WHERE agent_id=1",
+            ),
+            (
+                "total counter",
+                "UPDATE inbox_stats SET total_count=100 WHERE agent_id=1",
+            ),
+            (
+                "unread counter",
+                "UPDATE inbox_stats SET unread_count=99 WHERE agent_id=1",
+            ),
+            (
+                "pending acknowledgement counter",
+                "UPDATE inbox_stats SET ack_pending_count=98 WHERE agent_id=1",
+            ),
+            (
+                "last message timestamp",
+                "UPDATE inbox_stats SET last_message_ts=97 WHERE agent_id=1",
+            ),
+            (
+                "trigger definition",
+                "DROP TRIGGER trg_inbox_stats_insert; \
+                 CREATE TRIGGER trg_inbox_stats_insert AFTER INSERT ON message_recipients BEGIN SELECT 2; END",
+            ),
+            (
+                "trigger identity",
+                "DROP TRIGGER trg_inbox_stats_insert; \
+                 CREATE TRIGGER renamed_inbox_stats_insert AFTER INSERT ON message_recipients BEGIN SELECT 1; END",
+            ),
+        ] {
+            conn.execute_raw("BEGIN").expect("begin snapshot witness");
+            conn.execute_raw(mutation).expect(description);
+            assert_ne!(
+                startup_repair_snapshot(&conn),
+                original,
+                "snapshot must detect changed {description}"
+            );
+            conn.execute_raw("ROLLBACK")
+                .expect("restore snapshot witness");
+            assert_eq!(
+                startup_repair_snapshot(&conn),
+                original,
+                "rollback must restore the exact snapshot after {description}"
+            );
+        }
     }
 
     #[test]

@@ -919,11 +919,15 @@ fn owned_cursor_delete_trigger(rows: &[sqlmodel_core::Row]) -> Result<Option<Str
 }
 
 fn same_owned_creation_sql(actual: &str, authored: &str, kind: &str) -> bool {
+    if actual == authored {
+        return true;
+    }
     let stored_prefix = format!("CREATE {kind} ");
     let authored_prefix = format!("CREATE {kind} IF NOT EXISTS ");
-    actual == authored
-        || actual.strip_prefix(stored_prefix.as_str())
-            == authored.strip_prefix(authored_prefix.as_str())
+    let Some(authored_body) = authored.strip_prefix(authored_prefix.as_str()) else {
+        return false;
+    };
+    actual.strip_prefix(stored_prefix.as_str()) == Some(authored_body)
 }
 
 /// Capture only exact owned versions. This also protects the temporary
@@ -5554,6 +5558,34 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use sqlmodel_core::Value;
 
+    #[test]
+    fn owned_creation_sql_only_normalizes_the_authored_creation_prefix() {
+        assert!(same_owned_creation_sql(
+            V36_SENDER_INDEX_SQL,
+            V36_SENDER_INDEX_SQL,
+            "INDEX"
+        ));
+        assert!(same_owned_creation_sql(
+            "CREATE INDEX idx_messages_sender_id ON messages(sender_id)",
+            V36_SENDER_INDEX_SQL,
+            "INDEX"
+        ));
+        for unsupported in [
+            "CREATE INDEX idx_messages_sender_id ON messages(project_id)",
+            "CREATE UNIQUE INDEX idx_messages_sender_id ON messages(sender_id)",
+            "CREATE INDEX idx_messages_sender_id ON messages(sender_id) WHERE sender_id > 0",
+        ] {
+            assert!(
+                !same_owned_creation_sql(unsupported, V36_SENDER_INDEX_SQL, "INDEX"),
+                "customized schema must not be treated as owned: {unsupported}"
+            );
+        }
+        assert!(
+            !same_owned_creation_sql("DROP INDEX first", "DROP INDEX second", "INDEX"),
+            "two missing creation prefixes cannot establish schema ownership"
+        );
+    }
+
     fn block_on<F, Fut, T>(f: F) -> T
     where
         F: FnOnce(Cx) -> Fut,
@@ -5674,12 +5706,12 @@ mod tests {
             [RELEVANT_LEXICAL_IDENTITY_MIGRATION.to_string()]
         );
         assert_eq!(v15_fixture_rows(conn, &historical_sql), historical);
-        assert!(
+        assert_eq!(
             run_specific_migrations(cx, conn, vec![migration])
                 .await
                 .into_result()
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Vec::<String>::new()
         );
         let columns = conn
             .query(cx, "PRAGMA index_info(idx_messages_sender_id)", &[])
@@ -6950,10 +6982,34 @@ mod tests {
         );
 
         conn.execute_sync(
-            "INSERT INTO projects (slug, human_key, created_at) VALUES ('clock-test', '/clock-test', 1)",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'clock-test', '/clock-test', 1)",
             &[],
         )
-        .expect("exercise the installed projection trigger");
+        .expect("create an unreferenced project");
+        let unused_revision = conn
+            .query_sync(
+                "SELECT revision FROM lexical_change_clock WHERE id = 1",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("revision")
+            .unwrap();
+        assert_eq!(
+            unused_revision, 0,
+            "unreferenced metadata has no message projection"
+        );
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'ClockSender', 'test', 'test', 1, 1)",
+            &[],
+        )
+        .expect("create the message sender");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (1, 1, 1, 'clock', 'native projection witness', 1)",
+            &[],
+        )
+        .expect("exercise the installed message projection trigger");
         let revision_before = conn
             .query_sync(
                 "SELECT revision FROM lexical_change_clock WHERE id = 1",
