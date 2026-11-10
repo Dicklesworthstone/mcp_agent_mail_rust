@@ -14471,7 +14471,7 @@ pub async fn acknowledge_message(
     agent_id: i64,
     message_id: i64,
 ) -> Outcome<(i64, i64), DbError> {
-    match acknowledge_message_impl(cx, pool, agent_id, message_id, None).await {
+    match acknowledge_message_impl(cx, pool, agent_id, message_id, None, None).await {
         Outcome::Ok(IdempotentOutcome::Fresh(ts) | IdempotentOutcome::Replayed(ts)) => {
             Outcome::Ok(ts)
         }
@@ -14503,7 +14503,34 @@ pub async fn acknowledge_message_idempotent(
     message_id: i64,
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<(i64, i64)>, DbError> {
-    acknowledge_message_impl(cx, pool, agent_id, message_id, Some(claim)).await
+    acknowledge_message_impl(cx, pool, agent_id, message_id, Some(claim), None).await
+}
+
+/// Replay an acknowledgement accepted while the database was unavailable.
+///
+/// An intent authorizes the message and identity that existed when it was
+/// queued, not a future delivery or a replacement identity at reused IDs.
+/// Check their timestamps in the acknowledgement transaction before mutating
+/// either direct or shared-mailbox receipts. A matching committed idempotency
+/// receipt remains a read-only replay and does not require a fresh mutation.
+/// This temporal bound is not a substitute for a database-generation witness.
+pub async fn acknowledge_message_with_replay_cutoff(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    message_id: i64,
+    created_at_or_before: i64,
+    claim: Option<IdempotencyClaim<'_>>,
+) -> Outcome<IdempotentOutcome<(i64, i64)>, DbError> {
+    acknowledge_message_impl(
+        cx,
+        pool,
+        agent_id,
+        message_id,
+        claim,
+        Some(created_at_or_before),
+    )
+    .await
 }
 
 async fn acknowledge_message_impl(
@@ -14512,6 +14539,7 @@ async fn acknowledge_message_impl(
     agent_id: i64,
     message_id: i64,
     idempotency: Option<IdempotencyClaim<'_>>,
+    created_at_or_before: Option<i64>,
 ) -> Outcome<IdempotentOutcome<(i64, i64)>, DbError> {
     let now = now_micros();
     let idempotency_expires_ts =
@@ -14560,6 +14588,37 @@ async fn acknowledge_message_impl(
                     rollback_tx(cx, &tracked).await;
                     return Outcome::Panicked(p);
                 }
+            }
+        }
+
+        if let Some(cutoff) = created_at_or_before {
+            // Resolve again inside this transaction: cached tool identities
+            // cannot authorize acknowledging an identity or message that only
+            // appeared after the durable intent. Refuse missing/malformed
+            // timestamps rather than coercing them to an ancient epoch.
+            let eligible = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT m.id \
+                     FROM (SELECT id, project_id, created_ts FROM messages WHERE id = ?2) m \
+                     JOIN (SELECT id, project_id, inception_ts FROM agents WHERE id = ?1) a \
+                       ON a.project_id = m.project_id \
+                     WHERE m.id > 0 AND a.id > 0 \
+                       AND typeof(m.created_ts) = 'integer' \
+                       AND typeof(a.inception_ts) = 'integer' \
+                       AND m.created_ts <= ?3 AND a.inception_ts <= ?3 LIMIT 1",
+                    &[Value::BigInt(agent_id), Value::BigInt(message_id), Value::BigInt(cutoff)],
+                ).await)
+            );
+            if eligible.is_empty() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::not_found(
+                    "MessageRecipient",
+                    format!("{agent_id}:{message_id} at acknowledgement intent time"),
+                ));
             }
         }
 
@@ -44076,6 +44135,138 @@ mod tests {
                 other_rows[0].get_named("ack_ts").expect("other ack_ts");
             assert_eq!(other_read_ts, None);
             assert_eq!(other_ack_ts, None);
+        });
+    }
+
+    async fn seed_ack_replay_cutoff_fixture(cx: &Cx, pool: &DbPool) {
+        let conn = acquire_conn(cx, pool).await.into_result().unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                 (1, 'ack-cutoff', '/ack-cutoff', 1), (2, 'other', '/other', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+                 (1, 1, 'BlueLake', 'test', 'test', 1699999999999999, 1700000000000000), \
+                 (2, 1, 'GreenStone', 'test', 'test', 1700000000000000, 1700000000000000), \
+                 (3, 1, 'AmberHill', 'test', 'test', 1700000000000001, 1700000000000001), \
+                 (4, 1, 'SilverFox', 'test', 'test', 'invalid', 1700000000000000), \
+                 (5, 2, 'RedPeak', 'test', 'test', 1699999999999999, 1700000000000000); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, ack_required, created_ts) VALUES \
+                 (1, 1, 1, 'direct original', 'body', 1, 1700000000000000), \
+                 (2, 1, 1, 'direct future', 'body', 1, 1700000000000001), \
+                 (3, 1, 1, 'shared original', 'body', 1, 1700000000000000), \
+                 (4, 1, 1, 'shared future', 'body', 1, 1700000000000001), \
+                 (5, 1, 1, 'invalid timestamp', 'body', 1, 'invalid'); \
+             INSERT INTO message_recipients (message_id, agent_id, kind) VALUES \
+                 (1, 2, 'to'), (2, 2, 'to'), (1, 3, 'to'), (1, 4, 'to'), \
+                 (1, 5, 'to'), (5, 2, 'to'); \
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts) VALUES \
+                 (3, 1, 'to', 1700000000000000), (4, 1, 'to', 1700000000000001); \
+             INSERT OR REPLACE INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count) \
+                 VALUES (2, 99, 99, 99);",
+        )
+        .expect("seed real receipt, shared delivery, and counter witnesses");
+    }
+
+    #[test]
+    fn ack_replay_cutoff_refuses_future_identity_scope_and_malformed_time_without_mutation() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (_, pool, _dir) = setup_test_pool("ack_replay_cutoff_refusals.db");
+        rt.block_on(async {
+            let cx = Cx::current().unwrap();
+            seed_ack_replay_cutoff_fixture(&cx, &pool).await;
+            // Future direct/shared messages, a later actor, malformed actor or
+            // message time, and a cross-project direct row all remain untouched.
+            for (case, (agent_id, message_id)) in
+                [(2, 2), (2, 4), (3, 1), (4, 1), (2, 5), (5, 1), (0, 1), (2, 0)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let key = format!("refused-cutoff-{case}");
+                for keyed in [false, true] {
+                    let claim = keyed.then_some(IdempotencyClaim {
+                        project_id: 1,
+                        tool: "acknowledge_message",
+                        key: &key,
+                        fingerprint: "cutoff-payload",
+                    });
+                    let outcome = acknowledge_message_with_replay_cutoff(
+                        &cx, &pool, agent_id, message_id, 1_700_000_000_000_000, claim,
+                    )
+                    .await;
+                    assert!(matches!(outcome, Outcome::Err(DbError::NotFound { .. })), "{case}/{keyed}: {outcome:?}");
+                }
+            }
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            for sql in [
+                "SELECT COUNT(*) AS n FROM message_recipients WHERE read_ts IS NOT NULL OR ack_ts IS NOT NULL",
+                "SELECT COUNT(*) AS n FROM project_mailbox_receipts",
+                "SELECT COUNT(*) AS n FROM idempotency_keys",
+            ] {
+                assert_eq!(conn.query_sync(sql, &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 0);
+            }
+            let rows = conn.query_sync("SELECT total_count, unread_count, ack_pending_count FROM inbox_stats WHERE agent_id = 2", &[]).unwrap();
+            for column in ["total_count", "unread_count", "ack_pending_count"] {
+                assert_eq!(rows[0].get_named::<i64>(column).unwrap(), 99, "{column}");
+            }
+        });
+    }
+
+    #[test]
+    fn ack_replay_cutoff_accepts_boundary_receipts_and_preserves_prior_keyed_results() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (_, pool, _dir) = setup_test_pool("ack_replay_cutoff_success.db");
+        rt.block_on(async {
+            let cx = Cx::current().unwrap();
+            seed_ack_replay_cutoff_fixture(&cx, &pool).await;
+            for message_id in [1, 3] {
+                let key = format!("accepted-cutoff-{message_id}");
+                let claim = IdempotencyClaim {
+                    project_id: 1,
+                    tool: "acknowledge_message",
+                    key: &key,
+                    fingerprint: "original-cutoff-payload",
+                };
+                let first = acknowledge_message_with_replay_cutoff(
+                    &cx, &pool, 2, message_id, 1_700_000_000_000_000, Some(claim),
+                )
+                .await
+                .into_result()
+                .expect("actor and target exactly at cutoff are eligible");
+                let IdempotentOutcome::Fresh(timestamps) = first else { panic!("expected a fresh receipt") };
+                let replay = acknowledge_message_with_replay_cutoff(
+                    &cx, &pool, 2, message_id, 0, Some(claim),
+                )
+                .await
+                .into_result()
+                .expect("a committed receipt replay performs no fresh mutation");
+                assert!(matches!(replay, IdempotentOutcome::Replayed(ts) if ts == timestamps));
+                let conflict = acknowledge_message_with_replay_cutoff(
+                    &cx, &pool, 2, message_id, 0,
+                    Some(IdempotencyClaim { fingerprint: "different-payload", ..claim }),
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert!(matches!(conflict, IdempotentOutcome::Conflict(_)));
+                let unkeyed = acknowledge_message_with_replay_cutoff(
+                    &cx, &pool, 2, message_id, 1_700_000_000_000_000, None,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert!(matches!(unkeyed, IdempotentOutcome::Fresh(ts) if ts == timestamps));
+            }
+            // Foreground ACKs still operate on newer mail normally; only an
+            // older queued intent lacks authority over that future delivery.
+            acknowledge_message(&cx, &pool, 2, 2).await.into_result().unwrap();
+            acknowledge_message(&cx, &pool, 2, 4).await.into_result().unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT message_id FROM project_mailbox_receipts WHERE agent_id = 2 AND read_ts IS NOT NULL AND ack_ts IS NOT NULL ORDER BY message_id", &[]).unwrap();
+            assert_eq!(rows.iter().map(|row| row.get_named::<i64>("message_id").unwrap()).collect::<Vec<_>>(), [3, 4]);
+            assert_eq!(conn.query_sync("SELECT COUNT(*) AS n FROM idempotency_keys", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 2);
         });
     }
 

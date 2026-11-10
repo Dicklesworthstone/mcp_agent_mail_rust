@@ -6034,47 +6034,37 @@ async fn replay_single_ack_intent(
     .map_err(ack_intent_replay_error)?;
     ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
     let agent_id = agent.id.unwrap_or(0);
-    if let Some(idempotency) = &intent.idempotency {
-        let claim = mcp_agent_mail_db::IdempotencyClaim {
-            project_id,
-            tool: "acknowledge_message",
-            key: &idempotency.key,
-            fingerprint: &idempotency.fingerprint,
-        };
-        return match mcp_agent_mail_db::queries::acknowledge_message_idempotent(
-            ctx.cx(),
-            pool,
-            agent_id,
-            intent.message_id,
-            claim,
-        )
-        .await
-        {
-            Outcome::Ok(
-                mcp_agent_mail_db::IdempotentOutcome::Fresh(_)
-                | mcp_agent_mail_db::IdempotentOutcome::Replayed(_),
-            ) => Ok(()),
-            Outcome::Ok(mcp_agent_mail_db::IdempotentOutcome::Conflict(_)) => Err((
-                "IDEMPOTENCY_KEY_CONFLICT: the original acknowledgement stands".to_string(),
-                false,
-            )),
-            Outcome::Err(error) => {
-                let retryable = db_error_supports_ack_intent(&error);
-                Err((error.to_string(), retryable))
-            }
-            Outcome::Cancelled(_) => Err(("ack replay cancelled".to_string(), true)),
-            Outcome::Panicked(_) => Err(("ack replay panicked".to_string(), true)),
-        };
-    }
-    match mcp_agent_mail_db::queries::acknowledge_message(
+    let claim =
+        intent
+            .idempotency
+            .as_ref()
+            .map(|idempotency| mcp_agent_mail_db::IdempotencyClaim {
+                project_id,
+                tool: "acknowledge_message",
+                key: &idempotency.key,
+                fingerprint: &idempotency.fingerprint,
+            });
+    // A queued acknowledgement is not permission to acknowledge a message or
+    // identity created later at the same ID. The DB guard covers direct and
+    // lazy shared-mailbox receipts atomically, including unkeyed intents.
+    match mcp_agent_mail_db::queries::acknowledge_message_with_replay_cutoff(
         ctx.cx(),
         pool,
         agent_id,
         intent.message_id,
+        intent.created_ts,
+        claim,
     )
     .await
     {
-        Outcome::Ok(_) => Ok(()),
+        Outcome::Ok(
+            mcp_agent_mail_db::IdempotentOutcome::Fresh(_)
+            | mcp_agent_mail_db::IdempotentOutcome::Replayed(_),
+        ) => Ok(()),
+        Outcome::Ok(mcp_agent_mail_db::IdempotentOutcome::Conflict(_)) => Err((
+            "IDEMPOTENCY_KEY_CONFLICT: the original acknowledgement stands".to_string(),
+            false,
+        )),
         Outcome::Err(error) => {
             let retryable = db_error_supports_ack_intent(&error);
             Err((error.to_string(), retryable))
@@ -9674,6 +9664,116 @@ mod tests {
                 .unwrap();
             assert_eq!((second.read_ts, second.ack_ts), (None, None));
         });
+    }
+
+    #[test]
+    fn queued_ack_replay_abandons_later_targets_without_acknowledging_them() {
+        with_messaging_mailbox(&[], |_| {
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                let ctx = McpContext::new(cx.clone(), 1);
+                let pool = get_db_pool().unwrap();
+                let config = Config::get();
+                let project = ensure_project_row(&cx, &pool, "/queued-ack-cutoff").await;
+                let project_id = project.id.unwrap();
+                let original = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let replacement = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                let original_id = original.id.unwrap();
+                let replacement_id = replacement.id.unwrap();
+                let mut cases = Vec::new();
+                for (label, agent) in [
+                    ("old", &original), ("later-message", &original), ("later-actor", &replacement),
+                ] {
+                    let message_id = create_ack_test_message(
+                        &cx, &pool, project_id, original_id, &[(agent.id.unwrap(), "to")],
+                    )
+                    .await;
+                    for keyed in [false, true] {
+                        let claim = keyed.then(|| ack_retry_claim(&agent.name, message_id, label));
+                        crate::degraded_intents::append_ack_intent(
+                            &config, &project.human_key, &agent.name, message_id,
+                            "acknowledge_message", "fixture outage", claim.as_ref(),
+                        )
+                        .unwrap();
+                    }
+                    cases.push((agent.id.unwrap(), message_id));
+                }
+                let intents = crate::degraded_intents::read_queued_ack_intents(&config).unwrap();
+                assert_eq!(intents.len(), 6);
+                let later = intents.iter().map(|intent| intent.created_ts).max().unwrap() + 1;
+                // Model a later message/identity occupying the recorded IDs.
+                // The cached actor still has its earlier inception timestamp;
+                // only the transaction's current database evidence can refuse.
+                {
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    conn.execute_sync(
+                        "UPDATE messages SET created_ts = ? WHERE id = ?",
+                        &[sqlmodel_core::Value::BigInt(later), sqlmodel_core::Value::BigInt(cases[1].1)],
+                    ).unwrap();
+                    conn.execute_sync(
+                        "UPDATE agents SET inception_ts = ? WHERE id = ?",
+                        &[sqlmodel_core::Value::BigInt(later), sqlmodel_core::Value::BigInt(replacement_id)],
+                    ).unwrap();
+                }
+                replay_queued_ack_intents(&ctx, &pool, &config).await;
+                assert_eq!(crate::degraded_intents::read_queued_ack_intents(&config).unwrap(), []);
+                {
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    for (index, (agent_id, message_id)) in cases.into_iter().enumerate() {
+                        let rows = conn.query_sync(
+                            "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?",
+                            &[sqlmodel_core::Value::BigInt(agent_id), sqlmodel_core::Value::BigInt(message_id)],
+                        ).unwrap();
+                        assert_eq!(rows.len(), 1);
+                        for field in ["read_ts", "ack_ts"] {
+                            assert_eq!(rows[0].get_named::<Option<i64>>(field).unwrap().is_some(), index == 0, "{index}/{field}");
+                        }
+                    }
+                    let rows = conn.query_sync("SELECT COUNT(*) AS n FROM idempotency_keys", &[]).unwrap();
+                    assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+                }
+                let log = assert_ack_cutoff_replay_markers(&config);
+                replay_queued_ack_intents(&ctx, &pool, &config).await;
+                assert_eq!(std::fs::read_to_string(crate::degraded_intents::log_path(
+                    &config, crate::degraded_intents::ACK_INTENT_LOG_FILE,
+                )).unwrap(), log, "terminal refusals must not be retried forever");
+            });
+        });
+    }
+
+    fn assert_ack_cutoff_replay_markers(config: &Config) -> String {
+        let log = std::fs::read_to_string(crate::degraded_intents::log_path(
+            config,
+            crate::degraded_intents::ACK_INTENT_LOG_FILE,
+        ))
+        .unwrap();
+        let markers: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["kind"] == crate::degraded_intents::ACK_INTENT_REPLAY_KIND)
+            .collect();
+        assert_eq!(markers.len(), 6);
+        for (index, marker) in markers.iter().enumerate() {
+            if index < 2 {
+                assert_eq!(
+                    marker["status"],
+                    crate::degraded_intents::REPLAY_STATUS_REPLAYED
+                );
+            } else {
+                assert_eq!(
+                    marker["status"],
+                    crate::degraded_intents::REPLAY_STATUS_ABANDONED
+                );
+                assert!(
+                    marker["error_detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("acknowledgement intent time")
+                );
+            }
+        }
+        log
     }
 
     #[test]
