@@ -28,11 +28,12 @@
 #[cfg(debug_assertions)]
 use std::cell::RefCell;
 use std::fmt;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,9 @@ use live::{ActivityGuard, LiveLock};
 pub use live::{
     LockAccess, LockActivity, LockActivitySnapshot, LockParticipant, lock_activity_snapshot,
 };
+
+/// Shared bound for reporting an unfinished lock wait in health and watchdogs.
+pub const LOCK_WAIT_STALL_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Extension trait for `Duration` that converts to nanoseconds as `u64`,
 /// saturating to `u64::MAX` for extremely long durations (>585 years).
@@ -94,11 +98,15 @@ pub enum LockLevel {
     // Server layer (only a handful of process-global statics)
     // ---------------------------------------------------------------------
     ServerLiveDashboard,
+
+    /// Async message insertion admission. Observed without thread-local
+    /// ordering checks because its owned guard can move between executor threads.
+    DbMessageWriteSerializer,
 }
 
 impl LockLevel {
     /// Number of distinct lock levels.
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 20;
 
     /// All lock levels in rank order (for iteration/snapshots).
     pub const ALL: [Self; Self::COUNT] = [
@@ -121,6 +129,7 @@ impl LockLevel {
         Self::ToolsBridgedEnv,
         Self::ToolsToolMetrics,
         Self::ServerLiveDashboard,
+        Self::DbMessageWriteSerializer,
     ];
 
     /// Dense ordinal index [0..COUNT) for array-based stats lookup.
@@ -146,6 +155,7 @@ impl LockLevel {
             Self::ToolsBridgedEnv => 16,
             Self::ToolsToolMetrics => 17,
             Self::ServerLiveDashboard => 18,
+            Self::DbMessageWriteSerializer => 19,
         }
     }
 
@@ -172,6 +182,7 @@ impl LockLevel {
             16 => Some(Self::ToolsBridgedEnv),
             17 => Some(Self::ToolsToolMetrics),
             18 => Some(Self::ServerLiveDashboard),
+            19 => Some(Self::DbMessageWriteSerializer),
             _ => None,
         }
     }
@@ -206,6 +217,10 @@ impl LockLevel {
 
             // Server
             Self::ServerLiveDashboard => 90,
+
+            // Observation identity only: ObservedLock does not enforce an
+            // acquisition order across async suspension or task migration.
+            Self::DbMessageWriteSerializer => 100,
         }
     }
 }
@@ -376,6 +391,116 @@ pub fn lock_contention_reset() {
     let stats = global_lock_stats();
     for s in stats {
         s.reset();
+    }
+}
+
+/// Observe an externally owned async lock without replacing its cancellation,
+/// fairness, or wakeup protocol. Unlike the ordered synchronous wrappers, this
+/// observer never puts a movable task's guards on a thread-local lock stack.
+#[derive(Debug)]
+pub struct ObservedLock {
+    level: LockLevel,
+    activity: LiveLock,
+}
+
+impl ObservedLock {
+    #[must_use]
+    pub const fn new(level: LockLevel) -> Self {
+        Self {
+            level,
+            activity: LiveLock::new(),
+        }
+    }
+
+    /// Track a real acquisition future, registering a waiter only after it
+    /// actually yields Pending. Dropping or cancelling that future clears the
+    /// waiter; successful acquisition transfers the observation into the guard.
+    /// The recorded site is the caller, not this polling adapter.
+    #[track_caller]
+    pub fn observe_acquisition<F, G, E>(
+        &self,
+        acquisition: F,
+    ) -> impl Future<Output = Result<ObservedLockGuard<G>, E>>
+    where
+        F: Future<Output = Result<G, E>>,
+    {
+        let site = Location::caller();
+        async move {
+            let mut acquisition = std::pin::pin!(acquisition);
+            let mut waiting = None;
+            let mut wait_started = None;
+            let guard = std::future::poll_fn(|cx| match acquisition.as_mut().poll(cx) {
+                std::task::Poll::Pending => {
+                    if wait_started.is_none() {
+                        let started = Instant::now();
+                        waiting =
+                            self.activity
+                                .waiting(self.level, LockAccess::Mutex, site, started);
+                        wait_started = Some(started);
+                    }
+                    std::task::Poll::Pending
+                }
+                ready => ready,
+            })
+            .await?;
+            let acquired_at = Instant::now();
+            let activity = if let Some(waiting) = waiting {
+                Some(waiting.acquired(acquired_at))
+            } else if wait_started.is_none() {
+                self.activity
+                    .holding(self.level, LockAccess::Mutex, site, acquired_at)
+            } else {
+                // A refused registration stays explicitly incomplete. Do not
+                // invent a second identity for an unobserved pending wait.
+                None
+            };
+            global_lock_stats()[self.level.ordinal()].record_acquire(
+                wait_started.is_some(),
+                wait_started.map_or(0, |started| {
+                    acquired_at
+                        .saturating_duration_since(started)
+                        .as_nanos_u64()
+                }),
+            );
+            Ok(ObservedLockGuard {
+                level: self.level,
+                acquired_at,
+                activity,
+                guard,
+            })
+        }
+    }
+}
+
+/// The observation and the real owned guard share one lifetime. It remains
+/// Send exactly when the underlying guard is Send. Drop removes the observation
+/// before unlocking so an old owner cannot erase its successor's evidence.
+pub struct ObservedLockGuard<G> {
+    level: LockLevel,
+    acquired_at: Instant,
+    activity: Option<ActivityGuard>,
+    guard: G,
+}
+
+impl<G> Drop for ObservedLockGuard<G> {
+    fn drop(&mut self) {
+        global_lock_stats()[self.level.ordinal()]
+            .record_hold(self.acquired_at.elapsed().as_nanos_u64());
+        drop(self.activity.take());
+    }
+}
+
+impl<G: Deref> Deref for ObservedLockGuard<G> {
+    type Target = G::Target;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl<G: DerefMut> DerefMut for ObservedLockGuard<G> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.deref_mut()
     }
 }
 

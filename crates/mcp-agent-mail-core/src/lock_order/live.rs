@@ -10,7 +10,7 @@
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, TryLockError, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,8 @@ pub enum LockAccess {
 /// One named holder or waiter. Protected values are never inspected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockParticipant {
+    /// Thread observed when this phase began. Async tasks may subsequently
+    /// migrate; this is not a claim about their current executor thread.
     pub thread_id: String,
     pub thread_name: Option<String>,
     pub access: LockAccess,
@@ -58,6 +60,15 @@ pub struct LockActivity {
     pub holders: Vec<LockParticipant>,
     pub waiters: Vec<LockParticipant>,
     pub omitted_participants: usize,
+}
+
+impl LockActivity {
+    /// An observed unfinished wait at or beyond the reporting threshold.
+    /// A long-lived holder without a waiter does not establish a stall.
+    #[must_use]
+    pub fn is_stalled(&self, threshold: Duration) -> bool {
+        self.waiter_count > 0 && Duration::from_nanos(self.oldest_observed_wait_ns) >= threshold
+    }
 }
 
 /// Bounded, best-effort observation of the instrumented ordered locks only.
@@ -444,6 +455,7 @@ impl ActivityGuard {
     }
 
     pub(super) fn acquired(mut self, since: Instant) -> Self {
+        let thread = THREAD_LABEL.try_with(Arc::clone).ok();
         let mut state = self
             .instance
             .state
@@ -451,13 +463,22 @@ impl ActivityGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.waiters = state.waiters.saturating_sub(1);
         state.holders += 1;
-        if let Some(participant) = state
+        if let Some(index) = state
             .participants
-            .iter_mut()
-            .find(|participant| Some(participant.token) == self.token)
+            .iter()
+            .position(|participant| Some(participant.token) == self.token)
         {
-            participant.phase = Phase::Holding;
-            participant.since = since;
+            if let Some(thread) = thread {
+                let participant = &mut state.participants[index];
+                participant.phase = Phase::Holding;
+                participant.since = since;
+                participant.thread = thread;
+            } else {
+                // Preserve anonymous counts if TLS has already been torn
+                // down; never label a new owner with the old waiter's thread.
+                state.participants.remove(index);
+                self.token = None;
+            }
         }
         self.phase = Phase::Holding;
         drop(state);
@@ -490,9 +511,11 @@ impl Drop for ActivityGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{OrderedMutex, OrderedRwLock};
+    use super::super::{ObservedLock, OrderedMutex, OrderedRwLock};
     use super::*;
+    use std::future::Future;
     use std::sync::mpsc;
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     fn instance_id(activity: &LiveLock) -> u64 {
@@ -531,6 +554,136 @@ mod tests {
         assert_eq!((state.holders, state.waiters), (0, 0));
         assert!(state.participants.is_empty());
         drop(state);
+    }
+
+    #[test]
+    fn observed_acquisition_tracks_the_real_guard_without_a_phantom_wait() {
+        let observed = ObservedLock::new(LockLevel::DbMessageWriteSerializer);
+        let mutex = Mutex::new("protected mailbox state");
+        let caller_line = line!() + 2;
+        let acquisition =
+            observed.observe_acquisition(async { Ok::<_, ()>(mutex.lock().unwrap()) });
+        let mut acquisition = std::pin::pin!(acquisition);
+        assert!(observed.activity.instance.get().is_none());
+        let Poll::Ready(Ok(guard)) = acquisition
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("uncontended real mutex must acquire immediately");
+        };
+        let snapshot = observe_activity(instance_id(&observed.activity), |lock| {
+            lock.holder_count == 1
+        })
+        .unwrap();
+        assert_eq!(snapshot.waiter_count, 0);
+        assert_eq!(snapshot.holders[0].line, caller_line);
+        assert_eq!(*guard, "protected mailbox state");
+        assert!(mutex.try_lock().is_err());
+        drop(guard);
+        assert!(mutex.try_lock().is_ok());
+        assert_inactive(&observed.activity);
+    }
+
+    #[test]
+    fn dropping_unpolled_and_pending_acquisitions_leaves_no_waiter() {
+        let observed = ObservedLock::new(LockLevel::DbMessageWriteSerializer);
+        drop(observed.observe_acquisition(std::future::pending::<Result<Box<()>, ()>>()));
+        assert!(observed.activity.instance.get().is_none());
+        let mut acquisition =
+            Box::pin(observed.observe_acquisition(std::future::pending::<Result<Box<()>, ()>>()));
+        assert!(
+            acquisition
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let waiting = observe_waiter(instance_id(&observed.activity)).unwrap();
+        assert_eq!((waiting.holder_count, waiting.waiter_count), (0, 1));
+        drop(acquisition);
+        assert_inactive(&observed.activity);
+    }
+
+    #[test]
+    fn acquisition_error_removes_its_pending_observation() {
+        let observed = ObservedLock::new(LockLevel::DbMessageWriteSerializer);
+        let mut polled = false;
+        let acquisition = std::future::poll_fn(|_| {
+            if std::mem::replace(&mut polled, true) {
+                Poll::Ready(Err::<Box<()>, _>("cancelled"))
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut acquisition = std::pin::pin!(observed.observe_acquisition(acquisition));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            acquisition.as_mut().poll(&mut cx),
+            Poll::Ready(Err("cancelled"))
+        ));
+        assert_inactive(&observed.activity);
+    }
+
+    #[test]
+    fn observed_wait_and_owner_can_migrate_without_thread_local_order_state() {
+        let observed = ObservedLock::new(LockLevel::DbMessageWriteSerializer);
+        let mut polled = false;
+        let acquisition = std::future::poll_fn(move |_| {
+            if std::mem::replace(&mut polled, true) {
+                Poll::Ready(Ok::<_, ()>(Box::new(7)))
+            } else {
+                Poll::Pending
+            }
+        });
+        let acquisition = Box::pin(observed.observe_acquisition(acquisition));
+        std::thread::scope(|scope| {
+            let first = std::thread::Builder::new()
+                .name("serializer-wait-origin".into())
+                .spawn_scoped(scope, move || {
+                    let mut acquisition = acquisition;
+                    assert!(
+                        acquisition
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                    acquisition
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            let id = instance_id(&observed.activity);
+            let waiting = observe_waiter(id).unwrap();
+            assert_eq!(
+                waiting.waiters[0].thread_name.as_deref(),
+                Some("serializer-wait-origin")
+            );
+            let guard = std::thread::Builder::new()
+                .name("serializer-acquire-destination".into())
+                .spawn_scoped(scope, move || {
+                    let mut acquisition = first;
+                    let Poll::Ready(Ok(guard)) = acquisition
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                    else {
+                        panic!("acquisition must resolve on the second poll");
+                    };
+                    guard
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            let owned = observe_activity(id, |lock| lock.holder_count == 1).unwrap();
+            assert_eq!((owned.holder_count, owned.waiter_count), (1, 0));
+            assert_eq!(
+                owned.holders[0].thread_name.as_deref(),
+                Some("serializer-acquire-destination")
+            );
+            assert_ne!(owned.holders[0].thread_id, waiting.waiters[0].thread_id);
+            assert_eq!(*guard, 7);
+            drop(guard);
+        });
+        assert_inactive(&observed.activity);
     }
 
     #[test]

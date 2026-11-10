@@ -22,6 +22,7 @@ use crate::pool::DbPool;
 use crate::timestamps::now_micros;
 use asupersync::{CancelReason, Outcome};
 use mcp_agent_mail_core::experience::validate_atc_context;
+use mcp_agent_mail_core::lock_order::{LockLevel, ObservedLock, ObservedLockGuard};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_core::{
     ExperienceOutcome, ExperienceRow, ExperienceState, FEATURE_SCHEMA_VERSION, FeatureExtension,
@@ -44,15 +45,26 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
 
 static MESSAGE_WRITE_SERIALIZER: LazyLock<Arc<asupersync::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(asupersync::sync::Mutex::new(())));
+static MESSAGE_WRITE_ACTIVITY: ObservedLock =
+    ObservedLock::new(LockLevel::DbMessageWriteSerializer);
 
 /// Serialize in-process message inserts (br-5e8ew): id election and the insert
 /// transaction. Owned guard because the section spans async database and
 /// archive I/O; the borrowed guard is thread-affine, which would make the
 /// public future non-Send.
-async fn lock_message_write_serializer(
+#[track_caller]
+fn lock_message_write_serializer(
     cx: &Cx,
-) -> std::result::Result<asupersync::sync::OwnedMutexGuard<()>, asupersync::sync::LockError> {
-    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&MESSAGE_WRITE_SERIALIZER), cx).await
+) -> impl std::future::Future<
+    Output = std::result::Result<
+        ObservedLockGuard<asupersync::sync::OwnedMutexGuard<()>>,
+        asupersync::sync::LockError,
+    >,
+> {
+    MESSAGE_WRITE_ACTIVITY.observe_acquisition(asupersync::sync::OwnedMutexGuard::lock(
+        Arc::clone(&MESSAGE_WRITE_SERIALIZER),
+        cx,
+    ))
 }
 
 #[cfg(test)]
@@ -37800,6 +37812,85 @@ mod tests {
             0,
             "pooled connection teardown should close cleanly without drop_close warnings"
         );
+    }
+
+    #[test]
+    fn message_serializer_exposes_cancelled_and_dropped_waits_without_losing_its_owner() {
+        use mcp_agent_mail_core::lock_order::lock_activity_snapshot;
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("serializer observation runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime request context");
+            let owner_line = line!() + 1;
+            let owner = lock_message_write_serializer(&cx).await.unwrap();
+            let observed_at = |line, holding| {
+                lock_activity_snapshot().locks.iter().any(|lock| {
+                    lock.lock_name == "DbMessageWriteSerializer"
+                        && (if holding {
+                            &lock.holders
+                        } else {
+                            &lock.waiters
+                        })
+                        .iter()
+                        .any(|participant| {
+                            participant.file.ends_with("queries.rs") && participant.line == line
+                        })
+                })
+            };
+            assert!(observed_at(owner_line, true));
+
+            let cancelled = Cx::for_testing();
+            let waiter_line = line!() + 1;
+            let mut waiter = Box::pin(lock_message_write_serializer(&cancelled));
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(observed_at(waiter_line, false));
+            assert!(observed_at(owner_line, true));
+            cancelled.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel a real blocked message writer"),
+            );
+            assert!(matches!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(asupersync::sync::LockError::Cancelled))
+            ));
+            drop(waiter);
+            assert!(!observed_at(waiter_line, false));
+            assert!(observed_at(owner_line, true));
+
+            let dropped_line = line!() + 1;
+            let mut dropped = Box::pin(lock_message_write_serializer(&cx));
+            assert!(
+                dropped
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(observed_at(dropped_line, false));
+            drop(dropped);
+            assert!(!observed_at(dropped_line, false));
+            assert!(observed_at(owner_line, true));
+            drop(owner);
+            assert!(!observed_at(owner_line, true));
+
+            // The underlying Asupersync queue remains usable after both forms
+            // of cancellation, including guard release on another thread.
+            let next_line = line!() + 1;
+            let next = lock_message_write_serializer(&cx).await.unwrap();
+            assert!(observed_at(next_line, true));
+            std::thread::spawn(move || drop(next)).join().unwrap();
+            assert!(!observed_at(next_line, true));
+        });
     }
 
     /// br-kp1in.32: the process-wide message serializer covers id election and
