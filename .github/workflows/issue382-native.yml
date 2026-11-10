@@ -1,0 +1,92 @@
+name: Issue 382 native scalability qualification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/issue382-native.yml'
+      - 'scripts/perf/gh382_qualify.py'
+      - 'scripts/perf/gh362_runner_common.py'
+      - 'crates/mcp-agent-mail-db/**'
+      - 'crates/mcp-agent-mail-server/**'
+      - 'crates/mcp-agent-mail-tools/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue382-native-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '1'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  CARGO_HTTP_USER_AGENT: 'mcp_agent_mail_rust-ci (+https://github.com/Dicklesworthstone/mcp_agent_mail_rust)'
+  RUST_TEST_THREADS: '1'
+
+jobs:
+  native:
+    name: Native mailbox tests at 2 CPUs and 4 GiB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository's pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          python3 -m py_compile scripts/perf/gh382_qualify.py
+
+      # Compilation is deliberately outside the mailbox's runtime budget.
+      # Both artifacts are the actual workspace test binaries, with the same
+      # locked dependency graph as the portable production library check.
+      - name: Build native production and regression paths
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/gh382-target
+        run: python3 scripts/perf/gh382_qualify.py prepare --output "$RUNNER_TEMP/gh382"
+
+      - name: Execute native cases in a verified cgroup
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n systemd-run --quiet --wait --pipe --collect \
+            --unit="am-gh382-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --property=CPUQuota=200% \
+            --property=MemoryMax=4294967296 \
+            --property=MemoryHigh=3221225472 \
+            --property=Nice=10 \
+            --property=RuntimeMaxSec=50min \
+            /usr/bin/python3 "$GITHUB_WORKSPACE/scripts/perf/gh382_qualify.py" \
+            run --output "$RUNNER_TEMP/gh382"
+
+      - name: Check formatting and native lints
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/gh382-target
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --locked -p mcp-agent-mail-db -p mcp-agent-mail-server \
+            --no-default-features --features portable --lib --tests -- -D warnings
+
+      - name: Retain raw evidence, including failed runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue382-native-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gh382
+          if-no-files-found: warn
+          retention-days: 14
