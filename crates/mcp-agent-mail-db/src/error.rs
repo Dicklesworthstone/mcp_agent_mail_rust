@@ -1177,7 +1177,19 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_foreign_key_inconsistency(msg) {
         return DbErrorClass::ForeignKeyInconsistency;
     }
+    // A bounded waiter has not observed a database failure: another checkout
+    // still owns startup. Keep this after actual failure diagnoses so a joined
+    // probe error cannot hide corruption behind its earlier wait (GH#382).
+    if contains_initialization_gate_wait(msg) {
+        return DbErrorClass::BusyRetryable;
+    }
     DbErrorClass::ConnectionOrConfigError
+}
+
+fn contains_initialization_gate_wait(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("database initialization still in progress after ")
+        && lower.contains("(bounded init-gate wait, gh#245)")
 }
 
 fn contains_lock_or_busy(msg: &str) -> bool {
@@ -1459,6 +1471,49 @@ mod tests {
         assert!(!classification.repairable);
         assert!(is_lock_error(message));
         assert!(!is_corruption_error(message));
+    }
+
+    #[test]
+    fn initialization_gate_timeout_is_retryable_without_repair() {
+        let message = "database initialization still in progress after 30s; \
+             the mailbox is warming up or its archive reconcile is \
+             slow — retry shortly (bounded init-gate wait, GH#245)";
+        for detail in [message.to_string(), format!("Custom error: {message}")] {
+            let classification = assert_class(&detail, DbErrorClass::BusyRetryable);
+            assert!(classification.safe_to_retry);
+            assert!(!classification.repairable);
+            assert!(is_lock_error(&detail));
+            assert!(!is_corruption_error(&detail));
+            assert!(DbError::Sqlite(detail.clone()).is_retryable());
+            assert!(DbError::Pool(detail).is_retryable());
+        }
+
+        // Initialization failures must retain their underlying diagnosis.
+        for (detail, expected) in [
+            (
+                "database initialization failed: database disk image is malformed",
+                DbErrorClass::MainDbBtreeCorruption,
+            ),
+            (
+                "database initialization failed: no such table: messages",
+                DbErrorClass::SchemaDriftOrMissingTables,
+            ),
+            (
+                "database initialization failed: permission denied",
+                DbErrorClass::ConnectionOrConfigError,
+            ),
+        ] {
+            assert!(!assert_class(detail, expected).safe_to_retry);
+            assert!(!DbError::Sqlite(detail.to_string()).is_retryable());
+        }
+
+        assert_class(
+            "database initialization still in progress after 30s",
+            DbErrorClass::ConnectionOrConfigError,
+        );
+        let mixed = format!("{message}; integrity_check failed: database disk image is malformed");
+        assert!(!assert_class(&mixed, DbErrorClass::MainDbBtreeCorruption).safe_to_retry);
+        assert!(!is_lock_error(&mixed));
     }
 
     /// GH#312: a multi-form integrity probe joins every form's error into one

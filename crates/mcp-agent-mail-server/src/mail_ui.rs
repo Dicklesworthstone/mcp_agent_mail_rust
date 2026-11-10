@@ -307,6 +307,63 @@ mod request_budget_tests {
             Err((503, "Database operation did not complete".to_string()))
         );
     }
+
+    #[test]
+    fn mail_ui_db_bridge_retryable_database_errors_return_503() {
+        use mcp_agent_mail_db::DbError;
+
+        let cx = Cx::for_testing();
+        for error in [
+            DbError::Sqlite(
+                "database initialization still in progress after 30s; \
+                 the mailbox is warming up or its archive reconcile is \
+                 slow — retry shortly (bounded init-gate wait, GH#245)"
+                    .to_string(),
+            ),
+            DbError::ResourceBusy("database is locked".to_string()),
+            DbError::PoolExhausted {
+                message: "pool acquisition timed out".to_string(),
+                pool_size: 1,
+                max_overflow: 0,
+            },
+            DbError::Sqlite("Too many open files (os error 24)".to_string()),
+        ] {
+            let future = std::future::ready(asupersync::Outcome::Err(error));
+            let result: Result<(), _> = block_on_outcome(&cx, future);
+            assert_eq!(
+                result,
+                Err((
+                    503,
+                    "Database temporarily unavailable; retry shortly".to_string()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_preserves_permanent_error_and_not_found_statuses() {
+        use mcp_agent_mail_db::DbError;
+
+        let cx = Cx::for_testing();
+        for error in [
+            DbError::Sqlite("database disk image is malformed".to_string()),
+            DbError::Schema("no such table: messages".to_string()),
+            DbError::Pool("permission denied: /private/mailbox.sqlite3".to_string()),
+            DbError::invalid("project", "invalid project key"),
+        ] {
+            let future = std::future::ready(asupersync::Outcome::Err(error));
+            let result: Result<(), _> = block_on_outcome(&cx, future);
+            assert_eq!(result, Err((500, "Internal server error".to_string())));
+        }
+        let missing: Result<(), _> = block_on_outcome(
+            &cx,
+            std::future::ready(asupersync::Outcome::Err(DbError::not_found(
+                "Project",
+                "private-project-key",
+            ))),
+        );
+        assert_eq!(missing, Err((404, "Not found".to_string())));
+    }
 }
 
 #[cfg(test)]
@@ -1750,6 +1807,10 @@ fn block_on_outcome<T>(
         asupersync::Outcome::Err(e) => {
             let status = if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. }) {
                 404
+            } else if e.is_retryable() {
+                // A bounded startup wait or busy pool is temporary, not a
+                // broken database. Keep internal diagnostics in the log.
+                503
             } else {
                 500
             };
@@ -1758,6 +1819,7 @@ fn block_on_outcome<T>(
                 status,
                 match status {
                     404 => "Not found".to_string(),
+                    503 => "Database temporarily unavailable; retry shortly".to_string(),
                     _ => "Internal server error".to_string(),
                 },
             ))
