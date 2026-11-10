@@ -17305,10 +17305,14 @@ fn check_archive_consistency_with_checkpoint(
         let fallback_subject_marker = format!("__{subject_slug}");
 
         let messages_dir = project_dir.join("messages").join(&year).join(&month);
+        // Native writers use second-resolution UTC filenames. Probe that
+        // exact path first: enumerating a populated month for every recent
+        // message turns a 100-row startup sample into 100 directory walks.
+        let canonical_name = format!("{iso_prefix}Z__{subject_slug}__{}.md", msg.message_id);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
-        // We check both the computed path and do a directory scan fallback
-        // because the archive ID suffix can vary.
+        // Other timestamp spellings and archive ID suffixes retain the
+        // directory scan fallback.
         //
         // After `doctor reconstruct`, DB IDs may have been remapped from
         // canonical frontmatter IDs, so the `__{id}.md` suffix in the
@@ -17319,6 +17323,10 @@ fn check_archive_consistency_with_checkpoint(
         // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
         let found_file = if path_existing_prefix_has_symlink(&messages_dir).unwrap_or(true) {
             false
+        } else if validate_archive_component("message filename", &canonical_name).is_ok()
+            && path_is_nonsymlink_file(&messages_dir.join(&canonical_name))
+        {
+            true
         } else if path_is_nonsymlink_dir(&messages_dir) {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
@@ -18580,7 +18588,10 @@ mod tests {
             fields.remove("deregistered_at");
             fields.insert("agent_name".to_string(), serde_json::json!("BlueLake"));
             fields.insert("registered_ts".to_string(), inception);
-            fields.insert("extension".to_string(), serde_json::json!({"note": "retain"}));
+            fields.insert(
+                "extension".to_string(),
+                serde_json::json!({"note": "retain"}),
+            );
             if null_name {
                 fields.insert("name".to_string(), serde_json::Value::Null);
             }
@@ -30528,6 +30539,94 @@ mod tests {
         assert_eq!(report.found, 1);
         assert_eq!(report.missing, 0);
         assert!(report.missing_ids.is_empty());
+    }
+
+    #[test]
+    fn consistency_canonical_probes_do_not_walk_populated_month() {
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(&month).unwrap();
+        for index in 0..4096 {
+            fs::write(
+                month.join(format!("unrelated-{index}.md")),
+                "retained history",
+            )
+            .unwrap();
+        }
+        let refs: Vec<_> = (1..=100)
+            .map(|id| {
+                fs::write(
+                    month.join(format!("2026-02-08T03-29-30Z__hello-world__{id}.md")),
+                    "canonical archive message",
+                )
+                .unwrap();
+                ConsistencyMessageRef {
+                    project_slug: "test-project".into(),
+                    message_id: id,
+                    sender_name: "BlueLake".into(),
+                    subject: "hello world".into(),
+                    created_ts_iso: "2026-02-08T03:29:30.123456Z".into(),
+                }
+            })
+            .collect();
+        let checkpoints = std::cell::Cell::new(0);
+        let report = check_archive_consistency_with_checkpoint(dir.path(), &refs, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            if checkpoints.get() > refs.len() + 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "canonical archive probes must not enumerate month entries",
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(report.sampled, refs.len());
+        assert_eq!(report.found, refs.len());
+        assert_eq!(report.missing, 0);
+        assert!(report.missing_ids.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consistency_canonical_probe_rejects_symlinks_directories_and_timestamp_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(month.join("2026-02")).unwrap();
+        let outside = dir.path().join("outside.md");
+        fs::write(&outside, "outside evidence").unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            month.join("2026-02-08T03-29-30Z__hello-world__1.md"),
+        )
+        .unwrap();
+        fs::create_dir(month.join("2026-02-08T03-29-30Z__hello-world__2.md")).unwrap();
+        // This would be the fast probe's target if an untrusted timestamp
+        // were joined without validating the complete filename component.
+        let escaped = month.parent().unwrap().join("escapZ__hello-world__3.md");
+        fs::write(&escaped, "foreign month evidence").unwrap();
+        let refs: Vec<_> = (1..=3)
+            .map(|id| ConsistencyMessageRef {
+                project_slug: "test-project".into(),
+                message_id: id,
+                sender_name: "BlueLake".into(),
+                subject: "hello world".into(),
+                created_ts_iso: if id == 3 {
+                    "2026-02/../../escape".into()
+                } else {
+                    "2026-02-08T03:29:30Z".into()
+                },
+            })
+            .collect();
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 3);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing_ids, [1, 2, 3]);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside evidence");
+        assert_eq!(
+            fs::read_to_string(&escaped).unwrap(),
+            "foreign month evidence"
+        );
     }
 
     #[test]
