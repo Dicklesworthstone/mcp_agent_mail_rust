@@ -526,7 +526,7 @@ fn record_rotation_continuation(
     completed: Instant,
 ) {
     let continue_work = result.as_ref().is_ok_and(|report| {
-        report.work_deferred
+        report.work_deferred()
             && !report.admission_refused
             && !report.inventory_incomplete
             && (report.failures.is_empty()
@@ -574,7 +574,7 @@ fn run_rotation_continuation_if_due(
     match rotate() {
         Ok(report) => report_backup_rotation(&report, "bounded background continuation"),
         Err(error) => {
-            tracing::warn!(%error, "background backup retention refused; ordinary retry pacing remains in effect")
+            tracing::warn!(%error, "background backup retention refused; ordinary retry pacing remains in effect");
         }
     }
     true
@@ -981,7 +981,7 @@ fn prepare_periodic_publication(
                     "backup retention admission is unavailable; no repair export was reserved, retry after the reported reader, namespace, inventory, or durability failure is resolved",
                 ));
             }
-            if report.work_deferred {
+            if report.work_deferred() {
                 return Err(std::io::Error::other(
                     crate::backup_rotation::RotationWorkDeferred,
                 ));
@@ -1064,7 +1064,7 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_unconfirmed_deletions = report.bytes_unconfirmed_deletions,
             inventory_incomplete = report.inventory_incomplete,
             admission_refused = report.admission_refused,
-            work_deferred = report.work_deferred,
+            work_deferred = report.work_deferred(),
             completed_pin_search_without_match = report.completed_pin_search_without_match,
             failures = report.failures.len(),
             first_failure = ?report.failures.first(),
@@ -1072,8 +1072,8 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
         );
     } else if report.evicted() > 0
         || report.empty_directories_deleted > 0
-        || report.deadline_reached
-        || report.work_deferred
+        || report.deadline_reached()
+        || report.work_deferred()
     {
         tracing::info!(
             phase,
@@ -1087,8 +1087,8 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
             bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
-            deadline_reached = report.deadline_reached,
-            work_deferred = report.work_deferred,
+            deadline_reached = report.deadline_reached(),
+            work_deferred = report.work_deferred(),
             completed_pin_search_without_match = report.completed_pin_search_without_match,
             "backup retention completed"
         );
@@ -2318,7 +2318,7 @@ mod tests {
         );
         assert!(!crate::backup_rotation::periodic_publication_budget_exhausted(&error));
         let deferred = expired.rotate(&primary, None);
-        assert!(deferred.as_ref().unwrap().work_deferred);
+        assert!(deferred.as_ref().unwrap().work_deferred());
         assert_eq!(deferred.as_ref().unwrap().evicted(), 0);
         let completed = Instant::now();
         record_rotation_continuation(&primary, &deferred, Duration::from_secs(2), completed);
@@ -2327,7 +2327,12 @@ mod tests {
 
         let callbacks = std::cell::Cell::new(0);
         for (at, allowed, shutdown) in [
-            (due - Duration::from_nanos(1), true, false),
+            (
+                due.checked_sub(Duration::from_nanos(1))
+                    .expect("continuation due time permits a one-nanosecond lookback"),
+                true,
+                false,
+            ),
             (due, false, false),
             (due, true, true),
         ] {
@@ -2353,7 +2358,7 @@ mod tests {
                 callbacks.set(callbacks.get() + 1);
                 let report = policy.rotate(&primary, None)?;
                 assert_eq!(report.deleted, 4, "{report:?}");
-                assert!(!report.work_deferred, "{report:?}");
+                assert!(!report.work_deferred(), "{report:?}");
                 Ok(report)
             },
         ));
@@ -2484,7 +2489,7 @@ mod tests {
             || {
                 let report = policy.rotate(&primary, None)?;
                 assert!(report.completed_pin_search_without_match, "{report:?}");
-                assert!(!report.work_deferred, "{report:?}");
+                assert!(!report.work_deferred(), "{report:?}");
                 assert!(!report.admission_refused, "{report:?}");
                 assert_eq!(
                     report.evicted(),

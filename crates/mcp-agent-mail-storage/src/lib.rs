@@ -2531,10 +2531,15 @@ impl ArchiveRetryBacklog {
 
     /// Current `(depth, oldest_age_us)` of the backlog.
     fn backlog_state(&self) -> (u64, u64) {
-        let queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sample_backlog_state(ArchiveLagLockPolicy::Wait)
+            .unwrap_or_default()
+    }
+
+    fn sample_backlog_state(
+        &self,
+        policy: ArchiveLagLockPolicy,
+    ) -> std::result::Result<(u64, u64), &'static str> {
+        let queue = archive_lag_lock(&self.queue, policy, "archive_backlog.queue")?;
         let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
         let oldest = queue
             .iter()
@@ -2543,7 +2548,7 @@ impl ArchiveRetryBacklog {
             .map_or(0, |enqueued_at| {
                 duration_as_micros_u64(enqueued_at.elapsed())
             });
-        (depth, oldest)
+        Ok((depth, oldest))
     }
 
     /// Process the front entry once (single-drainer; the front is stable across
@@ -3397,6 +3402,34 @@ pub struct ArchiveLagSnapshot {
     pub wbq_since_progress_us: u64,
 }
 
+/// A diagnostic sample could not inspect a queue without waiting for its owner.
+#[derive(Debug, Clone, Copy, Error)]
+#[error("archive lag sample unavailable at {unavailable_lock}")]
+pub struct ArchiveLagSnapshotUnavailable {
+    pub unavailable_lock: &'static str,
+    /// Confirmed lower bounds only. Missing queue evidence is not an empty queue.
+    pub lower_bound: ArchiveLagSnapshot,
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveLagLockPolicy {
+    Wait,
+    Try,
+}
+
+fn archive_lag_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    policy: ArchiveLagLockPolicy,
+    site: &'static str,
+) -> std::result::Result<std::sync::MutexGuard<'a, T>, &'static str> {
+    match policy {
+        ArchiveLagLockPolicy::Wait => Ok(mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)),
+        ArchiveLagLockPolicy::Try => mutex.try_lock().map_err(|_| site),
+    }
+}
+
 /// Wall-clock µs at which the WBQ drain dequeued the batch it is executing
 /// now; 0 when no batch is in flight (br-kp1in.23).
 static WBQ_INFLIGHT_SINCE_US: AtomicU64 = AtomicU64::new(0);
@@ -3474,7 +3507,9 @@ fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
     )
 }
 
-/// Snapshot the live archive-materialization lag for `health_check`.
+/// Blocking archive-materialization lag snapshot for accounting.
+///
+/// Health diagnostics use [`try_archive_lag_snapshot`] to avoid queue waits.
 ///
 /// `oldest_unmaterialized_us` covers the retry backlog, the commit coalescer
 /// AND the batch the WBQ drain is executing. Before br-kp1in.23 the WBQ was
@@ -3482,13 +3517,41 @@ fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
 /// reported 0 ms of lag (observed 2026-09-23).
 #[must_use]
 pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
+    sample_archive_lag(ArchiveLagLockPolicy::Wait).0
+}
+
+/// Sample health without waiting for an archive queue mutex.
+///
+/// Unavailable queue ages must remain unknown. The error retains already
+/// observed lower bounds, including the lock-free WBQ stall signals.
+///
+/// # Errors
+/// Returns the unavailable lock and confirmed lower bounds on contention or
+/// a poisoned queue mutex.
+pub fn try_archive_lag_snapshot()
+-> std::result::Result<ArchiveLagSnapshot, Box<ArchiveLagSnapshotUnavailable>> {
+    let (snapshot, unavailable_lock) = sample_archive_lag(ArchiveLagLockPolicy::Try);
+    unavailable_lock.map_or(Ok(snapshot), |unavailable_lock| {
+        Err(Box::new(ArchiveLagSnapshotUnavailable {
+            unavailable_lock,
+            lower_bound: snapshot,
+        }))
+    })
+}
+
+fn sample_archive_lag(policy: ArchiveLagLockPolicy) -> (ArchiveLagSnapshot, Option<&'static str>) {
     let backlog = &*ARCHIVE_BACKLOG;
-    let (backlog_depth, backlog_oldest_age_us) = backlog.backlog_state();
-    let (coalescer_pending, coalescer_lag) = COMMIT_COALESCER
-        .get()
-        .map_or((0, CoalescerLagState::default()), |c| {
-            (c.pending_requests(), c.lag_state())
-        });
+    // Blocking accounting samples WBQ ages after queue waits, as before.
+    // Diagnostics need those lock-free lower bounds before any try-lock fails.
+    let blocking = matches!(policy, ArchiveLagLockPolicy::Wait).then(|| {
+        let backlog_state = backlog.backlog_state();
+        let coalescer = COMMIT_COALESCER
+            .get()
+            .map_or((0, CoalescerLagState::default()), |coalescer| {
+                (coalescer.pending_requests(), coalescer.lag_state())
+            });
+        (backlog_state, coalescer)
+    });
     let now_us = now_micros_u64();
     let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) = wbq_inflight_ages_us(now_us);
     let wbq_depth = mcp_agent_mail_core::global_metrics()
@@ -3501,18 +3564,18 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed),
         WBQ_BACKLOG_SINCE_US.load(Ordering::Relaxed),
     );
-    ArchiveLagSnapshot {
-        backlog_depth,
-        backlog_oldest_age_us,
-        coalescer_pending,
-        coalescer_oldest_age_us: coalescer_lag.oldest_age_us,
-        coalescer_since_progress_us: coalescer_lag.since_progress_us,
+    let mut snapshot = ArchiveLagSnapshot {
+        coalescer_pending: blocking.map_or_else(
+            || {
+                COMMIT_COALESCER
+                    .get()
+                    .map_or(0, CommitCoalescer::pending_requests)
+            },
+            |(_, (pending, _))| pending,
+        ),
         // Queued work that has not advanced for this long is at least this
         // stale, even when no batch is in flight (dead or idle drain).
-        oldest_unmaterialized_us: backlog_oldest_age_us
-            .max(coalescer_lag.oldest_age_us)
-            .max(wbq_inflight_oldest_age_us)
-            .max(wbq_since_progress_us),
+        oldest_unmaterialized_us: wbq_inflight_oldest_age_us.max(wbq_since_progress_us),
         wbq_depth,
         wbq_inflight_oldest_age_us,
         wbq_inflight_execution_us,
@@ -3522,7 +3585,37 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
         dead_lettered_total: backlog.dead_lettered_total.load(Ordering::Relaxed),
         ephemeral_total: backlog.ephemeral_total.load(Ordering::Relaxed),
+        ..ArchiveLagSnapshot::default()
+    };
+    let backlog_state = blocking.map_or_else(
+        || backlog.sample_backlog_state(policy),
+        |(state, _)| Ok(state),
+    );
+    let (depth, age) = match backlog_state {
+        Ok(state) => state,
+        Err(site) => return (snapshot, Some(site)),
+    };
+    snapshot.backlog_depth = depth;
+    snapshot.backlog_oldest_age_us = age;
+    snapshot.oldest_unmaterialized_us = snapshot.oldest_unmaterialized_us.max(age);
+    if let Some(coalescer) = COMMIT_COALESCER.get() {
+        let (lag, unavailable) = if let Some((_, (_, lag))) = blocking {
+            (lag, None)
+        } else {
+            match coalescer.sample_lag_state(policy) {
+                Ok(lag) => (lag, None),
+                Err((site, lag)) => (lag, Some(site)),
+            }
+        };
+        snapshot.coalescer_oldest_age_us = lag.oldest_age_us;
+        snapshot.coalescer_since_progress_us = lag.since_progress_us;
+        snapshot.oldest_unmaterialized_us =
+            snapshot.oldest_unmaterialized_us.max(lag.oldest_age_us);
+        if unavailable.is_some() {
+            return (snapshot, unavailable);
+        }
     }
+    (snapshot, None)
 }
 
 /// Failure modes for delivering a control message (`Flush`/`Shutdown`) to the
@@ -6801,50 +6894,56 @@ impl CommitCoalescer {
     }
 
     fn lag_state(&self) -> CoalescerLagState {
+        self.sample_lag_state(ArchiveLagLockPolicy::Wait)
+            .unwrap_or_else(|(_, lower_bound)| lower_bound)
+    }
+
+    fn sample_lag_state(
+        &self,
+        policy: ArchiveLagLockPolicy,
+    ) -> std::result::Result<CoalescerLagState, (&'static str, CoalescerLagState)> {
         let now = Instant::now();
-        let repos = self
-            .repos
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut lag = CoalescerLagState::default();
-        for rq in repos.values() {
-            // Keep all three ownership locations locked together. In
-            // particular, a failed commit can move from in-flight back into
-            // the queue while this snapshot is being sampled.
-            let queue = rq
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let spill = rq
-                .spill
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
-            if let Some(repo) = spill.inner.as_ref() {
-                oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
-                    o.min(repo.earliest_enqueued_at)
-                }));
+        let sampled = (|| {
+            let repos = archive_lag_lock(&self.repos, policy, "commit_coalescer.repos")?;
+            for rq in repos.values() {
+                // Keep all three ownership locations locked together. In
+                // particular, a failed commit can move from in-flight back into
+                // the queue while this snapshot is being sampled.
+                let queue = archive_lag_lock(&rq.queue, policy, "commit_coalescer.queue")?;
+                let spill = archive_lag_lock(&rq.spill, policy, "commit_coalescer.spill")?;
+                let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
+                if let Some(repo) = spill.inner.as_ref() {
+                    oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
+                        o.min(repo.earliest_enqueued_at)
+                    }));
+                }
+                // Queued work is already confirmed pending while these
+                // guards are held. Preserve its age if progress is unavailable.
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                }
+                let progress = archive_lag_lock(&rq.progress, policy, "commit_coalescer.progress")?;
+                if let Some(inflight) = progress.inflight_oldest {
+                    oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
+                }
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                    let last_progress = progress
+                        .last_completed
+                        .map_or(oldest, |completed| completed.max(oldest));
+                    lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(last_progress),
+                    ));
+                }
             }
-            let progress = rq
-                .progress
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(inflight) = progress.inflight_oldest {
-                oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
-            }
-            if let Some(oldest) = oldest {
-                lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
-                    now.saturating_duration_since(oldest),
-                ));
-                let last_progress = progress
-                    .last_completed
-                    .map_or(oldest, |completed| completed.max(oldest));
-                lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
-                    now.saturating_duration_since(last_progress),
-                ));
-            }
-        }
-        lag
+            Ok(())
+        })();
+        sampled.map(|()| lag).map_err(|site| (site, lag))
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -25508,6 +25607,13 @@ mod tests {
             "overall lag must include the blocked WBQ batch: {stuck:?}"
         );
 
+        let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+        let unavailable = try_archive_lag_snapshot().unwrap_err();
+        assert_eq!(unavailable.unavailable_lock, "archive_backlog.queue");
+        assert!(unavailable.lower_bound.wbq_inflight_execution_us >= 1_000_000);
+        assert!(unavailable.lower_bound.oldest_unmaterialized_us >= 1_000_000);
+        drop(backlog);
+
         drop(fence);
         assert_eq!(
             wbq_flush_status(),
@@ -28291,6 +28397,54 @@ mod tests {
     }
 
     #[test]
+    fn archive_lag_nonblocking_sample_names_real_held_queue_mutexes() {
+        if !isolated_coalescer_regression(
+            "tests::archive_lag_nonblocking_sample_names_real_held_queue_mutexes",
+        ) {
+            return;
+        }
+        let coalescer = get_commit_coalescer();
+        let root = TempDir::new().unwrap();
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(root.path()));
+        assert!(try_archive_lag_snapshot().is_ok());
+
+        // These are the actual global queues used by production sampling,
+        // not independent fixture mutexes. A blocking regression deadlocks
+        // against this same-thread holder and is terminated by nextest.
+        let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "archive_backlog.queue"
+        );
+        drop(backlog);
+        let repos = coalescer.repos.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.repos"
+        );
+        drop(repos);
+        let queue = rq.queue.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.queue"
+        );
+        drop(queue);
+        let spill = rq.spill.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.spill"
+        );
+        drop(spill);
+        let progress = rq.progress.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.progress"
+        );
+        drop(progress);
+        assert_eq!(try_archive_lag_snapshot().unwrap(), archive_lag_snapshot());
+    }
+
+    #[test]
     fn archive_lag_reports_coalescer_batch_blocked_in_flight() {
         if !isolated_coalescer_regression(
             "tests::archive_lag_reports_coalescer_batch_blocked_in_flight",
@@ -28710,6 +28864,7 @@ mod tests {
         let config = test_config(tmp.path());
         let repo_root = config.storage_root.join("projects").join("cproj");
         std::fs::create_dir_all(&repo_root).unwrap();
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(&repo_root));
         coalescer.enqueue(
             repo_root,
             &config,
@@ -28725,6 +28880,18 @@ mod tests {
         assert!(
             coalescer.oldest_pending_age_us() > 0,
             "oldest uncommitted request reports commit-lag age"
+        );
+        let progress = rq.progress.lock().unwrap();
+        let (site, lower_bound) = coalescer
+            .sample_lag_state(ArchiveLagLockPolicy::Try)
+            .unwrap_err();
+        assert_eq!(site, "commit_coalescer.progress");
+        assert!(lower_bound.oldest_age_us > 0);
+        drop(progress);
+        assert!(
+            coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .is_ok()
         );
     }
 
