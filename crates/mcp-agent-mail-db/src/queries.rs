@@ -9995,7 +9995,6 @@ fn decode_idempotency_result<T: DeserializeOwned>(
 /// only messages belonging to that project are returned — preventing
 /// cross-project data leakage.  When `None` (e.g., internal index
 /// rebuilds), all matching messages are returned regardless of project.
-#[allow(clippy::too_many_lines)]
 pub async fn get_messages_details_by_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -10013,12 +10012,33 @@ pub async fn get_messages_details_by_ids(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    // Split message/sender reads must observe the same committed snapshot.
+    // Retire the checkout if cancellation drops this future mid-transaction.
+    conn.retire_on_drop.store(true, Ordering::Release);
     let tracked = tracked(&*conn);
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+    let rows = try_in_tx!(
+        cx,
+        &tracked,
+        get_messages_details_by_ids_in_tx(cx, &tracked, message_ids, project_id).await
+    );
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+    conn.retire_on_drop.store(false, Ordering::Release);
+    Outcome::Ok(rows)
+}
 
+#[allow(clippy::too_many_lines)]
+async fn get_messages_details_by_ids_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    message_ids: &[i64],
+    project_id: Option<i64>,
+) -> Outcome<Vec<ThreadMessageRow>, DbError> {
     let mut out = Vec::with_capacity(message_ids.len());
 
     for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-        let placeholders = placeholders(chunk.len());
+        let chunk_start = out.len();
+        let message_placeholders = placeholders(chunk.len());
         let project_clause = if project_id.is_some() {
             " AND m.project_id = ?"
         } else {
@@ -10027,10 +10047,9 @@ pub async fn get_messages_details_by_ids(
         let sql = format!(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                     m.importance, m.ack_required, m.created_ts, m.recipients_json, \
-                    m.attachments, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name \
+                    m.attachments \
              FROM messages m \
-             LEFT JOIN agents a ON a.id = m.sender_id \
-             WHERE m.id IN ({placeholders}){project_clause}"
+             WHERE m.id IN ({message_placeholders}){project_clause}"
         );
 
         let mut params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
@@ -10038,7 +10057,7 @@ pub async fn get_messages_details_by_ids(
             params.push(Value::BigInt(pid));
         }
 
-        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
             Outcome::Ok(rows) => {
                 for row in rows {
                     let get_i64 = |idx: usize| -> std::result::Result<i64, DbError> {
@@ -10102,10 +10121,6 @@ pub async fn get_messages_details_by_ids(
                         Ok(v) => v.unwrap_or_else(|| "[]".to_string()),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let from: String = match row.get_as::<Option<String>>(12) {
-                        Ok(v) => v.unwrap_or_default(),
-                        Err(e) => return Outcome::Err(map_sql_error(&e)),
-                    };
                     out.push(ThreadMessageRow {
                         id,
                         project_id,
@@ -10119,13 +10134,58 @@ pub async fn get_messages_details_by_ids(
                         created_ts,
                         recipients,
                         attachments,
-                        from,
+                        from: String::new(),
                     });
                 }
             }
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+
+        // Keep both reads as simple primary-key lookups instead of invoking
+        // joined row materialization for the mailbox. Only senders belonging
+        // to this selected chunk are hydrated, on the same connection and
+        // snapshot. A second pool acquisition could deadlock a size-one pool;
+        // the agent cache could return a stale name after an import or rename.
+        let mut sender_ids: Vec<i64> = out[chunk_start..]
+            .iter()
+            .map(|message| message.sender_id)
+            .collect();
+        sender_ids.sort_unstable();
+        sender_ids.dedup();
+        if sender_ids.is_empty() {
+            continue;
+        }
+        let sender_sql = format!(
+            "SELECT id, name FROM agents WHERE id IN ({})",
+            placeholders(sender_ids.len())
+        );
+        let sender_params: Vec<Value> = sender_ids.into_iter().map(Value::BigInt).collect();
+        let sender_rows =
+            match map_sql_outcome(traw_query(cx, tracked, &sender_sql, &sender_params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+        let mut sender_names = HashMap::with_capacity(sender_rows.len());
+        for row in sender_rows {
+            let id = match row.get_as::<i64>(0) {
+                Ok(id) => id,
+                Err(error) => return Outcome::Err(map_sql_error(&error)),
+            };
+            let name = match row.get_as::<Option<String>>(1) {
+                Ok(name) => name.unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string()),
+                Err(error) => return Outcome::Err(map_sql_error(&error)),
+            };
+            sender_names.insert(id, name);
+        }
+        for message in &mut out[chunk_start..] {
+            message.from = sender_names
+                .get(&message.sender_id)
+                .cloned()
+                .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
         }
     }
     Outcome::Ok(out)
@@ -30657,6 +30717,220 @@ mod tests {
         .await
         .into_result()
         .expect("multiple deliveries must not multiply conversation counts");
+    }
+
+    #[test]
+    fn message_details_hydration_preserves_scope_and_metadata() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build hydration runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("message_details_hydration.db");
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs hydration context");
+            seed_project_thread_fixture(&cx, &pool).await;
+            let recipients = r#"{"to":["BlueLake"],"cc":["RedStone"],"bcc":["HiddenPine"]}"#;
+            let attachments = r#"[{"path":"attachments/diagram.webp"}]"#;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire hydration fixture connection");
+            conn.execute(
+                &cx,
+                "UPDATE messages SET sender_id = 2, topic = ?, subject = ?, body_md = ?, \
+                 importance = 'urgent', ack_required = 1, recipients_json = ?, attachments = ? \
+                 WHERE id = 4",
+                &[
+                    Value::Text("release".into()),
+                    Value::Text("Hydrate Unicode 📨".into()),
+                    Value::Text("Body with 'quotes' and Ω".into()),
+                    Value::Text(recipients.into()),
+                    Value::Text(attachments.into()),
+                ],
+            )
+            .await
+            .into_result()
+            .expect("set complete envelope metadata");
+            drop(conn);
+
+            let mut rows = get_messages_details_by_ids(&cx, &pool, &[4, 1, 4, 10, i64::MAX], Some(1))
+                .await
+                .into_result()
+                .expect("hydrate scoped message batch");
+            rows.sort_by_key(|row| row.id);
+            assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1, 4]);
+            assert_eq!(rows[0].from, "BlueLake");
+            assert_eq!(rows[0].thread_id, None);
+            assert_eq!(rows[0].topic, None);
+            let detail = &rows[1];
+            assert_eq!(detail.project_id, 1);
+            assert_eq!(detail.sender_id, 2);
+            assert_eq!(detail.from, "RedStone");
+            assert_eq!(detail.thread_id.as_deref(), Some("topic"));
+            assert_eq!(detail.topic.as_deref(), Some("release"));
+            assert_eq!(detail.subject, "Hydrate Unicode 📨");
+            assert_eq!(detail.body_md, "Body with 'quotes' and Ω");
+            assert_eq!(detail.importance, "urgent");
+            assert_eq!(detail.ack_required, 1);
+            assert_eq!(detail.created_ts, 50);
+            assert_eq!(detail.recipients, recipients);
+            assert_eq!(detail.attachments, attachments);
+
+            let foreign = get_messages_details_by_ids(&cx, &pool, &[1, 4, 10], Some(2))
+                .await
+                .into_result()
+                .expect("hydrate foreign project only");
+            assert_eq!(foreign.len(), 1);
+            assert_eq!(foreign[0].id, 10);
+            assert_eq!(foreign[0].from, "GreenLake");
+            let mut unscoped = get_messages_details_by_ids(&cx, &pool, &[10, 4, 1], None)
+                .await
+                .into_result()
+                .expect("hydrate unscoped batch");
+            unscoped.sort_by_key(|row| row.id);
+            assert_eq!(
+                unscoped.iter().map(|row| row.id).collect::<Vec<_>>(),
+                vec![1, 4, 10]
+            );
+        });
+    }
+
+    #[test]
+    fn message_details_hydration_refreshes_renamed_and_missing_senders() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build sender hydration runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("message_details_senders.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs hydration context");
+            seed_project_thread_fixture(&cx, &pool).await;
+            // An import can rename an agent without updating the process cache.
+            get_agents_by_ids(&cx, &pool, &[1])
+                .await
+                .into_result()
+                .expect("cache original sender");
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire sender update connection");
+            conn.execute(
+                &cx,
+                "UPDATE agents SET name = 'GreenCastle' WHERE id = 1",
+                &[],
+            )
+            .await
+            .into_result()
+            .expect("rename sender");
+            drop(conn);
+            let renamed = get_messages_details_by_ids(&cx, &pool, &[1], Some(1))
+                .await
+                .into_result()
+                .expect("hydrate renamed sender");
+            assert_eq!(renamed[0].from, "GreenCastle");
+            cleanup_committed_agent_after_consistency_failure(&cx, &pool, 2, 3, "GreenLake")
+                .await
+                .into_result()
+                .expect("orphan hydrated message sender");
+            let orphaned = get_messages_details_by_ids(&cx, &pool, &[10], Some(2))
+                .await
+                .into_result()
+                .expect("hydrate orphaned sender");
+            assert_eq!(orphaned.len(), 1);
+            assert_eq!(orphaned[0].from, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(orphaned[0].subject, "foreign topic");
+            for ids in [&[][..], &[i64::MAX][..]] {
+                assert!(
+                    get_messages_details_by_ids(&cx, &pool, ids, Some(1))
+                        .await
+                        .into_result()
+                        .expect("empty hydration")
+                        .is_empty()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn message_details_hydration_bounds_sender_queries_across_chunks() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build chunked hydration runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("message_details_hydration_chunks.db");
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs hydration context");
+            seed_project_thread_fixture(&cx, &pool).await;
+            let mut ids: Vec<i64> = (1..=21).collect();
+            ids.resize(MAX_IN_CLAUSE_ITEMS, i64::MAX);
+            ids.extend([4, 4, 10, i64::MAX]);
+            let tracker = Arc::new(crate::QueryTracker::new());
+            tracker.enable(None);
+            let mut rows = {
+                let _guard = crate::set_active_tracker(Arc::clone(&tracker));
+                get_messages_details_by_ids(&cx, &pool, &ids, Some(1))
+                    .await
+                    .into_result()
+                    .expect("hydrate two parameter chunks")
+            };
+            rows.sort_by_key(|row| row.id);
+            let mut expected: Vec<i64> = (1..=21)
+                .filter(|id| *id != 10 && *id != 11)
+                .collect();
+            // Each SQL IN clause deduplicates its own parameters. As before,
+            // an ID requested in both chunks appears in both chunks' output.
+            expected.push(4);
+            expected.sort_unstable();
+            assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), expected);
+            assert!(
+                rows.iter()
+                    .all(|row| row.project_id == 1 && row.from == "BlueLake")
+            );
+            let snapshot = tracker.snapshot();
+            assert!(
+                snapshot.total > 0 && snapshot.total <= 6,
+                "two message batches must not issue per-message sender lookups: {snapshot:?}"
+            );
+            assert!(snapshot.per_table.get("agents").copied().unwrap_or(0) <= 2);
+        });
+    }
+
+    #[test]
+    fn message_details_hydration_decode_error_leaves_pool_usable() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build failed hydration runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("message_details_decode_error.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs hydration context");
+            seed_project_thread_fixture(&cx, &pool).await;
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire malformed fixture connection");
+            // A damaged imported timestamp must fail decoding without
+            // stranding a read transaction in this single-connection pool.
+            conn.execute(
+                &cx,
+                "UPDATE messages SET created_ts = 'invalid-timestamp' WHERE id = 1",
+                &[],
+            )
+            .await
+            .into_result()
+            .expect("seed malformed timestamp");
+            drop(conn);
+            assert!(matches!(
+                get_messages_details_by_ids(&cx, &pool, &[1], Some(1)).await,
+                Outcome::Err(_)
+            ));
+            let rows = get_messages_details_by_ids(&cx, &pool, &[4], Some(1))
+                .await
+                .into_result()
+                .expect("next hydration must acquire and start a clean snapshot");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, 4);
+            assert_eq!(rows[0].created_ts, 50);
+            assert_eq!(rows[0].from, "BlueLake");
+        });
     }
 
     #[test]
