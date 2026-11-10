@@ -55,6 +55,10 @@ pub struct TantivyBridge {
     /// completed before the search.
     catch_ups_started: AtomicU64,
     catch_up_completed: AtomicU64,
+    backfill_in_progress: AtomicBool,
+    verified_source: Mutex<Option<ObservedLexicalSource>>,
+    /// Usable generation proof, distinct from exact current-revision coverage.
+    available_source: Mutex<Option<ObservedLexicalSource>>,
     /// Last source revision seen by this process. A marker refreshed by a
     /// different process cannot invalidate this process's result cache.
     observed_source: Mutex<Option<ObservedLexicalSource>>,
@@ -103,6 +107,9 @@ impl TantivyBridge {
             source_operation: Mutex::new(()),
             catch_ups_started: AtomicU64::new(0),
             catch_up_completed: AtomicU64::new(0),
+            backfill_in_progress: AtomicBool::new(false),
+            verified_source: Mutex::new(None),
+            available_source: Mutex::new(None),
             observed_source: Mutex::new(None),
             publish_source_state,
             handles,
@@ -123,6 +130,9 @@ impl TantivyBridge {
             source_operation: Mutex::new(()),
             catch_ups_started: AtomicU64::new(0),
             catch_up_completed: AtomicU64::new(0),
+            backfill_in_progress: AtomicBool::new(false),
+            verified_source: Mutex::new(None),
+            available_source: Mutex::new(None),
             observed_source: Mutex::new(None),
             publish_source_state: false,
             handles,
@@ -148,12 +158,94 @@ impl TantivyBridge {
         &self.index_dir
     }
 
+    /// A source scan may be startup work or an interactive catch-up.
+    #[must_use]
+    pub fn backfill_in_progress(&self) -> bool {
+        self.backfill_in_progress.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn source_is_verified(&self, path: &str, generation: Option<&str>) -> bool {
+        let Ok(observed) = self.observed_source.try_lock() else {
+            return false;
+        };
+        let Ok(verified) = self.verified_source.try_lock() else {
+            return false;
+        };
+        verified.as_ref().is_some_and(|source| {
+            source.path == path
+                && source.generation.as_deref() == generation
+                && observed.as_ref() == Some(source)
+        })
+    }
+
+    /// A usable generation is not a freshness claim. A possible append tail
+    /// still needs the ordinary row-delta, watermark and publication checks;
+    /// INSERT OR REPLACE and late commits can require repair.
+    pub(crate) fn source_is_available(&self, path: &str, generation: Option<&str>) -> bool {
+        let Ok(observed) = self.observed_source.try_lock() else {
+            return false;
+        };
+        let Ok(available) = self.available_source.try_lock() else {
+            return false;
+        };
+        let (Some(current), Some(indexed)) = (observed.as_ref(), available.as_ref()) else {
+            return false;
+        };
+        current.path == path
+            && current.generation.as_deref() == generation
+            && current.same_generation_as(indexed)
+            && match (current.clock, indexed.clock) {
+                (Some(current_clock), Some(indexed_clock)) => {
+                    if current.memory {
+                        current_clock == indexed_clock
+                    } else {
+                        current_clock.revision >= indexed_clock.revision
+                            && current_clock.rewrite_revision == indexed_clock.rewrite_revision
+                    }
+                }
+                _ => false,
+            }
+    }
+
+    pub(crate) fn revoke_source_proof_for(&self, path: &str, generation: &str) {
+        let observed = self
+            .observed_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observed.as_ref().is_some_and(|source| {
+            source.path == path && source.generation.as_deref() == Some(generation)
+        }) {
+            // Keep observation locked through revocation: the same Arc may
+            // be rebound to another mailbox in the same index directory.
+            self.revoke_source_proof();
+        }
+    }
+
+    pub(crate) fn revoke_source_proof(&self) {
+        *self
+            .verified_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .available_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// Execute a search using the planner query types.
     ///
     /// Converts the planner `SearchQuery` to Tantivy-native queries,
     /// executes the search, and converts results back to `SearchResult`.
     #[must_use]
     pub fn search(&self, query: &PlannerQuery) -> Vec<PlannerResult> {
+        self.search_inner(query, false).unwrap_or_default()
+    }
+
+    fn search_inner(
+        &self,
+        query: &PlannerQuery,
+        canonical_candidates: bool,
+    ) -> Result<Vec<PlannerResult>, String> {
         let importance_plan = build_importance_filter_plan(query);
         let filter = build_search_filter(query, &importance_plan);
         let compiled = compile_filters(&filter, &self.handles);
@@ -167,13 +259,39 @@ impl TantivyBridge {
             ParseOutcome::Parsed(q) | ParseOutcome::Fallback { query: q, .. } => q,
             ParseOutcome::Empty => {
                 if compiled.is_empty() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 Box::new(AllQuery)
             }
         };
 
         let final_query = compiled.apply_to(text_query);
+
+        // Live service calls hydrate and authorize these IDs from SQLite.
+        // An exact filter must precede top-K truncation. Keep the rich path
+        // for index-only callers and filters needing metadata after retrieval.
+        if canonical_candidates && !importance_plan.needs_post_filter {
+            let cursor = query.cursor.as_deref().and_then(SearchCursor::decode);
+            return lexical_response::collect_message_candidates(
+                &self.index,
+                &*final_query,
+                &self.handles,
+                query.effective_limit(),
+                cursor.as_ref(),
+            )
+            .map(|candidates| {
+                candidates
+                    .into_iter()
+                    .map(|(id, score)| PlannerResult {
+                        doc_kind: query.doc_kind,
+                        id,
+                        score: Some(score),
+                        ..PlannerResult::default()
+                    })
+                    .collect()
+            })
+            .map_err(|error| format!("lexical candidate collection failed: {error}"));
+        }
 
         // Extract terms for snippets
         let terms = extract_terms(&query.text);
@@ -216,7 +334,7 @@ impl TantivyBridge {
                 || fetch_limit >= max_fetch_limit
             {
                 planner_results.truncate(limit);
-                return planner_results;
+                return Ok(planner_results);
             }
             fetch_limit = fetch_limit.saturating_mul(2).min(max_fetch_limit);
         }
@@ -543,6 +661,11 @@ pub fn get_bridge() -> Option<Arc<TantivyBridge>> {
         .clone()
 }
 
+/// Readiness callbacks must not queue behind a bridge replacement.
+pub(crate) fn try_get_bridge() -> Option<Arc<TantivyBridge>> {
+    bridge_slot().try_read().ok().and_then(|slot| slot.clone())
+}
+
 #[cfg(test)]
 pub(crate) fn reset_bridge_for_tests() {
     *bridge_slot()
@@ -675,12 +798,37 @@ impl LexicalChangeClock {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone)]
 struct ObservedLexicalSource {
     path: String,
     generation: Option<String>,
     clock: Option<LexicalChangeClock>,
+    memory: bool,
+    // Probe this in the readiness worker, never in the HTTP callback. A
+    // restored file can reuse a logical generation and every clock value.
+    file_fingerprint: Option<BackfillDbFingerprint>,
 }
+
+impl ObservedLexicalSource {
+    fn same_generation_as(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.generation == other.generation
+            && self.memory == other.memory
+            && match (self.file_fingerprint, other.file_fingerprint) {
+                (Some(left), Some(right)) => same_backfill_source_file(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl PartialEq for ObservedLexicalSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_generation_as(other) && self.clock == other.clock
+    }
+}
+
+impl Eq for ObservedLexicalSource {}
 
 fn observe_lexical_source(bridge: &TantivyBridge, source: ObservedLexicalSource) {
     if !bridge.publish_source_state {
@@ -699,6 +847,81 @@ fn observe_lexical_source(bridge: &TantivyBridge, source: ObservedLexicalSource)
     }
 }
 
+fn record_verified_source(bridge: &TantivyBridge, source: ObservedLexicalSource) {
+    if bridge.publish_source_state
+        && source.clock.is_some()
+        && (source.memory || source.file_fingerprint.is_some())
+    {
+        *bridge
+            .available_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source.clone());
+        *bridge
+            .verified_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+}
+
+/// Observe one actual serving-pool snapshot. It can revoke a previous proof,
+/// but only a successfully sealed backfill can certify a nonempty source.
+pub(crate) fn observe_pool_source(
+    bridge: &TantivyBridge,
+    path: &str,
+    generation: &str,
+    revision: i64,
+    rewrite_revision: i64,
+    memory: bool,
+) {
+    observe_lexical_source(
+        bridge,
+        ObservedLexicalSource {
+            path: path.to_string(),
+            generation: Some(generation.to_string()),
+            clock: Some(LexicalChangeClock {
+                revision,
+                rewrite_revision,
+            }),
+            memory,
+            file_fingerprint: if memory {
+                None
+            } else {
+                sqlite_file_backfill_fingerprint(path)
+            },
+        },
+    );
+}
+
+/// The caller has observed an empty *actual* memory pool, not a freshly
+/// opened standalone :memory: database. The source identity is pool-specific.
+pub(crate) fn verify_empty_memory_source(
+    bridge: &TantivyBridge,
+    cx: &asupersync::Cx,
+    path: &str,
+    generation: &str,
+    revision: i64,
+    rewrite_revision: i64,
+) -> Result<(), String> {
+    let _source_guard = backfill_source_lock(bridge, Some(cx))?;
+    backfill_checkpoint(Some(cx))?;
+    if fetch_index_message_stats(bridge)?.count != 0 {
+        return Err("empty memory mailbox has a nonempty lexical index".to_string());
+    }
+    let source = ObservedLexicalSource {
+        path: path.to_string(),
+        generation: Some(generation.to_string()),
+        clock: Some(LexicalChangeClock {
+            revision,
+            rewrite_revision,
+        }),
+        memory: true,
+        file_fingerprint: None,
+    };
+    observe_lexical_source(bridge, source.clone());
+    record_verified_source(bridge, source);
+    Ok(())
+}
+
 /// An absent clock is an old schema, never evidence that the index is fresh.
 /// Errors reading a present clock must remain errors rather than becoming a
 /// zero revision that could authorize a stale marker.
@@ -708,7 +931,7 @@ pub(crate) fn lexical_change_clock(conn: &DbConn) -> Result<Option<LexicalChange
 
 fn lexical_change_clock_with_cancellation(
     conn: &DbConn,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<Option<LexicalChangeClock>, String> {
     let rows = match query_sync_with_lock_retry(
         conn,
@@ -916,7 +1139,7 @@ fn write_backfill_state(
 
 fn fetch_db_message_stats(
     conn: &DbConn,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<MessageStats, String> {
     // Keep COUNT and MAX in separate scalar subqueries; FrankensQLite rejects
     // mixed aggregate/non-aggregate projections in one SELECT.
@@ -952,7 +1175,7 @@ fn fetch_db_message_stats(
 
 fn fetch_db_message_watermark(
     conn: &DbConn,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<MessageWatermark, String> {
     let max_id_rows = match query_sync_with_lock_retry(
         conn,
@@ -1018,15 +1241,44 @@ const BACKFILL_SOURCE_CHANGED: &str =
     "backfill source changed during scan; index was not published";
 const BACKFILL_CANCELLED: &str = "startup lexical backfill cancelled";
 
-fn backfill_checkpoint(cancelled: Option<&AtomicBool>) -> Result<(), String> {
-    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-        Err(BACKFILL_CANCELLED.into())
-    } else {
-        Ok(())
+/// A foreground request and a startup worker share cancellation checkpoints,
+/// but retain their own lifetime and budget. No new timeout is invented here.
+trait BackfillCancellation {
+    fn check(&self) -> Result<(), String>;
+
+    fn remaining_ms(&self) -> Option<u64> {
+        None
     }
 }
 
-fn backfill_wait(delay: std::time::Duration, cancelled: Option<&AtomicBool>) -> Result<(), String> {
+impl BackfillCancellation for AtomicBool {
+    fn check(&self) -> Result<(), String> {
+        if self.load(Ordering::Acquire) {
+            Err(BACKFILL_CANCELLED.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl BackfillCancellation for asupersync::Cx {
+    fn check(&self) -> Result<(), String> {
+        crate::search_service::check_lexical_request(self)
+    }
+
+    fn remaining_ms(&self) -> Option<u64> {
+        crate::search_service::request_budget_remaining_ms(self)
+    }
+}
+
+fn backfill_checkpoint(cancelled: Option<&dyn BackfillCancellation>) -> Result<(), String> {
+    cancelled.map_or(Ok(()), BackfillCancellation::check)
+}
+
+fn backfill_wait(
+    delay: std::time::Duration,
+    cancelled: Option<&dyn BackfillCancellation>,
+) -> Result<(), String> {
     let started = std::time::Instant::now();
     loop {
         backfill_checkpoint(cancelled)?;
@@ -1044,7 +1296,7 @@ fn backfill_wait(delay: std::time::Duration, cancelled: Option<&AtomicBool>) -> 
 
 fn backfill_source_lock<'a>(
     bridge: &'a TantivyBridge,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<MutexGuard<'a, ()>, String> {
     if cancelled.is_none() {
         return Ok(bridge
@@ -1070,10 +1322,25 @@ fn backfill_source_lock<'a>(
 /// Interactive searches may retry that whole scan on a fresh connection;
 /// they must never publish the rejected scan or treat it as a successful empty index.
 pub(crate) fn with_backfill_source_retry<T>(
+    operation: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    with_backfill_source_retry_cancellable(None, operation)
+}
+
+pub(crate) fn with_backfill_source_retry_for_request<T>(
+    cx: &asupersync::Cx,
+    operation: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    with_backfill_source_retry_cancellable(Some(cx), operation)
+}
+
+fn with_backfill_source_retry_cancellable<T>(
+    cancelled: Option<&dyn BackfillCancellation>,
     mut operation: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
     let mut retry = 0;
     loop {
+        backfill_checkpoint(cancelled)?;
         match operation() {
             Err(error)
                 if error == BACKFILL_SOURCE_CHANGED && retry < BOOTSTRAP_LOCK_MAX_RETRIES =>
@@ -1082,7 +1349,7 @@ pub(crate) fn with_backfill_source_retry<T>(
                     retry = retry + 1,
                     "search source changed; restarting the rejected backfill"
                 );
-                std::thread::sleep(bootstrap_lock_retry_delay(retry));
+                backfill_wait(bootstrap_lock_retry_delay(retry), cancelled)?;
                 retry += 1;
             }
             result => return result,
@@ -1111,14 +1378,17 @@ fn bootstrap_lock_retry_delay(retry_index: usize) -> std::time::Duration {
 /// classification keeps working.
 fn with_bootstrap_lock_retry<T, E: std::fmt::Display>(
     operation: &str,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
     mut op: impl FnMut() -> Result<T, E>,
 ) -> Result<T, String> {
     let mut retries = 0_usize;
     loop {
         backfill_checkpoint(cancelled)?;
         match op() {
-            Ok(value) => return Ok(value),
+            Ok(value) => {
+                backfill_checkpoint(cancelled)?;
+                return Ok(value);
+            }
             Err(err) => {
                 let message = err.to_string();
                 if !crate::error::is_lock_error(&message) || retries >= BOOTSTRAP_LOCK_MAX_RETRIES {
@@ -1145,7 +1415,7 @@ fn query_sync_with_lock_retry(
     operation: &str,
     sql: &str,
     params: &[Value],
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<Vec<sqlmodel_core::Row>, String> {
     with_bootstrap_lock_retry(operation, cancelled, || conn.query_sync(sql, params))
 }
@@ -1161,7 +1431,7 @@ fn open_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, String> {
 
 fn open_backfill_conn_with_cancellation(
     db_path: &str,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<crate::DbConnGuard, String> {
     backfill_checkpoint(cancelled)?;
     if db_path != ":memory:" {
@@ -1178,8 +1448,14 @@ fn open_backfill_conn_with_cancellation(
             .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
         "search backfill connection",
     );
+    // A retry inherits the caller's remaining budget. A native call already
+    // in progress still owns its worker until it returns.
+    let busy_timeout_ms = cancelled
+        .and_then(BackfillCancellation::remaining_ms)
+        .unwrap_or(10_000)
+        .min(10_000);
     with_bootstrap_lock_retry("backfill busy_timeout pragma", cancelled, || {
-        conn.execute_raw("PRAGMA busy_timeout = 10000;")
+        conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
     })
     .map_err(|e| format!("backfill: busy_timeout pragma failed: {e}"))?;
     Ok(conn)
@@ -1200,7 +1476,7 @@ fn open_read_only_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, Str
 /// retain at most one page plus one serialized row at a time.
 fn legacy_backfill_content_digest(
     conn: &DbConn,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<[u8; 32], String> {
     let mut digest = Sha256::new();
     for sql in [
@@ -1244,7 +1520,7 @@ fn legacy_backfill_content_digest(
 fn backfill_table_exists(
     conn: &DbConn,
     table: &str,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<bool, String> {
     match query_sync_with_lock_retry(
         conn,
@@ -1262,7 +1538,7 @@ fn backfill_table_exists(
 fn fetch_id_text_map(
     conn: &DbConn,
     sql: &str,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<HashMap<i64, String>, String> {
     let rows = query_sync_with_lock_retry(conn, "backfill id/text map", sql, &[], cancelled)
         .map_err(|e| format!("backfill map query failed: {e}"))?;
@@ -1278,7 +1554,7 @@ fn fetch_id_text_map(
 fn fetch_db_tail_count(
     conn: &DbConn,
     start_after_id: i64,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<u64, String> {
     let rows = query_sync_with_lock_retry(
         conn,
@@ -1309,7 +1585,7 @@ fn only_appends_outside_scanned_range(
     rows_at_start: u64,
     (after, max): (i64, i64),
     indexed_in_range: usize,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<bool, String> {
     let Some(start) = start else {
         return Ok(false);
@@ -1352,7 +1628,7 @@ fn marker_resume_plan(
     conn: &DbConn,
     db: MessageStats,
     state: Option<&BackfillState>,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<Option<BackfillPlan>, String> {
     let Some(state) = state else {
         return Ok(None);
@@ -1389,7 +1665,7 @@ fn recent_hole_repair_plan(
     bridge: &TantivyBridge,
     db: MessageStats,
     index: MessageStats,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<Option<BackfillPlan>, String> {
     // Only the append shape: an index holding an id the source lacks needs
     // the rebuild's delete_all_documents.
@@ -1490,7 +1766,7 @@ fn choose_backfill_plan(
     conn: &DbConn,
     db: MessageStats,
     index: MessageStats,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<BackfillPlan, String> {
     if db.count == 0 {
         return Ok(if index.count == 0 {
@@ -1584,7 +1860,7 @@ enum WriterBusyPolicy {
 fn acquire_writer_with_retry(
     index: &tantivy::Index,
     busy: WriterBusyPolicy,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<tantivy::IndexWriter, String> {
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
@@ -1619,7 +1895,7 @@ fn acquire_writer_with_retry(
 fn with_tantivy_writer_policy<T>(
     bridge: &TantivyBridge,
     busy: WriterBusyPolicy,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
     operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
 ) -> Result<T, String> {
     let mut slot = match if cancelled.is_some() {
@@ -1719,6 +1995,61 @@ pub fn backfill_from_db_cancellable(
     )
 }
 
+/// Catch up for one foreground request using its original cancellation and
+/// deadline. This does not detach a worker or renew the budget at each retry.
+pub(crate) fn backfill_for_request(
+    cx: &asupersync::Cx,
+    pool: &crate::DbPool,
+    db_url: &str,
+    identity_path: Option<&str>,
+) -> Result<(usize, usize), String> {
+    backfill_checkpoint(Some(cx))?;
+    let Some(bridge) = get_bridge() else {
+        return Ok((0, 0));
+    };
+    let _source_guard = backfill_source_lock(&bridge, Some(cx))?;
+    backfill_into_bridge_locked_with_opener(
+        &bridge,
+        db_url,
+        identity_path,
+        |path| {
+            pool.verify_sqlite_authority("request lexical backfill")
+                .map_err(|error| error.to_string())?;
+            open_backfill_conn_with_cancellation(path, Some(cx))
+        },
+        WriterBusyPolicy::Retry,
+        Some(cx),
+    )
+}
+
+/// Refresh one frozen serving pool for its lifecycle-owned maintenance
+/// worker. Every new source connection repeats that pool's authority check.
+pub(crate) fn backfill_for_pool_cancellable(
+    pool: &crate::DbPool,
+    db_url: &str,
+    stopped: &AtomicBool,
+) -> Result<(usize, usize), String> {
+    backfill_checkpoint(Some(stopped))?;
+    let bridge = get_bridge().ok_or("lexical bridge is unavailable")?;
+    let _source_guard = backfill_source_lock(&bridge, Some(stopped))?;
+    with_backfill_source_retry_cancellable(Some(stopped), || {
+        pool.verify_sqlite_authority("owned lexical maintenance")
+            .map_err(|error| error.to_string())?;
+        backfill_into_bridge_locked_with_opener(
+            &bridge,
+            db_url,
+            Some(pool.search_identity_path()),
+            |path| {
+                pool.verify_sqlite_authority("owned lexical maintenance source")
+                    .map_err(|error| error.to_string())?;
+                open_backfill_conn_with_cancellation(path, Some(stopped))
+            },
+            WriterBusyPolicy::Retry,
+            Some(stopped),
+        )
+    })
+}
+
 /// Backfill with an explicit mailbox identity.
 ///
 /// Private snapshots must use private snapshot search; they cannot publish
@@ -1763,24 +2094,44 @@ pub(crate) fn backfill_read_only_live(db_url: &str, index_dir: &Path) -> Result<
 /// filters and ranking as the live index, without modifying global bridge
 /// state, live index bytes or the process-wide result cache.
 pub(crate) fn search_private_snapshot(
+    cx: Option<&asupersync::Cx>,
     db_url: &str,
     query: &PlannerQuery,
 ) -> Result<Vec<PlannerResult>, String> {
+    let cancelled = cx.map(|cx| cx as &dyn BackfillCancellation);
+    backfill_checkpoint(cancelled)?;
     // Keep the corpus on disk: a RAM directory retains every segment even
     // after the writer's bounded buffer flushes. The private directory lives
     // until the writer/readers are dropped at the end of this search.
     let directory =
         tempfile::tempdir().map_err(|error| format!("private lexical index: {error}"))?;
     let bridge = TantivyBridge::open_scoped(directory.path(), false)?;
-    with_backfill_source_retry(|| backfill_into_bridge(&bridge, db_url, None))?;
-    Ok(bridge.search(query))
+    with_backfill_source_retry_cancellable(cancelled, || {
+        backfill_into_bridge_locked_with_opener(
+            &bridge,
+            db_url,
+            None,
+            |path| open_backfill_conn_with_cancellation(path, cancelled),
+            WriterBusyPolicy::Retry,
+            cancelled,
+        )
+    })?;
+    backfill_checkpoint(cancelled)?;
+    let results = bridge.search_inner(query, false)?;
+    backfill_checkpoint(cancelled)?;
+    Ok(results)
 }
 
 /// Record the live source revision without indexing anything (br-ekdk1). A
 /// moved clock invalidates cached result sets, so the result cache may be
-/// consulted before [`search_database`] runs the query's own catch-up; the
+/// consulted before [`search_database_with_cx`] runs the query's own catch-up; the
 /// source is identified exactly as that catch-up identifies it.
-pub(crate) fn observe_live_source_revision(db_url: &str) -> Result<(), String> {
+pub(crate) fn observe_live_source_revision(
+    cx: Option<&asupersync::Cx>,
+    db_url: &str,
+) -> Result<(), String> {
+    let cancelled = cx.map(|cx| cx as &dyn BackfillCancellation);
+    backfill_checkpoint(cancelled)?;
     let Some(bridge) = get_bridge() else {
         return Ok(());
     };
@@ -1790,12 +2141,14 @@ pub(crate) fn observe_live_source_revision(db_url: &str) -> Result<(), String> {
     if !bridge.publish_source_state {
         return Ok(());
     }
-    let conn = open_backfill_conn(&db_path)?;
+    let conn = open_backfill_conn_with_cancellation(&db_path, cancelled)?;
     let generation = crate::queries::db_generation_id_conn(&conn);
-    let clock = lexical_change_clock(&conn)?;
+    let clock = lexical_change_clock_with_cancellation(&conn, cancelled)?;
     observe_lexical_source(
         &bridge,
         ObservedLexicalSource {
+            file_fingerprint: sqlite_file_backfill_fingerprint(&db_path),
+            memory: false,
             path: db_path,
             generation,
             clock,
@@ -1807,25 +2160,58 @@ pub(crate) fn observe_live_source_revision(db_url: &str) -> Result<(), String> {
 /// Refresh and collect candidates while holding the same source operation
 /// lock. If another mailbox switched the global bridge after service bootstrap,
 /// use a private index rather than publishing this source into its directory.
-pub(crate) fn search_database(
+pub(crate) fn search_database_with_cx(
+    cx: &asupersync::Cx,
+    pool: &crate::DbPool,
+    db_url: &str,
+    expected_index_dir: &Path,
+    query: &PlannerQuery,
+    canonical_candidates: bool,
+) -> Result<Option<Vec<PlannerResult>>, String> {
+    search_database_inner(
+        Some(cx),
+        Some(pool),
+        db_url,
+        expected_index_dir,
+        query,
+        canonical_candidates,
+    )
+}
+
+#[cfg(test)]
+fn search_database(
     db_url: &str,
     expected_index_dir: &Path,
     query: &PlannerQuery,
 ) -> Result<Option<Vec<PlannerResult>>, String> {
+    search_database_inner(None, None, db_url, expected_index_dir, query, false)
+}
+
+fn search_database_inner(
+    cx: Option<&asupersync::Cx>,
+    pool: Option<&crate::DbPool>,
+    db_url: &str,
+    expected_index_dir: &Path,
+    query: &PlannerQuery,
+    canonical_candidates: bool,
+) -> Result<Option<Vec<PlannerResult>>, String> {
+    let cancelled = cx.map(|cx| cx as &dyn BackfillCancellation);
+    backfill_checkpoint(cancelled)?;
     let Some(bridge) = get_bridge() else {
         return Ok(None);
     };
     let arrival = bridge.catch_ups_started.load(Ordering::Acquire);
-    let source_guard = bridge
-        .source_operation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let source_guard = backfill_source_lock(&bridge, cancelled)?;
+    if let Some(pool) = pool {
+        pool.verify_sqlite_authority("request lexical source admission")
+            .map_err(|error| error.to_string())?;
+    }
     let db_path = resolve_search_sqlite_path_from_database_url(db_url);
     let foreign_marker = read_backfill_state(&bridge)
         .is_some_and(|state| db_path.as_deref().is_some_and(|path| path != state.db_path));
     if !same_index_dir(bridge.index_dir(), expected_index_dir) || foreign_marker {
         drop(source_guard);
-        return search_private_snapshot(db_url, query).map(Some);
+        return search_private_snapshot(cx, db_url, query).map(Some);
     }
     // Searches queued behind one catch-up share it (br-ekdk1) instead of each
     // committing the index again in turn.
@@ -1833,10 +2219,28 @@ pub(crate) fn search_database(
         && bridge.catch_up_completed.load(Ordering::Acquire) <= arrival
     {
         let started = bridge.catch_ups_started.fetch_add(1, Ordering::AcqRel) + 1;
-        with_backfill_source_retry(|| backfill_into_bridge_locked(&bridge, db_url, None))?;
+        with_backfill_source_retry_cancellable(cancelled, || {
+            backfill_into_bridge_locked_with_opener(
+                &bridge,
+                db_url,
+                None,
+                |path| {
+                    if let Some(pool) = pool {
+                        pool.verify_sqlite_authority("request lexical source")
+                            .map_err(|error| error.to_string())?;
+                    }
+                    open_backfill_conn_with_cancellation(path, cancelled)
+                },
+                WriterBusyPolicy::Retry,
+                cancelled,
+            )
+        })?;
         bridge.catch_up_completed.store(started, Ordering::Release);
     }
-    Ok(Some(bridge.search(query)))
+    backfill_checkpoint(cancelled)?;
+    let results = bridge.search_inner(query, canonical_candidates)?;
+    backfill_checkpoint(cancelled)?;
+    Ok(Some(results))
 }
 
 fn backfill_into_bridge(
@@ -1871,9 +2275,26 @@ fn backfill_into_bridge_locked_with_opener(
     identity_path: Option<&str>,
     open_connection: impl Fn(&str) -> Result<crate::DbConnGuard, String>,
     writer_busy: WriterBusyPolicy,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<&dyn BackfillCancellation>,
 ) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
+    // A failed refresh cannot leave an older capability proof. Keep usable
+    // generation and exact coverage distinct while checking a possible tail.
+    struct RefreshProof<'a> {
+        bridge: &'a TantivyBridge,
+        completed: bool,
+    }
+    impl Drop for RefreshProof<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.bridge.revoke_source_proof();
+            }
+        }
+    }
+    let mut refresh_proof = RefreshProof {
+        bridge,
+        completed: false,
+    };
     backfill_checkpoint(cancelled)?;
 
     // Open a sync connection via FrankenSQLite.
@@ -1928,26 +2349,27 @@ fn backfill_into_bridge_locked_with_opener(
         return Ok((0, 0));
     }
 
-    let db_generation = crate::queries::db_generation_id_conn(&conn);
     backfill_checkpoint(cancelled)?;
-    // One read snapshot for the change clock, the watermark, the message
-    // stats and the scan, as the legacy digest path always had.
+    // One read snapshot for the generation, change clock, watermark, message
+    // stats and scan. Reading generation before BEGIN could pair an older
+    // identity with a newer clock at the unchanged-marker early return.
     conn.execute_sync("BEGIN DEFERRED", &[])
         .map_err(|error| format!("backfill read transaction: {error}"))?;
+    let db_generation = crate::queries::db_generation_id_conn(&conn);
     let change_clock = lexical_change_clock_with_cancellation(&conn, cancelled)?;
     let legacy_digest = if change_clock.is_none() {
         Some(legacy_backfill_content_digest(&conn, cancelled)?)
     } else {
         None
     };
-    observe_lexical_source(
-        bridge,
-        ObservedLexicalSource {
-            path: identity_path.to_string(),
-            generation: db_generation.clone(),
-            clock: change_clock,
-        },
-    );
+    let source = ObservedLexicalSource {
+        path: identity_path.to_string(),
+        generation: db_generation.clone(),
+        clock: change_clock,
+        memory: db_path == ":memory:",
+        file_fingerprint: db_fingerprint,
+    };
+    observe_lexical_source(bridge, source.clone());
     let message_watermark = fetch_db_message_watermark(&conn, cancelled)?;
     let current_index_fingerprint = index_meta_fingerprint(bridge);
     let previous_state = read_backfill_state(bridge);
@@ -1988,12 +2410,19 @@ fn backfill_into_bridge_locked_with_opener(
             "backfill: lexical change clock unchanged, skipping"
         );
         refresh_index_health_metrics(bridge);
+        record_verified_source(bridge, source);
+        refresh_proof.completed = true;
         return Ok((
             0,
             usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
         ));
     }
 
+    // The unchanged marker is the only exact proof reusable before planning.
+    *bridge
+        .verified_source
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let db_stats = fetch_db_message_stats(&conn, cancelled)?;
     let index_stats = fetch_index_message_stats(bridge)?;
     backfill_checkpoint(cancelled)?;
@@ -2079,8 +2508,27 @@ fn backfill_into_bridge_locked_with_opener(
             );
         }
         refresh_index_health_metrics(bridge);
+        record_verified_source(bridge, source);
+        refresh_proof.completed = true;
         return Ok((0, usize::try_from(db_stats.count).unwrap_or(usize::MAX)));
     }
+
+    // The source mutex serializes scans. The guard also clears activity after
+    // cancellation or a rejected publication, without certifying freshness.
+    struct BackfillActivity<'a>(&'a AtomicBool);
+    impl Drop for BackfillActivity<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    if matches!(plan, BackfillPlan::FullRebuild) {
+        *bridge
+            .available_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+    bridge.backfill_in_progress.store(true, Ordering::Release);
+    let _activity = BackfillActivity(&bridge.backfill_in_progress);
 
     let handles = bridge.handles();
     let scan_max_id = i64::try_from(db_stats.max_id)
@@ -2251,6 +2699,15 @@ fn backfill_into_bridge_locked_with_opener(
         writer
             .commit()
             .map_err(|e| format!("Tantivy commit error: {e}"))?;
+        if seal_clock != change_clock {
+            // This pass covered its initial bounded snapshot, but it also
+            // observed a newer safe append tail. Keep that observation so
+            // maintenance knows another catch-up is needed immediately.
+            // Only the original covered clock is certified below.
+            let mut observed_at_seal = source.clone();
+            observed_at_seal.clock = seal_clock;
+            observe_lexical_source(bridge, observed_at_seal);
+        }
         Ok(total_indexed)
     })?;
 
@@ -2295,6 +2752,8 @@ fn backfill_into_bridge_locked_with_opener(
         BackfillPlan::Skip => {}
     }
 
+    record_verified_source(bridge, source);
+    refresh_proof.completed = true;
     Ok((total_indexed, 0))
 }
 
@@ -2359,6 +2818,391 @@ mod tests {
         writer.commit().unwrap();
 
         bridge
+    }
+
+    #[test]
+    fn gh382_canonical_candidates_keep_filters_scores_and_defer_payloads() {
+        let bridge = setup_bridge_with_docs();
+        for query in [
+            PlannerQuery::messages("migration", 1),
+            PlannerQuery::messages("plan OR search", 1),
+            PlannerQuery {
+                direction: Some(Direction::Outbox),
+                agent_name: Some("BlueLake".into()),
+                ..PlannerQuery::messages("plan", 1)
+            },
+            PlannerQuery {
+                importance: vec![Importance::Urgent],
+                ..PlannerQuery::messages("fix", 2)
+            },
+        ] {
+            let rich = bridge.search(&query);
+            let lean = bridge.search_inner(&query, true).unwrap();
+            assert!(!rich.is_empty(), "fixture must match");
+            assert_eq!(
+                lean.iter()
+                    .map(|hit| (hit.id, hit.score.map(f64::to_bits)))
+                    .collect::<Vec<_>>(),
+                rich.iter()
+                    .map(|hit| (hit.id, hit.score.map(f64::to_bits)))
+                    .collect::<Vec<_>>()
+            );
+            assert!(lean.iter().all(|hit| hit.body.is_empty()
+                && hit.title.is_empty()
+                && hit.from_agent.is_none()));
+        }
+    }
+
+    #[test]
+    fn gh382_request_deadline_leaves_source_and_writer_locks_owned() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "commonmail", "body", "normal", "thread")],
+        );
+        init_bridge(index.path()).unwrap();
+        let bridge = get_bridge().unwrap();
+        for hold_source in [true, false] {
+            let source_lock = hold_source.then(|| bridge.source_operation.lock().unwrap());
+            let writer_lock = (!hold_source).then(|| bridge.writer.lock().unwrap());
+            let worker_path = path.clone();
+            let index_path = index.path().to_path_buf();
+            let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let deadline = asupersync::Time::from_nanos(
+                    u64::try_from(now).unwrap().saturating_add(2_000_000_000),
+                );
+                let cx = asupersync::Cx::for_request_with_budget(
+                    asupersync::Budget::new().with_deadline(deadline),
+                );
+                BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
+                    *observer.borrow_mut() = Some(Box::new(move |lock| {
+                        let _ = parked_tx.send(lock);
+                    }));
+                });
+                let result = search_database_inner(
+                    Some(&cx),
+                    None,
+                    &worker_path,
+                    &index_path,
+                    &PlannerQuery::messages("commonmail", 1),
+                    true,
+                );
+                finished_tx.send(result).unwrap();
+            });
+            let parked = parked_rx.recv_timeout(std::time::Duration::from_secs(5));
+            let result = finished_rx.recv_timeout(std::time::Duration::from_secs(3));
+            // Release before asserting/joining so a regression fails rather
+            // than leaving a blocked background task after the test.
+            drop(source_lock);
+            drop(writer_lock);
+            worker.join().unwrap();
+            assert_eq!(
+                parked.unwrap(),
+                if hold_source { "source" } else { "writer" }
+            );
+            let error = result
+                .expect("request deadline must stop a contended local wait")
+                .unwrap_err();
+            assert!(
+                error.contains("budget exhausted") || error.contains("cancelled"),
+                "{error}"
+            );
+        }
+        assert!(!bridge.backfill_in_progress());
+        assert!(!backfill_state_path(&bridge).exists());
+        assert_eq!(backfill_from_db(&path).unwrap(), (1, 0));
+        assert_eq!(
+            bridge.search(&PlannerQuery::messages("commonmail", 1))[0].id,
+            1
+        );
+        reset_bridge_for_tests();
+    }
+
+    fn gh382_install_lexical_clock(conn: &DbConn) {
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| {
+                migration.id.starts_with("v29_")
+                    || migration.id == "v36_relevant_lexical_identity_changes"
+            })
+        {
+            for sql in crate::schema::migration_sql_statements(&migration) {
+                conn.execute_sync(sql, &[]).unwrap();
+            }
+        }
+        conn.execute_sync(
+            "CREATE TABLE db_identity(singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync("INSERT INTO db_identity VALUES(0,'gh382-generation')", &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn gh382_unrelated_registration_keeps_real_backfill_index_unchanged() {
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "commonmail", "body", "normal", "thread")],
+        );
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "gh382 clock fixture");
+        gh382_install_lexical_clock(&conn);
+        let bridge = TantivyBridge::open(index.path()).unwrap();
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (1, 0));
+        let index_before = std::fs::read(index.path().join("meta.json")).unwrap();
+        let clock_before = lexical_change_clock(&conn).unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents(id,project_id,name) VALUES(2,1,'UnusedSender')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(2,'unused','unused',0)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync("UPDATE agents SET name=name WHERE id=1", &[])
+            .unwrap();
+        assert_eq!(lexical_change_clock(&conn).unwrap(), clock_before);
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (0, 1));
+        assert_eq!(
+            std::fs::read(index.path().join("meta.json")).unwrap(),
+            index_before
+        );
+        assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+
+        conn.execute_sync("UPDATE agents SET name='RenamedSender' WHERE id=1", &[])
+            .unwrap();
+        let changed = lexical_change_clock(&conn).unwrap().unwrap();
+        observe_pool_source(
+            &bridge,
+            &path,
+            "gh382-generation",
+            changed.revision,
+            changed.rewrite_revision,
+            false,
+        );
+        assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (1, 0));
+        assert_eq!(
+            bridge.search(&PlannerQuery::messages("commonmail", 1))[0]
+                .from_agent
+                .as_deref(),
+            Some("RenamedSender")
+        );
+    }
+
+    #[test]
+    fn gh382_available_generation_rejects_clock_rollback_and_missing_file_identity() {
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "commonmail", "body", "normal", "thread")],
+        );
+        let conn =
+            crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "gh382 rollback fixture");
+        gh382_install_lexical_clock(&conn);
+        conn.execute_sync(
+            "UPDATE lexical_change_clock SET revision=5,rewrite_revision=1",
+            &[],
+        )
+        .unwrap();
+        let bridge = TantivyBridge::open(index.path()).unwrap();
+        backfill_into_bridge(&bridge, &path, None).unwrap();
+        assert!(bridge.source_is_available(&path, Some("gh382-generation")));
+        bridge.revoke_source_proof_for("/unrelated-mailbox", "gh382-generation");
+        bridge.revoke_source_proof_for(&path, "another-generation");
+        assert!(bridge.source_is_available(&path, Some("gh382-generation")));
+        assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+        bridge.revoke_source_proof_for(&path, "gh382-generation");
+        assert!(!bridge.source_is_available(&path, Some("gh382-generation")));
+        assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (0, 1));
+        observe_pool_source(&bridge, &path, "gh382-generation", 4, 1, false);
+        assert!(!bridge.source_is_available(&path, Some("gh382-generation")));
+        observe_pool_source(&bridge, &path, "gh382-generation", 6, 1, false);
+        assert!(bridge.source_is_available(&path, Some("gh382-generation")));
+        assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
+        let missing = source
+            .path()
+            .join("missing.sqlite3")
+            .to_str()
+            .unwrap()
+            .to_string();
+        observe_pool_source(&bridge, &missing, "gh382-generation", 6, 1, false);
+        assert!(!bridge.source_is_available(&missing, Some("gh382-generation")));
+    }
+
+    #[test]
+    fn gh382_append_during_scan_retains_known_catch_up_requirement() {
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "initialmail", "body", "normal", "thread")],
+        );
+        let conn = crate::guard_db_conn(
+            DbConn::open_file(&path).unwrap(),
+            "gh382 append seal fixture",
+        );
+        gh382_install_lexical_clock(&conn);
+        let bridge = TantivyBridge::open(index.path()).unwrap();
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (1, 0));
+        conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+        for id in 2..=501 {
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(?,1,1,'batchmail','body',1000000)",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+        conn.execute_sync("COMMIT", &[]).unwrap();
+        let committed = std::rc::Rc::new(std::cell::Cell::new(false));
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            let committed = committed.clone();
+            *observer.borrow_mut() = Some(Box::new(move |indexed| {
+                if indexed >= 500 && !committed.replace(true) {
+                    conn.execute_sync(
+                        "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                         VALUES(1000,1,1,'latearrival','committed during scan',2000000)",
+                        &[],
+                    )
+                    .unwrap();
+                }
+            }));
+        });
+        let result = backfill_into_bridge(&bridge, &path, None);
+        BACKFILL_SCAN_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        assert!(
+            committed.get(),
+            "the concurrent append must actually commit"
+        );
+        assert_eq!(result.unwrap(), (500, 0));
+        assert!(bridge.source_is_available(&path, Some("gh382-generation")));
+        assert!(
+            !bridge.source_is_verified(&path, Some("gh382-generation")),
+            "the seal saw a newer tail that this pass did not cover"
+        );
+        assert!(
+            bridge
+                .search(&PlannerQuery::messages("latearrival", 1))
+                .is_empty()
+        );
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (1, 0));
+        assert!(bridge.source_is_available(&path, Some("gh382-generation")));
+        assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+        assert_eq!(
+            bridge.search(&PlannerQuery::messages("latearrival", 1))[0].id,
+            1000
+        );
+    }
+
+    #[test]
+    fn gh382_failed_repair_revokes_unchanged_source_readiness_proof() {
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "commonmail", "body", "normal", "thread")],
+        );
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "gh382 repair fixture");
+        gh382_install_lexical_clock(&conn);
+        let bridge = TantivyBridge::open(index.path()).unwrap();
+        backfill_into_bridge(&bridge, &path, None).unwrap();
+        assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+        let clock = lexical_change_clock(&conn).unwrap().unwrap();
+        // A nonlexical write/checkpoint changes file metadata, not the source
+        // identity or indexed fields.
+        conn.execute_sync("UPDATE agents SET last_active_ts=123456 WHERE id=1", &[])
+            .unwrap();
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        observe_pool_source(
+            &bridge,
+            &path,
+            "gh382-generation",
+            clock.revision,
+            clock.rewrite_revision,
+            false,
+        );
+        #[cfg(unix)]
+        assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+
+        // Damage the local index without modifying the source. A failed
+        // repair must not retain the previous same-clock readiness proof.
+        with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, None, |writer| {
+            writer
+                .delete_all_documents()
+                .map_err(|error| error.to_string())?;
+            writer.commit().map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let writer_lock = bridge.writer.lock().unwrap();
+        BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
+            let cancelled = Arc::clone(&cancelled);
+            *observer.borrow_mut() = Some(Box::new(move |lock| {
+                assert_eq!(lock, "writer");
+                cancelled.store(true, Ordering::Release);
+            }));
+        });
+        let result = backfill_into_bridge_locked_with_opener(
+            &bridge,
+            &path,
+            None,
+            open_backfill_conn,
+            WriterBusyPolicy::Retry,
+            Some(cancelled.as_ref()),
+        );
+        BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        drop(writer_lock);
+        assert_eq!(result.unwrap_err(), BACKFILL_CANCELLED);
+        assert!(!bridge.backfill_in_progress());
+        assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
+        assert!(!bridge.source_is_available(&path, Some("gh382-generation")));
+        assert_eq!(lexical_change_clock(&conn).unwrap(), Some(clock));
+        assert_eq!(backfill_into_bridge(&bridge, &path, None).unwrap(), (1, 0));
+        assert!(bridge.source_is_verified(&path, Some("gh382-generation")));
+
+        #[cfg(unix)]
+        {
+            // An actual same-generation file replacement is distinct from
+            // routine checkpoint metadata churn.
+            conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            drop(conn);
+            let copied = source.path().join("copied.sqlite3");
+            std::fs::copy(&path, &copied).unwrap();
+            std::fs::rename(&path, source.path().join("previous.sqlite3")).unwrap();
+            std::fs::rename(copied, &path).unwrap();
+            observe_pool_source(
+                &bridge,
+                &path,
+                "gh382-generation",
+                clock.revision,
+                clock.rewrite_revision,
+                false,
+            );
+            assert!(!bridge.source_is_verified(&path, Some("gh382-generation")));
+        }
     }
 
     #[test]
@@ -4879,7 +5723,8 @@ mod tests {
             doc_kind: DocKind::Message,
             ..Default::default()
         };
-        let results = search_private_snapshot(snapshot_path.to_str().unwrap(), &query).unwrap();
+        let results =
+            search_private_snapshot(None, snapshot_path.to_str().unwrap(), &query).unwrap();
         assert_eq!(results.len(), 1, "snapshot retains phrase-search semantics");
         assert_eq!(results[0].id, 1);
         assert_eq!(

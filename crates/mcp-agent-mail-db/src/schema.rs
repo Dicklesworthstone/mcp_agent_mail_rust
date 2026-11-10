@@ -671,6 +671,128 @@ const SHARED_CURSOR_LIFECYCLE_STATEMENTS: &[&str] = &[
     V35_CURSOR_DELETE_TRIGGER_SQL,
 ];
 
+// Keep v29 SQL/checksums frozen. Only identity changes that can affect an
+// existing message invalidate lexical documents. Inserting a previously
+// missing referenced identity remains observable, including orphan imports.
+const RELEVANT_LEXICAL_IDENTITY_MIGRATION: &str = "v36_relevant_lexical_identity_changes";
+const V36_SENDER_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id)";
+
+macro_rules! relevant_lexical_identity_trigger_sql {
+    ($table:literal, $event:literal, $suffix:literal, $predicate:literal) => {
+        concat!(
+            "CREATE TRIGGER IF NOT EXISTS trg_lexical_clock_",
+            $table,
+            "_",
+            $suffix,
+            " AFTER ",
+            $event,
+            " ON ",
+            $table,
+            " WHEN ",
+            $predicate,
+            " BEGIN ",
+            "UPDATE lexical_change_clock SET revision = revision + 1, ",
+            "rewrite_revision = rewrite_revision + 1 WHERE id = 1; END"
+        )
+    };
+}
+
+const V36_AGENT_INSERT_SQL: &str = relevant_lexical_identity_trigger_sql!(
+    "agents",
+    "INSERT",
+    "insert",
+    "EXISTS (SELECT 1 FROM messages WHERE sender_id = NEW.id)"
+);
+const V36_AGENT_UPDATE_SQL: &str = relevant_lexical_identity_trigger_sql!(
+    "agents",
+    "UPDATE OF id, name",
+    "update",
+    "(NEW.id IS NOT OLD.id OR NEW.name IS NOT OLD.name) \
+     AND (EXISTS (SELECT 1 FROM messages WHERE sender_id = OLD.id) \
+          OR EXISTS (SELECT 1 FROM messages WHERE sender_id = NEW.id))"
+);
+const V36_AGENT_DELETE_SQL: &str = relevant_lexical_identity_trigger_sql!(
+    "agents",
+    "DELETE",
+    "delete",
+    "EXISTS (SELECT 1 FROM messages WHERE sender_id = OLD.id)"
+);
+const V36_PROJECT_INSERT_SQL: &str = relevant_lexical_identity_trigger_sql!(
+    "projects",
+    "INSERT",
+    "insert",
+    "EXISTS (SELECT 1 FROM messages WHERE project_id = NEW.id)"
+);
+const V36_PROJECT_UPDATE_SQL: &str = relevant_lexical_identity_trigger_sql!(
+    "projects",
+    "UPDATE OF id, slug",
+    "update",
+    "(NEW.id IS NOT OLD.id OR NEW.slug IS NOT OLD.slug) \
+     AND (EXISTS (SELECT 1 FROM messages WHERE project_id = OLD.id) \
+          OR EXISTS (SELECT 1 FROM messages WHERE project_id = NEW.id))"
+);
+const V36_PROJECT_DELETE_SQL: &str = relevant_lexical_identity_trigger_sql!(
+    "projects",
+    "DELETE",
+    "delete",
+    "EXISTS (SELECT 1 FROM messages WHERE project_id = OLD.id)"
+);
+
+const RELEVANT_LEXICAL_IDENTITY_TRIGGERS: &[(&str, &str, &str, &str)] = &[
+    (
+        "agents",
+        "insert",
+        "trg_lexical_clock_agents_insert",
+        V36_AGENT_INSERT_SQL,
+    ),
+    (
+        "agents",
+        "update",
+        "trg_lexical_clock_agents_update",
+        V36_AGENT_UPDATE_SQL,
+    ),
+    (
+        "agents",
+        "delete",
+        "trg_lexical_clock_agents_delete",
+        V36_AGENT_DELETE_SQL,
+    ),
+    (
+        "projects",
+        "insert",
+        "trg_lexical_clock_projects_insert",
+        V36_PROJECT_INSERT_SQL,
+    ),
+    (
+        "projects",
+        "update",
+        "trg_lexical_clock_projects_update",
+        V36_PROJECT_UPDATE_SQL,
+    ),
+    (
+        "projects",
+        "delete",
+        "trg_lexical_clock_projects_delete",
+        V36_PROJECT_DELETE_SQL,
+    ),
+];
+const RELEVANT_LEXICAL_IDENTITY_STATEMENTS: &[&str] = &[
+    V36_SENDER_INDEX_SQL,
+    "DROP TRIGGER trg_lexical_clock_agents_insert",
+    V36_AGENT_INSERT_SQL,
+    "DROP TRIGGER trg_lexical_clock_agents_update",
+    V36_AGENT_UPDATE_SQL,
+    "DROP TRIGGER trg_lexical_clock_agents_delete",
+    V36_AGENT_DELETE_SQL,
+    "DROP TRIGGER trg_lexical_clock_projects_insert",
+    V36_PROJECT_INSERT_SQL,
+    "DROP TRIGGER trg_lexical_clock_projects_update",
+    V36_PROJECT_UPDATE_SQL,
+    "DROP TRIGGER trg_lexical_clock_projects_delete",
+    V36_PROJECT_DELETE_SQL,
+];
+
 // One atomic migration, including its ledger entry. Keep the historical v25
 // and v32 SQL/checksums intact. Project events have no recipient agent; NULL
 // expresses that without inventing an agent or weakening direct-event FKs.
@@ -752,6 +874,8 @@ pub(crate) fn migration_sql_statements(migration: &Migration) -> Vec<&str> {
         PROJECT_EVENT_SCOPE_STATEMENTS.to_vec()
     } else if migration.id == SHARED_CURSOR_LIFECYCLE_MIGRATION {
         SHARED_CURSOR_LIFECYCLE_STATEMENTS.to_vec()
+    } else if migration.id == RELEVANT_LEXICAL_IDENTITY_MIGRATION {
+        RELEVANT_LEXICAL_IDENTITY_STATEMENTS.to_vec()
     } else {
         vec![migration_execution_sql(migration)]
     }
@@ -794,6 +918,92 @@ fn owned_cursor_delete_trigger(rows: &[sqlmodel_core::Row]) -> Result<Option<Str
     Ok(found)
 }
 
+fn same_owned_creation_sql(actual: &str, authored: &str, kind: &str) -> bool {
+    let stored_prefix = format!("CREATE {kind} ");
+    let authored_prefix = format!("CREATE {kind} IF NOT EXISTS ");
+    actual == authored
+        || actual.strip_prefix(stored_prefix.as_str())
+            == authored.strip_prefix(authored_prefix.as_str())
+}
+
+/// Capture only exact owned versions. This also protects the temporary
+/// removal/restoration of external references during a legacy v15 rebuild.
+fn owned_lexical_identity_triggers(
+    rows: &[sqlmodel_core::Row],
+) -> Result<Vec<(String, String)>, SqlError> {
+    let historical = schema_migrations();
+    let mut owned = Vec::new();
+    for &(table, suffix, name, replacement) in RELEVANT_LEXICAL_IDENTITY_TRIGGERS {
+        let old_id = format!("v29_lexical_clock_{table}_{suffix}");
+        let original = historical
+            .iter()
+            .find(|entry| entry.id == old_id)
+            .expect("historical lexical trigger migration exists");
+        let mut found = false;
+        for row in rows {
+            let actual_name = row.get_named::<String>("name")?;
+            if !actual_name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            let sql = row.get_named::<String>("sql")?;
+            if found
+                || actual_name != name
+                || row.get_named::<String>("type")? != "trigger"
+                || row.get_named::<String>("tbl_name")? != table
+                || !(same_owned_creation_sql(&sql, &original.up, "TRIGGER")
+                    || same_owned_creation_sql(&sql, replacement, "TRIGGER"))
+            {
+                return Err(SqlError::Custom(format!(
+                    "refuses unsupported definition of {name}; preserve or migrate this schema before retrying"
+                )));
+            }
+            found = true;
+            owned.push((actual_name, sql));
+        }
+    }
+    Ok(owned)
+}
+
+/// Trigger replacement is allowed only for exact versions owned by Agent
+/// Mail. Preserve customized schemas by rejecting them before any DDL. A
+/// restored schema may already contain v36 without its ledger entry.
+fn validate_relevant_lexical_identity_schema(
+    migration: &Migration,
+    rows: &[sqlmodel_core::Row],
+) -> Result<(), SqlError> {
+    if migration.up != RELEVANT_LEXICAL_IDENTITY_STATEMENTS.join(";\n") {
+        return Err(SqlError::Custom(
+            "lexical identity migration differs from its checked statements".to_string(),
+        ));
+    }
+    let owned = owned_lexical_identity_triggers(rows)?;
+    for &(_, _, name, _) in RELEVANT_LEXICAL_IDENTITY_TRIGGERS {
+        if !owned.iter().any(|(actual, _)| actual == name) {
+            return Err(SqlError::Custom(format!(
+                "lexical identity migration requires existing owned trigger {name}"
+            )));
+        }
+    }
+    for row in rows {
+        let name = row.get_named::<String>("name")?;
+        if name.eq_ignore_ascii_case("idx_messages_sender_id")
+            && (name != "idx_messages_sender_id"
+                || row.get_named::<String>("type")? != "index"
+                || row.get_named::<String>("tbl_name")? != "messages"
+                || !same_owned_creation_sql(
+                    &row.get_named::<String>("sql")?,
+                    V36_SENDER_INDEX_SQL,
+                    "INDEX",
+                ))
+        {
+            return Err(SqlError::Custom(
+                "refuses unsupported definition of idx_messages_sender_id".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Shared preflight for runtime upgrades and canonical reconstruction. All
 /// destructive statements remain inside the caller's migration transaction.
 pub(crate) fn validate_multi_statement_migration_schema(
@@ -814,6 +1024,8 @@ pub(crate) fn validate_multi_statement_migration_schema(
             ));
         }
         Ok(())
+    } else if migration.id == RELEVANT_LEXICAL_IDENTITY_MIGRATION {
+        validate_relevant_lexical_identity_schema(migration, rows)
     } else {
         validate_project_event_rebuild_schema(migration, rows)
     }
@@ -2905,6 +3117,12 @@ pub fn schema_migrations() -> Vec<Migration> {
         SHARED_CURSOR_LIFECYCLE_STATEMENTS.join(";\n"),
         String::new(),
     ));
+    migrations.push(Migration::new(
+        RELEVANT_LEXICAL_IDENTITY_MIGRATION.to_string(),
+        "invalidate lexical documents only for referenced identity changes".to_string(),
+        RELEVANT_LEXICAL_IDENTITY_STATEMENTS.join(";\n"),
+        String::new(),
+    ));
 
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
@@ -4084,6 +4302,11 @@ async fn migration_preflight_already_satisfied<C: Connection>(
     conn: &C,
     migration: &Migration,
 ) -> Outcome<bool, SqlError> {
+    // The first index is only one step of this checked transaction. Its
+    // presence cannot establish that all six owned triggers were upgraded.
+    if migration.id == RELEVANT_LEXICAL_IDENTITY_MIGRATION {
+        return Outcome::Ok(false);
+    }
     if let Some((table, column)) = parse_alter_table_add_column(&migration.up) {
         let sql = format!("PRAGMA table_info({table})");
         return match conn.query(cx, &sql, &[]).await {
@@ -4324,6 +4547,18 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    // The base pass can install v36 before this deferred canonical rebuild.
+    // Its agent/project triggers live on other tables but reference messages;
+    // SQLite validates those references during ALTER TABLE ... RENAME.
+    let external_lexical = match conn.query(cx, PROJECT_EVENT_SCHEMA_SQL, &[]).await {
+        Outcome::Ok(rows) => match owned_lexical_identity_triggers(&rows) {
+            Ok(triggers) => triggers,
+            Err(error) => return Outcome::Err(error),
+        },
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
     match conn
         .query(
             cx,
@@ -4350,6 +4585,9 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         // only its verified authored definition during the DROP/RENAME gap.
         drops.push("DROP TRIGGER trg_inbox_delivery_cursor_delete".to_string());
     }
+    for (name, _) in &external_lexical {
+        drops.push(format!("DROP TRIGGER {name}"));
+    }
     match execute_statements(cx, conn, &drops).await {
         Outcome::Ok(()) => {}
         other => return other,
@@ -4373,6 +4611,7 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     if let Some(sql) = external_cursor_delete {
         dependents.push(("trg_inbox_delivery_cursor_delete".to_string(), sql));
     }
+    dependents.extend(external_lexical);
 
     let carried = later_columns
         .iter()
@@ -4780,7 +5019,9 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
         // particular, preserve custom indexes added after the winner finished.
         if matches!(
             migration.id.as_str(),
-            PROJECT_EVENT_SCOPE_MIGRATION | SHARED_CURSOR_LIFECYCLE_MIGRATION
+            PROJECT_EVENT_SCOPE_MIGRATION
+                | SHARED_CURSOR_LIFECYCLE_MIGRATION
+                | RELEVANT_LEXICAL_IDENTITY_MIGRATION
         ) {
             match migration_set_is_complete(cx, conn, std::slice::from_ref(migration)).await {
                 Outcome::Ok(false) => {}
@@ -4844,7 +5085,9 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                     execute_v15_add_recipients_json_to_messages(cx, conn).await
                 } else if matches!(
                     migration.id.as_str(),
-                    PROJECT_EVENT_SCOPE_MIGRATION | SHARED_CURSOR_LIFECYCLE_MIGRATION
+                    PROJECT_EVENT_SCOPE_MIGRATION
+                        | SHARED_CURSOR_LIFECYCLE_MIGRATION
+                        | RELEVANT_LEXICAL_IDENTITY_MIGRATION
                 ) {
                     execute_checked_multi_statement_migration(cx, conn, migration).await
                 } else {
@@ -5321,6 +5564,269 @@ mod tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    fn gh382_lexical_clock<C: crate::pool::SyncQuery>(conn: &C) -> (i64, i64) {
+        let rows = conn
+            .query_sync(
+                "SELECT revision, rewrite_revision FROM lexical_change_clock WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        (
+            rows[0].get_as::<i64>(0).unwrap(),
+            rows[0].get_as::<i64>(1).unwrap(),
+        )
+    }
+
+    async fn gh382_seed_lexical_upgrade<C: Connection>(cx: &Cx, conn: &C) -> Migration {
+        init_migrations_table(cx, conn).await.into_result().unwrap();
+        execute_statements(
+            cx,
+            conn,
+            &[
+                "CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT NOT NULL)".into(),
+                "CREATE TABLE agents(id INTEGER PRIMARY KEY, name TEXT NOT NULL)".into(),
+                "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL)".into(),
+                "CREATE INDEX idx_messages_project_id ON messages(project_id)".into(),
+                "INSERT INTO projects VALUES(1,'existing')".into(),
+                "INSERT INTO agents VALUES(1,'ExistingSender')".into(),
+                "INSERT INTO messages VALUES(1,1,1)".into(),
+            ],
+        ).await.into_result().unwrap();
+        let historical = schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+            .collect();
+        run_specific_migrations(cx, conn, historical)
+            .await
+            .into_result()
+            .unwrap();
+        schema_migrations_base()
+            .into_iter()
+            .find(|migration| migration.id == RELEVANT_LEXICAL_IDENTITY_MIGRATION)
+            .expect("v36 belongs to the native runtime migration lane")
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn gh382_assert_relevant_lexical_upgrade<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+        already_new: bool,
+        index_only: bool,
+    ) {
+        let migration = gh382_seed_lexical_upgrade(cx, conn).await;
+        if index_only {
+            conn.execute(cx, V36_SENDER_INDEX_SQL, &[])
+                .await
+                .into_result()
+                .unwrap();
+        }
+        let historical_sql = format!(
+            "SELECT id,description,applied_at,checksum FROM {MIGRATIONS_TABLE_NAME} \
+             WHERE id <> '{RELEVANT_LEXICAL_IDENTITY_MIGRATION}' ORDER BY id"
+        );
+        let historical = v15_fixture_rows(conn, &historical_sql);
+        if already_new {
+            execute_statements(
+                cx,
+                conn,
+                &RELEVANT_LEXICAL_IDENTITY_STATEMENTS
+                    .iter()
+                    .map(|sql| (*sql).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+        }
+        conn.execute(
+            cx,
+            &format!(
+                "CREATE TRIGGER reject_lexical_ledger BEFORE INSERT ON {MIGRATIONS_TABLE_NAME} \
+                 WHEN NEW.id = '{RELEVANT_LEXICAL_IDENTITY_MIGRATION}' BEGIN \
+                 SELECT RAISE(ABORT, 'lexical ledger failure'); END"
+            ),
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let before = v15_fixture_snapshot(conn);
+        let error = run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .expect_err("index, all triggers and ledger must roll back together");
+        assert!(
+            error.to_string().contains("lexical ledger failure"),
+            "{error}"
+        );
+        assert_eq!(v15_fixture_snapshot(conn), before);
+        conn.execute(cx, "DROP TRIGGER reject_lexical_ledger", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            run_specific_migrations(cx, conn, vec![migration.clone()])
+                .await
+                .into_result()
+                .unwrap(),
+            [RELEVANT_LEXICAL_IDENTITY_MIGRATION.to_string()]
+        );
+        assert_eq!(v15_fixture_rows(conn, &historical_sql), historical);
+        assert!(
+            run_specific_migrations(cx, conn, vec![migration])
+                .await
+                .into_result()
+                .unwrap()
+                .is_empty()
+        );
+        let columns = conn
+            .query(cx, "PRAGMA index_info(idx_messages_sender_id)", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            columns
+                .iter()
+                .map(|row| row.get_as::<String>(2).unwrap())
+                .collect::<Vec<_>>(),
+            ["sender_id"]
+        );
+
+        let initial = gh382_lexical_clock(conn);
+        for sql in [
+            "INSERT INTO projects VALUES(2,'unused')",
+            "INSERT INTO agents VALUES(2,'UnusedSender')",
+            "UPDATE agents SET name='AnotherUnusedSender' WHERE id=2",
+            "UPDATE projects SET slug='another-unused' WHERE id=2",
+            "UPDATE agents SET id=id,name=name WHERE id=1",
+            "UPDATE projects SET id=id,slug=slug WHERE id=1",
+            "DELETE FROM agents WHERE id=2",
+            "DELETE FROM projects WHERE id=2",
+        ] {
+            conn.execute(cx, sql, &[]).await.into_result().unwrap();
+            assert_eq!(
+                gh382_lexical_clock(conn),
+                initial,
+                "unrelated/no-op identity: {sql}"
+            );
+        }
+        for sql in [
+            "UPDATE agents SET name='RenamedSender' WHERE id=1",
+            "UPDATE projects SET slug='renamed' WHERE id=1",
+            "DELETE FROM agents WHERE id=1",
+            "INSERT INTO agents VALUES(1,'RestoredSender')",
+            "DELETE FROM projects WHERE id=1",
+            "INSERT INTO projects VALUES(1,'restored')",
+        ] {
+            let before = gh382_lexical_clock(conn);
+            conn.execute(cx, sql, &[]).await.into_result().unwrap();
+            assert_eq!(
+                gh382_lexical_clock(conn),
+                (before.0 + 1, before.1 + 1),
+                "{sql}"
+            );
+        }
+        // Both directions of a primary-key move matter. An imported orphan
+        // becomes searchable by its restored identity even without a message edit.
+        for sql in [
+            "INSERT INTO messages VALUES(2,9,9)",
+            "INSERT INTO agents VALUES(9,'OrphanSender')",
+            "INSERT INTO projects VALUES(9,'orphan-project')",
+            "UPDATE agents SET id=10 WHERE id=9",
+            "UPDATE agents SET id=9 WHERE id=10",
+            "UPDATE projects SET id=10 WHERE id=9",
+            "UPDATE projects SET id=9 WHERE id=10",
+            "UPDATE messages SET sender_id=1 WHERE id=2",
+            "DELETE FROM messages WHERE id=2",
+        ] {
+            let before = gh382_lexical_clock(conn);
+            conn.execute(cx, sql, &[]).await.into_result().unwrap();
+            let rewrites = i64::from(!sql.starts_with("INSERT INTO messages"));
+            assert_eq!(
+                gh382_lexical_clock(conn),
+                (before.0 + 1, before.1 + rewrites),
+                "{sql}"
+            );
+        }
+        let before = gh382_lexical_clock(conn);
+        conn.execute(cx, "BEGIN", &[]).await.into_result().unwrap();
+        conn.execute(cx, "UPDATE agents SET name='RolledBack' WHERE id=1", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_ne!(gh382_lexical_clock(conn), before);
+        conn.execute(cx, "ROLLBACK", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(gh382_lexical_clock(conn), before);
+    }
+
+    #[test]
+    fn gh382_relevant_identity_migration_preserves_clocks_orphans_and_rollback_on_both_engines() {
+        block_on(|cx| async move {
+            for (already_new, index_only) in [(false, false), (true, false), (false, true)] {
+                let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+                gh382_assert_relevant_lexical_upgrade(&cx, &canonical, already_new, index_only)
+                    .await;
+                let runtime = DbConn::open_memory().unwrap();
+                gh382_assert_relevant_lexical_upgrade(&cx, &runtime, already_new, index_only).await;
+            }
+        });
+    }
+
+    async fn gh382_assert_custom_lexical_schema_preserved<
+        C: Connection + crate::pool::SyncQuery,
+    >(
+        cx: &Cx,
+        conn: &C,
+        custom_index: bool,
+    ) {
+        let migration = gh382_seed_lexical_upgrade(cx, conn).await;
+        if custom_index {
+            conn.execute(
+                cx,
+                "CREATE INDEX idx_messages_sender_id ON messages(project_id)",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        } else {
+            conn.execute(cx, "DROP TRIGGER trg_lexical_clock_agents_insert", &[])
+                .await
+                .into_result()
+                .unwrap();
+            conn.execute(
+                cx,
+                "CREATE TRIGGER trg_lexical_clock_agents_insert AFTER INSERT ON agents BEGIN SELECT 1; END",
+                &[],
+            ).await.into_result().unwrap();
+        }
+        let before = v15_fixture_snapshot(conn);
+        let error = run_specific_migrations(cx, conn, vec![migration])
+            .await
+            .into_result()
+            .expect_err("custom definitions are not owned by this migration");
+        assert!(
+            error.to_string().contains("refuses unsupported definition"),
+            "{error}"
+        );
+        assert_eq!(v15_fixture_snapshot(conn), before);
+    }
+
+    #[test]
+    fn gh382_relevant_identity_migration_preserves_custom_schema_on_both_engines() {
+        block_on(|cx| async move {
+            for custom_index in [false, true] {
+                let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+                gh382_assert_custom_lexical_schema_preserved(&cx, &canonical, custom_index).await;
+                let runtime = DbConn::open_memory().unwrap();
+                gh382_assert_custom_lexical_schema_preserved(&cx, &runtime, custom_index).await;
+            }
+        });
     }
 
     #[test]
@@ -7057,6 +7563,28 @@ mod tests {
             audit[0].get_named::<String>("body").unwrap(),
             "updated after rebuild"
         );
+        // The restored v36 definitions must still distinguish unrelated
+        // identity activity from changes to indexed message metadata.
+        let initial = gh382_lexical_clock(conn);
+        conn.execute(cx, "UPDATE agents SET name=name WHERE id=1", &[])
+            .await
+            .into_result()
+            .unwrap();
+        conn.execute(cx, "UPDATE agents SET name='UnusedViewer' WHERE id=3", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(gh382_lexical_clock(conn), initial);
+        conn.execute(cx, "UPDATE agents SET name='RenamedSender' WHERE id=1", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(gh382_lexical_clock(conn), (initial.0 + 1, initial.1 + 1));
+        conn.execute(cx, "UPDATE projects SET slug='v15-renamed' WHERE id=1", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(gh382_lexical_clock(conn), (initial.0 + 2, initial.1 + 2));
     }
 
     #[test]
@@ -7137,6 +7665,32 @@ mod tests {
             before,
             "unknown schema and every populated row remain authoritative"
         );
+    }
+
+    #[test]
+    fn gh382_v15_refuses_custom_lexical_trigger_without_modification() {
+        block_on(|cx| async move {
+            let mutations = [
+                "DROP TRIGGER trg_lexical_clock_agents_insert".to_string(),
+                "CREATE TRIGGER trg_lexical_clock_agents_insert AFTER INSERT ON agents BEGIN SELECT 1; END".to_string(),
+            ];
+            let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+            assert_v15_unsupported_schema_is_retained(
+                &cx,
+                &canonical,
+                &mutations,
+                "unsupported definition of trg_lexical_clock_agents_insert",
+            )
+            .await;
+            let runtime = DbConn::open_memory().unwrap();
+            assert_v15_unsupported_schema_is_retained(
+                &cx,
+                &runtime,
+                &mutations,
+                "unsupported definition of trg_lexical_clock_agents_insert",
+            )
+            .await;
+        });
     }
 
     #[test]
