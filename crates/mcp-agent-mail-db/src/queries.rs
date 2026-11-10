@@ -590,7 +590,13 @@ fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> 
     })
 }
 
-fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> ProjectRow {
+/// Construct the display identity for a project whose row is missing.
+///
+/// Callers must already have a reference to this project (for example, a
+/// selected message). The placeholder preserves recovery visibility; it does
+/// not grant permission to create new project state.
+#[must_use]
+pub fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> ProjectRow {
     let placeholder = format!("[unknown-project-{project_id}]");
     ProjectRow {
         id: Some(project_id),

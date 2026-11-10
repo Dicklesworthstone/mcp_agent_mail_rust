@@ -3511,6 +3511,7 @@ impl UnifiedMessageAggregate {
     }
 }
 
+#[cfg(test)]
 fn collect_unified_message_aggregates(
     cx: &Cx,
     pool: &DbPool,
@@ -5605,15 +5606,16 @@ fn render_api_unified_inbox(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
 
-    let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let messages = collect_unified_message_aggregates(
-        &cx,
-        &pool,
-        &projects,
-        limit,
-        normalized_filter.as_deref(),
-    )
-    .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
+    // Live refreshes normally request only messages. Global project inventory
+    // (including recovery orphan discovery) is independent of that bounded
+    // page and belongs only to callers that explicitly request navigation.
+    let projects = if include_projects {
+        block_on_outcome(cx, queries::list_projects(cx, pool))?
+    } else {
+        Vec::new()
+    };
+    let messages = unified::collect_messages(cx, pool, limit, normalized_filter.as_deref())
+        .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
 
     let mut result = serde_json::json!({ "messages": messages.into_iter().map(|message| unified_api_message_value(&message.into_view())).collect::<Vec<_>>() });
     if include_projects {
