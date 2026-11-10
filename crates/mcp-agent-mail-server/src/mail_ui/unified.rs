@@ -1084,17 +1084,10 @@ mod tests {
         );
         for id in [12, 13] {
             let agent = agents.iter().find(|agent| agent.id == id).unwrap();
-            assert!(agent.program.is_empty());
-            assert!(agent.model.is_empty());
+            assert_eq!(agent.program, "");
+            assert_eq!(agent.model, "");
         }
-        assert!(
-            agents
-                .iter()
-                .find(|agent| agent.id == 17)
-                .unwrap()
-                .name
-                .is_empty()
-        );
+        assert_eq!(agents.iter().find(|agent| agent.id == 17).unwrap().name, "");
         assert!(!selected[&1].contains(&16));
         assert!(
             in_snapshot(&*conn, || read(&*conn, &selected, 1, None)).is_err(),
@@ -1454,12 +1447,11 @@ mod tests {
     #[test]
     fn live_collector_matches_the_original_on_a_real_migrated_mailbox() {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
-            let _runtime = super::super::message_fixture_runtime();
+            let runtime = super::super::message_fixture_runtime();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let _guard = Cx::set_current(Some(cx.clone()));
             let pool = super::super::initialized_test_pool("unified-message-first-reference");
-            let cx = Cx::for_testing();
-            let conn = fastmcp_core::block_on(pool.acquire(&cx))
-                .into_result()
-                .unwrap();
+            let conn = runtime.block_on(pool.acquire(&cx)).into_result().unwrap();
             for sql in [
                 "INSERT INTO projects(id,slug,human_key,created_at) VALUES(71,'unified-one','/unified-one',1),(72,'unified-two','/unified-two',1)",
                 "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES(81,71,'AmberFox','test','test',1,1),(82,71,'BlueLake','test','test',1,1),(83,71,'GoldFox','test','test',1,1),(84,72,'RedFox','test','test',1,1),(85,72,'BlueLake','test','test',1,1)",
