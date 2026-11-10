@@ -43,16 +43,24 @@ The older receipts below retain their original source scope.
   Both exact owned obsolete wrappers are now recovered. Fresh protected disk
   accounting permits a new preparation on vmi1149989; af110-prepare-180.log
   records that request, with no execution credit until bodies actually run.
-- [ ] Complete af110866 production graph, all-targets graph and strict Clippy.
+- [x] Complete af110866 production graph, all-targets graph and strict Clippy.
   Production retry passes 0/592.3s on vmi1152480; all-targets passes 0/641.0s
   on vmi1153651. Both bind clean base af110866, fingerprint
   fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195,
-  tree 9b7720a661a95b56ecb9194c962f2282f8c4592b. Strict Clippy remains pending.
+  tree 9b7720a661a95b56ecb9194c962f2282f8c4592b. Strict Clippy passes
+  0/564.1s on vmi1152480 with that same clean-base identity.
   The a5571948 runtime-context overlay had passed all three static gates;
   those results remain historical, not substitutes for the frozen new graph.
 - [ ] Record final native/static outcomes and fresh-review disposition, update
   br-asldx without closing unmet readiness/benchmark acceptance, verify equal
   tracker stores and an acyclic graph, publish normally and release exact leases.
+- [x] Preserve four later peer commits (84c46ead through ba2f560e) after a fresh
+  read of their five-file diff and a dirty-overlap/deletion check. These change
+  the runtime dependency graph and unified collector. Frozen af110866 native
+  preparation continues; its eventual result will not qualify these newer bytes.
+  Another process advanced/published the shared checkout through c0816cf4,
+  including this record's earlier checkpoint. No Git rewrite or duplicate
+  merge performed here; import tracker truth after observing that advance.
 
 ## November 10 archive reader follow-through — EmeraldEagle / br-asldx
 
