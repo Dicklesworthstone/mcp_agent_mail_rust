@@ -1210,6 +1210,21 @@ fn archive_drain_stall_detail(
         })
 }
 
+fn apply_archive_sample_unavailable(verdicts: &mut HealthVerdicts, lock: &str) {
+    let level = verdicts
+        .archive_db_parity
+        .level()
+        .max(mcp_agent_mail_core::HealthLevel::Yellow);
+    verdicts.archive_db_parity = HealthVerdict::new(
+        level,
+        true,
+        format!(
+            "{}; archive lag sample unavailable at {lock}; queue convergence is unverified",
+            verdicts.archive_db_parity.detail
+        ),
+    );
+}
+
 /// Decompose the bundled health signals into independent verdicts
 /// (br-bvq1x.3.1 / C1). The strict roll-up over the critical verdicts is what
 /// prevents a green top-level result from coexisting with a broken write or
@@ -2116,20 +2131,22 @@ pub struct QueuesHealthResponse {
 /// the depth of the durable retry backlog and commit coalescer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveLagHealthResponse {
+    /// Queue mutex that could not be sampled; null means the sample is complete.
+    pub unavailable_lock: Option<String>,
     /// Ops in the durable retry backlog (WBQ-unavailable fallback path).
-    pub backlog_depth: u64,
+    pub backlog_depth: Option<u64>,
     /// Age of the oldest op in the retry backlog, milliseconds.
-    pub backlog_oldest_age_ms: u64,
+    pub backlog_oldest_age_ms: Option<u64>,
     /// Enqueued-but-not-committed requests in the commit coalescer.
     pub coalescer_pending: u64,
     /// Age of the oldest uncommitted coalescer request, milliseconds.
-    pub coalescer_oldest_age_ms: u64,
+    pub coalescer_oldest_age_ms: Option<u64>,
     /// Longest interval without a committed request among repositories with
     /// queued or in-flight coalescer work, milliseconds.
     #[serde(default)]
-    pub coalescer_since_progress_ms: u64,
+    pub coalescer_since_progress_ms: Option<u64>,
     /// Age of the oldest unmaterialized archive write overall, milliseconds.
-    pub oldest_unmaterialized_ms: u64,
+    pub oldest_unmaterialized_ms: Option<u64>,
     /// Lifetime totals for the retry backlog.
     pub backlog_enqueued_total: u64,
     pub backlog_drained_total: u64,
@@ -2161,6 +2178,41 @@ pub struct ArchiveLagHealthResponse {
     /// drain is stuck, not merely behind.
     #[serde(default)]
     pub drain_stalled: bool,
+}
+
+impl ArchiveLagHealthResponse {
+    fn from_sample(
+        lag: &mcp_agent_mail_storage::ArchiveLagSnapshot,
+        unavailable_lock: Option<&str>,
+        warn_us: u64,
+        critical_us: u64,
+    ) -> Self {
+        let complete = unavailable_lock.is_none();
+        Self {
+            unavailable_lock: unavailable_lock.map(str::to_string),
+            backlog_depth: complete.then_some(lag.backlog_depth),
+            backlog_oldest_age_ms: complete.then(|| us_to_ms_ceil(lag.backlog_oldest_age_us)),
+            coalescer_pending: lag.coalescer_pending,
+            coalescer_oldest_age_ms: complete.then(|| us_to_ms_ceil(lag.coalescer_oldest_age_us)),
+            coalescer_since_progress_ms: complete
+                .then(|| us_to_ms_ceil(lag.coalescer_since_progress_us)),
+            oldest_unmaterialized_ms: complete.then(|| us_to_ms_ceil(lag.oldest_unmaterialized_us)),
+            backlog_enqueued_total: lag.enqueued_total,
+            backlog_drained_total: lag.drained_total,
+            backlog_dropped_total: lag.dropped_total,
+            backlog_ephemeral_total: lag.ephemeral_total,
+            warn_threshold_ms: warn_us.div_ceil(1_000),
+            critical_threshold_ms: critical_us.div_ceil(1_000),
+            warning: !complete
+                || lag.oldest_unmaterialized_us >= warn_us
+                || lag.ephemeral_total > 0,
+            wbq_depth: lag.wbq_depth,
+            wbq_inflight_oldest_age_ms: us_to_ms_ceil(lag.wbq_inflight_oldest_age_us),
+            wbq_inflight_execution_ms: us_to_ms_ceil(lag.wbq_inflight_execution_us),
+            wbq_since_progress_ms: us_to_ms_ceil(lag.wbq_since_progress_us),
+            drain_stalled: archive_drain_stall_detail(lag, critical_us).is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2541,7 +2593,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // tool replies are decoupled from git-archive materialization, so this is the
     // eventual-consistency window operators watch. Bounds degrade health_level so a
     // stuck archive can never read fully green (acceptance criterion (b)).
-    let archive_lag = mcp_agent_mail_storage::archive_lag_snapshot();
+    let (archive_lag, unavailable_archive_lock) =
+        match mcp_agent_mail_storage::try_archive_lag_snapshot() {
+            Ok(sample) => (sample, None),
+            Err(unavailable) => (unavailable.lower_bound, Some(unavailable.unavailable_lock)),
+        };
     let archive_lag_warn_us = mcp_agent_mail_storage::archive_lag_warn_threshold_us();
     let archive_lag_critical_us = mcp_agent_mail_storage::archive_lag_critical_threshold_us();
     let archive_lag_oldest_us = archive_lag.oldest_unmaterialized_us;
@@ -2562,7 +2618,10 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
-    let archive_pending = archive_writes_pending(&archive_lag);
+    // Unknown queues cannot prove an idle gap. Break that observational age
+    // rather than manufacturing persistence while queue evidence is missing.
+    let archive_pending =
+        unavailable_archive_lock.is_some() || archive_writes_pending(&archive_lag);
     let idle_gap_age = observe_idle_archive_gap(
         config,
         observed_generation.as_ref(),
@@ -2583,6 +2642,9 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         archive_pending,
         idle_gap_age,
     );
+    if let Some(lock) = unavailable_archive_lock {
+        apply_archive_sample_unavailable(&mut verdicts, lock);
+    }
     let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
     let lock_wait_verdict = lock_wait_health_verdict(&lock_activity);
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red
@@ -2605,7 +2667,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // stalled drain is not converging and is already red in archive_db_parity.
     if archive_lag_oldest_us >= archive_lag_critical_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Red);
-    } else if archive_lag_oldest_us >= archive_lag_warn_us {
+    } else if unavailable_archive_lock.is_some() || archive_lag_oldest_us >= archive_lag_warn_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Yellow);
     }
     // A coalescer can have an empty queue now while its tail latency is already
@@ -2632,7 +2694,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // nondeterministic aggregation.
     let archive_lag_level = if archive_lag_oldest_us >= archive_lag_critical_us {
         mcp_agent_mail_core::HealthLevel::Red
-    } else if archive_lag_oldest_us >= archive_lag_warn_us {
+    } else if unavailable_archive_lock.is_some() || archive_lag_oldest_us >= archive_lag_warn_us {
         mcp_agent_mail_core::HealthLevel::Yellow
     } else {
         mcp_agent_mail_core::HealthLevel::Green
@@ -2656,7 +2718,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "archive_lag".to_string(),
             level: archive_lag_level.to_string(),
             detail: format!(
-                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms); wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; coalescer pending {}, no committed request for {} ms{}",
+                "{}confirmed lag lower bound: {} ms (warn {} ms, critical {} ms); \
+                 wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; \
+                 coalescer pending {}, confirmed progress-gap lower bound {} ms{}",
+                unavailable_archive_lock.map_or_else(String::new, |lock| {
+                    format!("archive sample unavailable at {lock}; ")
+                }),
                 archive_lag_oldest_us / 1_000,
                 archive_lag_warn_us / 1_000,
                 archive_lag_critical_us / 1_000,
@@ -2802,33 +2869,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     warning: commit_over_80_for_s >= 300
                         || coalescer_latency_level != mcp_agent_mail_core::HealthLevel::Green,
                 },
-                archive_lag: ArchiveLagHealthResponse {
-                    backlog_depth: archive_lag.backlog_depth,
-                    backlog_oldest_age_ms: us_to_ms_ceil(archive_lag.backlog_oldest_age_us),
-                    coalescer_pending: archive_lag.coalescer_pending,
-                    coalescer_oldest_age_ms: us_to_ms_ceil(archive_lag.coalescer_oldest_age_us),
-                    coalescer_since_progress_ms: us_to_ms_ceil(
-                        archive_lag.coalescer_since_progress_us,
-                    ),
-                    oldest_unmaterialized_ms: us_to_ms_ceil(archive_lag_oldest_us),
-                    backlog_enqueued_total: archive_lag.enqueued_total,
-                    backlog_drained_total: archive_lag.drained_total,
-                    backlog_dropped_total: archive_lag.dropped_total,
-                    backlog_ephemeral_total: archive_lag.ephemeral_total,
-                    warn_threshold_ms: archive_lag_warn_us.div_ceil(1_000),
-                    critical_threshold_ms: archive_lag_critical_us.div_ceil(1_000),
-                    // br-ack-fast: a lagging archive OR any op that could not be
-                    // durably journaled (ephemeral) warrants operator attention.
-                    warning: archive_lag_oldest_us >= archive_lag_warn_us
-                        || archive_lag.ephemeral_total > 0,
-                    wbq_depth: archive_lag.wbq_depth,
-                    wbq_inflight_oldest_age_ms: us_to_ms_ceil(
-                        archive_lag.wbq_inflight_oldest_age_us,
-                    ),
-                    wbq_inflight_execution_ms: us_to_ms_ceil(archive_lag.wbq_inflight_execution_us),
-                    wbq_since_progress_ms: us_to_ms_ceil(archive_lag.wbq_since_progress_us),
-                    drain_stalled: archive_drain_stalled,
-                },
+                archive_lag: ArchiveLagHealthResponse::from_sample(
+                    &archive_lag,
+                    unavailable_archive_lock,
+                    archive_lag_warn_us,
+                    archive_lag_critical_us,
+                ),
             }
         }),
         disk: disk_sample.as_ref().map(|s| DiskHealthResponse {
@@ -5469,6 +5515,68 @@ mod tests {
             verdicts.archive_db_parity.detail, "git archive and sqlite index are aligned",
             "must not assert bare alignment over visibly unequal counts"
         );
+    }
+
+    #[test]
+    fn unavailable_archive_sample_is_unknown_and_preserves_known_stalls() {
+        let mut lag = mcp_agent_mail_storage::ArchiveLagSnapshot::default();
+        let complete = ArchiveLagHealthResponse::from_sample(&lag, None, 1_000_000, 30_000_000);
+        assert_eq!(complete.backlog_depth, Some(0));
+        assert_eq!(complete.oldest_unmaterialized_ms, Some(0));
+        assert!(!complete.warning);
+
+        let lock = "commit_coalescer.progress";
+        let unknown =
+            ArchiveLagHealthResponse::from_sample(&lag, Some(lock), 1_000_000, 30_000_000);
+        let value = serde_json::to_value(unknown).unwrap();
+        assert_eq!(value["unavailable_lock"], lock);
+        assert_eq!(value["warning"], true);
+        for field in [
+            "backlog_depth",
+            "backlog_oldest_age_ms",
+            "coalescer_oldest_age_ms",
+            "coalescer_since_progress_ms",
+            "oldest_unmaterialized_ms",
+        ] {
+            assert!(
+                value[field].is_null(),
+                "missing {field} must not become zero"
+            );
+        }
+
+        let mut verdicts = compute_health_verdicts(
+            &Config::from_env(),
+            true,
+            &semantic("ok", "archive and sqlite aligned"),
+            &healthy_integrity_metrics(),
+            None,
+            true,
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "green");
+        apply_archive_sample_unavailable(&mut verdicts, lock);
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
+        assert!(verdicts.archive_db_parity.detail.contains(lock));
+
+        lag.wbq_inflight_execution_us = 31_000_000;
+        lag.oldest_unmaterialized_us = 31_000_000;
+        let unknown =
+            ArchiveLagHealthResponse::from_sample(&lag, Some(lock), 1_000_000, 30_000_000);
+        assert!(unknown.drain_stalled);
+        assert_eq!(unknown.wbq_inflight_execution_ms, 31_000);
+        assert_eq!(unknown.oldest_unmaterialized_ms, None);
+        let stall = archive_drain_stall_detail(&lag, 30_000_000).unwrap();
+        let mut stalled = compute_health_verdicts(
+            &Config::from_env(),
+            true,
+            &semantic("ok", "archive is behind sqlite"),
+            &healthy_integrity_metrics(),
+            Some(&stall),
+            true,
+        );
+        apply_archive_sample_unavailable(&mut stalled, lock);
+        assert_eq!(stalled.archive_db_parity.status, "red");
+        assert!(stalled.archive_db_parity.detail.contains("drain stalled"));
+        assert!(stalled.archive_db_parity.detail.contains(lock));
     }
 
     #[test]

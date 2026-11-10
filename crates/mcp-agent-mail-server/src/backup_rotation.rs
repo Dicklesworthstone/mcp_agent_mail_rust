@@ -65,6 +65,17 @@ pub use mcp_agent_mail_db::recovery_retention::{
     inspect_storage_backups,
 };
 
+/// Monotone budget evidence for a rotation pass. A deadline may be reached
+/// by the final admitted operation without leaving any deferred work.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RotationBudgetState {
+    #[default]
+    WithinBudget,
+    WorkDeferred,
+    DeadlineReached,
+    DeadlineWithDeferredWork,
+}
+
 /// Report returned by `rotate_storage_backups`. One entry per non-empty kind.
 ///
 /// "Staged" means moved into a `doctor/reclaimable/rotation-<ts>[-<n>]/`
@@ -109,12 +120,9 @@ pub struct RotateReport {
     /// completed mutation has unconfirmed durability. A quota refusal following
     /// this pass must not authorize a repair export.
     pub admission_refused: bool,
-    /// The pass reached its wall-clock budget. What it did not reach stays on
-    /// disk, counted as kept, for a later pass.
-    pub deadline_reached: bool,
-    /// A bounded maintenance slice left work for another pass. This cannot be
-    /// used as evidence that reclamation failed or a repair export is needed.
-    pub work_deferred: bool,
+    /// Budget exhaustion and deferred work remain distinct: neither means
+    /// reclamation failed or authorizes a repair export.
+    pub budget_state: RotationBudgetState,
     /// An unchanged complete bounded search found no verified pin. This may
     /// reach the existing one-shot repair-export gate, never deletion.
     pub completed_pin_search_without_match: bool,
@@ -126,6 +134,38 @@ pub struct RotateReport {
 }
 
 impl RotateReport {
+    #[must_use]
+    pub const fn deadline_reached(&self) -> bool {
+        matches!(
+            self.budget_state,
+            RotationBudgetState::DeadlineReached | RotationBudgetState::DeadlineWithDeferredWork
+        )
+    }
+
+    #[must_use]
+    pub const fn work_deferred(&self) -> bool {
+        matches!(
+            self.budget_state,
+            RotationBudgetState::WorkDeferred | RotationBudgetState::DeadlineWithDeferredWork
+        )
+    }
+
+    fn note_deadline(&mut self) {
+        self.budget_state = if self.work_deferred() {
+            RotationBudgetState::DeadlineWithDeferredWork
+        } else {
+            RotationBudgetState::DeadlineReached
+        };
+    }
+
+    fn defer_work(&mut self) {
+        self.budget_state = if self.deadline_reached() {
+            RotationBudgetState::DeadlineWithDeferredWork
+        } else {
+            RotationBudgetState::WorkDeferred
+        };
+    }
+
     /// Confirmed completed evictions. Unconfirmed moves are reported separately
     /// and must never be silently promoted into successful staging counts.
     #[must_use]
@@ -777,8 +817,8 @@ fn reclaim_empty_rotation_directories(
             continue;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            report.deadline_reached = true;
-            report.work_deferred = true;
+            report.note_deadline();
+            report.defer_work();
             break;
         }
         admit()?;
@@ -979,7 +1019,7 @@ fn reclaim_periodic_file(
         .saturating_mul(2)
         .saturating_add(guard.verified_source_size_bytes().unwrap_or(0));
     if !budget.admit(verification_bytes) {
-        report.work_deferred = true;
+        report.defer_work();
         summary.kept = summary.kept.saturating_add(1);
         summary.bytes_kept = summary.bytes_kept.saturating_add(metadata.len());
         return false;
@@ -1236,9 +1276,10 @@ fn record_snapshot_admission_error(report: &mut RotateReport, path: &Path, error
     if let Some(reason) =
         mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::from_io_error(error)
     {
-        report.work_deferred = true;
-        report.deadline_reached |=
-            reason == mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::Deadline;
+        report.defer_work();
+        if reason == mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::Deadline {
+            report.note_deadline();
+        }
         if reason == mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::InventoryChanged {
             report.inventory_incomplete = true;
             report.admission_refused = true;
@@ -1637,13 +1678,17 @@ where
     // Finish inventory even after the budget expires so deferred files remain
     // visible in retained counts. Snapshot admission selects and fully verifies
     // the survivor, so checking only the later per-file budget is too late.
-    report.deadline_reached |= deadline.is_some_and(|deadline| Instant::now() >= deadline);
-    report.work_deferred |= report.deadline_reached;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        report.note_deadline();
+    }
+    if report.deadline_reached() {
+        report.defer_work();
+    }
     // Inventory is only a hint: every move checks its retained file witness.
     // Acquire before choosing a pin, then retain admission for the whole pass.
     // Do not create control state for a missing/empty backup inventory or work
     // deferred by the deadline. Deferral is not an admission refusal.
-    if report.inventory_incomplete || report.admission_refused || report.work_deferred {
+    if report.inventory_incomplete || report.admission_refused || report.work_deferred() {
         // An unreadable entry may be the recovery record for a visible payload.
         // Preserve every known file and report lower bounds until the complete
         // namespace can be inspected; never infer absence from an I/O error.
@@ -1946,7 +1991,7 @@ where
                     size
                 };
                 if !incident_reclaim_budget.admit(work_bytes) {
-                    report.work_deferred = true;
+                    report.defer_work();
                     summary.kept += 1;
                     summary.bytes_kept = summary.bytes_kept.saturating_add(size);
                     continue;
@@ -2092,8 +2137,9 @@ where
     );
     #[cfg(unix)]
     {
-        report.deadline_reached |=
-            reclaim_budget.deadline_reached || incident_reclaim_budget.deadline_reached;
+        if reclaim_budget.deadline_reached || incident_reclaim_budget.deadline_reached {
+            report.note_deadline();
+        }
     }
     #[cfg(unix)]
     if !report.admission_refused
@@ -2125,8 +2171,8 @@ where
     if report.evicted() > 0
         || report.empty_directories_deleted > 0
         || report.unconfirmed_moves > 0
-        || report.deadline_reached
-        || report.work_deferred
+        || report.deadline_reached()
+        || report.work_deferred()
         || !report.failures.is_empty()
     {
         info!(
@@ -2142,8 +2188,8 @@ where
             bytes_retained = report.bytes_retained(),
             inventory_incomplete = report.inventory_incomplete,
             admission_refused = report.admission_refused,
-            work_deferred = report.work_deferred,
-            deadline_reached = report.deadline_reached,
+            work_deferred = report.work_deferred(),
+            deadline_reached = report.deadline_reached(),
             failures = report.failures.len(),
             unconfirmed_deletions = report.unconfirmed_deletions,
             bytes_unconfirmed_deletions = report.bytes_unconfirmed_deletions,
@@ -2365,7 +2411,7 @@ mod tests {
         );
         let first = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
         assert!(first.failures.is_empty(), "{first:?}");
-        assert!(first.work_deferred);
+        assert!(first.work_deferred());
         assert!(!first.admission_refused);
         assert_eq!(first.deleted, MAX_RECLAIM_FILES_PER_PASS);
         assert_eq!(
@@ -2376,7 +2422,7 @@ mod tests {
         );
         let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
         assert!(next.failures.is_empty(), "{next:?}");
-        assert!(!next.work_deferred);
+        assert!(!next.work_deferred());
         assert_eq!(first.deleted + next.deleted, 208);
         let footprint = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
         assert_eq!(footprint.images, 4);
@@ -2966,8 +3012,8 @@ mod tests {
         let primary = mailbox_with_backlog(tmp.path());
         let before = names_on_disk(tmp.path());
         let spent = rotate_storage_backups_within(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
-        assert!(spent.deadline_reached);
-        assert!(spent.work_deferred);
+        assert!(spent.deadline_reached());
+        assert!(spent.work_deferred());
         assert_eq!(spent.deleted, 0);
         assert!(spent.failures.is_empty(), "{:?}", spent.failures);
         assert!(!spent.admission_refused);
@@ -2980,7 +3026,7 @@ mod tests {
 
         // The background pass has no budget: same evictions, same kept set.
         let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
-        assert!(!next.deadline_reached);
+        assert!(!next.deadline_reached());
         assert_eq!(next.deleted, unbudgeted.deleted);
         assert_eq!(next.kept, unbudgeted.kept);
         assert_eq!(
@@ -3034,8 +3080,8 @@ mod tests {
             assert_eq!(report.kept, remaining - 1);
             assert_eq!(budget.attempted, 1);
             assert!(budget.deadline_reached);
-            assert_eq!(report.work_deferred, remaining > 1);
-            assert!(report.failures.is_empty());
+            assert_eq!(report.work_deferred(), remaining > 1);
+            assert_eq!(report.failures, Vec::<RotationFailure>::new());
             guard.revalidate().unwrap();
         }
         assert!(paths.iter().all(|path| !path.exists()));
@@ -3070,7 +3116,7 @@ mod tests {
         assert_eq!(report.kept, 131, "{report:?}");
         assert_eq!(report.evicted(), 0, "{report:?}");
         assert!(
-            !report.work_deferred,
+            !report.work_deferred(),
             "no possible delete remains unfinished"
         );
         assert!(!report.admission_refused, "{report:?}");
@@ -3110,7 +3156,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(report.kept, 140, "{report:?}");
                 assert_eq!(report.evicted(), 0, "{report:?}");
-                assert!(!report.work_deferred, "{report:?}");
+                assert!(!report.work_deferred(), "{report:?}");
                 assert!(!report.admission_refused, "{report:?}");
                 let error = admit_periodic_publication(tmp.path(), &primary, 3).unwrap_err();
                 assert!(periodic_publication_budget_exhausted(&error));
@@ -3174,7 +3220,7 @@ mod tests {
         };
 
         let spent = rotate(Duration::ZERO);
-        assert!(spent.deadline_reached);
+        assert!(spent.deadline_reached());
         assert!(!spent.admission_refused, "{:?}", spent.failures);
         assert!(!spent.inventory_incomplete);
         assert!(spent.failures.is_empty(), "{:?}", spent.failures);
@@ -3202,7 +3248,7 @@ mod tests {
         // This is real contention, not an inventory that happens to fit the
         // window: with time remaining the same pass must still try admission.
         let contended = rotate(Duration::from_secs(3600));
-        assert!(!contended.deadline_reached);
+        assert!(!contended.deadline_reached());
         assert!(contended.admission_refused);
         assert!(!contended.inventory_incomplete);
         assert_eq!(contended.failures.len(), 1);
@@ -3223,7 +3269,7 @@ mod tests {
         let primary = mailbox_with_backlog(tmp.path());
         let ample = Duration::from_secs(3600);
         let report = rotate_storage_backups_within(tmp.path(), &primary, 3, ample).unwrap();
-        assert!(!report.deadline_reached);
+        assert!(!report.deadline_reached());
         assert_eq!(report.deleted, unbudgeted.deleted);
         assert_eq!(report.kept, unbudgeted.kept);
         assert_eq!(names_on_disk(tmp.path()), names_on_disk(control.path()));
@@ -3243,13 +3289,13 @@ mod tests {
         });
 
         let spent = rotate_storage_backups_within(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
-        assert!(spent.deadline_reached);
+        assert!(spent.deadline_reached());
         assert_eq!(spent.empty_directories_deleted, 0);
         assert!(spent.failures.is_empty(), "{:?}", spent.failures);
         assert!(empties.iter().all(|directory| directory.is_dir()));
 
         let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
-        assert!(!next.deadline_reached);
+        assert!(!next.deadline_reached());
         assert_eq!(next.empty_directories_deleted, 3);
         assert!(empties.iter().all(|directory| !directory.exists()));
     }
