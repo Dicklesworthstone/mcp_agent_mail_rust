@@ -1,5 +1,59 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 10 final source qualification — EmeraldEagle / br-asldx
+
+Frozen target: af110866db204319191a24c8e50c80a320c15eea, lock 208ea862.
+The older receipts below retain their original source scope.
+
+- [x] Re-read the reader repair, its callers, four regressions and migration
+  setup again. Combined reconstruction 6bb15508 passed all 139 cases; the
+  expanded server run executed 37, passed 36 and exposed the live fixture's
+  first-acquire timeout. The runtime-context correction remains unproven natively.
+- [x] Preserve shared work after another process committed/reorganized history.
+  Our original 1c2bb22c survives at refs/retained/am-reader-1c2bb22c; its reader
+  repair is now bcd46ba9. No reset, stash, force push or peer edit reversal.
+  Source hashes remain reconstruction 6bb15508 / unified b96821de /
+  schedule 3d1b2dbc, but error.rs, queries.rs, mail_ui.rs and storage/lib.rs
+  have changed upstream. Old a5571948 graph receipts do not qualify this graph.
+- [x] Review those four incoming diffs, including lifecycle refusal/extension
+  handling, retryable-error precedence, orphan-reference deduplication and
+  canonical-file probing. Stock full-file UBS reports no failed modules:
+  error 0/274/36, queries 0/4134/651, mail_ui 5/824/342, storage 0/4860/1220
+  (critical/warning/info). All five critical alerts refer to timestamp-based
+  private test fixture names, not credential generation. They remain reported;
+  no suppression or claim that the expanded scan is green. Final fmt exits 0.
+- [x] Retain and reconcile the older native attempts. The original 37-case
+  actual run with one compiler job reached its unchanged 1800s deadline:
+  exit 137, complete:false, zero bodies. Official recovery acknowledges 137.
+  One compiler job stayed within the prior maximum of two, without changing
+  disk growth/floor, runtime parallelism, cases or per-test bounds. The cold
+  compile-only a5571948 fallback was superseded by af110866 and cooperatively
+  cancelled through its exact owned RCH wrapper: local 143, daemon earlier
+  130, recovered delivery 120; acknowledged, zero bodies, no pass credit.
+- [x] Predeclare the frozen native population before execution: reconstruction
+  139 + original startup 12 + unified 17 + schedule 8 + error classification 1
+  + UI error contracts 2 + existing orphan-inventory regression 1 = 180.
+  The prior 179-case preparation refused before Cargo; adding the last case
+  follows the newly reviewed queries diff, with no original case removed.
+- [ ] Complete strict compile-only preparation of those 180 cases, then actual
+  execution with original 1800s command / 240s per-test limits. Default features,
+  dev.debug=0, maximum one compiler job, 30 GiB growth / 10 GiB floor retained.
+  Initial af110866 preparation refused disk admission 120; production refused
+  unfinished source ownership 103; all-targets refused disk admission 103.
+  Both exact owned obsolete wrappers are now recovered. Fresh protected disk
+  accounting permits a new preparation on vmi1149989; af110-prepare-180.log
+  records that request, with no execution credit until bodies actually run.
+- [ ] Complete af110866 production graph, all-targets graph and strict Clippy.
+  Production retry passes 0/592.3s on vmi1152480; all-targets passes 0/641.0s
+  on vmi1153651. Both bind clean base af110866, fingerprint
+  fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195,
+  tree 9b7720a661a95b56ecb9194c962f2282f8c4592b. Strict Clippy remains pending.
+  The a5571948 runtime-context overlay had passed all three static gates;
+  those results remain historical, not substitutes for the frozen new graph.
+- [ ] Record final native/static outcomes and fresh-review disposition, update
+  br-asldx without closing unmet readiness/benchmark acceptance, verify equal
+  tracker stores and an acyclic graph, publish normally and release exact leases.
+
 ## November 10 archive reader follow-through — EmeraldEagle / br-asldx
 
 - [x] Verify unchanged governing docs and tracked 91fb1340; preserve seven
