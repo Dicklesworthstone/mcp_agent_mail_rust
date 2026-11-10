@@ -252,7 +252,8 @@ fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Opt
     let message_repair_enabled = message_archive_reconcile::enabled(config);
     let agent_repair_enabled = agent_reconcile::enabled(config);
     let reservation_repair_enabled = reservation_reconcile::enabled(config);
-    let repair_enabled = message_repair_enabled || agent_repair_enabled || reservation_repair_enabled;
+    let repair_enabled =
+        message_repair_enabled || agent_repair_enabled || reservation_repair_enabled;
     let poll_interval = maintenance_poll_interval(interval, repair_enabled);
     let mut repair_schedule = schedule::RepairSchedule::new(
         poll_interval,

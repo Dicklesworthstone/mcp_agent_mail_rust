@@ -881,6 +881,27 @@ pub mod tool_util {
                     }),
                 ),
             ),
+            DbError::InvalidArgument {
+                field: field @ ("cross_project_contact_blocked" | "cross_project_contact_required"),
+                message,
+            } => legacy_tool_error(
+                if field == "cross_project_contact_blocked" {
+                    "CONTACT_BLOCKED"
+                } else {
+                    "CONTACT_REQUIRED"
+                },
+                message.clone(),
+                true,
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "field": "to|cc|bcc",
+                        "error_detail": message,
+                        "phase": "message_admission",
+                    }),
+                ),
+            ),
             DbError::InvalidArgument { field, message } => legacy_tool_error(
                 "INVALID_ARGUMENT",
                 format!(
@@ -3256,6 +3277,22 @@ body
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
             assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_preserves_contact_admission_errors() {
+            for (field, code) in [
+                ("cross_project_contact_blocked", "CONTACT_BLOCKED"),
+                ("cross_project_contact_required", "CONTACT_REQUIRED"),
+            ] {
+                let err = db_error_to_mcp_error(DbError::invalid(field, "No message was sent."));
+                assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+                assert_eq!(err.message, "No message was sent.");
+                let data = err.data.expect("contact refusal envelope");
+                assert_eq!(data["error"]["type"], code);
+                assert_eq!(data["error"]["recoverable"], true);
+                assert_eq!(data["error"]["data"]["phase"], "message_admission");
+            }
         }
 
         #[test]

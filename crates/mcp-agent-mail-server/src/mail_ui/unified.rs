@@ -198,7 +198,10 @@ pub(super) fn collect(
     if projects.is_empty() {
         return Ok(UnifiedPage::default());
     }
-    let project_ids: Vec<_> = projects.iter().map(|project| project.id.unwrap_or(0)).collect();
+    let project_ids: Vec<_> = projects
+        .iter()
+        .map(|project| project.id.unwrap_or(0))
+        .collect();
     let SelectedPage {
         messages: selected,
         agents,
@@ -387,7 +390,10 @@ fn read_roster(
         // oldest-ID rule. Preserve retired/deregistered direct history, and
         // choose the newest activity then greatest ID for case variants.
         profiles.sort_by(|left, right| {
-            right.0.cmp(&left.0).then_with(|| right.1.id.cmp(&left.1.id))
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.id.cmp(&left.1.id))
         });
         let mut seen_names = BTreeSet::new();
         let agents: Vec<_> = profiles
@@ -1016,8 +1022,7 @@ mod tests {
             statements: RefCell::new(Vec::new()),
         };
         let projects: Vec<i64> = (1..=257).collect();
-        let (selected, agents) =
-            in_snapshot(&traced, || read_roster(&traced, &projects)).unwrap();
+        let (selected, agents) = in_snapshot(&traced, || read_roster(&traced, &projects)).unwrap();
         assert_eq!(selected.len(), 257);
         assert_eq!(
             selected[&1],

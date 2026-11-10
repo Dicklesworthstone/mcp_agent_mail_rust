@@ -3795,69 +3795,55 @@ effective_free_bytes={free}"
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
-    // Idempotency (br-idempotency-keys-mutating-tools-h0x9k): when the client
-    // supplied a key, route through the idempotent DB entry point. A matching
-    // prior key replays the original message — the index/notification/archive
-    // side effects below are then skipped (at-most-once) — while a differing
-    // payload under the same key is a typed conflict.
-    let (message, idempotent_replay) = if let Some(fingerprint) = idempotency_fingerprint.as_deref()
-    {
-        let key = idempotency_key.as_deref().unwrap_or_default();
+    #[cfg(test)]
+    tests::run_before_message_admission_hook();
+    // Both fresh and keyed sends share the same transaction-bound admission.
+    // The earlier cross-project contact check supplies helpful errors, but its
+    // result cannot authorize a send after attachment processing or pool waits.
+    let cross_project =
+        foreign_project
+            .as_ref()
+            .map(|_| mcp_agent_mail_db::queries::CrossProjectMessageScope {
+                sender_project_id: project_id,
+            });
+    let claim = idempotency_fingerprint.as_deref().map(|fingerprint| {
         // The claim is keyed by the sender's project (where a retry looks it
         // up), even when the message itself is stored in another project.
-        let claim = mcp_agent_mail_db::IdempotencyClaim {
+        mcp_agent_mail_db::IdempotencyClaim {
             project_id,
             tool: idempotency_tool,
-            key,
+            key: idempotency_key.as_deref().unwrap_or_default(),
             fingerprint,
-        };
-        match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
-                ctx.cx(),
-                &pool,
-                delivery_id,
-                sender_id,
-                &subject,
-                &final_body,
-                thread_id.as_deref(),
-                topic.as_deref(),
-                reply_to,
-                &importance_val,
-                ack_required.unwrap_or(false),
-                &attachments_json,
-                &recipient_refs,
-                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
-                claim,
-            )
-            .await,
-        )? {
-            mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
-            mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
-            mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
-                return Err(crate::idempotency::idempotency_conflict_error(&info));
-            }
         }
-    } else {
-        let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
-                ctx.cx(),
-                &pool,
-                delivery_id,
-                sender_id,
-                &subject,
-                &final_body,
-                thread_id.as_deref(),
-                topic.as_deref(),
-                reply_to,
-                &importance_val,
-                ack_required.unwrap_or(false),
-                &attachments_json,
-                &recipient_refs,
-                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
-            )
-            .await,
-        )?;
-        (row, false)
+    });
+    // A replay returns before checking current contact permission and skips
+    // indexing, notification and archive side effects below: no new mail is sent.
+    let (message, idempotent_replay) = match db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::create_message_with_recipients_guarded(
+            ctx.cx(),
+            &pool,
+            delivery_id,
+            sender_id,
+            &subject,
+            &final_body,
+            thread_id.as_deref(),
+            topic.as_deref(),
+            reply_to,
+            &importance_val,
+            ack_required.unwrap_or(false),
+            &attachments_json,
+            &recipient_refs,
+            project_mailbox.as_ref().map(|mailbox| mailbox.kind),
+            cross_project,
+            claim,
+        )
+        .await,
+    )? {
+        mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
+        mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
+        mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
+            return Err(crate::idempotency::idempotency_conflict_error(&info));
+        }
     };
 
     if idempotent_replay {
@@ -6473,9 +6459,29 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::{Cx, Outcome};
     use fastmcp::prelude::McpContext;
-    use mcp_agent_mail_db::{AgentRow, DbPool, DbPoolConfig, ProjectRow, queries};
+    use mcp_agent_mail_db::{AgentRow, DbPool, DbPoolConfig, ProjectRow, queries, sqlmodel_core};
 
     static MESSAGING_THREAD_ID_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    std::thread_local! {
+        static BEFORE_MESSAGE_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_before_message_admission_hook() {
+        let hook = BEFORE_MESSAGE_ADMISSION.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    struct MessageAdmissionHookGuard;
+
+    impl Drop for MessageAdmissionHookGuard {
+        fn drop(&mut self) {
+            BEFORE_MESSAGE_ADMISSION.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
 
     /// Run a tool-driving test against a private mailbox. The harness drains
     /// this test's archive writes before its tempdir is removed, so a late
@@ -7686,6 +7692,101 @@ mod tests {
         // A malformed qualifier is routed (and then refused), never treated
         // as a plain local name that could be auto-registered.
         assert!(any_qualified_recipient(&["GreenCastle@".to_string()]));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cross_project_send_and_reply_recheck_contact_after_tool_preflight() {
+        with_messaging_mailbox(
+            &[
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_SESSION_IDENTITY", "false"),
+            ],
+            |mailbox| {
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = get_db_pool().expect("private test mailbox");
+                    let source = ensure_project_row(&cx, &pool, "/data/projects/admission-source").await;
+                    let target = ensure_project_row(&cx, &pool, "/data/projects/admission-target").await;
+                    let sender = register_agent_row(&cx, &pool, source.id.unwrap(), "BlueLake").await;
+                    let recipient = register_agent_row(&cx, &pool, target.id.unwrap(), "RedFox").await;
+                    queries::request_contact(
+                        &cx, &pool, source.id.unwrap(), sender.id.unwrap(),
+                        target.id.unwrap(), recipient.id.unwrap(), "approved route", 3600,
+                    ).await.into_result().expect("request contact");
+                    queries::respond_contact(
+                        &cx, &pool, source.id.unwrap(), sender.id.unwrap(),
+                        target.id.unwrap(), recipient.id.unwrap(), true, 3600,
+                    ).await.into_result().expect("approve contact");
+                    let send = |key: Option<String>| {
+                        send_message(
+                            &ctx, source.human_key.clone(), sender.name.clone(),
+                            vec![format!("{}@{}", recipient.name, target.slug)],
+                            "cross-project admission".to_string(), "body".to_string(),
+                            None, None, None, Some(false), None, Some(true), None, None,
+                            None, Some(false), None, key,
+                        )
+                    };
+                    let accepted: Value = serde_json::from_str(&send(None).await.expect("approved control send"))
+                        .expect("send receipt");
+                    let original_id = accepted["deliveries"][0]["payload"]["id"].as_i64().expect("message id");
+
+                    for mode in ["send", "keyed_send", "reply"] {
+                        queries::respond_contact(
+                            &cx, &pool, source.id.unwrap(), sender.id.unwrap(),
+                            target.id.unwrap(), recipient.id.unwrap(), true, 3600,
+                        ).await.into_result().expect("restore approval for preflight");
+                        let writer = mcp_agent_mail_db::DbConn::open_file(
+                            mailbox.database_path.to_str().expect("database path"),
+                        ).expect("independent contact writer");
+                        let before = ["messages", "message_recipients", "inbox_delivery_events", "idempotency_keys"]
+                            .map(|table| writer.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                                .expect("pre-send counts")[0].get_as::<i64>(0).unwrap());
+                        let called = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let observed = std::rc::Rc::clone(&called);
+                        let from = sender.id.unwrap();
+                        let to = recipient.id.unwrap();
+                        let _hook_guard = MessageAdmissionHookGuard;
+                        BEFORE_MESSAGE_ADMISSION.with(|slot| {
+                            assert!(slot.borrow().is_none());
+                            *slot.borrow_mut() = Some(Box::new(move || {
+                                writer.execute_sync(
+                                    "UPDATE agent_links SET status = 'blocked' WHERE a_agent_id = ? AND b_agent_id = ?",
+                                    &[sqlmodel_core::Value::BigInt(from), sqlmodel_core::Value::BigInt(to)],
+                                ).expect("commit revocation after preflight");
+                                let status = writer.query_sync(
+                                    "SELECT status FROM agent_links WHERE a_agent_id = ? AND b_agent_id = ?",
+                                    &[sqlmodel_core::Value::BigInt(from), sqlmodel_core::Value::BigInt(to)],
+                                ).expect("read committed contact decision")[0].get_as::<String>(0).unwrap();
+                                assert_eq!(status, "blocked");
+                                observed.set(true);
+                                mcp_agent_mail_db::close_db_conn(writer, "contact-admission test writer");
+                            }));
+                        });
+                        let outcome = if mode == "reply" {
+                            reply_message(
+                                &ctx, target.human_key.clone(), original_id, recipient.name.clone(),
+                                "reply body".to_string(), None, None, None, None, None, None,
+                                None, Some(false), None, Some("reply-after-revocation".to_string()),
+                            ).await
+                        } else {
+                            send((mode == "keyed_send").then(|| "send-after-revocation".to_string())).await
+                        };
+                        let error = outcome.expect_err("committed revocation must prevent new mail");
+                        assert!(called.get(), "{mode} must reach the real DB admission after passing preflight");
+                        assert_eq!(crate::tool_util::tool_error_code(&error), Some("CONTACT_BLOCKED"), "{mode}: {error:?}");
+                        assert_eq!(error.data.as_ref().unwrap()["error"]["data"]["phase"], "message_admission");
+                        let conn = pool.acquire(&cx).await.into_result().expect("verify refusal state");
+                        let after = ["messages", "message_recipients", "inbox_delivery_events", "idempotency_keys"]
+                            .map(|table| conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                                .expect("post-refusal counts")[0].get_as::<i64>(0).unwrap());
+                        assert_eq!(after, before, "{mode} must not publish mail or an idempotency result");
+                    }
+                });
+            },
+        );
     }
 
     /// br-xhfoz: requesting contact again with an already-approved peer (what a

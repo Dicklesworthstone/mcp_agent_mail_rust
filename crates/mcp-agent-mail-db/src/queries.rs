@@ -8807,7 +8807,7 @@ pub async fn create_message_with_recipients_topic(
     recipients: &[(i64, &str)],
     project_mailbox: Option<&str>,
 ) -> Outcome<MessageRow, DbError> {
-    match create_message_with_recipients_impl(
+    match create_message_with_recipients_guarded(
         cx,
         pool,
         project_id,
@@ -8822,6 +8822,7 @@ pub async fn create_message_with_recipients_topic(
         attachments,
         recipients,
         project_mailbox,
+        None,
         None,
     )
     .await
@@ -8905,7 +8906,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
     project_mailbox: Option<&str>,
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
-    create_message_with_recipients_impl(
+    create_message_with_recipients_guarded(
         cx,
         pool,
         project_id,
@@ -8920,13 +8921,31 @@ pub async fn create_message_with_recipients_idempotent_topic(
         attachments,
         recipients,
         project_mailbox,
+        None,
         Some(claim),
     )
     .await
 }
 
+/// The source project of a user message delivered into another project.
+///
+/// This is a scope constraint, not cached authorization. The message transaction
+/// re-reads the sender, recipient policies and both directions of each contact
+/// link before accepting a fresh message.
+#[derive(Debug, Clone, Copy)]
+pub struct CrossProjectMessageScope {
+    pub sender_project_id: i64,
+}
+
+/// Create a message with transaction-bound cross-project contact authorization.
+///
+/// User-facing qualified sends and replies pass `cross_project`. Internal
+/// contact-request notices use the ordinary creation functions because their
+/// purpose is to request approval that does not yet exist. Same-project policy
+/// stays with its existing tool-layer rules. An existing idempotency result is
+/// returned before checking current contact permission: replay creates no mail.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn create_message_with_recipients_impl(
+pub async fn create_message_with_recipients_guarded(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
@@ -8941,8 +8960,19 @@ async fn create_message_with_recipients_impl(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
     project_mailbox: Option<&str>,
+    cross_project: Option<CrossProjectMessageScope>,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    if let Some(scope) = cross_project
+        && (scope.sender_project_id == project_id
+            || recipients.is_empty()
+            || project_mailbox.is_some())
+    {
+        return Outcome::Err(DbError::invalid(
+            "cross_project",
+            "a cross-project message requires named recipients in a different project",
+        ));
+    }
     if project_mailbox.is_some_and(|kind| !matches!(kind, "to" | "cc")) {
         return Outcome::Err(DbError::InvalidArgument {
             field: "project_mailbox",
@@ -9066,6 +9096,7 @@ async fn create_message_with_recipients_impl(
                     attachments,
                     recipients,
                     project_mailbox,
+                    cross_project,
                     now,
                     archive_seed,
                     idempotency,
@@ -9289,6 +9320,139 @@ async fn ensure_message_participants_active_in_tx(
     ensure_agents_active_in_tx(cx, tracked, &participant_ids, None).await
 }
 
+/// Re-read cross-project consent on the same snapshot that creates the mail.
+/// Preflight checks can become stale while attachments, the message serializer
+/// or pool admission are pending. Reading these rows inside the MVCC transaction
+/// makes a concurrent policy/link write either visible here or a retry conflict.
+#[allow(clippy::too_many_lines)]
+async fn ensure_cross_project_message_contacts_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    scope: CrossProjectMessageScope,
+    project_id: i64,
+    sender_id: i64,
+    recipients: &[(i64, &str)],
+) -> Outcome<(), DbError> {
+    // A fresh cutoff for every transaction attempt, never the message's
+    // pre-checkout created_ts: a queued request cannot extend expired consent.
+    let admitted_at = now_micros();
+    let sender_rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT project_id FROM agents WHERE id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if sender_rows.first().and_then(row_first_i64) != Some(scope.sender_project_id) {
+        return Outcome::Err(DbError::invalid(
+            "cross_project",
+            "sender project changed before message admission",
+        ));
+    }
+
+    let mut missing_approval = false;
+    for chunk in recipients.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let ph = placeholders(chunk.len());
+        let recipient_sql =
+            format!("SELECT id, contact_policy FROM agents WHERE project_id = ? AND id IN ({ph})");
+        let mut recipient_params = vec![Value::BigInt(project_id)];
+        recipient_params.extend(chunk.iter().map(|(id, _)| Value::BigInt(*id)));
+        let rows =
+            match map_sql_outcome(traw_query(cx, tracked, &recipient_sql, &recipient_params).await)
+            {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+        if rows.len() != chunk.len() {
+            return Outcome::Err(DbError::invalid(
+                "cross_project",
+                "recipient project changed before message admission",
+            ));
+        }
+        for row in rows {
+            let policy = match row.get_as::<String>(1) {
+                Ok(policy) => policy,
+                Err(error) => return Outcome::Err(map_sql_error(&error)),
+            };
+            if policy.eq_ignore_ascii_case("block_all") {
+                return Outcome::Err(DbError::invalid(
+                    "cross_project_contact_blocked",
+                    "Recipient is not accepting messages.",
+                ));
+            }
+        }
+
+        let mut approved = HashSet::with_capacity(chunk.len());
+        // Separate indexed queries keep each statement below the SQLite bind
+        // limit and avoid scanning every contact held by a busy sender. Either
+        // direction can approve, but a block in either direction always wins.
+        for (sender_side, recipient_side) in [("a", "b"), ("b", "a")] {
+            let sql = format!(
+                "SELECT {recipient_side}_agent_id, status, expires_ts FROM agent_links \
+                 WHERE {sender_side}_project_id = ? AND {sender_side}_agent_id = ? \
+                   AND {recipient_side}_project_id = ? \
+                   AND {recipient_side}_agent_id IN ({ph})"
+            );
+            let mut params = vec![
+                Value::BigInt(scope.sender_project_id),
+                Value::BigInt(sender_id),
+                Value::BigInt(project_id),
+            ];
+            params.extend(chunk.iter().map(|(id, _)| Value::BigInt(*id)));
+            let links = match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+            for row in links {
+                let decode = || -> std::result::Result<_, SqlError> {
+                    Ok((
+                        row.get_as::<i64>(0)?,
+                        row.get_as::<String>(1)?,
+                        row.get_as::<Option<i64>>(2)?,
+                    ))
+                };
+                let (recipient_id, status, expires_ts) = match decode() {
+                    Ok(link) => link,
+                    Err(error) => return Outcome::Err(map_sql_error(&error)),
+                };
+                if status.eq_ignore_ascii_case("blocked") {
+                    return Outcome::Err(DbError::invalid(
+                        "cross_project_contact_blocked",
+                        "Recipient is not accepting messages.",
+                    ));
+                }
+                if status.eq_ignore_ascii_case("approved")
+                    && expires_ts.is_none_or(|expires| expires > admitted_at)
+                {
+                    approved.insert(recipient_id);
+                }
+            }
+        }
+        missing_approval |= chunk.iter().any(|(id, _)| !approved.contains(id));
+    }
+    // Match preflight precedence across the entire batch: a later blocked
+    // recipient wins over an earlier recipient merely awaiting approval.
+    if missing_approval {
+        return Outcome::Err(DbError::invalid(
+            "cross_project_contact_required",
+            "Cross-project contact approval is no longer valid. Obtain an approved, \
+             unexpired contact link before retrying; nothing was sent.",
+        ));
+    }
+    Outcome::Ok(())
+}
+
 /// Revalidate distinct agent identities at the same transaction boundary as
 /// the new work they authorize. Reservations and contacts additionally require
 /// participants to belong to their project; cached tool-layer checks are insufficient.
@@ -9390,6 +9554,7 @@ async fn create_message_with_recipients_tx(
     attachments: &str,
     recipients: &[(i64, &str)],
     project_mailbox: Option<&str>,
+    cross_project: Option<CrossProjectMessageScope>,
     now: i64,
     archive_seed: Option<i64>,
     idempotency: Option<IdempotencyClaim<'_>>,
@@ -9454,6 +9619,16 @@ async fn create_message_with_recipients_tx(
         tracked,
         ensure_message_participants_active_in_tx(cx, tracked, sender_id, recipients).await
     );
+    if let Some(scope) = cross_project {
+        try_in_tx!(
+            cx,
+            tracked,
+            ensure_cross_project_message_contacts_in_tx(
+                cx, tracked, scope, project_id, sender_id, recipients,
+            )
+            .await
+        );
+    }
 
     // Elect the canonical id durably inside this transaction, AFTER the
     // idempotency gate so a replayed key never burns a fresh id, and BEFORE
@@ -30210,6 +30385,656 @@ mod tests {
         });
     }
 
+    async fn cross_project_message_fixture(cx: &Cx, pool: &DbPool) -> (i64, i64, i64, i64) {
+        let source = ensure_project(cx, pool, "/tmp/contact-admission-source")
+            .await
+            .into_result()
+            .expect("source project")
+            .id
+            .unwrap();
+        let target = ensure_project(cx, pool, "/tmp/contact-admission-target")
+            .await
+            .into_result()
+            .expect("target project")
+            .id
+            .unwrap();
+        let sender = register_agent(
+            cx, pool, source, "BlueLake", "test", "test", None, None, None,
+        )
+        .await
+        .into_result()
+        .expect("sender")
+        .id
+        .unwrap();
+        let recipient =
+            register_agent(cx, pool, target, "RedFox", "test", "test", None, None, None)
+                .await
+                .into_result()
+                .expect("recipient")
+                .id
+                .unwrap();
+        request_contact(
+            cx,
+            pool,
+            source,
+            sender,
+            target,
+            recipient,
+            "test consent",
+            3600,
+        )
+        .await
+        .into_result()
+        .expect("request contact");
+        respond_contact(cx, pool, source, sender, target, recipient, true, 3600)
+            .await
+            .into_result()
+            .expect("approve contact");
+        (source, target, sender, recipient)
+    }
+
+    async fn cross_project_message_counts(cx: &Cx, pool: &DbPool) -> Vec<i64> {
+        let conn = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("count connection");
+        [
+            "messages",
+            "message_recipients",
+            "inbox_delivery_events",
+            "idempotency_keys",
+        ]
+        .into_iter()
+        .map(|table| {
+            conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                .expect("count stored message state")[0]
+                .get_as::<i64>(0)
+                .expect("count")
+        })
+        .collect()
+    }
+
+    async fn cross_project_message_sequence(cx: &Cx, pool: &DbPool) -> i64 {
+        let conn = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("allocator connection");
+        conn.query_sync(
+            "SELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'messages'",
+            &[],
+        )
+        .expect("message allocator snapshot")[0]
+            .get_as::<i64>(0)
+            .expect("sequence")
+    }
+
+    async fn cross_project_message_send(
+        cx: &Cx,
+        pool: &DbPool,
+        target: i64,
+        sender: i64,
+        recipients: &[(i64, &str)],
+        scope: Option<CrossProjectMessageScope>,
+        claim: Option<IdempotencyClaim<'_>>,
+    ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+        create_message_with_recipients_guarded(
+            cx,
+            pool,
+            target,
+            sender,
+            "scoped mail",
+            "original body",
+            Some("contact-thread"),
+            Some("review"),
+            None,
+            "high",
+            true,
+            "[]",
+            recipients,
+            None,
+            scope,
+            claim,
+        )
+        .await
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cross_project_message_admission_rechecks_queued_contact_changes() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for change in ["blocked", "block_all", "expired"] {
+            let (_cx, pool, _dir) = setup_test_pool(&format!("contact-admission-{change}.db"));
+            let contact_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("independent contact writer");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let (source, target, sender, recipient) = cross_project_message_fixture(&cx, &pool).await;
+                drop(contact_pool.acquire(&cx).await.into_result().expect("initialize writer"));
+                let before = cross_project_message_counts(&cx, &pool).await;
+                let before_sequence = cross_project_message_sequence(&cx, &pool).await;
+                assert_eq!(before, [0, 0, 0, 0]);
+                let held = pool.acquire(&cx).await.into_result().expect("hold sole checkout");
+                let recipients = [(recipient, "bcc")];
+                let mut waiting = std::pin::pin!(create_message_with_recipients_guarded(
+                    &cx,
+                    &pool,
+                    target,
+                    sender,
+                    "queued mail",
+                    "must not reach the recipient",
+                    None,
+                    None,
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &recipients,
+                    None,
+                    Some(CrossProjectMessageScope { sender_project_id: source }),
+                    Some(IdempotencyClaim {
+                        project_id: source,
+                        tool: "send_message",
+                        key: "queued-send",
+                        fingerprint: "original-payload",
+                    }),
+                ));
+                {
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                }
+                // The preflight-approved request is suspended at a real pool
+                // boundary while another connection commits a changed decision.
+                match change {
+                    "blocked" => {
+                        respond_contact(&cx, &contact_pool, source, sender, target, recipient, false, 0)
+                            .await.into_result().expect("revoke queued send's contact");
+                    }
+                    "block_all" => {
+                        set_agent_contact_policy_by_name(&cx, &contact_pool, target, "RedFox", "block_all")
+                            .await.into_result().expect("block recipient while send waits");
+                    }
+                    "expired" => {
+                        let expired_at = now_micros();
+                        let conn = contact_pool.acquire(&cx).await.into_result().expect("expiry writer");
+                        conn.execute(
+                            &cx,
+                            "UPDATE agent_links SET expires_ts = ? WHERE a_agent_id = ? AND b_agent_id = ?",
+                            &[Value::BigInt(expired_at), Value::BigInt(sender), Value::BigInt(recipient)],
+                        ).await.into_result().expect("expire consent while queued");
+                    }
+                    _ => unreachable!(),
+                }
+                drop(held);
+                let outcome = asupersync::time::timeout(
+                    cx.now(), std::time::Duration::from_secs(5), waiting,
+                ).await.expect("message admission watchdog");
+                let expected = if change == "expired" {
+                    "cross_project_contact_required"
+                } else {
+                    "cross_project_contact_blocked"
+                };
+                assert!(matches!(outcome, Outcome::Err(DbError::InvalidArgument { field, .. }) if field == expected), "{change}: {outcome:?}");
+                assert_eq!(cross_project_message_counts(&cx, &pool).await, before,
+                    "a refusal cannot publish a partial message, receipt, event or idempotency claim");
+                assert_eq!(cross_project_message_sequence(&cx, &pool).await, before_sequence,
+                    "refused mail must not consume a durable message ID");
+            });
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cross_project_message_admission_checks_both_directions_roles_and_scope() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("contact-admission-directions.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let (source, target, sender, recipient) =
+                cross_project_message_fixture(&cx, &pool).await;
+            let other = register_agent(
+                &cx,
+                &pool,
+                target,
+                "GreenStone",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("second recipient")
+            .id
+            .unwrap();
+            let scope = Some(CrossProjectMessageScope {
+                sender_project_id: source,
+            });
+            // An unapproved CC/BCC must reject the entire multi-recipient send.
+            for role in ["to", "cc", "bcc"] {
+                let recipients = [(recipient, "to"), (other, role)];
+                assert!(matches!(
+                    cross_project_message_send(
+                        &cx,
+                        &pool,
+                        target,
+                        sender,
+                        &recipients,
+                        scope,
+                        None
+                    )
+                    .await,
+                    Outcome::Err(DbError::InvalidArgument {
+                        field: "cross_project_contact_required",
+                        ..
+                    })
+                ));
+                assert_eq!(cross_project_message_counts(&cx, &pool).await, [0, 0, 0, 0]);
+            }
+            request_contact(
+                &cx,
+                &pool,
+                target,
+                other,
+                source,
+                sender,
+                "reverse consent",
+                3600,
+            )
+            .await
+            .into_result()
+            .expect("reverse request");
+            respond_contact(&cx, &pool, target, other, source, sender, true, 3600)
+                .await
+                .into_result()
+                .expect("reverse approval");
+            let recipients = [(recipient, "to"), (other, "bcc"), (recipient, "cc")];
+            let Outcome::Ok(IdempotentOutcome::Fresh(message)) =
+                cross_project_message_send(&cx, &pool, target, sender, &recipients, scope, None)
+                    .await
+            else {
+                panic!("approved links in either direction must permit delivery");
+            };
+            let envelope: serde_json::Value =
+                serde_json::from_str(&message.recipients_json).unwrap();
+            assert_eq!(envelope["to"], serde_json::json!(["RedFox"]));
+            assert_eq!(envelope["cc"], serde_json::json!([]));
+            assert_eq!(envelope["bcc"], serde_json::json!(["GreenStone"]));
+            let before = cross_project_message_counts(&cx, &pool).await;
+            assert_eq!(before, [1, 2, 2, 0]);
+
+            request_contact(
+                &cx,
+                &pool,
+                target,
+                recipient,
+                source,
+                sender,
+                "reverse block",
+                3600,
+            )
+            .await
+            .into_result()
+            .expect("reverse link");
+            respond_contact(&cx, &pool, target, recipient, source, sender, false, 0)
+                .await
+                .into_result()
+                .expect("reverse block");
+            // A blocked link does not become consent merely because its old
+            // expiry passes. The preflight also gives every block precedence.
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("expired reverse block");
+            conn.execute(
+                &cx,
+                "UPDATE agent_links SET expires_ts = 1 WHERE a_agent_id = ? AND b_agent_id = ?",
+                &[Value::BigInt(recipient), Value::BigInt(sender)],
+            )
+            .await
+            .into_result()
+            .expect("expire blocked link");
+            drop(conn);
+            assert!(
+                matches!(
+                    cross_project_message_send(
+                        &cx,
+                        &pool,
+                        target,
+                        sender,
+                        &[(recipient, "to")],
+                        scope,
+                        None
+                    )
+                    .await,
+                    Outcome::Err(DbError::InvalidArgument {
+                        field: "cross_project_contact_blocked",
+                        ..
+                    })
+                ),
+                "a reverse block overrides the still-approved forward link"
+            );
+            assert!(
+                matches!(
+                    cross_project_message_send(
+                        &cx,
+                        &pool,
+                        target,
+                        sender,
+                        &[(other, "to")],
+                        Some(CrossProjectMessageScope {
+                            sender_project_id: target + 1
+                        }),
+                        None
+                    )
+                    .await,
+                    Outcome::Err(DbError::InvalidArgument {
+                        field: "cross_project",
+                        ..
+                    })
+                ),
+                "a stale source-project claim cannot borrow another project's approval"
+            );
+            assert!(
+                matches!(
+                    cross_project_message_send(
+                        &cx,
+                        &pool,
+                        target,
+                        sender,
+                        &[(sender, "to")],
+                        scope,
+                        None
+                    )
+                    .await,
+                    Outcome::Err(DbError::InvalidArgument {
+                        field: "cross_project",
+                        ..
+                    })
+                ),
+                "every recipient must belong to the delivery project"
+            );
+            assert_eq!(cross_project_message_counts(&cx, &pool).await, before);
+        });
+    }
+
+    #[test]
+    fn cross_project_message_admission_preserves_block_precedence_across_chunks() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("contact-admission-chunks.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let (source, target, sender, recipient) =
+                cross_project_message_fixture(&cx, &pool).await;
+            let mut recipients = vec![(recipient, "to")];
+            let conn = pool.acquire(&cx).await.into_result().expect("chunk fixture");
+            // One transaction creates just enough identities to cross the
+            // parameter boundary, without hundreds of registration commits.
+            conn.execute_raw("BEGIN IMMEDIATE").expect("fixture transaction");
+            for offset in 0..MAX_IN_CLAUSE_ITEMS {
+                let id = 10_000 + i64::try_from(offset).unwrap();
+                conn.execute_sync(
+                    "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                     VALUES (?, ?, ?, 'test', 'test', 1, 1)",
+                    &[
+                        Value::BigInt(id),
+                        Value::BigInt(target),
+                        Value::Text(format!("ChunkRecipient{offset}")),
+                    ],
+                ).expect("insert chunk recipient");
+                recipients.push((id, "bcc"));
+            }
+            let last = recipients.last().unwrap().0;
+            conn.execute_sync(
+                "UPDATE agent_links SET b_agent_id = ? WHERE a_agent_id = ?",
+                &[Value::BigInt(last), Value::BigInt(sender)],
+            ).expect("move the only contact link to the final chunk");
+            conn.execute_raw("COMMIT").expect("commit chunk fixture");
+            drop(conn);
+
+            for (status, policy, expected) in [
+                ("blocked", "auto", "cross_project_contact_blocked"),
+                ("pending", "block_all", "cross_project_contact_blocked"),
+                ("pending", "auto", "cross_project_contact_required"),
+            ] {
+                let conn = pool.acquire(&cx).await.into_result().expect("last-chunk decision");
+                conn.execute_sync(
+                    "UPDATE agent_links SET status = ? WHERE b_agent_id = ?",
+                    &[Value::Text(status.to_string()), Value::BigInt(last)],
+                ).expect("set last-chunk contact status");
+                conn.execute_sync(
+                    "UPDATE agents SET contact_policy = ? WHERE id = ?",
+                    &[Value::Text(policy.to_string()), Value::BigInt(last)],
+                ).expect("set last-chunk recipient policy");
+                drop(conn);
+                let outcome = cross_project_message_send(
+                    &cx, &pool, target, sender, &recipients,
+                    Some(CrossProjectMessageScope { sender_project_id: source }), None,
+                ).await;
+                assert!(
+                    matches!(outcome, Outcome::Err(DbError::InvalidArgument { field, .. }) if field == expected),
+                    "the final chunk's {status}/{policy} must determine the refusal: {outcome:?}"
+                );
+                assert_eq!(cross_project_message_counts(&cx, &pool).await, [0, 0, 0, 0]);
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cross_project_message_admission_replays_history_after_revocation() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("contact-admission-replay.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let (source, target, sender, recipient) =
+                cross_project_message_fixture(&cx, &pool).await;
+            let recipients = [(recipient, "to")];
+            let scope = Some(CrossProjectMessageScope {
+                sender_project_id: source,
+            });
+            let claim = IdempotencyClaim {
+                project_id: source,
+                tool: "send_message",
+                key: "accepted",
+                fingerprint: "same-payload",
+            };
+            let Outcome::Ok(IdempotentOutcome::Fresh(original)) = cross_project_message_send(
+                &cx,
+                &pool,
+                target,
+                sender,
+                &recipients,
+                scope,
+                Some(claim),
+            )
+            .await
+            else {
+                panic!("approved send must succeed");
+            };
+            respond_contact(&cx, &pool, source, sender, target, recipient, false, 0)
+                .await
+                .into_result()
+                .expect("revoke contact after accepted send");
+            let before = cross_project_message_counts(&cx, &pool).await;
+            assert_eq!(before, [1, 1, 1, 1]);
+            let Outcome::Ok(IdempotentOutcome::Replayed(replayed)) = cross_project_message_send(
+                &cx,
+                &pool,
+                target,
+                sender,
+                &recipients,
+                scope,
+                Some(claim),
+            )
+            .await
+            else {
+                panic!("an exact retry must return its accepted result after revocation");
+            };
+            assert_eq!(
+                serde_json::to_value(replayed).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+            assert!(matches!(
+                cross_project_message_send(
+                    &cx,
+                    &pool,
+                    target,
+                    sender,
+                    &recipients,
+                    scope,
+                    Some(IdempotencyClaim {
+                        fingerprint: "different-payload",
+                        ..claim
+                    })
+                )
+                .await,
+                Outcome::Ok(IdempotentOutcome::Conflict(_))
+            ));
+            assert!(matches!(
+                cross_project_message_send(
+                    &cx,
+                    &pool,
+                    target,
+                    sender,
+                    &recipients,
+                    scope,
+                    Some(IdempotencyClaim {
+                        key: "fresh",
+                        ..claim
+                    })
+                )
+                .await,
+                Outcome::Err(DbError::InvalidArgument {
+                    field: "cross_project_contact_blocked",
+                    ..
+                })
+            ));
+            assert_eq!(cross_project_message_counts(&cx, &pool).await, before);
+        });
+    }
+
+    #[test]
+    fn cross_project_message_admission_preserves_status_and_internal_notice_semantics() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("contact-admission-notices.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let (source, target, sender, recipient) =
+                cross_project_message_fixture(&cx, &pool).await;
+            set_agent_contact_policy_by_name(&cx, &pool, target, "RedFox", "open")
+                .await
+                .into_result()
+                .expect("open local contact policy");
+            let recipients = [(recipient, "to")];
+            let scope = Some(CrossProjectMessageScope {
+                sender_project_id: source,
+            });
+            for status in ["pending", "accepted", "rejected", "unknown"] {
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("contact fixture update");
+                conn.execute(
+                    &cx,
+                    "UPDATE agent_links SET status = ?",
+                    &[Value::Text(status.to_string())],
+                )
+                .await
+                .into_result()
+                .expect("set non-approving status");
+                drop(conn);
+                assert!(
+                    matches!(
+                        cross_project_message_send(
+                            &cx,
+                            &pool,
+                            target,
+                            sender,
+                            &recipients,
+                            scope,
+                            None
+                        )
+                        .await,
+                        Outcome::Err(DbError::InvalidArgument {
+                            field: "cross_project_contact_required",
+                            ..
+                        })
+                    ),
+                    "{status} cannot authorize a cross-project send even to an open recipient"
+                );
+                assert_eq!(cross_project_message_counts(&cx, &pool).await, [0, 0, 0, 0]);
+            }
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("contact fixture update");
+            conn.execute(&cx, "UPDATE agent_links SET status = 'ApPrOvEd'", &[])
+                .await
+                .into_result()
+                .expect("case-insensitive approval");
+            drop(conn);
+            assert!(matches!(
+                cross_project_message_send(&cx, &pool, target, sender, &recipients, scope, None)
+                    .await,
+                Outcome::Ok(IdempotentOutcome::Fresh(_))
+            ));
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("contact fixture update");
+            conn.execute(&cx, "UPDATE agent_links SET status = 'pending'", &[])
+                .await
+                .into_result()
+                .expect("contact awaiting approval");
+            drop(conn);
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                target,
+                sender,
+                "Contact request from BlueLake",
+                "BlueLake requests permission to contact RedFox.",
+                None,
+                "normal",
+                true,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("internal request notice precedes approval");
+            assert_eq!(cross_project_message_counts(&cx, &pool).await, [2, 2, 2, 0]);
+        });
+    }
+
     #[test]
     fn create_message_with_recipients_dedupes_duplicate_recipient_ids() {
         use asupersync::runtime::RuntimeBuilder;
@@ -30753,12 +31578,16 @@ mod tests {
             .expect("set complete envelope metadata");
             drop(conn);
 
-            let mut rows = get_messages_details_by_ids(&cx, &pool, &[4, 1, 4, 10, i64::MAX], Some(1))
-                .await
-                .into_result()
-                .expect("hydrate scoped message batch");
+            let mut rows =
+                get_messages_details_by_ids(&cx, &pool, &[4, 1, 4, 10, i64::MAX], Some(1))
+                    .await
+                    .into_result()
+                    .expect("hydrate scoped message batch");
             rows.sort_by_key(|row| row.id);
-            assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1, 4]);
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                vec![1, 4]
+            );
             assert_eq!(rows[0].from, "BlueLake");
             assert_eq!(rows[0].thread_id, None);
             assert_eq!(rows[0].topic, None);
@@ -30873,9 +31702,7 @@ mod tests {
                     .expect("hydrate two parameter chunks")
             };
             rows.sort_by_key(|row| row.id);
-            let mut expected: Vec<i64> = (1..=21)
-                .filter(|id| *id != 10 && *id != 11)
-                .collect();
+            let mut expected: Vec<i64> = (1..=21).filter(|id| *id != 10 && *id != 11).collect();
             // Each SQL IN clause deduplicates its own parameters. As before,
             // an ID requested in both chunks appears in both chunks' output.
             expected.push(4);
