@@ -106,6 +106,16 @@ is superseded here. The reader repair and every originally selected test remain.
   Preserve those commits through a normal merge; the frozen b3f65fda results
   do not qualify their newer source. Publication and exact lease-release outcomes
   are reported after they happen in the session handoff.
+- [x] Collect post-merge formatting failure (54 hunks in incoming server lib.rs).
+  Manually apply only those formatter suggestions, with one helper assigned the
+  disjoint tail per AGENTS.md's parallel-simple-edits instruction. Parent then
+  re-runs whole-workspace fmt: 0. The complete file matches a read-only canonical
+  rendering of committed merge 525c7358 byte for byte (SHA-256 6bc10011).
+  All assertions, fixtures, literals, limits and ignore attributes remain intact;
+  no code-changing script or formatter write was used. Full-file stock UBS is 0,
+  status ok/no failed modules, 0 critical/3560 warning/1839 info. Detailed results
+  are retained in publish-ubs-server-lib.json. These are
+  formatting/scan results, not new native qualification of peer behavior.
 
 ## November 10 final source qualification — EmeraldEagle / br-asldx
 

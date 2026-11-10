@@ -1301,10 +1301,9 @@ fn run_startup_search_backfill(
         return false;
     }
     let _active_refresh = StartupSearchRefreshGuard::begin();
-    if let Err(error) = mcp_agent_mail_db::search_service::refresh_lexical_index_cancellable(
-        pool,
-        &control.stopped,
-    ) {
+    if let Err(error) =
+        mcp_agent_mail_db::search_service::refresh_lexical_index_cancellable(pool, &control.stopped)
+    {
         if control.checkpoint().is_ok() {
             tracing::warn!(%error, "owned lexical refresh failed; retrying with backoff");
             let _ = recover_startup_search_backfill_db(config, &error.to_string());
@@ -1369,7 +1368,10 @@ fn spawn_startup_search_backfill_after(
     let thread_config = match resolve_serving_config(config) {
         Ok(config) => config,
         Err(reason) => {
-            tracing::warn!(reason, "lexical maintenance refused mismatched serving configuration");
+            tracing::warn!(
+                reason,
+                "lexical maintenance refused mismatched serving configuration"
+            );
             return;
         }
     };
@@ -1499,14 +1501,20 @@ fn serving_search_uses_lexical(config: &mcp_agent_mail_core::Config) -> bool {
         )
     };
     requires_index(rollout.engine)
-        || rollout.surface_overrides.values().any(|engine| requires_index(*engine))
+        || rollout
+            .surface_overrides
+            .values()
+            .any(|engine| requires_index(*engine))
 }
 
 fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
     let config = match resolve_serving_config(config) {
         Ok(config) => config,
         Err(reason) => {
-            tracing::warn!(reason, "search startup refused mismatched serving configuration");
+            tracing::warn!(
+                reason,
+                "search startup refused mismatched serving configuration"
+            );
             return;
         }
     };
@@ -12197,7 +12205,10 @@ impl HttpState {
         let lexical_required = serving_search_uses_lexical(&serving_config);
         let disk_full = serving_config.disk_space_monitor_enabled
             && mcp_agent_mail_core::disk::DiskPressure::from_u64(
-                mcp_agent_mail_core::global_metrics().system.disk_pressure_level.load(),
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
             ) == mcp_agent_mail_core::disk::DiskPressure::Fatal;
         let unavailable = |reason| MailReadinessSnapshot {
             database: Err(reason),
@@ -12239,9 +12250,9 @@ impl HttpState {
             }
             let refresh = self.health_refresh_scheduler.is_some()
                 && !cache.refreshing
-                && cache.last_attempt.is_none_or(|attempt| {
-                    attempt.elapsed() >= MAIL_READINESS_REFRESH_INTERVAL
-                });
+                && cache
+                    .last_attempt
+                    .is_none_or(|attempt| attempt.elapsed() >= MAIL_READINESS_REFRESH_INTERVAL);
             if refresh {
                 cache.refreshing = true;
             }
@@ -12283,7 +12294,10 @@ impl HttpState {
                 cache: Arc::clone(&self.mail_readiness),
                 generation,
             };
-            let schedule = self.health_refresh_scheduler.as_ref().expect("scheduler checked");
+            let schedule = self
+                .health_refresh_scheduler
+                .as_ref()
+                .expect("scheduler checked");
             schedule(Box::new(move || {
                 let retired_pool = {
                     let mut cache = lock_mutex(&guard.cache);
@@ -17289,8 +17303,9 @@ fn probe_serving_mail_pool(
     lexical_required: bool,
 ) -> MailReadinessProbe {
     let started = Instant::now();
-    let cx =
-        runtime_request_cx(Budget::with_deadline_secs(MAIL_READINESS_PROBE_BUDGET.as_secs()));
+    let cx = runtime_request_cx(Budget::with_deadline_secs(
+        MAIL_READINESS_PROBE_BUDGET.as_secs(),
+    ));
     // This is the same nonblocking activity admission used by normal mail
     // operations. A healthy connection cannot bypass an exclusive recovery
     // owner. Retain the guard through the lexical source observation as well.
@@ -17315,7 +17330,10 @@ fn probe_serving_mail_pool(
                 return Err("serving-pool readiness cancelled".to_string());
             }
             Ok(asupersync::Outcome::Panicked(error)) => {
-                return Err(format!("serving-pool readiness panicked: {}", error.message()));
+                return Err(format!(
+                    "serving-pool readiness panicked: {}",
+                    error.message()
+                ));
             }
             Err(_) => return Err("serving-pool readiness acquisition timed out".to_string()),
         };
@@ -17325,7 +17343,8 @@ fn probe_serving_mail_pool(
             &[],
         )
         .map_err(|error| format!("serving mail query failed: {error}"))?;
-        cx.checkpoint().map_err(|_| "serving-pool readiness expired".to_string())?;
+        cx.checkpoint()
+            .map_err(|_| "serving-pool readiness expired".to_string())?;
         if started.elapsed() > MAIL_READINESS_PROBE_BUDGET || !pool.is_initialized() {
             return Err("serving-pool readiness expired or generation retired".to_string());
         }
@@ -17547,7 +17566,6 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
         storage_root = %config.storage_root.display(),
         "Active database"
     );
-
 }
 
 /// The mailbox verdict cannot see the write-back latch (#122), which refuses
@@ -21094,8 +21112,12 @@ mod tests {
                                 && probe.lexical.failure().is_none()
                         })
                 });
-                *callback_observed.lock().expect("callback result") =
-                    Some((bound.storage_root.clone(), bound.http_port, connected, admitted));
+                *callback_observed.lock().expect("callback result") = Some((
+                    bound.storage_root.clone(),
+                    bound.http_port,
+                    connected,
+                    admitted,
+                ));
                 let _ = ready_tx.send(());
                 let _ = control_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
             });
@@ -21115,11 +21137,15 @@ mod tests {
         });
         assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
         let observation = observed.lock().expect("callback result");
-        let (storage, port, connected, admitted) = observation.as_ref().expect("ready callback ran");
+        let (storage, port, connected, admitted) =
+            observation.as_ref().expect("ready callback ran");
         assert_eq!(storage, &expected_storage);
         assert_ne!(*port, 0, "callback must receive actual bound port");
         assert!(*connected, "callback must follow listener bind");
-        assert!(*admitted, "callback must follow real mail and lexical admission");
+        assert!(
+            *admitted,
+            "callback must follow real mail and lexical admission"
+        );
         assert!(
             !config.storage_root.exists(),
             "caller mutation must not retarget startup"
@@ -21374,17 +21400,17 @@ mod tests {
             ..mcp_agent_mail_core::Config::default()
         };
         with_health_serving_env(&config, || {
-        let _ = integrity_guard::take_startup_probe_note_for_test();
+            let _ = integrity_guard::take_startup_probe_note_for_test();
 
-        readiness_check(&config).expect("first readiness");
-        assert!(
-            integrity_guard::take_startup_probe_note_for_test(),
-            "a startup quick-check that ran must spare the guard's first cycle"
-        );
-        // Unchanged mailbox: the fingerprint cache skips the startup check, so
-        // the guard must run its own first cycle.
-        readiness_check(&config).expect("second readiness");
-        assert!(!integrity_guard::take_startup_probe_note_for_test());
+            readiness_check(&config).expect("first readiness");
+            assert!(
+                integrity_guard::take_startup_probe_note_for_test(),
+                "a startup quick-check that ran must spare the guard's first cycle"
+            );
+            // Unchanged mailbox: the fingerprint cache skips the startup check, so
+            // the guard must run its own first cycle.
+            readiness_check(&config).expect("second readiness");
+            assert!(!integrity_guard::take_startup_probe_note_for_test());
         });
     }
 
@@ -22065,39 +22091,41 @@ first body
             };
 
             with_health_serving_env(&config, || {
-            let state = build_state(config.clone());
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 503);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "unavailable");
-            assert_eq!(body["reason"], "database_initializing");
-            assert_eq!(body["durability_state"], "not_probed");
-            assert!(body["project_count"].is_null());
-            assert!(body["message_count"].is_null());
+                let state = build_state(config.clone());
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 503);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "unavailable");
+                assert_eq!(body["reason"], "database_initializing");
+                assert_eq!(body["durability_state"], "not_probed");
+                assert!(body["project_count"].is_null());
+                assert!(body["message_count"].is_null());
 
-            let conn =
-                DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open probed db");
-            let rows = conn
-                .query_sync(
-                    "SELECT \
+                let conn =
+                    DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open probed db");
+                let rows = conn
+                    .query_sync(
+                        "SELECT \
                     (SELECT COUNT(*) FROM projects) AS project_count, \
                     (SELECT COUNT(*) FROM agents) AS agent_count, \
                     (SELECT COUNT(*) FROM messages) AS message_count",
-                    &[],
-                )
-                .expect("query probed inventory");
-            let row = rows.first().expect("inventory row");
-            assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 0);
-            assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 0);
-            assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 0);
+                        &[],
+                    )
+                    .expect("query probed inventory");
+                let row = rows.first().expect("inventory row");
+                assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 0);
+                assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 0);
+                assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 0);
             });
         });
     }
 
     #[test]
     fn health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive() {
-        if run_prepared_http_test_in_child("tests::health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive") {
+        if run_prepared_http_test_in_child(
+            "tests::health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive",
+        ) {
             return;
         }
         with_serialized_health_route(|| {
@@ -22110,25 +22138,30 @@ first body
                 ..Default::default()
             };
             with_ready_health_state(config, |state, _archive| {
-            let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
-            let _exclusive = acquire_mailbox_activity_lock_for_sqlite_path(
-                &db_path,
-                MailboxActivityLockMode::Exclusive,
-            )
-            .expect("acquire exclusive sqlite activity lock");
-            let observed_at = Instant::now();
-            let value = probe_serving_mail_pool(&pool, serving_search_uses_lexical(&state.config));
-            assert!(value.database.is_err(), "pooled health bypassed recovery admission");
-            assert!(observed_at.elapsed() < Duration::from_secs(1));
-            lock_mutex(&state.mail_readiness).sample = Some(HealthSample { observed_at, value });
+                let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+                let _exclusive = acquire_mailbox_activity_lock_for_sqlite_path(
+                    &db_path,
+                    MailboxActivityLockMode::Exclusive,
+                )
+                .expect("acquire exclusive sqlite activity lock");
+                let observed_at = Instant::now();
+                let value =
+                    probe_serving_mail_pool(&pool, serving_search_uses_lexical(&state.config));
+                assert!(
+                    value.database.is_err(),
+                    "pooled health bypassed recovery admission"
+                );
+                assert!(observed_at.elapsed() < Duration::from_secs(1));
+                lock_mutex(&state.mail_readiness).sample =
+                    Some(HealthSample { observed_at, value });
 
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 503);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["reason"], "database_probe_failed");
-            let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
-            assert_eq!(live.status, 200);
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 503);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["reason"], "database_probe_failed");
+                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                assert_eq!(live.status, 200);
             });
         });
     }
@@ -22201,102 +22234,102 @@ first body
         config.database_pool_size = Some(1);
         config.database_max_overflow = Some(0);
         with_health_serving_env(&config, || {
-        let pool = create_pool(&DbPoolConfig::from_env())
-            .expect("one-connection serving/readiness pool");
-        let cx = runtime_request_cx(Budget::INFINITE);
+            let pool = create_pool(&DbPoolConfig::from_env())
+                .expect("one-connection serving/readiness pool");
+            let cx = runtime_request_cx(Budget::INFINITE);
 
-        for tui in [false, true] {
-            let held = block_on(pool.acquire(&cx))
-                .into_result()
-                .expect("hold the actual readiness pool's sole connection");
-            held.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
-                .expect("native schema remains usable");
-            let scope = StartupWorkerScope::default();
-            let state = tui_bridge::TuiSharedState::new(&config);
-            if tui {
-                spawn_tui_readiness_warmup(&config, &state, &scope.workers);
-            } else {
-                // Exercise the same headless readiness worker after its bind
-                // wait expires. The production wrapper keeps the 20s default.
-                run_startup_readiness_with_bind_deadline(
-                    &config,
-                    &scope.workers,
-                    Duration::from_millis(10),
-                );
-            }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let parked = loop {
-                pool.sample_pool_stats_now();
-                if mcp_agent_mail_core::global_metrics()
-                    .db
-                    .pool_pending_requests
-                    .load()
-                    != 0
-                {
-                    break true;
+            for tui in [false, true] {
+                let held = block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("hold the actual readiness pool's sole connection");
+                held.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+                    .expect("native schema remains usable");
+                let scope = StartupWorkerScope::default();
+                let state = tui_bridge::TuiSharedState::new(&config);
+                if tui {
+                    spawn_tui_readiness_warmup(&config, &state, &scope.workers);
+                } else {
+                    // Exercise the same headless readiness worker after its bind
+                    // wait expires. The production wrapper keeps the 20s default.
+                    run_startup_readiness_with_bind_deadline(
+                        &config,
+                        &scope.workers,
+                        Duration::from_millis(10),
+                    );
                 }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            };
-            let retained = lock_mutex(&scope.workers.state)
-                .workers
-                .iter()
-                .any(|(_, worker)| !worker.is_finished());
-            let workers = Arc::clone(&scope.workers);
-            let (done_tx, done_rx) = std::sync::mpsc::channel();
-            let (finished_while_held, pending_after_stop) = std::thread::scope(|threads| {
-                let shutdown = threads.spawn(move || {
-                    if tui {
-                        scope.workers.shutdown();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let parked = loop {
+                    pool.sample_pool_stats_now();
+                    if mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load()
+                        != 0
+                    {
+                        break true;
                     }
-                    // The headless case exercises the same ownership guard
-                    // used on an early return after the bind wait expired.
-                    drop(scope);
-                    done_tx.send(()).unwrap();
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let retained = lock_mutex(&scope.workers.state)
+                    .workers
+                    .iter()
+                    .any(|(_, worker)| !worker.is_finished());
+                let workers = Arc::clone(&scope.workers);
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let (finished_while_held, pending_after_stop) = std::thread::scope(|threads| {
+                    let shutdown = threads.spawn(move || {
+                        if tui {
+                            scope.workers.shutdown();
+                        }
+                        // The headless case exercises the same ownership guard
+                        // used on an early return after the bind wait expired.
+                        drop(scope);
+                        done_tx.send(()).unwrap();
+                    });
+                    let finished = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                    pool.sample_pool_stats_now();
+                    let pending = mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load();
+                    // Release and reap even if cancellation is broken, so a
+                    // negative control fails without leaving an orphan waiter.
+                    drop(held);
+                    shutdown.join().expect("join readiness shutdown");
+                    (finished, pending)
                 });
-                let finished = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
-                pool.sample_pool_stats_now();
-                let pending = mcp_agent_mail_core::global_metrics()
-                    .db
-                    .pool_pending_requests
-                    .load();
-                // Release and reap even if cancellation is broken, so a
-                // negative control fails without leaving an orphan waiter.
-                drop(held);
-                shutdown.join().expect("join readiness shutdown");
-                (finished, pending)
-            });
-            assert!(
-                parked,
-                "readiness must reach a real pending pool acquisition"
-            );
-            assert!(
-                retained,
-                "bind timeout must retain the active readiness worker"
-            );
-            assert!(
-                finished_while_held,
-                "shutdown waited for the foreign pool lease"
-            );
-            assert_eq!(pending_after_stop, 0, "cancelled native waiter leaked");
-            assert_eq!(STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire), 0);
-            assert!(lock_mutex(&workers.state).workers.is_empty());
-            assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Pending);
+                assert!(
+                    parked,
+                    "readiness must reach a real pending pool acquisition"
+                );
+                assert!(
+                    retained,
+                    "bind timeout must retain the active readiness worker"
+                );
+                assert!(
+                    finished_while_held,
+                    "shutdown waited for the foreign pool lease"
+                );
+                assert_eq!(pending_after_stop, 0, "cancelled native waiter leaked");
+                assert_eq!(STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire), 0);
+                assert!(lock_mutex(&workers.state).workers.is_empty());
+                assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Pending);
 
-            let retry = StartupWorkerScope::default();
-            let retry_state = tui_bridge::TuiSharedState::new(&config);
-            spawn_tui_readiness_warmup(&config, &retry_state, &retry.workers);
-            let ready = retry_state.wait_for_db_ready(Duration::from_secs(20));
-            retry.workers.shutdown();
-            assert!(ready, "a later startup must acquire the same native pool");
-            let conn = block_on(pool.acquire(&cx))
-                .into_result()
-                .expect("pool reusable");
-            conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
-                .expect("mailbox still readable after cancelled readiness");
-        }
+                let retry = StartupWorkerScope::default();
+                let retry_state = tui_bridge::TuiSharedState::new(&config);
+                spawn_tui_readiness_warmup(&config, &retry_state, &retry.workers);
+                let ready = retry_state.wait_for_db_ready(Duration::from_secs(20));
+                retry.workers.shutdown();
+                assert!(ready, "a later startup must acquire the same native pool");
+                let conn = block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("pool reusable");
+                conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
+                    .expect("mailbox still readable after cancelled readiness");
+            }
         });
     }
 
@@ -22323,7 +22356,11 @@ first body
         drop(conn);
         let pool = create_pool(&DbPoolConfig::from_env()).expect("actual serving pool");
         let cx = runtime_request_cx(Budget::INFINITE);
-        drop(block_on(pool.acquire(&cx)).into_result().expect("initialize serving generation"));
+        drop(
+            block_on(pool.acquire(&cx))
+                .into_result()
+                .expect("initialize serving generation"),
+        );
         mcp_agent_mail_db::search_v3::init_or_switch_bridge(
             &config.storage_root.join("search_index"),
         )
@@ -22351,7 +22388,10 @@ first body
         let wait_for_verified = || {
             let deadline = Instant::now() + Duration::from_secs(30);
             while !mcp_agent_mail_db::search_service::lexical_readiness(&pool).verified {
-                assert!(Instant::now() < deadline, "owned maintenance did not certify its source");
+                assert!(
+                    Instant::now() < deadline,
+                    "owned maintenance did not certify its source"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
         };
@@ -22368,31 +22408,46 @@ first body
         // Normal traffic can append after the initial pass without losing
         // usable generation coverage. A bounded source observation asks the
         // same owned worker to catch up; no search request performs the repair.
-        let conn = block_on(pool.acquire(&cx)).into_result().expect("serving append");
+        let conn = block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("serving append");
         conn.execute_raw(
             "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
              VALUES (3, 1, 1, 'laterstartupmail', 'appended after readiness', 3);",
-        ).expect("append real message");
+        )
+        .expect("append real message");
         drop(conn);
-        let appended = block_on(
-            mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, &pool),
-        ).into_result().expect("observe append");
-        assert!(appended.available, "ordinary append must not flap service admission");
+        let appended = block_on(mcp_agent_mail_db::search_service::probe_lexical_readiness(
+            &cx, &pool,
+        ))
+        .into_result()
+        .expect("observe append");
+        assert!(
+            appended.available,
+            "ordinary append must not flap service admission"
+        );
         assert!(appended.catch_up_required || appended.verified);
         wait_for_verified();
         let appended_hits = bridge.search(
             &mcp_agent_mail_db::search_planner::SearchQuery::messages("laterstartupmail", 1),
         );
-        assert_eq!(appended_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), [3]);
+        assert_eq!(
+            appended_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            [3]
+        );
 
-        let conn = block_on(pool.acquire(&cx)).into_result().expect("serving rewrite");
+        let conn = block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("serving rewrite");
         conn.execute_raw(
             "UPDATE messages SET subject = 'repairedstartupmail', body_md = 'rewritten body' WHERE id = 1;",
         ).expect("rewrite real message");
         drop(conn);
-        let rewritten = block_on(
-            mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, &pool),
-        ).into_result().expect("observe rewrite");
+        let rewritten = block_on(mcp_agent_mail_db::search_service::probe_lexical_readiness(
+            &cx, &pool,
+        ))
+        .into_result()
+        .expect("observe rewrite");
         assert!(
             !rewritten.available || rewritten.verified,
             "known rewrite cannot preserve stale usable coverage"
@@ -22401,12 +22456,21 @@ first body
         let rewritten_hits = bridge.search(
             &mcp_agent_mail_db::search_planner::SearchQuery::messages("repairedstartupmail", 1),
         );
-        assert_eq!(rewritten_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), [1]);
-        assert!(bridge.search(&query).is_empty(), "old rewritten subject remains visible");
+        assert_eq!(
+            rewritten_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(
+            bridge.search(&query).is_empty(),
+            "old rewritten subject remains visible"
+        );
 
         let stopped_at = Instant::now();
         retry.workers.shutdown();
-        assert!(stopped_at.elapsed() < Duration::from_secs(2), "idle maintenance did not wake");
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(2),
+            "idle maintenance did not wake"
+        );
         assert!(!STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
         assert!(lock_mutex(&retry.workers.state).workers.is_empty());
     }
@@ -22533,14 +22597,14 @@ first body
         };
 
         with_health_serving_env(&config, || {
-        let startup_scope = StartupWorkerScope::default();
-        init_search_bridge(&config, &startup_scope.workers);
+            let startup_scope = StartupWorkerScope::default();
+            init_search_bridge(&config, &startup_scope.workers);
 
-        assert!(config.storage_root.join("search_index").exists());
-        assert!(
-            !STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire),
-            "memory-backed startup should not spawn lexical backfill worker"
-        );
+            assert!(config.storage_root.join("search_index").exists());
+            assert!(
+                !STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire),
+                "memory-backed startup should not spawn lexical backfill worker"
+            );
         });
     }
 
@@ -23139,9 +23203,15 @@ first body
         f: impl FnOnce() -> T,
     ) -> T {
         let storage_root = config.storage_root.to_string_lossy().into_owned();
-        let size = config.database_pool_size.map_or_else(String::new, |v| v.to_string());
-        let overflow = config.database_max_overflow.map_or_else(String::new, |v| v.to_string());
-        let timeout = config.database_pool_timeout.map_or_else(String::new, |v| v.to_string());
+        let size = config
+            .database_pool_size
+            .map_or_else(String::new, |v| v.to_string());
+        let overflow = config
+            .database_max_overflow
+            .map_or_else(String::new, |v| v.to_string());
+        let timeout = config
+            .database_pool_timeout
+            .map_or_else(String::new, |v| v.to_string());
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", config.database_url.as_str()),
@@ -23161,9 +23231,16 @@ first body
         let actual = resolve_serving_config(&state.config).expect("matching serving authority");
         let observed_at = Instant::now();
         let value = probe_serving_mail_pool(pool, serving_search_uses_lexical(&actual));
-        assert!(value.database.is_ok(), "real serving-pool probe: {:?}", value.database);
         assert!(
-            matches!(value.lexical, LexicalReadiness::Ready | LexicalReadiness::Disabled),
+            value.database.is_ok(),
+            "real serving-pool probe: {:?}",
+            value.database
+        );
+        assert!(
+            matches!(
+                value.lexical,
+                LexicalReadiness::Ready | LexicalReadiness::Disabled
+            ),
             "real lexical proof: {:?}",
             value.lexical
         );
@@ -23187,7 +23264,9 @@ first body
         }
         .expect("real serving pool");
         let cx = runtime_request_cx(Budget::INFINITE);
-        let conn = block_on(pool.acquire(&cx)).into_result().expect("initialize actual pool");
+        let conn = block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("initialize actual pool");
         conn.query_sync("SELECT id FROM messages LIMIT 1", &[])
             .expect("real mailbox table");
         drop(conn);
@@ -23205,12 +23284,15 @@ first body
             }
             // Empty memory is certified from this actual pool. File-backed
             // fixtures must have completed their real backfill above.
-            let lexical = block_on(
-                mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, &pool),
-            )
+            let lexical = block_on(mcp_agent_mail_db::search_service::probe_lexical_readiness(
+                &cx, &pool,
+            ))
             .into_result()
             .expect("verify actual fixture source");
-            assert!(lexical.verified, "fixture index must cover its own database");
+            assert!(
+                lexical.verified,
+                "fixture index must cover its own database"
+            );
         }
         let state = build_state(config);
         prime_health_admission(&state, &pool);
@@ -23237,7 +23319,10 @@ first body
     fn wait_for_mail_readiness_refresh(state: &HttpState) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while lock_mutex(&state.mail_readiness).refreshing {
-            assert!(Instant::now() < deadline, "owned readiness probe did not finish");
+            assert!(
+                Instant::now() < deadline,
+                "owned readiness probe did not finish"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -32476,13 +32561,17 @@ first body
         ] {
             config.search_rollout.engine = engine;
             config.search_rollout.semantic_enabled = semantic_enabled;
-            assert_eq!(serving_search_uses_lexical(&config), requires_index, "{engine:?}");
+            assert_eq!(
+                serving_search_uses_lexical(&config),
+                requires_index,
+                "{engine:?}"
+            );
         }
         config.search_rollout.engine = SearchEngine::Shadow;
-        config.search_rollout.surface_overrides.insert(
-            "search_messages".to_string(),
-            SearchEngine::Lexical,
-        );
+        config
+            .search_rollout
+            .surface_overrides
+            .insert("search_messages".to_string(), SearchEngine::Lexical);
         assert!(serving_search_uses_lexical(&config));
         assert_eq!(
             LexicalReadiness::from_index(
@@ -32502,12 +32591,18 @@ first body
         for (elapsed, extension) in [
             (Duration::ZERO, Some(15_000_000)),
             (Duration::from_secs(695), Some(15_000_000)),
-            (MAIL_STARTUP_NOTIFY_GRACE - Duration::from_secs(2), Some(2_000_000)),
+            (
+                MAIL_STARTUP_NOTIFY_GRACE - Duration::from_secs(2),
+                Some(2_000_000),
+            ),
             (MAIL_STARTUP_NOTIFY_GRACE, None),
         ] {
             let payload = startup_readiness_notify_payload("lexical_initializing", elapsed, true);
             assert!(payload.starts_with("STATUS=Waiting for mailbox admission: "));
-            assert!(!payload.contains("READY=1"), "a timeout extension is not readiness");
+            assert!(
+                !payload.contains("READY=1"),
+                "a timeout extension is not readiness"
+            );
             match extension {
                 Some(micros) => assert!(payload.contains(&format!("EXTEND_TIMEOUT_USEC={micros}"))),
                 None => assert!(!payload.contains("EXTEND_TIMEOUT_USEC")),
@@ -32518,7 +32613,10 @@ first body
             Duration::from_secs(100),
             false,
         );
-        assert!(!stopped.contains("EXTEND_TIMEOUT_USEC"), "cancelled work cannot extend startup");
+        assert!(
+            !stopped.contains("EXTEND_TIMEOUT_USEC"),
+            "cancelled work cannot extend startup"
+        );
 
         let state = build_state(mcp_agent_mail_core::Config::from_env());
         assert!(!state.startup_initialization_active("database_probe_failed"));
@@ -32565,32 +32663,47 @@ first body
                 ..Default::default()
             };
             with_health_serving_env(&config, || {
-            let pool_config = DbPoolConfig::from_env();
-            let state = build_state(config.clone());
-            for lazy_pool in [false, true] {
-                let owner = lazy_pool.then(|| create_pool(&pool_config).expect("lazy pool"));
-                if let Some(pool) = owner.as_ref() {
-                    assert!(!pool.is_initialized(), "construction is not admission");
-                } else {
-                    assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                let pool_config = DbPoolConfig::from_env();
+                let state = build_state(config.clone());
+                for lazy_pool in [false, true] {
+                    let owner = lazy_pool.then(|| create_pool(&pool_config).expect("lazy pool"));
+                    if let Some(pool) = owner.as_ref() {
+                        assert!(!pool.is_initialized(), "construction is not admission");
+                    } else {
+                        assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                    }
+                    let started = Instant::now();
+                    for route in ["/health", "/health/readiness"] {
+                        let response =
+                            block_on(state.handle(make_request(Http1Method::Get, route, &[])));
+                        assert_eq!(
+                            response.status, 503,
+                            "a schema-only connection is not ready"
+                        );
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&response.body).unwrap();
+                        assert_eq!(body["reason"], "database_initializing");
+                        assert_eq!(body["capabilities"]["mail_read"], false);
+                        assert_eq!(body["capabilities"]["mail_write"], false);
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(1),
+                        "health joined initialization"
+                    );
+                    let live =
+                        block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                    assert_eq!(
+                        live.status, 200,
+                        "liveness and auth bypass remain independent"
+                    );
+                    assert!(lock_mutex(&state.mail_readiness).sample.is_none());
+                    if let Some(pool) = owner {
+                        assert!(
+                            !pool.is_initialized(),
+                            "health must not initialize a file mailbox"
+                        );
+                    }
                 }
-                let started = Instant::now();
-                for route in ["/health", "/health/readiness"] {
-                    let response = block_on(state.handle(make_request(Http1Method::Get, route, &[])));
-                    assert_eq!(response.status, 503, "a schema-only connection is not ready");
-                    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-                    assert_eq!(body["reason"], "database_initializing");
-                    assert_eq!(body["capabilities"]["mail_read"], false);
-                    assert_eq!(body["capabilities"]["mail_write"], false);
-                }
-                assert!(started.elapsed() < Duration::from_secs(1), "health joined initialization");
-                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
-                assert_eq!(live.status, 200, "liveness and auth bypass remain independent");
-                assert!(lock_mutex(&state.mail_readiness).sample.is_none());
-                if let Some(pool) = owner {
-                    assert!(!pool.is_initialized(), "health must not initialize a file mailbox");
-                }
-            }
             });
         });
     }
@@ -32603,71 +32716,98 @@ first body
         }
         with_serialized_health_route(|| {
             with_ready_health_state(isolated_health_config(), |state, _archive| {
-            let pool = lock_mutex(&state.mail_readiness).pool.clone().expect("serving pool");
-            let runtime = RuntimeBuilder::new()
-                .worker_threads(1)
-                .blocking_threads(1, 1)
-                .build()
-                .expect("owned readiness runtime");
-            state.health_refresh_scheduler = Some(health_enrichment_scheduler(runtime.handle()));
-            let cx = runtime_request_cx(Budget::INFINITE);
-            let held = block_on(pool.acquire(&cx)).into_result().expect("hold sole live lease");
-            let old = Instant::now()
-                .checked_sub(MAIL_READINESS_MAX_SAMPLE_AGE + Duration::from_secs(1))
-                .unwrap();
-            {
-                let mut cache = lock_mutex(&state.mail_readiness);
-                cache.sample.as_mut().unwrap().observed_at = old;
-                cache.last_attempt = Some(old);
-            }
-            let started = Instant::now();
-            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
-            assert_eq!(response.status, 503);
-            assert!(started.elapsed() < Duration::from_millis(500), "probe waited for the lease");
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
+                let pool = lock_mutex(&state.mail_readiness)
+                    .pool
+                    .clone()
+                    .expect("serving pool");
+                let runtime = RuntimeBuilder::new()
+                    .worker_threads(1)
+                    .blocking_threads(1, 1)
+                    .build()
+                    .expect("owned readiness runtime");
+                state.health_refresh_scheduler =
+                    Some(health_enrichment_scheduler(runtime.handle()));
+                let cx = runtime_request_cx(Budget::INFINITE);
+                let held = block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("hold sole live lease");
+                let old = Instant::now()
+                    .checked_sub(MAIL_READINESS_MAX_SAMPLE_AGE + Duration::from_secs(1))
+                    .unwrap();
+                {
+                    let mut cache = lock_mutex(&state.mail_readiness);
+                    cache.sample.as_mut().unwrap().observed_at = old;
+                    cache.last_attempt = Some(old);
+                }
+                let started = Instant::now();
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                assert_eq!(response.status, 503);
+                assert!(
+                    started.elapsed() < Duration::from_millis(500),
+                    "probe waited for the lease"
+                );
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    pool.sample_pool_stats_now();
+                    if mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load()
+                        > 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "probe never queued on the actual pool"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::scope(|threads| {
+                    for _ in 0..16 {
+                        threads.spawn(|| assert!(state.mail_readiness().result().is_err()));
+                    }
+                });
                 pool.sample_pool_stats_now();
-                if mcp_agent_mail_core::global_metrics().db.pool_pending_requests.load() > 0 {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "probe never queued on the actual pool");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            std::thread::scope(|threads| {
-                for _ in 0..16 {
-                    threads.spawn(|| assert!(state.mail_readiness().result().is_err()));
-                }
-            });
-            pool.sample_pool_stats_now();
-            assert!(
-                mcp_agent_mail_core::global_metrics().db.pool_pending_requests.load() <= 1,
-                "repeated health calls created duplicate admission work"
-            );
-            let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
-            assert_eq!(live.status, 200);
-            wait_for_mail_readiness_refresh(state);
-            assert!(
-                lock_mutex(&state.mail_readiness)
-                    .sample
-                    .as_ref()
-                    .unwrap()
-                    .value
-                    .database
-                    .is_err(),
-                "a timed-out acquisition refreshed a successful sample"
-            );
-            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
-            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            assert_eq!(response.status, 503);
-            assert_eq!(body["reason"], "database_probe_failed");
-            drop(held);
-            lock_mutex(&state.mail_readiness).last_attempt = None;
-            assert!(state.mail_readiness().result().is_err());
-            wait_for_mail_readiness_refresh(state);
-            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
-            assert_eq!(response.status, 200, "released serving pool must recover readiness");
-            state.health_refresh_scheduler = None;
-            assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
+                assert!(
+                    mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load()
+                        <= 1,
+                    "repeated health calls created duplicate admission work"
+                );
+                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                assert_eq!(live.status, 200);
+                wait_for_mail_readiness_refresh(state);
+                assert!(
+                    lock_mutex(&state.mail_readiness)
+                        .sample
+                        .as_ref()
+                        .unwrap()
+                        .value
+                        .database
+                        .is_err(),
+                    "a timed-out acquisition refreshed a successful sample"
+                );
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "database_probe_failed");
+                drop(held);
+                lock_mutex(&state.mail_readiness).last_attempt = None;
+                assert!(state.mail_readiness().result().is_err());
+                wait_for_mail_readiness_refresh(state);
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                assert_eq!(
+                    response.status, 200,
+                    "released serving pool must recover readiness"
+                );
+                state.health_refresh_scheduler = None;
+                assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
             });
         });
     }
@@ -32697,16 +32837,22 @@ first body
             with_health_serving_env(&next_config, || {
                 let second = create_pool(&DbPoolConfig::from_env()).expect("next serving pool");
                 let cx = runtime_request_cx(Budget::INFINITE);
-                drop(block_on(second.acquire(&cx)).into_result().expect("initialize next engine"));
+                drop(
+                    block_on(second.acquire(&cx))
+                        .into_result()
+                        .expect("initialize next engine"),
+                );
                 assert_ne!(first.engine_identity_key(), second.engine_identity_key());
                 assert_eq!(state.config.database_pool_size, Some(1));
-                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
                 let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
                 assert_eq!(response.status, 503);
                 assert_eq!(body["reason"], "database_probe_pending");
                 assert!(lock_mutex(&state.mail_readiness).sample.is_none());
                 prime_health_admission(&state, &second);
-                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
                 assert_eq!(response.status, 200);
             });
         });
@@ -32732,7 +32878,8 @@ first body
             actual.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&serving_path);
             with_health_serving_env(&actual, || {
                 let state = build_state(bound.clone());
-                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
                 let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
                 assert_eq!(response.status, 503);
                 assert_eq!(body["reason"], "database_configuration_mismatch");
@@ -32748,7 +32895,8 @@ first body
             actual.storage_root = temp.path().join("serving-archive");
             with_health_serving_env(&actual, || {
                 let state = build_state(bound.clone());
-                let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
                 let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
                 assert_eq!(response.status, 503);
                 assert_eq!(body["reason"], "storage_configuration_mismatch");
@@ -32766,42 +32914,48 @@ first body
         }
         with_serialized_health_route(|| {
             with_ready_health_state(isolated_health_config(), |state, archive| {
-            let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
-            assert!(state.mail_readiness().result().is_ok());
-            let blocked_root = archive.join("not-a-directory");
-            std::fs::write(&blocked_root, b"block archive creation").expect("real I/O failure");
-            let mut failing_config = state.config.clone();
-            failing_config.storage_root = blocked_root;
-            mcp_agent_mail_storage::wbq_start();
-            assert!(matches!(
-                mcp_agent_mail_storage::wbq_enqueue(mcp_agent_mail_storage::WriteOp::AgentProfile {
-                    project_slug: "failed-archive".to_string(),
-                    config: failing_config,
-                    agent_json: serde_json::json!({
-                        "name": "BlueLake", "program": "test", "model": "test"
-                    }),
-                }),
-                mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-            ));
-            assert!(matches!(
-                mcp_agent_mail_storage::wbq_flush_status(),
-                mcp_agent_mail_storage::WbqFlushOutcome::Drained
-            ));
-            mcp_agent_mail_storage::wbq_shutdown();
-            assert!(mcp_agent_mail_storage::durability_degraded());
-            // Re-probe reads so a slow CI filesystem cannot turn this into
-            // a sample-expiry test. This never clears the real write latch.
-            prime_health_admission(state, &pool);
-            let response = block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
-            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            assert_eq!(response.status, 503);
-            assert_eq!(body["reason"], "durability_degraded");
-            assert_eq!(body["writes_refused"], "DURABILITY_DEGRADED");
-            assert_eq!(body["capabilities"]["mail_read"], true);
-            assert_eq!(body["capabilities"]["mail_write"], false);
-            assert_eq!(body["capabilities"]["lexical_search"], true);
-            let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
-            assert_eq!(live.status, 200, "write refusal must not restart the listener");
+                let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+                assert!(state.mail_readiness().result().is_ok());
+                let blocked_root = archive.join("not-a-directory");
+                std::fs::write(&blocked_root, b"block archive creation").expect("real I/O failure");
+                let mut failing_config = state.config.clone();
+                failing_config.storage_root = blocked_root;
+                mcp_agent_mail_storage::wbq_start();
+                assert!(matches!(
+                    mcp_agent_mail_storage::wbq_enqueue(
+                        mcp_agent_mail_storage::WriteOp::AgentProfile {
+                            project_slug: "failed-archive".to_string(),
+                            config: failing_config,
+                            agent_json: serde_json::json!({
+                                "name": "BlueLake", "program": "test", "model": "test"
+                            }),
+                        }
+                    ),
+                    mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+                ));
+                assert!(matches!(
+                    mcp_agent_mail_storage::wbq_flush_status(),
+                    mcp_agent_mail_storage::WbqFlushOutcome::Drained
+                ));
+                mcp_agent_mail_storage::wbq_shutdown();
+                assert!(mcp_agent_mail_storage::durability_degraded());
+                // Re-probe reads so a slow CI filesystem cannot turn this into
+                // a sample-expiry test. This never clears the real write latch.
+                prime_health_admission(state, &pool);
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "durability_degraded");
+                assert_eq!(body["writes_refused"], "DURABILITY_DEGRADED");
+                assert_eq!(body["capabilities"]["mail_read"], true);
+                assert_eq!(body["capabilities"]["mail_write"], false);
+                assert_eq!(body["capabilities"]["lexical_search"], true);
+                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                assert_eq!(
+                    live.status, 200,
+                    "write refusal must not restart the listener"
+                );
             });
         });
     }
@@ -32814,40 +32968,40 @@ first body
         with_serialized_health_route(|| {
             let config = isolated_health_config();
             with_ready_health_state(config, |state, _archive| {
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
-            // Enriched identity fields are present.
-            assert!(
-                body.get("version").is_some(),
-                "version field must be present"
-            );
-            assert!(
-                body.get("database_path").is_some(),
-                "database_path field must be present"
-            );
-            assert!(
-                body.get("project_count").is_some(),
-                "project_count field must be present"
-            );
-            assert!(
-                body.get("message_count").is_some(),
-                "message_count field must be present"
-            );
-            assert_eq!(body["atc_experience_store"]["storage"], "in_memory");
-            assert_eq!(body["atc_experience_store"]["write_mode"], "off");
-            assert_eq!(
-                body["atc_experience_store"]["row_cap"],
-                serde_json::json!(50_000)
-            );
-            assert_eq!(
-                body["atc_experience_store"]["row_cap_enforced"],
-                serde_json::json!(false)
-            );
-            assert_eq!(body["database_path"], ":memory:");
-            assert_eq!(body["durability_state"], "not_probed");
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
+                // Enriched identity fields are present.
+                assert!(
+                    body.get("version").is_some(),
+                    "version field must be present"
+                );
+                assert!(
+                    body.get("database_path").is_some(),
+                    "database_path field must be present"
+                );
+                assert!(
+                    body.get("project_count").is_some(),
+                    "project_count field must be present"
+                );
+                assert!(
+                    body.get("message_count").is_some(),
+                    "message_count field must be present"
+                );
+                assert_eq!(body["atc_experience_store"]["storage"], "in_memory");
+                assert_eq!(body["atc_experience_store"]["write_mode"], "off");
+                assert_eq!(
+                    body["atc_experience_store"]["row_cap"],
+                    serde_json::json!(50_000)
+                );
+                assert_eq!(
+                    body["atc_experience_store"]["row_cap_enforced"],
+                    serde_json::json!(false)
+                );
+                assert_eq!(body["database_path"], ":memory:");
+                assert_eq!(body["durability_state"], "not_probed");
             });
         });
     }
@@ -32901,7 +33055,9 @@ first body
     #[test]
     #[allow(clippy::too_many_lines)]
     fn health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe() {
-        if run_prepared_http_test_in_child("tests::health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe") {
+        if run_prepared_http_test_in_child(
+            "tests::health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe",
+        ) {
             return;
         }
         with_serialized_health_route(|| {
@@ -32917,123 +33073,125 @@ first body
                 .blocking_handle()
                 .expect("owned blocking pool");
             with_ready_health_state(config, |state, _archive| {
-            state.health_refresh_scheduler = Some(health_enrichment_scheduler(runtime.handle()));
-            let serving_pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+                state.health_refresh_scheduler =
+                    Some(health_enrichment_scheduler(runtime.handle()));
+                let serving_pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
 
-            for expired in [false, true] {
-                prime_health_admission(state, &serving_pool);
-                if expired {
-                    let primary =
-                        resolve_server_database_url_sqlite_path(&state.config.database_url)
-                            .expect("primary path");
-                    let sidecar_path =
-                        mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary.to_str().unwrap());
-                    let sidecar = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path)
-                        .expect("reopen sidecar");
-                    sidecar
-                        .execute_raw("INSERT INTO atc_experiences (state) VALUES ('second');")
-                        .expect("second observation");
-                    drop(sidecar);
-                    let old = Instant::now()
-                        .checked_sub(HEALTH_ENRICHMENT_CACHE_TTL + Duration::from_secs(1))
-                        .expect("expired sample time");
-                    let mut cache = lock_mutex(&state.health_enrichment);
-                    cache.last_attempt = Some(old);
-                    cache.counts.as_mut().expect("first counts").observed_at = old;
-                    cache
-                        .atc
-                        .as_mut()
-                        .expect("first sidecar sample")
-                        .observed_at = old;
-                }
-
-                // Occupy the actual runtime pool, not a substitute probe. A
-                // refresh must remain queued until these requests finish.
-                let (started_tx, started_rx) = std::sync::mpsc::channel();
-                let (release_tx, release_rx) = std::sync::mpsc::channel();
-                let blocker = runtime
-                    .handle()
-                    .spawn_blocking(move || {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.recv_timeout(Duration::from_secs(15));
-                    })
-                    .expect("occupy owned pool");
-                started_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("blocker started");
-                std::thread::scope(|scope| {
-                    for _ in 0..8 {
-                        scope.spawn(|| state.schedule_health_enrichment_refresh());
-                    }
-                });
-                assert_eq!(
-                    pool.pending_count(),
-                    1,
-                    "concurrent callers share one refresh"
-                );
-                for path in [
-                    "/health",
-                    "/health/readiness",
-                    "/health",
-                    "/health/readiness",
-                ] {
-                    let started = Instant::now();
-                    let response =
-                        block_on(state.handle(make_request(Http1Method::Get, path, &[])));
-                    assert_eq!(response.status, 200);
-                    assert!(
-                        started.elapsed() < Duration::from_secs(2),
-                        "readiness waited on optional enrichment"
-                    );
-                    let body: serde_json::Value =
-                        serde_json::from_slice(&response.body).expect("health JSON");
-                    assert_eq!(body["enrichment_refresh_in_flight"], true);
-                    assert_eq!(body["durability_state"], "not_probed");
+                for expired in [false, true] {
+                    prime_health_admission(state, &serving_pool);
                     if expired {
-                        assert_eq!(body["project_count"], 1);
-                        assert_eq!(body["counts_sample_stale"], true);
-                        assert_eq!(body["atc_experience_store"]["raw_row_count"], 1);
-                        assert_eq!(body["atc_experience_store"]["sample_stale"], true);
-                    } else {
-                        assert!(body["project_count"].is_null());
-                        assert!(body["counts_sample_age_ms"].is_null());
-                        assert!(body["atc_experience_store"]["raw_row_count"].is_null());
-                        assert!(body["atc_experience_store"]["sample_age_ms"].is_null());
+                        let primary =
+                            resolve_server_database_url_sqlite_path(&state.config.database_url)
+                                .expect("primary path");
+                        let sidecar_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(
+                            primary.to_str().unwrap(),
+                        );
+                        let sidecar = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path)
+                            .expect("reopen sidecar");
+                        sidecar
+                            .execute_raw("INSERT INTO atc_experiences (state) VALUES ('second');")
+                            .expect("second observation");
+                        drop(sidecar);
+                        let old = Instant::now()
+                            .checked_sub(HEALTH_ENRICHMENT_CACHE_TTL + Duration::from_secs(1))
+                            .expect("expired sample time");
+                        let mut cache = lock_mutex(&state.health_enrichment);
+                        cache.last_attempt = Some(old);
+                        cache.counts.as_mut().expect("first counts").observed_at = old;
+                        cache
+                            .atc
+                            .as_mut()
+                            .expect("first sidecar sample")
+                            .observed_at = old;
                     }
+
+                    // Occupy the actual runtime pool, not a substitute probe. A
+                    // refresh must remain queued until these requests finish.
+                    let (started_tx, started_rx) = std::sync::mpsc::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = runtime
+                        .handle()
+                        .spawn_blocking(move || {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                        })
+                        .expect("occupy owned pool");
+                    started_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("blocker started");
+                    std::thread::scope(|scope| {
+                        for _ in 0..8 {
+                            scope.spawn(|| state.schedule_health_enrichment_refresh());
+                        }
+                    });
                     assert_eq!(
                         pool.pending_count(),
                         1,
-                        "one refresh despite repeated requests"
+                        "concurrent callers share one refresh"
                     );
+                    for path in [
+                        "/health",
+                        "/health/readiness",
+                        "/health",
+                        "/health/readiness",
+                    ] {
+                        let started = Instant::now();
+                        let response =
+                            block_on(state.handle(make_request(Http1Method::Get, path, &[])));
+                        assert_eq!(response.status, 200);
+                        assert!(
+                            started.elapsed() < Duration::from_secs(2),
+                            "readiness waited on optional enrichment"
+                        );
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&response.body).expect("health JSON");
+                        assert_eq!(body["enrichment_refresh_in_flight"], true);
+                        assert_eq!(body["durability_state"], "not_probed");
+                        if expired {
+                            assert_eq!(body["project_count"], 1);
+                            assert_eq!(body["counts_sample_stale"], true);
+                            assert_eq!(body["atc_experience_store"]["raw_row_count"], 1);
+                            assert_eq!(body["atc_experience_store"]["sample_stale"], true);
+                        } else {
+                            assert!(body["project_count"].is_null());
+                            assert!(body["counts_sample_age_ms"].is_null());
+                            assert!(body["atc_experience_store"]["raw_row_count"].is_null());
+                            assert!(body["atc_experience_store"]["sample_age_ms"].is_null());
+                        }
+                        assert_eq!(
+                            pool.pending_count(),
+                            1,
+                            "one refresh despite repeated requests"
+                        );
+                        assert!(
+                            !blocker.is_done(),
+                            "requests completed while the real pool was blocked"
+                        );
+                    }
+                    release_tx.send(()).expect("release pool");
+                    assert!(blocker.wait_timeout(Duration::from_secs(5)));
+                    wait_for_health_enrichment(state);
+                    let mut body = serde_json::json!({});
+                    enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
+                    assert_eq!(body["project_count"], 1);
+                    assert_eq!(body["message_count"], 0);
+                    assert_eq!(body["counts_sample_stale"], false);
+                    let atc = &body["atc_experience_store"];
+                    assert_eq!(atc["raw_row_count"], if expired { 2 } else { 1 });
+                    assert_eq!(atc["storage"], "sidecar");
+                    assert_eq!(atc["quick_check"], "ok");
+                    assert_eq!(atc["write_mode"], "live");
+                    assert_eq!(atc["row_cap"], 2);
+                    assert_eq!(atc["row_cap_enforced"], true);
+                    assert_eq!(atc["sample_stale"], false);
+                    assert!(atc["sample_age_ms"].as_u64().is_some());
                     assert!(
-                        !blocker.is_done(),
-                        "requests completed while the real pool was blocked"
+                        atc["size_share_basis_points"]
+                            .as_u64()
+                            .is_some_and(|share| share > 0)
                     );
+                    assert_eq!(pool.pending_count(), 0);
                 }
-                release_tx.send(()).expect("release pool");
-                assert!(blocker.wait_timeout(Duration::from_secs(5)));
-                wait_for_health_enrichment(state);
-                let mut body = serde_json::json!({});
-                enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
-                assert_eq!(body["project_count"], 1);
-                assert_eq!(body["message_count"], 0);
-                assert_eq!(body["counts_sample_stale"], false);
-                let atc = &body["atc_experience_store"];
-                assert_eq!(atc["raw_row_count"], if expired { 2 } else { 1 });
-                assert_eq!(atc["storage"], "sidecar");
-                assert_eq!(atc["quick_check"], "ok");
-                assert_eq!(atc["write_mode"], "live");
-                assert_eq!(atc["row_cap"], 2);
-                assert_eq!(atc["row_cap_enforced"], true);
-                assert_eq!(atc["sample_stale"], false);
-                assert!(atc["sample_age_ms"].as_u64().is_some());
-                assert!(
-                    atc["size_share_basis_points"]
-                        .as_u64()
-                        .is_some_and(|share| share > 0)
-                );
-                assert_eq!(pool.pending_count(), 0);
-            }
             });
         });
     }
@@ -33212,7 +33370,9 @@ first body
 
     #[test]
     fn health_readiness_exposes_disabled_atc_population_without_changing_admission() {
-        if run_prepared_http_test_in_child("tests::health_readiness_exposes_disabled_atc_population_without_changing_admission") {
+        if run_prepared_http_test_in_child(
+            "tests::health_readiness_exposes_disabled_atc_population_without_changing_admission",
+        ) {
             return;
         }
         with_serialized_health_route(|| {
@@ -33221,14 +33381,14 @@ first body
                 ..isolated_health_config()
             };
             with_ready_health_state(config, |state, _archive| {
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let response = block_on(state.handle(req));
-            assert_eq!(response.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            assert_eq!(body["status"], "ready");
-            assert_eq!(body["atc_population_hydration"]["status"], "disabled");
-            assert!(body["atc_population_hydration"]["progress"].is_null());
-            assert!(body["atc_population_hydration"]["backlog_age_ms"].is_null());
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let response = block_on(state.handle(req));
+                assert_eq!(response.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(body["status"], "ready");
+                assert_eq!(body["atc_population_hydration"]["status"], "disabled");
+                assert!(body["atc_population_hydration"]["progress"].is_null());
+                assert!(body["atc_population_hydration"]["backlog_age_ms"].is_null());
             });
         });
     }
@@ -33241,22 +33401,22 @@ first body
         with_serialized_health_route(|| {
             let config = isolated_health_config();
             with_ready_health_state(config, |state, _archive| {
-            let req = make_request(Http1Method::Get, "/health", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
-            // Enriched identity fields are present.
-            assert!(
-                body.get("version").is_some(),
-                "version field must be present"
-            );
-            assert!(
-                body.get("database_path").is_some(),
-                "database_path field must be present"
-            );
-            assert_eq!(body["database_path"], ":memory:");
-            assert_eq!(body["durability_state"], "not_probed");
+                let req = make_request(Http1Method::Get, "/health", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
+                // Enriched identity fields are present.
+                assert!(
+                    body.get("version").is_some(),
+                    "version field must be present"
+                );
+                assert!(
+                    body.get("database_path").is_some(),
+                    "database_path field must be present"
+                );
+                assert_eq!(body["database_path"], ":memory:");
+                assert_eq!(body["durability_state"], "not_probed");
             });
         });
     }
@@ -33539,11 +33699,11 @@ first body
                 ..isolated_health_config()
             };
             with_ready_health_state(config, |state, _archive| {
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
             });
         });
     }
@@ -33559,11 +33719,11 @@ first body
                 ..isolated_health_config()
             };
             with_ready_health_state(config, |state, _archive| {
-            let req = make_request(Http1Method::Get, "/health", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
+                let req = make_request(Http1Method::Get, "/health", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
             });
         });
     }
