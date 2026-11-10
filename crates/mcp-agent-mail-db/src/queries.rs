@@ -1081,8 +1081,11 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     }
 }
 
+/// Decode integer metadata using the mailbox's legacy numeric coercion rules.
+/// Integer text and finite numeric values are accepted; other values are absent.
+#[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn value_as_i64(value: &Value) -> Option<i64> {
+pub fn value_as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::BigInt(n) => Some(*n),
         Value::Int(n) => Some(i64::from(*n)),

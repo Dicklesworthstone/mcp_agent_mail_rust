@@ -1,7 +1,7 @@
 //! Message-first projection for the operator's HTML/JSON unified inbox.
 //!
-//! The roster remains the one selected by the existing project/agent readers.
-//! Receipt and body reads share one checkout and snapshot. Read newest-first
+//! The roster preserves the existing project/agent readers' visibility rules.
+//! Roster, receipt and body reads share one checkout and snapshot. Read newest-first
 //! header pages until the visible window is full, then hydrate only that window.
 //! Sparse filters can still scan history, without retaining history-sized bodies.
 //! No cache, receipt write, or replacement pool is used.
@@ -13,10 +13,12 @@ use mcp_agent_mail_db::DbError;
 use mcp_agent_mail_db::mail_explorer::ExplorerQuery;
 use mcp_agent_mail_db::models::{MessageRow, ProjectRow};
 use mcp_agent_mail_db::pool::{DbPool, SyncQuery};
-use mcp_agent_mail_db::queries::{self, InboxRow, UNKNOWN_SENDER_DISPLAY};
+use mcp_agent_mail_db::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY, value_as_i64};
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 
-use super::{UnifiedMessageAggregate, block_on_outcome, matches_importance_filter};
+use super::{
+    UnifiedAgent, UnifiedMessageAggregate, block_on_outcome, matches_importance_filter, ts_display,
+};
 
 const PAGE_SIZE: usize = 256;
 const SAVEPOINT: &str = "SAVEPOINT am_unified_inbox_read";
@@ -27,6 +29,7 @@ const FIRST_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, impor
 const NEXT_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages WHERE created_ts <= ? ORDER BY created_ts DESC, id DESC LIMIT 256 OFFSET ?";
 
 type Roster = BTreeMap<i64, BTreeSet<i64>>;
+type ProjectAgents = BTreeMap<i64, Vec<UnifiedAgent>>;
 
 fn database_error(error: impl std::fmt::Display) -> DbError {
     let detail = error.to_string();
@@ -174,29 +177,32 @@ struct SelectedMessage {
     recipients: Vec<Receipt>,
 }
 
+#[derive(Default)]
+pub(super) struct UnifiedPage {
+    pub(super) messages: Vec<UnifiedMessageAggregate>,
+    pub(super) agents: ProjectAgents,
+}
+
+struct SelectedPage {
+    messages: Vec<SelectedMessage>,
+    agents: ProjectAgents,
+}
+
 pub(super) fn collect(
     cx: &Cx,
     pool: &DbPool,
     projects: &[ProjectRow],
     limit: usize,
     importance: Option<&str>,
-) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    if limit == 0 || projects.is_empty() {
-        return Ok(Vec::new());
+) -> Result<UnifiedPage, (u16, String)> {
+    if projects.is_empty() {
+        return Ok(UnifiedPage::default());
     }
-    // Preserve the existing list_agents visibility contract, including legacy
-    // identities. Recheck these exact IDs in the read snapshot; do not discover
-    // additional viewers while expanding shared deliveries.
-    let mut roster = Roster::new();
-    for project in projects {
-        let project_id = project.id.unwrap_or(0);
-        let agents = block_on_outcome(cx, queries::list_agents(cx, pool, project_id))?;
-        roster
-            .entry(project_id)
-            .or_default()
-            .extend(agents.into_iter().map(|agent| agent.id.unwrap_or(0)));
-    }
-    let selected = block_on_outcome(cx, fetch(cx, pool, &roster, limit, importance))?;
+    let project_ids: Vec<_> = projects.iter().map(|project| project.id.unwrap_or(0)).collect();
+    let SelectedPage {
+        messages: selected,
+        agents,
+    } = block_on_outcome(cx, fetch(cx, pool, &project_ids, limit, importance))?;
     let projects: HashMap<_, _> = projects
         .iter()
         .map(|project| (project.id.unwrap_or(0), project))
@@ -235,24 +241,30 @@ pub(super) fn collect(
             )
         })?);
     }
-    Ok(out)
+    Ok(UnifiedPage {
+        messages: out,
+        agents,
+    })
 }
 
 async fn fetch(
     cx: &Cx,
     pool: &DbPool,
-    roster: &Roster,
+    project_ids: &[i64],
     limit: usize,
     importance: Option<&str>,
-) -> Outcome<Vec<SelectedMessage>, DbError> {
+) -> Outcome<SelectedPage, DbError> {
     if cx.checkpoint().is_err() {
         return cancelled(cx);
     }
     if i64::try_from(limit).is_err() {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     }
-    if limit == 0 || roster.values().all(BTreeSet::is_empty) {
-        return Outcome::Ok(Vec::new());
+    if project_ids.is_empty() {
+        return Outcome::Ok(SelectedPage {
+            messages: Vec::new(),
+            agents: ProjectAgents::new(),
+        });
     }
     let connection = match pool.acquire(cx).await {
         Outcome::Ok(connection) => connection,
@@ -273,7 +285,11 @@ async fn fetch(
         cx,
         interrupted: std::cell::Cell::new(false),
     };
-    let result = in_snapshot(&checked, || read(&checked, roster, limit, importance));
+    let result = in_snapshot(&checked, || {
+        let (roster, agents) = read_roster(&checked, project_ids)?;
+        let messages = read(&checked, &roster, limit, importance)?;
+        Ok(SelectedPage { messages, agents })
+    });
     if checked.interrupted.get() || cx.checkpoint().is_err() {
         return cancelled(cx);
     }
@@ -311,6 +327,78 @@ fn lookup(
 
 fn integer(row: &Row, column: &str) -> Result<i64, DbError> {
     row.get_named(column).map_err(database_error)
+}
+
+/// Select each project's legacy display roster without one checkout/query per
+/// project. Only display fields enter this projection; registration tokens and
+/// other unused profile data never need to be decoded for the unified inbox.
+fn read_roster(
+    conn: &impl SyncQuery,
+    project_ids: &[i64],
+) -> Result<(Roster, ProjectAgents), DbError> {
+    let project_ids: Vec<_> = project_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut profiles: BTreeMap<i64, Vec<(i64, UnifiedAgent)>> = BTreeMap::new();
+    let mut seen_ids = BTreeSet::new();
+    for chunk in project_ids.chunks(PAGE_SIZE) {
+        for row in lookup(
+            conn,
+            "agents",
+            "project_id",
+            "id, project_id, name, program, model, last_active_ts",
+            chunk,
+        )? {
+            let project = integer(&row, "project_id")?;
+            let id = integer(&row, "id")?;
+            if chunk.binary_search(&project).is_err() || !seen_ids.insert(id) {
+                return Err(DbError::Internal(
+                    "unrequested or duplicate unified inbox roster agent".into(),
+                ));
+            }
+            // Match the legacy profile decoder for display fields. Identity
+            // and project keys remain strict, and current_viewers validates
+            // the selected identities before any message can be returned.
+            let last_active = row.get(5).and_then(value_as_i64).unwrap_or_default();
+            let display_text = |index| match row.get(index) {
+                Some(Value::Text(value)) => value.clone(),
+                _ => String::new(),
+            };
+            profiles.entry(project).or_default().push((
+                last_active,
+                UnifiedAgent {
+                    id,
+                    name: display_text(2),
+                    program: display_text(3),
+                    model: display_text(4),
+                    last_active: ts_display(last_active),
+                },
+            ));
+        }
+    }
+
+    let mut roster = Roster::new();
+    let mut project_agents = ProjectAgents::new();
+    for (project, mut profiles) in profiles {
+        // This is list_agents' legacy rule, not list_agent_roster's canonical
+        // oldest-ID rule. Preserve retired/deregistered direct history, and
+        // choose the newest activity then greatest ID for case variants.
+        profiles.sort_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| right.1.id.cmp(&left.1.id))
+        });
+        let mut seen_names = BTreeSet::new();
+        let agents: Vec<_> = profiles
+            .into_iter()
+            .map(|(_, agent)| agent)
+            .filter(|agent| seen_names.insert(agent.name.to_ascii_lowercase()))
+            .collect();
+        roster.insert(project, agents.iter().map(|agent| agent.id).collect());
+        project_agents.insert(project, agents);
+    }
+    Ok((roster, project_agents))
 }
 
 fn current_viewers(
@@ -706,6 +794,7 @@ fn hydrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_agent_mail_db::queries;
     use mcp_agent_mail_db::{DbConn, DbConnGuard};
     use std::cell::{Cell, RefCell};
 
@@ -899,6 +988,113 @@ mod tests {
         fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
             self.conn.execute_raw(sql)
         }
+    }
+
+    #[test]
+    fn project_rosters_are_batched_and_keep_legacy_alias_and_scope_rules() {
+        let (_dir, conn) = fixture();
+        for sql in [
+            "ALTER TABLE agents ADD COLUMN program TEXT NOT NULL DEFAULT 'test-program'",
+            "ALTER TABLE agents ADD COLUMN model TEXT NOT NULL DEFAULT 'test-model'",
+            "ALTER TABLE agents ADD COLUMN last_active_ts INTEGER NOT NULL DEFAULT 0",
+            "INSERT INTO agents(id,project_id,name,inception_ts,retired_at,contact_policy,last_active_ts) VALUES(16,1,'bluelake',0,NULL,'auto',10),(17,1,'BLUELAKE',0,9,'auto',10),(90000,999,'OtherProject',0,NULL,'auto',99)",
+            "INSERT INTO agent_deregistrations VALUES(21,1)",
+            "BEGIN",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+        for project in 3..=257_i64 {
+            conn.execute_raw(&format!(
+                "INSERT INTO agents(id,project_id,name,inception_ts,contact_policy) VALUES({}, {project}, 'Agent{project}', 0, 'auto')",
+                1000 + project
+            ))
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT; PRAGMA query_only=ON").unwrap();
+        let traced = Traced {
+            conn: &conn,
+            statements: RefCell::new(Vec::new()),
+        };
+        let projects: Vec<i64> = (1..=257).collect();
+        let (selected, agents) =
+            in_snapshot(&traced, || read_roster(&traced, &projects)).unwrap();
+        assert_eq!(selected.len(), 257);
+        assert_eq!(
+            selected[&1],
+            BTreeSet::from([10, 12, 13, 14, 15, 17]),
+            "newest case variant wins, including retired direct-history viewers"
+        );
+        assert_eq!(
+            selected[&2],
+            BTreeSet::from([21]),
+            "same-name identities in other projects and deregistered direct history remain selected"
+        );
+        assert_eq!(
+            agents[&1].iter().map(|agent| agent.id).collect::<Vec<_>>(),
+            [17, 15, 14, 13, 12, 10]
+        );
+        assert_eq!(agents[&1][0].name, "BLUELAKE");
+        assert_eq!(agents[&1][0].program, "test-program");
+        assert_eq!(agents[&1][0].model, "test-model");
+        assert_eq!(agents[&2][0].name, "BlueLake");
+        let statements = traced.statements.borrow();
+        assert_eq!(
+            statements.len(),
+            2,
+            "257 projects must not require 257 roster queries"
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|(_, params)| params.len() <= PAGE_SIZE)
+        );
+        drop(statements);
+        let (scoped, _) = in_snapshot(&*conn, || read_roster(&*conn, &[1, 1])).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[&1], selected[&1]);
+    }
+
+    #[test]
+    fn project_roster_preserves_legacy_display_value_decoding() {
+        let (_dir, conn) = fixture();
+        for sql in [
+            "ALTER TABLE agents ADD COLUMN program TEXT DEFAULT 'test-program'",
+            "ALTER TABLE agents ADD COLUMN model TEXT DEFAULT 'test-model'",
+            "ALTER TABLE agents ADD COLUMN last_active_ts INTEGER DEFAULT 0",
+            "UPDATE agents SET program=NULL, model=X'ff', last_active_ts=5.75 WHERE id=12",
+            "UPDATE agents SET program=X'ff', model=NULL, last_active_ts='7' WHERE id=13",
+            "UPDATE agents SET last_active_ts='invalid' WHERE id=14",
+            "UPDATE agents SET last_active_ts=NULL WHERE id=15",
+            "INSERT INTO agents(id,project_id,name,inception_ts,contact_policy,last_active_ts) VALUES(16,1,NULL,0,'auto',1),(17,1,X'ff',0,'auto',1)",
+            "PRAGMA query_only=ON",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+        let (selected, agents) = in_snapshot(&*conn, || read_roster(&*conn, &[1])).unwrap();
+        let agents = &agents[&1];
+        assert_eq!(
+            agents.iter().map(|agent| agent.id).collect::<Vec<_>>(),
+            [13, 12, 17, 15, 14, 11, 10],
+            "legacy activity coercion must preserve ordering and alias selection"
+        );
+        for id in [12, 13] {
+            let agent = agents.iter().find(|agent| agent.id == id).unwrap();
+            assert!(agent.program.is_empty());
+            assert!(agent.model.is_empty());
+        }
+        assert!(
+            agents
+                .iter()
+                .find(|agent| agent.id == 17)
+                .unwrap()
+                .name
+                .is_empty()
+        );
+        assert!(!selected[&1].contains(&16));
+        assert!(
+            in_snapshot(&*conn, || read(&*conn, &selected, 1, None)).is_err(),
+            "a selected malformed identity must still fail current_viewers validation"
+        );
     }
 
     #[test]
@@ -1286,7 +1482,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             };
-            for limit in [1, 2, 8] {
+            for limit in [0, 1, 2, 8] {
                 for importance in [
                     None,
                     Some("urgent"),
@@ -1299,8 +1495,10 @@ mod tests {
                     )
                     .unwrap();
                     let current = collect(&cx, &pool, &projects, limit, importance).unwrap();
+                    assert_eq!(current.agents[&71].len(), 3);
+                    assert_eq!(current.agents[&72].len(), 2);
                     assert_eq!(
-                        project(current),
+                        project(current.messages),
                         project(original),
                         "limit={limit} filter={importance:?}"
                     );

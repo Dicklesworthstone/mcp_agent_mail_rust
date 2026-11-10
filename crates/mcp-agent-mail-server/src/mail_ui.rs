@@ -3456,7 +3456,10 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    unified::collect(cx, pool, projects_rows, limit, filter_importance)
+    if limit == 0 || projects_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    unified::collect(cx, pool, projects_rows, limit, filter_importance).map(|page| page.messages)
 }
 
 #[cfg(test)]
@@ -3531,25 +3534,22 @@ fn render_unified_inbox(
         .map(str::to_ascii_lowercase);
     let projects_rows = block_on_outcome(cx, queries::list_projects(cx, pool))?;
 
+    let mut page = unified::collect(
+        cx,
+        pool,
+        &projects_rows,
+        limit,
+        normalized_filter.as_deref(),
+    )?;
     let mut projects = Vec::new();
     let mut total_agents: usize = 0;
     for p in &projects_rows {
         let pid = p.id.unwrap_or(0);
-        let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-        if agents_rows.is_empty() {
+        let agents = page.agents.remove(&pid).unwrap_or_default();
+        if agents.is_empty() {
             continue;
         }
-        total_agents += agents_rows.len();
-        let agents: Vec<UnifiedAgent> = agents_rows
-            .iter()
-            .map(|a| UnifiedAgent {
-                id: a.id.unwrap_or(0),
-                name: a.name.clone(),
-                program: a.program.clone(),
-                model: a.model.clone(),
-                last_active: ts_display(a.last_active_ts),
-            })
-            .collect();
+        total_agents += agents.len();
         projects.push(UnifiedProject {
             id: pid,
             slug: p.slug.clone(),
@@ -3560,21 +3560,16 @@ fn render_unified_inbox(
         });
     }
 
-    let messages = collect_unified_message_aggregates(
-        cx,
-        pool,
-        &projects_rows,
-        limit,
-        normalized_filter.as_deref(),
-    )?
-    .into_iter()
-    .map(UnifiedMessageAggregate::into_view)
-    .map(|mut message| {
-        message.thread_url =
-            mail_thread_href_for_mode(&message.project_slug, &message.thread_id, static_export);
-        message
-    })
-    .collect::<Vec<_>>();
+    let messages = page
+        .messages
+        .into_iter()
+        .map(UnifiedMessageAggregate::into_view)
+        .map(|mut message| {
+            message.thread_url =
+                mail_thread_href_for_mode(&message.project_slug, &message.thread_id, static_export);
+            message
+        })
+        .collect::<Vec<_>>();
 
     let total_messages = messages.len();
     render(
