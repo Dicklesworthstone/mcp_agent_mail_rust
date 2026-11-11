@@ -43,7 +43,7 @@ use crate::search_embedder::{
 #[cfg(feature = "hybrid")]
 use crate::search_embedding_jobs::{
     EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest, IndexRefreshWorker,
-    JobMetricsSnapshot, QueueStats, RefreshWorkerConfig,
+    JobMetricsSnapshot, JobResult, QueueStats, RefreshWorkerConfig,
 };
 #[cfg(feature = "hybrid")]
 use crate::search_metrics::{TwoTierAlertConfig, TwoTierMetrics, TwoTierMetricsSnapshot};
@@ -2419,6 +2419,58 @@ impl Embedder for AutoInitSemanticEmbedder {
 #[cfg(feature = "hybrid")]
 const SEMANTIC_BACKFILL_PAGE_SIZE: i64 = 64;
 
+#[cfg(feature = "hybrid")]
+const SEMANTIC_RECOVERY_PAGE_SIZE: i64 = 16;
+
+/// Only IDs are retained after the fast embedding retries are exhausted. A
+/// range can cover arbitrarily many failures without filling the live queue;
+/// valid vectors between its endpoints are checked, never embedded again.
+#[cfg(feature = "hybrid")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SemanticRecoveryRange {
+    first_id: i64,
+    last_id: i64,
+    after_id: Option<i64>,
+}
+
+#[cfg(feature = "hybrid")]
+#[derive(Default)]
+struct SemanticRecovery {
+    pending: Option<SemanticRecoveryRange>,
+    active: Option<SemanticRecoveryRange>,
+    not_before: Option<std::time::Instant>,
+    rounds: u32,
+    append_first: bool,
+}
+
+#[cfg(feature = "hybrid")]
+impl SemanticRecovery {
+    fn record_failure(&mut self, id: i64, now: std::time::Instant) {
+        let range = self.pending.get_or_insert(SemanticRecoveryRange {
+            first_id: id,
+            last_id: id,
+            after_id: None,
+        });
+        range.first_id = range.first_id.min(id);
+        range.last_id = range.last_id.max(id);
+        // New failures widen the next pass, including IDs behind an active
+        // cursor, but can never keep postponing its original deadline.
+        self.not_before.get_or_insert_with(|| {
+            let seconds = 30_u64.saturating_mul(1_u64 << self.rounds.min(5)).min(900);
+            now + std::time::Duration::from_secs(seconds)
+        });
+    }
+
+    fn ready_range(&mut self, now: std::time::Instant) -> Option<SemanticRecoveryRange> {
+        if self.active.is_none() && self.not_before.is_some_and(|deadline| deadline <= now) {
+            self.active = self.pending.take();
+            self.not_before = None;
+            self.rounds = self.rounds.saturating_add(1);
+        }
+        self.active
+    }
+}
+
 /// One mailbox owns the process-local semantic index. Reconstruct its message
 /// history lazily from bounded, read-only pages after the first semantic query.
 /// Source resets run on the embedding worker, between completed batches.
@@ -2434,6 +2486,7 @@ struct SemanticSourceState {
     scan_started_clock: Option<crate::search_v3::LexicalChangeClock>,
     tail_base_clock: Option<crate::search_v3::LexicalChangeClock>,
     tail_rows: u64,
+    recovery: SemanticRecovery,
     epoch: u64,
     last_error: Option<String>,
 }
@@ -2443,6 +2496,13 @@ struct SemanticSource {
     state: Mutex<SemanticSourceState>,
     queue: Arc<EmbeddingQueue>,
     index: Arc<RwLock<VectorIndex>>,
+}
+
+#[cfg(feature = "hybrid")]
+enum SemanticEnqueue {
+    Current,
+    Added,
+    Full,
 }
 
 /// An unavailable source is distinct from a current legacy source that has
@@ -2530,6 +2590,7 @@ impl SemanticSource {
         state.scan_started_clock = None;
         state.tail_base_clock = None;
         state.tail_rows = 0;
+        state.recovery = SemanticRecovery::default();
         state.epoch = state.epoch.wrapping_add(1);
         if had_work || had_vectors {
             invalidate_search_cache(InvalidationTrigger::IndexUpdate);
@@ -2566,6 +2627,83 @@ impl SemanticSource {
                 false
             }
         }
+    }
+
+    fn record_failures(&self, results: &[JobResult]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active_pool_key.is_none() {
+            // Before source binding, the first canonical scan will recover
+            // these IDs. A replacement binding likewise starts a fresh scan.
+            return;
+        }
+        let now = std::time::Instant::now();
+        for result in results {
+            if let JobResult::Failed {
+                doc_id,
+                doc_kind: SearchDocKind::Message,
+                ..
+            } = result
+            {
+                state.recovery.record_failure(*doc_id, now);
+            }
+        }
+    }
+
+    fn enqueue_canonical_request(&self, request: EmbeddingRequest) -> SemanticEnqueue {
+        let hash = crate::search_canonical::canonicalize_and_hash(
+            request.doc_kind,
+            &request.title,
+            &request.body,
+            crate::search_canonical::CanonPolicy::Full,
+        )
+        .1;
+        let up_to_date = read_guard_or_recover("semantic.vector_index", &self.index)
+            .get(request.doc_id, request.doc_kind)
+            .is_some_and(|entry| {
+                entry.metadata.project_id == request.project_id
+                    && entry.metadata.content_hash == hash
+            });
+        if up_to_date || self.queue.contains(request.doc_id, request.doc_kind) {
+            SemanticEnqueue::Current
+        } else if self.queue.enqueue(request) {
+            SemanticEnqueue::Added
+        } else {
+            SemanticEnqueue::Full
+        }
+    }
+
+    fn enqueue_canonical_page(
+        &self,
+        requests: Vec<EmbeddingRequest>,
+        after_id: &mut Option<i64>,
+    ) -> (u64, usize) {
+        let mut visited = 0;
+        let mut added = 0;
+        for request in requests {
+            let id = request.doc_id;
+            match self.enqueue_canonical_request(request) {
+                SemanticEnqueue::Current => {}
+                SemanticEnqueue::Added => added += 1,
+                // Neither cursor may skip a row the bounded queue refused.
+                SemanticEnqueue::Full => break,
+            }
+            *after_id = Some(id);
+            visited += 1;
+        }
+        (visited, added)
+    }
+
+    fn enqueue_recovery_page(
+        &self,
+        requests: Vec<EmbeddingRequest>,
+        recovery: &mut SemanticRecovery,
+    ) -> usize {
+        recovery.active.as_mut().map_or(0, |range| {
+            self.enqueue_canonical_page(requests, &mut range.after_id).1
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2619,23 +2757,40 @@ impl SemanticSource {
             ),
         }
         .map_err(|error| error.to_string())?;
-        let mut requests = Vec::with_capacity(rows.len());
-        for row in rows {
-            requests.push(EmbeddingRequest::new(
-                row.get_named::<i64>("id")
-                    .map_err(|error| error.to_string())?,
-                SearchDocKind::Message,
-                Some(
-                    row.get_named::<i64>("project_id")
-                        .map_err(|error| error.to_string())?,
-                ),
-                row.get_named::<String>("subject")
-                    .map_err(|error| error.to_string())?,
-                row.get_named::<String>("body_md")
-                    .map_err(|error| error.to_string())?,
-                ModelTier::Fast,
-            ));
-        }
+        let requests = semantic_history_requests(rows)?;
+        let recovery_range = if reset {
+            None
+        } else {
+            state.recovery.ready_range(std::time::Instant::now())
+        };
+        let recovery_requests = match recovery_range {
+            Some(range) => {
+                let (sql, start) = match range.after_id {
+                    Some(after) => (
+                        "SELECT id, project_id, subject, body_md FROM messages \
+                         WHERE id > ? AND id <= ? ORDER BY id LIMIT ?",
+                        after,
+                    ),
+                    None => (
+                        "SELECT id, project_id, subject, body_md FROM messages \
+                         WHERE id >= ? AND id <= ? ORDER BY id LIMIT ?",
+                        range.first_id,
+                    ),
+                };
+                let rows = conn
+                    .query_sync(
+                        sql,
+                        &[
+                            Value::BigInt(start),
+                            Value::BigInt(range.last_id),
+                            Value::BigInt(SEMANTIC_RECOVERY_PAGE_SIZE),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                semantic_history_requests(rows)?
+            }
+            None => Vec::new(),
+        };
         conn.execute_raw("COMMIT")
             .map_err(|error| error.to_string())?;
 
@@ -2660,6 +2815,9 @@ impl SemanticSource {
         state.generation = generation;
         state.clock = Some(clock);
         state.scan_started_clock.get_or_insert(clock);
+        if recovery_range.is_some() && recovery_requests.is_empty() {
+            state.recovery.active = None;
+        }
         if requests.is_empty() {
             let complete = state.tail_base_clock.map_or_else(
                 || state.scan_started_clock == Some(clock),
@@ -2677,33 +2835,56 @@ impl SemanticSource {
             }
             state.tail_rows = 0;
         }
-        for request in requests {
-            let id = request.doc_id;
-            let hash = crate::search_canonical::canonicalize_and_hash(
-                request.doc_kind,
-                &request.title,
-                &request.body,
-                crate::search_canonical::CanonPolicy::Full,
-            )
-            .1;
-            let up_to_date = read_guard_or_recover("semantic.vector_index", &self.index)
-                .get(id, request.doc_kind)
-                .is_some_and(|entry| {
-                    entry.metadata.project_id == request.project_id
-                        && entry.metadata.content_hash == hash
-                });
-            if !up_to_date && !self.queue.enqueue(request) {
-                // Keep the cursor before the rejected row; model absence or a
-                // full live queue must never permanently skip historical mail.
-                break;
-            }
-            state.after_id = Some(id);
-            if state.tail_base_clock.is_some() {
-                state.tail_rows = state.tail_rows.saturating_add(1);
-            }
+        // Each lane has an independent bounded page and cursor. Alternate
+        // admission priority only after actual queue progress, so even a
+        // one-slot queue serves both new mail and a large repair range.
+        let ((visited, appended), repaired) = if state.recovery.append_first {
+            let append = self.enqueue_canonical_page(requests, &mut state.after_id);
+            let repair = self.enqueue_recovery_page(recovery_requests, &mut state.recovery);
+            (append, repair)
+        } else {
+            let repair = self.enqueue_recovery_page(recovery_requests, &mut state.recovery);
+            let append = self.enqueue_canonical_page(requests, &mut state.after_id);
+            (append, repair)
+        };
+        if state.tail_base_clock.is_some() {
+            state.tail_rows = state.tail_rows.saturating_add(visited);
+        }
+        if recovery_range.is_some() && (appended > 0 || repaired > 0) {
+            state.recovery.append_first = !state.recovery.append_first;
+        }
+        if state.recovery.active.is_none()
+            && state.recovery.pending.is_none()
+            && self.queue.is_empty()
+        {
+            state.recovery.rounds = 0;
         }
         Ok(true)
     }
+}
+
+#[cfg(feature = "hybrid")]
+fn semantic_history_requests(
+    rows: Vec<sqlmodel_core::Row>,
+) -> Result<Vec<EmbeddingRequest>, String> {
+    rows.into_iter()
+        .map(|row| {
+            Ok(EmbeddingRequest::new(
+                row.get_named::<i64>("id")
+                    .map_err(|error| error.to_string())?,
+                SearchDocKind::Message,
+                Some(
+                    row.get_named::<i64>("project_id")
+                        .map_err(|error| error.to_string())?,
+                ),
+                row.get_named::<String>("subject")
+                    .map_err(|error| error.to_string())?,
+                row.get_named::<String>("body_md")
+                    .map_err(|error| error.to_string())?,
+                ModelTier::Fast,
+            ))
+        })
+        .collect()
 }
 
 /// Observe the pathname's physical identity without opening the main database.
@@ -2792,9 +2973,17 @@ impl SemanticBridge {
 
     #[must_use]
     fn new_with_embedder(config: VectorIndexConfig, embedder: Arc<dyn Embedder>) -> Self {
+        Self::new_with_embedder_config(config, embedder, EmbeddingJobConfig::default())
+    }
+
+    #[must_use]
+    fn new_with_embedder_config(
+        config: VectorIndexConfig,
+        embedder: Arc<dyn Embedder>,
+        job_config: EmbeddingJobConfig,
+    ) -> Self {
         let index = Arc::new(RwLock::new(VectorIndex::new(config)));
         let registry = Arc::new(RwLock::new(ModelRegistry::new(RegistryConfig::default())));
-        let job_config = EmbeddingJobConfig::default();
         let queue = Arc::new(EmbeddingQueue::with_config(job_config.clone()));
         let runner = Arc::new(
             EmbeddingJobRunner::new(job_config, queue.clone(), embedder.clone(), index.clone())
@@ -2811,9 +3000,13 @@ impl SemanticBridge {
             index: index.clone(),
         });
         let refill_source = source.clone();
+        let recovery_source = source.clone();
         let refresh_worker = Arc::new(
             IndexRefreshWorker::new(worker_cfg, runner.clone())
-                .with_source_refill(move |shutdown| refill_source.refill(shutdown)),
+                .with_source_refill(move |shutdown| refill_source.refill(shutdown))
+                .with_source_failure_recovery(move |results| {
+                    recovery_source.record_failures(results)
+                }),
         );
         let worker = {
             let worker = refresh_worker.clone();
@@ -11113,6 +11306,7 @@ mod tests {
     struct FixedSemanticTestEmbedder {
         info: ModelInfo,
         ready: std::sync::atomic::AtomicBool,
+        failing: std::sync::atomic::AtomicBool,
         model_changed: std::sync::atomic::AtomicBool,
         output_dimension: std::sync::atomic::AtomicUsize,
         on_first_embedding: Mutex<Option<(String, Vec<String>)>>,
@@ -11131,6 +11325,7 @@ mod tests {
                 )
                 .with_available(true),
                 ready: std::sync::atomic::AtomicBool::new(true),
+                failing: std::sync::atomic::AtomicBool::new(false),
                 model_changed: std::sync::atomic::AtomicBool::new(false),
                 output_dimension: std::sync::atomic::AtomicUsize::new(dimension),
                 on_first_embedding: Mutex::new(None),
@@ -11143,6 +11338,11 @@ mod tests {
         fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
             if !self.is_ready() {
                 return HashEmbedder::new().embed(text);
+            }
+            if self.failing.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(crate::search_error::SearchError::Timeout(
+                    "controlled embedding outage".to_string(),
+                ));
             }
             let first_embedding = self.on_first_embedding.lock().unwrap().take();
             if let Some((path, statements)) = first_embedding {
@@ -11229,7 +11429,19 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     fn manual_semantic_history_bridge(embedder: Arc<FixedSemanticTestEmbedder>) -> SemanticBridge {
-        let bridge = SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder);
+        manual_semantic_history_bridge_config(embedder, EmbeddingJobConfig::default())
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn manual_semantic_history_bridge_config(
+        embedder: Arc<FixedSemanticTestEmbedder>,
+        config: EmbeddingJobConfig,
+    ) -> SemanticBridge {
+        let bridge = SemanticBridge::new_with_embedder_config(
+            VectorIndexConfig::default(),
+            embedder,
+            config,
+        );
         bridge.refresh_worker.shutdown();
         let worker = bridge.worker.lock().unwrap().take();
         if let Some(worker) = worker {
@@ -11240,6 +11452,339 @@ mod tests {
             .shutdown_flag()
             .store(false, std::sync::atomic::Ordering::Release);
         bridge
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn exhaust_semantic_history_embeddings(bridge: &SemanticBridge, expected: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while bridge.metrics_snapshot().total_failed < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the original fast retries did not reach their terminal failure"
+            );
+            let _ = bridge.refresh_worker.run_cycle();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(bridge.metrics_snapshot().total_failed, expected);
+        assert!(bridge.queue.is_empty());
+        assert!(bridge.index().is_empty());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_recovery_backoff_retains_late_failures_without_postponement() {
+        let now = std::time::Instant::now();
+        let mut recovery = SemanticRecovery::default();
+        recovery.record_failure(i64::MIN, now);
+        let first_deadline = now + Duration::from_secs(30);
+        assert_eq!(recovery.not_before, Some(first_deadline));
+        recovery.record_failure(i64::MAX, now + Duration::from_secs(29));
+        assert_eq!(recovery.not_before, Some(first_deadline));
+        assert!(
+            recovery
+                .ready_range(now + Duration::from_secs(29))
+                .is_none()
+        );
+        assert_eq!(
+            recovery.ready_range(first_deadline),
+            Some(SemanticRecoveryRange {
+                first_id: i64::MIN,
+                last_id: i64::MAX,
+                after_id: None,
+            })
+        );
+        recovery.active.as_mut().unwrap().after_id = Some(100);
+        let failed_again = first_deadline + Duration::from_secs(1);
+        recovery.record_failure(2, failed_again);
+        let second_deadline = failed_again + Duration::from_mins(1);
+        recovery.record_failure(300, second_deadline - Duration::from_secs(1));
+        assert_eq!(recovery.not_before, Some(second_deadline));
+        assert_eq!(recovery.pending.unwrap().first_id, 2);
+        assert_eq!(recovery.active.unwrap().after_id, Some(100));
+        recovery.active = None;
+        assert_eq!(recovery.ready_range(second_deadline).unwrap().first_id, 2);
+
+        // Permanently failing documents are retried slowly, with finite state
+        // and a capped delay even after the round counter saturates.
+        for (rounds, seconds) in [(2, 120), (3, 240), (4, 480), (5, 900), (u32::MAX, 900)] {
+            recovery = SemanticRecovery {
+                rounds,
+                ..Default::default()
+            };
+            recovery.record_failure(-1, now);
+            let due = now + Duration::from_secs(seconds);
+            assert_eq!(recovery.not_before, Some(due));
+            assert_eq!(recovery.ready_range(due).unwrap().first_id, -1);
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovers_exhausted_embeddings_without_reembedding_healthy_mail() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "exhausted-history.sqlite3", 3);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .failing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        exhaust_semantic_history_embeddings(&bridge, 3);
+        assert_eq!(bridge.source.state.lock().unwrap().after_id, Some(3));
+        embedder
+            .failing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let batches = bridge.metrics_snapshot().total_batches;
+        for _ in 0..3 {
+            assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        }
+        assert_eq!(bridge.metrics_snapshot().total_batches, batches);
+
+        // The unchanged historical tail stays missing during the cooldown,
+        // while new canonical mail gets its own budget and is indexed at once.
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "exhausted history append",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (4, 1, 1, 'new mail during recovery', 'canonical new body', 2)",
+        )
+        .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert!(bridge.index().contains(4, SearchDocKind::Message));
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 1);
+
+        // Advance only the recovery scheduler in this test. The real DB,
+        // source cursor, ordinary fast retry policy and worker path are intact.
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 3);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.index().len(), 4);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 4);
+        let results = hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].title, "Historical subject 1");
+        assert_eq!(results[3].body, "canonical new body");
+        let state = bridge.source.state.lock().unwrap();
+        assert_eq!(state.after_id, Some(4));
+        assert!(state.recovery.pending.is_none());
+        assert!(state.recovery.active.is_none());
+        assert_eq!(state.recovery.rounds, 0);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovery_preserves_cursors_under_backpressure_and_late_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "recovery-pressure.sqlite3", 80);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 16);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        for id in [1, 48] {
+            assert!(bridge.index_mut().remove(id, SearchDocKind::Message));
+            bridge.source.record_failures(&[JobResult::Failed {
+                doc_id: id,
+                doc_kind: SearchDocKind::Message,
+                error: "controlled exhausted job".to_string(),
+            }]);
+        }
+        embedder
+            .ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        for id in 1000..2000 {
+            assert!(bridge.queue.enqueue(EmbeddingRequest::new(
+                id,
+                SearchDocKind::Agent,
+                Some(1),
+                "other pending work",
+                "queue capacity control",
+                ModelTier::Fast,
+            )));
+        }
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "recovery pressure append",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (81, 1, 1, 'new mail behind pressure', 'canonical body', 2)",
+        )
+        .unwrap();
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        {
+            let state = bridge.source.state.lock().unwrap();
+            assert_eq!(state.after_id, Some(80));
+            assert_eq!(state.recovery.active.unwrap().after_id, None);
+        }
+        assert_eq!(bridge.queue.drain_batch(1000).len(), 1000);
+        embedder
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        {
+            let state = bridge.source.state.lock().unwrap();
+            assert_eq!(state.after_id, Some(81));
+            assert_eq!(state.recovery.active.unwrap().after_id, Some(16));
+        }
+        assert!(bridge.index().contains(1, SearchDocKind::Message));
+        assert!(bridge.index().contains(81, SearchDocKind::Message));
+        assert!(!bridge.index().contains(48, SearchDocKind::Message));
+
+        // A failure behind the active repair cursor belongs to the next pass;
+        // it must not disappear when this range reaches its upper bound.
+        assert!(bridge.index_mut().remove(2, SearchDocKind::Message));
+        bridge.source.record_failures(&[JobResult::Failed {
+            doc_id: 2,
+            doc_kind: SearchDocKind::Message,
+            error: "late failure behind repair cursor".to_string(),
+        }]);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        {
+            let mut state = bridge.source.state.lock().unwrap();
+            assert!(state.recovery.active.is_none());
+            assert_eq!(state.recovery.pending.unwrap().first_id, 2);
+            state.recovery.not_before = Some(std::time::Instant::now());
+        }
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.index().len(), 81);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 84);
+        assert_eq!(bridge.source.state.lock().unwrap().after_id, Some(81));
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovery_and_append_are_fair_with_one_queue_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "recovery-fairness.sqlite3", 6);
+        let bridge = manual_semantic_history_bridge_config(
+            Arc::new(FixedSemanticTestEmbedder::new(4)),
+            EmbeddingJobConfig {
+                batch_size: 1,
+                backpressure_threshold: 1,
+                ..Default::default()
+            },
+        );
+        assert!(bridge.source.bind_pool(&pool));
+        for _ in 0..6 {
+            assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        }
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        for id in [1, 2] {
+            assert!(bridge.index_mut().remove(id, SearchDocKind::Message));
+            bridge.source.record_failures(&[JobResult::Failed {
+                doc_id: id,
+                doc_kind: SearchDocKind::Message,
+                error: "controlled exhausted job".to_string(),
+            }]);
+        }
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "recovery fairness append",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+             (7, 1, 1, 'fresh seven', 'canonical body', 2), \
+             (8, 1, 1, 'fresh eight', 'canonical body', 2)",
+        )
+        .unwrap();
+        for (indexed, absent) in [(1, 7), (7, 2), (2, 8), (8, 9)] {
+            assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+            assert!(bridge.index().contains(indexed, SearchDocKind::Message));
+            assert!(!bridge.index().contains(absent, SearchDocKind::Message));
+        }
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.index().len(), 8);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 10);
+        let state = bridge.source.state.lock().unwrap();
+        assert_eq!(state.after_id, Some(8));
+        assert!(state.recovery.active.is_none());
+        assert!(state.recovery.pending.is_none());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovery_stops_on_shutdown_and_retires_changed_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "recovery-generation.sqlite3", 3);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .failing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        exhaust_semantic_history_embeddings(&bridge, 3);
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        bridge.refresh_worker.shutdown();
+        embedder
+            .failing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "recovery generation replacement",
+        );
+        conn.execute_raw("UPDATE messages SET body_md = 'replacement canonical body' WHERE id = 1")
+            .unwrap();
+        conn.execute_raw("DELETE FROM messages WHERE id = 2")
+            .unwrap();
+        conn.execute_raw(
+            "UPDATE db_identity SET generation_id = 'after-outage' WHERE singleton = 0",
+        )
+        .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert!(bridge.index().is_empty());
+        assert!(
+            bridge
+                .source
+                .state
+                .lock()
+                .unwrap()
+                .recovery
+                .pending
+                .is_some()
+        );
+        bridge
+            .refresh_worker
+            .shutdown_flag()
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert!(!bridge.index().contains(2, SearchDocKind::Message));
+        assert!(
+            bridge
+                .source
+                .state
+                .lock()
+                .unwrap()
+                .recovery
+                .pending
+                .is_none()
+        );
+        assert!(
+            bridge
+                .source
+                .state
+                .lock()
+                .unwrap()
+                .recovery
+                .active
+                .is_none()
+        );
+        let results = hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].body, "replacement canonical body");
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 2);
     }
 
     #[cfg(feature = "hybrid")]

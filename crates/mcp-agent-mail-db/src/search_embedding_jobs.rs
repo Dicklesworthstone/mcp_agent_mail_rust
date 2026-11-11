@@ -513,6 +513,14 @@ impl EmbeddingQueue {
         state.queue.len() + state.retry_queue.len()
     }
 
+    /// Whether this source document already has queued work, including a
+    /// delayed retry. Canonical recovery must not reset its retry deadline.
+    pub(crate) fn contains(&self, doc_id: i64, doc_kind: DocKind) -> bool {
+        mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending)
+            .dedup
+            .contains(&(doc_id, doc_kind))
+    }
+
     /// Discard work belonging to a retired source generation.
     /// The source refresh hook calls this between embedding batches.
     pub(crate) fn clear(&self) {
@@ -934,6 +942,7 @@ impl Default for RefreshWorkerConfig {
 }
 
 type SourceRefillHook = dyn Fn(&AtomicBool) -> bool + Send + Sync;
+type SourceFailureHook = dyn Fn(&[JobResult]) + Send + Sync;
 
 /// Background worker that drives embedding refresh.
 ///
@@ -944,6 +953,7 @@ pub struct IndexRefreshWorker {
     runner: Arc<EmbeddingJobRunner>,
     rebuild_lifecycle: Option<Arc<dyn IndexLifecycle>>,
     source_refill: Option<Arc<SourceRefillHook>>,
+    source_failure: Option<Arc<SourceFailureHook>>,
     shutdown: Arc<AtomicBool>,
     last_refresh: Mutex<Option<Instant>>,
     cycle: Mutex<()>,
@@ -958,6 +968,7 @@ impl IndexRefreshWorker {
             runner,
             rebuild_lifecycle: None,
             source_refill: None,
+            source_failure: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             last_refresh: Mutex::new(None),
             cycle: Mutex::new(()),
@@ -981,6 +992,18 @@ impl IndexRefreshWorker {
         refill: impl Fn(&AtomicBool) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.source_refill = Some(Arc::new(refill));
+        self
+    }
+
+    /// Retain exhausted work in the canonical source's bounded recovery
+    /// schedule. This runs between batches under the same cycle barrier as
+    /// source refresh, without retaining failed document payloads in the queue.
+    #[must_use]
+    pub(crate) fn with_source_failure_recovery(
+        mut self,
+        recover: impl Fn(&[JobResult]) + Send + Sync + 'static,
+    ) -> Self {
+        self.source_failure = Some(Arc::new(recover));
         self
     }
 
@@ -1061,6 +1084,11 @@ impl IndexRefreshWorker {
             let remaining = max_docs.saturating_sub(processed).max(1);
             match self.runner.process_batch_limit(remaining) {
                 Ok(result) => {
+                    if result.failed > 0
+                        && let Some(recover) = self.source_failure.as_ref()
+                    {
+                        recover(&result.details);
+                    }
                     let total = result.total();
                     if total == 0 {
                         break;
@@ -1613,6 +1641,47 @@ mod tests {
         let config = RefreshWorkerConfig::default();
         assert_eq!(config.refresh_interval_ms, 1000);
         assert!(!config.rebuild_on_startup);
+    }
+
+    #[test]
+    fn refresh_worker_reports_exhausted_jobs_once_and_stops_after_shutdown() {
+        let config = EmbeddingJobConfig {
+            max_retries: 1,
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(
+            config,
+            queue.clone(),
+            Arc::new(FlakyBatchEmbedder::new(4, 10)),
+            index,
+        ));
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let observed = failures.clone();
+        let worker = IndexRefreshWorker::new(RefreshWorkerConfig::default(), runner.clone())
+            .with_source_failure_recovery(move |results| {
+                for result in results {
+                    if let JobResult::Failed { doc_id, .. } = result {
+                        observed.lock().unwrap().push(*doc_id);
+                    }
+                }
+            });
+        assert!(queue.enqueue(make_request(42)));
+        assert_eq!(worker.run_cycle(), 2);
+        assert_eq!(*failures.lock().unwrap(), vec![42]);
+        assert_eq!(runner.metrics().snapshot().total_retryable, 1);
+        assert_eq!(runner.metrics().snapshot().total_failed, 1);
+        assert!(queue.is_empty(), "the one-shot retry contract stays finite");
+        worker.shutdown();
+        assert!(queue.enqueue(make_request(43)));
+        assert_eq!(worker.run_cycle(), 0);
+        assert_eq!(*failures.lock().unwrap(), vec![42]);
+        assert!(queue.contains(43, DocKind::Message));
     }
 
     #[test]
