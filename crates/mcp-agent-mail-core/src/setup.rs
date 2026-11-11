@@ -7293,18 +7293,28 @@ fn omp_mcp_json_connection(
     provider: OmpMcpAuthorityProvider,
 ) -> OmpMcpConnection {
     let mut invalid_endpoint_shape = false;
-    let mut command = if format == OmpMcpAuthorityFormat::OpenCodeJsonc
-        && entry.get("command").is_some_and(Value::is_array)
-    {
-        None
+    let mut command = if format == OmpMcpAuthorityFormat::OpenCodeJsonc {
+        entry
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
     } else {
         omp_mcp_optional_string(entry, "command", &mut invalid_endpoint_shape)
     };
     let mut args = entry.get("args").cloned();
     let mut env = entry.get("env").cloned();
     let mut cwd = None;
-    let url = omp_mcp_optional_string(entry, "url", &mut invalid_endpoint_shape);
-    let headers = entry.get("headers").cloned();
+    let url = if format == OmpMcpAuthorityFormat::OpenCodeJsonc {
+        entry
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    } else {
+        omp_mcp_optional_string(entry, "url", &mut invalid_endpoint_shape)
+    };
+    let mut headers = entry.get("headers").cloned();
     let mut auth = None;
     let mut oauth = None;
     let mut request_id_format = None;
@@ -7317,6 +7327,8 @@ fn omp_mcp_json_connection(
         OmpMcpAuthorityFormat::OpenCodeJsonc => match entry.get("type").and_then(Value::as_str) {
             Some("local") => Some("stdio".to_string()),
             Some("remote") => Some("http".to_string()),
+            _ if entry.get("url").is_some_and(omp_json_truthy) => Some("http".to_string()),
+            _ if entry.get("command").is_some_and(omp_json_truthy) => Some("stdio".to_string()),
             _ => None,
         },
         OmpMcpAuthorityFormat::CodexToml => {
@@ -7360,28 +7372,60 @@ fn omp_mcp_json_connection(
             env = entry.get("env").cloned();
         }
         OmpMcpAuthorityFormat::OpenCodeJsonc => {
+            // Match discovery/opencode.ts at the pinned OMP revision above:
+            // malformed optional fields are dropped, not endpoint vetoes.
+            // An empty command array must still permit a valid remote URL.
+            let configured_args = args
+                .as_ref()
+                .and_then(Value::as_array)
+                .filter(|values| values.iter().all(Value::is_string));
             if let Some(Value::Array(command_parts)) = entry.get("command") {
                 command = command_parts
                     .first()
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
-                if command.is_none() || command_parts[1..].iter().any(|value| !value.is_string()) {
-                    invalid_endpoint_shape = true;
-                }
-                let mut combined = command_parts[1..].to_vec();
-                if let Some(Value::Array(configured_args)) = &args {
+                let command_args = command_parts.get(1..).unwrap_or_default();
+                let mut combined = command_args.to_vec();
+                if let Some(configured_args) = configured_args {
                     combined.extend(configured_args.iter().cloned());
-                } else if args.is_some() {
-                    invalid_endpoint_shape = true;
                 }
                 args = (!combined.is_empty()).then_some(Value::Array(combined));
+            } else {
+                args = configured_args
+                    .filter(|values| !values.is_empty())
+                    .cloned()
+                    .map(Value::Array);
             }
-            env = entry
-                .get("environment")
-                .filter(|value| value.is_object())
-                .cloned()
-                .or_else(|| entry.get("env").filter(|value| value.is_object()).cloned());
+            env = ["environment", "env"].into_iter().find_map(|key| {
+                entry
+                    .get(key)
+                    .filter(|value| {
+                        value
+                            .as_object()
+                            .is_some_and(|values| values.values().all(Value::is_string))
+                    })
+                    .cloned()
+            });
+            headers = entry
+                .get("headers")
+                .filter(|value| value.is_object() || value.is_array())
+                .cloned();
+            oauth = entry
+                .get("oauth")
+                .and_then(Value::as_object)
+                .and_then(|value| {
+                    let mut normalized = Map::new();
+                    for key in ["clientId", "clientSecret", "scope", "redirectUri"] {
+                        if let Some(field) = value.get(key).filter(|field| field.is_string()) {
+                            normalized.insert(key.to_string(), field.clone());
+                        }
+                    }
+                    if let Some(port) = value.get("callbackPort").filter(|port| port.is_number()) {
+                        normalized.insert("callbackPort".to_string(), port.clone());
+                    }
+                    (!normalized.is_empty()).then_some(Value::Object(normalized))
+                });
         }
         OmpMcpAuthorityFormat::StandardJson
         | OmpMcpAuthorityFormat::VsCodeJson
@@ -15854,6 +15898,131 @@ http_headers = { Authorization = "Bearer tok" }
             overlapping_provider_path.omp_mcp_alias_drift,
             "Claude's skipped overlapping alternative must not erase the later standalone provider identity"
         );
+    }
+
+    #[test]
+    fn omp_opencode_empty_commands_preserve_status_and_remote_alias_detection() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let imported = params.project_dir.join("opencode.jsonc");
+
+        for (entry, expected_conflict) in [
+            (serde_json::json!({"type": "local", "command": []}), false),
+            (
+                serde_json::json!({"type": "local", "command": [null]}),
+                false,
+            ),
+            (
+                serde_json::json!({"type": "remote", "command": [], "url": "http://stale.example/mcp"}),
+                true,
+            ),
+            (
+                serde_json::json!({"type": "remote", "command": false, "url": "http://stale.example/mcp"}),
+                true,
+            ),
+            (
+                serde_json::json!({"type": "local", "command": ["mail-server"], "args": "ignored", "url": false}),
+                true,
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "mcp": {
+                    "unrelated": {"type": "local", "command": []},
+                    "mcp_agent_mail": entry,
+                },
+            }))
+            .unwrap();
+            std::fs::write(&imported, &bytes).unwrap();
+            let status = first_setup_status_file(&params);
+            assert_eq!(status.omp_mcp_alias_drift, expected_conflict, "{entry}");
+            if expected_conflict {
+                assert!(status.remediation.contains("opencode.jsonc"));
+            } else {
+                assert!(status.drift_reasons.is_empty(), "{status:?}");
+            }
+            assert_eq!(std::fs::read(&imported).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn omp_opencode_oauth_and_inferred_transport_keep_distinct_connections_visible() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let imported = params.project_dir.join("opencode.json");
+        for (oauth, expected_conflict) in [
+            (Value::Null, false),
+            (serde_json::json!({}), false),
+            (serde_json::json!({"clientId": 17, "scope": false}), false),
+            (serde_json::json!({"clientId": "alternate-client"}), true),
+            (serde_json::json!({"clientSecret": "fixture-only"}), true),
+            (serde_json::json!({"scope": "mail.read"}), true),
+            (
+                serde_json::json!({"redirectUri": "http://localhost/callback"}),
+                true,
+            ),
+            (serde_json::json!({"callbackPort": 7654}), true),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "mcp": {"mcp_agent_mail": {
+                    "type": "remote",
+                    "url": params.server_url(),
+                    "headers": {"Authorization": "Bearer tok"},
+                    "oauth": oauth,
+                }},
+            }))
+            .unwrap();
+            std::fs::write(&imported, &bytes).unwrap();
+            let status = first_setup_status_file(&params);
+            assert_eq!(status.omp_mcp_alias_drift, expected_conflict, "{oauth}");
+            assert_eq!(std::fs::read(&imported).unwrap(), bytes);
+        }
+
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "mcp": {"mcp_agent_mail": {
+                // With no explicit type, OpenCode prefers the URL even
+                // when a command is also present.
+                "command": ["unused-server"],
+                "url": params.server_url(),
+                "headers": {"Authorization": "Bearer tok"},
+            }},
+        }))
+        .unwrap();
+        std::fs::write(&imported, &bytes).unwrap();
+        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+        assert_eq!(std::fs::read(&imported).unwrap(), bytes);
+    }
+
+    #[test]
+    fn omp_opencode_command_and_environment_normalization_matches_connection_dedup() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        std::fs::write(
+            params.project_dir.join(".omp/.mcp.json"),
+            r#"{"mcpServers":{"helper":{"command":"mail-server","args":["serve","--quiet"],"env":{"KEPT":"yes"}}}}"#,
+        )
+        .unwrap();
+        let imported = params.project_dir.join("opencode.json");
+        for (argument, expected_conflict) in [("--quiet", false), ("--other", true)] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "mcp": {"mcp_agent_mail": {
+                    "type": "local",
+                    "command": ["mail-server", "serve"],
+                    "args": [argument],
+                    // Invalid environment values make OMP use the valid env
+                    // fallback as a complete record, not partially merge it.
+                    "environment": {"IGNORED": 0},
+                    "env": {"KEPT": "yes"},
+                }},
+            }))
+            .unwrap();
+            std::fs::write(&imported, &bytes).unwrap();
+            let status = first_setup_status_file(&params);
+            assert_eq!(status.omp_mcp_alias_drift, expected_conflict, "{argument}");
+            assert_eq!(std::fs::read(&imported).unwrap(), bytes);
+        }
     }
 
     #[test]
