@@ -2592,16 +2592,20 @@ impl OnsState {
 
     /// Update this e-process with a new observation.
     fn update(&mut self, centered: f64, alpha: f64) {
-        self.sum_centered += centered;
-        self.sum_sq += centered * centered;
-
+        // A test-martingale bet must be predictable: choose it using only
+        // earlier observations. Including this outcome before placing its bet
+        // makes both possible first outcomes increase the evidence, even under
+        // the calibrated null (85% accuracy gives E[E_1] = 1.0816, not 1).
         let lambda = self.adaptive_bet_size(alpha);
         let factor = lambda.mul_add(centered, 1.0);
         // factor is guaranteed non-negative by the lambda bounds.
-        // Cap at 1e100 to prevent f64 overflow during sustained miscalibration
-        // (the e-value is evidence, not a probability — any value > threshold
-        // is equally actionable, so capping doesn't lose information).
-        self.e_value = (self.e_value * factor).clamp(1e-30, 1e100);
+        // Upper truncation preserves the supermartingale inequality while
+        // preventing overflow. A positive lower floor would create evidence
+        // after ruin; zero must remain absorbing. Clamp rounding at zero only.
+        self.e_value = (self.e_value * factor).clamp(0.0, 1e100);
+
+        self.sum_centered += centered;
+        self.sum_sq += centered * centered;
     }
 
     /// ONS adaptive bet sizing with CORRECT bounds for non-negative factors.
@@ -2996,6 +3000,79 @@ mod martingale_tests {
         let monitor = EProcessMonitor::new(0.85, 20.0);
         assert!((monitor.e_value() - 1.0).abs() < f64::EPSILON);
         assert!(!monitor.miscalibrated());
+    }
+
+    #[test]
+    fn eprocess_first_outcome_cannot_choose_its_own_bet() {
+        for correct in [false, true] {
+            let mut monitor = EProcessMonitor::new(0.85, 20.0);
+            monitor.update(correct, AtcSubsystem::Liveness, Some("BlueLake"));
+
+            // All three independent processes have no prior observations.
+            // Neither first outcome can finance a bet on itself.
+            for state in [
+                &monitor.global,
+                &monitor.per_subsystem[&AtcSubsystem::Liveness],
+                &monitor.per_agent["BlueLake"],
+            ] {
+                assert!((state.e_value - 1.0).abs() < f64::EPSILON);
+                assert!(state.sum_sq > 0.0, "learn the outcome for the next bet");
+            }
+        }
+    }
+
+    #[test]
+    fn ons_conditional_null_expectation_never_increases_evidence() {
+        // Enumerate both possible next observations after every short history,
+        // not just one conveniently ordered stream at the nominal accuracy.
+        // Under the null P(error | history) = alpha, each conditional expected
+        // next value must be no greater than the current value.
+        for alpha in [0.0, 0.01, 0.15, 0.5, 0.99, 1.0] {
+            let mut histories = vec![OnsState::new()];
+            for _ in 0..10 {
+                let mut next = Vec::with_capacity(histories.len() * 2);
+                for state in histories {
+                    let mut correct = state.clone();
+                    correct.update(-alpha, alpha);
+                    let mut incorrect = state.clone();
+                    incorrect.update(1.0 - alpha, alpha);
+
+                    let expectation =
+                        (1.0 - alpha).mul_add(correct.e_value, alpha * incorrect.e_value);
+                    let tolerance = 1e-12 * state.e_value.max(1.0);
+                    assert!(
+                        expectation <= state.e_value + tolerance,
+                        "alpha={alpha}, history={state:?}, conditional mean={expectation}"
+                    );
+                    assert!(correct.e_value.is_finite() && correct.e_value >= 0.0);
+                    assert!(incorrect.e_value.is_finite() && incorrect.e_value >= 0.0);
+                    next.extend([correct, incorrect]);
+                }
+                histories = next;
+            }
+        }
+    }
+
+    #[test]
+    fn ons_does_not_create_evidence_with_a_positive_floor() {
+        for initial in [0.0, 1e-40] {
+            for centered in [-0.15, 0.85] {
+                let mut state = OnsState {
+                    e_value: initial,
+                    ..OnsState::new()
+                };
+                state.update(centered, 0.15);
+                assert_eq!(state.e_value.to_bits(), initial.to_bits());
+            }
+        }
+
+        let mut exhausted = OnsState {
+            e_value: 0.0,
+            sum_centered: 10.0,
+            sum_sq: 1.0,
+        };
+        exhausted.update(0.85, 0.15);
+        assert_eq!(exhausted.e_value.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]
