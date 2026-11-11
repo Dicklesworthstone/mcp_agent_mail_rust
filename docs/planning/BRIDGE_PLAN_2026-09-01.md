@@ -1,5 +1,104 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 11 independent-queue diagnostic follow-through — EmeraldEagle
+
+- [x] Confirm the clean c61d6571 checkout and unchanged hashes of the fully read
+  suite/repository AGENTS.md and README.md. Recheck ready Beads and active owners;
+  preserve the prior eighteen failed/incomplete native outcomes and all receipts.
+- [x] Re-read the latest query fixture, pool authority, diagnostic retention and
+  queue sampling changes through their callers. Find an early return in the new
+  nonblocking sampler: a busy retry backlog hides independently observable
+  coalescer ages and progress, potentially hiding an already-stalled commit.
+- [x] Continue owned br-kp1in.29 and reserve only the storage implementation and
+  this existing TODO. Extend the actual fenced Git/coalescer regression for both
+  queue and spill paths while holding the real global retry-backlog mutex.
+- [x] Execute the strengthened regressions against immutable original production
+  sampling; retain the exact old source and failing results alongside the fix.
+  Both old-production regressions fail at their added age-preservation assertions:
+  native100,2actual/0PASS/2FAIL,2377skipped,0.116s execution,
+  run9863ff35-3ed0-42db-af8d-fc581f537ed7. The immutable old source contains only
+  the two test additions relative to c61d6571, not a reimplemented old sampler.
+  The corrected38-case run passes both. Native runtime features are the same
+  declared two-package default graph; the seeded state control is not live Git
+  proof. Retain the distinct stable old/corrected executable identities.
+- [x] Continue sampling independent queues without blocking, retaining the first
+  unavailable-lock diagnostic and confirmed lower bounds; never call an incomplete
+  sample healthy or admit reconciliation from it. A second pass finds the same
+  early-return pattern between coalescer repositories; continue past a busy
+  repository while preserving all three ownership guards within each sampled
+  repository. Add both-repository/three-mutex controls with explicitly seeded
+  diagnostic ownership state, separately from the actual fenced Git regression.
+- [x] Re-read the fix and both unavailable/complete paths; execute the regression
+  and adjacent archive-lag, coalescer, reconciliation and health controls.
+  Final focused native0:38/38PASS,2341skipped,31.715s execution, run
+  b19d36a3-6d98-49b9-8357-8f5d5d62c3ae,1070.5s total on vmi1149989. All37
+  retained selected identities plus the new control actually execute. The real
+  fenced queue/spill case passes0.122s, cross-repository control0.013s, real
+  reconciliation/cursor/byte-preservation case1.694s, and the previously globally
+  interrupted oldest-pending case30.024s. This does not rewrite F21's outcome.
+  Retain both actual selected ELF hashes/stable identities after terminal:
+  storage83e3f1f7 and tools944da2da, with the expected test markers. The old-source
+  two-regression probe remains separate and pending, not inferred from this pass.
+- [x] Run workspace all-target and separate production checks, strict Clippy,
+  portable production check, formatting and stock UBS on the exact final source.
+  Corrected packet: c61d6571 plus only storage/lib.rs, overlay64d95fb7;
+  formatting0 and stock UBS0/0critical4989warning1249info. All five final
+  native/compiler workers match the five source/Cargo/lock/toolchain/nextest
+  hashes; the old-production red run separately matches its2ba23108 packet.
+  Terminal compiler results: all-targets0/468.5s on hz4; separate default
+  production0/406.3s on hz3; strict Clippy0/564.4s and separate portable
+  production0/541.9s on hz2. Native execution remains pending.
+  The first corrected native attempt exits101 during server-test linking after
+  1293.170s: required dependency rlibs are missing from the worker target. No
+  native test executes. Preserve the receipt and retry the exact command through
+  RCH; do not edit source, target caches, ownership, guards or budgets for this.
+  The unchanged retry starts rebuilding dependencies. Before any test executes,
+  inspect the filters and source inventories: their cases belong only to storage
+  and tools; the other three root test binaries select no case. Cancel only the
+  two owned compilation wrappers through RCH and recover terminal acknowledgement
+  (local143, zero test credit). Reissue both old/corrected native selections with
+  those two actual packages; all assertions, default features, budgets and test
+  limits remain intact. This is focused native evidence, not full-workspace proof.
+  Manually materialize the exact old test-only overlay for its immutable transfer,
+  then restore the corrected source byte-for-byte: c5139e0f red and4d2c043b final.
+  RCH confirms the original2ba23108 old packet; no source or cache is edited on
+  a worker. The corrected two-package run also fixes the misspelled selector.
+  Package restriction changes Cargo feature unification and causes additional
+  cold compilation; the initial choice was inefficient. After measuring both
+  workers at10CPUs and40734796/49569792KiB available memory, use four compile
+  jobs with the same two actual packages, default features, debug0, native
+  test-process counts1(old)/2(candidate), global1800s/per-test240s/outer14400s
+  and unchanged disk guards. Cancel/recover only the two owned one-job wrappers;
+  neither runs a test. The first old-j4 request refuses103 while its own prior
+  teardown is unacknowledged; same-wrapper recovery first returnsE504, then
+  terminal acknowledgement, without replay or infrastructure edits. Retain all
+  failures/cancellations. Final old production plus both regressions is now
+  e88781d2 (source3ba1f5a5); corrected source remains64d95fb7/4d2c043b.
+  Both old regressions are predeclared before any old test executes, separately
+  identifying the seeded cross-repository control and the real fenced Git case.
+  Before execution, compare the retained F21 identities against the declared
+  selectors:37 original cases (6storage/31tools), plus the new cross-repository
+  control, require38 actual candidate cases (7storage/31tools). The three removed
+  root packages contain no selected case; reconciliation is included by its
+  actual name. Both current workers match all five packet/config hashes.
+  The first native selector misspells the reconciliation case and earns no
+  credit for it; execute the actual named case separately before any claim.
+- [x] Inspect the complete production/test diff again: blocking accounting keeps
+  its acquisition sequence and timing, per-repository ownership guards remain
+  together, partial samples retain their first error, and both production
+  consumers still reject unknown evidence. Compiler and test policies are intact.
+- [x] Record actual results and remaining acceptance on owned br-kp1in.29,
+  comments4276/4277. Flush/import tracker truth and verify2867 identical records
+  in both JSONLs, no added/removed IDs, only that owned issue's comments/updated_at
+  changed, and zero active dependency cycles. Inspect the complete final source
+  diff again; no further production change is needed. This is self-review, not
+  independent certification. No liveness/overhead/soak closure follows.
+- [ ] Final landing step, recorded from terminal commands in the session result:
+  commit/push the four reviewed paths, verify both required remote refs, and
+  release only this session's1607/1608 reservations. This checklist captures the
+  reviewed pre-publication state; implementation/qualification gaps above remain
+  distinct from the final Git/lease operations.
+
 ## November 10 fresh-eyes follow-through, 22:30 UTC — EmeraldEagle
 
 - [x] Verify c393f89d and the clean tracked checkout; preserve seven existing

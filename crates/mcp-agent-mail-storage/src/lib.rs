@@ -3591,13 +3591,18 @@ fn sample_archive_lag(policy: ArchiveLagLockPolicy) -> (ArchiveLagSnapshot, Opti
         || backlog.sample_backlog_state(policy),
         |(state, _)| Ok(state),
     );
-    let (depth, age) = match backlog_state {
-        Ok(state) => state,
-        Err(site) => return (snapshot, Some(site)),
-    };
-    snapshot.backlog_depth = depth;
-    snapshot.backlog_oldest_age_us = age;
-    snapshot.oldest_unmaterialized_us = snapshot.oldest_unmaterialized_us.max(age);
+    let mut unavailable_lock = None;
+    match backlog_state {
+        Ok((depth, age)) => {
+            snapshot.backlog_depth = depth;
+            snapshot.backlog_oldest_age_us = age;
+            snapshot.oldest_unmaterialized_us = snapshot.oldest_unmaterialized_us.max(age);
+        }
+        Err(site) => unavailable_lock = Some(site),
+    }
+    // A busy retry queue does not make the independent coalescer evidence
+    // unavailable. Keep collecting confirmed bounds without waiting, while
+    // retaining the first refusal so this never becomes a complete sample.
     if let Some(coalescer) = COMMIT_COALESCER.get() {
         let (lag, unavailable) = if let Some((_, (_, lag))) = blocking {
             (lag, None)
@@ -3611,11 +3616,9 @@ fn sample_archive_lag(policy: ArchiveLagLockPolicy) -> (ArchiveLagSnapshot, Opti
         snapshot.coalescer_since_progress_us = lag.since_progress_us;
         snapshot.oldest_unmaterialized_us =
             snapshot.oldest_unmaterialized_us.max(lag.oldest_age_us);
-        if unavailable.is_some() {
-            return (snapshot, unavailable);
-        }
+        unavailable_lock = unavailable_lock.or(unavailable);
     }
-    (snapshot, None)
+    (snapshot, unavailable_lock)
 }
 
 /// Failure modes for delivering a control message (`Flush`/`Shutdown`) to the
@@ -6904,9 +6907,11 @@ impl CommitCoalescer {
     ) -> std::result::Result<CoalescerLagState, (&'static str, CoalescerLagState)> {
         let now = Instant::now();
         let mut lag = CoalescerLagState::default();
-        let sampled = (|| {
-            let repos = archive_lag_lock(&self.repos, policy, "commit_coalescer.repos")?;
-            for rq in repos.values() {
+        let repos = archive_lag_lock(&self.repos, policy, "commit_coalescer.repos")
+            .map_err(|site| (site, lag))?;
+        let mut unavailable_lock = None;
+        for rq in repos.values() {
+            let sampled = (|| {
                 // Keep all three ownership locations locked together. In
                 // particular, a failed commit can move from in-flight back into
                 // the queue while this snapshot is being sampled.
@@ -6945,10 +6950,15 @@ impl CommitCoalescer {
                         now.saturating_duration_since(last_progress),
                     ));
                 }
+                Ok(())
+            })();
+            // Each repository has independent ownership locations. A busy
+            // one must not hide another repository's confirmed stalled work.
+            if let Err(site) = sampled {
+                unavailable_lock = unavailable_lock.or(Some(site));
             }
-            Ok(())
-        })();
-        sampled.map(|()| lag).map_err(|site| (site, lag))
+        }
+        unavailable_lock.map_or(Ok(lag), |site| Err((site, lag)))
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -28496,6 +28506,23 @@ mod tests {
                 "the blocked request must not be committed yet"
             );
 
+            // An unrelated busy backlog must not hide this independently
+            // observable in-flight commit. The sample remains incomplete,
+            // but its confirmed coalescer age/progress bounds must survive.
+            let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+            let unavailable = try_archive_lag_snapshot().unwrap_err();
+            assert_eq!(unavailable.unavailable_lock, "archive_backlog.queue");
+            let lower_bound = unavailable.lower_bound;
+            assert_eq!(lower_bound.coalescer_pending, 1);
+            assert!(lower_bound.coalescer_oldest_age_us >= stuck.coalescer_oldest_age_us);
+            assert!(lower_bound.coalescer_since_progress_us >= stuck.coalescer_since_progress_us);
+            assert!(lower_bound.oldest_unmaterialized_us >= lower_bound.coalescer_oldest_age_us);
+            assert!(
+                repo.head().is_err(),
+                "sampling cannot publish the blocked commit"
+            );
+            drop(backlog);
+
             drop(fence);
             let deadline = Instant::now() + Duration::from_secs(5);
             while coalescer.pending_requests() != 0 || rq.processing.load(Ordering::Acquire) {
@@ -28856,6 +28883,57 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
         );
         false
+    }
+
+    #[test]
+    fn coalescer_partial_sample_keeps_other_repositories_confirmed_progress() {
+        // Seed diagnostic ownership state without waking a worker. The real
+        // fenced Git regression above separately exercises in-flight commits.
+        let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
+        let root = TempDir::new().unwrap();
+        let first = coalescer.get_or_create_repo(&root.path().join("first"));
+        let second = coalescer.get_or_create_repo(&root.path().join("second"));
+        let oldest = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+        for rq in [&first, &second] {
+            rq.progress.lock().unwrap().inflight_oldest = Some(oldest);
+        }
+        let minimum_age = duration_as_micros_u64(Duration::from_secs(120));
+        // Exercise both iteration orders without depending on HashMap order:
+        // holding whichever repository is visited first must still sample the
+        // other one. All three actual ownership mutexes are checked in turn.
+        for rq in [&first, &second] {
+            let queue = rq.queue.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.queue");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(queue);
+            let spill = rq.spill.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.spill");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(spill);
+            let progress = rq.progress.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.progress");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(progress);
+        }
+        assert!(
+            coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .is_ok()
+        );
     }
 
     #[test]
