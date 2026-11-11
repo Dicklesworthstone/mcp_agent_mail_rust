@@ -7,13 +7,14 @@
   its full source diff; no deletion or dependency change. Preserve both through
   a normal automatic non-conflicting merge35c64045, then import tracker truth.
   Do not overwrite the peer's pool changes or rewrite either source history.
-- [ ] Verify immutable35c64045 with separate all-target/production/strictClippy
+- [x] Verify immutable35c64045 with separate all-target/production/strictClippy
   checks and formatting. Preserve pre-integration815 receipts as historical.
   Do not credit the peer's reported macOS/DB results as this agent's execution.
   Production0/198.3s on1149989 and standalone fmt0. Integrated three-file DB
   stock scan0/0critical6200warning3185info/failed_modules[]; unchanged seven
-  other Rust files retain their exact prior hashes/scans. All-targets and
-  strictClippy remain pending; no compiler result inferred from native success.
+  other Rust files retain their exact prior hashes/scans. All-targets0/1460.2s
+  on1149989 and strictClippy0/1827.0s on1153651 finish separately. Every command
+  has its own terminal0 receipt; native success was not used as a compiler pass.
 - [x] Predeclare and execute integration90: all45 health/lifecycle controls,
   all31 benchmark cases and all14 repaired original failures, default three-
   package native graph, original watchdogs/resource limits and two test slots.
@@ -30,10 +31,15 @@
   Immutable Git35c/RCH receipt/local14-file hashes and three executable hashes
   remain retained; the still-active compiler worker independently matches all
   fourteen files and rustc1.100.0-nightly. No macOS verification claim.
-- [ ] Retain final integrated-source results, review the metadata-only follow-
-  through, publish normal refs, verify fetched ancestry and tracked cleanliness,
-  then release exactly the nine reservations owned by this review. Original
-  .29/.5/br-asldx acceptance stays open; this is self-run Linux verification.
+- [x] Retain final integrated-source results and prepare the reviewed metadata
+  follow-through. A concurrent process commits/publishes planning-only0f23e5a4
+  during qualification; preserve it. Its diff from35c changes no source or
+  dependency, and all14 source/config hashes still match. This final receipt
+  update also changes only planning/tracker data. Publish its normal refs,
+  verify fetched ancestry/tracked cleanliness and release exactly the nine
+  reservations as the final operations; report terminal outcomes in the turn
+  handoff. Original .29/.5/br-asldx acceptance stays open. Verification is
+  self-run Linux evidence, with no macOS, performance-win or release clearance.
 
 ## November 11 published-source review, 20:39 UTC — EmeraldEagle
 
