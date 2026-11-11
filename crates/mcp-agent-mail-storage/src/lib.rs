@@ -6911,8 +6911,13 @@ impl CommitCoalescer {
                 // particular, a failed commit can move from in-flight back into
                 // the queue while this snapshot is being sampled.
                 let queue = archive_lag_lock(&rq.queue, policy, "commit_coalescer.queue")?;
-                let spill = archive_lag_lock(&rq.spill, policy, "commit_coalescer.spill")?;
                 let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                }
+                let spill = archive_lag_lock(&rq.spill, policy, "commit_coalescer.spill")?;
                 if let Some(repo) = spill.inner.as_ref() {
                     oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
                         o.min(repo.earliest_enqueued_at)
@@ -28881,6 +28886,13 @@ mod tests {
             coalescer.oldest_pending_age_us() > 0,
             "oldest uncommitted request reports commit-lag age"
         );
+        let spill = rq.spill.lock().unwrap();
+        let (site, lower_bound) = coalescer
+            .sample_lag_state(ArchiveLagLockPolicy::Try)
+            .unwrap_err();
+        assert_eq!(site, "commit_coalescer.spill");
+        assert!(lower_bound.oldest_age_us > 0);
+        drop(spill);
         let progress = rq.progress.lock().unwrap();
         let (site, lower_bound) = coalescer
             .sample_lag_state(ArchiveLagLockPolicy::Try)

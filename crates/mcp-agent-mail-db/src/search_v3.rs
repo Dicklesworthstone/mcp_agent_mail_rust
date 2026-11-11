@@ -2932,16 +2932,17 @@ mod tests {
             let (parked_tx, parked_rx) = std::sync::mpsc::channel();
             let (finished_tx, finished_rx) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-                let deadline = asupersync::Time::from_nanos(
-                    u64::try_from(now).unwrap().saturating_add(2_000_000_000),
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .unwrap();
+                let budget = asupersync::Budget::new().with_timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(2),
                 );
-                let cx = asupersync::Cx::for_request_with_budget(
-                    asupersync::Budget::new().with_deadline(deadline),
-                );
+                let cx = runtime.request_cx_with_budget(budget);
+                let remaining = crate::search_service::request_budget_remaining_ms(&cx).unwrap();
+                assert!(remaining > 0 && remaining <= 2_000);
+                assert!(crate::search_service::check_lexical_request(&cx).is_ok());
                 BACKFILL_LOCK_WAIT_OBSERVER.with(|observer| {
                     *observer.borrow_mut() = Some(Box::new(move |lock| {
                         let _ = parked_tx.send(lock);

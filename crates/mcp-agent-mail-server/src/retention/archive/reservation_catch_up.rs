@@ -167,6 +167,7 @@ fn run_with(
         // must never be turned into speculative work by this scheduler.
         let progressed = report.repaired > 0 || report.unchanged > 0 || report.scan_advanced;
         if !backlog
+            || !report.budget_exhausted
             || !progressed
             || report.deferred > 0
             || report.deferred_transient > 0

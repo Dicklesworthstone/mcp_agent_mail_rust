@@ -6016,6 +6016,17 @@ struct PoolCacheKey {
     max_lifetime_ms: u64,
 }
 
+impl PoolCacheKey {
+    fn same_pool_shape(&self, other: &Self) -> bool {
+        self.sqlite_identity == other.sqlite_identity
+            && self.storage_root_identity == other.storage_root_identity
+            && self.min_connections == other.min_connections
+            && self.max_connections == other.max_connections
+            && self.acquire_timeout_ms == other.acquire_timeout_ms
+            && self.max_lifetime_ms == other.max_lifetime_ms
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SqliteInitGateKey {
     sqlite_identity: Option<PathBuf>,
@@ -6024,8 +6035,66 @@ struct SqliteInitGateKey {
 
 static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<SqliteInitGateKey, Arc<SqliteInitGate>>>> =
     OnceLock::new();
-static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, Weak<Pool<DbConn>>>>> =
-    OnceLock::new();
+#[derive(Clone)]
+struct CachedPool {
+    pool: Weak<Pool<DbConn>>,
+    sqlite_authority: Option<Weak<FrozenDirectoryAuthority>>,
+    storage_root_authority: Weak<FrozenDirectoryAuthority>,
+}
+
+impl CachedPool {
+    fn new(pool: &DbPool) -> Self {
+        Self {
+            pool: Arc::downgrade(&pool.pool),
+            sqlite_authority: pool.sqlite_authority.as_ref().map(Arc::downgrade),
+            storage_root_authority: Arc::downgrade(&pool.storage_root_authority),
+        }
+    }
+
+    /// Reuse the original frozen descriptors, including directories latched
+    /// after lazy construction. A freshly resolved wrapper must never forget
+    /// those bindings or mistake their legitimate creation for a new engine.
+    fn bind_authority(&self, requested: &DbPoolAuthority) -> Option<DbPoolAuthority> {
+        let sqlite_authority = match self.sqlite_authority.as_ref() {
+            Some(authority) => Some(authority.upgrade()?),
+            None => None,
+        };
+        let storage_root_authority = self.storage_root_authority.upgrade()?;
+        validate_frozen_sqlite_open_authority_with_descriptor(
+            &requested.sqlite_path,
+            requested.sqlite_identity.as_deref(),
+            sqlite_authority.as_deref(),
+            "cached pool authority",
+        )
+        .ok()?;
+        verify_frozen_storage_root_with_descriptor(
+            &requested.storage_root,
+            &requested.storage_root_alias,
+            &storage_root_authority,
+            "cached pool authority",
+        )
+        .ok()?;
+        if sqlite_authority
+            .as_ref()
+            .map(|authority| authority.materialized_chain_ids())
+            != requested
+                .sqlite_authority
+                .as_ref()
+                .map(|authority| authority.existing_chain_ids())
+            || storage_root_authority.materialized_chain_ids()
+                != requested.storage_root_authority.existing_chain_ids()
+        {
+            return None;
+        }
+        Some(DbPoolAuthority {
+            sqlite_authority,
+            storage_root_authority,
+            ..requested.clone()
+        })
+    }
+}
+
+static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, CachedPool>>> = OnceLock::new();
 /// Strict query-only pools for the live mailbox read lane, held strongly.
 ///
 /// Request-path reads used to build a fresh uncached pool per call, so every
@@ -6081,7 +6150,7 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
     trigger: &str,
     initializing_owner: Option<&InitializingPoolOwner>,
 ) {
-    let (mut retired_pools, initializing_cache_keys) = {
+    let (mut retired_pools, initializing_cache_entries) = {
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
         let mut guard = cache.write();
@@ -6091,11 +6160,13 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
             .cloned()
             .collect::<Vec<_>>();
         let mut pools = Vec::new();
-        let mut initializing_cache_keys = Vec::new();
+        let mut initializing_cache_entries = Vec::new();
         for key in &matching_keys {
-            if let Some(pool) = guard.remove(key).and_then(|weak| weak.upgrade()) {
+            if let Some(entry) = guard.remove(key)
+                && let Some(pool) = entry.pool.upgrade()
+            {
                 if initializing_owner.is_some_and(|owner| Arc::ptr_eq(&owner.pool, &pool)) {
-                    initializing_cache_keys.push(key.clone());
+                    initializing_cache_entries.push((key.clone(), entry));
                 }
                 if !pools
                     .iter()
@@ -6123,7 +6194,7 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
                 false
             });
         }
-        (pools, initializing_cache_keys)
+        (pools, initializing_cache_entries)
     };
 
     let (message_id_allocator_invalidated, retired_generations, adopted_initializing_owner) = {
@@ -6241,10 +6312,8 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
         let mut guard = cache.write();
-        for key in initializing_cache_keys {
-            guard
-                .entry(key)
-                .or_insert_with(|| Arc::downgrade(&owner.pool));
+        for (key, entry) in initializing_cache_entries {
+            guard.entry(key).or_insert(entry);
         }
     }
 
@@ -6526,6 +6595,27 @@ const fn stat_dir_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
 }
 
 impl FrozenDirectoryAuthority {
+    #[must_use]
+    fn materialized_chain_ids(&self) -> Vec<(u64, u64)> {
+        let chain = self.existing_chain_ids();
+        #[cfg(unix)]
+        {
+            let mut chain = chain;
+            chain.extend(
+                self.latched_suffix_dirs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .copied(),
+            );
+            chain
+        }
+        #[cfg(not(unix))]
+        {
+            chain
+        }
+    }
+
     #[must_use]
     fn existing_chain_ids(&self) -> Vec<(u64, u64)> {
         #[cfg(unix)]
@@ -20425,15 +20515,8 @@ fn get_or_create_pool_with_authority(
         config.max_lifetime_ms,
     );
 
-    // Fast path: shared read lock for existing live pool (concurrent readers).
-    {
-        let guard = cache.read();
-        if let Some(pool) = guard.get(&cache_key)
-            && let Some(shared_pool) = pool.upgrade()
-            && !shared_pool.is_closed()
-        {
-            return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
-        }
+    if let Some(pool) = cached_pool_with_authority(config, &authority) {
+        return Ok(pool);
     }
 
     // Slow path: create a new pool (rare), or refresh a dead weak entry left
@@ -20456,14 +20539,17 @@ fn get_or_create_pool_with_authority(
     // Double-check after acquiring the write lock — another thread may have
     // won the race while we were bootstrapping. Prefer the published pool so
     // all callers share one instance; ours (unpublished, unused) drops.
-    if let Some(existing) = guard.get(&cache_key)
-        && let Some(shared_pool) = existing.upgrade()
+    if let Some(existing) = guard.get(&cache_key).cloned()
+        && let Some(shared_pool) = existing.pool.upgrade()
         && !shared_pool.is_closed()
     {
         drop(guard);
-        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
+        let bound = existing.bind_authority(&authority).ok_or_else(|| {
+            DbError::ResourceBusy("cached pool frozen authority is unavailable or changed".into())
+        })?;
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, bound);
     }
-    guard.insert(cache_key, Arc::downgrade(&pool.pool));
+    guard.insert(cache_key, CachedPool::new(&pool));
     drop(guard);
     Ok(pool)
 }
@@ -20480,55 +20566,108 @@ fn get_or_create_pool_with_authority(
 #[must_use]
 pub fn get_cached_pool(config: &DbPoolConfig) -> Option<DbPool> {
     let authority = DbPoolAuthority::resolve(config).ok()?;
+    cached_pool_with_authority(config, &authority)
+}
+
+fn cached_pool_with_authority(
+    config: &DbPoolConfig,
+    authority: &DbPoolAuthority,
+) -> Option<DbPool> {
     let cache_key = pool_cache_key_from_authority(
-        &authority,
+        authority,
         config.min_connections,
         config.max_connections,
         config.acquire_timeout_ms,
         config.max_lifetime_ms,
     );
     let cache = POOL_CACHE.get()?;
-    let guard = cache.read();
-    let shared_pool = guard.get(&cache_key)?.upgrade()?;
-    if shared_pool.is_closed() {
-        return None;
+    // Snapshot weak witnesses only. Descriptor validation must not hold the
+    // process-wide registry lock or pin otherwise dead pools/directories.
+    let candidates = {
+        let guard = cache.read();
+        if let Some(entry) = guard
+            .get(&cache_key)
+            .filter(|entry| entry.pool.strong_count() > 0)
+        {
+            vec![(cache_key.clone(), entry.clone())]
+        } else {
+            guard
+                .iter()
+                .filter(|(key, _)| key.same_pool_shape(&cache_key))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect()
+        }
+    };
+    for (old_key, entry) in candidates {
+        let Some(shared_pool) = entry.pool.upgrade().filter(|pool| !pool.is_closed()) else {
+            continue;
+        };
+        let Some(bound) = entry.bind_authority(authority) else {
+            continue;
+        };
+        if old_key != cache_key {
+            let mut guard = cache.write();
+            // Recovery may have retired the engine during validation. Never
+            // resurrect its entry or overwrite another published generation.
+            if shared_pool.is_closed()
+                || !(guard
+                    .get(&old_key)
+                    .is_some_and(|current| current.pool.ptr_eq(&entry.pool))
+                    || guard
+                        .get(&cache_key)
+                        .is_some_and(|current| current.pool.ptr_eq(&entry.pool)))
+                || guard.get(&cache_key).is_some_and(|current| {
+                    current.pool.strong_count() > 0 && !current.pool.ptr_eq(&entry.pool)
+                })
+            {
+                continue;
+            }
+            guard.remove(&old_key);
+            guard.insert(cache_key.clone(), entry);
+        }
+        if !shared_pool.is_closed() {
+            return DbPool::from_shared_pool_with_authority(config, shared_pool, false, bound).ok();
+        }
     }
-    drop(guard);
-    DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority).ok()
+    None
 }
 
-fn compatible_cached_memory_pool(authority: &DbPoolAuthority) -> Option<Arc<Pool<DbConn>>> {
+fn compatible_cached_memory_pool(
+    authority: &DbPoolAuthority,
+) -> Option<(Arc<Pool<DbConn>>, DbPoolAuthority)> {
     if authority.sqlite_identity.is_some() {
         return None;
     }
 
     let cache =
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
-    let guard = cache.read();
-
-    let expected_chain = authority.storage_root_authority.existing_chain_ids();
-    let mut candidate: Option<Arc<Pool<DbConn>>> = None;
-    for (key, weak) in guard.iter() {
-        if key.sqlite_identity.is_some()
-            || key.storage_root_identity != authority.storage_root
-            || key.storage_root_chain != expected_chain
-        {
-            continue;
-        }
-        let Some(shared_pool) = weak.upgrade() else {
+    let entries = {
+        let guard = cache.read();
+        guard
+            .iter()
+            .filter(|(key, _)| {
+                key.sqlite_identity.is_none() && key.storage_root_identity == authority.storage_root
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut candidate: Option<(Arc<Pool<DbConn>>, DbPoolAuthority)> = None;
+    for entry in entries {
+        let Some(shared_pool) = entry.pool.upgrade() else {
             continue;
         };
         if shared_pool.is_closed() {
             continue;
         }
+        let Some(bound) = entry.bind_authority(authority) else {
+            continue;
+        };
         match &candidate {
-            None => candidate = Some(shared_pool),
-            Some(existing) if Arc::ptr_eq(existing, &shared_pool) => {}
+            None => candidate = Some((shared_pool, bound)),
+            Some((existing, _)) if Arc::ptr_eq(existing, &shared_pool) => {}
             Some(_) => return None,
         }
     }
-    drop(guard);
-
     candidate
 }
 
@@ -20541,8 +20680,8 @@ fn compatible_cached_memory_pool(authority: &DbPoolAuthority) -> Option<Arc<Pool
 /// SQLite file.
 pub fn get_or_reuse_compatible_memory_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let authority = DbPoolAuthority::resolve(config)?;
-    if let Some(shared_pool) = compatible_cached_memory_pool(&authority) {
-        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
+    if let Some((shared_pool, bound)) = compatible_cached_memory_pool(&authority) {
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, bound);
     }
     get_or_create_pool_with_authority(config, authority)
 }
@@ -30094,6 +30233,91 @@ mod tests {
             "get_or_create_pool must not return a closed cached pool"
         );
         assert!(!pool2.pool.is_closed(), "replacement pool should be live");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_pool_preserves_materialized_directory_authority_and_rejects_replacement() {
+        for memory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = dir.path().join("archive/later");
+            let database = dir.path().join("cached-authority.sqlite3");
+            let config = DbPoolConfig {
+                database_url: if memory {
+                    "sqlite:///:memory:".to_string()
+                } else {
+                    mcp_agent_mail_core::disk::sqlite_url_from_path(&database)
+                },
+                storage_root: Some(storage.clone()),
+                min_connections: 0,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let pool = get_or_create_pool(&config).expect("lazy original pool");
+            assert!(!storage.exists(), "cache construction must stay lazy");
+            assert!(!pool.is_initialized());
+            let cold = get_cached_pool(&config).expect("cached lazy pool");
+            assert!(Arc::ptr_eq(&pool.pool, &cold.pool));
+            assert!(!cold.is_initialized(), "lookup cannot invent a checkout");
+
+            std::fs::create_dir_all(&storage).unwrap();
+            let materialized = get_cached_pool(&config)
+                .expect("creating the frozen suffix must not lose the pool");
+            assert!(Arc::ptr_eq(&pool.pool, &materialized.pool));
+            assert_eq!(
+                pool.engine_identity_key(),
+                materialized.engine_identity_key()
+            );
+            assert!(!materialized.is_initialized());
+            if memory {
+                let resized = DbPoolConfig {
+                    max_connections: 2,
+                    ..config.clone()
+                };
+                let compatible = get_or_reuse_compatible_memory_pool(&resized).unwrap();
+                assert!(Arc::ptr_eq(&pool.pool, &compatible.pool));
+            }
+
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            runtime.block_on(async {
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("real checkout");
+                conn.query_sync("SELECT id FROM messages LIMIT 1", &[])
+                    .unwrap();
+            });
+            let ready = get_cached_pool(&config).expect("initialized pool stays discoverable");
+            assert!(ready.is_initialized());
+            assert_eq!(pool.engine_identity_key(), ready.engine_identity_key());
+
+            let retained = dir.path().join("retained-archive");
+            std::fs::rename(&storage, &retained).unwrap();
+            std::fs::create_dir(&storage).unwrap();
+            let sentinel = storage.join("operator-evidence");
+            std::fs::write(&sentinel, b"replacement archive").unwrap();
+            assert!(
+                get_cached_pool(&config).is_none(),
+                "replacement cannot inherit readiness"
+            );
+            if memory {
+                assert!(
+                    compatible_cached_memory_pool(&DbPoolAuthority::resolve(&config).unwrap())
+                        .is_none()
+                );
+            }
+            runtime.block_on(async {
+                assert!(pool.acquire(&cx).await.into_result().is_err());
+                assert!(materialized.acquire(&cx).await.into_result().is_err());
+            });
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"replacement archive");
+            assert!(retained.is_dir(), "the original archive remains intact");
+        }
     }
 
     /// GH#333 / br-8r6dl: request-path reads must share one strict query-only

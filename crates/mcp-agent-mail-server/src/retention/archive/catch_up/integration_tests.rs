@@ -963,8 +963,12 @@ fn add_large_native_index(fixture: &Fixture) -> u64 {
     drop(conn);
     let archive = mcp_agent_mail_storage::ensure_archive(&fixture.config, &slug).unwrap();
     let repo = git2::Repository::open(&archive.repo_root).unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
     let blob = repo.blob(b"synthetic index-size witness\n").unwrap();
     let mut index = repo.index().unwrap();
+    // Ordinary commits advance HEAD before their background index sync. The
+    // fixture must extend committed mail, never publish an older index tree.
+    index.read_tree(&parent.tree().unwrap()).unwrap();
     index.set_version(2).unwrap();
     for id in 0..154_845 {
         let mut path = format!("maintenance-fixture/{id:06}-").into_bytes();
@@ -988,7 +992,10 @@ fn add_large_native_index(fixture: &Fixture) -> u64 {
     }
     let tree_id = index.write_tree().unwrap();
     index.write().unwrap();
-    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(
+        repo.head().unwrap().peel_to_commit().unwrap().id(),
+        parent.id()
+    );
     let signature =
         git2::Signature::now("Maintenance test", "maintenance@example.invalid").unwrap();
     repo.commit(
@@ -1067,8 +1074,10 @@ fn gh383_populated_maintenance_paces_cpu_and_reaches_old_orphan() {
     insert_tail_messages(&fixture, std::iter::once(9128));
     let source_before = source_snapshot(&fixture);
     assert_eq!(source_before[0].len(), 256);
+    assert_committed_bundles_in_range(&fixture, 9001..=9256, 255);
     let index_bytes = add_large_native_index(&fixture);
     assert!(index_bytes > 30 * 1024 * 1024);
+    assert_committed_bundles_in_range(&fixture, 9001..=9256, 255);
 
     let output = Command::new("getconf").arg("CLK_TCK").output().unwrap();
     assert!(output.status.success());
