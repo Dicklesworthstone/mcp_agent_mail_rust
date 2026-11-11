@@ -6776,6 +6776,10 @@ pub async fn list_agent_roster(
 // A NULL is a refusal witness, not a row to omit: the caller must fail the
 // entire refresh so an incomplete roster cannot authorize automatic effects.
 // BLOB length counts UTF-8 bytes and includes suffixes after an embedded NUL.
+// Resolve case variants before filtering lifecycle, activity, or the result
+// cap. As in get_agent, the first registered row owns the scoped name even
+// when a newer alias is active or more recent. The grouped relation is
+// independent of the outer row, avoiding a correlated scan for every agent.
 const ATC_POPULATION_SQL: &str = "\
 SELECT p.id, \
        CASE WHEN length(CAST(p.human_key AS BLOB)) <= ?3 THEN p.human_key ELSE NULL END, \
@@ -6783,6 +6787,8 @@ SELECT p.id, \
        CASE WHEN length(CAST(a.program AS BLOB)) <= ?5 THEN a.program ELSE NULL END, \
        a.last_active_ts \
 FROM agents AS a \
+JOIN (SELECT MIN(id) AS id FROM agents \
+      GROUP BY project_id, name COLLATE NOCASE) AS canonical ON canonical.id = a.id \
 JOIN projects AS p ON p.id = a.project_id \
 WHERE (a.last_active_ts <= 0 OR a.last_active_ts >= ?1) \
   AND a.retired_at IS NULL \
@@ -6811,6 +6817,9 @@ fn atc_population_query_params(min_last_active_ts: i64, limit: usize) -> [Value;
 /// Count and metadata-byte bounds apply before materializing the projection.
 /// An oversized selected identity fails the entire refresh without altering
 /// mailbox data or silently omitting evidence from the population.
+/// Only the lowest-id case variant within each project may enter this
+/// population; a newer alias cannot revive an inactive identity or refresh
+/// its activity timestamp.
 pub async fn list_atc_population_snapshot(
     cx: &Cx,
     pool: &DbPool,
@@ -28778,6 +28787,106 @@ mod tests {
                 capped.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
                 vec!["RecentA", "RecentB"]
             );
+        });
+    }
+
+    #[test]
+    fn atc_population_snapshot_resolves_identity_before_lifecycle_recency_and_limit() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("atc-population-canonical.db");
+
+        rt.block_on(async {
+            let first = ensure_project(&cx, &pool, "/tmp/atc-canonical-a")
+                .await
+                .into_result()
+                .expect("ensure first project");
+            let second = ensure_project(&cx, &pool, "/tmp/atc-canonical-b")
+                .await
+                .into_result()
+                .expect("ensure second project");
+            let first_id = first.id.expect("first project id");
+            let second_id = second.id.expect("second project id");
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) \
+                 VALUES \
+                 (10, {first_id}, 'BlueLake', 'codex-cli', 'test', 1, 100, 90), \
+                 (11, {first_id}, 'bluelake', 'alias', 'test', 1, 1000, NULL), \
+                 (20, {first_id}, 'RedFox', 'codex-cli', 'test', 1, 100, NULL), \
+                 (21, {first_id}, 'redfox', 'alias', 'test', 1, 1100, NULL), \
+                 (30, {first_id}, 'OldTree', 'codex-cli', 'test', 1, 100, NULL), \
+                 (31, {first_id}, 'oldtree', 'alias', 'test', 1, 1200, NULL), \
+                 (40, {first_id}, 'GoldenPond', 'codex-cli', 'test', 1, 500, NULL), \
+                 (41, {first_id}, 'goldenpond', 'alias', 'test', 1, 1300, NULL), \
+                 (50, {first_id}, 'GreenField', 'codex-cli', 'test', 1, 400, NULL), \
+                 (51, {first_id}, 'greenfield', 'alias', 'test', 1, 1400, 90), \
+                 (60, {first_id}, 'UnknownBird', 'codex-cli', 'test', 1, 0, NULL), \
+                 (61, {first_id}, 'unknownbird', 'alias', 'test', 1, 1500, NULL), \
+                 (70, {second_id}, 'BlueLake', 'claude-code', 'test', 1, 600, NULL), \
+                 (80, {first_id}, 'SunnyHill', 'codex-cli', 'test', 1, 500, NULL)"
+            ))
+            .expect("insert canonical and case-variant agents");
+            // A ledger-only deregistration must hide its active alias, while
+            // deregistering only an alias cannot hide the canonical identity.
+            conn.execute_raw(
+                "INSERT INTO agent_deregistrations (agent_id, deregistered_at) \
+                 VALUES (20, 90), (41, 90)",
+            )
+            .expect("insert deregistration ledger");
+            drop(conn);
+
+            let population = list_atc_population_snapshot(&cx, &pool, 200, 10)
+                .await
+                .into_result()
+                .expect("load canonical population");
+            assert_eq!(
+                population
+                    .iter()
+                    .map(|agent| (agent.project_id, agent.name.as_str(), agent.last_active_ts))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (second_id, "BlueLake", 600),
+                    (first_id, "SunnyHill", 500),
+                    (first_id, "GoldenPond", 500),
+                    (first_id, "GreenField", 400),
+                    (first_id, "UnknownBird", 0),
+                ],
+                "the canonical row owns lifecycle, activity and project scope"
+            );
+            for agent in &population {
+                let routed = get_agent(&cx, &pool, agent.project_id, &agent.name)
+                    .await
+                    .into_result()
+                    .expect("resolve population identity through routing");
+                assert_eq!(agent.name, routed.name);
+                assert_eq!(agent.program, routed.program);
+                assert_eq!(agent.last_active_ts, routed.last_active_ts);
+                assert!(routed.retired_at.is_none());
+            }
+
+            let capped = list_atc_population_snapshot(&cx, &pool, 200, 3)
+                .await
+                .into_result()
+                .expect("load capped canonical population");
+            assert_eq!(
+                capped
+                    .iter()
+                    .map(|agent| agent.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["BlueLake", "SunnyHill", "GoldenPond"],
+                "aliases and inactive identities must not consume the result cap"
+            );
+            let empty = list_atc_population_snapshot(&cx, &pool, 200, 0)
+                .await
+                .into_result()
+                .expect("load zero-limit population");
+            assert!(empty.is_empty());
         });
     }
 
