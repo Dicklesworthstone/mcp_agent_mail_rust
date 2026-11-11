@@ -13803,6 +13803,12 @@ to skip auth for local requests.</p>
         if per_minute == 0 {
             return true;
         }
+        // Tool names and JWT subjects are supplied by clients. Bound retained
+        // keys before either backend allocates its own copy; truncating them
+        // would merge unrelated clients' quotas.
+        if key.len() > RATE_LIMIT_MAX_KEY_BYTES {
+            return false;
+        }
 
         let now = rate_limit_now();
         let budget = if self.request_timeout_secs == 0 {
@@ -13815,7 +13821,6 @@ to skip auth for local requests.</p>
         let cx = runtime_request_cx(budget);
 
         let redis = self.rate_limit_redis_client(&cx).await;
-        let has_redis = redis.is_some();
 
         if let Some(redis) = redis
             && let Ok(allowed) =
@@ -13823,11 +13828,10 @@ to skip auth for local requests.</p>
         {
             return allowed;
         }
-        // Legacy parity: if Redis is configured, periodic cleanup is disabled even when
-        // a specific Redis call fails and we fall back to memory.
-
+        // A ready Redis client can keep failing commands for an entire outage.
+        // Its fallback needs the same bounded retention as a memory-only server.
         self.rate_limiter
-            .allow_memory(key, per_minute, burst, now, !has_redis)
+            .allow_memory(key, per_minute, burst, now, true)
     }
 
     #[cfg(test)]
@@ -18277,9 +18281,72 @@ async fn consume_rate_limit_redis(
     Ok(allowed)
 }
 
+// At most 16 MiB of key bytes per server, plus bounded map/entry overhead.
+// Preserve existing quotas at capacity: evicting active buckets would let key
+// churn replenish exhausted clients' bursts.
+const RATE_LIMIT_MAX_BUCKETS: usize = 16_384;
+const RATE_LIMIT_MAX_KEY_BYTES: usize = 1_024;
+const RATE_LIMIT_CAPACITY_CLEANUP_INTERVAL_SECS: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug)]
+struct RateLimitBucket {
+    tokens: f64,
+    observed_at: f64,
+    rate_per_sec: f64,
+    burst: f64,
+}
+
+impl RateLimitBucket {
+    fn new(per_minute: u32, burst: u32, now: f64) -> Self {
+        Self {
+            tokens: f64::from(burst.max(1)),
+            observed_at: now,
+            rate_per_sec: f64::from(per_minute) / 60.0,
+            burst: f64::from(burst.max(1)),
+        }
+    }
+
+    fn refilled_tokens(self, now: f64) -> f64 {
+        (self.tokens + (now - self.observed_at).max(0.0) * self.rate_per_sec).min(self.burst)
+    }
+
+    fn fully_refilled(self, now: f64) -> bool {
+        now >= self.observed_at && self.refilled_tokens(now) >= self.burst
+    }
+
+    fn consume(&mut self, per_minute: u32, burst: u32, now: f64) -> bool {
+        // A backwards clock must not move the refill origin backwards, which
+        // would mint tokens when the clock returns to its previous value.
+        let now = now.max(self.observed_at);
+        let burst = f64::from(burst.max(1));
+        let refilled = self.refilled_tokens(now);
+        // Refill elapsed time under the policy that governed that interval.
+        // An updated policy can replace a fully restored bucket, just as if it
+        // had been reclaimed; an outstanding debit survives policy changes.
+        let mut tokens = if refilled >= self.burst {
+            burst
+        } else {
+            refilled.min(burst)
+        };
+        let allowed = tokens >= 1.0;
+        if allowed {
+            tokens -= 1.0;
+        }
+        *self = Self {
+            tokens,
+            observed_at: now,
+            rate_per_sec: f64::from(per_minute) / 60.0,
+            burst,
+        };
+        allowed
+    }
+}
+
 struct RateLimiter {
-    buckets: Mutex<HashMap<String, (f64, f64)>>,
+    buckets: Mutex<HashMap<String, RateLimitBucket>>,
     last_cleanup: Mutex<f64>,
+    last_capacity_cleanup: Mutex<Option<f64>>,
+    capacity: usize,
 }
 
 impl RateLimiter {
@@ -18288,6 +18355,8 @@ impl RateLimiter {
         Self {
             buckets: Mutex::new(HashMap::new()),
             last_cleanup: Mutex::new(now),
+            last_capacity_cleanup: Mutex::new(None),
+            capacity: RATE_LIMIT_MAX_BUCKETS,
         }
     }
 
@@ -18302,8 +18371,9 @@ impl RateLimiter {
         if per_minute == 0 {
             return true;
         }
-        let rate_per_sec = f64::from(per_minute) / 60.0;
-        let burst = f64::from(burst.max(1));
+        if key.len() > RATE_LIMIT_MAX_KEY_BYTES || !now.is_finite() {
+            return false;
+        }
 
         if do_cleanup {
             self.cleanup(now);
@@ -18314,27 +18384,37 @@ impl RateLimiter {
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (tokens0, ts) = buckets.get(key).copied().unwrap_or((burst, now));
-            let elapsed = (now - ts).max(0.0);
-            let mut tokens = (tokens0 + elapsed * rate_per_sec).min(burst);
-
-            let allowed = tokens >= 1.0;
-            if allowed {
-                tokens -= 1.0;
+            if let Some(bucket) = buckets.get_mut(key) {
+                return bucket.consume(per_minute, burst, now);
+            }
+            if buckets.len() >= self.capacity {
+                // Reclaim only quotas that have completely recovered. Rate
+                // limit the bounded scan too: a stream of unknown keys must
+                // not cause an O(capacity) scan on every denied request.
+                let mut last = self
+                    .last_capacity_cleanup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if last.is_none_or(|last| now - last >= RATE_LIMIT_CAPACITY_CLEANUP_INTERVAL_SECS) {
+                    buckets.retain(|_, bucket| !bucket.fully_refilled(now));
+                    *last = Some(now);
+                }
+                if buckets.len() >= self.capacity {
+                    return false;
+                }
             }
 
-            let new_state = (tokens, now);
-            if let Some(entry) = buckets.get_mut(key) {
-                *entry = new_state;
-            } else {
-                buckets.insert(key.to_string(), new_state);
-            }
-
+            let mut bucket = RateLimitBucket::new(per_minute, burst, now);
+            let allowed = bucket.consume(per_minute, burst, now);
+            buckets.insert(key.to_string(), bucket);
             allowed
         }
     }
 
     fn cleanup(&self, now: f64) {
+        if !now.is_finite() {
+            return;
+        }
         {
             let mut last = self
                 .last_cleanup
@@ -18351,7 +18431,9 @@ impl RateLimiter {
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        buckets.retain(|_, (_, ts)| *ts >= cutoff);
+        // An idle hour does not repay a large, slow-refilling burst. Forgetting
+        // that debt would grant more requests than the configured quota.
+        buckets.retain(|_, bucket| bucket.observed_at >= cutoff || !bucket.fully_refilled(now));
     }
 }
 
@@ -29150,7 +29232,7 @@ first body
                             "now": now,
                             "expected_allowed": exp,
                             "actual_allowed": allowed,
-                            "bucket_state": state.map(|(tokens, ts)| serde_json::json!({"tokens": tokens, "ts": ts})),
+                            "bucket_state": state.map(|bucket| serde_json::json!({"tokens": bucket.tokens, "ts": bucket.observed_at})),
                             "key": key,
                         }),
                     );
@@ -29338,6 +29420,12 @@ first body
             ..Default::default()
         };
         let state = build_state(config);
+        let now = rate_limit_now();
+        state.rate_limiter.buckets.lock().unwrap().insert(
+            "expired-fallback-client".to_string(),
+            RateLimitBucket::new(60, 1, now - 7200.0),
+        );
+        *state.rate_limiter.last_cleanup.lock().unwrap() = now - 61.0;
 
         let params = serde_json::json!({ "name": "health_check", "arguments": {} });
         let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
@@ -29345,6 +29433,15 @@ first body
 
         let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
         assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+        assert!(
+            !state
+                .rate_limiter
+                .buckets
+                .lock()
+                .unwrap()
+                .contains_key("expired-fallback-client"),
+            "Redis command failures must not disable memory fallback cleanup"
+        );
 
         let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
         let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
@@ -29445,6 +29542,218 @@ first body
     }
 
     #[test]
+    fn rate_limiter_key_churn_preserves_existing_quotas_at_capacity() {
+        let limiter = RateLimiter {
+            capacity: 4,
+            ..RateLimiter::new()
+        };
+        let now = 1000.0;
+        for key in ["a", "b", "c", "d"] {
+            assert!(limiter.allow_memory(key, 60, 2, now, false));
+        }
+        for index in 0..1000 {
+            assert!(!limiter.allow_memory(&format!("churn-{index}"), 60, 2, now, false));
+        }
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 4);
+        assert!(limiter.allow_memory("a", 60, 2, now, false));
+        assert!(!limiter.allow_memory("a", 60, 2, now, false));
+        assert!(!limiter.allow_memory("new", 60, 2, now + 0.999, false));
+
+        // b/c/d have restored their whole burst; a has only one token back.
+        // A new identity can enter without forgetting a's remaining debit.
+        assert!(limiter.allow_memory("new", 60, 2, now + 1.0, false));
+        assert!(limiter.allow_memory("a", 60, 2, now + 1.0, false));
+        assert!(!limiter.allow_memory("a", 60, 2, now + 1.0, false));
+        assert!(limiter.buckets.lock().unwrap().len() <= 4);
+    }
+
+    #[test]
+    fn rate_limiter_long_refill_debt_survives_idle_cleanup_and_capacity_pressure() {
+        let now = rate_limit_now();
+        let limiter = RateLimiter {
+            capacity: 2,
+            ..RateLimiter::new()
+        };
+        for _ in 0..100 {
+            assert!(limiter.allow_memory("slow", 1, 100, now, false));
+        }
+        assert!(!limiter.allow_memory("slow", 1, 100, now, false));
+        assert!(limiter.allow_memory("fast", 60, 1, now, false));
+
+        // One idle hour replenishes only 60 of the slow bucket's 100 tokens.
+        limiter.cleanup(now + 3601.0);
+        {
+            let buckets = limiter.buckets.lock().unwrap();
+            assert!(buckets.contains_key("slow"));
+            assert!(!buckets.contains_key("fast"));
+        }
+        assert!(limiter.allow_memory("new", 1, 1, now + 3601.0, false));
+        assert!(!limiter.allow_memory("overflow", 1, 1, now + 3601.0, false));
+        for _ in 0..60 {
+            assert!(limiter.allow_memory("slow", 1, 100, now + 3601.0, false));
+        }
+        assert!(!limiter.allow_memory("slow", 1, 100, now + 3601.0, false));
+    }
+
+    #[test]
+    fn rate_limiter_bounds_key_bytes_and_rejects_nonfinite_time_without_allocation() {
+        let limiter = RateLimiter::new();
+        let now = 1000.0;
+        let max_key = "é".repeat(RATE_LIMIT_MAX_KEY_BYTES / 2);
+        assert!(limiter.allow_memory(&max_key, 60, 1, now, false));
+        assert!(!limiter.allow_memory(&format!("{max_key}x"), 60, 1, now, false));
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!limiter.allow_memory("invalid-clock", 60, 1, invalid, true));
+        }
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+        assert!(!limiter.allow_memory(&max_key, 60, 1, now, false));
+        assert!(limiter.allow_memory(&format!("{max_key}x"), 0, 0, now, true));
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rate_limiter_policy_change_retains_debt_and_uses_the_new_refill_horizon() {
+        let limiter = RateLimiter {
+            capacity: 1,
+            ..RateLimiter::new()
+        };
+        let now = 1000.0;
+        assert!(limiter.allow_memory("agent", 60, 2, now, false));
+        assert!(limiter.allow_memory("agent", 60, 2, now, false));
+        // Slowing refill and increasing the burst must not grant new tokens.
+        assert!(!limiter.allow_memory("agent", 1, 100, now, false));
+        assert!(!limiter.allow_memory("new", 60, 1, now + 2.0, false));
+        assert!(limiter.allow_memory("agent", 1, 100, now + 60.0, false));
+        assert!(!limiter.allow_memory("agent", 1, 100, now + 60.0, false));
+        assert!(!limiter.allow_memory("new", 60, 1, now + 3601.0, false));
+        assert!(limiter.allow_memory("new", 60, 1, now + 6060.0, false));
+    }
+
+    #[test]
+    fn rate_limiter_concurrent_new_keys_cannot_exceed_capacity() {
+        let limiter = Arc::new(RateLimiter {
+            capacity: 4,
+            ..RateLimiter::new()
+        });
+        let allowed = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for index in 0..32 {
+                let limiter = &limiter;
+                let allowed = &allowed;
+                scope.spawn(move || {
+                    if limiter.allow_memory(&format!("agent-{index}"), 1, 1, 1000.0, false) {
+                        allowed.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(allowed.load(Ordering::Relaxed), 4);
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn http_rate_limit_capacity_preserves_clients_with_memory_and_redis_fallback() {
+        for backend in [
+            mcp_agent_mail_core::RateLimitBackend::Memory,
+            mcp_agent_mail_core::RateLimitBackend::Redis,
+        ] {
+            let config = mcp_agent_mail_core::Config {
+                http_bearer_token: Some("capacity-secret".to_string()),
+                http_allow_localhost_unauthenticated: false,
+                http_rate_limit_enabled: true,
+                http_rate_limit_backend: backend,
+                http_rate_limit_redis_url: Some("not-a-url".to_string()),
+                http_rate_limit_tools_per_minute: 1,
+                http_rate_limit_tools_burst: 2,
+                ..Default::default()
+            };
+            let mut state = build_state(config);
+            state.rate_limiter = Arc::new(RateLimiter {
+                capacity: 2,
+                ..RateLimiter::new()
+            });
+            let request = |host, id| {
+                let mut req = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api",
+                    &[("Authorization", "Bearer capacity-secret")],
+                    Some(SocketAddr::from(([10, 0, 0, host], 1234))),
+                );
+                req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, id))
+                    .expect("serialize tool-list request");
+                req
+            };
+            assert_eq!(block_on(state.handle(request(1, 1_i64))).status, 200);
+            assert_eq!(block_on(state.handle(request(2, 2_i64))).status, 200);
+            for host in 3..32 {
+                let response = block_on(state.handle(request(host, i64::from(host))));
+                assert_jsonrpc_error_response(
+                    &response,
+                    429,
+                    serde_json::json!(host),
+                    fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE,
+                    "Rate limit exceeded",
+                );
+            }
+            for host in [1, 2] {
+                assert_eq!(block_on(state.handle(request(host, 100_i64))).status, 200);
+                assert_eq!(block_on(state.handle(request(host, 101_i64))).status, 429);
+            }
+            assert_eq!(state.rate_limiter.buckets.lock().unwrap().len(), 2);
+            if backend == mcp_agent_mail_core::RateLimitBackend::Redis {
+                assert!(matches!(
+                    &*state.rate_limit_redis.lock().unwrap(),
+                    RateLimitRedisState::Failed
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn http_rate_limit_rejects_oversized_tool_and_jwt_subject_without_retaining_them() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("bounded-rate-key".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            http_rate_limit_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let oversized = "é".repeat(RATE_LIMIT_MAX_KEY_BYTES);
+        for (tool, subject) in [
+            (oversized.as_str(), "ordinary-subject"),
+            ("health_check", oversized.as_str()),
+        ] {
+            let token = hs256_token(
+                b"bounded-rate-key",
+                &serde_json::json!({"sub": subject, "role": "writer"}),
+            );
+            let auth = format!("Bearer {token}");
+            let mut req = make_request_with_peer_addr(
+                Http1Method::Post,
+                "/api",
+                &[("Authorization", &auth)],
+                Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+            );
+            req.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({"name": tool, "arguments": {}})),
+                1_i64,
+            ))
+            .expect("serialize oversized-key request");
+            let response = block_on(state.handle(req));
+            assert_jsonrpc_error_response(
+                &response,
+                429,
+                serde_json::json!(1),
+                fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE,
+                "Rate limit exceeded",
+            );
+            assert!(state.rate_limiter.buckets.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn rate_limiter_cleanup_eviction_after_one_hour() {
         let limiter = RateLimiter::new();
         let now = rate_limit_now();
@@ -29455,8 +29764,8 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("old".to_string(), (1.0, cutoff - 1.0));
-            buckets.insert("new".to_string(), (1.0, cutoff + 1.0));
+            buckets.insert("old".to_string(), RateLimitBucket::new(60, 1, cutoff - 1.0));
+            buckets.insert("new".to_string(), RateLimitBucket::new(60, 1, cutoff + 1.0));
         }
         {
             let mut last = limiter
@@ -29540,6 +29849,8 @@ first body
         assert!(limiter.allow_memory(key, 60, 1, t0, false));
         assert!(!limiter.allow_memory(key, 60, 1, t0, false));
         assert!(!limiter.allow_memory(key, 60, 1, t0 - 30.0, false));
+        assert!(!limiter.allow_memory(key, 60, 1, t0, false));
+        assert!(!limiter.allow_memory(key, 60, 1, t0 + 0.5, false));
         assert!(limiter.allow_memory(key, 60, 1, t0 + 1.0, false));
     }
 
@@ -29554,7 +29865,10 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("old".to_string(), (1.0, cutoff - 10.0));
+            buckets.insert(
+                "old".to_string(),
+                RateLimitBucket::new(60, 1, cutoff - 10.0),
+            );
         }
         {
             let mut last = limiter
@@ -29590,8 +29904,14 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("stale".to_string(), (1.0, cutoff - 5.0));
-            buckets.insert("fresh".to_string(), (1.0, cutoff + 5.0));
+            buckets.insert(
+                "stale".to_string(),
+                RateLimitBucket::new(60, 1, cutoff - 5.0),
+            );
+            buckets.insert(
+                "fresh".to_string(),
+                RateLimitBucket::new(60, 1, cutoff + 5.0),
+            );
         }
         {
             let mut last = limiter
@@ -29982,7 +30302,10 @@ first body
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for i in 0..10 {
-                buckets.insert(format!("stale_{i}"), (1.0, cutoff - f64::from(i) - 1.0));
+                buckets.insert(
+                    format!("stale_{i}"),
+                    RateLimitBucket::new(60, 1, cutoff - f64::from(i) - 1.0),
+                );
             }
         }
         {
@@ -30099,7 +30422,10 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("stale_key".to_string(), (1.0, cutoff - 10.0));
+            buckets.insert(
+                "stale_key".to_string(),
+                RateLimitBucket::new(60, 1, cutoff - 10.0),
+            );
         }
         {
             let mut last = limiter
