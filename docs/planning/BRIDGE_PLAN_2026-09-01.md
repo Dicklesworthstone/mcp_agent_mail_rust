@@ -8,16 +8,21 @@
 - [x] Recheck Beads and graph triage. Continue owned br-asldx/br-kp1in.29;
   original acceptance remains unchanged. Other release P0s need canonical
   DSR/public transitions and cannot close from source inspection alone.
-- [ ] Execute the complete predeclared core/db/tools/server native population
+- [x] Execute the complete predeclared core/db/tools/server native population
   on immutable c393f89d, default features/profile.dev.debug0/build-jobs1,
   nextest dev global1800s and inherited per-test240s, outer14400s,
   native30GiB/floor10GiB. A local argument refusal omitted --no-overlay;
   corrected immediately with a separate retained receipt, no remote work.
   hz4 exits103/queue_timeout before transfer; unchanged c393 execution is
-  now compiling on admissible vmi1149989. No administrative override.
-- [ ] Compare every actual identity with both retained original338 and805
+  finishes normally on vmi1149989:885 executed,880 passed,5 failed,12054 skipped;
+  execution323.391s, total11773.948s, exit100. The five failures match h5's
+  deadline fixture and four pool-backed health/startup cases. Historical
+  source, not candidate qualification; no administrative override.
+- [x] Compare every c393 actual identity with both retained original338 and805
   populations, all four added regressions and the additive lock cases.
-  Diagnose real failures without reducing assertions, workload or limits.
+  Original338 all pass; every805 runs,800 pass and those same five fail. All
+  four added regressions pass. The candidate must reexecute the full population;
+  no assertions, workload or limits have been reduced.
 - [x] Re-read the source fixes and their callers: observed-lock lifecycle,
   optional source identity, committed prefix/suffix repair, caller-clock
   deadlines, transactional snapshot and migration witnesses.
@@ -30,6 +35,15 @@
   fence test and add incomplete-sample lower-bound assertions, strengthen
   queued-age/progress-lock coverage, and add known-zero/unknown/red-preservation
   response controls. These are not an executed health-under-global-wedge proof.
+- [x] A second source pass finds that treating unknown queues as pending would
+  erase an already-confirmed persistent gap. Pause the last confirmed age,
+  retain its red verdict without aging through unknown intervals, and resume
+  only with actual queue evidence. Add frozen-age/red-preservation controls,
+  missing-source and recovery cases, and real-progress/replacement resets.
+  Preserve an already-read queue age even if the spill mutex is unavailable;
+  extend the actual held-lock test to spill and progress independently.
+  Final five-file packet is review3-integrated-h7-hashes.txt; fmt0. Its native
+  regressions and compiler checks remain pending, not inferred from h5/h6.
 - [x] Fix the new diagnostic Result signatures after production101 reveals
   this crate's fixed-error Result alias; use std::result::Result explicitly.
   Retain the failed draft: production101/483.817s and draft Clippy101/685.165s.
@@ -41,15 +55,121 @@
   fix the literal and semicolon, keep the empty-failure assertion, and use
   checked subtraction for the unchanged exact one-nanosecond boundary. A helper
   handles only integrity_guard mechanical edits; parent reads the full diff.
-- [ ] Qualify merged8c4 plus the exact five-file packet in
-  review3-integrated-h5-hashes.txt. Whole-workspace fmt0; required compiler,
-  production, Clippy, portable and native runs still need terminal results.
+- [x] Characterize merged8c4 plus the historical five-file packet in
+  review3-integrated-h7-hashes.txt (overlay69b5fc64). Whole-workspace
+  fmt0; all-targets0/573.8s on vmi1152480 and default production0/296.2s on hz4.
+  Later lint/fixture/runtime corrections supersede this packet; no final
+  native qualification follows from these compiler passes.
   hz4's next Clippy request refuses120/monitor_unavailable before Cargo;
   never reinterpret its unknown free_bytes0 as measured full-disk evidence.
+- [x] h7 also passes portable production0/630.9s on hz4. The earlier h5
+  strict Clippy passes0/1903.2s. h7 Clippy reports duration_suboptimal_units
+  in the new regression; preserve the same24-hour value using from_hours(24),
+  without suppressing the lint. These are historical after the correction.
+- [x] h5 starts1678 actual native cases. Its deadline/held-lock test fails at
+  the unchanged3-second completion bound: its Unix-epoch deadline is decades
+  ahead of Asupersync's process-relative clock. Use an actual runtime request
+  context and the shared clock for the same2-second budget; add positive
+  0<remaining<=2000 and initially-live checks. Preserve both held-lock branches,
+  5-second park/3-second completion bounds, cleanup/join, retry and readback.
+  This repairs a fixture, not a measured production failure or a timeout waiver.
+- [x] Characterize h8's six-file packet: all-targets0/193.5s, production0/538.8s
+  on vmi1152480 and strict Clippy0/1454.3s on vmi1293453. hz4's production
+  retry refuses103/TOPOLOGY_PATHS_PRESENT before source/execution grant.
+  These passes are historical after the next runtime corrections.
+- [x] Finish h5's full1678 native selection: exit100/1602.838s execution,
+  1664 passed,13 failed,1 timeout,12411 skipped. Every original338/805 identity
+  actually ran; original338 all pass,805 has800 passes and five failures.
+  Keep the complete raw receipt and identity comparison; no denominator cut.
+- [x] Extract actual persisted-size attribution from that failed run's passing
+  startup fixture (8.794s):100 messages/348160DBbytes prepare140059us, including
+  integrity137904us and archive-preflight869us;10000 messages/8691712DBbytes
+  prepare2557117us, integrity2552678us and archive-preflight736us. Each has all11
+  phase records and retained runtime-engine row/body/recipient/archive-parity
+  assertions. These warmed synthetic constructor samples identify the integrity
+  phase, which also includes drift/floor work, not its inner culprit. No listener
+  readiness, original corpus, incumbent speedup or bounded-readiness claim.
+- [x] Trace the four remaining original health/startup failures to the pool
+  cache's pre-materialization directory-chain key. Preserve weak references
+  to the original frozen descriptors, verify newly latched chains outside
+  registry locks, and rekey only the same still-live engine. Reused wrappers
+  retain original authority; directory replacement still refuses. Add real
+  file/memory checkout and replacement controls; no new strong cache ownership.
+- [x] Fix the actual reservation scheduler counterexample: cooling retry debt
+  must not start another scan after budget_exhausted=false completes a round.
+  Return the existing backlog hint and keep the original exact-call oracle.
+- [x] Characterize h9a's eight-source packet (review3-integrated-h9a-hashes.txt,
+  overlay775ee701). fmt0 and complete stock scans0critical; compiler/native
+  workspace all-targets0/341.2s on vmi1293453 and strict Clippy0/482.5s on hz4.
+  Clippy uses one compile job to fit the available measured scheduler slot;
+  lint levels, targets and features remain unchanged. Production and portable
+  production graphs, and actual native results, remain pending.
+  The first all-targets and prepared-worker native requests
+  refuse120 before Cargo because protected reservations consume headroom.
+  vmi1293453's observed8CPUs/23410108KiB available and
+  18.2GB protected native headroom support an unchanged four-job native attempt.
+  Its Clippy request refuses103/queue_timeout while native owns both measured
+  slots. A malformed local production command refusesE301 before remote work;
+  preserve that receipt and correct the duplicated rch exec, without fallback.
+  h10 supersedes this packet before any native case executes. Cooperatively
+  cancel only the owned obsolete wrapper through rch jobs cancel; local143,
+  recovered durable120, zero bodies, no qualification credit. Preserve all
+  partial output. Historical c393 continues normally.
+- [ ] Recheck h5's `rotation_delete_requires_explicit_optin`: its no-pin
+  failure-count oracle expects2 and observes1. Retain the deletion refusal and
+  every evidence file; do not regenerate an expected count merely to pass.
+- [ ] Recheck `empty_rotation_backlog_drains_past_the_inventory_limit_without_losing_evidence`:
+  the16641-directory workload times out at240s. Preserve the original workload,
+  reader proof, progress-per-pass and evidence-preservation assertions.
+- [ ] Recheck `default_retention_repairs_large_backlogs_without_verification_authority`:
+  h5 publishes its repair but normal publication remains over budget. Require
+  actual safe reclamation and restored admission, with no larger cleanup budget.
+- [ ] Recheck `legacy_v0330_snapshot_metadata_no_longer_strands_a_backup_backlog`:
+  h5 retains too many images after replacing legacy metadata. Keep original
+  legacy-byte preservation, verified-generation and final admission checks.
+- [ ] Recheck `active_snapshot_reader_defers_repair_without_spending_export_allowance`:
+  h5 still refuses normal admission after the reader leaves and repair runs.
+  Keep both real-reader timings and the original export-allowance witnesses.
+- [ ] Recheck `refused_automatic_admission_reclaims_safe_backlog_without_export`:
+  h5 leaves151 images where the third attempt expects3. Preserve the real
+  journal/staging refusals, reader protection, backoff and no-export assertions.
+- [ ] Recheck `publication_follows_a_pass_with_refusals`: h5 observes one
+  incomplete attempt where the test expects zero failures. Preserve real
+  publication, inode/verification evidence and all three refusal scenarios;
+  no counter reset or retry-policy change to manufacture completion.
+- [x] Trace the populated maintenance fixture's lost healthy Git bytes: normal
+  commits advance HEAD before background index sync, but the large-index setup
+  committed the possibly stale disk index as a new full tree. Seed that index
+  from its captured parent HEAD, reject concurrent parent movement, and check
+  all255 existing messages' three raw committed copies before and after setup.
+  Preserve154845 synthetic entries, the30MiB floor,256 source messages,
+  30-second/35%-CPU window,120-second orphan deadline and final256-message HEAD
+  oracle. This is a fixture correction with stronger setup checks, not a
+  retention performance improvement. h10's only change after h9a is this test
+  file; fmt0 and complete stock scan0critical/246warning/41info, no suppression.
+- [ ] Execute the COMPLETE population on h10, including the corrected populated
+  worker. Native h9a is cancelled before tests to avoid compiling the large
+  server executable twice after the fixture correction. Keep every h9a case
+  and original338/805 identity; this is not a reduced one-test qualification.
+  The first h10 request refuses103 before source grant because the old source
+  owner is unfinished. Same-wrapper recovery first times out at10s, then
+  succeeds at60s with terminal acknowledgement; no command is replayed.
+  Clippy now executes on that canonically admitted h10 source pair. Wait for
+  its required slots before the full native attempt; never edit owner markers.
+- [x] Finish h10's separate required compiler graphs. All-targets on122 passes
+  0/2551.4s, separate default production0/1337.6s and portable production0/2263.1s.
+  Strict Clippy's hz4 attempt refuses120 before Cargo (27GiB estimate, growth0);
+  final Clippy passes0/451.8s on129. h10 overlay35da3ab3, manifest
+  review3-integrated-h10-hashes.txt; all11
+  worker-read source/lock/toolchain/config hashes match. Same scopes and lints.
 - [ ] Execute the expanded five-package native population, retaining every
   original338/805 case and four earlier regressions, adding archive-lag and
-  health/rotation/integrity/retention controls. For the new packet, use four
-  compile jobs on hz4's observed64 CPUs/128545MiB available memory. This changes
+  health/rotation/integrity/retention controls. h5 used four compile jobs on
+  vmi1153651's observed10 CPUs/47599516KiB available memory. The h9a request on
+  that worker refuses120; current h9a executes on admissible vmi1293453 instead.
+  h5 is retained as actual failed evidence. The full population plus
+  new pool-authority/replacement controls now builds on h10/129 after canonical
+  recovery; all11 native-worker hashes match. This changes
   compilation parallelism only, not test threads, assertions, features,
   global1800s/per-test240s, outer14400s, native30GiB or floor10GiB. No performance
   ratio or constrained-host qualification follows from these functional runs.

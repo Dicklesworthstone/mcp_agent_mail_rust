@@ -17,10 +17,44 @@ results, not the constrained-host runtime qualification below. The stock scans
 retain the existing query-fixture token and debug-only invariant panic alerts;
 they are not uniformly green.
 
+The November 10 expanded native execution on the intermediate five-file packet
+(`8c4fa856` plus overlay `73fe2671`) actually runs 1,678 cases: **1,664 pass,
+13 fail, one times out** in 1,602.838 seconds. Every original 338-case and
+805-case identity executes; all 338 pass, while 800 of the original 805 pass.
+The five failures are the caller-clock deadline fixture and four pool-backed
+health/startup cases. Further source review repairs the fixture's clock,
+preserves cached pool authority as absent directories materialize, and stops
+reservation catch-up after its completed round. The expanded run also exposes
+eight additional retention failures that remain open: five cleanup/publication
+cases, one aggregate error-count case, one committed-Git case, and the large
+empty-directory timeout. Their assertions and watchdogs remain unchanged.
+
+That run's passing persisted-size fixture records preparation at 140,059 µs
+for 100 messages and 2,557,117 µs for 10,000 messages. The integrity phase takes
+137,904 µs and 2,552,678 µs respectively; archive preflight takes 869 µs and
+736 µs. These warmed synthetic preparation samples include real-engine row,
+body, recipient and archive-parity checks. The integrity phase includes
+archive-drift and ID-floor work, so the inner cause remains unmeasured. These
+are not listener-readiness timings, a constrained-host result or an
+incumbent-relative speedup.
+
+The final eight-file packet `35da3ab3` passes formatting, workspace all-targets
+compilation, separate production `--lib --bins`, strict Clippy, and portable
+production. Its complete native execution is still pending. The final
+test-only correction seeds the populated-worker fixture's large
+index from committed HEAD, preserving mail that background index sync has not
+yet copied. Added raw committed-byte checks for all 255 healthy messages before
+and after setup strengthen the fixture; the original CPU, workload, deadline
+and final 256-message oracles remain intact. The complete final-source native
+run retains every earlier case, including this corrected worker fixture.
+These are self-reviewed functional repairs, not independent verification or
+evidence of a startup speedup. The owned Beads remain in progress.
+
 An earlier native execution ran 805 cases: 785 passed and 20 failed. Those
 failures drove fixes to transactional snapshot comparisons, migration witnesses,
 optional source identity, caller-clock deadlines, and damaged-index repair.
-The corrected four-crate native preparation completes successfully and all four
+At that earlier checkpoint, the corrected four-crate native preparation
+completed successfully and all four
 executables have retained SHA-256 identities. Its first execution request is
 refused before Cargo starts because active disk reservations plus the protected
 floor prevent admission; it executes **zero tests**. The original case set,
@@ -29,8 +63,8 @@ An optional nextest `dev` profile now inherits the default watchdogs and
 isolation rules while bounding test execution to 30 minutes, allowing build
 and run to share one reservation. That combined retry is also refused before
 Cargo (exit 120); the profile is parser-validated, with no runtime pass claimed.
-No native pass, issue closure, startup speedup, or 2-CPU/4-GiB clearance follows
-from preparation. The [bridge plan](../planning/BRIDGE_PLAN_2026-09-01.md) records
+No complete native pass, issue closure, startup speedup, or 2-CPU/4-GiB clearance
+has been established. The [bridge plan](../planning/BRIDGE_PLAN_2026-09-01.md) records
 the exact source hashes, receipts and outstanding acceptance.
 
 The original integration record follows; its outages and failed attempts remain
