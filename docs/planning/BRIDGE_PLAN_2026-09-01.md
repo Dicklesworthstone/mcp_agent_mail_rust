@@ -13,7 +13,7 @@
   nextest dev global1800s and inherited per-test240s, outer14400s,
   native30GiB/floor10GiB. A local argument refusal omitted --no-overlay;
   corrected immediately with a separate retained receipt, no remote work.
-  hz4 exits103/queue_timeout before transfer; unchanged c393 execution is
+  hz4 exits103/queue_timeout before transfer; unchanged c393 execution
   finishes normally on vmi1149989:885 executed,880 passed,5 failed,12054 skipped;
   execution323.391s, total11773.948s, exit100. The five failures match h5's
   deadline fixture and four pool-backed health/startup cases. Historical
@@ -133,10 +133,12 @@
 - [ ] Recheck `refused_automatic_admission_reclaims_safe_backlog_without_export`:
   h5 leaves151 images where the third attempt expects3. Preserve the real
   journal/staging refusals, reader protection, backoff and no-export assertions.
-- [ ] Recheck `publication_follows_a_pass_with_refusals`: h5 observes one
+- [x] Recheck `publication_follows_a_pass_with_refusals`: h5 observes one
   incomplete attempt where the test expects zero failures. Preserve real
   publication, inode/verification evidence and all three refusal scenarios;
-  no counter reset or retry-policy change to manufacture completion.
+  no counter reset or retry-policy change to manufacture completion. This case
+  passes unchanged in the full h10 run; retain the h5 failure without attributing
+  its later pass to an unmeasured runtime fix.
 - [x] Trace the populated maintenance fixture's lost healthy Git bytes: normal
   commits advance HEAD before background index sync, but the large-index setup
   committed the possibly stale disk index as a new full tree. Seed that index
@@ -147,32 +149,200 @@
   oracle. This is a fixture correction with stronger setup checks, not a
   retention performance improvement. h10's only change after h9a is this test
   file; fmt0 and complete stock scan0critical/246warning/41info, no suppression.
-- [ ] Execute the COMPLETE population on h10, including the corrected populated
+- [x] Execute the COMPLETE population on h10, including the corrected populated
   worker. Native h9a is cancelled before tests to avoid compiling the large
   server executable twice after the fixture correction. Keep every h9a case
   and original338/805 identity; this is not a reduced one-test qualification.
   The first h10 request refuses103 before source grant because the old source
   owner is unfinished. Same-wrapper recovery first times out at10s, then
   succeeds at60s with terminal acknowledgement; no command is replayed.
-  Clippy now executes on that canonically admitted h10 source pair. Wait for
-  its required slots before the full native attempt; never edit owner markers.
+  Clippy and the full native run then acquire that source pair normally;
+  never edit owner markers. Native finishes100:1717 executed,1710 passed,
+  six failed,one timed out,12374 skipped,1586.130s execution. Every original805
+  and338 case passes, every h5 case is present, and all four earlier regressions
+  pass. Five stable native executable hashes and all11 worker source hashes
+  are retained. The six old retention gaps above remain red. The populated
+  fixture preserves all255 pre/post-setup message bundles but fails while
+  discovering the asynchronously starting maintenance thread.
 - [x] Finish h10's separate required compiler graphs. All-targets on122 passes
   0/2551.4s, separate default production0/1337.6s and portable production0/2263.1s.
   Strict Clippy's hz4 attempt refuses120 before Cargo (27GiB estimate, growth0);
   final Clippy passes0/451.8s on129. h10 overlay35da3ab3, manifest
   review3-integrated-h10-hashes.txt; all11
   worker-read source/lock/toolchain/config hashes match. Same scopes and lints.
-- [ ] Execute the expanded five-package native population, retaining every
+- [x] Execute the expanded five-package native population on h10, retaining every
   original338/805 case and four earlier regressions, adding archive-lag and
   health/rotation/integrity/retention controls. h5 used four compile jobs on
   vmi1153651's observed10 CPUs/47599516KiB available memory. The h9a request on
   that worker refuses120; current h9a executes on admissible vmi1293453 instead.
   h5 is retained as actual failed evidence. The full population plus
-  new pool-authority/replacement controls now builds on h10/129 after canonical
+  new pool-authority/replacement controls executes on h10/129 after canonical
   recovery; all11 native-worker hashes match. This changes
   compilation parallelism only, not test threads, assertions, features,
   global1800s/per-test240s, outer14400s, native30GiB or floor10GiB. No performance
   ratio or constrained-host qualification follows from these functional runs.
+- [x] Correct the populated fixture's asynchronous thread-discovery race.
+  Poll for the real production thread within its original nine-second warmup,
+  then sleep only the remaining warmup. Retain the original CPU monotonicity,
+  30-second/35% window,120-second convergence,240-second per-test and1800-second
+  suite bounds. This test-only h11a change introduces no additional grace.
+  Manifest review3-integrated-h11a-hashes.txt, overlayb8eda4fb; fmt0 and the
+  complete stock scan0critical/246warning/41info, without suppression.
+- [ ] Qualify the h11a correction through the integrated h12 population below.
+  Its unchanged1717-case selection and every required compiler
+  graph on those final bytes. Preserve the first native103/queue_timeout and
+  portable120/started:false/growth0 refusals; neither executes any test or
+  compiler body. All-targets runs on122; a portable retry follows a fresh
+  positive protected-headroom observation. No worker, owner, ledger, disk-floor,
+  workload or timeout override is authorized by this test correction. H11a's
+  standalone compiler results remain historical after the integration below.
+- [x] Preserve four incoming commits by fast-forward21d2f513 to b0e31ce0:
+  OpenCode discovery/OAuth identity, bounded rate-limit state with quota-debt
+  preservation, bounded/fair ATC reviews, and semantic retry recovery. Read
+  all five changed files' diffs; no deletion or dirty-path overlap. Import
+  Beads truth and verify all11 h11a patch/lock/toolchain/config hashes unchanged.
+- [x] Stop only the obsolete owned h11a native wrapper before compilation or
+  any test body, using canonical cancellation and completed artifact recovery.
+  Local143, earlier daemon130, recovered120/terminal_acknowledged=true;
+  zero native credit. Preserve its downloads and all raw receipts. The first
+  integrated request is queued behind a new foreign job, then cancelled through
+  its exact queued wrapper before source grant:130/slots_released0. No foreign
+  cancellation or worker/owner/ledger edit. A free scheduler slot alone is not
+  disk admission: the fresh129 probe still has negative protected headroom.
+- [x] Freeze integrated h12 at b0e31ce0 plus only the h11a test-file overlay;
+  review3-h12-hashes.txt binds all16 patch, incoming-source and configuration
+  files. Whole-workspace formatting passes; no further source edit is planned
+  without an actual diagnostic.
+- [x] Trace the remaining production blocking lag-snapshot caller into message
+  reconciliation. Use the existing nonblocking sampler and return the existing
+  exact admission-contention error when evidence is unavailable; log the named
+  mutex, preserve the server's pool/cursor and bounded contention backoff, and
+  never synthesize a report or treat unknown lag as zero. Checkpointed workers
+  preflight before checkpoint restoration and resample before selecting rows.
+- [x] Add a real held-global-queue regression for both ordinary and startup-
+  checkpointed cursors. Assert unchanged cursor and accepted row/receipt bytes,
+  shutdown while the mutex remains held, then two actual repairs after release.
+  The unchanged nextest watchdog catches any same-thread blocking regression.
+  H13 actually passes this case2.675s; both cursor modes execute in the child.
+  Final integrated execution remains separate from this earlier runtime packet.
+- [x] Freeze h13 at the same b0e31ce0 base plus three source overlays. The
+  18-file review3-integrated-h13-hashes.txt includes both added storage paths;
+  final formatting0 and full stock scan0/statusok/failed[]/0critical,
+  1270warning/150info. Initial manual formatting failures remain retained.
+  H11a all-targets passes0/2567.4s, historical after integration and h13.
+- [x] Cooperatively cancel only four obsolete owned compiler wrappers after
+  the final runtime correction; retain partial logs/caches and complete their
+  canonical recovery before reusing any source pair. Local143/daemon130;
+  recovered exits120/137/120/120 with terminal acknowledgements, no pass credit.
+- [x] Complete h13 workspace all-targets check: R3 passes0/1376.2s on
+  hz4 after its earlier queue103. Its first122
+  request refuses120 before Cargo: started:false/growth0, protected reservations
+  exceed headroom. No lower disk budget, floor or administrative override.
+- [x] Complete h13's separate default production lib/bins check:0/690.9s on
+  hz4 after normal source-lease serialization; same base/fingerprint and flags
+  excluding dev-only feature unification.
+- [x] Collect h13 strict Clippy101: private semantic recovery fields share an
+  unnecessary `_id` suffix and a unit closure lacks a semicolon. Rename only
+  those private fields and add the semicolon; retain values, SQL and predicates.
+  The following f14 run exposes four incoming ATC empty-vector assertion lints;
+  use equivalent equality/inequality assertions, with no lint suppression.
+- [x] Complete h13's separate portable production check:0/861.2s on hz4,
+  immutable b0e31ce0+788b21ed. Both check-worker manifests match all18 declared
+  files. The retained proc-macro-error2 v2.0.1 future-Rust warning also appears
+  in h10; no dependency update or suppression is used to change the result.
+- [ ] Execute integrated h13 native qualification: retain all1717 earlier cases,
+  add embedding-worker, rate-limit, four ATC and OpenCode integration controls,
+  add the new real-queue control, and compare actual identities against every
+  original338/805/h5/h10 case.
+  Native jobs4, default features/debug0,1800s suite/240s per-test,14400s outer,
+  30GiB/floor10GiB remain fixed. H13 actually starts1818 cases across five
+  binaries,12294 skipped, run973ad565-ec5a-4358-9bfe-ee8aa467faac. The old
+  empty-directory case still times out at240s. Its incoming ATC stale-heap test
+  also fails: the full tick legitimately probes two never-observed identities
+  and replaces their artificial future deadlines. All terminal results and
+  original-population comparisons still need collection.
+- [x] Correct only that ATC fixture's preconditions: seed actual activity and a
+  recent probe for all940 agents. Keep probing enabled and assert that the full
+  tick does not send another probe. Preserve2820 initial entries, the64-pop
+  bound, due-resume deadline, nonmutating observation and all940 unique future
+  reviews. H13's failing original fixture remains evidence, not a runtime fix.
+- [x] Strict f15 Clippy101 reveals two further incoming semantic test lints.
+  Retain the exact one-second boundary with checked subtraction and release
+  the source-state mutex immediately after its final assertion. No predicate
+  or production behavior changes. Read the full final five-source diff again.
+- [x] Preserve peer540db95c by fast-forward: seven disjoint paths,1182+/191-,
+  no incoming deletion or dirty overlap. Review its bounded/redacted diagnostic
+  previews and retained-byte accounting, then import current tracker truth.
+  Suite/repo AGENTS and README hashes still match the original complete read.
+- [x] Fix f16's last incoming OpenCode test lint with equivalent empty-vector
+  equality. Reserve only core/setup.rs; final f18 adds this sixth overlay.
+  f17 portable production passes0/105.8s before this test-only correction.
+  Its24 worker hashes match that earlier packet, not the new core test bytes.
+- [x] Preserve diagnostic allocation bounds while resolving f18's actual
+  assigning_clones error: rebuild the small record with fresh strings and
+  release the original before locking the ring. Keep all limits/values;
+  extend the existing regression to a1MiB spare-capacity tool name as well as
+  the original agent/project controls. Using clone_into would retain capacity.
+- [x] Resolve f19's11 incoming server diagnostics without suppression: remove
+  the unused truncation helper, pass optional String references directly to
+  unchanged capacity accounting, and fix eight declarations inside a private
+  module plus its doc paragraph. A bounded mechanical helper handles the last
+  file per AGENTS; parent reads the diff and reruns required checks.
+- [x] Final f20 formatting0; complete changed-file stock scans finish with
+  statusok/failed[]. The three new server paths have0critical3984warning1924info;
+  metrics0critical158warning16info. Existing semantic/core fixture token alerts
+  remain red and unmodified. No uniformly-green scanner claim.
+- [x] f20 strict Clippy (540db95c plus ten overlays):0/2245.1s on129,
+  unchanged -D warnings and all25 worker hashes matched. This precedes the
+  following functional preview fix; it is not final f21 qualification.
+- [x] Fresh caller review finds an existing UTF-8 preview oracle violated by
+  the new generic truncation marker. Reconnect the existing byte-safe prefix
+  helper AFTER full JSON redaction and escape processing, preserving verbatim
+  plain-text prefixes and fresh200-byte allocation. All four original preview
+  tests remain unchanged; add them and existing console masking/sanitization
+  controls to the final native selection. No oracle migration or suppression.
+- [x] f21 formatting0 and complete stock preview-file scan0/statusok/failed[],
+  0critical3675warning1843info. Other final-source scan hashes stay unchanged.
+- [ ] Final f21 strict Clippy, with the same full workspace targets/lint levels.
+- [ ] Final f21 workspace all-targets compiler check; f20's request was
+  superseded before execution, without taking any pass credit.
+- [x] Final f20 separate default production lib/bins compiler check:0/962.9s
+  on ovh-a,540db95c+1351fb0c. All25 worker source/config hashes match, including
+  rootCargo.toml, Cargo.lock and toolchain; no dev-only feature unification.
+- [x] Final f20 separate portable production compiler check:0/962.9s on ovh-a,
+  separate namespace and --no-default-features --features portable. All25 hashes
+  match. Both retain the previously observed proc-macro-error2 future-Rust warning.
+- [ ] Final f21 separate default production lib/bins check, currently compiling
+  on1152 after a positive protected14GiB-headroom probe. f20 results above are
+  historical after the prefix repair.
+- [ ] Final f21 separate portable production check, still required on current bytes.
+  f14's first Clippy refuses120/monitor_unavailable before Cargo;
+  free_bytes0 is unknown, not measured disk exhaustion. Retain the unchanged
+  query-hint fixture's stock scanner alert; do not suppress it to manufacture0.
+- [x] Collect h13's terminal global-timeout result:1644/1818 execute,
+  1634PASS/8ordinaryFAIL/1TIMEOUT/1SIGTERM,174notrun,12294skipped,1800.132s.
+  Nextest's9failed includes that global cancellation. Every original805/338
+  actually passes, but174 h10 cases remain unexecuted. Retain all raw failures
+  and five stable executable hashes; no expanded-population qualification.
+- [ ] Execute final f21's COMPLETE native population. Retain
+  every1818 selected identity and every original338/805/h5/h10 comparison,
+  including all red retention cases. Add the incoming diagnostic preview,
+  dispatch, ring, timeline and recent-call allocation controls, plus all four
+  existing root preview and eleven console masking/sanitization cases; unchanged
+  workload, features and watchdogs. Installed nextest help confirms no-capture
+  forces serial execution; final invocation uses two test processes with full
+  captured success/failure output, retaining the existing isolation overrides,
+  1800s suite/240s per-test/14400s outer limits,30GiB/floor10GiB and four compile
+  jobs. This explicit scheduling change addresses aggregate runner capacity;
+  it is not a serial-run pass or a relaxation of any source oracle.
+  Earlier H13 execution does not qualify
+  the corrected ATC fixture or incoming peer bytes. The25-file manifest binds
+  the final integrated source; compiler-only f16 results stay historical.
+- [ ] Bind actual integrated-worker source/toolchain and five executable
+  identities, review terminal nonpasses, and retain every failed/refused receipt.
+- [ ] Flush Beads, verify matching JSONL inventories and no dependency cycles,
+  review the scoped diff, commit the owned correction/evidence once, push main
+  and its required legacy mirror, and release only the21 owned reservations.
 - [ ] Run required compiler/scanner checks for any further source correction,
   review it again, record bounded results in both Beads, and publish only the
   reviewed owned changes. Original scaling/liveness/overhead gates stay open

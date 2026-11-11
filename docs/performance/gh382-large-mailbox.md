@@ -38,15 +38,87 @@ archive-drift and ID-floor work, so the inner cause remains unmeasured. These
 are not listener-readiness timings, a constrained-host result or an
 incumbent-relative speedup.
 
-The final eight-file packet `35da3ab3` passes formatting, workspace all-targets
+The eight-file packet `35da3ab3` passes formatting, workspace all-targets
 compilation, separate production `--lib --bins`, strict Clippy, and portable
-production. Its complete native execution is still pending. The final
-test-only correction seeds the populated-worker fixture's large
+production. Its complete native execution runs **1,717 cases: 1,710 pass,
+six fail, one times out**, with 12,374 skipped and 1,586.130 seconds of test
+execution. All original 805 and 338 cases pass; every earlier expanded case
+is present. Five stable executable hashes and all 11 worker source hashes are
+retained. The unchanged publication-with-refusals case now passes, while the
+aggregate-count case, four cleanup/admission cases and empty-directory timeout
+remain red. The populated-worker case also fails while discovering its newly
+spawned maintenance thread, after both healthy committed-byte setup checks pass.
+
+The first test-only correction seeds the populated-worker fixture's large
 index from committed HEAD, preserving mail that background index sync has not
 yet copied. Added raw committed-byte checks for all 255 healthy messages before
 and after setup strengthen the fixture; the original CPU, workload, deadline
-and final 256-message oracles remain intact. The complete final-source native
-run retains every earlier case, including this corrected worker fixture.
+and final 256-message oracles remain intact. A further test-only correction
+(`b8eda4fb`) polls for the actual production thread within the existing
+nine-second warmup and sleeps only its remainder. It grants no additional
+warmup or watchdog time. Formatting and the complete stock scan finish;
+compiler graphs and the complete native population still require terminal
+qualification on those final bytes. Initial native queue and portable disk
+admission refusals execute zero bodies and remain recorded separately.
+Four disjoint peer commits are subsequently preserved by fast-forward to
+`b0e31ce0`. Integrated qualification now uses that immutable base plus only the
+thread-discovery test overlay. It retains all 1,717 earlier selected cases and
+adds the incoming embedding-worker, rate-limit, ATC and OpenCode controls.
+The obsolete native preparation is cancelled before any compilation or test
+body; local cancellation and recovered delivery statuses are retained separately.
+Another real integration gap is then found in message reconciliation: it still
+uses the blocking lag sampler before selecting rows. The final runtime change
+uses the existing nonblocking sampler, defers unavailable evidence through the
+existing admission-contention path, and checks checkpointed workers before
+restoration as well as before selection. Its regression holds the actual global
+queue and checks both cursor modes, source/receipt preservation, shutdown and
+real repair after release. Native assertions are pending execution.
+Final qualification uses the same base plus three source overlays (`788b21ed`),
+bound by an 18-file manifest. Formatting and stock scanning complete; the native
+selection is admitted and compiling on vmi1149989. After its earlier queue
+refusal, the all-targets retry passes on hz4 (exit 0, 1,376.2 seconds). Portable
+production passes separately (exit 0, 861.2 seconds); both check-worker manifests
+match all 18 declared files. The pinned proc-macro-error2 future-Rust warning is
+retained from h10. Separate default production also passes (exit 0, 690.9 seconds).
+Strict Clippy exposes two incoming semantic-recovery style errors, then four
+incoming ATC assertion-style errors. Their fixes preserve behavior and predicates.
+Native execution actually starts 1,818 cases across five binaries; its original
+empty-directory timeout remains red, and an incoming ATC fixture also fails when
+normal probing replaces two artificial future deadlines for never-observed
+agents. That fixture now seeds active, recently probed agents and positively
+checks no reprobe, preserving all 940-agent, 2,820-entry, bounded-pop and eventual
+unique-review oracles. Probing remains enabled. This is a fixture correction,
+not a measured runtime scheduling repair. Two further semantic test lints use
+checked time subtraction and an explicit mutex-guard drop after its last use.
+Peer540db95c is preserved without overlapping edits. One final OpenCode test
+lint uses equivalent empty-vector equality. Final f18 binds that base plus six
+overlays and adds the incoming diagnostic-retention controls to native testing.
+It requires its own compiler checks and complete native execution; H13's
+original failure and every retained retention failure remain evidence. H13's
+populated maintenance case passes71.812s with its original workload, CPU and
+convergence assertions; publication-with-refusals and repeated-hourly retention
+fail in this run despite earlier passes. No green/flake inference follows.
+That passing maintenance fixture records3,780ms of worker-thread CPU during
+30,000ms wall time,35,268ms to convergence,32,394,392 index bytes and256 source/
+committed messages. It is bounded synthetic worker evidence with reporting and
+quota disabled, not an incumbent-relative speedup, service soak or the requested
+release send-latency overhead qualification.
+H13 terminates at its unchanged1,800-second suite limit:1,644 of1,818 selected
+cases run,1,634 pass,eight fail,one times out at240s,and one is terminated by
+the global watchdog;174 are not run and12,294 are skipped. All original805 and
+338 cases pass, but174 earlier h10 cases remain unexecuted. Five stable actual
+executable identities are retained. This is incomplete expanded qualification.
+The installed runner confirms that no-capture forces serial execution. Final
+f20 uses two test processes with captured success/failure output and preserves
+all1,818 identities plus14 incoming diagnostic controls, normal isolation
+overrides and every existing deadline/resource bound. This explicit concurrency
+change is not presented as a serial pass or a service performance improvement.
+Final f20 also preserves fresh diagnostic-string allocations while resolving
+the integrated lint error; its existing regression now checks spare tool-name
+capacity as well as agent/project bounds. Unused helper removal, private-module
+visibility/doc fixes and equivalent borrowed optional capacity accounting
+complete the ten-overlay packet. Final-source qualification is pending.
+Earlier compiler/native results do not qualify this final source.
 These are self-reviewed functional repairs, not independent verification or
 evidence of a startup speedup. The owned Beads remain in progress.
 
