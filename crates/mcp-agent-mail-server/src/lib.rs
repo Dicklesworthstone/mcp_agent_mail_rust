@@ -581,16 +581,13 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..idx]
 }
 
-/// Build a masked preview string (max 200 chars) from tool result contents.
+/// Build a masked preview string (max 200 bytes) from tool result contents.
 fn result_preview_from_contents(contents: &[Content]) -> Option<String> {
     let Content::Text { text: raw } = contents.first()? else {
         return None;
     };
     let masked = console::mask_result_preview(raw);
-    Some(console::bounded_diagnostic_text(
-        &masked.replace('\n', "\\n").replace('\r', "\\r"),
-        200,
-    ))
+    Some(truncate_utf8(&masked.replace('\n', "\\n").replace('\r', "\\r"), 200).to_owned())
 }
 
 /// Build a preview string (max 200 chars, masked) from a sync tool result.

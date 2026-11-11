@@ -15990,7 +15990,10 @@ http_headers = { Authorization = "Bearer tok" }
         }))
         .unwrap();
         std::fs::write(&imported, &bytes).unwrap();
-        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            [] as [ConfigDriftReason; 0]
+        );
         assert_eq!(std::fs::read(&imported).unwrap(), bytes);
     }
 

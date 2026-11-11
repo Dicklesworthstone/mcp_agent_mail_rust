@@ -80,30 +80,36 @@ static RECENT_TOOL_CALLS: LazyLock<Mutex<VecDeque<RecentToolCall>>> =
 
 /// Append a finished call to the bounded ring, evicting the oldest entry
 /// once the ring is full. Called once per dispatched tool call.
-pub fn record_recent_call(mut call: RecentToolCall) {
+pub fn record_recent_call(call: RecentToolCall) {
     if call.tool.len() > RECENT_TOOL_CALL_NAME_BYTES {
         return;
     }
     // Fresh copies also release excessive spare capacity in caller-owned
     // strings; String::truncate/clear alone would retain that allocation.
-    call.tool = call.tool.as_str().to_owned();
-    call.project = call
-        .project
-        .as_deref()
-        .filter(|value| value.len() <= RECENT_TOOL_CALL_IDENTITY_BYTES)
-        .map(str::to_owned);
-    call.agent = call
-        .agent
-        .as_deref()
-        .filter(|value| value.len() <= RECENT_TOOL_CALL_IDENTITY_BYTES)
-        .map(str::to_owned);
+    let bounded_call = RecentToolCall {
+        finished_at_micros: call.finished_at_micros,
+        tool: call.tool.as_str().to_owned(),
+        project: call
+            .project
+            .as_deref()
+            .filter(|value| value.len() <= RECENT_TOOL_CALL_IDENTITY_BYTES)
+            .map(str::to_owned),
+        agent: call
+            .agent
+            .as_deref()
+            .filter(|value| value.len() <= RECENT_TOOL_CALL_IDENTITY_BYTES)
+            .map(str::to_owned),
+        latency_us: call.latency_us,
+        outcome: call.outcome,
+    };
+    drop(call);
     let mut ring = RECENT_TOOL_CALLS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if ring.len() >= RECENT_TOOL_CALL_CAPACITY {
         ring.pop_front();
     }
-    ring.push_back(call);
+    ring.push_back(bounded_call);
 }
 
 /// Calls that finished at or after `cutoff_micros`, newest first.
@@ -761,9 +767,11 @@ pub(crate) mod tests {
         let _guard = METRICS_LOCK.lock().unwrap();
         let mut overallocated = String::with_capacity(1024 * 1024);
         overallocated.push_str("ExactAgent");
+        let mut tool = String::with_capacity(1024 * 1024);
+        tool.push_str("diagnostic_bounds_test");
         record_recent_call(RecentToolCall {
             finished_at_micros: i64::MAX,
-            tool: "diagnostic_bounds_test".to_string(),
+            tool,
             project: Some("é".repeat(RECENT_TOOL_CALL_IDENTITY_BYTES)),
             agent: Some(overallocated),
             latency_us: 1,
@@ -781,6 +789,8 @@ pub(crate) mod tests {
         let agent = call.agent.as_ref().unwrap();
         assert_eq!(agent, "ExactAgent");
         assert_eq!(agent.capacity(), agent.len());
+        assert_eq!(call.tool.capacity(), call.tool.len());
+        drop(ring);
     }
 
     #[test]

@@ -3,19 +3,19 @@
 use serde_json::Value;
 use std::path::Path;
 
-pub(crate) const MASK_REDACTED: &str = "<redacted>";
-pub(crate) const DIAGNOSTIC_TRUNCATED: &str = "<truncated>";
+pub const MASK_REDACTED: &str = "<redacted>";
+pub const DIAGNOSTIC_TRUNCATED: &str = "<truncated>";
 /// Diagnostics retain a preview, never another copy of an entire request or
 /// response. The byte budget is complemented by node, depth and key limits so
 /// wide JSON containing tiny values cannot hide unbounded allocation overhead.
-pub(crate) const DIAGNOSTIC_JSON_BYTES: usize = 16 * 1024;
-pub(crate) const DIAGNOSTIC_JSON_NODES: usize = 256;
-pub(crate) const DIAGNOSTIC_STRING_BYTES: usize = 2048;
-pub(crate) const DIAGNOSTIC_KEY_BYTES: usize = 256;
+pub const DIAGNOSTIC_JSON_BYTES: usize = 16 * 1024;
+pub const DIAGNOSTIC_JSON_NODES: usize = 256;
+pub const DIAGNOSTIC_STRING_BYTES: usize = 2048;
+pub const DIAGNOSTIC_KEY_BYTES: usize = 256;
 
 /// Allocate only the retained UTF-8 preview. Truncating an owned `String`
 /// would keep its original, potentially multi-megabyte backing allocation.
-pub(crate) fn bounded_diagnostic_text(value: &str, max_bytes: usize) -> String {
+pub fn bounded_diagnostic_text(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
     }
@@ -36,7 +36,7 @@ struct DiagnosticJsonBudget {
 }
 
 /// Measure an arbitrary-precision JSON number without allocating its text.
-pub(crate) fn diagnostic_number_bytes(number: &serde_json::Number, limit: usize) -> Option<usize> {
+pub fn diagnostic_number_bytes(number: &serde_json::Number, limit: usize) -> Option<usize> {
     struct Counter {
         bytes: usize,
         limit: usize,
@@ -183,8 +183,10 @@ fn mask_json_depth(value: &Value, depth: usize, budget: &mut DiagnosticJsonBudge
 }
 
 /// Walk a `serde_json::Value` tree and replace values whose keys match
-/// sensitive patterns with redaction placeholders. Also sanitizes select known
-/// keys and visibly omits data beyond the bounded diagnostic preview budget.
+/// sensitive patterns with redaction placeholders.
+///
+/// Also sanitizes select known keys and visibly omits data beyond the bounded
+/// diagnostic preview budget.
 #[must_use]
 pub fn mask_json(value: &Value) -> Value {
     mask_json_depth(

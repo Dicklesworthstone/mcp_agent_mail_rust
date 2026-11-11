@@ -2428,9 +2428,9 @@ const SEMANTIC_RECOVERY_PAGE_SIZE: i64 = 16;
 #[cfg(feature = "hybrid")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SemanticRecoveryRange {
-    first_id: i64,
-    last_id: i64,
-    after_id: Option<i64>,
+    first: i64,
+    last: i64,
+    after: Option<i64>,
 }
 
 #[cfg(feature = "hybrid")]
@@ -2447,12 +2447,12 @@ struct SemanticRecovery {
 impl SemanticRecovery {
     fn record_failure(&mut self, id: i64, now: std::time::Instant) {
         let range = self.pending.get_or_insert(SemanticRecoveryRange {
-            first_id: id,
-            last_id: id,
-            after_id: None,
+            first: id,
+            last: id,
+            after: None,
         });
-        range.first_id = range.first_id.min(id);
-        range.last_id = range.last_id.max(id);
+        range.first = range.first.min(id);
+        range.last = range.last.max(id);
         // New failures widen the next pass, including IDs behind an active
         // cursor, but can never keep postponing its original deadline.
         self.not_before.get_or_insert_with(|| {
@@ -2702,7 +2702,7 @@ impl SemanticSource {
         recovery: &mut SemanticRecovery,
     ) -> usize {
         recovery.active.as_mut().map_or(0, |range| {
-            self.enqueue_canonical_page(requests, &mut range.after_id).1
+            self.enqueue_canonical_page(requests, &mut range.after).1
         })
     }
 
@@ -2765,7 +2765,7 @@ impl SemanticSource {
         };
         let recovery_requests = match recovery_range {
             Some(range) => {
-                let (sql, start) = match range.after_id {
+                let (sql, start) = match range.after {
                     Some(after) => (
                         "SELECT id, project_id, subject, body_md FROM messages \
                          WHERE id > ? AND id <= ? ORDER BY id LIMIT ?",
@@ -2774,7 +2774,7 @@ impl SemanticSource {
                     None => (
                         "SELECT id, project_id, subject, body_md FROM messages \
                          WHERE id >= ? AND id <= ? ORDER BY id LIMIT ?",
-                        range.first_id,
+                        range.first,
                     ),
                 };
                 let rows = conn
@@ -2782,7 +2782,7 @@ impl SemanticSource {
                         sql,
                         &[
                             Value::BigInt(start),
-                            Value::BigInt(range.last_id),
+                            Value::BigInt(range.last),
                             Value::BigInt(SEMANTIC_RECOVERY_PAGE_SIZE),
                         ],
                     )
@@ -3005,7 +3005,7 @@ impl SemanticBridge {
             IndexRefreshWorker::new(worker_cfg, runner.clone())
                 .with_source_refill(move |shutdown| refill_source.refill(shutdown))
                 .with_source_failure_recovery(move |results| {
-                    recovery_source.record_failures(results)
+                    recovery_source.record_failures(results);
                 }),
         );
         let worker = {
@@ -11488,21 +11488,24 @@ mod tests {
         assert_eq!(
             recovery.ready_range(first_deadline),
             Some(SemanticRecoveryRange {
-                first_id: i64::MIN,
-                last_id: i64::MAX,
-                after_id: None,
+                first: i64::MIN,
+                last: i64::MAX,
+                after: None,
             })
         );
-        recovery.active.as_mut().unwrap().after_id = Some(100);
+        recovery.active.as_mut().unwrap().after = Some(100);
         let failed_again = first_deadline + Duration::from_secs(1);
         recovery.record_failure(2, failed_again);
         let second_deadline = failed_again + Duration::from_mins(1);
-        recovery.record_failure(300, second_deadline - Duration::from_secs(1));
+        recovery.record_failure(
+            300,
+            second_deadline.checked_sub(Duration::from_secs(1)).unwrap(),
+        );
         assert_eq!(recovery.not_before, Some(second_deadline));
-        assert_eq!(recovery.pending.unwrap().first_id, 2);
-        assert_eq!(recovery.active.unwrap().after_id, Some(100));
+        assert_eq!(recovery.pending.unwrap().first, 2);
+        assert_eq!(recovery.active.unwrap().after, Some(100));
         recovery.active = None;
-        assert_eq!(recovery.ready_range(second_deadline).unwrap().first_id, 2);
+        assert_eq!(recovery.ready_range(second_deadline).unwrap().first, 2);
 
         // Permanently failing documents are retried slowly, with finite state
         // and a capped delay even after the round counter saturates.
@@ -11514,7 +11517,7 @@ mod tests {
             recovery.record_failure(-1, now);
             let due = now + Duration::from_secs(seconds);
             assert_eq!(recovery.not_before, Some(due));
-            assert_eq!(recovery.ready_range(due).unwrap().first_id, -1);
+            assert_eq!(recovery.ready_range(due).unwrap().first, -1);
         }
     }
 
@@ -11621,7 +11624,7 @@ mod tests {
         {
             let state = bridge.source.state.lock().unwrap();
             assert_eq!(state.after_id, Some(80));
-            assert_eq!(state.recovery.active.unwrap().after_id, None);
+            assert_eq!(state.recovery.active.unwrap().after, None);
         }
         assert_eq!(bridge.queue.drain_batch(1000).len(), 1000);
         embedder
@@ -11631,7 +11634,7 @@ mod tests {
         {
             let state = bridge.source.state.lock().unwrap();
             assert_eq!(state.after_id, Some(81));
-            assert_eq!(state.recovery.active.unwrap().after_id, Some(16));
+            assert_eq!(state.recovery.active.unwrap().after, Some(16));
         }
         assert!(bridge.index().contains(1, SearchDocKind::Message));
         assert!(bridge.index().contains(81, SearchDocKind::Message));
@@ -11651,7 +11654,7 @@ mod tests {
         {
             let mut state = bridge.source.state.lock().unwrap();
             assert!(state.recovery.active.is_none());
-            assert_eq!(state.recovery.pending.unwrap().first_id, 2);
+            assert_eq!(state.recovery.pending.unwrap().first, 2);
             state.recovery.not_before = Some(std::time::Instant::now());
         }
         assert_eq!(bridge.refresh_worker.run_cycle(), 1);
@@ -11711,6 +11714,7 @@ mod tests {
         assert_eq!(state.after_id, Some(8));
         assert!(state.recovery.active.is_none());
         assert!(state.recovery.pending.is_none());
+        drop(state);
     }
 
     #[cfg(feature = "hybrid")]

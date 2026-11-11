@@ -548,10 +548,8 @@ impl RetainedEventBytes {
         values.iter().all(|value| self.add(value.capacity()))
     }
 
-    fn optional(&mut self, value: &Option<String>) -> bool {
-        value
-            .as_ref()
-            .is_none_or(|value| self.add(value.capacity()))
+    fn optional(&mut self, value: Option<&String>) -> bool {
+        value.is_none_or(|value| self.add(value.capacity()))
     }
 
     fn vector<T>(&mut self, values: &Vec<T>) -> bool {
@@ -662,8 +660,8 @@ impl MailEvent {
                 ..
             } => {
                 size.strings([tool_name])
-                    && size.optional(project)
-                    && size.optional(agent)
+                    && size.optional(project.as_ref())
+                    && size.optional(agent.as_ref())
                     && size.json(params_json, 0)
             }
             Self::ToolCallEnd {
@@ -675,9 +673,9 @@ impl MailEvent {
                 ..
             } => {
                 size.strings([tool_name])
-                    && size.optional(result_preview)
-                    && size.optional(project)
-                    && size.optional(agent)
+                    && size.optional(result_preview.as_ref())
+                    && size.optional(project.as_ref())
+                    && size.optional(agent.as_ref())
                     && size.vector(per_table)
                     && per_table.iter().all(|(name, _)| size.strings([name]))
             }

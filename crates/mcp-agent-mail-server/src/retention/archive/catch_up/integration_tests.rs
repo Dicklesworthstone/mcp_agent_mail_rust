@@ -927,7 +927,7 @@ fn run_populated_maintenance_child(receipt: &std::path::Path) {
 }
 
 #[cfg(target_os = "linux")]
-fn maintenance_thread_stat() -> std::path::PathBuf {
+fn maintenance_thread_stat() -> Option<std::path::PathBuf> {
     std::fs::read_dir("/proc/self/task")
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -935,8 +935,7 @@ fn maintenance_thread_stat() -> std::path::PathBuf {
             std::fs::read_to_string(path.join("comm"))
                 .is_ok_and(|name| name.trim() == "retention-quota")
         })
-        .expect("the production maintenance worker must exist")
-        .join("stat")
+        .map(|path| path.join("stat"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1103,10 +1102,22 @@ fn gh383_populated_maintenance_paces_cpu_and_reaches_old_orphan() {
                 }
                 super::super::start(&fixture.config);
                 let worker = Worker;
-                let stat = maintenance_thread_stat();
+                let warmup_started = Instant::now();
+                let warmup = Duration::from_secs(9);
+                let stat = loop {
+                    assert!(
+                        warmup_started.elapsed() < warmup,
+                        "the production maintenance worker must exist before the CPU window"
+                    );
+                    if let Some(stat) = maintenance_thread_stat() {
+                        break stat;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
                 // Start just before the worker's ten-second startup admission;
-                // the measured interval includes actual catch-up and its rest.
-                std::thread::sleep(Duration::from_secs(9));
+                // thread birth consumes the same premeasurement period instead
+                // of extending it. Include actual catch-up and its rest.
+                std::thread::sleep(warmup.saturating_sub(warmup_started.elapsed()));
                 let started = Instant::now();
                 let before = thread_cpu_ticks(&stat);
                 std::thread::sleep(Duration::from_secs(30));

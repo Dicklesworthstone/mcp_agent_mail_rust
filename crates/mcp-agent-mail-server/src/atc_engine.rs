@@ -13637,7 +13637,7 @@ mod alien_enhancement_tests {
             let dirty_before = engine.dirty_agents.clone();
             let heap_before = engine.liveness_schedule.len();
             let turn_before = engine.dirty_review_next;
-            assert!(engine.pop_due_agents(1, 0).is_empty());
+            assert_eq!(engine.pop_due_agents(1, 0), [] as [String; 0]);
             assert_eq!(engine.dirty_agents, dirty_before);
             assert_eq!(engine.liveness_schedule.len(), heap_before);
             assert_eq!(engine.dirty_review_next, turn_before);
@@ -13661,10 +13661,9 @@ mod alien_enhancement_tests {
         assert_eq!(due, vec!["AgentA", "AgentB", "AgentC"]);
         assert!(engine.dirty_agents.is_empty());
         assert!(engine.liveness_schedule.is_empty());
-        assert!(
-            engine
-                .pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK)
-                .is_empty()
+        assert_eq!(
+            engine.pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK),
+            [] as [String; 0]
         );
     }
 
@@ -13675,6 +13674,12 @@ mod alien_enhancement_tests {
         for index in 0..POPULATION {
             let agent = format!("Rescheduled{index:04}");
             engine.register_agent(&agent, "codex-cli", None);
+            // These are active, recently probed agents. Otherwise the full
+            // tick legitimately selects never-probed identities and replaces
+            // their artificial deadlines while this test counts heap pops.
+            let entry = engine.agents.get_mut(&agent).expect("registered agent");
+            entry.rhythm.observe(1);
+            entry.probe_sent_at = 1;
             // Use the production reschedule path to retain two obsolete
             // versions ahead of the actual future review for each identity.
             engine.schedule_entry_for_push(&agent, 1);
@@ -13686,6 +13691,7 @@ mod alien_enhancement_tests {
 
         let now_micros = 3;
         let report = engine.run_tick(now_micros);
+        assert!(engine.agents.values().all(|entry| entry.probe_sent_at == 1));
         assert_eq!(report.summary.kernel.due_agents, 0);
         assert_eq!(report.summary.kernel.scheduled_agents, POPULATION);
         assert_eq!(
@@ -13718,10 +13724,9 @@ mod alien_enhancement_tests {
         let mut passes = 1;
         while engine.liveness_schedule.len() > POPULATION {
             let before = engine.liveness_schedule.len();
-            assert!(
-                engine
-                    .pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK)
-                    .is_empty()
+            assert_eq!(
+                engine.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK),
+                [] as [String; 0]
             );
             let popped = before - engine.liveness_schedule.len();
             assert!((1..=MAX_LIVENESS_SCHEDULE_POPS_PER_TICK).contains(&popped));
@@ -13734,7 +13739,7 @@ mod alien_enhancement_tests {
         let mut reviewed = HashSet::new();
         while !engine.liveness_schedule.is_empty() {
             let due = engine.pop_due_agents(1_000_000, MAX_LIVENESS_REVIEWS_PER_TICK);
-            assert!(!due.is_empty());
+            assert_ne!(due, [] as [String; 0]);
             for agent in due {
                 assert!(
                     reviewed.insert(agent),
