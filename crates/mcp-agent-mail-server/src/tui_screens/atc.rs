@@ -576,8 +576,11 @@ impl AtcScreen {
         lines.push(format!("  Tick count:     {}", snap.tick_count));
         lines.push(format!("  Policy:         {}", atc_policy_label(snap)));
         lines.push(format!(
-            "  Learning:       decisions={} open={} resolved={}",
-            snap.decisions_total, snap.experiences_open, snap.experiences_resolved
+            "  Learning:       decisions={} open={} resolved={} censored={}",
+            snap.decisions_total,
+            snap.experiences_open,
+            snap.experiences_resolved,
+            snap.experiences_censored
         ));
         lines.push(format!(
             "  Fairness:       e-process={:.3} regret_avg={:.3}",
@@ -1203,6 +1206,7 @@ mod tests {
             tick_count: 42,
             experiences_open: 3,
             experiences_resolved: 9,
+            experiences_censored: 2,
             policy_revision: 7,
             tracked_agents: vec![
                 AtcOperatorAgentSnapshot {
@@ -1354,6 +1358,22 @@ mod tests {
         assert!(
             text.contains("liveness/probe"),
             "expected decision class in table, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn learning_detail_distinguishes_censored_and_resolved_outcomes() {
+        let mut screen = AtcScreen::new();
+        screen.snapshot = Some(sample_snapshot());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 24, &mut pool);
+        screen.render_detail_panel(&mut frame, Rect::new(0, 0, 120, 24));
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("decisions=11 open=3 resolved=9 censored=2"),
+            "expected separate learning outcomes, got:\n{text}"
         );
     }
 

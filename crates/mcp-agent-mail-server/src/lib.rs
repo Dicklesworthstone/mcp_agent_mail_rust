@@ -7187,8 +7187,10 @@ pub(crate) struct AtcOperatorSnapshot {
     pub(crate) safe_mode: bool,
     pub(crate) kill_switch_enabled: bool,
     pub(crate) tick_count: u64,
+    /// Current-process liveness feedback, separate from durable observability.
     pub(crate) experiences_open: usize,
     pub(crate) experiences_resolved: u64,
+    pub(crate) experiences_censored: u64,
     pub(crate) policy_revision: u64,
     pub(crate) tracked_agents: Vec<AtcOperatorAgentSnapshot>,
     pub(crate) deadlock_cycles: usize,
@@ -9110,6 +9112,7 @@ fn build_atc_operator_snapshot(
             tick_count: summary.tick_count,
             experiences_open: summary.experiences_open,
             experiences_resolved: summary.experiences_resolved,
+            experiences_censored: summary.experiences_censored,
             policy_revision: summary.policy_revision,
             tracked_agents: summary
                 .tracked_agents

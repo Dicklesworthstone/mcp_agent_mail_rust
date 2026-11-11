@@ -1804,6 +1804,10 @@ struct PendingLivenessFeedback {
     action: LivenessAction,
     expected_loss: f64,
     issued_at_micros: i64,
+    /// Score independent Alive observations using the policy that issued the
+    /// decision, even if tuning or reload changes the policy before feedback.
+    alive_loss_at_issue: f64,
+    correct_if_alive_at_issue: bool,
 }
 
 /// Infer a reasonable inter-activity prior from program name.
@@ -4221,6 +4225,9 @@ pub struct AtcEngine {
     snapshot_seq: u64,
     /// Number of feedback resolutions received (resolved experiences).
     resolved_experience_count: u64,
+    /// Feedback windows closed without an independent outcome observation.
+    /// Expiration and supersession are censored, never successful predictions.
+    censored_experience_count: u64,
     /// Per-agent intervention counts for concentration detection.
     agent_intervention_counts: HashMap<String, u64>,
     /// Cached state from the previous snapshot for delta computation.
@@ -4389,6 +4396,7 @@ impl AtcEngine {
             tick_count: 0,
             snapshot_seq: 0,
             resolved_experience_count: 0,
+            censored_experience_count: 0,
             agent_intervention_counts: HashMap::new(),
             prev_snapshot_state: PrevSnapshotState::default(),
             reservation_event_log: VecDeque::new(),
@@ -4879,14 +4887,30 @@ impl AtcEngine {
         if action == LivenessAction::DeclareAlive {
             return;
         }
-        self.pending_liveness_feedback.insert(
-            agent.to_string(),
-            PendingLivenessFeedback {
-                action,
-                expected_loss,
-                issued_at_micros,
-            },
-        );
+        if self
+            .pending_liveness_feedback
+            .insert(
+                agent.to_string(),
+                PendingLivenessFeedback {
+                    action,
+                    expected_loss,
+                    issued_at_micros,
+                    alive_loss_at_issue: self
+                        .liveness_core
+                        .loss_entry(action, LivenessState::Alive),
+                    correct_if_alive_at_issue: action
+                        == self
+                            .liveness_core
+                            .best_action_for_state(LivenessState::Alive),
+                },
+            )
+            .is_some()
+        {
+            // The bounded per-agent frontier retains the newest decision. A
+            // superseded decision has no attributable outcome; replacing it
+            // must not silently turn it into resolved learning evidence.
+            self.censored_experience_count = self.censored_experience_count.saturating_add(1);
+        }
     }
 
     fn apply_liveness_feedback(
@@ -4967,63 +4991,47 @@ impl AtcEngine {
         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
             return;
         };
-        let (actual_loss, correct) = match pending.action {
-            LivenessAction::ReleaseReservations => (100.0, false),
-            LivenessAction::Suspect => (2.0, true),
-            LivenessAction::DeclareAlive => (0.0, true),
-        };
+        if timestamp_micros.saturating_sub(pending.issued_at_micros)
+            >= self.liveness_feedback_window_micros()
+        {
+            // Use observation time as well as the periodic sweep. Otherwise
+            // the same late activity trains or does not train depending only
+            // on whether an operator tick happened to run first.
+            self.censored_experience_count = self.censored_experience_count.saturating_add(1);
+            return;
+        }
+        // Independent activity establishes Alive. Score the issued action
+        // against that state using the issued policy's costs: suspecting a live
+        // agent is not a correct Flaky prediction merely because it replied.
         self.apply_liveness_feedback(
             agent,
             pending.action,
             LivenessState::Alive,
             pending.expected_loss,
-            actual_loss,
-            correct,
+            pending.alive_loss_at_issue,
+            pending.correct_if_alive_at_issue,
             timestamp_micros,
         );
     }
 
-    fn resolve_stale_liveness_feedback(&mut self, now_micros: i64) {
-        let feedback_window_micros = self.config.probe_interval_micros.max(60_000_000);
-        let expired_agents: Vec<String> = self
-            .pending_liveness_feedback
-            .iter()
-            .filter_map(|(agent, pending)| {
-                (now_micros.saturating_sub(pending.issued_at_micros) >= feedback_window_micros)
-                    .then_some(agent.clone())
-            })
-            .collect();
-        for agent in expired_agents {
-            let Some(pending) = self.pending_liveness_feedback.remove(&agent) else {
-                continue;
-            };
-            let true_state = self
-                .agents
-                .get(&agent)
-                .map_or(LivenessState::Dead, |entry| entry.state);
-            let (actual_loss, correct) = match pending.action {
-                LivenessAction::ReleaseReservations => match true_state {
-                    LivenessState::Dead => (1.0, true),
-                    LivenessState::Flaky => (20.0, false),
-                    LivenessState::Alive => (100.0, false),
-                },
-                LivenessAction::Suspect => match true_state {
-                    LivenessState::Alive => (8.0, false),
-                    LivenessState::Flaky => (2.0, true),
-                    LivenessState::Dead => (6.0, true),
-                },
-                LivenessAction::DeclareAlive => (0.0, true),
-            };
-            self.apply_liveness_feedback(
-                &agent,
-                pending.action,
-                true_state,
-                pending.expected_loss,
-                actual_loss,
-                correct,
-                now_micros,
-            );
-        }
+    fn liveness_feedback_window_micros(&self) -> i64 {
+        self.config.probe_interval_micros.max(60_000_000)
+    }
+
+    fn expire_stale_liveness_feedback(&mut self, now_micros: i64) {
+        let feedback_window_micros = self.liveness_feedback_window_micros();
+        let before = self.pending_liveness_feedback.len();
+        self.pending_liveness_feedback.retain(|_, pending| {
+            now_micros.saturating_sub(pending.issued_at_micros) < feedback_window_micros
+        });
+        // An agent's inferred Dead/Flaky state is the prediction under review,
+        // not ground truth. Silence alone cannot validate that prediction or
+        // train calibration, adaptive thresholds, survival, or the loss tuner.
+        // The bounded frontier can expire while the outcome remains unknown.
+        let expired = before.saturating_sub(self.pending_liveness_feedback.len());
+        self.censored_experience_count = self
+            .censored_experience_count
+            .saturating_add(u64::try_from(expired).unwrap_or(u64::MAX));
     }
 
     fn prune_stale_conflicts(&mut self, now_micros: i64) {
@@ -5917,6 +5925,7 @@ impl AtcEngine {
             decisions_total: self.ledger.latest_id(),
             experiences_open: self.pending_liveness_feedback.len(),
             experiences_resolved: self.resolved_experience_count,
+            experiences_censored: self.censored_experience_count,
             calibration_consecutive_correct: self.calibration.consecutive_correct(),
             calibration_recovery_target: self.calibration.recovery_count(),
             regime_state,
@@ -6158,7 +6167,7 @@ impl AtcEngine {
     fn run_tick(&mut self, now_micros: i64) -> AtcTickReport {
         let total_started = Instant::now();
         self.tick_count = self.tick_count.saturating_add(1);
-        self.resolve_stale_liveness_feedback(now_micros);
+        self.expire_stale_liveness_feedback(now_micros);
         self.prune_stale_conflicts(now_micros);
 
         let decision_fallback_reason = self.current_release_guard_reason();
@@ -8071,6 +8080,267 @@ mod engine_tests {
                 .contains_key("FeedbackAgent")
         );
         assert_eq!(engine.resolved_experience_count, 1);
+    }
+
+    fn isolated_liveness_feedback_test() -> bool {
+        // Calibration also updates process-global conformal, threshold, and
+        // loss-tuner state. Other local engine tests can feed those globals,
+        // so verify their invariance in a real, otherwise empty test process.
+        const CHILD: &str = "AM_TEST_LIVENESS_FEEDBACK_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let log = output.reopen().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{name} exceeded its watchdog");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let log = std::fs::read_to_string(output.path()).unwrap();
+        assert!(
+            status.success() && log.contains("1 passed; 0 failed"),
+            "{name}: {log}"
+        );
+        true
+    }
+
+    #[test]
+    fn liveness_feedback_expiration_is_censored_not_ground_truth() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new(AtcConfig {
+            enabled: true,
+            safe_mode_recovery_count: 1,
+            ..AtcConfig::default()
+        });
+        let issued_at = 10_000_000;
+        let expires_at = issued_at + engine.liveness_feedback_window_micros();
+        for (name, state, action) in [
+            (
+                "PredictedDead",
+                LivenessState::Dead,
+                LivenessAction::ReleaseReservations,
+            ),
+            (
+                "PredictedFlaky",
+                LivenessState::Flaky,
+                LivenessAction::Suspect,
+            ),
+            (
+                "PredictedAlive",
+                LivenessState::Alive,
+                LivenessAction::Suspect,
+            ),
+        ] {
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.agents.get_mut(name).unwrap().state = state;
+            engine.record_pending_liveness_feedback(name, action, 7.0, issued_at);
+        }
+        engine.set_safe_mode(true, issued_at);
+        let policy_revision = engine.policy_revision;
+        let loss_matrix = engine.liveness_core.loss_matrix.clone();
+
+        engine.expire_stale_liveness_feedback(expires_at - 1);
+        assert_eq!(engine.pending_liveness_feedback.len(), 3);
+        assert_eq!(engine.censored_experience_count, 0);
+        engine.expire_stale_liveness_feedback(expires_at);
+        engine.expire_stale_liveness_feedback(i64::MAX);
+
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(engine.censored_experience_count, 3);
+        assert_eq!(engine.resolved_experience_count, 0);
+        assert!(
+            engine.is_safe_mode(),
+            "silence cannot satisfy safe-mode recovery"
+        );
+        assert_eq!(engine.calibration.consecutive_correct(), 0);
+        assert_eq!(
+            engine.eprocess.global.sum_centered.to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert!(engine.eprocess.per_agent.is_empty());
+        assert_eq!(engine.cusum.s_pos.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(engine.cusum.s_neg.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(engine.regret.outcome_count(), 0);
+        assert!(engine.agent_intervention_counts.is_empty());
+        assert_eq!(engine.policy_revision, policy_revision);
+        assert_eq!(engine.liveness_core.loss_matrix, loss_matrix);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        assert_eq!(tuner.decisions_since_update, 0);
+        assert!(tuner.regret_accum.is_empty());
+        drop(tuner);
+        let conformal = ATC_CONFORMAL.get().unwrap().lock().unwrap();
+        assert!(conformal.sets[&AtcSubsystem::Liveness].scores.is_empty());
+        drop(conformal);
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds.values().all(|threshold| {
+            threshold.alpha.to_bits() == 2.0_f64.to_bits()
+                && threshold.beta_param.to_bits() == 2.0_f64.to_bits()
+        }));
+        drop(thresholds);
+        assert!(ATC_SURVIVAL.get().unwrap().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn liveness_feedback_uses_observation_time_at_expiration_boundary() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new_for_testing();
+        let issued_at = 10_000_000;
+        let expires_at = issued_at + engine.liveness_feedback_window_micros();
+        for (name, offset) in [("Observed", -1), ("AtDeadline", 0), ("AfterDeadline", 1)] {
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.agents.get_mut(name).unwrap().state = LivenessState::Dead;
+            engine.record_pending_liveness_feedback(
+                name,
+                LivenessAction::ReleaseReservations,
+                1.0,
+                issued_at,
+            );
+            engine.observe_activity(name, None, expires_at + offset);
+            assert_eq!(engine.agent_liveness(name), Some(LivenessState::Alive));
+        }
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(engine.resolved_experience_count, 1);
+        assert_eq!(engine.censored_experience_count, 2);
+        assert!(engine.eprocess.per_agent.contains_key("Observed"));
+        assert!(!engine.eprocess.per_agent.contains_key("AtDeadline"));
+        assert!(!engine.eprocess.per_agent.contains_key("AfterDeadline"));
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds["Observed"].precision_estimate() < 0.5);
+        assert_eq!(
+            thresholds["AtDeadline"].beta_param.to_bits(),
+            2.0_f64.to_bits()
+        );
+        assert_eq!(
+            thresholds["AfterDeadline"].beta_param.to_bits(),
+            2.0_f64.to_bits()
+        );
+        drop(thresholds);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        assert_eq!(tuner.decisions_since_update, 1);
+        assert_eq!(
+            tuner.regret_accum[&(LivenessAction::ReleaseReservations, LivenessState::Alive)].1,
+            1
+        );
+    }
+
+    #[test]
+    fn liveness_feedback_scores_observed_alive_against_issued_policy() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new(AtcConfig {
+            enabled: true,
+            safe_mode_recovery_count: 1,
+            ..AtcConfig::default()
+        });
+        engine.set_safe_mode(true, 1);
+        for (name, alive_loss) in [("DefaultPolicy", 8.0), ("TunedPolicy", 23.0)] {
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::Suspect,
+                LivenessState::Alive,
+                alive_loss,
+            );
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::DeclareAlive,
+                LivenessState::Alive,
+                0.0,
+            );
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.record_pending_liveness_feedback(name, LivenessAction::Suspect, 2.0, 1);
+            // Both the incurred cost and best action change while the outcome
+            // is pending. Neither may rewrite the issued decision's score.
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::Suspect,
+                LivenessState::Alive,
+                99.0,
+            );
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::DeclareAlive,
+                LivenessState::Alive,
+                1000.0,
+            );
+            assert_eq!(
+                engine
+                    .liveness_core
+                    .best_action_for_state(LivenessState::Alive),
+                LivenessAction::Suspect
+            );
+            engine.observe_activity(name, None, 2);
+        }
+
+        assert_eq!(engine.resolved_experience_count, 2);
+        assert_eq!(engine.censored_experience_count, 0);
+        assert!(
+            engine.is_safe_mode(),
+            "a false suspicion cannot recover calibration"
+        );
+        assert_eq!(engine.calibration.consecutive_correct(), 0);
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds.values().all(|threshold| {
+            threshold.alpha.to_bits() == 2.0_f64.to_bits()
+                && threshold.beta_param.to_bits() == 3.0_f64.to_bits()
+        }));
+        drop(thresholds);
+        let conformal = ATC_CONFORMAL.get().unwrap().lock().unwrap();
+        let scores = &conformal.sets[&AtcSubsystem::Liveness].scores;
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].to_bits(), 6.0_f64.to_bits());
+        assert_eq!(scores[1].to_bits(), 21.0_f64.to_bits());
+        drop(conformal);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        let (regret, count) = tuner.regret_accum[&(LivenessAction::Suspect, LivenessState::Alive)];
+        assert_eq!(count, 2);
+        assert_eq!(regret.to_bits(), 27.0_f64.to_bits());
+    }
+
+    #[test]
+    fn liveness_feedback_tick_publishes_censorship_and_supersession() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Silent", "codex-cli", None);
+        engine.agents.get_mut("Silent").unwrap().state = LivenessState::Dead;
+        engine.record_pending_liveness_feedback("Silent", LivenessAction::Suspect, 2.0, 1);
+        engine.record_pending_liveness_feedback(
+            "Silent",
+            LivenessAction::ReleaseReservations,
+            1.0,
+            2,
+        );
+        assert_eq!(engine.censored_experience_count, 1);
+        let report = engine.run_tick(2 + engine.liveness_feedback_window_micros());
+        assert_eq!(report.summary.experiences_open, 0);
+        assert_eq!(report.summary.experiences_resolved, 0);
+        assert_eq!(report.summary.experiences_censored, 2);
+        assert_eq!(
+            engine.eprocess.global.sum_centered.to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
@@ -12822,10 +13092,13 @@ pub struct AtcSummarySnapshot {
     pub regret_trend: TrendDirection,
     /// Total decisions recorded in the evidence ledger.
     pub decisions_total: u64,
-    /// Open experiences (decisions awaiting ground-truth feedback).
+    /// Process-local liveness decisions awaiting independent feedback.
     pub experiences_open: usize,
-    /// Resolved experiences (decisions with feedback received).
+    /// Process-local liveness decisions with independent feedback received.
     pub experiences_resolved: u64,
+    /// Process-local liveness decisions expired or superseded without an
+    /// independent outcome. These do not update any learning controller.
+    pub experiences_censored: u64,
 
     // ── calibration & regime (operator-facing) ───────────────────────
     /// Calibration guard state: consecutive correct predictions toward

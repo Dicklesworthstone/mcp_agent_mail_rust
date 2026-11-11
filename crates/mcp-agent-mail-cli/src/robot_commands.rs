@@ -2279,6 +2279,9 @@ struct AtcRobotSnapshot {
     experiences_open: usize,
     #[serde(default)]
     experiences_resolved: u64,
+    /// Current-process liveness feedback. Missing on older daemon snapshots.
+    #[serde(default)]
+    experiences_censored: Option<u64>,
     #[serde(default)]
     policy_revision: u64,
     #[serde(default)]
@@ -2501,6 +2504,13 @@ struct AtcRobotExecution {
 }
 
 #[derive(Debug, Serialize)]
+struct AtcLivenessFeedbackData {
+    open: usize,
+    resolved: u64,
+    censored: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct AtcSummaryData {
     enabled: bool,
     source: String,
@@ -2513,6 +2523,10 @@ struct AtcSummaryData {
     experiences_resolved: u64,
     experiences_censored: u64,
     experiences_expired: u64,
+    /// Current-process liveness decisions, separate from durable experience
+    /// rollups. Absent when an older daemon or the local DB cannot report them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liveness_feedback: Option<AtcLivenessFeedbackData>,
     tracked_agents: usize,
     degraded_agents: usize,
     deadlock_cycles: usize,
@@ -15417,6 +15431,13 @@ fn atc_summary_data(
         experiences_resolved: resolved_total,
         experiences_censored: censored_total,
         experiences_expired: expired_total,
+        liveness_feedback: snapshot
+            .experiences_censored
+            .map(|censored| AtcLivenessFeedbackData {
+                open: snapshot.experiences_open,
+                resolved: snapshot.experiences_resolved,
+                censored,
+            }),
         tracked_agents: snapshot.tracked_agents.len(),
         degraded_agents: snapshot
             .tracked_agents
@@ -19667,6 +19688,7 @@ mod tests {
             tick_count: 7,
             experiences_open: 4,
             experiences_resolved: 9,
+            experiences_censored: None,
             policy_revision: 17,
             tracked_agents: vec![
                 AtcRobotAgent {
@@ -20215,6 +20237,40 @@ mod tests {
                 .map(|execution| execution.trace_id.as_str()),
             Some("atc-trace-12")
         );
+    }
+
+    #[test]
+    fn atc_summary_distinguishes_live_feedback_from_durable_experiences() {
+        let mut snapshot = sample_atc_snapshot();
+        snapshot.experiences_censored = Some(7);
+        let summary = atc_summary_data(&snapshot, None, 5);
+        assert_eq!(summary.experiences_resolved, 9);
+        assert_eq!(summary.experiences_censored, 1);
+        let live = summary.liveness_feedback.as_ref().unwrap();
+        assert_eq!(live.open, 4);
+        assert_eq!(live.resolved, 9);
+        assert_eq!(live.censored, 7);
+
+        snapshot.experiences_censored = Some(0);
+        let summary = atc_summary_data(&snapshot, None, 5);
+        assert_eq!(summary.experiences_censored, 1);
+        assert_eq!(summary.liveness_feedback.as_ref().unwrap().censored, 0);
+        let payload = serde_json::to_value(summary).unwrap();
+        assert_eq!(payload["liveness_feedback"]["censored"], 0);
+
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("experiences_censored");
+        let legacy: AtcRobotSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.experiences_censored, None);
+        let summary = atc_summary_data(&legacy, None, 5);
+        assert_eq!(summary.experiences_resolved, 9);
+        assert_eq!(summary.experiences_censored, 1);
+        assert!(summary.liveness_feedback.is_none());
+        let payload = serde_json::to_value(summary).unwrap();
+        assert!(payload.get("liveness_feedback").is_none());
     }
 
     #[test]
