@@ -14,6 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const DEFAULT_EVENT_RING_CAPACITY: usize = 10_000;
+/// Retained event payloads have a separate byte budget: a count limit alone
+/// can retain gigabytes of large tool arguments. This is a conservative heap
+/// estimate (including String/Vec capacity and JSON map overhead), not RSS.
+pub(crate) const EVENT_RING_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_EVENT_RETAINED_BYTES: usize = 256 * 1024;
+const DIAGNOSTIC_IDENTITY_BYTES: usize = 4096;
 /// Bounded scan window for low-severity-preferred eviction when the ring is full.
 ///
 /// A tight bound prevents O(capacity) scans under sustained load while still
@@ -528,7 +534,258 @@ pub enum MailEvent {
     },
 }
 
+struct RetainedEventBytes {
+    bytes: usize,
+}
+
+impl RetainedEventBytes {
+    fn add(&mut self, bytes: usize) -> bool {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.bytes <= MAX_EVENT_RETAINED_BYTES
+    }
+
+    fn strings<const N: usize>(&mut self, values: [&String; N]) -> bool {
+        values.iter().all(|value| self.add(value.capacity()))
+    }
+
+    fn optional(&mut self, value: &Option<String>) -> bool {
+        value
+            .as_ref()
+            .is_none_or(|value| self.add(value.capacity()))
+    }
+
+    fn vector<T>(&mut self, values: &Vec<T>) -> bool {
+        self.add(values.capacity().saturating_mul(std::mem::size_of::<T>()))
+    }
+
+    fn json(&mut self, value: &Value, depth: usize) -> bool {
+        if depth > 20 {
+            return false;
+        }
+        match value {
+            Value::String(value) => self.add(value.capacity()),
+            Value::Array(values) => {
+                self.vector(values) && values.iter().all(|value| self.json(value, depth + 1))
+            }
+            Value::Object(values) => {
+                // Normalized maps are built fresh, with bounded cardinality.
+                // Allow generous node/table overhead for either serde_json
+                // map representation; do not serialize to measure a payload.
+                self.add(values.len().saturating_mul(256))
+                    && values
+                        .iter()
+                        .all(|(key, value)| self.add(key.capacity()) && self.json(value, depth + 1))
+            }
+            Value::Number(number) => crate::console::diagnostic_number_bytes(
+                number,
+                MAX_EVENT_RETAINED_BYTES.saturating_sub(self.bytes),
+            )
+            .is_some_and(|bytes| self.add(bytes.saturating_mul(2))),
+            Value::Null | Value::Bool(_) => true,
+        }
+    }
+}
+
+fn bound_diagnostic_identity(value: &mut Option<String>) {
+    *value = value
+        .as_deref()
+        .filter(|value| value.len() <= DIAGNOSTIC_IDENTITY_BYTES)
+        .map(str::to_owned);
+}
+
 impl MailEvent {
+    /// Bound tool diagnostics without changing authoritative arguments or
+    /// domain identities. Oversized optional identity context is omitted:
+    /// a shortened name could incorrectly link to another project or agent.
+    fn bound_diagnostics(&mut self) {
+        // Full health lists live in TuiSharedState's separate current snapshot.
+        // Keep the historical counters used by resource graphs even when a
+        // large roster would make each repeated pulse exceed the event budget.
+        if matches!(self, Self::HealthPulse { .. })
+            && self.retained_bytes() > MAX_EVENT_RETAINED_BYTES
+            && let Self::HealthPulse {
+                db_stats, redacted, ..
+            } = self
+        {
+            db_stats.agents_list = Vec::new();
+            db_stats.projects_list = Vec::new();
+            db_stats.contacts_list = Vec::new();
+            db_stats.reservation_snapshots = Vec::new();
+            *redacted = true;
+        }
+        match self {
+            Self::ToolCallStart {
+                tool_name,
+                params_json,
+                project,
+                agent,
+                ..
+            } => {
+                *tool_name = crate::console::bounded_diagnostic_text(tool_name, 256);
+                *params_json = crate::console::mask_json(params_json);
+                bound_diagnostic_identity(project);
+                bound_diagnostic_identity(agent);
+            }
+            Self::ToolCallEnd {
+                tool_name,
+                result_preview,
+                project,
+                agent,
+                ..
+            } => {
+                *tool_name = crate::console::bounded_diagnostic_text(tool_name, 256);
+                *result_preview = result_preview
+                    .as_deref()
+                    .map(|value| crate::console::bounded_diagnostic_text(value, 2048));
+                bound_diagnostic_identity(project);
+                bound_diagnostic_identity(agent);
+            }
+            _ => {}
+        }
+    }
+
+    /// Estimated retained bytes, or a sentinel above the per-event limit.
+    /// Accounting stops as soon as the limit is exceeded. This is also used
+    /// by UI caches which clone events after the source ring has evicted them.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // Exhaustive accounting keeps every retained payload visible.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let mut size = RetainedEventBytes {
+            bytes: std::mem::size_of::<Self>(),
+        };
+        let fits = match self {
+            Self::ToolCallStart {
+                tool_name,
+                params_json,
+                project,
+                agent,
+                ..
+            } => {
+                size.strings([tool_name])
+                    && size.optional(project)
+                    && size.optional(agent)
+                    && size.json(params_json, 0)
+            }
+            Self::ToolCallEnd {
+                tool_name,
+                result_preview,
+                per_table,
+                project,
+                agent,
+                ..
+            } => {
+                size.strings([tool_name])
+                    && size.optional(result_preview)
+                    && size.optional(project)
+                    && size.optional(agent)
+                    && size.vector(per_table)
+                    && per_table.iter().all(|(name, _)| size.strings([name]))
+            }
+            Self::MessageSent {
+                from,
+                to,
+                subject,
+                thread_id,
+                project,
+                body_md,
+                ..
+            }
+            | Self::MessageReceived {
+                from,
+                to,
+                subject,
+                thread_id,
+                project,
+                body_md,
+                ..
+            } => {
+                size.strings([from, subject, thread_id, project, body_md])
+                    && size.vector(to)
+                    && to.iter().all(|name| size.strings([name]))
+            }
+            Self::ReservationGranted {
+                agent,
+                paths,
+                project,
+                ..
+            }
+            | Self::ReservationReleased {
+                agent,
+                paths,
+                project,
+                ..
+            } => {
+                size.strings([agent, project])
+                    && size.vector(paths)
+                    && paths.iter().all(|path| size.strings([path]))
+            }
+            Self::AgentRegistered {
+                name,
+                program,
+                model_name,
+                project,
+                ..
+            } => size.strings([name, program, model_name, project]),
+            Self::HttpRequest {
+                method,
+                path,
+                client_ip,
+                ..
+            } => size.strings([method, path, client_ip]),
+            Self::GitSegfaultRetry {
+                name, repo_slug, ..
+            } => size.strings([name, repo_slug]),
+            Self::ServerStarted {
+                endpoint,
+                config_summary,
+                ..
+            } => size.strings([endpoint, config_summary]),
+            Self::ServerShutdown { .. } => true,
+            Self::HealthPulse { db_stats, .. } => {
+                size.vector(&db_stats.agents_list)
+                    && db_stats.agents_list.iter().all(|agent| {
+                        size.strings([&agent.project, &agent.name, &agent.program, &agent.model])
+                            && agent.health.as_ref().is_none_or(|health| {
+                                size.vector(&health.metrics)
+                                    && health
+                                        .metrics
+                                        .iter()
+                                        .all(|metric| size.strings([&metric.evidence]))
+                            })
+                    })
+                    && size.vector(&db_stats.projects_list)
+                    && db_stats
+                        .projects_list
+                        .iter()
+                        .all(|project| size.strings([&project.slug, &project.human_key]))
+                    && size.vector(&db_stats.contacts_list)
+                    && db_stats.contacts_list.iter().all(|contact| {
+                        size.strings([
+                            &contact.from_agent,
+                            &contact.to_agent,
+                            &contact.from_project_slug,
+                            &contact.to_project_slug,
+                            &contact.status,
+                            &contact.reason,
+                        ])
+                    })
+                    && size.vector(&db_stats.reservation_snapshots)
+                    && db_stats.reservation_snapshots.iter().all(|reservation| {
+                        size.strings([
+                            &reservation.project_slug,
+                            &reservation.agent_name,
+                            &reservation.path_pattern,
+                        ])
+                    })
+            }
+        };
+        if fits {
+            size.bytes
+        } else {
+            MAX_EVENT_RETAINED_BYTES + 1
+        }
+    }
+
     #[must_use]
     pub fn tool_call_start(
         tool_name: impl Into<String>,
@@ -1186,6 +1443,9 @@ pub struct EventRingBuffer {
 #[derive(Debug)]
 struct EventRingBufferInner {
     events: VecDeque<MailEvent>,
+    event_bytes: VecDeque<usize>,
+    retained_bytes: usize,
+    byte_capacity: usize,
     capacity: usize,
     next_seq: u64,
     total_pushed: u64,
@@ -1211,6 +1471,9 @@ impl EventRingBuffer {
         };
         let inner = EventRingBufferInner {
             events: VecDeque::with_capacity(bounded_capacity),
+            event_bytes: VecDeque::with_capacity(bounded_capacity),
+            retained_bytes: 0,
+            byte_capacity: EVENT_RING_MAX_BYTES,
             capacity: bounded_capacity,
             next_seq: 1,
             total_pushed: 0,
@@ -1225,19 +1488,23 @@ impl EventRingBuffer {
     }
 
     #[must_use]
-    pub fn push(&self, event: MailEvent) -> u64 {
+    pub fn push(&self, mut event: MailEvent) -> u64 {
+        event.bound_diagnostics();
         let mut inner = self.lock_inner();
         Self::push_inner(&mut inner, event)
     }
 
     /// Non-blocking push with backpressure policy.
     ///
-    /// Returns `Ok(seq)` on success, `Err(event)` if the lock is contended
+    /// Returns `Ok(seq)` on best-effort admission, `Err(event)` if the lock is contended
     /// or the event was dropped by the sampling policy.  This is the
     /// preferred path for the server thread where blocking on the TUI
     /// reader is unacceptable.
     #[allow(clippy::result_large_err)]
-    pub fn try_push(&self, event: MailEvent) -> Result<u64, MailEvent> {
+    /// An oversized domain event consumes a sequence and is counted as an
+    /// overflow omission; it is not retried or shortened into a false identity.
+    pub fn try_push(&self, mut event: MailEvent) -> Result<u64, MailEvent> {
+        event.bound_diagnostics();
         let Ok(mut inner) = self.inner.try_lock() else {
             self.contention_drops.fetch_add(1, Ordering::Relaxed);
             return Err(event);
@@ -1288,7 +1555,14 @@ impl EventRingBuffer {
         inner.next_seq = inner.next_seq.saturating_add(1);
         event.set_seq(seq);
         event.set_timestamp_if_unset(event_timestamp_micros());
-        if inner.events.len() >= inner.capacity {
+        inner.total_pushed = inner.total_pushed.saturating_add(1);
+        let event_bytes = event.retained_bytes();
+        if event_bytes > MAX_EVENT_RETAINED_BYTES || event_bytes > inner.byte_capacity {
+            return seq;
+        }
+        while inner.events.len() >= inner.capacity
+            || inner.retained_bytes.saturating_add(event_bytes) > inner.byte_capacity
+        {
             let scan_limit = inner.events.len().min(LOW_SEVERITY_EVICT_SCAN_LIMIT);
             let drop_idx = inner
                 .events
@@ -1296,14 +1570,13 @@ impl EventRingBuffer {
                 .take(scan_limit)
                 .position(|existing| existing.severity() < EventSeverity::Info)
                 .unwrap_or(0);
-            if drop_idx == 0 {
-                let _ = inner.events.pop_front();
-            } else {
-                let _ = inner.events.remove(drop_idx);
-            }
+            let _ = inner.events.remove(drop_idx);
+            let removed_bytes = inner.event_bytes.remove(drop_idx).unwrap_or_default();
+            inner.retained_bytes = inner.retained_bytes.saturating_sub(removed_bytes);
         }
         inner.events.push_back(event);
-        inner.total_pushed = inner.total_pushed.saturating_add(1);
+        inner.event_bytes.push_back(event_bytes);
+        inner.retained_bytes += event_bytes;
         seq
     }
 
@@ -2161,6 +2434,145 @@ mod tests {
 
     fn sample_http(path: &str, status: u16) -> MailEvent {
         MailEvent::http_request("GET", path, status, 5, "127.0.0.1")
+    }
+
+    #[test]
+    fn diagnostic_ring_byte_eviction_precedes_the_event_count_limit() {
+        let ring = EventRingBuffer::with_capacity(128);
+        ring.lock_inner().byte_capacity = 8192;
+        for _ in 0..64 {
+            let _ = ring.push(sample_http(&"p".repeat(2048), 200));
+        }
+        let stats = ring.stats();
+        assert!(stats.len < 128);
+        assert!(stats.dropped_overflow > 0);
+        assert_eq!(stats.total_pushed, 64);
+        let inner = ring.lock_inner();
+        assert!(inner.retained_bytes <= inner.byte_capacity);
+        assert_eq!(inner.events.len(), inner.event_bytes.len());
+        assert_eq!(
+            inner.retained_bytes,
+            inner.event_bytes.iter().sum::<usize>()
+        );
+        assert_eq!(inner.events.back().unwrap().seq(), 64);
+    }
+
+    #[test]
+    fn diagnostic_ring_bounds_tool_params_without_fabricating_identity_links() {
+        let ring = EventRingBuffer::with_capacity(8);
+        let params = serde_json::json!({
+            "body_md": "é".repeat(32 * 1024),
+            "sender_token": "never retain this",
+        });
+        assert_eq!(
+            ring.try_push(MailEvent::tool_call_start(
+                "send_message",
+                params.clone(),
+                Some("p".repeat(8192)),
+                Some("ExactAgent".to_string()),
+            )),
+            Ok(1)
+        );
+        let inner = ring.lock_inner();
+        let event = inner.events.front().unwrap();
+        assert!(event.retained_bytes() < MAX_EVENT_RETAINED_BYTES);
+        let MailEvent::ToolCallStart {
+            params_json,
+            project,
+            agent,
+            ..
+        } = event
+        else {
+            panic!("tool start");
+        };
+        assert!(project.is_none());
+        assert_eq!(agent.as_deref(), Some("ExactAgent"));
+        assert!(params_json.to_string().contains("[truncated]"));
+        assert!(!params_json.to_string().contains("never retain this"));
+        assert_eq!(params["body_md"].as_str().unwrap().len(), 64 * 1024);
+    }
+
+    #[test]
+    fn diagnostic_ring_omits_oversize_domain_allocations_without_retry() {
+        let ring = EventRingBuffer::with_capacity(8);
+        let mut path = String::with_capacity(MAX_EVENT_RETAINED_BYTES * 2);
+        path.push('/');
+        let mut event = sample_http("/", 404);
+        if let MailEvent::HttpRequest { path: stored, .. } = &mut event {
+            *stored = path;
+        }
+        assert!(event.retained_bytes() > MAX_EVENT_RETAINED_BYTES);
+        assert_eq!(ring.try_push(event), Ok(1));
+        assert!(ring.is_empty());
+        assert_eq!(ring.stats().dropped_overflow, 1);
+        assert_eq!(ring.push(sample_http("/ordinary", 200)), 2);
+    }
+
+    #[test]
+    fn diagnostic_ring_compacts_large_health_pulses_preserving_graph_counters() {
+        let ring = EventRingBuffer::with_capacity(8);
+        let small = DbStatSnapshot {
+            agents: 1,
+            timestamp_micros: 10,
+            ..Default::default()
+        };
+        let _ = ring.push(MailEvent::HealthPulse {
+            seq: 0,
+            timestamp_micros: 10,
+            source: EventSource::Database,
+            redacted: false,
+            db_stats: small.clone(),
+        });
+        let large = DbStatSnapshot {
+            projects: 17,
+            agents: 940,
+            messages: 12345,
+            ack_pending: 9,
+            timestamp_micros: 20,
+            agents_list: (0..940)
+                .map(|_| AgentSummary {
+                    program: "p".repeat(1024),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let _ = ring.push(MailEvent::HealthPulse {
+            seq: 0,
+            timestamp_micros: 20,
+            source: EventSource::Database,
+            redacted: false,
+            db_stats: large,
+        });
+        let events = ring.iter_recent(8);
+        let MailEvent::HealthPulse {
+            db_stats, redacted, ..
+        } = &events[0]
+        else {
+            panic!("pulse")
+        };
+        assert_eq!(db_stats, &small);
+        assert!(!redacted);
+        let MailEvent::HealthPulse {
+            db_stats, redacted, ..
+        } = &events[1]
+        else {
+            panic!("pulse")
+        };
+        assert!(*redacted);
+        assert_eq!(
+            (
+                db_stats.projects,
+                db_stats.agents,
+                db_stats.messages,
+                db_stats.ack_pending
+            ),
+            (17, 940, 12345, 9)
+        );
+        assert_eq!(db_stats.timestamp_micros, 20);
+        assert_eq!(db_stats.agents_list.capacity(), 0);
+        assert!(events[1].retained_bytes() < 1024);
+        assert_eq!(ring.stats().dropped_overflow, 0);
     }
 
     #[test]

@@ -24,7 +24,10 @@ use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListStat
 
 use crate::tui_action_menu::{ActionEntry, ActionKind, timeline_actions, timeline_batch_actions};
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
-use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
+use crate::tui_events::{
+    EVENT_RING_MAX_BYTES, EventSeverity, EventSource, MAX_EVENT_RETAINED_BYTES, MailEvent,
+    MailEventKind, VerbosityTier,
+};
 use crate::tui_layout::{DockLayout, DockPosition, DockPreset};
 use crate::tui_persist::{
     PreferencePersister, ScreenFilterPresetStore, TuiPreferences, configured_console_persist_path,
@@ -114,6 +117,8 @@ fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, act
 pub struct TimelinePane {
     /// All ingested event entries.
     entries: Vec<TimelineEntry>,
+    /// Retained raw-event and display allocation estimate for these entries.
+    retained_bytes: usize,
     /// Last consumed sequence number.
     last_seq: u64,
     /// Cursor position in the *filtered* view (0 = first visible entry).
@@ -145,6 +150,15 @@ pub(crate) struct TimelineEntry {
     pub severity: EventSeverity,
     /// Raw event for the inspector detail panel (br-10wc.7.2).
     pub raw: MailEvent,
+}
+
+impl TimelineEntry {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.raw.retained_bytes())
+            .saturating_add(self.display.timestamp.capacity())
+            .saturating_add(self.display.summary.capacity())
+    }
 }
 
 impl RenderItem for TimelineEntry {
@@ -435,6 +449,7 @@ impl TimelinePane {
     pub fn new() -> Self {
         Self {
             entries: Vec::with_capacity(TIMELINE_CAPACITY),
+            retained_bytes: 0,
             last_seq: 0,
             cursor: 0,
             follow: false,
@@ -448,24 +463,50 @@ impl TimelinePane {
     /// Ingest new events from the shared state ring buffer.
     pub fn ingest(&mut self, state: &TuiSharedState) {
         let new_events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
-        for event in &new_events {
+        self.ingest_events(&new_events, EVENT_RING_MAX_BYTES);
+    }
+
+    fn ingest_events(&mut self, new_events: &[MailEvent], byte_budget: usize) {
+        for event in new_events {
             self.last_seq = event.seq().max(self.last_seq);
             self.total_ingested += 1;
-            self.entries.push(TimelineEntry {
+            // The ring is already bounded, but replay/tick batches must not
+            // bypass the same admission limit for this independent raw cache.
+            if event.retained_bytes() > MAX_EVENT_RETAINED_BYTES {
+                continue;
+            }
+            let entry = TimelineEntry {
                 display: format_event(event),
                 seq: event.seq(),
                 timestamp_micros: event.timestamp_micros(),
                 source: event.source(),
                 severity: event.severity(),
                 raw: event.clone(),
-            });
+            };
+            self.retained_bytes = self.retained_bytes.saturating_add(entry.retained_bytes());
+            self.entries.push(entry);
         }
-        // Trim to capacity.
-        if self.entries.len() > TIMELINE_CAPACITY {
-            let excess = self.entries.len() - TIMELINE_CAPACITY;
+        // Raw events outlive ring eviction here. Bound the independent cache
+        // by bytes as well as count, draining the oldest prefix once per batch.
+        let mut excess = 0;
+        let mut visible_removed = 0;
+        while excess < self.entries.len()
+            && (self.entries.len() - excess > TIMELINE_CAPACITY
+                || self.retained_bytes > byte_budget)
+        {
+            let entry = &self.entries[excess];
+            self.retained_bytes = self.retained_bytes.saturating_sub(entry.retained_bytes());
+            if self.matches_filters(entry) {
+                visible_removed += 1;
+            }
+            excess += 1;
+        }
+        if excess > 0 {
             self.entries.drain(..excess);
-            // Adjust cursor if it pointed at drained entries.
-            self.cursor = self.cursor.saturating_sub(excess);
+            // The cursor indexes visible entries, not all raw events. Removing
+            // hidden entries must not change the selected surviving event.
+            self.cursor = self.cursor.saturating_sub(visible_removed);
+            self.clamp_cursor();
         }
         // Auto-follow: move cursor to end.
         if self.follow && !new_events.is_empty() {
@@ -581,25 +622,23 @@ impl TimelinePane {
 
     // ── Internal helpers ────────────────────────────────────────────
 
+    fn matches_filters(&self, entry: &TimelineEntry) -> bool {
+        self.verbosity.includes(entry.severity)
+            && (self.kind_filter.is_empty() || self.kind_filter.contains(&entry.display.kind))
+            && (self.source_filter.is_empty() || self.source_filter.contains(&entry.source))
+    }
+
     fn filtered_entries(&self) -> Vec<&TimelineEntry> {
         self.entries
             .iter()
-            .filter(|e| {
-                self.verbosity.includes(e.severity)
-                    && (self.kind_filter.is_empty() || self.kind_filter.contains(&e.display.kind))
-                    && (self.source_filter.is_empty() || self.source_filter.contains(&e.source))
-            })
+            .filter(|entry| self.matches_filters(entry))
             .collect()
     }
 
     fn filtered_len(&self) -> usize {
         self.entries
             .iter()
-            .filter(|e| {
-                self.verbosity.includes(e.severity)
-                    && (self.kind_filter.is_empty() || self.kind_filter.contains(&e.display.kind))
-                    && (self.source_filter.is_empty() || self.source_filter.contains(&e.source))
-            })
+            .filter(|entry| self.matches_filters(entry))
             .count()
     }
 
@@ -3513,6 +3552,118 @@ mod tests {
 
         assert_eq!(pane.entries.len(), TIMELINE_CAPACITY);
         assert!(pane.cursor < TIMELINE_CAPACITY);
+    }
+
+    fn diagnostic_message_event(seq: u64, body_bytes: usize) -> MailEvent {
+        MailEvent::MessageSent {
+            seq,
+            timestamp_micros: i64::try_from(seq).expect("test sequence fits i64"),
+            source: EventSource::Mail,
+            redacted: false,
+            id: i64::try_from(seq).expect("test message id fits i64"),
+            from: "BluePuma".to_string(),
+            to: vec!["RedLake".to_string()],
+            subject: "retention regression".to_string(),
+            thread_id: "diagnostic-thread".to_string(),
+            project: "test-project".to_string(),
+            body_md: "x".repeat(body_bytes),
+        }
+    }
+
+    #[test]
+    fn timeline_byte_budget_evicts_raw_events_below_count_capacity() {
+        let mut pane = test_pane();
+        pane.follow = true;
+        let events: Vec<_> = (1..=8)
+            .map(|seq| diagnostic_message_event(seq, 4096))
+            .collect();
+        let byte_budget = 20 * 1024;
+
+        pane.ingest_events(&events, byte_budget);
+
+        assert!(pane.entries.len() < events.len());
+        assert!(pane.entries.len() < TIMELINE_CAPACITY);
+        assert!(!pane.entries.is_empty());
+        assert!(pane.retained_bytes <= byte_budget);
+        assert_eq!(
+            pane.retained_bytes,
+            pane.entries
+                .iter()
+                .map(TimelineEntry::retained_bytes)
+                .sum::<usize>()
+        );
+        assert_eq!(pane.last_seq, 8);
+        assert_eq!(pane.total_ingested, 8);
+        assert_eq!(pane.selected_event().map(MailEvent::seq), Some(8));
+        assert!(pane.entries.first().expect("retained tail").seq > 1);
+        assert!(matches!(
+            &pane.entries.last().expect("newest event").raw,
+            MailEvent::MessageSent { body_md, project, .. }
+                if body_md.len() == 4096 && project == "test-project"
+        ));
+
+        let retained = pane.retained_bytes;
+        pane.ingest_events(&[], byte_budget);
+        assert_eq!(pane.retained_bytes, retained);
+        assert_eq!(pane.total_ingested, 8);
+    }
+
+    #[test]
+    fn timeline_byte_eviction_preserves_filtered_selection() {
+        let messages: Vec<_> = (2..=4)
+            .map(|seq| diagnostic_message_event(seq, 1024))
+            .collect();
+        let mut probe = test_pane();
+        probe.ingest_events(&messages, EVENT_RING_MAX_BYTES);
+        let byte_budget = probe.retained_bytes;
+        let hidden = MailEvent::HttpRequest {
+            seq: 1,
+            timestamp_micros: 1,
+            source: EventSource::Http,
+            redacted: false,
+            method: "GET".to_string(),
+            path: "/test".to_string(),
+            status: 200,
+            duration_ms: 1,
+            client_ip: "127.0.0.1".to_string(),
+        };
+        let mut pane = test_pane();
+        pane.kind_filter.insert(MailEventKind::MessageSent);
+        pane.source_filter.insert(EventSource::Mail);
+        pane.ingest_events(
+            &[hidden, messages[0].clone(), messages[1].clone()],
+            byte_budget,
+        );
+        pane.cursor = 1;
+        assert_eq!(pane.selected_event().map(MailEvent::seq), Some(3));
+
+        pane.ingest_events(&messages[2..], byte_budget);
+
+        assert_eq!(pane.entries.len(), 3);
+        assert_eq!(
+            pane.entries[0].seq, 2,
+            "only the hidden oldest event is evicted"
+        );
+        assert_eq!(pane.cursor, 1);
+        assert_eq!(pane.selected_event().map(MailEvent::seq), Some(3));
+        assert_eq!(pane.last_seq, 4);
+        assert!(pane.retained_bytes <= byte_budget);
+    }
+
+    #[test]
+    fn timeline_omits_oversized_replay_payload_without_stalling_sequence() {
+        let oversized = diagnostic_message_event(41, MAX_EVENT_RETAINED_BYTES + 1);
+        let normal = diagnostic_message_event(42, 32);
+        let mut pane = test_pane();
+
+        pane.ingest_events(&[oversized, normal], EVENT_RING_MAX_BYTES);
+
+        assert_eq!(pane.last_seq, 42);
+        assert_eq!(pane.total_ingested, 2);
+        assert_eq!(pane.entries.len(), 1);
+        assert_eq!(pane.entries[0].seq, 42);
+        assert_eq!(pane.selected_event().map(MailEvent::seq), Some(42));
+        assert!(pane.retained_bytes < MAX_EVENT_RETAINED_BYTES);
     }
 
     #[test]

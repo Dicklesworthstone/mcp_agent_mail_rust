@@ -6,7 +6,6 @@
 use ftui::PackedRgba;
 use serde_json::Value;
 use std::io::IsTerminal;
-use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
@@ -23,135 +22,18 @@ pub const SPARKLINE_CAPACITY: usize = 60;
 // Sensitive value masking (br-1m6a.18)
 // ──────────────────────────────────────────────────────────────────────
 
-const MASK_REDACTED: &str = "<redacted>";
+#[path = "diagnostic_preview.rs"]
+mod diagnostic_preview;
 
-/// Sensitive key patterns (case-insensitive substring match).
-const SENSITIVE_PATTERNS: &[&str] = &[
-    "token",
-    "secret",
-    "password",
-    "credential",
-    "bearer",
-    "jwt",
-    "api_key",
-    "private_key",
-];
-
-/// Returns `true` if a JSON object key should have its value masked.
-#[must_use]
-pub fn is_sensitive_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    // Explicit allowlist: these are identity/safety-critical values and must remain visible.
-    if lower == "project_key" || lower == "storage_root" {
-        return false;
-    }
-    // Specific header-like keys that commonly carry secrets.
-    if lower == "authorization" || lower == "auth_header" {
-        return true;
-    }
-    SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
-/// Always returns the redaction placeholder (ASCII-only).
-#[must_use]
-pub fn mask_sensitive_value(_original: &str) -> String {
-    MASK_REDACTED.to_string()
-}
-
-/// Sanitize a value for known keys where secrets can appear in *values* even if the key is not
-/// obviously sensitive (e.g., `postgres://user:pass@host/db`).
-#[must_use]
-pub fn sanitize_known_value(key: &str, value: &str) -> Option<String> {
-    let lower = key.to_ascii_lowercase();
-    if lower == "am_git_binary" || lower == "git_binary" || lower.ends_with("_git_binary") {
-        return basename_for_absolute_path(value);
-    }
-    let is_database_url = lower == "database_url" || lower.ends_with("database_url");
-    let is_redis_url =
-        lower == "redis_url" || lower.ends_with("redis_url") || lower.contains("redis_url");
-    if !is_database_url && !is_redis_url {
-        return None;
-    }
-    sanitize_url_userinfo(value)
-}
-
-fn mask_json_depth(value: &Value, depth: usize) -> Value {
-    if depth > 20 {
-        return value.clone();
-    }
-    match value {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                if is_sensitive_key(k) {
-                    out.insert(k.clone(), Value::String(mask_sensitive_value("")));
-                } else if let Value::String(s) = v
-                    && let Some(sanitized) = sanitize_known_value(k, s)
-                {
-                    out.insert(k.clone(), Value::String(sanitized));
-                } else {
-                    out.insert(k.clone(), mask_json_depth(v, depth + 1));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(|v| mask_json_depth(v, depth + 1)).collect())
-        }
-        other => other.clone(),
-    }
-}
-
-/// Walk a `serde_json::Value` tree and replace values whose keys match
-/// sensitive patterns with redaction placeholders. Also sanitizes select known keys.
-#[must_use]
-pub fn mask_json(value: &Value) -> Value {
-    mask_json_depth(value, 0)
-}
-
-/// Back-compat name used by existing panel renderers/tests.
-#[must_use]
-pub fn mask_json_params(value: &Value) -> Value {
-    mask_json(value)
-}
-
-#[must_use]
-fn sanitize_url_userinfo(value: &str) -> Option<String> {
-    // Conservative, allocation-light sanitizer:
-    // - only modifies strings that look like: `scheme://user:pass@host/...`
-    // - masks ONLY the password segment
-    let scheme_end = value.find("://")?;
-    let after_scheme = scheme_end + 3;
-
-    // The authority section ends at the first '/', '?', or '#'
-    let authority_end = value[after_scheme..]
-        .find(['/', '?', '#'])
-        .map(|i| i + after_scheme)
-        .unwrap_or(value.len());
-
-    let authority = &value[after_scheme..authority_end];
-
-    // Find the '@' that separates userinfo from host within the authority.
-    let at_pos_in_authority = authority.rfind('@')?;
-    let userinfo = &authority[..at_pos_in_authority];
-
-    let colon_pos = userinfo.find(':')?;
-    let user = &userinfo[..colon_pos];
-    let pass = &userinfo[(colon_pos + 1)..];
-    if pass.is_empty() {
-        return None;
-    }
-
-    let absolute_at_pos = after_scheme + at_pos_in_authority;
-
-    let mut out = String::with_capacity(value.len() + MASK_REDACTED.len());
-    out.push_str(&value[..after_scheme]);
-    out.push_str(user);
-    out.push(':');
-    out.push_str(MASK_REDACTED);
-    out.push_str(&value[absolute_at_pos..]);
-    Some(out)
-}
+#[cfg(test)]
+use diagnostic_preview::DIAGNOSTIC_JSON_NODES;
+pub(crate) use diagnostic_preview::{
+    DIAGNOSTIC_JSON_BYTES, DIAGNOSTIC_KEY_BYTES, DIAGNOSTIC_STRING_BYTES, DIAGNOSTIC_TRUNCATED,
+    MASK_REDACTED, bounded_diagnostic_text, diagnostic_number_bytes,
+};
+pub use diagnostic_preview::{
+    is_sensitive_key, mask_json, mask_json_params, mask_sensitive_value, sanitize_known_value,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Duration color gradient (br-1m6a.2)
@@ -568,16 +450,6 @@ fn mask_url_token_query(url: &str) -> String {
     format!("{prefix}?{redacted_query}")
 }
 
-fn basename_for_absolute_path(value: &str) -> Option<String> {
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        return None;
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(std::string::ToString::to_string)
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // Tool call panels (br-1m6a.2)
 // ──────────────────────────────────────────────────────────────────────
@@ -808,11 +680,23 @@ pub fn render_tool_call_end(
     lines
 }
 
-fn mask_result_preview(result: &str) -> String {
-    // Best-effort safety: if the result is JSON, apply the same masking rules
-    // used for tool-call params. If parsing fails, fall back to raw text.
+pub(crate) fn mask_result_preview(result: &str) -> String {
+    let looks_like_json = result.trim_start().starts_with(['{', '[']);
+    if result.len() > DIAGNOSTIC_JSON_BYTES {
+        return if looks_like_json {
+            "<truncated JSON result: omitted before redaction>".to_string()
+        } else {
+            bounded_diagnostic_text(result, DIAGNOSTIC_JSON_BYTES)
+        };
+    }
+    // Parse only bounded complete JSON. Truncating first could turn a valid
+    // response into invalid JSON and leak secret fields through a raw fallback.
     let Ok(value) = serde_json::from_str::<Value>(result) else {
-        return result.to_string();
+        return if looks_like_json {
+            "<invalid or truncated JSON result>".to_string()
+        } else {
+            result.to_string()
+        };
     };
 
     let masked = mask_json_params(&value);
@@ -2193,6 +2077,28 @@ impl ConsoleEventBuffer {
         fields: Vec<(String, String)>,
         json: Option<Value>,
     ) -> u64 {
+        // This console timeline is independent of the MailEvent ring. Bound
+        // every retained field here too, including rejected calls and errors.
+        let summary = bounded_diagnostic_text(&summary.into(), DIAGNOSTIC_STRING_BYTES);
+        let mut bounded_fields = Vec::new();
+        for (index, (key, value)) in fields.into_iter().enumerate() {
+            if index >= 16 || key.len() > DIAGNOSTIC_KEY_BYTES {
+                bounded_fields.push(("_diagnostic_truncated".to_string(), "true".to_string()));
+                break;
+            }
+            let value = if is_sensitive_key(&key) {
+                mask_sensitive_value("")
+            } else if key.to_ascii_lowercase().contains("url")
+                && value.len() > DIAGNOSTIC_STRING_BYTES
+            {
+                DIAGNOSTIC_TRUNCATED.to_string()
+            } else {
+                let value = sanitize_known_value(&key, &value).unwrap_or(value);
+                bounded_diagnostic_text(&value, DIAGNOSTIC_STRING_BYTES)
+            };
+            bounded_fields.push((key.as_str().to_owned(), value));
+        }
+        let json = json.as_ref().map(mask_json);
         let id = self.next_id;
         let ts_iso = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         self.next_id = self.next_id.saturating_add(1);
@@ -2204,8 +2110,8 @@ impl ConsoleEventBuffer {
             ts_iso,
             kind,
             severity,
-            summary: summary.into(),
-            fields,
+            summary,
+            fields: bounded_fields,
             json,
         });
         id
@@ -3135,6 +3041,107 @@ mod tests {
         assert_eq!(masked["jwt_secret"], MASK_REDACTED);
         assert_eq!(masked["token"], MASK_REDACTED);
         assert_eq!(masked["ok"], false);
+    }
+
+    #[test]
+    fn diagnostic_json_bounds_utf8_values_keys_and_secret_subtrees() {
+        let input = serde_json::json!({
+            "sender_token": "never retain this credential",
+            "body_md": "é".repeat(32 * 1024),
+            "database_url": format!("postgres://user:{}@host/db", "password".repeat(1024)),
+        });
+        let preview = mask_json(&input);
+        let body = preview["body_md"].as_str().unwrap();
+        assert!(body.len() <= DIAGNOSTIC_STRING_BYTES);
+        assert!(body.ends_with("[truncated]"));
+        assert_eq!(preview["sender_token"], MASK_REDACTED);
+        assert_eq!(preview["database_url"], DIAGNOSTIC_TRUNCATED);
+        assert!(!preview.to_string().contains("password"));
+        assert_eq!(input["body_md"].as_str().unwrap().len(), 64 * 1024);
+
+        let mut keys = serde_json::Map::new();
+        keys.insert("x".repeat(4096), Value::String("hidden".to_string()));
+        let preview = mask_json(&Value::Object(keys));
+        assert_eq!(preview["_diagnostic_truncated"], true);
+        assert!(preview.to_string().len() < 100);
+    }
+
+    #[test]
+    fn diagnostic_json_depth_markers_consume_the_wide_leaf_budget() {
+        let mut input = Value::Array(vec![
+            serde_json::json!({"secret_token": "must not survive depth cutoff"});
+            4096
+        ]);
+        for _ in 0..20 {
+            input = Value::Array(vec![input]);
+        }
+        let preview = mask_json(&input).to_string();
+        assert!(preview.len() < DIAGNOSTIC_JSON_BYTES);
+        assert!(preview.contains("truncated"));
+        assert!(!preview.contains("must not survive"));
+
+        let wide = Value::Array(vec![Value::Null; 100_000]);
+        let preview = mask_json(&wide);
+        assert!(preview.as_array().unwrap().len() <= DIAGNOSTIC_JSON_NODES + 1);
+    }
+
+    #[test]
+    fn diagnostic_json_releases_excess_string_capacity_and_bounds_numbers() {
+        let mut allocated = String::with_capacity(1024 * 1024);
+        allocated.push_str("small");
+        let Value::String(preview) = mask_json(&Value::String(allocated)) else {
+            panic!("string preview");
+        };
+        assert_eq!(preview, "small");
+        assert_eq!(preview.capacity(), preview.len());
+        let number: serde_json::Number = 42.into();
+        assert_eq!(diagnostic_number_bytes(&number, 2), Some(2));
+        assert_eq!(diagnostic_number_bytes(&number, 1), None);
+        // The full native build enables arbitrary_precision. A lean browser
+        // build may reject the number at parsing, before it can be retained.
+        if let Ok(number) = serde_json::from_str::<Value>(&"9".repeat(8192)) {
+            assert_eq!(mask_json(&number), DIAGNOSTIC_TRUNCATED);
+        }
+    }
+
+    #[test]
+    fn diagnostic_console_buffer_bounds_payloads_and_retained_capacity() {
+        let mut buffer = ConsoleEventBuffer::new();
+        let mut allocated = String::with_capacity(1024 * 1024);
+        allocated.push_str("small summary");
+        buffer.push(
+            ConsoleEventKind::ToolCallEnd,
+            ConsoleEventSeverity::Error,
+            allocated,
+            vec![
+                ("error".to_string(), "é".repeat(32 * 1024)),
+                ("sender_token".to_string(), "do not retain".to_string()),
+            ],
+            Some(serde_json::json!({"result": "x".repeat(64 * 1024)})),
+        );
+        let event = buffer.events.back().unwrap();
+        assert_eq!(event.summary.capacity(), event.summary.len());
+        assert!(event.fields[0].1.capacity() <= DIAGNOSTIC_STRING_BYTES);
+        assert!(event.fields[0].1.ends_with("[truncated]"));
+        assert_eq!(event.fields[1].1, MASK_REDACTED);
+        assert!(event.json.as_ref().unwrap().to_string().len() < DIAGNOSTIC_JSON_BYTES);
+    }
+
+    #[test]
+    fn diagnostic_result_preview_masks_before_truncating_or_omits_large_json() {
+        let result = serde_json::json!({
+            "token": "never expose this",
+            "body": "x".repeat(1024),
+        })
+        .to_string();
+        let preview = mask_result_preview(&result);
+        assert!(preview.contains(MASK_REDACTED));
+        assert!(!preview.contains("never expose this"));
+        let huge = format!("{{\"token\":\"{}\"}}", "secret".repeat(16 * 1024));
+        assert_eq!(
+            mask_result_preview(&huge),
+            "<truncated JSON result: omitted before redaction>"
+        );
     }
 
     #[test]

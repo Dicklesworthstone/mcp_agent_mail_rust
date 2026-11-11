@@ -1,5 +1,10 @@
 //! Minimal browser-safe log-pane adapter used by the shared dashboard.
 
+#[path = "../../mcp-agent-mail-server/src/diagnostic_preview.rs"]
+mod diagnostic_preview;
+pub(crate) use diagnostic_preview::{bounded_diagnostic_text, diagnostic_number_bytes};
+pub use diagnostic_preview::{mask_json, mask_json_params};
+
 use ftui::layout::Rect;
 use ftui::text::{Line, Text};
 use ftui::widgets::log_viewer::{LogViewer, LogViewerState, LogWrapMode};

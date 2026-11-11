@@ -586,14 +586,11 @@ fn result_preview_from_contents(contents: &[Content]) -> Option<String> {
     let Content::Text { text: raw } = contents.first()? else {
         return None;
     };
-    let preview = truncate_utf8(raw, 200);
-    // Mask if it looks like JSON
-    Some(
-        serde_json::from_str::<serde_json::Value>(preview).map_or_else(
-            |_| preview.replace('\n', "\\n").replace('\r', "\\r"),
-            |v| console::mask_json(&v).to_string(),
-        ),
-    )
+    let masked = console::mask_result_preview(raw);
+    Some(console::bounded_diagnostic_text(
+        &masked.replace('\n', "\\n").replace('\r', "\\r"),
+        200,
+    ))
 }
 
 /// Build a preview string (max 200 chars, masked) from a sync tool result.
@@ -14198,13 +14195,11 @@ to skip auth for local requests.</p>
 
                 // Emit tool-call-start panel if console tool logging is enabled.
                 let call_start = if tool_call_console_enabled {
-                    let args = params
-                        .arguments
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({}));
+                    let empty_args = serde_json::json!({});
+                    let args = params.arguments.as_ref().unwrap_or(&empty_args);
                     let panel_lines = console::render_tool_call_start(
                         &tool_name,
-                        &args,
+                        args,
                         project_hint.as_deref(),
                         agent_hint.as_deref(),
                     );
@@ -14363,7 +14358,7 @@ to skip auth for local requests.</p>
                 // Emit tool-call-end panel
                 if let Some(start) = call_start {
                     let dur_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let result_preview = serde_json::to_string(&value).ok();
+                    let result_preview = serde_json::to_string(&console::mask_json(&value)).ok();
                     let panel_lines = console::render_tool_call_end(
                         &tool_name,
                         dur_ms,
@@ -19770,6 +19765,126 @@ mod tests {
     }
 
     struct NoopTool;
+
+    struct DiagnosticPayloadProbeTool {
+        expected: serde_json::Value,
+        reject: bool,
+    }
+
+    impl fastmcp::ToolHandler for DiagnosticPayloadProbeTool {
+        fn definition(&self) -> Tool {
+            fastmcp::ToolHandler::definition(&NoopTool)
+        }
+
+        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            assert_eq!(
+                arguments, self.expected,
+                "diagnostics must not change tool inputs"
+            );
+            if self.reject {
+                Err(mcp_agent_mail_tools::tool_util::legacy_tool_error(
+                    "CONTACT_REQUIRED",
+                    "controlled refusal",
+                    false,
+                    serde_json::json!({}),
+                ))
+            } else {
+                Ok(vec![Content::Text {
+                    text: serde_json::json!({
+                        "api_key": "original-result-credential",
+                        "body": "unmodified result body".repeat(128),
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_dispatch_bounds_ordinary_and_rejected_calls_without_changing_payloads() {
+        let _guard = TUI_STATE_TEST_LOCK.lock().unwrap();
+        let previous = tui_state_handle();
+        let state = tui_bridge::TuiSharedState::with_event_capacity(
+            &mcp_agent_mail_core::Config::default(),
+            32,
+        );
+        set_tui_state_handle(Some(state.clone()));
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        for asynchronous in [false, true] {
+            for reject in [false, true] {
+                let arguments = serde_json::json!({
+                    "project_key": "p".repeat(16 * 1024),
+                    "agent_name": "DiagnosticBoundaryAgent",
+                    "body_md": "é".repeat(32 * 1024),
+                    "sender_token": "original-request-credential",
+                });
+                let tool = InstrumentedTool {
+                    tool_index: mcp_agent_mail_tools::tool_index("send_message").unwrap(),
+                    tool_name: "send_message",
+                    inner: DiagnosticPayloadProbeTool {
+                        expected: arguments.clone(),
+                        reject,
+                    },
+                };
+                let result = if asynchronous {
+                    match block_on(tool.call_async(&ctx, arguments)) {
+                        fastmcp_core::Outcome::Ok(contents) => Ok(contents),
+                        fastmcp_core::Outcome::Err(error) => Err(error),
+                        other => panic!("unexpected diagnostic test outcome: {other:?}"),
+                    }
+                } else {
+                    tool.call(&ctx, arguments)
+                };
+                assert_eq!(result.is_err(), reject);
+                if let Ok(contents) = result {
+                    let Content::Text { text } = &contents[0] else {
+                        panic!("text result")
+                    };
+                    assert!(text.contains("original-result-credential"));
+                    assert!(text.len() > 2048, "response to caller remains complete");
+                }
+            }
+        }
+        let events = state.recent_events(32);
+        assert_eq!(events.len(), 8);
+        for event in &events {
+            assert!(event.retained_bytes() < tui_events::MAX_EVENT_RETAINED_BYTES);
+            match event {
+                tui_events::MailEvent::ToolCallStart {
+                    params_json,
+                    project,
+                    agent,
+                    ..
+                } => {
+                    assert!(project.is_none());
+                    assert_eq!(agent.as_deref(), Some("DiagnosticBoundaryAgent"));
+                    let preview = params_json.to_string();
+                    assert!(preview.contains("truncated"));
+                    assert!(!preview.contains("original-request-credential"));
+                }
+                tui_events::MailEvent::ToolCallEnd {
+                    result_preview,
+                    project,
+                    ..
+                } => {
+                    assert!(project.is_none());
+                    if let Some(preview) = result_preview {
+                        assert!(preview.len() <= 200);
+                        assert!(!preview.contains("original-result-credential"));
+                    }
+                }
+                other => panic!("unexpected diagnostic event: {other:?}"),
+            }
+        }
+        let calls = mcp_agent_mail_tools::recent_calls_since(0);
+        let ours: Vec<_> = calls
+            .iter()
+            .filter(|call| call.agent.as_deref() == Some("DiagnosticBoundaryAgent"))
+            .collect();
+        assert_eq!(ours.len(), 4);
+        assert!(ours.iter().all(|call| call.project.is_none()));
+        set_tui_state_handle(previous);
+    }
 
     impl fastmcp::ToolHandler for NoopTool {
         fn definition(&self) -> Tool {
