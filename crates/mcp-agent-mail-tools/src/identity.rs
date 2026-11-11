@@ -7724,6 +7724,107 @@ body
     }
 
     #[test]
+    fn health_check_observes_storage_without_starting_workers() {
+        const CASE: &str =
+            "identity::tests::health_check_observes_storage_without_starting_workers";
+        const CHILD: &str = "AM_TEST_HEALTH_STORAGE_OBSERVER";
+        if std::env::var(CHILD).as_deref() != Ok(CASE) {
+            // A fresh process makes absence of worker initialization observable,
+            // independently of other tests that intentionally start workers.
+            let root = tempfile::tempdir().expect("isolated health root");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, CASE)
+                .env("STORAGE_ROOT", root.path())
+                .output()
+                .expect("run isolated health observer");
+            assert!(
+                output.status.success(),
+                "{CASE}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("health mailbox root");
+        let storage_root = root.path().join("archive");
+        std::fs::create_dir(&storage_root).unwrap();
+        let database_url = format!("sqlite:///{}", root.path().join("health.sqlite3").display());
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("AM_WBQ_CHANNEL_CAPACITY", "257"),
+            ],
+            || {
+                Config::reset_cached();
+                let metrics = mcp_agent_mail_core::global_metrics();
+                let assert_not_started = || {
+                    assert_eq!(metrics.storage.wbq_capacity.load(), 0);
+                    assert_eq!(metrics.storage.commit_soft_cap.load(), 0);
+                    assert!(mcp_agent_mail_storage::commit_coalescer_worker_liveness().is_none());
+                };
+                assert_not_started();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let missing: serde_json::Value =
+                    serde_json::from_str(&health_check(&ctx).unwrap()).unwrap();
+                assert_eq!(missing["status"], "error");
+                assert_not_started();
+                assert_eq!(missing["queues"]["wbq"]["capacity"], 257);
+                let configured_soft_cap = missing["queues"]["commit_coalescer"]["soft_cap"]
+                    .as_u64()
+                    .expect("configured coalescer cap");
+                assert!(configured_soft_cap > 0);
+
+                // Bootstrap a real mailbox explicitly; health itself must not
+                // create the database or initialize storage workers.
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                let pool = get_db_pool().unwrap();
+                let conn = match runtime.block_on(pool.acquire(ctx.cx())) {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("bootstrap acquire failed: {error}"),
+                    Outcome::Cancelled(_) => panic!("bootstrap acquire cancelled"),
+                    Outcome::Panicked(_) => panic!("bootstrap acquire panicked"),
+                };
+                drop(conn);
+                let healthy: serde_json::Value =
+                    serde_json::from_str(&health_check(&ctx).unwrap()).unwrap();
+                assert_eq!(
+                    healthy["verdicts"]["db_health"]["status"], "green",
+                    "{healthy}"
+                );
+                assert_not_started();
+                assert_eq!(healthy["queues"]["wbq"]["capacity"], 257);
+                assert_eq!(
+                    healthy["queues"]["commit_coalescer"]["soft_cap"],
+                    configured_soft_cap
+                );
+
+                // Startup remains explicit and functional. Observational
+                // fallback limits must agree with the actual running workers.
+                mcp_agent_mail_storage::wbq_start();
+                let _ = mcp_agent_mail_storage::get_commit_coalescer();
+                assert_eq!(metrics.storage.wbq_capacity.load(), 257);
+                assert_eq!(metrics.storage.commit_soft_cap.load(), configured_soft_cap);
+                assert!(
+                    mcp_agent_mail_storage::commit_coalescer_worker_liveness()
+                        .is_some_and(|workers| workers.expected > 0)
+                );
+                let running: serde_json::Value =
+                    serde_json::from_str(&health_check(&ctx).unwrap()).unwrap();
+                assert_eq!(running["queues"]["wbq"]["capacity"], 257);
+                assert_eq!(
+                    running["queues"]["commit_coalescer"]["soft_cap"],
+                    configured_soft_cap
+                );
+                mcp_agent_mail_storage::wbq_shutdown();
+            },
+        );
+    }
+
+    #[test]
     fn health_check_does_not_initialize_missing_sqlite() {
         let _guard = HEALTH_CHECK_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -7813,7 +7914,7 @@ body
                 let response = health_check(&ctx).expect("hot health check");
                 let value: serde_json::Value =
                     serde_json::from_str(&response).expect("health response json");
-                assert_ne!(value["db_health"]["status"], "fail", "{value}");
+                assert_eq!(value["verdicts"]["db_health"]["status"], "green", "{value}");
                 assert_eq!(
                     crate::archive_read::writer_epoch_for_test(),
                     before_epoch,

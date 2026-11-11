@@ -1,5 +1,35 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 11 health observer follow-through — EmeraldEagle
+
+- [x] Recheck the governing-document hashes, clean9516670f checkout, and Beads.
+  Fetch and inspect three incoming ATC commits; fast-forward1a530335 without
+  overlap/deletion or dependency changes, then import tracker truth.
+- [x] Re-read the prior sampler fixes and the complete health caller. Find that
+  health still invokes blocking WBQ lifecycle startup and lazy coalescer startup
+  before its nonblocking observation. Startup/recovery belongs to actual startup
+  and write callers, which already invoke the real storage APIs.
+- [x] Continue owned br-kp1in.29 and reserve the two source files and existing TODO.
+  Add an isolated actual health regression for missing and healthy real SQLite,
+  untouched worker-init metrics/liveness, configured capacities and explicit real
+  worker startup. Strengthen the hot-health DB assertion: its old top-level path
+  read a missing/null field and could pass without a healthy DB verdict.
+- [ ] Execute the new regression on unchanged production health, retaining its
+  exact immutable source and actual failure; no test-only hooks or fake workers.
+- [ ] Remove health's worker-start calls and preserve configured queue limits
+  without initializing workers or overwriting observed running-worker metrics.
+- [ ] Re-read all changed paths; execute the original38 diagnostic cases, the
+  new actual health case, strengthened hot-read neutrality and relevant original
+  WBQ startup/shutdown/restart controls on the exact candidate.
+- [ ] Run all-target and separate production checks, strict Clippy, portable
+  production check, formatting and stock/staged UBS through strict RCH where
+  compilation is involved. Use the actual storage/tools default native graph,
+  four compile jobs on measured capacity, and unchanged test limits.
+- [ ] Record terminal evidence on the owned Bead; retain original broader
+  acceptance, check tracker parity/cycles, inspect the final diff, publish and
+  verify refs, then release only this session's reservations. Solo review is not
+  independent certification; no full-workspace/overhead/soak clearance is implied.
+
 ## November 11 independent-queue diagnostic follow-through — EmeraldEagle
 
 - [x] Confirm the clean c61d6571 checkout and unchanged hashes of the fully read
