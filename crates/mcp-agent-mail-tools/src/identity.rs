@@ -993,6 +993,7 @@ struct ArchiveGapObservation {
     gap: u64,
     since: std::time::Instant,
     last_observed: std::time::Instant,
+    queue_unknown: bool,
 }
 
 /// Bounded observational state only: eviction forgets an age, never mailbox
@@ -1035,7 +1036,16 @@ impl ArchiveGapTracker {
         }
         let since = previous
             .filter(|previous| previous.generation == *generation && gap >= previous.gap)
-            .map_or(now, |previous| previous.since);
+            .map_or(now, |previous| {
+                if previous.queue_unknown {
+                    let confirmed_age = previous
+                        .last_observed
+                        .saturating_duration_since(previous.since);
+                    now.checked_sub(confirmed_age).unwrap_or(now)
+                } else {
+                    previous.since
+                }
+            });
         let age = now.saturating_duration_since(since);
         if self.observations.len() >= MAX_ARCHIVE_GAP_OBSERVATIONS {
             let _ = self.observations.pop_front();
@@ -1046,7 +1056,44 @@ impl ArchiveGapTracker {
             gap,
             since,
             last_observed: now,
+            queue_unknown: false,
         });
+        Some(age)
+    }
+
+    fn observe_unknown_queue(
+        &mut self,
+        mailbox: &ArchiveGapMailbox,
+        generation: Option<&ArchiveGapGeneration>,
+        gap: Option<u64>,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let index = self
+            .observations
+            .iter()
+            .position(|previous| previous.mailbox == *mailbox)?;
+        let previous = self.observations.get_mut(index)?;
+        let age = previous
+            .last_observed
+            .saturating_duration_since(previous.since);
+        if now < previous.last_observed {
+            return Some(age);
+        }
+        // Freeze the last confirmed age, including when source evidence is
+        // missing. Neither repeated unknowns nor resumption may age this gap.
+        previous.since = now.checked_sub(age).unwrap_or(now);
+        previous.last_observed = now;
+        previous.queue_unknown = true;
+        let Some((generation, gap)) = generation.zip(gap) else {
+            return Some(age);
+        };
+        if generation != &previous.generation || gap == 0 || gap < previous.gap {
+            // Actual source replacement or inventory progress can clear the
+            // earlier failure; a busy queue alone cannot.
+            self.observations.remove(index);
+            return None;
+        }
+        previous.gap = gap;
         Some(age)
     }
 }
@@ -1055,7 +1102,7 @@ fn observe_idle_archive_gap(
     config: &Config,
     probe: Option<&ArchiveGapProbe>,
     semantic: &SemanticReadinessResponse,
-    archive_pending: bool,
+    archive_pending: Option<bool>,
 ) -> Option<std::time::Duration> {
     static TRACKER: std::sync::OnceLock<std::sync::Mutex<ArchiveGapTracker>> =
         std::sync::OnceLock::new();
@@ -1067,13 +1114,24 @@ fn observe_idle_archive_gap(
         tracker.clear_poison();
         observations
     });
-    observations.observe(
-        ArchiveGapMailbox::from_config(config),
-        probe.map(|probe| &probe.generation),
-        semantic.archive_message_gap,
-        archive_pending,
-        probe.map_or_else(std::time::Instant::now, |probe| probe.observed_at),
-    )
+    let mailbox = ArchiveGapMailbox::from_config(config);
+    let generation = probe.map(|probe| &probe.generation);
+    let now = probe.map_or_else(std::time::Instant::now, |probe| probe.observed_at);
+    match archive_pending {
+        Some(pending) => observations.observe(
+            mailbox,
+            generation,
+            semantic.archive_message_gap,
+            pending,
+            now,
+        ),
+        None => observations.observe_unknown_queue(
+            &mailbox,
+            generation,
+            semantic.archive_message_gap,
+            now,
+        ),
+    }
 }
 
 fn apply_idle_archive_gap_health(
@@ -1210,16 +1268,30 @@ fn archive_drain_stall_detail(
         })
 }
 
-fn apply_archive_sample_unavailable(verdicts: &mut HealthVerdicts, lock: &str) {
-    let level = verdicts
-        .archive_db_parity
-        .level()
-        .max(mcp_agent_mail_core::HealthLevel::Yellow);
+fn apply_archive_sample_unavailable(
+    verdicts: &mut HealthVerdicts,
+    lock: &str,
+    last_confirmed_idle_gap_age: Option<std::time::Duration>,
+) {
+    use mcp_agent_mail_core::HealthLevel::{Red, Yellow};
+
+    let floor = if last_confirmed_idle_gap_age.is_some_and(|age| age >= ARCHIVE_GAP_CRITICAL_AGE) {
+        Red
+    } else {
+        Yellow
+    };
+    let level = verdicts.archive_db_parity.level().max(floor);
+    let prior_gap = last_confirmed_idle_gap_age.map_or_else(String::new, |age| {
+        format!(
+            "; last confirmed idle inventory gap age {} ms (paused while queue evidence is unavailable)",
+            age.as_millis()
+        )
+    });
     verdicts.archive_db_parity = HealthVerdict::new(
         level,
         true,
         format!(
-            "{}; archive lag sample unavailable at {lock}; queue convergence is unverified",
+            "{}; archive lag sample unavailable at {lock}; queue convergence is unverified{prior_gap}",
             verdicts.archive_db_parity.detail
         ),
     );
@@ -2618,15 +2690,16 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
-    // Unknown queues cannot prove an idle gap. Break that observational age
-    // rather than manufacturing persistence while queue evidence is missing.
-    let archive_pending =
-        unavailable_archive_lock.is_some() || archive_writes_pending(&archive_lag);
+    // Unknown queues cannot prove an idle gap. Pause its age and retain the
+    // last confirmed failure rather than treating an unavailable sample as
+    // evidence of either new persistence or recovery.
+    let queue_unknown = unavailable_archive_lock.is_some();
+    let archive_pending = archive_writes_pending(&archive_lag);
     let idle_gap_age = observe_idle_archive_gap(
         config,
         observed_generation.as_ref(),
         &semantic_readiness,
-        archive_pending,
+        (!queue_unknown).then_some(archive_pending),
     );
     let mut verdicts = compute_health_verdicts(
         config,
@@ -2634,16 +2707,16 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         &semantic_readiness,
         &integrity_metrics,
         archive_drain_stall.as_deref(),
-        archive_pending,
+        archive_pending || queue_unknown,
     );
     apply_idle_archive_gap_health(
         &mut semantic_readiness,
         &mut verdicts,
-        archive_pending,
+        archive_pending || queue_unknown,
         idle_gap_age,
     );
     if let Some(lock) = unavailable_archive_lock {
-        apply_archive_sample_unavailable(&mut verdicts, lock);
+        apply_archive_sample_unavailable(&mut verdicts, lock, idle_gap_age);
     }
     let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
     let lock_wait_verdict = lock_wait_health_verdict(&lock_activity);
@@ -4977,6 +5050,85 @@ mod tests {
     }
 
     #[test]
+    fn archive_gap_unknown_queue_pauses_age_without_forgetting_prior_failure() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mailbox = || gap_mailbox("database", "archive");
+        let mut tracker = ArchiveGapTracker::default();
+        assert_eq!(
+            tracker.observe_unknown_queue(&mailbox(), Some(&generation), Some(3), start),
+            None,
+        );
+        assert_eq!(
+            tracker.observe(mailbox(), Some(&generation), Some(3), false, start),
+            Some(std::time::Duration::ZERO),
+        );
+        let critical_at = start + ARCHIVE_GAP_CRITICAL_AGE;
+        assert_eq!(
+            tracker.observe(mailbox(), Some(&generation), Some(3), false, critical_at),
+            Some(ARCHIVE_GAP_CRITICAL_AGE),
+        );
+        let day = std::time::Duration::from_hours(24);
+        for (elapsed, source, gap) in [
+            (day, Some(&generation), Some(3)),
+            (day * 2, None, None),
+            (day * 3, Some(&generation), Some(4)),
+        ] {
+            let age = tracker.observe_unknown_queue(&mailbox(), source, gap, start + elapsed);
+            assert_eq!(age, Some(ARCHIVE_GAP_CRITICAL_AGE));
+            let mut verdicts = compute_health_verdicts(
+                &Config::from_env(),
+                true,
+                &semantic("ok", "queue evidence unavailable"),
+                &healthy_integrity_metrics(),
+                None,
+                true,
+            );
+            apply_archive_sample_unavailable(&mut verdicts, "archive_backlog.queue", age);
+            assert_eq!(verdicts.archive_db_parity.status, "red");
+            assert!(verdicts.archive_db_parity.detail.contains("last confirmed"));
+            assert!(verdicts.archive_db_parity.detail.contains("paused"));
+        }
+        let resumed_at = start + day * 4;
+        assert_eq!(
+            tracker.observe(mailbox(), Some(&generation), Some(4), false, resumed_at),
+            Some(ARCHIVE_GAP_CRITICAL_AGE),
+        );
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(
+            tracker.observe(
+                mailbox(),
+                Some(&generation),
+                Some(4),
+                false,
+                resumed_at + second
+            ),
+            Some(ARCHIVE_GAP_CRITICAL_AGE + second),
+        );
+        // Authoritative progress, convergence and source replacement each
+        // clear a prior failure even when the queue cannot be sampled.
+        let replacement = gap_generation("generation-b");
+        for (source, gap) in [(&generation, 3), (&generation, 0), (&replacement, 4)] {
+            assert_eq!(
+                tracker.observe_unknown_queue(
+                    &mailbox(),
+                    Some(source),
+                    Some(gap),
+                    resumed_at + second,
+                ),
+                None,
+            );
+            assert!(tracker.observations.is_empty());
+            let _ = tracker.observe(mailbox(), Some(&generation), Some(4), false, resumed_at);
+        }
+        assert_eq!(
+            tracker
+                .observe_unknown_queue(&mailbox(), Some(&generation), Some(4), resumed_at + day,),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
     fn archive_gap_age_resets_on_progress_and_convergence() {
         let start = std::time::Instant::now();
         let generation = gap_generation("generation-a");
@@ -5553,9 +5705,11 @@ mod tests {
             true,
         );
         assert_eq!(verdicts.archive_db_parity.status, "green");
-        apply_archive_sample_unavailable(&mut verdicts, lock);
+        apply_archive_sample_unavailable(&mut verdicts, lock, None);
         assert_eq!(verdicts.archive_db_parity.status, "yellow");
         assert!(verdicts.archive_db_parity.detail.contains(lock));
+        apply_archive_sample_unavailable(&mut verdicts, lock, Some(std::time::Duration::ZERO));
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
 
         lag.wbq_inflight_execution_us = 31_000_000;
         lag.oldest_unmaterialized_us = 31_000_000;
@@ -5573,7 +5727,7 @@ mod tests {
             Some(&stall),
             true,
         );
-        apply_archive_sample_unavailable(&mut stalled, lock);
+        apply_archive_sample_unavailable(&mut stalled, lock, None);
         assert_eq!(stalled.archive_db_parity.status, "red");
         assert!(stalled.archive_db_parity.detail.contains("drain stalled"));
         assert!(stalled.archive_db_parity.detail.contains(lock));
