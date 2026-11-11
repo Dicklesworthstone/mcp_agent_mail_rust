@@ -4080,6 +4080,9 @@ pub struct AtcEngine {
     liveness_schedule: BinaryHeap<Reverse<ScheduledAgentReview>>,
     /// Agents that must be reevaluated immediately due to policy changes.
     dirty_agents: BTreeSet<String>,
+    /// Alternate eligible schedule and policy work, including across ticks
+    /// whose review budget is one. Each queue retains its own ordering.
+    dirty_review_next: bool,
     /// Per-project conflict graphs.
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
     /// Total edges across all projects, bounded by `max_tracked_agents`.
@@ -4275,6 +4278,7 @@ impl AtcEngine {
             agent_order_dirty: false,
             liveness_schedule: BinaryHeap::new(),
             dirty_agents: BTreeSet::new(),
+            dirty_review_next: false,
             conflict_graphs: HashMap::new(),
             conflict_edge_count: 0,
             conflict_capacity_refusals: 0,
@@ -5155,13 +5159,37 @@ impl AtcEngine {
     fn pop_due_agents(&mut self, now_micros: i64, max_reviews: usize) -> Vec<String> {
         let mut due = Vec::with_capacity(max_reviews);
         let mut seen = HashSet::with_capacity(max_reviews);
-        while due.len() < max_reviews
-            && let Some(Reverse(next)) = self.liveness_schedule.peek().cloned()
-        {
-            if next.review_at_micros > now_micros {
+        let mut schedule_pops = 0;
+        while due.len() < max_reviews {
+            let scheduled_due = schedule_pops < MAX_LIVENESS_SCHEDULE_POPS_PER_TICK
+                && self
+                    .liveness_schedule
+                    .peek()
+                    .is_some_and(|Reverse(next)| next.review_at_micros <= now_micros);
+            if !scheduled_due && self.dirty_agents.is_empty() {
                 break;
             }
-            self.liveness_schedule.pop();
+
+            // A continuously overdue population must not starve agents that
+            // need policy reevaluation but have no ordinary deadline. Likewise,
+            // policy changes must not consume every slot ahead of timed work.
+            if !self.dirty_agents.is_empty() && (self.dirty_review_next || !scheduled_due) {
+                if let Some(agent) = self.dirty_agents.pop_first()
+                    && seen.insert(agent.clone())
+                {
+                    due.push(agent);
+                    self.dirty_review_next = false;
+                }
+                continue;
+            }
+
+            let Some(Reverse(next)) = self.liveness_schedule.pop() else {
+                break;
+            };
+            // Stale and duplicate entries consume work even though they do
+            // not consume review slots. Leave excess cleanup for later ticks
+            // instead of scanning the whole heap under the engine mutex.
+            schedule_pops += 1;
             let Some(entry) = self.agents.get(&next.agent) else {
                 continue;
             };
@@ -5176,35 +5204,21 @@ impl AtcEngine {
                 // together so the next batch cannot evaluate it twice.
                 self.dirty_agents.remove(&next.agent);
                 due.push(next.agent);
-            }
-        }
-        while due.len() < max_reviews {
-            let Some(agent) = self.dirty_agents.iter().next().cloned() else {
-                break;
-            };
-            self.dirty_agents.remove(&agent);
-            if seen.insert(agent.clone()) {
-                due.push(agent);
+                self.dirty_review_next = true;
             }
         }
         due
     }
 
-    fn next_scheduled_review_micros(&mut self) -> Option<i64> {
-        while let Some(Reverse(next)) = self.liveness_schedule.peek().cloned() {
-            let Some(entry) = self.agents.get(&next.agent) else {
-                self.liveness_schedule.pop();
-                continue;
-            };
-            let stale_version = entry.schedule_version != next.schedule_version;
-            let stale_review_time = entry.next_review_micros != next.review_at_micros;
-            if stale_version || stale_review_time {
-                self.liveness_schedule.pop();
-                continue;
-            }
-            return Some(next.review_at_micros);
-        }
-        None
+    fn next_scheduled_review_micros(&self) -> Option<i64> {
+        // This is a conservative wake deadline, not proof that the head still
+        // represents a live review. Cleanup belongs to pop_due_agents's bounded
+        // work budget. An overdue stale head keeps the operator at its resume
+        // floor until cleanup catches up; removing it here would silently do
+        // an unbounded second heap walk while publishing the health snapshot.
+        self.liveness_schedule
+            .peek()
+            .map(|Reverse(next)| next.review_at_micros)
     }
 
     fn normalize_deadlock_cycles(mut cycles: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -6500,7 +6514,8 @@ impl AtcEngine {
         // their ordinary liveness deadlines. If a bounded tick leaves dirty
         // work behind, publish an already-due deadline so the operator loop
         // resumes at its 250ms floor instead of sleeping until the earliest
-        // (possibly hours-away) scheduled review.
+        // (possibly hours-away) scheduled review. An overdue stale heap head
+        // also retains a due wake time until bounded cleanup reaches it.
         let next_due_micros = if self.dirty_agents.is_empty() {
             self.next_scheduled_review_micros()
         } else {
@@ -11780,6 +11795,10 @@ pub struct AtcPopulationSyncStats {
 /// probes, deadlock advisories, and HTTP/MCP work.
 const MAX_LIVENESS_REVIEWS_PER_TICK: usize = 8;
 
+/// Includes stale versions and duplicates, not just completed reviews. Heap
+/// memory is separately bounded; this cap limits cleanup work in one tick.
+const MAX_LIVENESS_SCHEDULE_POPS_PER_TICK: usize = 64;
+
 /// Hydrate the ATC engine from the durable DB snapshot.
 ///
 /// This seeds pre-existing agents on cold start and refreshes their latest
@@ -13556,6 +13575,178 @@ mod alien_enhancement_tests {
         }
 
         assert_eq!(reviewed.len(), POPULATION);
+    }
+
+    #[test]
+    fn policy_dirty_reviews_progress_under_continuously_due_work() {
+        let mut engine = AtcEngine::new_for_testing();
+        let now_micros = 42_000_000;
+        for index in 0..MAX_LIVENESS_REVIEWS_PER_TICK {
+            let agent = format!("Scheduled{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            engine.schedule_entry_for_push(&agent, now_micros);
+        }
+        let policy_agents: Vec<_> = (0..12).map(|index| format!("Policy{index:04}")).collect();
+        for agent in &policy_agents {
+            engine.register_agent(agent, "codex-cli", None);
+            engine.dirty_agents.insert(agent.clone());
+        }
+
+        let mut policy_reviews = Vec::new();
+        let mut scheduled_reviews = HashSet::new();
+        for _ in 0..3 {
+            let due = engine.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_eq!(due.len(), MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_eq!(due.iter().collect::<HashSet<_>>().len(), due.len());
+            let before = policy_reviews.len();
+            for agent in due {
+                if agent.starts_with("Scheduled") {
+                    scheduled_reviews.insert(agent.clone());
+                    // Keep real scheduler work overdue on every pass. Simply
+                    // draining a fixed heap cannot expose queue starvation.
+                    engine.schedule_entry_for_push(&agent, now_micros);
+                } else {
+                    policy_reviews.push(agent);
+                }
+            }
+            assert_eq!(
+                policy_reviews.len() - before,
+                MAX_LIVENESS_REVIEWS_PER_TICK / 2
+            );
+        }
+        assert_eq!(
+            policy_reviews, policy_agents,
+            "retain policy queue ordering"
+        );
+        assert_eq!(scheduled_reviews.len(), MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert!(engine.dirty_agents.is_empty());
+    }
+
+    #[test]
+    fn one_review_budget_alternates_between_ready_queues() {
+        let mut engine = AtcEngine::new_for_testing();
+        for agent in ["Scheduled", "PolicyA", "PolicyB"] {
+            engine.register_agent(agent, "codex-cli", None);
+        }
+        engine.schedule_entry_for_push("Scheduled", 1);
+        engine
+            .dirty_agents
+            .extend(["PolicyA".to_string(), "PolicyB".to_string()]);
+
+        for expected in ["Scheduled", "PolicyA", "Scheduled", "PolicyB"] {
+            let dirty_before = engine.dirty_agents.clone();
+            let heap_before = engine.liveness_schedule.len();
+            let turn_before = engine.dirty_review_next;
+            assert!(engine.pop_due_agents(1, 0).is_empty());
+            assert_eq!(engine.dirty_agents, dirty_before);
+            assert_eq!(engine.liveness_schedule.len(), heap_before);
+            assert_eq!(engine.dirty_review_next, turn_before);
+
+            assert_eq!(engine.pop_due_agents(1, 1), vec![expected]);
+            if expected == "Scheduled" {
+                engine.schedule_entry_for_push(expected, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_and_timed_review_of_the_same_agent_is_not_duplicated() {
+        let mut engine = AtcEngine::new_for_testing();
+        for agent in ["AgentA", "AgentB", "AgentC"] {
+            engine.register_agent(agent, "codex-cli", None);
+            engine.schedule_entry_for_push(agent, 1);
+        }
+        engine.mark_agents_dirty();
+        let due = engine.pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert_eq!(due, vec!["AgentA", "AgentB", "AgentC"]);
+        assert!(engine.dirty_agents.is_empty());
+        assert!(engine.liveness_schedule.is_empty());
+        assert!(
+            engine
+                .pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_schedule_cleanup_yields_and_keeps_a_due_resume_deadline() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("Rescheduled{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            // Use the production reschedule path to retain two obsolete
+            // versions ahead of the actual future review for each identity.
+            engine.schedule_entry_for_push(&agent, 1);
+            engine.schedule_entry_for_push(&agent, 2);
+            engine.schedule_entry_for_push(&agent, 1_000_000);
+        }
+        let original_entries = engine.liveness_schedule.len();
+        assert_eq!(original_entries, POPULATION * 3);
+
+        let now_micros = 3;
+        let report = engine.run_tick(now_micros);
+        assert_eq!(report.summary.kernel.due_agents, 0);
+        assert_eq!(report.summary.kernel.scheduled_agents, POPULATION);
+        assert_eq!(
+            original_entries - engine.liveness_schedule.len(),
+            MAX_LIVENESS_SCHEDULE_POPS_PER_TICK,
+            "a tick must bound stale work as well as completed reviews"
+        );
+        assert!(
+            report
+                .summary
+                .kernel
+                .next_due_micros
+                .is_some_and(|due| due <= now_micros)
+        );
+
+        let remaining_entries = engine.liveness_schedule.len();
+        for _ in 0..100 {
+            assert!(
+                engine
+                    .next_scheduled_review_micros()
+                    .is_some_and(|due| due <= now_micros)
+            );
+        }
+        assert_eq!(
+            engine.liveness_schedule.len(),
+            remaining_entries,
+            "health/deadline observation must not drain deferred cleanup"
+        );
+
+        let mut passes = 1;
+        while engine.liveness_schedule.len() > POPULATION {
+            let before = engine.liveness_schedule.len();
+            assert!(
+                engine
+                    .pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK)
+                    .is_empty()
+            );
+            let popped = before - engine.liveness_schedule.len();
+            assert!((1..=MAX_LIVENESS_SCHEDULE_POPS_PER_TICK).contains(&popped));
+            passes += 1;
+            assert!(passes <= (POPULATION * 2).div_ceil(MAX_LIVENESS_SCHEDULE_POPS_PER_TICK));
+        }
+        assert_eq!(engine.next_scheduled_review_micros(), Some(1_000_000));
+        assert_eq!(engine.scheduled_agent_count(), POPULATION);
+
+        let mut reviewed = HashSet::new();
+        while !engine.liveness_schedule.is_empty() {
+            let due = engine.pop_due_agents(1_000_000, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert!(!due.is_empty());
+            for agent in due {
+                assert!(
+                    reviewed.insert(agent),
+                    "cleanup must not duplicate valid work"
+                );
+            }
+        }
+        assert_eq!(
+            reviewed.len(),
+            POPULATION,
+            "cleanup must preserve every valid review"
+        );
     }
 
     #[test]
