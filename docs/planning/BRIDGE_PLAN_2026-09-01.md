@@ -1,5 +1,40 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 11 integration follow-through, 22:58 UTC — EmeraldEagle
+
+- [x] Commit reviewed corrections as6c15bc1f. A fresh fetch discovers upstream
+  ab58b5ec (macOS owner-probe optimization plus two portability imports). Read
+  its full source diff; no deletion or dependency change. Preserve both through
+  a normal automatic non-conflicting merge35c64045, then import tracker truth.
+  Do not overwrite the peer's pool changes or rewrite either source history.
+- [ ] Verify immutable35c64045 with separate all-target/production/strictClippy
+  checks and formatting. Preserve pre-integration815 receipts as historical.
+  Do not credit the peer's reported macOS/DB results as this agent's execution.
+  Production0/198.3s on1149989 and standalone fmt0. Integrated three-file DB
+  stock scan0/0critical6200warning3185info/failed_modules[]; unchanged seven
+  other Rust files retain their exact prior hashes/scans. All-targets and
+  strictClippy remain pending; no compiler result inferred from native success.
+- [x] Predeclare and execute integration90: all45 health/lifecycle controls,
+  all31 benchmark cases and all14 repaired original failures, default three-
+  package native graph, original watchdogs/resource limits and two test slots.
+  This is a scoped integration check. Full pre-integration2378/13FAIL and the
+  unchanged diagnostic13/2FAIL remain RED, irrespective of its result.
+  Initial request exits2 at argument parsing because --clean-overlay was
+  omitted; zero remote/test execution. Preserve it and correct only that CLI
+  argument. No source, test, budget, feature or filter reduction.
+  Actual22bf93ec-7514-4437-8dcd-22d0cfa1f552 ends0:90/90PASS,5529skipped,
+  42.313s execution/316.8s total. All90 predeclared identities exactly match.
+  Stable actual CLI/storage/tools ELFs062b5c84/7126b6ea/54a31d9b contain their
+  respective new test markers. Post-run native source directory is already
+  absent, so independent native-worker file rehash is unavailable, not claimed.
+  Immutable Git35c/RCH receipt/local14-file hashes and three executable hashes
+  remain retained; the still-active compiler worker independently matches all
+  fourteen files and rustc1.100.0-nightly. No macOS verification claim.
+- [ ] Retain final integrated-source results, review the metadata-only follow-
+  through, publish normal refs, verify fetched ancestry and tracked cleanliness,
+  then release exactly the nine reservations owned by this review. Original
+  .29/.5/br-asldx acceptance stays open; this is self-run Linux verification.
+
 ## November 11 published-source review, 20:39 UTC — EmeraldEagle
 
 - [x] Verify clean tracked3e7fbab8, unchanged governing-document hashes and no
@@ -110,9 +145,11 @@
   predeclared identity matches, and ALL14 previous failures nowPASS. Stable
   actual storage/tools ELFs4b21e566/2af08bd2 have their respective test markers;
   eleven actual worker hashes and rustc1.100.0-nightly match. The full run stays
-  RED: eleven untouched cases fail initial healthy10s database checkout, and
-  two untouched recovery cases expect4 repairs despite the actual1s cooperative
-  turn yielding1 or2. No timeout, repair limit, assertion or runner retry changed.
+  RED: eleven untouched cases fail initial healthy database checkout, and two
+  untouched recovery cases report1/2 repairs instead of expected4. Production
+  has a1s cooperative turn, but its exact stop reason was not captured; this
+  budget is a candidate explanation, not an established cause. No timeout,
+  repair limit, assertion or runner retry changed.
 - [x] Predeclare one diagnostic invocation of exactly those13 failed cases on
   unchanged81501674/same hz3/native graph and resource policy. Run
   0501cd0b-1399-48a1-9641-cf5ea27c8003 ends100:13actual/11PASS/2FAIL,
