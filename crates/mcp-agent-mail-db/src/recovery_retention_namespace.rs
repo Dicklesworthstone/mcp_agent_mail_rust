@@ -1799,7 +1799,7 @@ fn ensure_no_file_readers(
     _retained_identity: &Metadata,
     excluded_descriptor: Option<&File>,
 ) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::AsRawFd;
 
     let excluded_descriptor = excluded_descriptor.map(AsRawFd::as_raw_fd);
     let output = std::process::Command::new("lsof")

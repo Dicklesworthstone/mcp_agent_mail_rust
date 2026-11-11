@@ -31,8 +31,11 @@ pub mod staging;
 
 pub use staging::{ProactiveBackupStagingInventory, inspect_proactive_backup_staging};
 
+// Only a Linux test builds non-Unicode staging names from the prefix.
+#[cfg(all(test, target_os = "linux"))]
+use staging::PROACTIVE_STAGING_PREFIX;
 #[cfg(test)]
-use staging::{PROACTIVE_STAGING_PREFIX, inspect_proactive_backup_staging_with_limit};
+use staging::inspect_proactive_backup_staging_with_limit;
 
 #[cfg(unix)]
 pub use namespace::{

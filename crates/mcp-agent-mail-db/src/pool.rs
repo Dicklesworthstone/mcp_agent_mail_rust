@@ -15370,20 +15370,84 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
     holders.into_iter().collect()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
-    // macOS/BSD do not expose `/proc/locks`.  Treat an Agent Mail process
-    // with the activity-lock file open as a conservative holder candidate;
-    // the caller filters these PIDs through `pid_is_agent_mail`.  This is
-    // intentionally fail-closed: misclassifying an open-but-not-locked Agent
-    // Mail process as live only defers repair, while missing the real holder
-    // can authorize repair/reconstruct against an active database (GH#195).
-    // Without a lock-mode column every candidate is reported as an exclusive
-    // holder for the same fail-closed reason.
-    pids_holding_file_via_lsof(path)
-        .into_iter()
-        .map(|pid| (pid, true))
-        .collect()
+/// Who has the mailbox files locked or open, for [`inspect_mailbox_ownership`].
+///
+/// Linux reads `/proc/locks` and `/proc/*/fd`. Other platforms have only
+/// `lsof`, and `lsof -- <file>` reads the descriptor table of every process on
+/// the host: about 1.2 s of kernel time with ~3,200 processes on macOS. One
+/// inspection asks about three files, and every CLI call that resolves its
+/// server inspects first, including each `am check-inbox` hook, so a busy
+/// agent host spent several cores of kernel time on it (2026-11-11). Ownership
+/// only counts processes that pass [`pid_is_agent_mail`], so this probe lists
+/// those from the process table, once and only when a probed file exists, and
+/// has `lsof` read only their descriptors. When the process table cannot be
+/// read it falls back to every process: slower, but it misses no holder. A
+/// process that starts after the listing is not read, just as one that opens
+/// the file after `lsof` reads it was never seen by the full scan either.
+struct MailboxFileHolders {
+    /// The PIDs whose descriptors are read, listed on first use; `None` reads
+    /// every process.
+    #[cfg(not(target_os = "linux"))]
+    candidates: std::cell::OnceCell<Option<Vec<u32>>>,
+}
+
+impl MailboxFileHolders {
+    #[cfg(target_os = "linux")]
+    const fn probe() -> Self {
+        Self {}
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn probe() -> Self {
+        Self {
+            candidates: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// `(pid, exclusive)` holders of the `flock` on `path`.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unused_self)] // the non-Linux probe needs its candidate list
+    fn lock_holders(&self, path: &Path) -> Vec<(u32, bool)> {
+        lock_holder_pids_via_proc(path)
+    }
+
+    /// `(pid, exclusive)` holders of the `flock` on `path`.
+    ///
+    /// macOS/BSD do not expose `/proc/locks`.  Treat an Agent Mail process
+    /// with the activity-lock file open as a conservative holder candidate;
+    /// the caller filters these PIDs through `pid_is_agent_mail`.  This is
+    /// intentionally fail-closed: misclassifying an open-but-not-locked Agent
+    /// Mail process as live only defers repair, while missing the real holder
+    /// can authorize repair/reconstruct against an active database (GH#195).
+    /// Without a lock-mode column every candidate is reported as an exclusive
+    /// holder for the same fail-closed reason.
+    #[cfg(not(target_os = "linux"))]
+    fn lock_holders(&self, path: &Path) -> Vec<(u32, bool)> {
+        self.open_holders(path)
+            .into_iter()
+            .map(|pid| (pid, true))
+            .collect()
+    }
+
+    /// PIDs with `path` open.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unused_self)] // the non-Linux probe needs its candidate list
+    fn open_holders(&self, path: &Path) -> Vec<u32> {
+        pids_holding_file_via_proc(path)
+    }
+
+    /// PIDs with `path` open.
+    #[cfg(not(target_os = "linux"))]
+    fn open_holders(&self, path: &Path) -> Vec<u32> {
+        // A missing file has no holders; skip listing the process table.
+        if !path.exists() {
+            return Vec::new();
+        }
+        let candidates = self
+            .candidates
+            .get_or_init(agent_mail_pids_from_process_table);
+        pids_holding_file_via_lsof(path, candidates.as_deref())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -15452,7 +15516,7 @@ fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
 
 #[cfg(not(target_os = "linux"))]
 fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
-    pids_holding_file_via_lsof(path)
+    pids_holding_file_via_lsof(path, None)
 }
 
 /// Enumerate PIDs with `path` open on platforms without Linux `/proc`.
@@ -15462,10 +15526,18 @@ fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
 /// diagnostics.  Passing `--` prevents a path beginning with `-` from being
 /// interpreted as an option.  Any probe failure returns no evidence; callers
 /// remain read-only and can combine this with other liveness signals.
+///
+/// `among` limits the search to those PIDs (see [`MailboxFileHolders`]);
+/// `None` reads every process's descriptors, which costs about a second of
+/// kernel time on a host with a few thousand processes.
 #[cfg(not(target_os = "linux"))]
-fn pids_holding_file_via_lsof(path: &Path) -> Vec<u32> {
+fn pids_holding_file_via_lsof(path: &Path, among: Option<&[u32]>) -> Vec<u32> {
+    // lsof reports no holder for a file it cannot stat, so skip running it.
+    if among.is_some_and(<[u32]>::is_empty) || !path.exists() {
+        return Vec::new();
+    }
     let Ok(output) = std::process::Command::new("lsof")
-        .args(["-t", "-w", "--"])
+        .args(lsof_holder_args(among))
         .arg(path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -15473,10 +15545,99 @@ fn pids_holding_file_via_lsof(path: &Path) -> Vec<u32> {
     else {
         return Vec::new();
     };
+    // A PID that exits before lsof reads it makes lsof exit 1 even when it
+    // printed the holders it did find, so only empty output means none.
     if !output.status.success() && output.stdout.is_empty() {
         return Vec::new();
     }
     parse_pid_lines(&output.stdout)
+}
+
+/// `lsof` arguments up to the file name: PIDs only (`-t`), no warnings
+/// (`-w`), and with `among`, `-a -p <pids>` so the PID list and the file name
+/// must both match and only those processes are read.
+#[cfg(any(test, not(target_os = "linux")))]
+fn lsof_holder_args(among: Option<&[u32]>) -> Vec<String> {
+    let mut args = vec!["-t".to_string(), "-w".to_string()];
+    if let Some(pids) = among {
+        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        args.extend(["-a".to_string(), "-p".to_string(), pids.join(",")]);
+    }
+    args.push("--".to_string());
+    args
+}
+
+/// PIDs that [`pid_is_agent_mail`] accepts, from two whole-table `ps` reads
+/// of the same `command=` and `comm=` columns it reads one PID at a time.
+/// The reads run side by side. `None` when either fails or omits this
+/// process, so the caller falls back to reading every process.
+#[cfg(not(target_os = "linux"))]
+fn agent_mail_pids_from_process_table() -> Option<Vec<u32>> {
+    let commands = spawn_ps_table("command=");
+    let executables = spawn_ps_table("comm=");
+    // Collect both before `?`, so neither child is left unwaited.
+    let commands = commands.and_then(collect_ps_table);
+    let executables = executables.and_then(collect_ps_table);
+    Some(agent_mail_pids_in_process_table(&commands?, &executables?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_ps_table(column: &str) -> Option<std::process::Child> {
+    std::process::Command::new("ps")
+        .args(["-ww", "-ax", "-o", &format!("pid=,{column}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_ps_table(child: std::process::Child) -> Option<Vec<(u32, String)>> {
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rows = parse_ps_table(&output.stdout);
+    // A listing that lacks the process reading it was not parsed correctly.
+    let me = std::process::id();
+    rows.iter().any(|(pid, _)| *pid == me).then_some(rows)
+}
+
+/// `(pid, value)` rows of `ps -o pid=,<column>=` output. Rows with an empty
+/// value are dropped, as [`parse_ps_output_value`] treats them as absent.
+#[cfg(any(test, not(target_os = "linux")))]
+fn parse_ps_table(stdout: &[u8]) -> Vec<(u32, String)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, value) = line.trim_start().split_once(char::is_whitespace)?;
+            let value = value.trim();
+            let pid = pid.parse::<u32>().ok()?;
+            (!value.is_empty()).then(|| (pid, value.to_owned()))
+        })
+        .collect()
+}
+
+/// The rows that pass [`pid_is_agent_mail`]'s two tests: the command line
+/// ([`command_line_is_agent_mail_process`]) or the executable path
+/// ([`executable_path_has_agent_mail_signature`]).
+#[cfg(any(test, not(target_os = "linux")))]
+fn agent_mail_pids_in_process_table(
+    commands: &[(u32, String)],
+    executables: &[(u32, String)],
+) -> Vec<u32> {
+    let by_command = commands
+        .iter()
+        .filter(|(_, command)| command_line_is_agent_mail_process(command));
+    let by_executable = executables
+        .iter()
+        .filter(|(_, executable)| executable_path_has_agent_mail_signature(Path::new(executable)));
+    by_command
+        .chain(by_executable)
+        .map(|(pid, _)| *pid)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(any(test, not(target_os = "linux")))]
@@ -15610,19 +15771,25 @@ fn pid_executable_deleted(pid: u32) -> bool {
 }
 
 fn pid_is_agent_mail(pid: u32) -> bool {
-    pid_command_line(pid).is_some_and(|command| {
-        // Rust binary (argv0 basename) OR a co-resident Python Agent Mail
-        // shadow (interpreter argv0 + agent-mail module). The Python case
-        // is what makes the pre-write mailbox-ownership gate refuse a
-        // concurrent legacy server (br-bvq1x.9.4 / I4).
-        command_line_has_agent_mail_signature(&command)
-            || command_is_python_agent_mail_shadow(&command)
-    }) || pid_executable_path(pid)
-        .and_then(|exe| {
-            exe.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .is_some_and(|basename| executable_name_has_agent_mail_signature(&basename))
+    pid_command_line(pid).is_some_and(|command| command_line_is_agent_mail_process(&command))
+        || pid_executable_path(pid)
+            .is_some_and(|executable| executable_path_has_agent_mail_signature(&executable))
+}
+
+/// The command-line test of [`pid_is_agent_mail`]: the Rust binary by its
+/// `argv0` basename, or a co-resident Python Agent Mail shadow (interpreter
+/// `argv0` plus the agent-mail module). The Python case is what makes the
+/// pre-write mailbox-ownership gate refuse a concurrent legacy server
+/// (br-bvq1x.9.4 / I4).
+fn command_line_is_agent_mail_process(command: &str) -> bool {
+    command_line_has_agent_mail_signature(command) || command_is_python_agent_mail_shadow(command)
+}
+
+/// The executable test of [`pid_is_agent_mail`]: the executable's basename.
+fn executable_path_has_agent_mail_signature(executable: &Path) -> bool {
+    executable
+        .file_name()
+        .is_some_and(|name| executable_name_has_agent_mail_signature(&name.to_string_lossy()))
 }
 
 fn add_mailbox_process_surface(
@@ -15840,8 +16007,9 @@ pub fn inspect_mailbox_ownership(
     let storage_lock_path = mailbox_activity_lock_path_for_storage_root(storage_root);
     let sqlite_lock_path = mailbox_activity_lock_path_for_sqlite(primary_path);
 
+    let holders = MailboxFileHolders::probe();
     let mut processes = HashMap::new();
-    for (pid, exclusive) in lock_holder_pids_via_proc(&storage_lock_path) {
+    for (pid, exclusive) in holders.lock_holders(&storage_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_storage_root_lock = true;
@@ -15849,7 +16017,7 @@ pub fn inspect_mailbox_ownership(
             });
         }
     }
-    for (pid, exclusive) in lock_holder_pids_via_proc(&sqlite_lock_path) {
+    for (pid, exclusive) in holders.lock_holders(&sqlite_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_sqlite_lock = true;
@@ -15858,7 +16026,7 @@ pub fn inspect_mailbox_ownership(
         }
     }
     if primary_path.exists() {
-        for pid in pids_holding_file_via_proc(primary_path) {
+        for pid in holders.open_holders(primary_path) {
             if pid_is_agent_mail(pid) {
                 add_mailbox_process_surface(&mut processes, pid, |process| {
                     process.holds_database_file = true;
@@ -35629,6 +35797,158 @@ mod tests {
             Some("am serve-http --port 8765".to_string())
         );
         assert_eq!(parse_ps_output_value(b"\n \t\n"), None);
+    }
+
+    #[test]
+    fn process_table_rows_keep_spaces_in_values_and_drop_unparseable_lines() {
+        let table = parse_ps_table(
+            b"    1 /sbin/launchd\n\
+              23744 /Users/me/.local/bin/am serve-http --port 8765\n\
+              57477 /System/Applications/Utilities/Screen Sharing.app/Contents/MacOS/Screen Sharing\n\
+              not-a-pid am\n\
+              99001   \n",
+        );
+        assert_eq!(
+            table,
+            vec![
+                (1, "/sbin/launchd".to_string()),
+                (
+                    23_744,
+                    "/Users/me/.local/bin/am serve-http --port 8765".to_string()
+                ),
+                (
+                    57_477,
+                    "/System/Applications/Utilities/Screen Sharing.app/Contents/MacOS/Screen Sharing"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_table_candidates_match_pid_is_agent_mail_tests() {
+        let row = |pid: u32, value: &str| (pid, value.to_string());
+        let commands = [
+            row(10, "/Users/me/.local/bin/am serve-http --port 8765"),
+            row(11, "am check-inbox --agent BlueLake"),
+            row(12, "/opt/homebrew/bin/python3 -m mcp_agent_mail.http"),
+            row(13, "renamed-argv0 serve-http"),
+            row(14, "/usr/bin/python3 -m unrelated_tool"),
+            row(15, "/Users/me/bin/amber --serve"),
+            row(16, "(am)"),
+        ];
+        let executables = [
+            row(10, "/Users/me/.local/bin/am"),
+            row(11, "/Users/me/.local/bin/am"),
+            row(12, "/opt/homebrew/bin/python3"),
+            row(13, "/Users/me/.cargo/bin/mcp-agent-mail"),
+            row(14, "/usr/bin/python3"),
+            row(15, "/Users/me/bin/amber"),
+            row(16, "am"),
+        ];
+        let candidates = agent_mail_pids_in_process_table(&commands, &executables);
+        // 10/11: argv0 basename; 12: Python shadow; 13: executable basename
+        // only; 16: an unreadable command line but a readable executable.
+        assert_eq!(candidates, vec![10, 11, 12, 13, 16]);
+        for (pid, command) in &commands {
+            let executable = &executables.iter().find(|(p, _)| p == pid).unwrap().1;
+            let accepted = command_line_is_agent_mail_process(command)
+                || executable_path_has_agent_mail_signature(Path::new(executable));
+            assert_eq!(
+                candidates.contains(pid),
+                accepted,
+                "pid {pid}: the table filter must apply pid_is_agent_mail's tests"
+            );
+        }
+    }
+
+    #[test]
+    fn lsof_holder_args_restrict_to_candidates_only_when_given() {
+        assert_eq!(lsof_holder_args(None), ["-t", "-w", "--"]);
+        assert_eq!(
+            lsof_holder_args(Some(&[23_744, 90_055])),
+            ["-t", "-w", "-a", "-p", "23744,90055", "--"]
+        );
+    }
+
+    // Needs lsof, which Windows lacks.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_lsof_among_candidates_finds_only_listed_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.lock");
+        let _held = std::fs::File::create(&path).unwrap();
+        let me = std::process::id();
+        // Above macOS's PID limit (99,999), so no process has it.
+        let no_such_pid = 99_999_999;
+
+        assert_eq!(pids_holding_file_via_lsof(&path, Some(&[me])), vec![me]);
+        // The full scan agrees with the restricted one about this holder.
+        assert!(pids_holding_file_via_lsof(&path, None).contains(&me));
+        // A listed PID that does not hold the file, a PID with no process,
+        // and an empty list report no holder.
+        let none: Vec<u32> = Vec::new();
+        assert_eq!(pids_holding_file_via_lsof(&path, Some(&[1])), none);
+        assert_eq!(
+            pids_holding_file_via_lsof(&path, Some(&[1, no_such_pid])),
+            none
+        );
+        assert_eq!(pids_holding_file_via_lsof(&path, Some(&[])), none);
+        // A missing file has no holder, with or without a PID list.
+        let missing = dir.path().join("missing.lock");
+        assert_eq!(pids_holding_file_via_lsof(&missing, Some(&[me])), none);
+        assert_eq!(pids_holding_file_via_lsof(&missing, None), none);
+        // lsof exits 1 when a listed PID has no process; the live holder it
+        // printed must still be reported.
+        assert_eq!(
+            pids_holding_file_via_lsof(&path, Some(&[me, no_such_pid])),
+            vec![me]
+        );
+    }
+
+    // Needs ps, which Windows lacks.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_process_table_lists_this_process() {
+        let commands = spawn_ps_table("command=")
+            .and_then(collect_ps_table)
+            .expect("ps command table");
+        let executables = spawn_ps_table("comm=")
+            .and_then(collect_ps_table)
+            .expect("ps comm table");
+        let me = std::process::id();
+        assert!(commands.iter().any(|(pid, _)| *pid == me));
+        assert!(executables.iter().any(|(pid, _)| *pid == me));
+        assert!(agent_mail_pids_from_process_table().is_some());
+    }
+
+    // Needs lsof and ps, which Windows lacks.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_mailbox_holders_list_processes_only_for_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let holders = MailboxFileHolders::probe();
+
+        assert_eq!(
+            holders.open_holders(&dir.path().join("missing.lock")),
+            Vec::<u32>::new()
+        );
+        assert!(
+            holders.candidates.get().is_none(),
+            "a missing file must not list the process table"
+        );
+
+        let path = dir.path().join("present.lock");
+        let _held = std::fs::File::create(&path).unwrap();
+        let found = holders.open_holders(&path);
+        match holders.candidates.get() {
+            // This test binary is not an Agent Mail process, so lsof skips it.
+            Some(Some(_)) => assert!(!found.contains(&me)),
+            // Without a process table every process is read.
+            Some(None) => assert!(found.contains(&me)),
+            None => panic!("an existing file must list the process table"),
+        }
     }
 
     #[test]
