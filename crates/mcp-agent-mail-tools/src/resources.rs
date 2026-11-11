@@ -7902,6 +7902,7 @@ mod resource_shape_tests {
             ],
             || {
                 run_async(|cx| async move {
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let pool = seed_pool();
                     let project = ensure_project(&cx, &pool, "/priority inbox resource").await;
                     let project_id = project.id.expect("project id");
@@ -8200,6 +8201,7 @@ mod resource_shape_tests {
             ],
             || {
                 run_async(|cx| async move {
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let pool = seed_pool();
                     let project = ensure_project(&cx, &pool, "/retired-priority-history").await;
                     let project_id = project.id.unwrap();
@@ -8350,6 +8352,7 @@ mod resource_shape_tests {
                 ],
                 || {
                     run_async(|cx| async move {
+                        crate::test_support::prepare_mailbox_before_outage(&cx).await;
                         let pool = seed_pool();
                         let project =
                             ensure_project(&cx, &pool, "/resource-session-identity").await;

@@ -4032,6 +4032,24 @@ pub(crate) mod test_support {
         mcp_agent_mail_storage::flush_async_commits();
     }
 
+    /// Initialize the real private mailbox before a tight checkout-outage probe.
+    /// Cold migrations use the normal startup budget; the caller's separately
+    /// keyed one-slot pool retains its configured timeout. No setup connection
+    /// or alternate setup pool remains available to service the faulted call.
+    pub async fn prepare_mailbox_before_outage(cx: &asupersync::Cx) {
+        let mut config = mcp_agent_mail_db::DbPoolConfig::from_env();
+        config.acquire_timeout_ms = mcp_agent_mail_db::DbPoolConfig::default().acquire_timeout_ms;
+        let pool =
+            mcp_agent_mail_db::get_or_create_pool(&config).expect("private mailbox setup pool");
+        let connection = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("initialize private mailbox before checkout outage");
+        drop(connection);
+        drop(pool);
+    }
+
     /// Run `f` with `DATABASE_URL` and `STORAGE_ROOT` pointed at a fresh
     /// tempdir (plus `extra_overrides`), serialized by `lock`.
     ///

@@ -1853,7 +1853,7 @@ mod tests {
                         ).expect("direct delivery");
                         if id % 3 == 0 {
                             conn.execute_sync(
-                                "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,3,'cc'),(?,4,'cc')",
+                                "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?1,3,'cc'),(?2,4,'cc')",
                                 &[Value::BigInt(id), Value::BigInt(id)],
                             ).expect("two CC deliveries must produce one search hit");
                         }

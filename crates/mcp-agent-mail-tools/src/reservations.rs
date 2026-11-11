@@ -8881,6 +8881,7 @@ mod tests {
                         assert_eq!(outage_config.min_connections, 1);
                         assert_eq!(outage_config.max_connections, 1);
                         assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                        crate::test_support::prepare_mailbox_before_outage(&cx).await;
                         let outage_pool = get_db_pool().expect("healthy configured mailbox");
                         assert_ne!(outage_pool.sqlite_path(), pool.sqlite_path());
                         let outage_engine = outage_pool.engine_identity_key();

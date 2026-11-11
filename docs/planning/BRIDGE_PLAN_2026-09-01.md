@@ -1,5 +1,171 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 11 published-source review, 20:39 UTC — EmeraldEagle
+
+- [x] Verify clean tracked3e7fbab8, unchanged governing-document hashes and no
+  incoming commits. Re-read the full latest source diff and isolated actual
+  health regression; preserve all earlier failed/refused receipts.
+- [x] Recheck Beads: continue owned br-kp1in.29 without acceptance/graph edits.
+  Reserve only this existing TODO. Confirm the six source/configuration hashes
+  still match the four completed compiler checks from the preceding pass.
+- [x] Measure worker admission before retry: vmi1149989 has two free slots,
+  native protected headroom29827076096 bytes and53028424KiB available memory.
+  Predeclare the unchanged45-case selection and execute exact commit3e7fbab8
+  through strict RCH with no working-tree overlay, same two packages/default
+  features, four compile jobs, two test processes and unchanged watchdogs/budgets.
+- [x] Observe actual terminal native execution, compare every result identity
+  against all45 predeclared cases and inspect the real health/lifecycle outputs.
+  Do not infer test passes from compilation, admission or prior-scope receipts.
+  Published3e7 native0:45/45PASS,2335skipped,31.845s execution (2423.7s total),
+  runb5270c89-ba1d-42ba-958b-f5a7101407c4 on vmi1149989. All45 identities match;
+  real isolated health1.498s and hot-read neutrality1.252s pass. Stable actual
+  storage/tools ELFs b20d7146/1bf48c36 match their new test markers. The worker's
+  six source/config hashes and rustc1.100.0-nightly were independently read.
+- [x] If those controls pass, exercise both complete storage/tools library test
+  populations on the same source/default graph (2380 expected, no name filter).
+  This checks other consumers affected by removing health's implicit startup.
+  Keep the same watchdogs, two test processes and every failed/unfinished case;
+  it is not full-workspace, transport, performance or release qualification.
+  First request refuses120 before compilation on1149989; retain it. Fresh
+  read-only admission later finds protected headroom46938808320B and free slots;
+  unchanged retry executes final3e7+bench overlay4fd3e89d. Same health/storage
+  bytes and default two-package graph. Actual2380 population is2378 eligible
+  plus2 pre-existing ignored microbenchmarks (insert/drain and random-order
+  spill BTreeSet timings); preserve these exclusions, no ignored-test override.
+  Native run27e08170-7014-438d-a6d3-dfa02541d569 ends100:2378 actual,
+  2364PASS/14FAIL/0timeouts in973.302s. The complete run is RED. Five failures
+  stop at the same anonymous-placeholder fixture; seven stop at healthy cold
+  setup under a1s checkout budget before injecting an outage; one contradicts
+  the existing explicit-agent-ID grammar; one reports a real WBQ archive-write
+  failure. Preserve all14 failures, not just the convenient fixture findings.
+- [x] Re-read the actual sampler/startup/health integration once more, including
+  both recent health commits, actual startup callers, queue-capacity parsing
+  and the new isolated positive/negative control. No further production health
+  defect found; configured capacity is already clamped before worker creation.
+  Subsequent concrete benchmark and fixture findings are recorded below.
+- [x] Review owned br-kp1in.5 and trace the real CLI comparison caller. Find
+  display-rounded deltas driving regression flags and percentages; reserve
+  existing bench.rs and add three explicit unchanged-threshold counterexamples.
+- [x] Execute those three cases on unchanged production and retain exact old
+  source/ELF/results. All three decisive counterexamples are slowdowns; the
+  constructor also retains unchanged equal/faster controls. The falsely rejected
+  but within-budget case is still a loss against its reference, never a speedup.
+  Immutable test-only b147d9f4 ends100:3actual/3FAIL,3236skipped,0.117s,
+  run8c70237c-6d52-4a54-a667-5c58280ae075 on vmi1153651. Stable actual CLI
+  ELF529962f2 contains all three new markers; five source/config hashes match.
+  Keep the earlier queued103 as zero execution, separate from these failures.
+- [x] Retain raw deltas through classification/percentage arithmetic, rounding
+  only presentation fields. Do not alter stored baselines, thresholds, workloads,
+  live-control/null policy or the original measurement acceptance.
+  Initial stock UBS reports1 existing critical at the deliberate command runner.
+  Trace its sole production caller: current_exe() is prepended, arguments remain
+  argv and no shell parses measured input. Document that specific cross-file
+  false positive with a supported inline annotation; retain the original red
+  scan. Final stock scan0,0critical225warning36info, failed_modules[]; fmt0.
+  Compiler checks already captured before that explanatory annotation remain
+  intermediate until final source hashes match. No scanner rule/category,
+  severity, profile, gate threshold or command behavior changes.
+- [x] Re-read the correction; execute all existing benchmark-module tests plus
+  the new controls on the exact final source. Run required workspace compiler
+  graphs, formatting and stock UBS; preserve every failed or incomplete result.
+  Math-only packet4fd3e89d passes all-targets0/247.7s, production0/338.3s,
+  strictClippy0/655.0s, portable production0/570.6s and fmt0. Candidate31-case
+  native request first refuses120 before compilation on114; unchanged retry
+  admitted on ovh-a22:09UTC and ends0:31actual/31PASS,3208skipped,0.312s execution,
+  854.1s total, run1a1822f1-c4c2-4169-8686-e642853c31ae. All31 predeclared names
+  exactly match actual passes (including space-padded result ordinals). Stable
+  actual CLI ELFfdcc4c21 contains all3 new markers; five worker hashes match.
+  The within-policy control admits exactly1LOSE/0WIN; no measured performance
+  win or original gate closure. Final complete fixture-packet checks below
+  remain separately required; math-only passes do not qualify edited tests.
+- [x] Repair the five search fixtures with explicit ?1/?2 parameter indices;
+  retain exactly the original rows, arguments, test cases and assertions.
+- [x] Correct the stale agent-name test against the existing runtime grammar;
+  check the three allowed separators and eight unsafe/reserved counterexamples.
+  Do not alter production naming policy to satisfy an obsolete test.
+- [x] Separate real cold-schema setup from the seven existing one-slot outage
+  scenarios. Add an explicit test-only helper using the normal10s acquisition
+  budget, then drop that connection and pool before obtaining the separately
+  keyed1s target pool. Strong path-scoped init gates retain completed schema
+  setup; weak pool cache and timeout-sensitive keys prevent an alternate pool
+  serving the faulted call. All max1/min1 settings,1s target deadlines, held-slot
+  faults, independent wrong-mailbox data and original assertions stay intact.
+  Two delegated agents perform only simple fixture edits/review under the root
+  leases; root retains implementation review, real checks and tracker ownership.
+- [x] Re-run all2380 storage/tools cases on the complete corrected source, with
+  exactly the original2 ignored microbenchmarks and no test-name filter. The
+  original14 failures stay retained. Investigate any actual archive-write
+  failure without clearing its counters or relaxing the durability assertion.
+  Source trace identifies the archive failure: raw DELETE/re-register invents
+  a new inception for a surviving name, correctly refused by monotonic archive
+  profile publication. Preserve inception while replacing its real row ID;
+  assert the new ID differs, registration returns it, inception is unchanged,
+  and both real recipient inboxes contain the actual sent message. Keep the
+  original durability assertion and all production publication guards intact.
+  Cancel only the earlier own queued wrapper before start (terminal130,
+  terminal_acknowledged:true, no remote build ID/bodies). New full packet is
+  admitted on hz3 after positive protected-headroom22754697216B.
+  Final run90fe2380-80ac-4ea4-b976-eda31a9ab667 ends100:2378actual,
+  2365PASS/13FAIL/0timeouts/2original ignores,680.624s execution. Every eligible
+  predeclared identity matches, and ALL14 previous failures nowPASS. Stable
+  actual storage/tools ELFs4b21e566/2af08bd2 have their respective test markers;
+  eleven actual worker hashes and rustc1.100.0-nightly match. The full run stays
+  RED: eleven untouched cases fail initial healthy10s database checkout, and
+  two untouched recovery cases expect4 repairs despite the actual1s cooperative
+  turn yielding1 or2. No timeout, repair limit, assertion or runner retry changed.
+- [x] Predeclare one diagnostic invocation of exactly those13 failed cases on
+  unchanged81501674/same hz3/native graph and resource policy. Run
+  0501cd0b-1399-48a1-9641-cf5ea27c8003 ends100:13actual/11PASS/2FAIL,
+  2367skipped,20.281s execution; all13 identities match. Repeated failures are
+  acknowledgement_views_include_shared_mail_and_keep_receipts_per_viewer and
+  agent_mail_resources_cannot_authorize_a_renamed_row_from_the_read_cache,
+  both at healthy seed_pool acquisition. This diagnostic does NOT replace the
+  full red result or qualify the previously failing eleven in full-suite load.
+- [x] Trace cold checkout honestly: FastMCP already installs a real native
+  runtime, and pool creation uses a wall clock. Synthetic Cx alone is not a
+  demonstrated cause. The deadline includes the real factory, whose non-
+  preemptible migration/recovery calls can finish late and then be refused.
+  Correct the stale opposite claim in pool.rs documentation only; runtime
+  policy/code unchanged. This later comment-only clarification is outside the
+  functional815 packet; its separate full-file stock scan0/0critical and fmt
+  check cover the documentation edit, not a claimed runtime correction.
+- [ ] Keep the broader qualification open: identify the actual slow cold-init
+  stage in the two reproducible resource fixtures before changing production
+  initialization. Preserve all thirteen full failures and both repeated ones.
+  The other eleven passing in a smaller diagnostic lane is not a root-cause
+  explanation. Recovery's4-per-pass expectations also need an independent
+  budget/actual-archive probe; do not raise the1s turn, pool10s acquisition,
+  case watchdogs or retries to manufacture green.
+- [x] Run all-targets, separate production and strictClippy on the final fixture
+  packet; verify formatting and stock UBS. Earlier math-only compiler passes do
+  not qualify the subsequently edited test code. Do not edit source while its
+  immutable remote requests are awaiting admission; retain any refusal outcome.
+  Three initial compiler requests refuse103 because explicit-j4 exceeds their
+  scheduler's2/3 slots. Adjust only compiler concurrency to-j2; no graph, lint,
+  test-timeout or disk-budget change. Intermediate fixture packet29a5 production
+  passes0/165.0s; strictClippy refuses120 before Cargo, all-targets executing.
+  Final recipient correction supersedes that test packet. Final fmt0; stock
+  seven-file scan0 with0critical/5533warning/1840info before this last fixture
+  correction; final stock scan0/0critical/5553warning/1840info/failed_modules[].
+  All added warnings are in the expanded real-data fixture's assertions and
+  readbacks; no production finding dismissed by that test-only classification.
+  Final packet81501674 production0/129.8s on1149989, strictClippy0/870.9s
+  on hz2 and all-targets0/1075.5s on ovh-a. Intermediate29a5 all-targets
+  ends0/1317.8s but does not qualify the later recipient fixture. Initial
+  finalClippy129 placement
+  refuses120 before Cargo as another reservation wins capacity; preserve it.
+- [x] Record terminal results and original unmet acceptance on owned .29/.5,
+  with the related bounded cold-init observation on owned br-asldx. All three
+  remain in_progress; no graph/acceptance change or closure. Flush JSONL truth,
+  verify2867-ID export coverage/no drift and empty cycles, review every source
+  diff and preserve peer/untracked files. The three-way base snapshot can lag
+  the latest auto-exported comment; it is not authoritative issue truth.
+  Prepare normal source publication. Publish refs and release only this
+  session's nine reservations as the final operations; report their terminal
+  outcomes in the turn handoff. Delegated edits/self-run checks provide no
+  independent verification or release qualification. The unresolved broader
+  qualification item above deliberately stays unchecked.
+
 ## November 11 health observer follow-through — EmeraldEagle
 
 - [x] Recheck the governing-document hashes, clean9516670f checkout, and Beads.
@@ -26,9 +192,10 @@
   without initializing workers or overwriting observed running-worker metrics.
 - [x] Re-read all changed paths and their startup/write callers again. No further
   source finding; configured display bounds retain actual nonzero observations.
-- [ ] Execute the original38 diagnostic cases, the new actual health case,
+- [x] Execute the original38 diagnostic cases, the new actual health case,
   strengthened hot-read neutrality and relevant original WBQ lifecycle controls
-  on the exact candidate. This positive native evidence remains unavailable.
+  on published3e7fbab8: all45 actually pass in the later published-source review
+  above. The three earlier admission refusals remain zero-execution outcomes.
 - [x] Run all-target and separate production checks, strict Clippy, portable
   production check, formatting and stock/staged UBS through strict RCH where
   compilation is involved. Use the actual storage/tools default native graph,

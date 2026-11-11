@@ -2801,10 +2801,10 @@ pub fn evaluate_write_route(
 /// a 16-hour outage was undiagnosable for exactly this reason). 10s leaves the
 /// dispatcher 20s of headroom to surface the attributed failure.
 ///
-/// The timeout bounds only the *wait* for a connection: the
-/// connection-create/init path (migrations, archive reconstruction) is not cut
-/// off by it, so a slow first-time init still completes. Waiters on that init
-/// are bounded separately by [`SqliteInitGate`].
+/// The acquisition deadline includes connection creation and initialization.
+/// A non-preemptible initialization call can run past it, but the pool checks
+/// the deadline before publishing the connection and refuses a late success.
+/// Waiters on another initializer are also bounded by [`SqliteInitGate`].
 ///
 /// Override via `DATABASE_POOL_TIMEOUT` (seconds; values of 1000 or more are read
 /// as milliseconds, see [`pool_timeout_ms_from_setting`]); sizing via

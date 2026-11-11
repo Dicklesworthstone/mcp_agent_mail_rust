@@ -715,7 +715,9 @@ fn run_once(
             false,
         );
     }
-    let mut process = Command::new(&command[0]);
+    // The CLI prepends current_exe(); direct API callers explicitly select a
+    // benchmark executable. Arguments remain separate argv, without a shell.
+    let mut process = Command::new(&command[0]); // ubs:ignore -- Intentional process runner; the production caller fixes this to current_exe(), not measured data or a shell-parsed string.
     process.args(&command[1..]);
     process.stdout(Stdio::null());
     process.stderr(Stdio::null());
@@ -1088,7 +1090,7 @@ impl BenchResult {
         let stddev_ms = round_to(variance_ms2.sqrt(), 2);
 
         let p95_ms = percentile(&samples_ms, 95.0);
-        let delta_p95_ms = baseline_p95_ms.map(|base| round_to(p95_ms - base, 2));
+        let delta_p95_ms = baseline_p95_ms.map(|base| p95_ms - base);
 
         Ok(Self {
             name: name.into(),
@@ -1105,7 +1107,7 @@ impl BenchResult {
             fixture_signature: fixture_signature.into(),
             baseline: BaselineComparison {
                 baseline_p95_ms,
-                delta_p95_ms,
+                delta_p95_ms: delta_p95_ms.map(|delta| round_to(delta, 2)),
                 regression: delta_p95_ms.is_some_and(|delta| delta > 0.0),
             },
         })
@@ -1259,7 +1261,9 @@ pub fn compare_baseline(
 
     for (name, result) in results {
         let baseline_p95_ms = baseline.get(name).copied();
-        let delta_p95_ms = baseline_p95_ms.map(|base| round_to(result.p95_ms - base, 2));
+        // Use the unrounded delta for classification and percentages. Rounding
+        // to two decimals first can move it across either side of the threshold.
+        let delta_p95_ms = baseline_p95_ms.map(|base| result.p95_ms - base);
         let delta_pct = baseline_p95_ms.and_then(|base| {
             if base <= f64::EPSILON {
                 return None;
@@ -1276,7 +1280,7 @@ pub fn compare_baseline(
             name: name.clone(),
             current_p95_ms: result.p95_ms,
             baseline_p95_ms,
-            delta_p95_ms,
+            delta_p95_ms: delta_p95_ms.map(|delta| round_to(delta, 2)),
             delta_pct,
             regression,
         });
@@ -1609,6 +1613,17 @@ mod tests {
     }
 
     #[test]
+    fn bench_result_compares_baseline_before_rounding() {
+        for (seconds, regression) in [(0.010_001, true), (0.010, false), (0.009_999, false)] {
+            let result =
+                BenchResult::from_samples("precision", "help", &[seconds], "sig", Some(10.0))
+                    .expect("valid timing");
+            assert_eq!(result.baseline.delta_p95_ms, Some(0.0));
+            assert_eq!(result.baseline.regression, regression, "{seconds}");
+        }
+    }
+
+    #[test]
     fn bench_summary_serializes_schema() {
         let mut summary = BenchSummary::new(test_hw());
         summary.insert(
@@ -1765,6 +1780,42 @@ mod tests {
         assert_eq!(over.delta_p95_ms, Some(1.1));
         assert_eq!(over.delta_pct, Some(11.0));
         assert!(over.regression, "11% delta must exceed 10% threshold");
+    }
+
+    #[test]
+    fn compare_baseline_does_not_round_away_excess_latency() {
+        let mut results = BTreeMap::from([(
+            "precision".to_string(),
+            BenchResult::from_samples("precision", "help", &[0.011_001], "sig", None)
+                .expect("valid timing"),
+        )]);
+        let baseline = BaselineData::from([("precision".to_string(), 10.0)]);
+        let comparison = compare_baseline(&results, &baseline, 0.10).remove(0);
+        // 11.001 ms exceeds 10 ms by 10.01%, even though its displayed
+        // millisecond delta rounds to the same 1.00 as the exact 10% boundary.
+        assert!(comparison.regression, "{comparison:?}");
+        assert_eq!(comparison.delta_p95_ms, Some(1.0));
+        assert_eq!(comparison.delta_pct, Some(10.01));
+        apply_baseline_comparison(&mut results, &baseline, 0.10);
+        assert!(results["precision"].baseline.regression);
+    }
+
+    #[test]
+    fn compare_baseline_does_not_round_under_budget_into_regression() {
+        let mut results = BTreeMap::from([(
+            "precision".to_string(),
+            BenchResult::from_samples("precision", "help", &[0.011_087], "sig", None)
+                .expect("valid timing"),
+        )]);
+        let baseline = BaselineData::from([("precision".to_string(), 10.08)]);
+        let comparison = compare_baseline(&results, &baseline, 0.10).remove(0);
+        // 1.007 / 10.08 is below 10%. Rounding that delta to 1.01 before
+        // comparison falsely rejects this slower but within-budget result.
+        assert!(!comparison.regression, "{comparison:?}");
+        assert_eq!(comparison.delta_p95_ms, Some(1.01));
+        assert_eq!(comparison.delta_pct, Some(9.99));
+        apply_baseline_comparison(&mut results, &baseline, 0.10);
+        assert!(!results["precision"].baseline.regression);
     }
 
     #[test]

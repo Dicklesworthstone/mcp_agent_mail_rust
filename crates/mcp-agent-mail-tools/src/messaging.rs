@@ -7385,7 +7385,7 @@ mod tests {
                 )
                 .await
                 .expect("register sender");
-                crate::register_agent(
+                let stable = crate::register_agent(
                     &ctx,
                     project_key.clone(),
                     "codex-cli".to_string(),
@@ -7400,6 +7400,9 @@ mod tests {
                 )
                 .await
                 .expect("register stable recipient");
+                let stable: serde_json::Value =
+                    serde_json::from_str(&stable).expect("parse stable recipient");
+                let stable_id = stable["id"].as_i64().expect("stable recipient id");
                 let initial = crate::register_agent(
                     &ctx,
                     project_key.clone(),
@@ -7418,6 +7421,9 @@ mod tests {
                 let initial: serde_json::Value =
                     serde_json::from_str(&initial).expect("parse initial recipient");
                 let initial_id = initial["id"].as_i64().expect("initial recipient id");
+                let project_id = initial["project_id"]
+                    .as_i64()
+                    .expect("recipient project id");
                 let refreshed = crate::register_agent(
                     &ctx,
                     project_key.clone(),
@@ -7443,14 +7449,27 @@ mod tests {
                     .await
                     .into_result()
                     .expect("acquire test connection");
-                conn.execute_raw(&format!("DELETE FROM agents WHERE id = {initial_id}"))
-                    .expect("replace recipient row");
+                let replacement_id = initial_id + 10_000;
+                // Replace the database row ID while preserving this identity's
+                // inception. Recreating the name with a new inception would
+                // correctly conflict with its surviving archive profile.
+                assert_eq!(
+                    conn.execute_sync(
+                        "UPDATE agents SET id = ?1 WHERE id = ?2",
+                        &[
+                            sqlmodel_core::Value::BigInt(replacement_id),
+                            sqlmodel_core::Value::BigInt(initial_id),
+                        ],
+                    )
+                    .expect("replace recipient row id"),
+                    1
+                );
                 drop(conn);
                 drop(pool);
 
                 // This mirrors a recipient re-registering after its row was
                 // replaced between recipient resolution attempts.
-                crate::register_agent(
+                let replacement = crate::register_agent(
                     &ctx,
                     project_key.clone(),
                     "codex-cli".to_string(),
@@ -7465,6 +7484,11 @@ mod tests {
                 )
                 .await
                 .expect("idempotent replacement registration");
+                let replacement: serde_json::Value =
+                    serde_json::from_str(&replacement).expect("parse replacement recipient");
+                assert_eq!(replacement["id"].as_i64(), Some(replacement_id));
+                assert_ne!(replacement_id, initial_id);
+                assert_eq!(replacement["inception_ts"], initial["inception_ts"]);
 
                 let sent = send_message(
                     &ctx,
@@ -7497,6 +7521,19 @@ mod tests {
                         .map(Vec::len),
                     Some(2)
                 );
+                let message_id = sent["deliveries"][0]["payload"]["id"]
+                    .as_i64()
+                    .expect("sent message id");
+                let pool = get_db_pool().expect("delivery readback pool");
+                for recipient_id in [stable_id, replacement_id] {
+                    let inbox =
+                        queries::fetch_inbox(&cx, &pool, project_id, recipient_id, false, None, 10)
+                            .await
+                            .into_result()
+                            .expect("read actual recipient delivery");
+                    assert_eq!(inbox.len(), 1);
+                    assert_eq!(inbox[0].message.id, Some(message_id));
+                }
             });
         });
     }
@@ -8303,6 +8340,7 @@ mod tests {
                 runtime.block_on(async {
                     let cx = Cx::current().expect("fixture context");
                     let ctx = McpContext::new(cx.clone(), 1);
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let pool = get_db_pool().expect("authoritative mailbox pool");
                     let project = ensure_project_row(&cx, &pool, "/ack-receipt-read-outage").await;
                     let project_id = project.id.unwrap();
@@ -8970,6 +9008,7 @@ mod tests {
                         assert_eq!(outage_config.min_connections, 1);
                         assert_eq!(outage_config.max_connections, 1);
                         assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                        crate::test_support::prepare_mailbox_before_outage(&cx).await;
                         let outage_pool = get_db_pool().expect("healthy configured mailbox");
                         assert_ne!(outage_pool.sqlite_path(), pool.sqlite_path());
                         let outage_engine = outage_pool.engine_identity_key();
@@ -9362,6 +9401,7 @@ mod tests {
                     assert_eq!(outage_config.min_connections, 1);
                     assert_eq!(outage_config.max_connections, 1);
                     assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let unavailable_pool = get_db_pool().expect("healthy configured mailbox");
                     assert_eq!(
                         Path::new(unavailable_pool.sqlite_path()),

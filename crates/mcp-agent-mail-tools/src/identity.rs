@@ -6815,12 +6815,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_name_special_chars_rejected() {
+    fn agent_name_separators_follow_explicit_id_contract() {
         use mcp_agent_mail_core::models::is_valid_agent_name;
-        assert!(!is_valid_agent_name("Blue-Lake"));
-        assert!(!is_valid_agent_name("Blue_Lake"));
-        assert!(!is_valid_agent_name("Blue.Lake"));
-        assert!(!is_valid_agent_name("Blue@Lake"));
+        // Safe explicit task IDs are distinct from generated vocabulary names.
+        for name in ["Blue-Lake", "Blue_Lake", "Blue.Lake"] {
+            assert!(is_valid_agent_name(name), "safe explicit ID: {name}");
+        }
+        for name in [
+            "Blue@Lake",
+            "Blue/Lake",
+            "Blue\\Lake",
+            "Blue..Lake",
+            "Blue.",
+            "-BlueLake",
+            "CON.txt",
+            "agent_name",
+        ] {
+            assert!(!is_valid_agent_name(name), "unsafe explicit ID: {name}");
+        }
     }
 
     #[test]
