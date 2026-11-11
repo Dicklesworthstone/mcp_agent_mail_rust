@@ -188,6 +188,51 @@ fn with_queued_archive_lag(config: &Config, age: Duration, test: impl FnOnce()) 
 }
 
 #[test]
+fn unavailable_archive_queue_defers_without_consuming_cursor_then_repairs() {
+    if isolated() {
+        return;
+    }
+    for checkpointed in [false, true] {
+        fixture(|cx, pool, config| {
+            let before = database_evidence(cx, pool);
+            let mut cursor = if checkpointed {
+                ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros())
+            } else {
+                ReconcileCursor::default()
+            };
+            let cursor_before = format!("{cursor:?}");
+            let stop = AtomicBool::new(false);
+
+            // Hold the actual global queue on this thread. A blocking sampler
+            // would deadlock here and hit the unchanged nextest watchdog.
+            let queue = crate::ARCHIVE_BACKLOG.queue.lock().unwrap();
+            let error = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap_err();
+            assert_eq!(
+                error,
+                "message reconciliation deferred: recovery promotion or admission contention"
+            );
+            assert_eq!(format!("{cursor:?}"), cursor_before);
+            assert_eq!(database_evidence(cx, pool), before);
+
+            stop.store(true, Ordering::Release);
+            let interrupted =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert!(interrupted.interrupted);
+            assert_eq!((interrupted.scanned, interrupted.repaired), (0, 0));
+            assert_eq!(format!("{cursor:?}"), cursor_before);
+            drop(queue);
+
+            stop.store(false, Ordering::Release);
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((report.repaired, report.deferred), (2, 0));
+            assert_recovered(cx, pool, config, 901, false);
+            assert_recovered(cx, pool, config, 902, false);
+            assert_eq!(database_evidence(cx, pool), before);
+        });
+    }
+}
+
+#[test]
 fn archive_lag_grace_leaves_queued_mail_to_drain_then_reconciles_orphans() {
     fixture(|cx, pool, config| {
         let created = mcp_agent_mail_db::now_micros() - 60 * 1_000_000;

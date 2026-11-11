@@ -1263,10 +1263,28 @@ pub fn reconcile_message_batch(
     stop: &AtomicBool,
 ) -> Result<ReconcileReport, String> {
     if cursor.persist_progress {
+        // Check before checkpoint restoration can change scheduling hints or
+        // publish them. The inner pass samples again before row selection.
+        if !stop.load(Ordering::Acquire)
+            && cx.checkpoint().is_ok()
+            && !corruption_circuit_breaker().is_tripped()
+        {
+            sample_archive_lag_for_reconciliation()?;
+        }
         checkpoint::run(cx, pool, config, cursor, stop)
     } else {
         reconcile_message_batch_inner(cx, pool, config, cursor, stop)
     }
+}
+
+fn sample_archive_lag_for_reconciliation() -> Result<crate::ArchiveLagSnapshot, String> {
+    crate::try_archive_lag_snapshot().map_err(|unavailable| {
+        tracing::debug!(
+            unavailable_lock = unavailable.unavailable_lock,
+            "message reconciliation admission deferred: archive queue evidence is unavailable"
+        );
+        "message reconciliation deferred: recovery promotion or admission contention".to_string()
+    })
 }
 
 fn reconcile_message_batch_inner(
@@ -1304,10 +1322,14 @@ fn reconcile_message_batch_at(
             "message reconciliation refused: source corruption breaker is open".to_string(),
         );
     }
+    // An unavailable queue cannot establish a safe cutoff. Defer admission
+    // without selecting rows or changing the cursor; never wait behind a
+    // wedged queue owner before the worker can observe cancellation again.
+    let archive_lag = sample_archive_lag_for_reconciliation()?;
     let cutoff = normal_archive_cutoff(
         now_us,
         cursor.settled_before_us,
-        crate::archive_lag_snapshot().oldest_unmaterialized_us,
+        archive_lag.oldest_unmaterialized_us,
     );
     let selected = {
         // The selection itself must not enter a pool while promotion owns
