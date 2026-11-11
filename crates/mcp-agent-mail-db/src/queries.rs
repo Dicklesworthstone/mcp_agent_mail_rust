@@ -28812,6 +28812,10 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire connection");
+            // Legacy imports can lack the newer case-insensitive uniqueness
+            // index, allowing the historical aliases this query must resolve.
+            conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                .expect("allow legacy case-variant registrations");
             conn.execute_raw(&format!(
                 "INSERT INTO agents \
                  (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) \
@@ -28886,7 +28890,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("load zero-limit population");
-            assert!(empty.is_empty());
+            assert_eq!(empty, [] as [AtcPopulationAgentRow; 0]);
         });
     }
 

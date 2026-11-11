@@ -9,6 +9,54 @@ from the synthetic fixtures introduced here.
 
 ## Evidence status
 
+**November 11 follow-through:** source packet `540db95c` plus ten overlays
+(`15aa1915`, the retained 25-file manifest) passes workspace all-targets
+compilation, separate default production, strict Clippy and separate portable
+production, with formatting also passing. The respective remote times are
+1,354.8, 2,422.7, 235.8 and 1,497.9 seconds. Check-worker manifests match all
+25 files; the late additional filesystem witness for Clippy is unavailable,
+so that result relies on its exact immutable-source RCH receipt. The expanded
+native invocation actually runs all 1,847 cases across five binaries:
+**1,829 pass, 15 fail, two time out, and one is stopped by the global watchdog**
+at 1,800.031 seconds (exit 100; 12,279 skipped). The runner's 16-failed summary
+includes that global cancellation. Every original 805/338 case passes, every
+earlier expanded identity is present, and all 29 added controls pass. Five
+stable executable hashes are retained. The native result is failed; the
+compiler graphs pass. No constrained-host speedup or release clearance follows.
+
+The passing f21 populated-worker fixture records 3,150 ms of thread CPU over
+30,000 ms wall time and 48,001 ms to convergence, with a 32,394,392-byte Git
+index and all 256 source/committed messages. Reporting and quota are disabled.
+This is a separate bounded synthetic sample from the H13 receipt below;
+neither establishes live-incumbent speedup, service soak or release send latency.
+
+This packet includes a further caller fix: the existing byte-safe preview
+prefix helper is connected after full JSON masking and newline escaping.
+That preserves the original UTF-8 prefix oracle while bounding the new
+allocation. All four original preview tests and eleven masking/sanitization
+controls are included without changing their assertions. A later shared
+canonical-identity query commit is outside this packet. Its separate
+`21f4efdf` plus typed empty-vector assertion packet (`3208347e`) passes
+all-targets (3,127.5 s), default production (980.1 s), portable production
+(2,373.0 s), strict Clippy (1,774.4 s) and formatting. All 26 declared hashes
+match each compiler worker. Its native run executes three real-pool cases:
+two pass and the new canonical case fails during fixture insertion, before
+the query, because the production NOCASE unique index rejects its aliases
+(5.946 s, 4,021 skipped, exit 100). The stable DB executable hash is retained.
+The corrected test now explicitly seeds a legacy schema without that index,
+matching adjacent canonical-routing fixtures; production SQL/schema and all
+14 input rows and result oracles are unchanged. Corrected `a8299ce1` passes
+formatting and stock scanning. Its native rerun passes all three original cases
+in 4.291 seconds (4,021 skipped), including the canonical case in 1.509 seconds;
+the stable actual executable hash is retained. Its own four compiler graphs
+also pass: all-targets (2,717.4 s), strict Clippy (1,131.5 s), separate default
+production (2,510.9 s) and portable production (2,539.3 s). All 26 worker hashes
+match each graph.
+The known pinned-dependency future-Rust warning remains recorded.
+The original failure remains evidence; it did not test the query.
+This verifies the query and real routing/byte-bound companions, not the peer
+lifecycle task's mounted retire/restart/unretire/deregister acceptance.
+
 **Native follow-through, November 10, 2026:** the reviewed candidate based on
 `ce1fac7f` plus the two-source `4037b5cf` overlay passes both workspace compiler
 graphs (`--all-targets` and production `--lib --bins`), strict Clippy, standalone
@@ -113,12 +161,16 @@ f20 uses two test processes with captured success/failure output and preserves
 all1,818 identities plus14 incoming diagnostic controls, normal isolation
 overrides and every existing deadline/resource bound. This explicit concurrency
 change is not presented as a serial pass or a service performance improvement.
-Final f20 also preserves fresh diagnostic-string allocations while resolving
+Intermediate f20 also preserves fresh diagnostic-string allocations while resolving
 the integrated lint error; its existing regression now checks spare tool-name
 capacity as well as agent/project bounds. Unused helper removal, private-module
 visibility/doc fixes and equivalent borrowed optional capacity accounting
-complete the ten-overlay packet. Final-source qualification is pending.
-Earlier compiler/native results do not qualify this final source.
+complete that ten-overlay packet. The subsequent f21 caller repair restores
+and connects the prefix helper as described above; f20's compiler results do
+not qualify that later repair. The terminal f21 run above retains all 18
+nonpasses, including five storage assertion failures, two per-test retention
+timeouts and the coalescer's global cancellation. They are listed as open work
+in the bridge plan; no load-related or flake explanation has been established.
 These are self-reviewed functional repairs, not independent verification or
 evidence of a startup speedup. The owned Beads remain in progress.
 

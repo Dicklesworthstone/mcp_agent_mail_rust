@@ -133,12 +133,12 @@
 - [ ] Recheck `refused_automatic_admission_reclaims_safe_backlog_without_export`:
   h5 leaves151 images where the third attempt expects3. Preserve the real
   journal/staging refusals, reader protection, backoff and no-export assertions.
-- [x] Recheck `publication_follows_a_pass_with_refusals`: h5 observes one
+- [ ] Recheck `publication_follows_a_pass_with_refusals`: h5 observes one
   incomplete attempt where the test expects zero failures. Preserve real
   publication, inode/verification evidence and all three refusal scenarios;
   no counter reset or retry-policy change to manufacture completion. This case
-  passes unchanged in the full h10 run; retain the h5 failure without attributing
-  its later pass to an unmeasured runtime fix.
+  passes unchanged in h10, then fails again in h13 and f21; retain all outcomes
+  without a flake attribution or an unmeasured runtime-fix claim.
 - [x] Trace the populated maintenance fixture's lost healthy Git bytes: normal
   commits advance HEAD before background index sync, but the large-index setup
   committed the possibly stale disk index as a new full tree. Seed that index
@@ -307,7 +307,8 @@
   -D warnings,540db95c+15aa1915. The exact RCH source receipt is retained; a late
   extra filesystem-hash copy is unavailable after its source namespace disappears,
   so no additional worker-copy witness is claimed for this terminal lint run.
-- [ ] Final f21 workspace all-targets compiler check; f20's request was
+- [x] Final f21 workspace all-targets compiler check:0/1354.8s on ovh-a,
+  540db95c+15aa1915; all25 worker hashes match. f20's request was
   superseded before execution, without taking any pass credit.
 - [x] Final f20 separate default production lib/bins compiler check:0/962.9s
   on ovh-a,540db95c+1351fb0c. All25 worker source/config hashes match, including
@@ -318,7 +319,8 @@
 - [x] Final f21 separate default production lib/bins check:0/2422.7s on1152,
  540db95c+15aa1915. All25 worker hashes match. f20 results above are historical
  after the prefix repair.
-- [ ] Final f21 separate portable production check, still required on current bytes.
+- [x] Final f21 separate portable production check:0/1497.9s on hz3,
+  540db95c+15aa1915; all25 worker hashes match.
   f14's first Clippy refuses120/monitor_unavailable before Cargo;
   free_bytes0 is unknown, not measured disk exhaustion. Retain the unchanged
   query-hint fixture's stock scanner alert; do not suppress it to manufacture0.
@@ -327,7 +329,7 @@
   Nextest's9failed includes that global cancellation. Every original805/338
   actually passes, but174 h10 cases remain unexecuted. Retain all raw failures
   and five stable executable hashes; no expanded-population qualification.
-- [ ] Execute final f21's COMPLETE native population. Retain
+- [x] Execute final f21's COMPLETE native population. Retain
   every1818 selected identity and every original338/805/h5/h10 comparison,
   including all red retention cases. Add the incoming diagnostic preview,
   dispatch, ring, timeline and recent-call allocation controls, plus all four
@@ -341,19 +343,132 @@
   Earlier H13 execution does not qualify
   the corrected ATC fixture or incoming peer bytes. The25-file manifest binds
   the final integrated source; compiler-only f16 results stay historical.
-  Native is actually compiling on114 with all25 hashes matched and the actual
+  Native actually starts1847 cases across five binaries,12279 skipped,
+  run d870db88-46ef-4dc8-811e-6afe12afc579, on114 with all25 hashes matched and the actual
   unchanged30GiB/floor10GiB guard(group1219008). Initial fixed-worker requests
   refuse103/queue_timeout before Cargo. The normal broader-worker retry first
   refuses Hz4 namespace initialization before any grant, then builds on114;
   no namespace cleanup, worker-state change or administrative override.
-- [ ] Bind actual integrated-worker source/toolchain and five executable
-  identities, review terminal nonpasses, and retain every failed/refused receipt.
-- [ ] Flush Beads, verify matching JSONL inventories and no dependency cycles,
-  review the scoped diff, commit the owned correction/evidence once, push main
-  and its required legacy mirror, and release only the21 owned reservations.
-- [ ] Run required compiler/scanner checks for any further source correction,
-  review it again, record bounded results in both Beads, and publish only the
-  reviewed owned changes. Original scaling/liveness/overhead gates stay open
+  Terminal exit100 at1800.031s: ALL1847 selected identities execute,
+  1829PASS/15ordinaryFAIL/2TIMEOUT/1globalSIGTERM,12279skipped. The summary's
+  16failed includes that SIGTERM. No identity is missing from original805/338,
+  h5/h10/h13 or their1818-case union; original805/338 and all29 added controls
+  pass. This is complete population execution with failed acceptance, not a pass.
+- [x] Bind actual integrated-worker source/toolchain and five stable executable
+  identities after terminal execution and before any worker reuse. Review all
+  18 nonpasses; retain raw streams, failed/refused receipts and identity diff
+  in review3-f21-native-identities.json under the existing evidence root.
+- [ ] Diagnose f21's additional retention nonpasses without weakening original
+  publication/disk/reader assertions: periodic_cycles_reclaim_disk_and_historical_staging
+  (240s TIMEOUT), automatic_admission_allows_real_proactive_and_verified_publication,
+  repeated_hourly_real_publication_keeps_verified_recovery_and_disk_usage_bounded,
+  unpublished_automatic_attempts_reclaim_below_quota_and_preserve_verified_recovery,
+  and stopped_backups_are_reported_as_a_warning.
+  The two unchanged rotation timeouts are already owned in br-kp1in.63;
+  preserve BlueSpring's work rather than creating duplicate structure.
+- [ ] Diagnose actual reader-recovery failures in
+  discovery_panics_retire_readers_preserve_cursors_and_resume_archive_repair and
+  failed_discovery_queries_retire_readers_preserve_cursors_and_resume_archive_repair.
+  Preserve source-error redaction, reader retirement, cursor and retry oracles.
+  Both fail at database.rs:2873 after those preservation checks: the report
+  repairs1 vs expected2, retains retry_len1 and sets budget_exhausted=true.
+  This localizes the observed failure to completion; it establishes neither
+  source damage nor a contention/flake explanation. Keep the original budget.
+- [ ] Diagnose newest_page_retains_young_lower_id_without_blocking_history_repairs
+  and retention_backlog_never_outpaces_complete_archive_repair (observed3 vs4).
+  Preserve young-message priority, complete archive repair and original budgets.
+- [ ] Diagnose back_to_back_direct_publishers_give_a_waiting_repair_an_execution_turn;
+  retain the original waiting-repair ordering oracle rather than blessing starvation.
+- [ ] Obtain terminal noncancelled coalescer-age evidence: f21's
+  commit_coalescer_oldest_pending_age_tracks_enqueue is interrupted by the1800s
+  global watchdog. Keep the same source oracle; no pass inferred from its start.
+- [x] Preserve shared commits7a8b15ec/6c428da6 containing the reviewed source
+  fixes. Do not duplicate that source history. Shared query commit57dc55da
+  lands outside the f21 source packet: review its complete canonical-identity
+  SQL and three real-pool regression tests separately. One equivalent typed
+  empty-array assertion preserves strict lint policy and its original predicate.
+  Verify the actual atc.rs export and operator call use the new loader; failed
+  refreshes retain the last good snapshot but suspend inference, with no
+  production call routed through the old shadowed engine helper.
+- [x] Integrated query packet21f4efdf plus only queries.rs passes formatting0
+  and complete stock scan0/statusok/failed[],0critical4197warning654info.
+- [x] Execute the original integrated query's three native real-pool tests, including
+  canonical identity before lifecycle/recency/cap and metadata-byte refusal.
+  Initial114 request refuses103/draining, hz2 refuses103/queue_timeout,
+  broader retry refuses120/protected disk on122, all before Cargo/test bodies.
+  Keep30GiB/floor10GiB, no administrative recovery or resource-budget reduction.
+  After observed114 native headroom becomes positive, the focused retry uses
+  one compile job and one test process to fit one slot. This is declared before
+  any query-test result; all three tests, default features and original
+  1800s/240s/14400s bounds remain. It is not a rerun or pass of the1847-case lane.
+  That attempt queues out103/zero bodies. Once114 capacity actually returns,
+  the unchanged one-slot retry is admitted and compiles. All26 worker hashes
+  match; its actual guardgroup3211461 retains30GiB/floor10GiB.
+  Terminal100 on3208347e:3 actual cases,2PASS/1FAIL,4021skipped,5.946s,
+  run0afa1878-d9df-42e3-bc1f-847515fd02bc. The new canonical case fails at
+  fixture INSERT, before querying: the production NOCASE unique index correctly
+  rejects its case aliases. The original two healthy-schema cases pass.
+  Actual DB executable4f4e9fedd4d031e699fa10f53ed7aff58e35fc1bd3edf83c2458038838940ce8
+  is stable and uniquely identified by its new test marker; the older f21
+  binary is separately retained. Canonical-query semantics are not yet qualified.
+- [x] Integrated separate production0/980.1s on ovh-a:21f4efdf plus overlay
+  3208347e39250785d842d81596ae5f0a57638769b3c0aefe3bd2b053abe9f857;
+  all26 worker source/config hashes match. Retain the known pinned dependency
+  future-Rust warning; no dependency or lint suppression change.
+- [x] Integrated all-targets0/3127.5s on1153 after1152 queue103, same frozen
+  21f4efdf+3208347e packet; all26 worker source/config hashes match.
+- [x] Integrated portable production0/2373.0s on1156, same21f4efdf+3208347e
+  packet and all26 worker hashes matched. The wrong worker-id request refused103
+  before work and was corrected from installed inventory.
+- [x] Integrated strict Clippy0/1774.4s on hz4, full workspace all-targets and
+  unchanged -D warnings, same21f4efdf+3208347e packet; all26 worker hashes match
+  after transfer.1153 refuses120/protected disk and114 refuses103/
+  draining before Cargo. The actual passing retry follows observed protected
+  headroom and scheduler availability returning on hz4.
+  f21's earlier passes remain separate historical evidence.
+- [x] Correct only the private canonical fixture's legacy-schema precondition:
+  drop idx_agents_project_name_nocase on that temporary test connection, as
+  existing canonical-routing tests already do. Production SQL/schema and the
+  original14 rows/two projects/five expected canonical rows, real get_agent
+  comparisons, ordering, lifecycle exclusions and caps0/3 remain unchanged.
+  Healthy-schema uniqueness remains a retained negative witness from the
+  failed run; the two companion cases keep their normal production schema.
+- [x] Corrected26-file manifest review3-canonical-legacy-fixture-hashes.txt
+  differs only in queries.rs; formatting0 and full stock scan0/statusok/failed[],
+  0critical4198warning654info. New21f4efdf+a8299ce1 qualification is separate
+  from the preceding3208347e compiler passes and failed native fixture.
+- [x] Execute the SAME three real-pool cases on corrected a8299ce1. Native114
+  actually compiles with all26 hashes matching and actual guardgroup1025287,
+  unchanged30GiB/floor10GiB/1800s global/240s per-test/14400s outer/default features.
+  Four compile jobs are declared before execution after observing10CPUs and
+  55879936KiB available memory; test processes remain1. No performance claim.
+  Terminal0:3/3PASS,4021skipped,4.291s,run c583e9ef-5a95-482b-9b23-1c361d28a31b,
+  total447.8s. All three expected identities are present; canonical case1.509s.
+  Stable actual DB executableb3e25899e774ae1a84f571ff5fe64d1c4256b8001fb63ce5f533c3b46a195ddb
+  is captured before worker reuse. Both healthy-schema companions and every
+  original legacy-row oracle pass; original3208347e failure remains retained.
+- [x] Corrected all-targets0/2717.4s on1156 and strict Clippy0/1131.5s on ovh-a,
+  same full targets/-D warnings and frozen21f4efdf+a8299ce1 source. All26 worker
+  source/config hashes match both workers.
+- [x] Corrected separate production lib/bins0/2510.9s on114 after terminal
+  native execution and executable capture; all26 worker hashes match.
+- [x] Corrected separate portable production0/2539.3s on114, separate namespace,
+  all26 worker hashes match. Hz4's first request refuses120/monitor_unavailable
+  before Cargo: startedfalse/growth0/free0UNKNOWN, not measured disk exhaustion.
+  The same full portable graph executes on114 after the native run terminates.
+- [x] Prepare one reviewed source/evidence publication packet: flush Beads,
+  verify2867 matching unique IDs in both JSONL inventories and no dependency
+  cycles, and review the scoped diff. Only comments/updated_at change on the
+  two owned Beads and the earlier scoped-query peer comment; owners, original
+  acceptance, statuses and graph structure remain intact.
+  Publication uses one scoped commit, normal main and required legacy-mirror
+  pushes, and release of only active owned reservations. Git refs and push
+  receipts carry completion of that final operational step.
+  All22 original source/metadata leases are released while the frozen native
+  build runs; reacquire only the paths needed for the final short write.
+- [x] Run required compiler/scanner checks for the fixture correction,
+  review it again, and record bounded results in both Beads (4274/4275).
+  Original scaling/liveness/overhead gates stay open
   until their populated probes execute successfully.
 
 ## November 10 shared-commit integration — EmeraldEagle / br-asldx / br-kp1in.29
