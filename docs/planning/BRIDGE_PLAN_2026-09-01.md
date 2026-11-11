@@ -14,21 +14,55 @@
   untouched worker-init metrics/liveness, configured capacities and explicit real
   worker startup. Strengthen the hot-health DB assertion: its old top-level path
   read a missing/null field and could pass without a healthy DB verdict.
-- [ ] Execute the new regression on unchanged production health, retaining its
+- [x] Execute the new regression on unchanged production health, retaining its
   exact immutable source and actual failure; no test-only hooks or fake workers.
-- [ ] Remove health's worker-start calls and preserve configured queue limits
+  Old packet:1a530335 + test-only identity overlay863668f1, source88ea3047.
+  Native100:1actual/1FAIL,2379skipped,0.078s execution, run
+  bb87456a-ccca-4d4a-a6ed-4a2fadec73c9. The actual health handler initializes
+  WBQ capacity257 where the regression requires untouched0. Stable actual tools
+  ELF62cdaed2 contains the new test marker. This failed test is the counterexample,
+  not a runtime/compiler/admission failure or inferred result.
+- [x] Remove health's worker-start calls and preserve configured queue limits
   without initializing workers or overwriting observed running-worker metrics.
-- [ ] Re-read all changed paths; execute the original38 diagnostic cases, the
-  new actual health case, strengthened hot-read neutrality and relevant original
-  WBQ startup/shutdown/restart controls on the exact candidate.
-- [ ] Run all-target and separate production checks, strict Clippy, portable
+- [x] Re-read all changed paths and their startup/write callers again. No further
+  source finding; configured display bounds retain actual nonzero observations.
+- [ ] Execute the original38 diagnostic cases, the new actual health case,
+  strengthened hot-read neutrality and relevant original WBQ lifecycle controls
+  on the exact candidate. This positive native evidence remains unavailable.
+- [x] Run all-target and separate production checks, strict Clippy, portable
   production check, formatting and stock/staged UBS through strict RCH where
   compilation is involved. Use the actual storage/tools default native graph,
   four compile jobs on measured capacity, and unchanged test limits.
-- [ ] Record terminal evidence on the owned Bead; retain original broader
-  acceptance, check tracker parity/cycles, inspect the final diff, publish and
-  verify refs, then release only this session's reservations. Solo review is not
-  independent certification; no full-workspace/overhead/soak clearance is implied.
+  Predeclared native selection: all original38 cases, the new actual-health
+  regression, strengthened hot-health control and five original WBQ lifecycle
+  controls (45 expected). Strict workspace Clippy passes on ovh-a (274.2s)
+  after the first wrapper refuses disk admission on all three placements before
+  compilation; retain that120 outcome. Formatting and stock changed-file UBS
+  pass (0 critical,5816 warnings,1481 info); no scanner or lint gate is weakened.
+  All-targets0/990.8s; separate production0/870.9s and portable0/896.6s.
+  All four compiler receipts bind1a530335 plus the exact two-source overlay
+  a7ac5cc2. Three live workspace-check worker source trees match all six
+  source/configuration hashes; Clippy's source tree retires before a separate
+  hash reread, so its binding is the RCH receipt. Initial candidate native
+  request on vmi1149989 refuses103 after admission queue timeout, zero bodies,
+  terminal acknowledged. Keep that log; the unchanged45-case selection is
+  reissued on the old-regression worker after its source ownership is released:
+  another103 when RCH reports it draining/unreachable, zero bodies. Normal
+  placement then refuses120 on vmi1152480 before compilation: active disk
+  reservations plus the protected floor cannot admit the unchanged30GiB native
+  budget. No higher-capacity placement is available; keep all three failures.
+  Final stock staged UBS also passes, same counts. Do not infer a candidate
+  native pass from compiler checks or from the old-code counterexample.
+- [x] Record terminal evidence on owned br-kp1in.29, comments4279/4280; retain
+  original broader acceptance. Verify both JSONLs identical2867 records, only
+  that issue's comments/timestamp changed and no IDs added/removed; active
+  dependency cycles0. Re-read the complete source/test diff and prepare the
+  exact five changed paths for publication. All three candidate RCH wrappers
+  are terminal acknowledged; no owned request remains running. Solo review
+  is not independent certification; no native/overhead/soak clearance implied.
+  Final normal Git pushes/ref checks and release of only1613/1614/1615 are
+  recorded after execution in the session result, without a self-attesting
+  process-only follow-up commit. The unchecked native item above remains open.
 
 ## November 11 independent-queue diagnostic follow-through — EmeraldEagle
 
@@ -68,7 +102,8 @@
   interrupted oldest-pending case30.024s. This does not rewrite F21's outcome.
   Retain both actual selected ELF hashes/stable identities after terminal:
   storage83e3f1f7 and tools944da2da, with the expected test markers. The old-source
-  two-regression probe remains separate and pending, not inferred from this pass.
+  two-regression probe is separate: its final2FAIL result is recorded above,
+  not inferred from the candidate pass.
 - [x] Run workspace all-target and separate production checks, strict Clippy,
   portable production check, formatting and stock UBS on the exact final source.
   Corrected packet: c61d6571 plus only storage/lib.rs, overlay64d95fb7;
@@ -77,7 +112,8 @@
   hashes; the old-production red run separately matches its2ba23108 packet.
   Terminal compiler results: all-targets0/468.5s on hz4; separate default
   production0/406.3s on hz3; strict Clippy0/564.4s and separate portable
-  production0/541.9s on hz2. Native execution remains pending.
+  production0/541.9s on hz2. Native execution was pending at this checkpoint;
+  the later terminal native results are recorded above.
   The first corrected native attempt exits101 during server-test linking after
   1293.170s: required dependency rlibs are missing from the worker target. No
   native test executes. Preserve the receipt and retry the exact command through
@@ -123,11 +159,10 @@
   changed, and zero active dependency cycles. Inspect the complete final source
   diff again; no further production change is needed. This is self-review, not
   independent certification. No liveness/overhead/soak closure follows.
-- [ ] Final landing step, recorded from terminal commands in the session result:
-  commit/push the four reviewed paths, verify both required remote refs, and
-  release only this session's1607/1608 reservations. This checklist captures the
-  reviewed pre-publication state; implementation/qualification gaps above remain
-  distinct from the final Git/lease operations.
+- [x] Final landing completed at12:49:55UTC: commit9516670f contains exactly
+  the four reviewed paths; fresh fetch verifies both required remote refs at that
+  commit and a clean tracked checkout. Release exactly1607/1608 (released2).
+  Implementation/qualification gaps above remain distinct from publication.
 
 ## November 10 fresh-eyes follow-through, 22:30 UTC — EmeraldEagle
 

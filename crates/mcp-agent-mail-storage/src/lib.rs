@@ -6310,7 +6310,9 @@ const MIN_COALESCER_FLUSH_INTERVAL: Duration = Duration::from_millis(MIN_COALESC
 const DEFAULT_COALESCER_ADAPTIVE_FLUSH_ENABLED: bool = false;
 const DEFAULT_COALESCER_TARGET_ARCHIVE_LAG_MS: u64 = DEFAULT_ARCHIVE_BATCH_MS;
 
-const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
+/// Configured outstanding-request bound, available before lazy worker startup
+/// so health reporting can remain observational.
+pub const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
 
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;

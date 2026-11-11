@@ -2633,10 +2633,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             }
         }
     };
-    // Ensure background workers are running so health_check reports stable
-    // queue capacity/soft-cap values even before the first write/commit.
-    mcp_agent_mail_storage::wbq_start();
-    let _ = mcp_agent_mail_storage::get_commit_coalescer();
+    // Storage startup and write callers own worker lifecycle. A health probe
+    // must not wait behind shutdown/restart admission or restart those workers.
     let disk_sample = if config.disk_space_monitor_enabled {
         Some(mcp_agent_mail_core::disk::sample_and_record(config))
     } else {
@@ -2885,6 +2883,17 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         ),
         lock_activity,
         queues: Some({
+            // Before lazy worker initialization these gauges are zero. Report
+            // the configured limits without starting workers or rewriting the
+            // observation; retain actual nonzero running-worker limits.
+            let wbq_capacity = match metrics.storage.wbq_capacity {
+                0 => u64::try_from(config.wbq_channel_capacity).unwrap_or(u64::MAX),
+                observed => observed,
+            };
+            let commit_soft_cap = match metrics.storage.commit_soft_cap {
+                0 => mcp_agent_mail_storage::COMMIT_COALESCER_SOFT_CAP,
+                observed => observed,
+            };
             let wbq_over_80_for_s = if metrics.storage.wbq_over_80_since_us == 0 {
                 0
             } else {
@@ -2892,8 +2901,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.wbq_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let wbq_utilization_pct =
-                percentage_clamped(metrics.storage.wbq_depth, metrics.storage.wbq_capacity);
+            let wbq_utilization_pct = percentage_clamped(metrics.storage.wbq_depth, wbq_capacity);
 
             let commit_over_80_for_s = if metrics.storage.commit_over_80_since_us == 0 {
                 0
@@ -2902,15 +2910,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.commit_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let commit_utilization_pct = percentage_clamped(
-                metrics.storage.commit_pending_requests,
-                metrics.storage.commit_soft_cap,
-            );
+            let commit_utilization_pct =
+                percentage_clamped(metrics.storage.commit_pending_requests, commit_soft_cap);
 
             QueuesHealthResponse {
                 wbq: WbqQueueHealthResponse {
                     depth: metrics.storage.wbq_depth,
-                    capacity: metrics.storage.wbq_capacity,
+                    capacity: wbq_capacity,
                     utilization_pct: wbq_utilization_pct,
                     peak_depth: metrics.storage.wbq_peak_depth,
                     enqueued_total: metrics.storage.wbq_enqueued_total,
@@ -2925,7 +2931,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                 },
                 commit_coalescer: CommitCoalescerHealthResponse {
                     pending_requests: metrics.storage.commit_pending_requests,
-                    soft_cap: metrics.storage.commit_soft_cap,
+                    soft_cap: commit_soft_cap,
                     utilization_pct: commit_utilization_pct,
                     peak_pending_requests: metrics.storage.commit_peak_pending_requests,
                     enqueued_total: metrics.storage.commit_enqueued_total,
