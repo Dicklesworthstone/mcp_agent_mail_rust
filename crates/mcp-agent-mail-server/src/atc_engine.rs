@@ -5749,10 +5749,22 @@ impl AtcEngine {
         self.refresh_incumbent_policy_from_core();
     }
 
-    fn absorb_population_snapshot(&self, population: &mut HierarchicalAgentModel) {
-        for entry in self.agents.values() {
-            population.absorb_agent(&entry.program, &entry.rhythm);
+    fn refresh_population_snapshot(&mut self, population: &mut HierarchicalAgentModel) {
+        // Rhythms already summarize each agent's observations. Reabsorbing
+        // their full counts into the previous population would count quiet
+        // agents again every 50 ticks, teaching stronger priors without any
+        // new activity. Rebuild the bounded current population instead: one
+        // contribution per agent, including program changes and rhythm resets.
+        // Reuse the cached stable order so floating-point pooling is also
+        // independent of HashMap iteration and registration order.
+        self.sorted_agent_names();
+        let mut refreshed = HierarchicalAgentModel::new();
+        for name in &self.sorted_agent_names {
+            if let Some(entry) = self.agents.get(name) {
+                refreshed.absorb_agent(&entry.program, &entry.rhythm);
+            }
         }
+        *population = refreshed;
     }
 
     fn build_summary_snapshot_with(
@@ -6570,7 +6582,7 @@ impl AtcEngine {
             && let Some(pop_lock) = ATC_POPULATION.get()
             && let Ok(mut pop) = pop_lock.lock()
         {
-            self.absorb_population_snapshot(&mut pop);
+            self.refresh_population_snapshot(&mut pop);
         }
         let pre_summary_total_micros = elapsed_micros(total_started);
         let budget_exceeded = pre_summary_total_micros > self.config.tick_budget_micros;
@@ -13109,7 +13121,7 @@ mod alien_enhancement_tests {
         }
 
         let mut population = HierarchicalAgentModel::new();
-        engine.absorb_population_snapshot(&mut population);
+        engine.refresh_population_snapshot(&mut population);
 
         let (claude_mean, _) = population.prior_for("claude-code");
         let (codex_mean, _) = population.prior_for("codex-cli");
@@ -13120,6 +13132,159 @@ mod alien_enhancement_tests {
         assert!(
             (codex_mean - 120_000_000.0).abs() < 1.0,
             "codex prior should stay near baseline when cadence matches it: {codex_mean}"
+        );
+    }
+
+    fn population_snapshot_values(population: &HierarchicalAgentModel) -> BTreeMap<&str, [u64; 4]> {
+        population
+            .populations
+            .iter()
+            .map(|(program, stats)| {
+                (
+                    program.as_str(),
+                    [
+                        stats.mean.to_bits(),
+                        stats.variance.to_bits(),
+                        stats.n.to_bits(),
+                        stats.agent_count,
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn engine_population_refresh_counts_each_observed_interval_once() {
+        let mut engine = AtcEngine::new_for_testing();
+        for (name, interval) in [("Quiet", 30_000_000), ("Busy", 90_000_000)] {
+            assert!(engine.register_agent(name, "claude-code", None));
+            // Use explicit priors so unrelated global ATC tests cannot seed
+            // this fixture's local rhythms with a learned population.
+            engine.agents.get_mut(name).unwrap().rhythm = AgentRhythm::new(60.0);
+            for i in 1..=4 {
+                engine.observe_activity(name, None, i * interval);
+            }
+        }
+        assert!(engine.register_agent("Unobserved", "claude-code", None));
+        let mut population = HierarchicalAgentModel::new();
+        engine.refresh_population_snapshot(&mut population);
+        let first = population.clone();
+        let stats = &population.populations["claude-code"];
+        assert_eq!(stats.agent_count, 2, "unobserved agents add no evidence");
+        assert_eq!(stats.n.to_bits(), 9.0_f64.to_bits()); // 3 prior + 3 + 3 intervals
+
+        for _ in 0..100 {
+            engine.refresh_population_snapshot(&mut population);
+            assert_eq!(
+                population_snapshot_values(&population),
+                population_snapshot_values(&first),
+                "an idle population refresh must not manufacture observations"
+            );
+        }
+
+        engine.observe_activity("Busy", None, 450_000_000);
+        engine.refresh_population_snapshot(&mut population);
+        let quiet = &engine.agents["Quiet"].rhythm;
+        let busy = &engine.agents["Busy"].rhythm;
+        assert_eq!((quiet.observation_count, busy.observation_count), (3, 4));
+        let stats = &population.populations["claude-code"];
+        assert_eq!(stats.agent_count, 2);
+        assert_eq!(stats.n.to_bits(), 10.0_f64.to_bits());
+        // Independent pooled-moment oracle: the fixed prior plus the current
+        // three quiet and four busy observations, never the old snapshot too.
+        let expected_mean =
+            (3.0 * 60_000_000.0 + 3.0 * quiet.avg_interval + 4.0 * busy.avg_interval) / 10.0;
+        let expected_variance = (3.0 * (30_000_000.0_f64.powi(2) + 60_000_000.0_f64.powi(2))
+            + 3.0 * (quiet.var_interval + quiet.avg_interval.powi(2))
+            + 4.0 * (busy.var_interval + busy.avg_interval.powi(2)))
+            / 10.0
+            - expected_mean.powi(2);
+        assert!((stats.mean - expected_mean).abs() < 1.0);
+        assert!((stats.variance - expected_variance).abs() < expected_variance * 1e-12);
+        let updated = population.clone();
+        engine.observe_activity("Busy", None, 450_000_000); // replayed activity
+        engine.observe_activity("Busy", None, 440_000_000); // stale activity
+        for _ in 0..100 {
+            engine.refresh_population_snapshot(&mut population);
+            assert_eq!(
+                population_snapshot_values(&population),
+                population_snapshot_values(&updated)
+            );
+        }
+    }
+
+    #[test]
+    fn engine_population_refresh_replaces_changed_program_and_reset_rhythm() {
+        let mut engine = AtcEngine::new_for_testing();
+        assert!(engine.register_agent("Agent", "claude-code", None));
+        engine.agents.get_mut("Agent").unwrap().rhythm = AgentRhythm::new(60.0);
+        for i in 1..=6 {
+            engine.observe_activity("Agent", None, i * 30_000_000);
+        }
+        let mut population = HierarchicalAgentModel::new();
+        engine.refresh_population_snapshot(&mut population);
+        assert_eq!(population.populations["claude-code"].agent_count, 1);
+
+        assert!(engine.register_agent("Agent", "codex_cli", None));
+        engine.refresh_population_snapshot(&mut population);
+        let defaults = HierarchicalAgentModel::new();
+        assert_eq!(
+            population_snapshot_values(&population)["claude-code"],
+            population_snapshot_values(&defaults)["claude-code"],
+            "reclassification must not leave stale evidence in the old cohort"
+        );
+        assert_eq!(population.populations["codex-cli"].agent_count, 1);
+        assert_eq!(
+            population.populations["codex-cli"].n.to_bits(),
+            8.0_f64.to_bits()
+        );
+
+        engine.agents.get_mut("Agent").unwrap().rhythm = AgentRhythm::new(120.0);
+        engine.observe_activity("Agent", None, 1_000_000); // anchor, not an interval
+        engine.refresh_population_snapshot(&mut population);
+        assert_eq!(
+            population_snapshot_values(&population),
+            population_snapshot_values(&defaults),
+            "a reset rhythm must not retain its previous lifetime's evidence"
+        );
+    }
+
+    #[test]
+    fn engine_population_refresh_is_independent_of_registration_order() {
+        let cases = [
+            ("Zeta", "claude-code", 17_000_003, 12),
+            ("Alpha", "claude_code", 921_001, 23),
+            ("Mu", "CLAUDE_CODE", 90_123_456, 7),
+            ("Beta", "claude-code", 1_700_900_013, 49),
+        ];
+        let build = |cases: &[(&str, &str, i64, i64)]| {
+            let mut engine = AtcEngine::new_for_testing();
+            for &(name, program, interval, count) in cases {
+                assert!(engine.register_agent(name, program, None));
+                engine.agents.get_mut(name).unwrap().rhythm = AgentRhythm::new(60.0);
+                for i in 1..=count {
+                    engine.observe_activity(name, None, i * interval);
+                }
+            }
+            engine
+        };
+        let mut forward = build(&cases);
+        let mut reverse_cases = cases;
+        reverse_cases.reverse();
+        let mut reverse = build(&reverse_cases);
+        let mut forward_population = HierarchicalAgentModel::new();
+        let mut reverse_population = HierarchicalAgentModel::new();
+        forward.refresh_population_snapshot(&mut forward_population);
+        reverse.refresh_population_snapshot(&mut reverse_population);
+        assert_eq!(
+            population_snapshot_values(&forward_population),
+            population_snapshot_values(&reverse_population),
+            "equivalent agent histories must produce bit-identical population priors"
+        );
+        assert_eq!(forward_population.populations["claude-code"].agent_count, 4);
+        assert_eq!(
+            forward_population.populations["claude-code"].n.to_bits(),
+            90.0_f64.to_bits()
         );
     }
 
