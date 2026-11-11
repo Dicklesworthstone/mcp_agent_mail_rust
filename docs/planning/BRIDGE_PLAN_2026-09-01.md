@@ -303,7 +303,10 @@
   controls to the final native selection. No oracle migration or suppression.
 - [x] f21 formatting0 and complete stock preview-file scan0/statusok/failed[],
   0critical3675warning1843info. Other final-source scan hashes stay unchanged.
-- [ ] Final f21 strict Clippy, with the same full workspace targets/lint levels.
+- [x] Final f21 strict Clippy:0/235.8s on129, same full workspace targets and
+  -D warnings,540db95c+15aa1915. The exact RCH source receipt is retained; a late
+  extra filesystem-hash copy is unavailable after its source namespace disappears,
+  so no additional worker-copy witness is claimed for this terminal lint run.
 - [ ] Final f21 workspace all-targets compiler check; f20's request was
   superseded before execution, without taking any pass credit.
 - [x] Final f20 separate default production lib/bins compiler check:0/962.9s
@@ -312,9 +315,9 @@
 - [x] Final f20 separate portable production compiler check:0/962.9s on ovh-a,
   separate namespace and --no-default-features --features portable. All25 hashes
   match. Both retain the previously observed proc-macro-error2 future-Rust warning.
-- [ ] Final f21 separate default production lib/bins check, currently compiling
-  on1152 after a positive protected14GiB-headroom probe. f20 results above are
-  historical after the prefix repair.
+- [x] Final f21 separate default production lib/bins check:0/2422.7s on1152,
+ 540db95c+15aa1915. All25 worker hashes match. f20 results above are historical
+ after the prefix repair.
 - [ ] Final f21 separate portable production check, still required on current bytes.
   f14's first Clippy refuses120/monitor_unavailable before Cargo;
   free_bytes0 is unknown, not measured disk exhaustion. Retain the unchanged
@@ -338,6 +341,11 @@
   Earlier H13 execution does not qualify
   the corrected ATC fixture or incoming peer bytes. The25-file manifest binds
   the final integrated source; compiler-only f16 results stay historical.
+  Native is actually compiling on114 with all25 hashes matched and the actual
+  unchanged30GiB/floor10GiB guard(group1219008). Initial fixed-worker requests
+  refuse103/queue_timeout before Cargo. The normal broader-worker retry first
+  refuses Hz4 namespace initialization before any grant, then builds on114;
+  no namespace cleanup, worker-state change or administrative override.
 - [ ] Bind actual integrated-worker source/toolchain and five executable
   identities, review terminal nonpasses, and retain every failed/refused receipt.
 - [ ] Flush Beads, verify matching JSONL inventories and no dependency cycles,
