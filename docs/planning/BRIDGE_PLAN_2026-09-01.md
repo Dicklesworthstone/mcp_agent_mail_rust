@@ -33,6 +33,11 @@
 - [ ] Qualify final424c680b with all four mandatory gates and31 predeclared
   cases:14 retention,8 checkpoint,3 real-process signal,5 supervisor result
   and1 real-Git archive route. Earlier snapshots remain distinct evidence.
+- [x] Final424c680b strict workspace all-targets Clippy-Dwarnings exits0
+  (752.446s remote); its formatter retry exits0. Keep the earlier formatter
+  admission refusal103 and proc-macro-error2 future-compat warning visible.
+- [ ] Complete final424c680b's production lib+bins graph and separate workspace
+  all-targets check; native execution remains a distinct outstanding gate.
 - [ ] Re-read any fix and callers with fresh eyes; perform focused final
   verification and stock scan if code changes. Do not claim full-suite,
   Windows/macOS, real live-mailbox, soak or release qualification from this lane.
