@@ -295,6 +295,127 @@ source-missing 1 0
 CASES
 done
 
+# GH#384: execute the production migration/takeover sequence with failures at
+# the database command, final verification and archive-parity boundaries. The
+# database algorithms have native tests; this checks that their refusal cannot
+# rewrite an operator's launchers, shell, env or MCP configuration.
+if python3 - "$INSTALL_SH" "$scratch/migration-order" "$BASH" <<'PY'
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+
+source, scratch, bash = sys.argv[1:]
+installer = Path(source).read_text()
+prelude = installer[installer.index('prune_binary_transaction_history "$DEST"\n'):installer.index("collect_migration_counts() {")]
+finish = installer[installer.index("# Run database migration if we copied a Python DB"):installer.index("# T2.4: Post-install verification")]
+fixture = r'''
+set -Eeuo pipefail
+root="$1" mode="$2"
+QUIET=1 MAC_DIRECT_EXEC_COMPAT_MODE=0 PYTHON_DETECTED=1
+FORCE_MIGRATE=1 FORCE_NO_MIGRATE=0 ASSUME_YES=1 EASY=0
+PYTHON_MIGRATION_MARKER="$root/migration-complete"
+PYTHON_MIGRATION_SKIP_MARKER="$root/migration-skipped"
+PYTHON_DB_MIGRATED_PATH=''
+PYTHON_DB_PATH="$root/legacy.sqlite3"
+RUST_STORAGE_ROOT="$root/mail"
+RUST_DB_PATH="$RUST_STORAGE_ROOT/storage.sqlite3"
+PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE=1 LEGACY_LAUNCHER_SHIM_COUNT=1
+DEST="$root/bin" BIN_CLI=am BIN_SERVER=mcp-agent-mail VERSION=fixture
+SQLITE_POST_MIGRATION_FAILURES='injected verification refusal'
+info() { printf '%s\n' "$*" >> "$root/events"; }
+ok() { info "$@"; }
+warn() { info "$@"; }
+err() { info "$@"; }
+verbose() { :; }
+error_support_hint() { :; }
+stop_python_server() { info stop-python; }
+prune_binary_transaction_history() { :; }
+detect_mac_direct_exec_compat_mode() { return 1; }
+resolve_database_path() {
+    [ "$mode" != launcher-only ] || return 0
+    cp "$PYTHON_DB_PATH" "$RUST_DB_PATH"
+    PYTHON_DB_MIGRATED_PATH="$RUST_DB_PATH"
+}
+detect_mcp_configs() { :; }
+displace_python_alias() { printf 'Rust alias\n' > "$root/shell-rc"; }
+displace_python_binary() { printf 'Rust launcher\n' > "$root/launcher"; }
+migrate_env_config() { printf 'Rust env\n' > "$root/config.env"; }
+maybe_add_path() { printf 'Rust PATH\n' >> "$root/shell-rc"; }
+install_local_bin_links() { printf 'Rust link\n' > "$root/local-link"; }
+configure_mcp_clients_for_install() { printf 'Rust client\n' > "$root/client.json"; }
+install_legacy_launcher_takeover_shims() { printf 'Rust shim\n' > "$root/legacy-shim"; }
+ensure_remote_http_client_readiness() { info clients-ready; }
+collect_migration_counts() { printf 'projects=1 agents=2 messages=1\n'; }
+count_matching_backup_files() { printf '0\n'; }
+check_copy_disk_space() { return 0; }
+copy_sqlite_snapshot() { cp "$1" "$2"; }
+extract_migration_error_line() { printf 'injected migration refusal\n'; }
+sqlite_timestamp_fallback_migration() { return 1; }
+sqlite_lightweight_self_heal() { return 1; }
+installer_reconstruct_database_from_archive() { return 1; }
+installer_apply_schema_migration() { return 1; }
+sqlite_pragma_reports_ok() { return 0; }
+migration_core_counts_preserved() { return 0; }
+sqlite_post_migration_verify() { [ "$mode" = success ] || [ "$mode" = parity-fails ]; }
+installer_archive_parity_verify() { [ "$mode" = success ]; }
+'''
+failures = []
+for delivery in ("file", "stdin"):
+    for mode in ("migration-fails", "verification-fails", "parity-fails", "success", "launcher-only"):
+        root = Path(scratch) / f"{delivery}-{mode}"
+        (root / "bin").mkdir(parents=True)
+        (root / "mail").mkdir()
+        originals = {}
+        for name in ("shell-rc", "launcher", "config.env", "client.json", "legacy-shim", "local-link"):
+            originals[name] = f"original Python {name}\n".encode()
+            (root / name).write_bytes(originals[name])
+        with sqlite3.connect(root / "legacy.sqlite3") as db:
+            db.execute("CREATE TABLE messages (body TEXT)")
+            db.execute("INSERT INTO messages VALUES ('legacy message')")
+        legacy_before = (root / "legacy.sqlite3").read_bytes()
+        binary = root / "bin" / "am"
+        binary.write_text("#!/bin/sh\nexit " + ("42" if mode == "migration-fails" else "0") + "\n")
+        binary.chmod(0o755)
+        program = fixture + prelude + finish
+        env = {"PATH": os.environ["PATH"], "HOME": str(root), "LC_ALL": "C"}
+        if delivery == "file":
+            script = root / "sequence.sh"
+            script.write_text(program)
+            result = subprocess.run([bash, str(script), str(root), mode], env=env, capture_output=True, text=True)
+        else:
+            result = subprocess.run([bash, "-s", "--", str(root), mode], input=program, env=env, capture_output=True, text=True)
+        (root / "output.log").write_text(result.stdout + result.stderr)
+        try:
+            assert (root / "legacy.sqlite3").read_bytes() == legacy_before
+            if mode.endswith("fails"):
+                assert result.returncode == 1, result.stderr
+                assert "Database migration could not be completed safely." in (root / "events").read_text()
+                assert not (root / "migration-complete").exists()
+                for name, before in originals.items():
+                    assert (root / name).read_bytes() == before, f"prematurely rewrote {name}"
+            else:
+                assert result.returncode == 0, result.stderr
+                assert (root / "migration-complete").exists()
+                for name, before in originals.items():
+                    if mode == "launcher-only" and name == "config.env":
+                        assert (root / name).read_bytes() == before
+                    else:
+                        assert (root / name).read_bytes() != before, f"did not complete {name}"
+            print(f"PASS: migration takeover {delivery} {mode}")
+        except AssertionError as error:
+            failures.append(f"{delivery} {mode}: {error}; see {root / 'output.log'}")
+for failure in failures:
+    print("FAIL: " + failure, file=sys.stderr)
+sys.exit(bool(failures))
+PY
+then
+    :
+else
+    failures=$((failures + 1))
+fi
+
 # A regular-file destination must be refused before any lock/state write.
 # Leftover PID records in the old global location are preserved, including a
 # PID that is alive again: they are no longer permission to remove or block it.

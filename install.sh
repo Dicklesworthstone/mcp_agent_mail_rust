@@ -9681,8 +9681,6 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ok "  Source receipt: $source_receipt_path"
 fi
 prune_binary_transaction_history "$DEST"
-maybe_add_path
-install_local_bin_links
 
 if detect_mac_direct_exec_compat_mode; then
   warn "macOS direct execution compatibility mode enabled"
@@ -9771,40 +9769,10 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
 
     if [ "$MIGRATE_PYTHON" -eq 1 ]; then
       stop_python_server
-      if ! displace_python_alias; then
-        err "Failed to fully displace legacy 'am' alias/function definitions."
-        err "Please remove remaining alias/function manually, then rerun installer."
-        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-        error_support_hint
-        exit 1
-      fi
-      if ! displace_python_binary; then
-        err "Failed to displace legacy 'am' launcher in PATH."
-        err "Please remove or rename the legacy launcher manually, then rerun installer."
-        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-        error_support_hint
-        exit 1
-      fi
+      # GH#384: copying the source does not establish that Rust can use it.
+      # Keep the Python launchers, shell startup, env and client configs intact
+      # until migration, integrity and archive-parity verification succeed.
       resolve_database_path
-      # Only migrate env config if resolve_database_path actually copied a Python DB.
-      # PYTHON_DB_MIGRATED_PATH is set only when a DB was copied and needs migration.
-      if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
-        migrate_env_config
-      else
-        # No Python DB to migrate — alias/binary displacement was the entire migration.
-        # Write the marker now so future runs skip the migration prompt entirely.
-        # (Without this, the clone directory still triggers PYTHON_DETECTED=1 and the
-        # user is prompted on every `acfs update` — see GitHub issue #258.)
-        if [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
-          mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
-          printf 'migrated_at=%s\nnote=no Python DB found; alias/binary displacement only\ninstaller_version=%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "${VERSION:-unknown}" \
-            > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
-          verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER} (no-db displacement-only)"
-          ok "Migration marker saved (no Python database found; alias/binary displaced)"
-        fi
-      fi
     fi
   fi
 fi
@@ -9827,21 +9795,6 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
       info "[$tool] $path (missing)"
     fi
   done <<< "$MCP_CONFIG_SCAN"
-fi
-
-# First run native setup so its atomic, Git-aware token writer durably commits
-# the one credential every subsequent client and service phase will use.
-# This also handles the broader non-Codex migration work:
-#   - Python→Rust command rewriting
-#   - env var preservation (bearer token, storage root)
-#   - BOM/JSONC/trailing-comma tolerance
-#   - Backup before modification
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
-    err "MCP client configuration failed."
-    error_support_hint
-    exit 1
-  fi
 fi
 
 collect_migration_counts() {
@@ -10745,19 +10698,6 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
     fi
   fi
 
-  if [ "$migration_succeeded" -eq 1 ]; then
-    # Write migration-complete marker so future installer runs skip Python migration entirely.
-    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
-    printf 'migrated_at=%s\nrust_db=%s\npython_db=%s\ninstaller_version=%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      "${RUST_DB_PATH:-unknown}" \
-      "${PYTHON_DB_PATH:-unknown}" \
-      "${VERSION:-unknown}" \
-      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
-    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER}"
-    ok "Python→Rust migration marker saved (future installs will skip migration)"
-  fi
-
   if [ "$migration_succeeded" -ne 1 ]; then
     err "Database migration could not be completed safely."
     err "Aborting install to avoid running with a potentially inconsistent migrated database."
@@ -10774,6 +10714,62 @@ fi
 if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
   warn "Rust database migration was skipped because this macOS host rejected direct execution of the installed Rust binaries."
   warn "The existing Python data path remains active through the compatibility launcher."
+fi
+
+# Commit the user-facing takeover only after all required database checks.
+# A refused migration above must not redirect clients to an unusable mailbox.
+if [ "${MIGRATE_PYTHON:-0}" -eq 1 ]; then
+  # PYTHON_DB_MIGRATED_PATH is set only when a database needs migration.
+  if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
+    migrate_env_config
+  fi
+  if ! displace_python_alias; then
+    err "Failed to fully displace legacy 'am' alias/function definitions."
+    err "Please remove remaining alias/function manually, then rerun installer."
+    err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+    error_support_hint
+    exit 1
+  fi
+  if ! displace_python_binary; then
+    err "Failed to displace legacy 'am' launcher in PATH."
+    err "Please remove or rename the legacy launcher manually, then rerun installer."
+    err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+    error_support_hint
+    exit 1
+  fi
+  if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
+    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+    printf 'migrated_at=%s\nrust_db=%s\npython_db=%s\ninstaller_version=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${RUST_DB_PATH:-unknown}" \
+      "${PYTHON_DB_PATH:-unknown}" \
+      "${VERSION:-unknown}" \
+      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER}"
+    ok "Python→Rust migration marker saved (future installs will skip migration)"
+  elif [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
+    # GH#258: launcher-only migrations must not prompt on every later update.
+    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+    printf 'migrated_at=%s\nnote=no Python DB found; alias/binary displacement only\ninstaller_version=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${VERSION:-unknown}" \
+      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER} (no-db displacement-only)"
+    ok "Migration marker saved (no Python database found; alias/binary displaced)"
+  fi
+fi
+
+maybe_add_path
+install_local_bin_links
+
+# Native setup durably commits the shared credential before clients/services
+# use it. Run only after the migrated mailbox has passed verification.
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
+  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
+    err "MCP client configuration failed."
+    error_support_hint
+    exit 1
+  fi
 fi
 
 if [ "${MIGRATE_PYTHON:-0}" -eq 1 ] && [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE" -eq 1 ]; then
