@@ -9,16 +9,42 @@
 - [x] Continue owned br-asldx and inspect actual health-cache/staging code. Find
   cache eligibility conflating missing and unsafe sidecars, discarded sidecar
   inode identity, and same-length rewrites with restored mtime.
-- [ ] Prove the defects on unchanged production using real seeded databases,
+- [x] Prove the defects on unchanged production using real seeded databases,
   actual health probes and filesystem mutations, retaining the exact old source.
-- [ ] Preserve absent/invalid distinctions and complete eligible member identity
+  Immutable37b51aab changes tests only. Actual fb15c0e2 ends100:0/4PASS,4FAIL,
+  4027skipped,0.126s execution. All fail at their intended cache assertions;
+  healthy setup succeeds first. Stable actual DB ELF afa77a7a contains all four
+  names. Initial hz3 queue timeout103 executes zero tests; the unchanged retry
+  runs after capacity becomes available, with original budgets/watchdogs.
+- [x] Preserve absent/invalid distinctions and complete eligible member identity
   in cache fingerprints. Keep both health variants separate, unchanged-family
   reuse working, and staging/cleanup/refusal contracts intact.
-- [ ] Run all new negatives and existing real health-cache/staging controls on
+  Fresh review also finds stale failure reasons after healthy results and the
+  strict variant's missing transfer to the live path. Add a real corrupt/restore
+  control and fix both. Preserve the earlier24ff1a85 compiler packet as
+  intermediate; frozen final f25c0288 and all35 declared cases include this
+  correction. Do not credit the intermediate check to final source.
+- [x] Run all new negatives and existing real health-cache/staging controls on
   frozen corrected source. Keep original full13FAIL/readiness-size acceptance
   open; cache correctness is not a speedup or constant-readiness qualification.
+  Actual d5c62529 ends0:35/35PASS,3997skipped,8.155s execution. Every old4 and
+  corrected35 identity matches its declaration. Actual stable final DB ELF
+  f28550e5 contains the new rejection and corrupt/restore controls. All seven
+  sidecar slots and both probe variants preserve unsafe source entries. The
+  unchanged-family staging count and real read-pool reuse/retirement pass.
+- [ ] Run the complete default DB library population (4032 compiled cases),
+  with no name filter and every default ignore preserved. Preserve any failure;
+  this broader regression run cannot clear the previous storage/tools13FAIL.
 - [ ] Fresh-review final callers/error paths, then run both required compiler
   graphs, strict Clippy, formatting and the stock changed-file bug scan.
+  Final fmt0 and stock UBS0/0critical4992warning2367info/failed_modules[].
+  Superseded24ff check is cancelled143 through its exact owned RCH wrapper,
+  not counted as a pass. A final hz3 check attempt queue-times-out103 without
+  execution; final all-targets on1153 and production onhz3 are running.
+- [x] Inspect concurrent publication: a shared process commits/pushes planning
+  e2b63bd0, cache fix f08d78cb, and diagnostic fix3f82a642 during qualification.
+  Preserve that history. The committed source exactly matches final f25c0288;
+  do not count publication or intermediate compiler output as qualification.
 - [ ] Record exact outcomes in Beads, review tracker/cycles and publish normal
   main/mirror refs without disturbing peer work; release exact reservations.
 
