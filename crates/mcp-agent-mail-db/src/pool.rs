@@ -6125,7 +6125,10 @@ struct LiveQueryOnlyPoolEntry {
 }
 
 fn live_query_only_file_id(sqlite_identity: &Path) -> Option<(u64, u64)> {
-    health_probe_file_stamp(sqlite_identity).map(|(device, file, _, _)| (device, file))
+    health_probe_file_stamp(sqlite_identity)
+        .ok()
+        .flatten()
+        .map(|stamp| stamp.identity)
 }
 /// Upper bound on [`LIVE_QUERY_ONLY_POOL_CACHE`] entries. A server reads one
 /// mailbox, so this only binds processes that touch many mailboxes (a test
@@ -14168,13 +14171,28 @@ enum HealthVerdictVariant {
 /// Family metadata that must be unchanged for a healthy verdict to be reused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HealthVerdictFingerprint {
-    /// Main database file: device, inode, length, mtime in nanoseconds.
-    main: (u64, u64, u64, i128),
-    /// Sidecars whose bytes decide the verdict: suffix, length, mtime.
-    content_sidecars: Vec<(&'static str, u64, i128)>,
+    main: HealthProbeFileStamp,
+    /// Sidecars whose bytes decide the verdict, including generation identity.
+    content_sidecars: Vec<(&'static str, HealthProbeFileStamp)>,
     /// Sidecars whose presence and length matter but whose bytes churn with
-    /// every reader (`-shm` read marks, namespace use counters): suffix, length.
-    shape_sidecars: Vec<(&'static str, u64)>,
+    /// every reader. Identity and permissions still belong to the generation;
+    /// only their modification/change times are omitted.
+    shape_sidecars: Vec<(&'static str, HealthProbeFileStamp)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthProbeFileStamp {
+    identity: (u64, u64),
+    len: u64,
+    modified_ns: i128,
+    #[cfg(unix)]
+    changed_ns: i128,
+    #[cfg(unix)]
+    owner: (u32, u32),
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    links: u64,
 }
 
 struct HealthVerdictEntry {
@@ -14198,52 +14216,90 @@ fn health_verdict_reuse_window() -> Duration {
     Duration::from_secs(secs.min(HEALTH_VERDICT_REUSE_WINDOW_MAX_SECS))
 }
 
-/// Device/volume, inode/file index, length, and mtime of a regular file.
-/// `None` for missing, nonregular, or unidentifiable files means "never reuse".
-fn health_probe_file_stamp(path: &Path) -> Option<(u64, u64, u64, i128)> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+/// Read metadata without opening a source descriptor or following a leaf link.
+/// Only absence is `Ok(None)`: unsafe, unreadable or unidentifiable entries
+/// disable reuse for the entire family instead of disappearing from its key.
+fn health_probe_file_stamp(path: &Path) -> std::io::Result<Option<HealthProbeFileStamp>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if !metadata.file_type().is_file() {
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "health verdict reuse requires regular family members",
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let mtime =
-            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
-        Some((metadata.dev(), metadata.ino(), metadata.len(), mtime))
+        Ok(Some(HealthProbeFileStamp {
+            identity: (metadata.dev(), metadata.ino()),
+            len: metadata.len(),
+            modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                + i128::from(metadata.mtime_nsec()),
+            changed_ns: i128::from(metadata.ctime()) * 1_000_000_000
+                + i128::from(metadata.ctime_nsec()),
+            owner: (metadata.uid(), metadata.gid()),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+        }))
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         // Windows timestamps use 100 ns ticks from its native epoch. Cache
         // entries are process-local, so only exact equality is significant.
-        Some((
-            u64::from(metadata.volume_serial_number()?),
-            metadata.file_index()?,
-            metadata.len(),
-            i128::from(metadata.last_write_time()) * 100,
-        ))
+        let volume = metadata
+            .volume_serial_number()
+            .ok_or_else(|| std::io::Error::other("health file volume identity unavailable"))?;
+        let index = metadata
+            .file_index()
+            .ok_or_else(|| std::io::Error::other("health file identity unavailable"))?;
+        Ok(Some(HealthProbeFileStamp {
+            identity: (u64::from(volume), index),
+            len: metadata.len(),
+            modified_ns: i128::from(metadata.last_write_time()) * 100,
+        }))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        None
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "health file identity unavailable on this platform",
+        ))
     }
 }
 
 fn health_verdict_fingerprint(path: &Path) -> Option<HealthVerdictFingerprint> {
-    let main = health_probe_file_stamp(path)?;
-    let mut content_sidecars = Vec::new();
-    for suffix in ["-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
-        if let Some((_, _, len, mtime)) =
-            health_probe_file_stamp(&sqlite_sidecar_path(path, suffix))
-        {
-            content_sidecars.push((suffix, len, mtime));
-        }
+    let main = health_probe_file_stamp(path).ok().flatten()?;
+    #[cfg(unix)]
+    if main.links != 1 {
+        return None;
     }
+    let mut content_sidecars = Vec::new();
     let mut shape_sidecars = Vec::new();
-    for suffix in ["-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
-        if let Some((_, _, len, _)) = health_probe_file_stamp(&sqlite_sidecar_path(path, suffix)) {
-            shape_sidecars.push((suffix, len));
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .into_iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
+    {
+        if let Some(mut stamp) = health_probe_file_stamp(&sqlite_sidecar_path(path, suffix)).ok()? {
+            #[cfg(unix)]
+            if stamp.links != 1 {
+                return None;
+            }
+            if suffix == "-shm" || FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.contains(&suffix) {
+                // Coordination updates must not defeat unchanged-family reuse.
+                stamp.modified_ns = 0;
+                #[cfg(unix)]
+                {
+                    stamp.changed_ns = 0;
+                }
+                shape_sidecars.push((suffix, stamp));
+            } else {
+                content_sidecars.push((suffix, stamp));
+            }
         }
     }
     Some(HealthVerdictFingerprint {
@@ -21331,7 +21387,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     type HealthProbe = fn(&Path) -> Result<bool, SqlError>;
 
     /// br-v0ucm: one WAL reset holds the gate at a time, checkouts wait for
@@ -32134,8 +32190,12 @@ mod tests {
     fn health_probe_file_stamp_tracks_identity_and_rejects_nonfiles() {
         let dir = tempfile::tempdir().expect("stamp fixture");
         let path = dir.path().join("main.db");
-        assert!(health_probe_file_stamp(&path).is_none());
-        assert!(health_probe_file_stamp(dir.path()).is_none());
+        assert!(
+            health_probe_file_stamp(&path)
+                .expect("missing path")
+                .is_none()
+        );
+        assert!(health_probe_file_stamp(dir.path()).is_err());
 
         let replacement = dir.path().join("replacement.db");
         let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -32148,19 +32208,26 @@ mod tests {
             file.set_times(std::fs::FileTimes::new().set_modified(modified))
                 .expect("set identical modification times");
         }
-        let before = health_probe_file_stamp(&path).expect("regular file identity");
-        assert_eq!(health_probe_file_stamp(&path), Some(before));
+        let before = health_probe_file_stamp(&path)
+            .expect("regular file metadata")
+            .expect("regular file identity");
+        assert_eq!(health_probe_file_stamp(&path).unwrap(), Some(before));
         std::fs::rename(&path, dir.path().join("preserved.db")).expect("preserve original");
         std::fs::rename(&replacement, &path).expect("install replacement");
-        let after = health_probe_file_stamp(&path).expect("replacement identity");
-        assert_eq!((before.2, before.3), (after.2, after.3));
-        assert_ne!((before.0, before.1), (after.0, after.1));
+        let after = health_probe_file_stamp(&path)
+            .expect("replacement metadata")
+            .expect("replacement identity");
+        assert_eq!(
+            (before.len, before.modified_ns),
+            (after.len, after.modified_ns)
+        );
+        assert_ne!(before.identity, after.identity);
 
         #[cfg(unix)]
         {
             let link = dir.path().join("link.db");
             std::os::unix::fs::symlink(&path, &link).expect("create symlink");
-            assert!(health_probe_file_stamp(&link).is_none());
+            assert!(health_probe_file_stamp(&link).is_err());
         }
     }
 
@@ -32186,6 +32253,142 @@ mod tests {
         assert_eq!(health_probe_stagings_for_test(&path), before + 2);
         assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("no-cleanup reuse"));
         assert_eq!(health_probe_stagings_for_test(&path), before + 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_rejects_new_unsafe_sidecars() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+                .into_iter()
+                .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
+            {
+                for directory in [false, true] {
+                    let dir = tempfile::tempdir().expect("unsafe sidecar fixture");
+                    let path = dir.path().join("cached.sqlite3");
+                    seed_settled_diagnostic_database(&path);
+                    assert!(probe(&path).expect("cache healthy source"));
+                    let staged = health_probe_stagings_for_test(&path);
+                    assert!(probe(&path).expect("reuse healthy source"));
+                    assert_eq!(health_probe_stagings_for_test(&path), staged);
+                    let sidecar = sqlite_sidecar_path(&path, suffix);
+                    if directory {
+                        std::fs::create_dir(&sidecar).expect("install directory sidecar");
+                    } else {
+                        std::os::unix::fs::symlink(dir.path().join("absent"), &sidecar)
+                            .expect("install dangling sidecar symlink");
+                    }
+                    let before = exact_diagnostic_parent_snapshot(dir.path());
+                    assert!(
+                        !matches!(probe(&path), Ok(true)),
+                        "cached health must refuse unsafe {suffix}, directory={directory}"
+                    );
+                    assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
+                    if !directory {
+                        assert_eq!(
+                            std::fs::read_link(&sidecar).unwrap(),
+                            dir.path().join("absent")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_rejects_a_new_primary_hard_link() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let dir = tempfile::tempdir().expect("hard link fixture");
+            let path = dir.path().join("cached.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            assert!(probe(&path).expect("cache healthy source"));
+            std::fs::hard_link(&path, dir.path().join("second-authority.sqlite3"))
+                .expect("introduce a second primary pathname");
+            let before = exact_diagnostic_parent_snapshot(dir.path());
+            assert!(
+                !matches!(probe(&path), Ok(true)),
+                "cached health cannot bypass the staging hard-link refusal"
+            );
+            assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_rejects_a_rewrite_with_restored_mtime() {
+        use std::io::Write as _;
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let dir = tempfile::tempdir().expect("rewrite fixture");
+            let path = dir.path().join("cached.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            assert!(probe(&path).expect("cache healthy source"));
+            let metadata = std::fs::metadata(&path).expect("original metadata");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open source for deliberate corruption");
+            file.write_all(b"not a SQLite DB!").expect("corrupt header");
+            file.sync_all().expect("settle deliberate corruption");
+            file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+                .expect("restore original mtime");
+            drop(file);
+            let after = std::fs::metadata(&path).expect("rewritten metadata");
+            assert_eq!(after.len(), metadata.len());
+            assert_eq!(after.modified().unwrap(), metadata.modified().unwrap());
+            let before = exact_diagnostic_parent_snapshot(dir.path());
+            assert!(
+                !matches!(probe(&path), Ok(true)),
+                "same-length corruption must not inherit the cached healthy verdict"
+            );
+            assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_verdict_fingerprint_tracks_sidecar_generation_identity() {
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .into_iter()
+            .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
+        {
+            let dir = tempfile::tempdir().expect("sidecar generation fixture");
+            let path = dir.path().join("source.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            let sidecar = sqlite_sidecar_path(&path, suffix);
+            let replacement = dir.path().join("replacement");
+            let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            for (file_path, bytes) in [(&sidecar, b"old!"), (&replacement, b"new!")] {
+                std::fs::write(file_path, bytes).expect("write sidecar generation");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(file_path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .expect("match sidecar mtimes");
+            }
+            let before = health_verdict_fingerprint(&path).expect("original fingerprint");
+            std::fs::rename(&sidecar, dir.path().join("preserved-sidecar"))
+                .expect("retain original generation");
+            std::fs::rename(&replacement, &sidecar).expect("install replacement generation");
+            assert_ne!(
+                health_verdict_fingerprint(&path).expect("replacement fingerprint"),
+                before,
+                "same-size, same-mtime replacement of {suffix} changes family identity"
+            );
+        }
     }
 
     #[test]
