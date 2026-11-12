@@ -67,6 +67,7 @@ impl SnapshotRetentionDeferred {
 #[cfg(unix)]
 struct RetentionSearchBudget {
     deadline: Instant,
+    finish_first_candidate: bool,
     candidates: usize,
     bytes: u64,
     candidate_limit: usize,
@@ -78,6 +79,7 @@ impl RetentionSearchBudget {
     fn new(deadline: Instant) -> Self {
         Self {
             deadline,
+            finish_first_candidate: false,
             candidates: 0,
             bytes: 0,
             candidate_limit: MAX_RETENTION_SEARCH_CANDIDATES,
@@ -85,8 +87,17 @@ impl RetentionSearchBudget {
         }
     }
 
+    fn finishing_admitted_turn(admitted_at: Instant, deadline: Instant) -> Self {
+        Self {
+            finish_first_candidate: admitted_at < deadline,
+            ..Self::new(deadline)
+        }
+    }
+
     fn admit(&mut self, bytes: u64) -> io::Result<()> {
-        let refused = if Instant::now() >= self.deadline {
+        let refused = if Instant::now() >= self.deadline
+            && !(self.finish_first_candidate && self.candidates == 0)
+        {
             Some(SnapshotRetentionDeferred::Deadline)
         } else if self.candidates >= self.candidate_limit {
             Some(SnapshotRetentionDeferred::Candidates)
@@ -268,6 +279,35 @@ impl SnapshotRetentionGuard {
             primary,
             Some(expected_parent),
             Some(RetentionSearchBudget::new(deadline)),
+        )
+    }
+
+    /// Finish the first pin candidate of a background turn admitted before its
+    /// original deadline. Complete inventory is prerequisite work for that
+    /// candidate; slow inventory must not consume every continuation without
+    /// ever checking a pin. Only the first candidate may cross the deadline,
+    /// and normal bounded search hints resume the suffix on a later turn.
+    ///
+    /// The caller must retain that original admission instant and charge the
+    /// entire elapsed turn to its rest schedule. This does not extend the
+    /// deadline, relax candidate/byte limits, or grant verification authority.
+    /// An admission at or after the deadline retains strict behavior.
+    ///
+    /// # Errors
+    /// Preserves every refusal of [`Self::acquire_for_parent_until`].
+    pub fn acquire_for_parent_finishing_turn(
+        primary: &Path,
+        expected_parent: &File,
+        admitted_at: Instant,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        Self::acquire_with_parent(
+            primary,
+            Some(expected_parent),
+            Some(RetentionSearchBudget::finishing_admitted_turn(
+                admitted_at,
+                deadline,
+            )),
         )
     }
 
@@ -1788,6 +1828,100 @@ mod tests {
         *different.last_mut().unwrap() ^= 0xff;
         std::fs::write(backup, different).unwrap();
         (primary, pin, original)
+    }
+
+    #[test]
+    fn admitted_background_search_finishes_only_one_candidate_after_expiry() {
+        let deadline = Instant::now();
+        let admitted = deadline - std::time::Duration::from_millis(1);
+        let mut background = RetentionSearchBudget::finishing_admitted_turn(admitted, deadline);
+        background.admit(MAX_RETENTION_SEARCH_BYTES + 1).unwrap();
+        let error = background.admit(1).unwrap_err();
+        assert_eq!(
+            SnapshotRetentionDeferred::from_io_error(&error),
+            Some(SnapshotRetentionDeferred::Deadline)
+        );
+        assert_eq!(background.candidates, 1);
+        assert_eq!(background.bytes, MAX_RETENTION_SEARCH_BYTES + 1);
+
+        for mut strict in [
+            RetentionSearchBudget::new(deadline),
+            RetentionSearchBudget::finishing_admitted_turn(deadline, deadline),
+            RetentionSearchBudget::finishing_admitted_turn(
+                deadline + std::time::Duration::from_millis(1),
+                deadline,
+            ),
+        ] {
+            let error = strict.admit(1).unwrap_err();
+            assert_eq!(
+                SnapshotRetentionDeferred::from_io_error(&error),
+                Some(SnapshotRetentionDeferred::Deadline)
+            );
+            assert_eq!(strict.candidates, 0);
+            assert_eq!(strict.bytes, 0);
+        }
+        let mut no_candidates = RetentionSearchBudget {
+            candidate_limit: 0,
+            ..RetentionSearchBudget::finishing_admitted_turn(admitted, deadline)
+        };
+        let error = no_candidates.admit(1).unwrap_err();
+        assert_eq!(
+            SnapshotRetentionDeferred::from_io_error(&error),
+            Some(SnapshotRetentionDeferred::Candidates)
+        );
+    }
+
+    #[test]
+    fn slow_inventory_background_search_resumes_one_real_candidate_per_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (primary, pin, original) = retention_search_fixture(&root);
+        let current = super::super::snapshot_bak_path(&primary);
+        for day in [2, 3] {
+            std::fs::copy(
+                &current,
+                root.join(format!("mail.sqlite3.bak.2000010{day}_000000")),
+            )
+            .unwrap();
+        }
+        let parent = File::open(&root).unwrap();
+        let metadata_path = super::super::snapshot_meta_path(&primary);
+        let metadata = std::fs::read(&metadata_path).unwrap();
+        let next = || {
+            // Inventory spent the original turn. The real file hashing,
+            // snapshot verification, source witnesses and locks still run.
+            let deadline = Instant::now();
+            SnapshotRetentionGuard::acquire_for_parent_finishing_turn(
+                &primary,
+                &parent,
+                deadline - std::time::Duration::from_millis(1),
+                deadline,
+            )
+        };
+        for _ in 0..3 {
+            let error = next().err().expect("one different candidate per turn");
+            assert_eq!(
+                SnapshotRetentionDeferred::from_io_error(&error),
+                Some(SnapshotRetentionDeferred::Deadline)
+            );
+            crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
+            assert_eq!(std::fs::read(&pin).unwrap(), original);
+        }
+        for _ in 0..2 {
+            let guard = next().unwrap();
+            assert_eq!(guard.verified_source_path(), Some(pin.as_path()));
+            guard.revalidate().unwrap();
+        }
+        std::fs::copy(&current, &pin).unwrap();
+        let error = next()
+            .err()
+            .expect("a resumed pin still needs real verification");
+        assert_eq!(
+            SnapshotRetentionDeferred::from_io_error(&error),
+            Some(SnapshotRetentionDeferred::Deadline)
+        );
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), metadata);
+        assert_eq!(std::fs::read(&primary).unwrap(), original);
     }
 
     #[test]

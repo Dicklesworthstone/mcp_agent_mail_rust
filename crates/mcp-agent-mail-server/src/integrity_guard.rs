@@ -890,7 +890,7 @@ impl<'a> PeriodicBackupPolicy<'a> {
         let started = Instant::now();
         let result = admission.map_or_else(
             || {
-                crate::backup_rotation::rotate_storage_backups_within(
+                crate::backup_rotation::rotate_storage_backups_in_background(
                     self.storage_root,
                     primary,
                     self.keep,
