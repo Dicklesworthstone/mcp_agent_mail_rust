@@ -38272,7 +38272,20 @@ mod tests {
     fn autocommit_writer_storm_loses_no_rows_and_keeps_integrity() {
         use asupersync::runtime::RuntimeBuilder;
 
+        // br-kp1in.29: attribute a real watchdog timeout without changing the
+        // workload, retry policy, or assertions. Silent on ordinary test runs.
+        let trace_phases = std::env::var_os("AM_TEST_WRITER_STORM_TRACE").is_some();
+        let started = std::time::Instant::now();
         for writers in [16_usize, 32] {
+            let phase = move |writer: usize, row: usize, attempt: usize, event: &str| {
+                if trace_phases {
+                    eprintln!(
+                        "writer_storm writers={writers} writer={writer} row={row} \
+                         attempt={attempt} elapsed_ms={} phase={event}",
+                        started.elapsed().as_millis()
+                    );
+                }
+            };
             let dir = tempfile::tempdir().expect("tempdir");
             let db_path = dir.path().join(format!("autocommit_storm_{writers}.db"));
             let cfg = crate::pool::DbPoolConfig {
@@ -38290,6 +38303,9 @@ mod tests {
             let warmup_rt = RuntimeBuilder::current_thread()
                 .build()
                 .expect("warmup runtime");
+            if trace_phases {
+                eprintln!("writer_storm writers={writers} phase=warmup_begin");
+            }
             warmup_rt.block_on(async {
                 let cx = Cx::current().expect("warmup cx");
                 assert!(
@@ -38297,6 +38313,9 @@ mod tests {
                     "warmup acquire_conn failed"
                 );
             });
+            if trace_phases {
+                eprintln!("writer_storm writers={writers} phase=warmup_end");
+            }
             let per_writer = 8_usize;
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
             // Spawn every writer before joining any: they meet at the barrier.
@@ -38305,16 +38324,23 @@ mod tests {
                 let pool = pool.clone();
                 let barrier = std::sync::Arc::clone(&barrier);
                 handles.push(std::thread::spawn(move || {
+                    phase(writer, 0, 0, "runtime_begin");
                     let rt = RuntimeBuilder::current_thread()
                         .build()
                         .expect("writer runtime");
+                    phase(writer, 0, 0, "barrier_begin");
                     barrier.wait();
+                    phase(writer, 0, 0, "barrier_end");
                     let mut failures = Vec::new();
                     for row in 0..per_writer {
                         let slug = format!("storm-{writers}-{writer}-{row}");
+                        let attempts = std::cell::Cell::new(0_usize);
                         let outcome = rt.block_on(async {
                             let cx = Cx::current().expect("runtime installs a context");
                             run_with_mvcc_retry(&cx, "autocommit storm insert", || async {
+                                let attempt = attempts.get();
+                                attempts.set(attempt + 1);
+                                phase(writer, row, attempt, "acquire_begin");
                                 let conn = match acquire_conn(&cx, &pool).await {
                                     Outcome::Ok(conn) => conn,
                                     Outcome::Err(error) => return Outcome::Err(error),
@@ -38325,20 +38351,31 @@ mod tests {
                                         return Outcome::Panicked(payload);
                                     }
                                 };
-                                match conn.execute_raw(&format!(
+                                phase(writer, row, attempt, "execute_begin");
+                                let result = conn.execute_raw(&format!(
                                     "INSERT INTO projects (slug, human_key, created_at) \
                                          VALUES ('{slug}', '/tmp/{slug}', 0)"
-                                )) {
+                                ));
+                                phase(writer, row, attempt, "execute_end");
+                                if trace_phases {
+                                    eprintln!(
+                                        "writer_storm writers={writers} writer={writer} \
+                                         row={row} attempt={attempt} result={result:?}"
+                                    );
+                                }
+                                match result {
                                     Ok(()) => Outcome::Ok(()),
                                     Err(error) => Outcome::Err(map_sql_error(&error)),
                                 }
                             })
                             .await
                         });
+                        phase(writer, row, attempts.get(), "row_end");
                         if !matches!(outcome, Outcome::Ok(())) {
                             failures.push(format!("{slug}: {outcome:?}"));
                         }
                     }
+                    phase(writer, per_writer, 0, "writer_end");
                     failures
                 }));
             }
@@ -38346,8 +38383,14 @@ mod tests {
                 .into_iter()
                 .flat_map(|handle| handle.join().expect("writer thread"))
                 .collect();
+            if trace_phases {
+                eprintln!("writer_storm writers={writers} phase=writers_joined");
+            }
             assert!(failures.is_empty(), "{writers} writers: {failures:?}");
             drop(pool);
+            if trace_phases {
+                eprintln!("writer_storm writers={writers} phase=pool_dropped");
+            }
 
             let verify = crate::CanonicalDbConn::open_file(db_path.display().to_string())
                 .expect("independent C SQLite connection");
@@ -38368,6 +38411,9 @@ mod tests {
                 .filter_map(|row| row.get_as::<String>(0).ok())
                 .collect();
             assert_eq!(integrity, vec!["ok".to_string()], "{writers} writers");
+            if trace_phases {
+                eprintln!("writer_storm writers={writers} phase=integrity_verified");
+            }
         }
     }
 
