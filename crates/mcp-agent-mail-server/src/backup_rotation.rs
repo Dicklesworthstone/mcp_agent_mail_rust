@@ -3153,7 +3153,9 @@ mod tests {
         }
         let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
         let deadline = Instant::now();
-        let admitted_at = deadline - Duration::from_millis(1);
+        let admitted_at = deadline
+            .checked_sub(Duration::from_millis(1))
+            .expect("fixture clock must have one millisecond of history");
         let mut first_unit = Some(admitted_at);
         let mut remaining = MAX_RECLAIM_DIRECTORIES_PER_PASS;
         let mut report = RotateReport::default();
@@ -3175,7 +3177,7 @@ mod tests {
         assert!(first_unit.is_none());
         assert_eq!(report.empty_directories_deleted, 1);
         assert!(report.deadline_reached() && report.work_deferred());
-        assert!(report.failures.is_empty());
+        assert!(report.failures.is_empty(), "{report:?}");
         assert_eq!(remaining, MAX_RECLAIM_DIRECTORIES_PER_PASS - 1);
         assert_eq!(
             fs::read_dir(tmp.path().join("doctor/reclaimable"))
@@ -3196,7 +3198,7 @@ mod tests {
             rotate_storage_backups_in_background(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
         assert!(zero.deadline_reached() && zero.work_deferred());
         assert_eq!((zero.deleted, zero.kept), (0, 10));
-        assert!(zero.failures.is_empty());
+        assert!(zero.failures.is_empty(), "{zero:?}");
         assert!(!zero.admission_refused);
 
         let budget = RotationWorkBudget::background(Duration::from_millis(1));
@@ -3219,7 +3221,7 @@ mod tests {
         .unwrap();
         assert!(expired.deadline_reached() && expired.work_deferred());
         assert_eq!((expired.deleted, expired.kept), (0, 10));
-        assert!(expired.failures.is_empty());
+        assert!(expired.failures.is_empty(), "{expired:?}");
         assert!(!expired.admission_refused);
         assert_eq!(names_on_disk(tmp.path()), before);
     }

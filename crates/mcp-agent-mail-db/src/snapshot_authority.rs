@@ -1833,7 +1833,9 @@ mod tests {
     #[test]
     fn admitted_background_search_finishes_only_one_candidate_after_expiry() {
         let deadline = Instant::now();
-        let admitted = deadline - std::time::Duration::from_millis(1);
+        let admitted = deadline
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("fixture clock must have one millisecond of history");
         let mut background = RetentionSearchBudget::finishing_admitted_turn(admitted, deadline);
         background.admit(MAX_RETENTION_SEARCH_BYTES + 1).unwrap();
         let error = background.admit(1).unwrap_err();
@@ -1894,7 +1896,9 @@ mod tests {
             SnapshotRetentionGuard::acquire_for_parent_finishing_turn(
                 &primary,
                 &parent,
-                deadline - std::time::Duration::from_millis(1),
+                deadline
+                    .checked_sub(std::time::Duration::from_millis(1))
+                    .expect("fixture clock must have one millisecond of history"),
                 deadline,
             )
         };
