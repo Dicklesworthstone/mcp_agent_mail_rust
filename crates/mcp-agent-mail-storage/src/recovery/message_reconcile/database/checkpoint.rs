@@ -643,7 +643,7 @@ enum RestoreState {
 enum StoredSnapshot {
     Absent,
     Legacy(u32),
-    Current(Snapshot),
+    Current(Box<Snapshot>),
 }
 
 /// Merge obligations, not authority or old scan positions. The per-pass flock
@@ -926,7 +926,7 @@ impl Store {
         snapshot
             .validate(&snapshot.binding)
             .map_err(|error| io_context("validate snapshot", &self.path, error))?;
-        Ok(StoredSnapshot::Current(snapshot))
+        Ok(StoredSnapshot::Current(Box::new(snapshot)))
     }
 
     #[cfg(test)]
@@ -938,7 +938,7 @@ impl Store {
                     "legacy checkpoint cannot establish the previous database/archive generation",
                 ));
             }
-            StoredSnapshot::Current(snapshot) => snapshot,
+            StoredSnapshot::Current(snapshot) => *snapshot,
         };
         snapshot
             .validate(&self.binding)
@@ -956,7 +956,7 @@ impl Store {
                 // repeatedly rewinding it would prevent convergence.
                 return Ok(RestoreState::LegacyIgnored(version));
             }
-            StoredSnapshot::Current(snapshot) => snapshot,
+            StoredSnapshot::Current(snapshot) => *snapshot,
         };
         if snapshot.binding != self.binding {
             // A failed replacement can leave obsolete disk hints behind every
