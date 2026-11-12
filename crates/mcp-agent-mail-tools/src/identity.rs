@@ -2048,6 +2048,10 @@ pub struct IntegrityHealthResponse {
     pub last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome,
     pub checks_total: u64,
     pub failures_total: u64,
+    /// Current failures, separate from the lifetime tally.
+    pub failures_since_last_ok: u64,
+    /// Accepted never-written orphan pages, retained as a space advisory.
+    pub never_written_orphan_pages: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2984,6 +2988,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             last_full_check_outcome: integrity_metrics.last_full_check_outcome,
             checks_total: integrity_metrics.checks_total,
             failures_total: integrity_metrics.failures_total,
+            failures_since_last_ok: integrity_metrics.failures_since_last_ok,
+            never_written_orphan_pages: integrity_metrics.never_written_orphan_pages,
         }),
         lexical_backfill: pool
             .as_ref()
@@ -7807,8 +7813,21 @@ body
                     Outcome::Panicked(_) => panic!("bootstrap acquire panicked"),
                 };
                 drop(conn);
+                // The real producer must serialize accepted reconciliation
+                // evidence; a fresh caller cannot replace these gauges by zero.
+                mcp_agent_mail_db::integrity::record_reconciled_acceptance(
+                    mcp_agent_mail_db::CheckKind::Full,
+                    425,
+                );
+                let counters = mcp_agent_mail_db::integrity_metrics();
+                assert_eq!(counters.never_written_orphan_pages, 425);
                 let healthy: serde_json::Value =
                     serde_json::from_str(&health_check(&ctx).unwrap()).unwrap();
+                assert_eq!(healthy["integrity"]["never_written_orphan_pages"], 425);
+                assert_eq!(
+                    healthy["integrity"]["failures_since_last_ok"],
+                    counters.failures_since_last_ok
+                );
                 assert_eq!(
                     healthy["verdicts"]["db_health"]["status"], "green",
                     "{healthy}"

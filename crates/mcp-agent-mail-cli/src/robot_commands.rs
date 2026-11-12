@@ -9425,8 +9425,8 @@ fn synthesize_robot_health_probes_from_server(
                 last_full_check_outcome: server_integrity.last_full_check_outcome,
                 checks_total: server_integrity.checks_total,
                 failures_total: server_integrity.failures_total,
-                failures_since_last_ok: 0,
-                never_written_orphan_pages: 0,
+                failures_since_last_ok: server_integrity.failures_since_last_ok,
+                never_written_orphan_pages: server_integrity.never_written_orphan_pages,
             });
 
     Some(LiveServerRobotHealthProbes {
@@ -29618,7 +29618,9 @@ mod tests {
                     "last_check_outcome": "passed",
                     "last_full_check_outcome": "passed",
                     "checks_total": 3,
-                    "failures_total": 0
+                    "failures_total": 0,
+                    "failures_since_last_ok": 0,
+                    "never_written_orphan_pages": 0
                 },
                 "lexical_backfill": {
                     "state": "fresh",
@@ -29679,6 +29681,40 @@ mod tests {
             .expect("matching live mailbox");
         assert_eq!(assessment.level, mcp_agent_mail_core::HealthLevel::Green);
         assert_eq!(assessment.probe.status, "ok");
+
+        // Retain the daemon's measured counters rather than manufacturing
+        // zeros in the CLI's fresh process. A real local DB remains required.
+        let mut counter_payload = healthy_payload.clone();
+        counter_payload["integrity"]["never_written_orphan_pages"] = 425.into();
+        let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
+            .expect("matching real local mailbox")
+            .integrity_metrics
+            .expect("daemon integrity counters");
+        assert_eq!(counters.never_written_orphan_pages, 425);
+        assert_eq!(counters.failures_since_last_ok, 0);
+        let (probe, _) = summarize_integrity_probe(&counters);
+        assert!(probe.detail.contains("425 never-written orphan page(s)"));
+        counter_payload["integrity"]["failures_since_last_ok"] = 2.into();
+        let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
+            .unwrap()
+            .integrity_metrics
+            .unwrap();
+        assert_eq!(counters.failures_since_last_ok, 2);
+        for field in ["failures_since_last_ok", "never_written_orphan_pages"] {
+            let mut incomplete = counter_payload.clone();
+            incomplete["integrity"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                parse_health_check_response(&incomplete).is_none(),
+                "{field}"
+            );
+            assert!(
+                synthesize_robot_health_probes_from_server(&config, &incomplete, 0.5).is_none(),
+                "a missing {field} is unavailable evidence, never an attested zero"
+            );
+        }
 
         // Each of these faults lives in the daemon, not in the CLI's fresh
         // process-global counters. A successful local DB probe must not make
