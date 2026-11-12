@@ -24,8 +24,19 @@
 - [x] Complete full formatter on frozen fe23fd3b and stock changed-file UBS:
   both exit0; UBS reports0critical/2817warning/927info, failed_modules[].
   All warnings remain unsuppressed. Native/compiler jobs are still pending.
-- [ ] Complete workspace all-targets, separate production lib+bins and strict
-  Clippy-Dwarnings; retain all warnings/failures without full-suite claims.
+- [x] Complete frozen fe23fd3b's separate production lib+bins graph:
+  exit0,2624.7s remote span on vmi1153651. Worker bytes match nine source/config
+  hashes and the pinned nightly. This is compiler evidence, not native proof.
+- [x] Complete frozen fe23fd3b's strict all-targets Clippy-Dwarnings:
+  exit0,1478.1s remote span on vmi1153651; no suppression or gate relaxation.
+- [ ] Complete workspace all-targets; retain all warnings/failures without
+  full-suite claims.
+- [x] Preserve the other process's source/tracker commits and installer
+  fast-forward. Confirm all Rust source/config still matches frozen fe23fd3b.
+  Re-read incoming baa88392's installer diff and callers; no new defect is
+  established. Re-execute its unit boundary harness and both Bash syntax checks:
+  all exit0, including all10 migration/takeover cases. These are fixture-based
+  ordering/boundary controls, not a live signed install or macOS execution.
 - [ ] Record exact source, executable identities, real outcomes and all proof
   limits in original .5 and existing review-audit.md. Original .5/.29/asldx
   acceptance and earlier writer/full-suite/ordinary-user/release blockers stay.
