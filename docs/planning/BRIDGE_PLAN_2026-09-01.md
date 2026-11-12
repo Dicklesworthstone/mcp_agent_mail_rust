@@ -1,5 +1,30 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 12 missing-integrity fresh review — EmeraldEagle
+
+- [x] Verify governing files, published source and seven untracked roots;
+  re-read the last change, producer/DTO and robot/doctor callers. Inspect ready
+  Beads and distinguish implemented work awaiting qualification from missing code.
+- [x] Identify the adjacent robot fast-path gap: a missing/null integrity object
+  is accepted, then the caller substitutes fresh-process counters. The current
+  actual handler supplies the object; unavailable observations must fall back
+  to real local probes rather than synthesize attested zero observations.
+- [ ] Extend the existing real-private-DB combined consumer test with both
+  schema-valid missing/null cases; preserve all original controls. Execute it
+  on unchanged production and retain the actual negative outcome.
+- [ ] Require integrity evidence before accepting the robot fast path; make
+  its internal metrics mandatory. Keep full-object optionality in the public
+  wire DTO and preserve pending/accepted-orphan advisory handling.
+- [ ] Re-read the full diff/callers, then execute the same eight declared
+  consumer/handler controls on final source with the original limits.
+- [ ] Complete workspace all-targets, separate production lib+bins, strict
+  Clippy-Dwarnings, full formatter and stock UBS; retain all warnings/failures.
+- [ ] Record exact source, executable identities, real outcomes and all proof
+  limits in original .5 and existing review-audit.md. Original .5/.29/asldx
+  acceptance and earlier writer/full-suite/ordinary-user/release blockers stay.
+- [ ] Review tracker/source scope, flush/cycle-check, publish one scoped commit
+  and release exact leases1692/1693; record actual final receipts externally.
+
 ## November 12 fresh review of doctor integrity attestation — EmeraldEagle
 
 - [x] Verify governing hashes/source and preserve all seven untracked roots.
