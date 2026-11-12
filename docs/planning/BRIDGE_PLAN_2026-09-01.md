@@ -1,5 +1,98 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 12 fresh review of doctor integrity attestation — EmeraldEagle
+
+- [x] Verify governing hashes/source and preserve all seven untracked roots.
+  Re-read the complete recent three-file diff and trace producer, DTO, CLI
+  parsing/mapping, robot fallback and doctor shortcut. Inspect ready Beads;
+  continue owned .5/asldx before starting unrelated infrastructure work.
+- [x] Identify a concrete remaining consumer gap: the live-doctor shortcut
+  rejects any historical failure forever, but accepts a missing integrity
+  object or pending-full evidence. The metrics contract explicitly distinguishes
+  lifetime failures from current state and preserves failed-full evidence.
+- [x] Find the related robot-summary gap before freezing: timestamp comparison
+  ignores explicit failed outcomes at equal timestamps and current failures
+  after a check. Add both cases to its existing current-vs-historical test.
+- [x] Add one table of counterexamples/controls to the existing real-private-DB
+  health test. Preserve its original assertions. Predeclare recovered lifetime
+  failures as the newly admitted
+  case; missing/pending/full-failed/current-failed/orphan evidence stays refused.
+- [x] Execute unchanged-production7d599ed9's two actual counterexamples:
+  UID1000 ovh-a,930ee272,exit100,0PASS/2FAIL/4490skipped,0.366s. Real private
+  DB/healthy controls succeed. Robot incorrectly marks explicit/current failures
+  ok; doctor rejects recovered history but accepts missing integrity and an
+  orphan gauge behind stale green labels. Stable actual CLI ELFa8de679a retained.
+- [x] Correct the existing shortcut using the already wired measurements;
+  require affirmative full/current results and retain identity/file/WAL guards.
+  Do not change counters, timeouts, producer verdict policy, fixture realism or budgets.
+  Robot summary also uses explicit failed outcomes and current failures while
+  preserving historical-failure and sticky-full wording. Frozen formatted
+  0168a39e differs from old-production/test-only7d599ed9 only in these consumers
+  and manual formatter layout; all original assertions remain.
+- [x] Re-read the full change/callers; run the exact named regression and
+  associated current-vs-historical, orphan, aggregate and handler controls.
+  Run both mandatory compiler graphs, strict Clippy, fmt and stock UBS.
+- [x] Complete intermediate0168's workspace all-targets, separate production lib+bins,
+  strict Clippy-Dwarnings and full formatter checks. Stock UBS exits0 with
+  0critical/2814warning/926info/failed_modules[]. Native outcomes were pending
+  at that checkpoint; the superseded native request is reconciled below.
+  Formatter first reports layout1, manually fixed. Earlier format invocations
+  stop before execution on slot/argument classification; no pass credit.
+  The final formatter uses a documented per-invocation one-slot build estimate;
+  no fleet file/capacity or formatter rule changes. Native buildjobs1/testthreads2,
+  original dev/watchdogs and native30GiB/floor10GiB remain unchanged.
+- [x] Fresh second pass traces evaluate_check_rows's actual update order:
+  Failed is published before checks_total. Honor that explicit outcome even
+  when the first counter is still0, and preserve the failure explanation.
+  Add the third first-check state input with0 lifetime/current counters and
+  unknown full evidence. It is a fixture, not a concurrent-preemption witness.
+  Freeze intermediate776e2645 after manual formatter layout corrections. Superseded
+  source0168's native request stops143 through its exact owned wrapper;
+  supported recovery returns0/remote120/terminal_acknowledged true, zero tests.
+- [x] Complete intermediate776e2645's four mandatory static gates: workspace
+  all-targets0/121.5s, separate production lib+bins0/93.3s, strict
+  Clippy-Dwarnings0/125.0s and full formatter0/48.7s. Earlier0168 receipts
+  remain intermediate. Its stock UBS0 has0critical/2815warning/926info and
+  failed_modules[]; its additional warning is the intentional unit-test assert
+  checking the failed-check explanation, unsuppressed. Native old/final workers
+  independently match nine frozen source/config hashes and pinned rustc.
+- [x] Complete intermediate776e2645's exact eight-case native cohort:
+  db14c6dc exits0,8/8PASS/4484skipped,1.573s. Old7d599ed9's two counterexamples
+  run as UID1000 on ovh-a; this cohort runs as root on vmi1149989. Both use
+  the original native limits. The two malformed Quick controls below earn no
+  semantic credit; this result cannot qualify corrected75e0a7ce.
+- [x] Inspect the old table's unexpected pending-full refusal. Its two Quick
+  rows used lowercase quick, while the actual wire enum is Quick; those two
+  refusals are parse failures and earn no semantic-control credit. Preserve
+  the old failures and valid counterexamples; do not relabel the malformed rows.
+  Correct them with the actual enum serializer and require every intended table
+  input to deserialize before exercising its decision. Freeze75e0a7ce; only
+  test code changes from776. The776 native run remains useful intermediate
+  execution/cache, not final schema-valid qualification.
+- [x] Execute schema-valid final75e0a7ce's same eight Rust cases and all four
+  mandatory static gates plus stock scan; keep all776 receipts intermediate.
+  Actual0ab422ba on root/Linux vmi1149989 exits0,8/8PASS/4484skipped,2.165s.
+  The executed identities exactly match the predeclared eight. Stable actual
+  CLI ELF46b273d0 contains the DTO-validity assertion; tools ELF5321c980
+  contains all four handler controls. Native/static worker byte reads match
+  nine frozen source/config hashes and pinned rustc. All-targets0/124.1s,
+  separate production lib+bins0/96.5s, strict Clippy-Dwarnings0/1312.1s,
+  full formatter0/48.9s. Stock UBS0:0critical/2816warning/926info,
+  failed_modules[]; warnings remain unsuppressed. Retain proc-macro-error2's
+  dependency future-compat warning. No warning-free claim or gate weakening.
+- [x] Record actual old/new outcomes, original open acceptance and all gate
+  failures/refusals in existing Beads and the retained review-audit.md.
+  Comments4320-4323 leave .5 in_progress; .29/asldx and peer work are unchanged.
+  This self-review and selected real-handler/consumer execution are not
+  independent review, live HTTP, real orphan creation, full-suite, ordinary-user
+  final-source, performance, size/readiness, soak or release clearance. Original
+  writer/full/ordinary-user failures and original acceptance remain open.
+- [x] Review tracker/source scope, prepare normal publication and exact lease
+  release; retain observed final ref/release receipts externally. Both tracker
+  exports preserve all2867 IDs and change only owned .5 comments4320-4323
+  plus its update timestamp. Dependency cycles and reservation conflicts are
+  empty; all seven untracked roots remain outside the staged scope.
+
 ## November 12 fresh review and writer-storm follow-through — EmeraldEagle
 
 - [x] Verify governing files and published source are unchanged; preserve the

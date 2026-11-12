@@ -8667,28 +8667,40 @@ fn search_message_ids_by_recipient_kind(
 
 fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (HealthProbe, bool) {
     let has_checks = metrics.checks_total > 0;
-    let last_check_failed = has_checks && metrics.last_ok_ts < metrics.last_check_ts;
+    let last_check_failed = metrics.last_check_outcome
+        == mcp_agent_mail_db::IntegrityCheckOutcome::Failed
+        || (has_checks && metrics.last_ok_ts < metrics.last_check_ts);
     let full_check_failed = matches!(
         metrics.last_full_check_outcome,
         mcp_agent_mail_db::IntegrityCheckOutcome::Failed
     );
     let runtime_failures_without_checks = !has_checks && metrics.failures_total > 0;
+    let current_failures = metrics.failures_since_last_ok > 0;
+    let integrity_failed = full_check_failed
+        || last_check_failed
+        || runtime_failures_without_checks
+        || current_failures;
     let detail = if full_check_failed {
         format!(
             "latest full integrity_check failed at {}; a later quick check cannot clear it",
             metrics.last_full_check_ts
         )
-    } else if !has_checks && metrics.failures_total == 0 {
+    } else if last_check_failed {
+        format!(
+            "last check failed; {} cumulative failures across {} checks",
+            metrics.failures_total, metrics.checks_total
+        )
+    } else if !has_checks && metrics.failures_total == 0 && !current_failures {
         "No checks run yet".to_string()
     } else if runtime_failures_without_checks {
         format!(
             "No integrity checks run yet; {} runtime corruption failures recorded",
             metrics.failures_total
         )
-    } else if last_check_failed {
+    } else if current_failures {
         format!(
-            "last check failed; {} cumulative failures across {} checks",
-            metrics.failures_total, metrics.checks_total
+            "{} failures since last clean check; {} lifetime failures across {} checks",
+            metrics.failures_since_last_ok, metrics.failures_total, metrics.checks_total
         )
     } else if metrics.failures_total == 0 {
         format!("{} checks, all passed", metrics.checks_total)
@@ -8705,9 +8717,7 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
 
     // GH#291: an accepted full check can still carry proven never-written
     // orphan pages. Say so; it is leaked space, not a failed probe.
-    let detail = if metrics.never_written_orphan_pages > 0
-        && !(full_check_failed || last_check_failed || runtime_failures_without_checks)
-    {
+    let detail = if metrics.never_written_orphan_pages > 0 && !integrity_failed {
         format!(
             "{detail}; {} never-written orphan page(s) (leaked space, not data damage)",
             metrics.never_written_orphan_pages
@@ -8719,16 +8729,11 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
     (
         HealthProbe {
             name: "integrity".into(),
-            status: if full_check_failed || last_check_failed || runtime_failures_without_checks {
-                "warn"
-            } else {
-                "ok"
-            }
-            .into(),
+            status: if integrity_failed { "warn" } else { "ok" }.into(),
             latency_ms: 0.0,
             detail,
         },
-        !(full_check_failed || last_check_failed || runtime_failures_without_checks),
+        !integrity_failed,
     )
 }
 
@@ -9462,7 +9467,7 @@ fn live_server_health_payload_proves_mailbox_healthy(
         || typed.verdicts.write_health.status != "green"
         || typed.verdicts.archive_db_parity.status == "red"
         || typed.semantic_readiness.status != "ok"
-        || typed.verdicts.integrity_check.status == "red"
+        || typed.verdicts.integrity_check.status != "green"
         || typed
             .verdicts
             .integrity_check
@@ -9471,10 +9476,16 @@ fn live_server_health_payload_proves_mailbox_healthy(
     {
         return false;
     }
-    if typed
-        .integrity
-        .as_ref()
-        .is_some_and(|integrity| integrity.failures_total > 0)
+    // A lifetime failure tally survives successful recovery. Reuse only
+    // affirmative current/full evidence; absent, pending or failed evidence
+    // and accepted leaked-space advisories require local doctor inspection.
+    let Some(integrity) = typed.integrity.as_ref() else {
+        return false;
+    };
+    if integrity.last_full_check_outcome != mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+        || integrity.last_check_outcome != mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+        || integrity.failures_since_last_ok > 0
+        || integrity.never_written_orphan_pages > 0
     {
         return false;
     }
@@ -22110,6 +22121,61 @@ mod tests {
         );
         assert_eq!(probe.status, "warn");
         assert!(probe.detail.contains("later quick check cannot clear it"));
+
+        let current_evidence: Vec<_> = [
+            (
+                "failed outcome at equal timestamps",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+                0,
+                5,
+                2,
+            ),
+            (
+                "current failures after last check",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+                1,
+                5,
+                2,
+            ),
+            (
+                "failed outcome precedes the check counter",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+                0,
+                0,
+                0,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(name, outcome, failures_since_last_ok, checks_total, failures_total)| {
+                let first_check = checks_total == 0;
+                let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
+                    last_ok_ts: if first_check { 0 } else { 3_000 },
+                    last_check_ts: 3_000,
+                    last_full_check_ts: if first_check { 0 } else { 2_000 },
+                    last_check_kind: Some(mcp_agent_mail_db::CheckKind::Quick),
+                    last_check_outcome: outcome,
+                    last_full_check_outcome: if first_check {
+                        mcp_agent_mail_db::IntegrityCheckOutcome::Unknown
+                    } else {
+                        mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+                    },
+                    checks_total,
+                    failures_total,
+                    failures_since_last_ok,
+                    never_written_orphan_pages: 0,
+                });
+                (name, ok, probe.status, probe.detail)
+            },
+        )
+        .collect();
+        assert!(
+            current_evidence
+                .iter()
+                .all(|(_, ok, status, _)| !ok && status == "warn"),
+            "explicit current integrity evidence must win over timestamps: {current_evidence:?}"
+        );
+        assert!(current_evidence[2].3.contains("last check failed"));
     }
 
     #[test]
@@ -29681,6 +29747,68 @@ mod tests {
             .expect("matching live mailbox");
         assert_eq!(assessment.level, mcp_agent_mail_core::HealthLevel::Green);
         assert_eq!(assessment.probe.status, "ok");
+
+        // Doctor may reuse affirmative current/full evidence after recovery;
+        // a lifetime tally is not a current failure. Missing or weaker evidence
+        // must still take the real local inspection path.
+        let mut recovered = healthy_payload.clone();
+        recovered["integrity"]["failures_total"] = 7.into();
+        let mut missing_integrity = healthy_payload.clone();
+        missing_integrity
+            .as_object_mut()
+            .unwrap()
+            .remove("integrity");
+        let mut pending_full = healthy_payload.clone();
+        pending_full["integrity"]["last_check_kind"] =
+            serde_json::json!(mcp_agent_mail_db::CheckKind::Quick);
+        pending_full["integrity"]["last_full_check_outcome"] = "unknown".into();
+        pending_full["integrity"]["last_full_check_ts"] = 0.into();
+        pending_full["verdicts"]["integrity_check"]["status"] = "yellow".into();
+        pending_full["verdicts"]["integrity_check"]["detail"] =
+            "no full PRAGMA integrity_check has completed".into();
+        let mut failed_full = recovered.clone();
+        failed_full["integrity"]["last_check_kind"] =
+            serde_json::json!(mcp_agent_mail_db::CheckKind::Quick);
+        failed_full["integrity"]["last_full_check_outcome"] = "failed".into();
+        let mut failed_latest = recovered.clone();
+        failed_latest["integrity"]["last_check_outcome"] = "failed".into();
+        let mut current_failures = recovered.clone();
+        current_failures["integrity"]["failures_since_last_ok"] = 1.into();
+        let mut accepted_orphans = healthy_payload.clone();
+        accepted_orphans["integrity"]["never_written_orphan_pages"] = 425.into();
+        let cases = [
+            ("recovered historical failures", recovered, true),
+            ("missing integrity object", missing_integrity, false),
+            ("pending full check", pending_full, false),
+            ("failed full after quick pass", failed_full, false),
+            ("latest check failed", failed_latest, false),
+            ("failures since last ok", current_failures, false),
+            ("accepted orphan-page advisory", accepted_orphans, false),
+        ];
+        let outcomes: Vec<_> = cases
+            .iter()
+            .map(|(name, payload, expected)| {
+                assert!(
+                    parse_health_check_response(payload).is_some(),
+                    "{name} must exercise a schema-valid health payload"
+                );
+                (
+                    *name,
+                    live_server_health_payload_proves_mailbox_healthy(
+                        &db_url,
+                        &storage_root,
+                        payload,
+                    ),
+                    *expected,
+                )
+            })
+            .collect();
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, actual, expected)| actual == expected),
+            "doctor integrity attestation (name, actual, expected): {outcomes:?}"
+        );
 
         // Retain the daemon's measured counters rather than manufacturing
         // zeros in the CLI's fresh process. A real local DB remains required.
