@@ -9,9 +9,13 @@
   is accepted, then the caller substitutes fresh-process counters. The current
   actual handler supplies the object; unavailable observations must fall back
   to real local probes rather than synthesize attested zero observations.
-- [ ] Extend the existing real-private-DB combined consumer test with both
+- [x] Extend the existing real-private-DB combined consumer test with both
   schema-valid missing/null cases; preserve all original controls. Execute it
-  on unchanged production and retain the actual negative outcome.
+  on unchanged production and retain the actual negative outcome. Actual old
+  6971d7e2/de56fe4d exits100,0PASS/1FAIL/4491skipped,1.328s. The real private
+  DB and original healthy controls complete before both schema-valid inputs
+  incorrectly returnSome. Stable actual CLI ELFcde8a028 is retained. This is
+  one Rust test with two inputs, not two passed tests.
 - [x] Require integrity evidence before accepting the robot fast path; make
   its internal metrics mandatory. Keep full-object optionality in the public
   wire DTO and preserve pending/accepted-orphan advisory handling. Freeze
@@ -19,29 +23,46 @@
 - [x] Re-read the full diff/callers with fresh eyes after the repair. No further
   defect is established; removed Option unwraps are made impossible by the
   mandatory internal type, while their measured-value assertions remain.
-- [ ] Execute the same eight declared
-  consumer/handler controls on final source with the original limits.
+- [x] Execute the same eight declared consumer/handler controls on frozen
+  final fe23fd3b with the original limits. Actual57a29996 exits0,
+  8/8PASS/4484skipped,1.580s. Exact case census matches the predeclared eight;
+  stable actual CLI ELFf9167b14 and tools ELF5321c980 retain all named markers.
+  Native worker bytes match the frozen source/config; local Cargo.lock has
+  since advanced with peer changes and is not qualified by this run.
 - [x] Complete full formatter on frozen fe23fd3b and stock changed-file UBS:
   both exit0; UBS reports0critical/2817warning/927info, failed_modules[].
-  All warnings remain unsuppressed. Native/compiler jobs are still pending.
+  All warnings remain unsuppressed; later gates below have actual terminals.
 - [x] Complete frozen fe23fd3b's separate production lib+bins graph:
   exit0,2624.7s remote span on vmi1153651. Worker bytes match nine source/config
   hashes and the pinned nightly. This is compiler evidence, not native proof.
 - [x] Complete frozen fe23fd3b's strict all-targets Clippy-Dwarnings:
   exit0,1478.1s remote span on vmi1153651; no suppression or gate relaxation.
-- [ ] Complete workspace all-targets; retain all warnings/failures without
-  full-suite claims.
+- [x] Complete frozen fe23fd3b's workspace all-targets check:
+  exit0,696.3s remote span on vmi1153651. Its actual worker bytes again match
+  nine pinned source/config hashes. All four mandatory static gates pass.
+  Keep proc-macro-error2's dependency
+  future-compat warning visible; no warning-free or full-suite claim.
 - [x] Preserve the other process's source/tracker commits and installer
-  fast-forward. Confirm all Rust source/config still matches frozen fe23fd3b.
+  fast-forward. At baa88392, confirm all Rust source/config matched frozen
+  fe23fd3b. Later shared HEAD bb390bc5 advances other Rust files/manifests and
+  Cargo.lock; preserve it. All results here qualify frozen fe23fd3b, never the
+  newer combined HEAD. The CLI repair blob itself remains unchanged.
   Re-read incoming baa88392's installer diff and callers; no new defect is
   established. Re-execute its unit boundary harness and both Bash syntax checks:
   all exit0, including all10 migration/takeover cases. These are fixture-based
   ordering/boundary controls, not a live signed install or macOS execution.
-- [ ] Record exact source, executable identities, real outcomes and all proof
+- [x] Record exact source, executable identities, real outcomes and all proof
   limits in original .5 and existing review-audit.md. Original .5/.29/asldx
   acceptance and earlier writer/full-suite/ordinary-user/release blockers stay.
-- [ ] Review tracker/source scope, flush/cycle-check, publish one scoped commit
-  and release exact leases1692/1693; record actual final receipts externally.
+  Comments4324/4325 distinguish old COMMIT6971 from repaired COMMITfe23 and
+  its public4fa11d2a CLI BLOB2eab1ef4. Self-review plus re-execution is not
+  independent certification, full-suite, transport or latest-graph clearance.
+- [x] Review tracker/source scope and prepare the remaining evidence publication
+  and exact lease release. Both tracker exports preserve all2867 IDs and alter
+  only owned .5 comments/update time; no status, owner, criteria or graph change.
+  Cycles/conflicts are empty. Source is already public4fa11d2a; publish only
+  remaining verification records, preserve all peer work and seven untracked
+  roots, and record actual final refs/release1692/1693 receipts externally.
 
 ## November 12 fresh review of doctor integrity attestation — EmeraldEagle
 
