@@ -17,8 +17,29 @@
 - [ ] Fix a demonstrated defect in existing code, if one is established; then
   re-read the repair and callers and run the required exact-source checks.
   Do not extend a timeout, change write mode or weaken a test to obtain green.
-- [ ] Inspect the current degraded health/104h-old backup read-only under owned
+- [x] Find and wire a concrete health-reporting gap under owned br-kp1in.5:
+  IntegrityMetrics already has current-failure and accepted-orphan gauges, but
+  the server response omits them and the CLI reconstructs both as zero. Carry
+  the actual values through producer/DTO/consumer; required fields make missing
+  evidence unavailable instead of attested zero. No counter or policy is reset.
+- [ ] Execute old test-only4e81's two counterexamples and corrected3eff's eight
+  declared real-handler/CLI/integrity controls, retaining every outcome. The
+  existing isolated handler uses real private SQLite and API-recorded counter
+  values; it is not proof of real leaked-page creation or HTTP qualification.
+  Health cohorts use buildjobs1/testthreads2 with original dev/watchdogs and
+  native30GiB/floor10GiB, fitting observed available slots. The original writer
+  diagnostic keeps its buildjobs4 and original assertions. Both source packets
+  remain immutable; no metric/performance comparison is claimed.
+- [ ] Re-read corrected health mappings/error paths and complete both compiler
+  graphs, strict Clippy, formatting and stock scans on final3eff. Earlier6f3
+  compiler runs are intermediate after this real source correction.
+- [x] Inspect the current degraded health/104h-old backup read-only under owned
   asldx, without touching the shared mailbox, owner or recovery policy.
+  Doctor remains degraded with1 orphaned page and104h50m-old backup; the
+  installed binary reports0.3.38, while this workspace is0.3.40. Source already
+  has bounded shared backup retry and sticky verification. No daemon cause or
+  current-source fix is inferred from the installed result. An unauthenticated
+  direct snapshot GET refuses401; no auth policy is bypassed or secret exposed.
 - [ ] Record actual findings/results in the original Beads, review tracker
   integrity and source scope, publish normal refs and release exact leases.
 
