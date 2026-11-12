@@ -68,17 +68,17 @@ pub fn dispatch(
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
     // Standalone callers (including static export) retain a real 30-second
-    // budget. The live HTTP server calls `dispatch_with_cx` with its own
+    // budget. The live HTTP server calls `dispatch_live_with_cx` with its own
     // timeout-linked context so cancellation crosses the blocking boundary.
     let cx = crate::runtime_request_cx(Budget::with_deadline_secs(30));
     dispatch_with_cx(path, query, method, body, &cx)
 }
 
-/// Dispatch a mail UI request with the server-owned cancellation context.
+/// Dispatch a standalone mail UI request with the caller's cancellation context.
 ///
-/// HTTP blocking dispatch must use this entrypoint so a request timeout
-/// cancels in-flight database work instead of merely returning while a worker
-/// continues and possibly commits the abandoned request.
+/// Offline/static-export callers may construct a read pool or an archive
+/// snapshot. Live HTTP requests use [`dispatch_live_with_cx`] so initialization
+/// remains owned by server startup.
 pub fn dispatch_with_cx(
     path: &str,
     query: &str,
@@ -93,10 +93,10 @@ pub fn dispatch_with_cx(
         return render_archive_route(sub, query, method);
     }
 
-    // GH#184: when this dispatch runs inside a live server process, the
-    // server's pool for this database is already open — reuse it for BOTH
-    // reads and writes instead of bootstrapping a fresh observability pool
-    // per GET request. A second in-process `DbPool::new` on the live file
+    // GH#184: standalone consumers may share a process with an existing
+    // server pool — reuse it for BOTH reads and writes instead of
+    // bootstrapping a fresh observability pool per GET request. A second
+    // in-process `DbPool::new` on the live file
     // re-runs the entire startup init (integrity probes, WAL checkpoint,
     // recovery) and can block outright against the live pool's engine-level
     // coordination — exactly the wedge that took the whole HTTP surface
@@ -126,6 +126,48 @@ pub fn dispatch_with_cx(
         .as_ref()
         .map_or(live_pool, crate::ObservabilityDbPool::pool);
 
+    dispatch_database_route(sub, query, method, body, cx, read_pool, live_pool)
+}
+
+/// Dispatch against the initialized pool already owned by the live server.
+///
+/// A browser arriving during startup must not bootstrap a second pool, wait
+/// on the initialization gate, or reconstruct a private archive snapshot.
+/// Archive-only routes remain usable while SQLite is unavailable.
+pub(super) fn dispatch_live_with_cx(
+    path: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+) -> Result<Option<String>, (u16, String)> {
+    let sub = path.strip_prefix("/mail").unwrap_or(path);
+    if sub.starts_with("/archive/") {
+        return render_archive_route(sub, query, method);
+    }
+
+    let pool = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+        .filter(DbPool::is_initialized);
+    let Some(pool) = pool else {
+        let detail = "Database is initializing or unavailable; retry shortly";
+        return if crate::HttpState::is_mail_json_route(path, method) {
+            json_detail_err(503, detail)
+        } else {
+            Err((503, detail.to_string()))
+        };
+    };
+    dispatch_database_route(sub, query, method, body, cx, &pool, &pool)
+}
+
+fn dispatch_database_route(
+    sub: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+    read_pool: &DbPool,
+    live_pool: &DbPool,
+) -> Result<Option<String>, (u16, String)> {
     match sub {
         // Python parity: GET /mail and /mail/unified-inbox → unified inbox.
         "" | "/" | "/unified-inbox" => {
@@ -142,9 +184,9 @@ pub fn dispatch_with_cx(
         // Explicit projects list route (legacy Python: GET /mail/projects).
         "/projects" => render_projects_list(cx, read_pool),
         _ if sub.starts_with("/api/") => {
-            handle_api_route(sub, query, method, body, cx, read_pool, &live_pool)
+            handle_api_route(sub, query, method, body, cx, read_pool, live_pool)
         }
-        _ => dispatch_project_route(sub, method, body, cx, read_pool, &live_pool, query),
+        _ => dispatch_project_route(sub, method, body, cx, read_pool, live_pool, query),
     }
 }
 
@@ -532,6 +574,16 @@ first body
                 .expect("archive file must not require a database")
                 .expect("archive file route must be handled");
                 assert_eq!(serde_json::from_str::<String>(&payload).unwrap(), content);
+                let live_payload = dispatch_live_with_cx(
+                    "/mail/archive/browser/demo/file",
+                    "path=notes.txt",
+                    "GET",
+                    "",
+                    &Cx::for_testing(),
+                )
+                .expect("live archive browsing must not require an initialized pool")
+                .expect("live archive file route must be handled");
+                assert_eq!(live_payload, payload);
 
                 for (path, query) in [
                     ("/mail/archive/guide", ""),

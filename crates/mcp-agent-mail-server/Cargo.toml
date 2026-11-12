@@ -72,6 +72,7 @@ mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools", default-features = fa
 ftui-runtime = { workspace = true, features = ["native-backend"] }
 ftui-tty.workspace = true
 nix = { workspace = true, features = ["fs"] }
+signal-hook.workspace = true
 
 [target.'cfg(not(unix))'.dependencies]
 ftui-runtime = { workspace = true, features = ["crossterm-compat"] }

@@ -79,6 +79,8 @@ pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+#[cfg(unix)]
+mod headless_signals;
 mod http_sessions;
 mod integrity_guard;
 mod mail_ui;
@@ -2962,6 +2964,9 @@ fn run_http_headless_supervisor(
     // run_http_with_control retain their caller-supplied shutdown authority.
     #[cfg(any(unix, windows))]
     let (signal_control, control_rx) = if control_rx.is_none() {
+        #[cfg(unix)]
+        let signals = headless_signals::ShutdownSignals::new()?;
+        #[cfg(windows)]
         let signals = [
             asupersync::signal::sigterm()?,
             asupersync::signal::sigint()?,
@@ -5178,32 +5183,48 @@ fn recv_http_supervisor_result(
     })
 }
 
+#[cfg(unix)]
+type HeadlessShutdownSignals = headless_signals::ShutdownSignals;
+#[cfg(windows)]
+type HeadlessShutdownSignals = [asupersync::signal::Signal; 2];
+
+#[cfg(any(unix, windows))]
+fn headless_shutdown_signal(signals: &mut HeadlessShutdownSignals) -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        signals.requested()
+    }
+    #[cfg(windows)]
+    {
+        for (signal, name) in signals.iter_mut().zip(["SIGTERM", "SIGINT"]) {
+            let mut next = std::pin::pin!(signal.recv());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            if next.as_mut().poll(&mut cx).is_ready() {
+                return Some(name);
+            }
+        }
+        None
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn recv_http_supervisor_result_signalled(
     result_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
     control_tx: &mpsc::Sender<tui_bridge::ServerControlMsg>,
-    signals: &mut [asupersync::signal::Signal],
+    signals: &mut HeadlessShutdownSignals,
 ) -> std::io::Result<()> {
     loop {
-        for signal in &mut *signals {
-            let kind = signal.kind();
-            // Signal::recv is cancel-safe and retains deliveries across polls.
-            // Poll once here, then park on the result receiver for at most
-            // 200ms; no detached signal-forwarder task outlives the server.
-            let received = {
-                let mut next = std::pin::pin!(signal.recv());
-                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-                next.as_mut().poll(&mut cx).is_ready()
-            };
-            if received {
-                tracing::info!(signal = %kind, "headless HTTP shutdown requested");
-                sd_notify("STOPPING=1");
-                send_server_shutdown_control(control_tx);
-                return recv_http_supervisor_result_within(
-                    result_rx,
-                    HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
-                );
-            }
+        // Unix signals set a retained flag directly in the OS handler. A dead
+        // signal-dispatch thread or closed pipe cannot strand this supervisor.
+        // Poll before parking for at most 200ms; delivery survives every park.
+        if let Some(kind) = headless_shutdown_signal(signals) {
+            tracing::info!(signal = kind, "headless HTTP shutdown requested");
+            sd_notify("STOPPING=1");
+            send_server_shutdown_control(control_tx);
+            return recv_http_supervisor_result_within(
+                result_rx,
+                HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
+            );
         }
         match result_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(result) => return result,
@@ -13152,7 +13173,7 @@ impl HttpState {
         };
         let body_str = std::str::from_utf8(&req.body).unwrap_or("");
         let is_api = Self::is_mail_json_route(path, method_str);
-        match mail_ui::dispatch_with_cx(path, query_str, method_str, body_str, cx) {
+        match mail_ui::dispatch_live_with_cx(path, query_str, method_str, body_str, cx) {
             Ok(Some(body)) => {
                 let content_type = if is_api {
                     "application/json"
@@ -13188,14 +13209,12 @@ impl HttpState {
     /// cancellable blocking-dispatch pool with the request timeout, keeping
     /// async workers free.
     ///
-    /// The mail UI layer is synchronous (per-request pool access, DB queries,
-    /// template rendering) and — on a large, long-lived mailbox — its pool
-    /// bootstrap can take tens of seconds or block outright against the live
-    /// pool's engine-level coordination. Inline execution on an async worker
-    /// starved the accept loop and timers, permanently wedging `/mcp` for all
-    /// agents after a single browser `GET /mail`. Here the worst case is a
-    /// consumed dispatch permit + one blocking thread, and the client gets a
-    /// 503 when the request times out.
+    /// The mail UI uses the initialized serving pool; startup alone owns its
+    /// bootstrap. Queries and template rendering are still synchronous and
+    /// can be expensive on a large mailbox. Keeping them off async workers
+    /// protects the accept loop and timers. The worst case is a consumed
+    /// dispatch permit + one blocking thread, and the client gets a 503 when
+    /// the request times out.
     async fn dispatch_mail_route_blocking(&self, req: Http1Request, path: String) -> Http1Response {
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             // self_ref not set or HttpState already dropped — fall back to the
@@ -33305,6 +33324,142 @@ first body
                         );
                     }
                 }
+            });
+        });
+    }
+
+    #[test]
+    fn mail_routes_refuse_uninitialized_serving_pool_without_starting_recovery() {
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("private mailbox");
+            let path = temp.path().join("storage.sqlite3");
+            let conn = DbConn::open_file(path.to_str().unwrap()).expect("fixture database");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("valid mail schema");
+            mcp_agent_mail_db::close_db_conn(conn, "cold mail-route fixture");
+            let config = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&path),
+                storage_root: temp.path().join("archive"),
+                database_pool_size: Some(1),
+                database_max_overflow: Some(0),
+                integrity_check_on_startup: false,
+                http_bearer_token: Some("private".to_string()),
+                http_rbac_default_role: "writer".to_string(),
+                ..Default::default()
+            };
+            with_health_serving_env(&config, || {
+                let pool_config = DbPoolConfig::from_env();
+                let state = build_state(config.clone());
+                let names = || {
+                    std::fs::read_dir(temp.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                for published_pool in [false, true] {
+                    let owner = published_pool
+                        .then(|| create_pool(&pool_config).expect("publish lazy pool"));
+                    if let Some(pool) = owner.as_ref() {
+                        assert!(!pool.is_initialized());
+                    } else {
+                        assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                    }
+                    let before_names = names();
+                    let before_bytes = std::fs::read(&path).unwrap();
+                    let started = Instant::now();
+                    for (method, route) in [
+                        (Http1Method::Get, "/mail"),
+                        (Http1Method::Get, "/mail/api/unified-inbox"),
+                        (Http1Method::Post, "/mail/demo/overseer/send"),
+                    ] {
+                        let response = block_on(state.handle(make_request(
+                            method,
+                            route,
+                            &[
+                                ("Authorization", "Bearer private"),
+                                ("Content-Type", "application/json"),
+                                ("Host", "localhost:8765"),
+                                ("Origin", "http://localhost:8765"),
+                            ],
+                        )));
+                        assert_eq!(response.status, 503, "{route}");
+                        let body: serde_json::Value = serde_json::from_slice(&response.body)
+                            .expect("HTML and API refusals must both be valid JSON");
+                        assert_eq!(
+                            body["detail"],
+                            "Database is initializing or unavailable; retry shortly"
+                        );
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(1),
+                        "mail requests joined initialization"
+                    );
+                    assert_eq!(names(), before_names, "request created recovery artifacts");
+                    assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+                    if let Some(pool) = owner.as_ref() {
+                        assert!(!pool.is_initialized(), "request initialized the lazy pool");
+                    } else {
+                        assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                    }
+                    let liveness =
+                        block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                    assert_eq!(liveness.status, 200);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn mail_routes_reuse_initialized_pool_without_waiting_for_search_readiness() {
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("private mailbox");
+            let config = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("storage.sqlite3"),
+                ),
+                storage_root: temp.path().join("archive"),
+                database_pool_size: Some(1),
+                database_max_overflow: Some(0),
+                integrity_check_on_startup: false,
+                http_bearer_token: Some("private".to_string()),
+                ..Default::default()
+            };
+            with_health_serving_env(&config, || {
+                let pool = create_pool(&DbPoolConfig::from_env()).expect("serving pool");
+                let cx = runtime_request_cx(Budget::INFINITE);
+                let project = block_on(mcp_agent_mail_db::queries::ensure_project(
+                    &cx,
+                    &pool,
+                    "/mail-startup-ready-project",
+                ))
+                .into_result()
+                .expect("initialize mailbox and project");
+                assert!(pool.is_initialized());
+                let generation = pool.engine_identity_key();
+                let state = build_state(config.clone());
+                assert!(lock_mutex(&state.mail_readiness).sample.is_none());
+                for route in [
+                    "/mail/projects",
+                    "/mail/api/unified-inbox?include_projects=true",
+                ] {
+                    let response = block_on(state.handle(make_request(
+                        Http1Method::Get,
+                        route,
+                        &[("Authorization", "Bearer private")],
+                    )));
+                    assert_eq!(response.status, 200, "{route}");
+                    assert!(String::from_utf8_lossy(&response.body).contains(&project.slug));
+                }
+                assert_eq!(
+                    mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+                        .expect("original serving pool remains cached")
+                        .engine_identity_key(),
+                    generation
+                );
+                assert!(
+                    lock_mutex(&state.mail_readiness).sample.is_none(),
+                    "ordinary mail reads must not require a lexical/readiness probe"
+                );
             });
         });
     }
