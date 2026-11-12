@@ -134,7 +134,7 @@ pub fn dispatch_with_cx(
 /// A browser arriving during startup must not bootstrap a second pool, wait
 /// on the initialization gate, or reconstruct a private archive snapshot.
 /// Archive-only routes remain usable while SQLite is unavailable.
-pub(super) fn dispatch_live_with_cx(
+pub fn dispatch_live_with_cx(
     path: &str,
     query: &str,
     method: &str,

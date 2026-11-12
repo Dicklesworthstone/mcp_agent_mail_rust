@@ -1294,16 +1294,16 @@ fn acquire_snapshot_retention(
 ) -> std::io::Result<mcp_agent_mail_db::snapshot::SnapshotRetentionGuard> {
     deadline.map_or_else(
         || mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent(primary, parent),
-        |deadline| match first_unit_admitted_at {
-            Some(admitted_at) => {
+        |deadline| first_unit_admitted_at.map_or_else(
+            || mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent_until(
+                primary, parent, deadline,
+            ),
+            |admitted_at| {
                 mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent_finishing_turn(
                     primary, parent, admitted_at, deadline,
                 )
-            }
-            None => mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent_until(
-                primary, parent, deadline,
-            ),
-        },
+            },
+        ),
     )
 }
 

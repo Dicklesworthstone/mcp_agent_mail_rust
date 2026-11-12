@@ -9,7 +9,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(super) struct ShutdownSignals {
+pub struct ShutdownSignals {
     requested: Arc<AtomicUsize>,
     registrations: Vec<signal_hook::SigId>,
 }

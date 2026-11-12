@@ -2988,8 +2988,8 @@ fn run_http_headless_supervisor(
     // Serving has no deadline. Once signalled, request the normal supervisor
     // drain and use the same bounded join budget as the TUI shutdown path.
     #[cfg(any(unix, windows))]
-    let result = if let Some((tx, mut signals)) = signal_control {
-        recv_http_supervisor_result_signalled(&result_rx, &tx, &mut signals)
+    let result = if let Some((tx, signals)) = signal_control {
+        recv_http_supervisor_result_signalled(&result_rx, &tx, signals)
     } else {
         recv_http_supervisor_result(result_rx)
     };
@@ -5188,36 +5188,35 @@ type HeadlessShutdownSignals = headless_signals::ShutdownSignals;
 #[cfg(windows)]
 type HeadlessShutdownSignals = [asupersync::signal::Signal; 2];
 
-#[cfg(any(unix, windows))]
+#[cfg(windows)]
 fn headless_shutdown_signal(signals: &mut HeadlessShutdownSignals) -> Option<&'static str> {
-    #[cfg(unix)]
-    {
-        signals.requested()
-    }
-    #[cfg(windows)]
-    {
-        for (signal, name) in signals.iter_mut().zip(["SIGTERM", "SIGINT"]) {
-            let mut next = std::pin::pin!(signal.recv());
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            if next.as_mut().poll(&mut cx).is_ready() {
-                return Some(name);
-            }
+    for (signal, name) in signals.iter_mut().zip(["SIGTERM", "SIGINT"]) {
+        let mut next = std::pin::pin!(signal.recv());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if next.as_mut().poll(&mut cx).is_ready() {
+            return Some(name);
         }
-        None
     }
+    None
 }
 
 #[cfg(any(unix, windows))]
 fn recv_http_supervisor_result_signalled(
     result_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
     control_tx: &mpsc::Sender<tui_bridge::ServerControlMsg>,
-    signals: &mut HeadlessShutdownSignals,
+    signals: HeadlessShutdownSignals,
 ) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let mut signals = signals;
     loop {
         // Unix signals set a retained flag directly in the OS handler. A dead
         // signal-dispatch thread or closed pipe cannot strand this supervisor.
         // Poll before parking for at most 200ms; delivery survives every park.
-        if let Some(kind) = headless_shutdown_signal(signals) {
+        #[cfg(unix)]
+        let requested = signals.requested();
+        #[cfg(windows)]
+        let requested = headless_shutdown_signal(&mut signals);
+        if let Some(kind) = requested {
             tracing::info!(signal = kind, "headless HTTP shutdown requested");
             sd_notify("STOPPING=1");
             send_server_shutdown_control(control_tx);
