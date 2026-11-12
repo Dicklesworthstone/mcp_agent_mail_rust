@@ -1,5 +1,27 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 12 fresh review and writer-storm follow-through — EmeraldEagle
+
+- [x] Verify governing files and published source are unchanged; preserve the
+  seven untracked roots. Re-read the entire health-cache diff, file-identity
+  caller, path validation, staging, cache and failure-report paths. No further
+  concrete defect is established in that repair; retain its exact-source gates.
+- [x] Re-read both prior writer-storm failures and the mapped stack capture.
+  Keep the full run and diagnostic RED, with the original240s watchdog and
+  root/ordinary-user environment distinction explicit.
+- [ ] Trace the real pool/connection return and engine transaction-admission
+  paths. Seek a concrete cause before changing runtime behavior or fixtures.
+- [ ] Select one decisive cause-discriminating experiment from that source
+  reading, declare it before execution, and retain its actual terminal outcome.
+  A repeat of the old uninstrumented diagnostic supplies no new attribution.
+- [ ] Fix a demonstrated defect in existing code, if one is established; then
+  re-read the repair and callers and run the required exact-source checks.
+  Do not extend a timeout, change write mode or weaken a test to obtain green.
+- [ ] Inspect the current degraded health/104h-old backup read-only under owned
+  asldx, without touching the shared mailbox, owner or recovery policy.
+- [ ] Record actual findings/results in the original Beads, review tracker
+  integrity and source scope, publish normal refs and release exact leases.
+
 ## November 12 health-cache review — EmeraldEagle
 
 - [x] Re-read the published baseline persistence correction and both callers;
