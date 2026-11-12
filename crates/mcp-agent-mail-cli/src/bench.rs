@@ -1192,9 +1192,11 @@ pub fn save_baseline(
         })?;
     }
 
+    // Baselines feed later decisions: retain the measured percentile rather
+    // than rounding it as presentation data.
     let baseline: BaselineData = results
         .iter()
-        .map(|(name, result)| (name.clone(), round_to(result.p95_ms, 2)))
+        .map(|(name, result)| (name.clone(), result.p95_ms))
         .collect();
 
     let encoded = serde_json::to_string_pretty(&baseline).map_err(|source| {
@@ -1242,7 +1244,7 @@ pub fn load_baseline(path: &Path) -> Result<BaselineData, BenchBaselineError> {
             .ok_or_else(|| BenchBaselineError::InvalidEntry {
                 benchmark: benchmark.clone(),
             })?;
-        baseline.insert(benchmark.clone(), round_to(p95_ms, 2));
+        baseline.insert(benchmark.clone(), p95_ms);
     }
 
     Ok(baseline)
@@ -1655,6 +1657,71 @@ mod tests {
         let loaded = load_baseline(&baseline_path).expect("load baseline");
         assert_eq!(loaded.get("help").copied(), Some(2.0));
         assert_eq!(loaded.get("lint").copied(), Some(60.0));
+    }
+
+    #[test]
+    fn save_baseline_preserves_measured_p95_precision() {
+        let results = BTreeMap::from([
+            (
+                "above".to_string(),
+                BenchResult::from_samples("above", "help", &[0.010_006], "sig", None)
+                    .expect("valid timing"),
+            ),
+            (
+                "below".to_string(),
+                BenchResult::from_samples("below", "help", &[0.010_004], "sig", None)
+                    .expect("valid timing"),
+            ),
+            (
+                "small".to_string(),
+                BenchResult::from_samples("small", "help", &[0.000_004], "sig", None)
+                    .expect("valid timing"),
+            ),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("baseline.json");
+        save_baseline(&results, &path).expect("save measured baseline");
+        let saved: BaselineData =
+            serde_json::from_slice(&fs::read(&path).expect("read saved baseline"))
+                .expect("numeric baseline JSON");
+        let loaded = load_baseline(&path).expect("reload saved baseline");
+        for (name, result) in &results {
+            assert_eq!(saved[name], result.p95_ms, "saved {name}");
+            assert_eq!(loaded[name], result.p95_ms, "loaded {name}");
+        }
+    }
+
+    #[test]
+    fn load_baseline_preserves_threshold_classification() {
+        let results = BTreeMap::from([
+            (
+                "above".to_string(),
+                BenchResult::from_samples("above", "help", &[0.011_007], "sig", None)
+                    .expect("valid timing"),
+            ),
+            (
+                "below".to_string(),
+                BenchResult::from_samples("below", "help", &[0.011_004], "sig", None)
+                    .expect("valid timing"),
+            ),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("baseline.json");
+        for input in [
+            r#"{"above":10.006,"below":10.004}"#,
+            r#"{"above":{"p95_ms":10.006},"below":{"p95_ms":10.004}}"#,
+        ] {
+            fs::write(&path, input).expect("write measured baseline");
+            let baseline = load_baseline(&path).expect("load measured baseline");
+            let comparisons = compare_baseline(&results, &baseline, 0.10);
+            let verdicts: Vec<_> = comparisons
+                .iter()
+                .map(|comparison| (comparison.name.as_str(), comparison.regression))
+                .collect();
+            // 11.007 / 10.006 is over 1.10; 11.004 / 10.004 is below it.
+            // Rounding either baseline to two decimals reverses its verdict.
+            assert_eq!(verdicts, [("above", true), ("below", false)], "{input}");
+        }
     }
 
     #[test]

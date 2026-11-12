@@ -1,5 +1,69 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 12 fresh review and baseline-file precision — EmeraldEagle
+
+- [x] Verify clean tracked d5a474b1, unchanged governing-document hashes, and
+  re-read all eight Rust-file changes from the preceding repair. Keep the
+  previous full2378/13FAIL and diagnostic13/2FAIL results intact.
+- [x] Continue owned br-asldx; distinguish the observed empty-mailbox checkout
+  failures from its still-unproven mailbox-size slope. Record the live health
+  probe's readable leaked page and97h-old backup separately; do not mutate the
+  shared live mailbox while diagnosing private fixtures.
+- [x] Discover that the managed cargo shim offloads even nextest --help. The
+  help command executes zero tests, then artifact recovery fails102 because
+  no target directory was created. Recover exact wrapper3f85b6cc to terminal
+  acknowledged:true; preserve the receipt and use immutable strict RCH for
+  every actual build/test. No fallback, daemon/ledger or worker policy change.
+- [x] Execute exactly the two resource cold-checkout cases on current
+  immutable source, default storage/tools library graph, normal10s checkout,
+  native30GiB/floor10GiB, dev1800/per-test240, buildjobs4/testthreads2. Declare
+  identities before execution; actual3d13ee4f ends0 with2/2PASS,2378skipped,
+  1.043s execution. A current pass is not an explanation of old red on hz3.
+- [x] Trace those same two real cases with an already-installed syscall runner;
+  preserve stderr and original assertions. Trace timing is diagnostic only,
+  with no benchmark-speed, full-suite, release or readiness-bound claim. Actual
+  00d265a7 ends0:2/2PASS,2378skipped,4.487s diagnostic execution. Stable actual
+  tools ELF e7c68010 contains both case names. Summary aggregates concurrent
+  waits (about90% futex); it does not identify the old slow stage. Attempting
+  detailed tracing on the original hz3 host refuses103 at source-namespace
+  pre-admission; zero test execution. Do not change namespace/worker policy.
+- [ ] Attribute the slow stage from actual evidence. If syscall categories are
+  insufficient, add minimal opt-in phase timing to the real initialization
+  path rather than guessing, warming away the failing path or changing limits.
+  Pending an admissible original-host probe: this host passes, so the syscall
+  summary does not demonstrate a slow stage. No speculative pool change lands.
+- [x] Fix only the demonstrated defect, verify positive and negative real paths,
+  then re-read all changed callers and cleanup/error branches with fresh eyes.
+- [x] Fix the newly observed baseline persistence gap under owned br-kp1in.5:
+  save/load still round p95 to2 decimals and can reverse either threshold verdict.
+  Demonstrate old behavior through real JSON files, preserve measured precision
+  at both boundaries, and run the complete benchmark cohort. Keep thresholds,
+  historical baselines, workload and original broad acceptance unchanged.
+  Immutable old-production cb35f941 adds only65 test lines. Actual8fd6de34
+  ends100:0/2PASS,2FAIL,3239skipped,0.032s execution; the loader reports both
+  reversed verdicts and save reports10.01 instead of10.006. Stable actual CLI
+  ELF b276df2e contains both new case names. Fixed1c26fa8a changes only the
+  two persistence expressions plus their explanation and these two tests.
+  Actual corrected ca287896 ends0:33/33PASS,3208skipped,0.320s execution.
+  Every old2 and corrected33 identity matches its declaration. Both active
+  workers independently match all six source/config hashes and rustc1.100.0-
+  nightly; stable old/new actual CLI ELFs are retained. These are arithmetic
+  correctness controls, not live speedup or original .5 acceptance evidence.
+- [x] Complete required compiler graphs, strict Clippy, formatting, stock scan
+  and appropriate actual tests on final functional source. Retain all red and
+  admission outcomes; original broad acceptance stays open if unmet.
+  All-targets0/782.889s; production lib+bins0/227.697s; strict Clippy all-targets
+  -Dwarnings0/170.163s; fmt0. Stock full-file UBS0:0critical242warning37info,
+  failed_modules[]. New-test alerts are assertions/expected results/private
+  fixture writes. Original runtime runner annotation is unchanged. Identity
+  reader initially missed space-padded ordinals; corrected after inspecting raw
+  output, then verified all declared names without rerunning or filtering tests.
+- [x] Prepare publication: flush/review tracker and source changes, preserve
+  concurrent work, and confirm no incoming commits or reservation conflicts.
+  Only comments/updated_at change on the same three already-owned Beads; no
+  criterion, status or graph edit. Final handoff records actual publication,
+  fetched normal refs, and release of the two exact session reservations.
+
 ## November 11 integration follow-through, 22:58 UTC — EmeraldEagle
 
 - [x] Commit reviewed corrections as6c15bc1f. A fresh fetch discovers upstream
