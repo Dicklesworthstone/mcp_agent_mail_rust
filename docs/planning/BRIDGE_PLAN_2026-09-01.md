@@ -12,13 +12,20 @@
 - [ ] Extend the existing real-private-DB combined consumer test with both
   schema-valid missing/null cases; preserve all original controls. Execute it
   on unchanged production and retain the actual negative outcome.
-- [ ] Require integrity evidence before accepting the robot fast path; make
+- [x] Require integrity evidence before accepting the robot fast path; make
   its internal metrics mandatory. Keep full-object optionality in the public
-  wire DTO and preserve pending/accepted-orphan advisory handling.
-- [ ] Re-read the full diff/callers, then execute the same eight declared
+  wire DTO and preserve pending/accepted-orphan advisory handling. Freeze
+  fe23fd3b; old test-only6971d7e2 changes no production code.
+- [x] Re-read the full diff/callers with fresh eyes after the repair. No further
+  defect is established; removed Option unwraps are made impossible by the
+  mandatory internal type, while their measured-value assertions remain.
+- [ ] Execute the same eight declared
   consumer/handler controls on final source with the original limits.
-- [ ] Complete workspace all-targets, separate production lib+bins, strict
-  Clippy-Dwarnings, full formatter and stock UBS; retain all warnings/failures.
+- [x] Complete full formatter on frozen fe23fd3b and stock changed-file UBS:
+  both exit0; UBS reports0critical/2817warning/927info, failed_modules[].
+  All warnings remain unsuppressed. Native/compiler jobs are still pending.
+- [ ] Complete workspace all-targets, separate production lib+bins and strict
+  Clippy-Dwarnings; retain all warnings/failures without full-suite claims.
 - [ ] Record exact source, executable identities, real outcomes and all proof
   limits in original .5 and existing review-audit.md. Original .5/.29/asldx
   acceptance and earlier writer/full-suite/ordinary-user/release blockers stay.
