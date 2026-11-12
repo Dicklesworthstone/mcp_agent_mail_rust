@@ -9085,7 +9085,7 @@ struct LiveServerRobotHealthProbes {
     search_index_probe: HealthProbe,
     search_index_unhealthy: bool,
     search_index_degraded: bool,
-    integrity_metrics: Option<mcp_agent_mail_db::IntegrityMetrics>,
+    integrity_metrics: mcp_agent_mail_db::IntegrityMetrics,
 }
 
 fn live_server_archive_parity_probe_from_health(
@@ -9337,6 +9337,9 @@ fn synthesize_robot_health_probes_from_server(
     rpc_latency_ms: f64,
 ) -> Option<LiveServerRobotHealthProbes> {
     let typed = parse_health_check_response(server_health)?;
+    // Missing observations must take the local probe path. A fresh CLI's
+    // process-global counters cannot stand in for the serving daemon's state.
+    let server_integrity = typed.integrity.as_ref()?;
     if mailbox_database_identity(&config.database_url)
         != mailbox_database_identity(&typed.database_url)
         || mailbox_storage_identity(&config.storage_root)
@@ -9418,21 +9421,18 @@ fn synthesize_robot_health_probes_from_server(
         degraded: false,
     };
 
-    let integrity_metrics =
-        typed
-            .integrity
-            .map(|server_integrity| mcp_agent_mail_db::IntegrityMetrics {
-                last_ok_ts: server_integrity.last_ok_ts,
-                last_check_ts: server_integrity.last_check_ts,
-                last_full_check_ts: server_integrity.last_full_check_ts,
-                last_check_kind: server_integrity.last_check_kind,
-                last_check_outcome: server_integrity.last_check_outcome,
-                last_full_check_outcome: server_integrity.last_full_check_outcome,
-                checks_total: server_integrity.checks_total,
-                failures_total: server_integrity.failures_total,
-                failures_since_last_ok: server_integrity.failures_since_last_ok,
-                never_written_orphan_pages: server_integrity.never_written_orphan_pages,
-            });
+    let integrity_metrics = mcp_agent_mail_db::IntegrityMetrics {
+        last_ok_ts: server_integrity.last_ok_ts,
+        last_check_ts: server_integrity.last_check_ts,
+        last_full_check_ts: server_integrity.last_full_check_ts,
+        last_check_kind: server_integrity.last_check_kind,
+        last_check_outcome: server_integrity.last_check_outcome,
+        last_full_check_outcome: server_integrity.last_full_check_outcome,
+        checks_total: server_integrity.checks_total,
+        failures_total: server_integrity.failures_total,
+        failures_since_last_ok: server_integrity.failures_since_last_ok,
+        never_written_orphan_pages: server_integrity.never_written_orphan_pages,
+    };
 
     Some(LiveServerRobotHealthProbes {
         db_file: resolved.canonical_path,
@@ -17203,7 +17203,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 let archive_db_parity_degraded = live.archive_db_parity.degraded;
                 probes.push(live.archive_db_parity.probe);
                 probes.push(live.search_index_probe);
-                integrity_override = live.integrity_metrics;
+                integrity_override = Some(live.integrity_metrics);
                 (
                     true,
                     db_file_sanity_unhealthy,
@@ -29730,13 +29730,7 @@ mod tests {
         assert_eq!(synthesized.search_index_probe.status, "ok");
         assert!(!synthesized.search_index_unhealthy);
         assert!(!synthesized.search_index_degraded);
-        assert_eq!(
-            synthesized
-                .integrity_metrics
-                .expect("integrity")
-                .checks_total,
-            3
-        );
+        assert_eq!(synthesized.integrity_metrics.checks_total, 3);
         assert!(live_server_health_payload_proves_mailbox_healthy(
             &db_url,
             &storage_root,
@@ -29810,14 +29804,41 @@ mod tests {
             "doctor integrity attestation (name, actual, expected): {outcomes:?}"
         );
 
+        let unavailable_integrity: Vec<_> = [
+            ("missing integrity object", None),
+            ("null integrity object", Some(serde_json::Value::Null)),
+        ]
+        .into_iter()
+        .map(|(name, integrity)| {
+            let mut payload = healthy_payload.clone();
+            let fields = payload.as_object_mut().unwrap();
+            if let Some(integrity) = integrity {
+                fields.insert("integrity".into(), integrity);
+            } else {
+                fields.remove("integrity");
+            }
+            assert!(
+                parse_health_check_response(&payload).is_some(),
+                "{name} must be a schema-valid unavailable observation"
+            );
+            (
+                name,
+                synthesize_robot_health_probes_from_server(&config, &payload, 0.5).is_some(),
+            )
+        })
+        .collect();
+        assert!(
+            unavailable_integrity.iter().all(|(_, accepted)| !accepted),
+            "unavailable daemon integrity must use local probes: {unavailable_integrity:?}"
+        );
+
         // Retain the daemon's measured counters rather than manufacturing
         // zeros in the CLI's fresh process. A real local DB remains required.
         let mut counter_payload = healthy_payload.clone();
         counter_payload["integrity"]["never_written_orphan_pages"] = 425.into();
         let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
             .expect("matching real local mailbox")
-            .integrity_metrics
-            .expect("daemon integrity counters");
+            .integrity_metrics;
         assert_eq!(counters.never_written_orphan_pages, 425);
         assert_eq!(counters.failures_since_last_ok, 0);
         let (probe, _) = summarize_integrity_probe(&counters);
@@ -29825,8 +29846,7 @@ mod tests {
         counter_payload["integrity"]["failures_since_last_ok"] = 2.into();
         let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
             .unwrap()
-            .integrity_metrics
-            .unwrap();
+            .integrity_metrics;
         assert_eq!(counters.failures_since_last_ok, 2);
         for field in ["failures_since_last_ok", "never_written_orphan_pages"] {
             let mut incomplete = counter_payload.clone();
