@@ -1,5 +1,27 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 12 health-cache review — EmeraldEagle
+
+- [x] Re-read the published baseline persistence correction and both callers;
+  no new defect there. Verify unchanged governing hashes and preserve the seven
+  untracked roots. Inspect ready Beads without claiming Actions-only changes
+  satisfy the canonical DSR publication requirements.
+- [x] Continue owned br-asldx and inspect actual health-cache/staging code. Find
+  cache eligibility conflating missing and unsafe sidecars, discarded sidecar
+  inode identity, and same-length rewrites with restored mtime.
+- [ ] Prove the defects on unchanged production using real seeded databases,
+  actual health probes and filesystem mutations, retaining the exact old source.
+- [ ] Preserve absent/invalid distinctions and complete eligible member identity
+  in cache fingerprints. Keep both health variants separate, unchanged-family
+  reuse working, and staging/cleanup/refusal contracts intact.
+- [ ] Run all new negatives and existing real health-cache/staging controls on
+  frozen corrected source. Keep original full13FAIL/readiness-size acceptance
+  open; cache correctness is not a speedup or constant-readiness qualification.
+- [ ] Fresh-review final callers/error paths, then run both required compiler
+  graphs, strict Clippy, formatting and the stock changed-file bug scan.
+- [ ] Record exact outcomes in Beads, review tracker/cycles and publish normal
+  main/mirror refs without disturbing peer work; release exact reservations.
+
 ## November 12 fresh review and baseline-file precision — EmeraldEagle
 
 - [x] Verify clean tracked d5a474b1, unchanged governing-document hashes, and
