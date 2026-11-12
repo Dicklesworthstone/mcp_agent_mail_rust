@@ -1012,6 +1012,25 @@ fn receipt_table_names(
     .collect()
 }
 
+fn receipt_column_names(
+    conn: &crate::CanonicalDbConn,
+    db_path: &Path,
+    table: &str,
+) -> Result<BTreeSet<String>, SqlError> {
+    conn.query_sync(
+        "SELECT name FROM pragma_table_info(?)",
+        &[Value::Text(table.to_string())],
+    )
+    .map_err(|error| recovery_receipt_error("column inventory", db_path, error))?
+    .into_iter()
+    .map(|row| {
+        row.get_named::<String>("name")
+            .map(|name| name.to_ascii_lowercase())
+            .map_err(|error| recovery_receipt_error("column inventory row decode", db_path, error))
+    })
+    .collect()
+}
+
 fn receipt_required_text(
     row: &sqlmodel_core::Row,
     column: &str,
@@ -1376,15 +1395,30 @@ fn collect_recovery_continuity_sets_with_overrides(
                 "agents table exists without projects table",
             ));
         }
+        // GH#384: a healthy Python-era source can predate these Rust-only
+        // lifecycle columns. Inventory the read-only snapshot and project the
+        // schema migration defaults only for absent columns; required identity
+        // columns and malformed values must still fail closed.
+        let columns = receipt_column_names(&conn, db_path, "agents")?;
+        let reaper_exempt = if columns.contains("reaper_exempt") {
+            "CAST(a.reaper_exempt AS INTEGER)"
+        } else {
+            "0"
+        };
+        let registration_token = if columns.contains("registration_token") {
+            "a.registration_token"
+        } else {
+            "NULL"
+        };
+        let agent_snapshot_sql = format!(
+            "SELECT p.slug AS project_slug, p.human_key AS project_human_key, a.name AS agent_name, \
+                    {reaper_exempt} AS reaper_exempt, \
+                    {registration_token} AS registration_token \
+             FROM agents AS a NOT INDEXED \
+             JOIN projects AS p NOT INDEXED ON p.id = a.project_id"
+        );
         let rows = conn
-            .query_sync(
-                "SELECT p.slug AS project_slug, p.human_key AS project_human_key, a.name AS agent_name, \
-                        CAST(a.reaper_exempt AS INTEGER) AS reaper_exempt, \
-                        a.registration_token AS registration_token \
-                 FROM agents AS a NOT INDEXED \
-                 JOIN projects AS p NOT INDEXED ON p.id = a.project_id",
-                &[],
-            )
+            .query_sync(&agent_snapshot_sql, &[])
             .map_err(|error| recovery_receipt_error("agent snapshot query", db_path, error))?;
         let table_count = conn
             .query_sync(
@@ -1738,23 +1772,32 @@ fn collect_recovery_continuity_sets_with_overrides(
                 "messages table exists without projects and agents tables",
             ));
         }
+        // v15 added this denormalized payload with an empty-object backfill.
+        // Legacy recipient identities remain verified independently through
+        // message_recipients; absence of this column must not discard them.
+        let columns = receipt_column_names(&conn, db_path, "messages")?;
+        let recipients_json = if columns.contains("recipients_json") {
+            "m.recipients_json"
+        } else {
+            "'{}'"
+        };
+        let message_snapshot_sql = format!(
+            "SELECT m.id AS message_id, \
+                    p.slug AS project_slug, p.human_key AS project_human_key, \
+                    sender.name AS sender_name, \
+                    CAST(m.thread_id AS TEXT) AS thread_id, \
+                    m.subject AS subject, m.body_md AS body_md, \
+                    m.importance AS importance, \
+                    CAST(m.ack_required AS INTEGER) AS ack_required, \
+                    CAST(m.created_ts AS INTEGER) AS created_ts, \
+                    {recipients_json} AS recipients_json, m.attachments AS attachments \
+             FROM messages AS m NOT INDEXED \
+             JOIN projects AS p NOT INDEXED ON p.id = m.project_id \
+             JOIN agents AS sender NOT INDEXED \
+               ON sender.id = m.sender_id"
+        );
         let rows = conn
-            .query_sync(
-                "SELECT m.id AS message_id, \
-                        p.slug AS project_slug, p.human_key AS project_human_key, \
-                        sender.name AS sender_name, \
-                        CAST(m.thread_id AS TEXT) AS thread_id, \
-                        m.subject AS subject, m.body_md AS body_md, \
-                        m.importance AS importance, \
-                        CAST(m.ack_required AS INTEGER) AS ack_required, \
-                        CAST(m.created_ts AS INTEGER) AS created_ts, \
-                        m.recipients_json AS recipients_json, m.attachments AS attachments \
-                 FROM messages AS m NOT INDEXED \
-                 JOIN projects AS p NOT INDEXED ON p.id = m.project_id \
-                 JOIN agents AS sender NOT INDEXED \
-                   ON sender.id = m.sender_id",
-                &[],
-            )
+            .query_sync(&message_snapshot_sql, &[])
             .map_err(|error| recovery_receipt_error("message snapshot query", db_path, error))?;
         let table_count = conn
             .query_sync(
@@ -5006,6 +5049,166 @@ mod tests {
             .expect("seed receipt fixture proof-gate nonce");
         }
         drop(conn);
+    }
+
+    #[test]
+    fn recovery_receipt_promotes_legacy_columns_without_mutating_source() {
+        // Exercise Python-era schemas after timestamp normalization as well
+        // as partially upgraded Rust schemas. Existing columns must retain
+        // their actual payload; only absent columns get migration defaults.
+        for absent_columns in 0u8..8 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("source.sqlite3");
+            let candidate = dir.path().join("candidate.sqlite3");
+            let primary = dir.path().join("storage.sqlite3");
+            let storage_root = dir.path().join("mail-root");
+            seed_recovery_receipt_db(&source, true);
+            seed_recovery_receipt_db(&candidate, true);
+            let source_conn = crate::CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+            let candidate_conn =
+                crate::CanonicalDbConn::open_file(candidate.to_str().unwrap()).unwrap();
+            for (bit, (table, column, default)) in [
+                ("agents", "reaper_exempt", "0"),
+                ("agents", "registration_token", "NULL"),
+                ("messages", "recipients_json", "'{}'"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if absent_columns & (1 << bit) != 0 {
+                    source_conn
+                        .execute_raw(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+                        .expect("restore legacy schema");
+                    candidate_conn
+                        .execute_raw(&format!("UPDATE {table} SET {column} = {default}"))
+                        .expect("apply migration default to candidate");
+                } else {
+                    source_conn
+                        .execute_raw(&format!(
+                            "ALTER TABLE {table} RENAME COLUMN {column} TO {}",
+                            column.to_ascii_uppercase()
+                        ))
+                        .expect("column inventory must respect SQLite identifier casing");
+                }
+            }
+            drop(source_conn);
+            drop(candidate_conn);
+            let source_before = std::fs::read(&source).unwrap();
+            let source_sets = collect_recovery_continuity_sets(&source).unwrap();
+            let candidate_sets = collect_recovery_continuity_sets(&candidate).unwrap();
+            assert_eq!(source_sets.agents, candidate_sets.agents);
+            assert_eq!(source_sets.messages, candidate_sets.messages);
+            assert_eq!(
+                source_sets.message_recipients,
+                candidate_sets.message_recipients
+            );
+
+            let preview = super::validate_recovery_candidate_continuity(
+                &storage_root,
+                &primary,
+                Some(&source),
+                &candidate,
+                false,
+            )
+            .expect("legacy source must remain verified promotion authority");
+            assert!(preview.source_verified);
+            assert_eq!(
+                (preview.agents, preview.messages, preview.recipients),
+                (2, 1, 1)
+            );
+            let prepared =
+                prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+                    .expect("prepare promotion from legacy schema");
+            let document: super::RecoveryReceiptDocument =
+                serde_json::from_slice(&std::fs::read(&prepared.pending_path).unwrap()).unwrap();
+            assert!(document.body.source_snapshot_failure_sha256.is_none());
+            assert_eq!(document.body.delta.agents.lost_count, 0);
+            assert_eq!(document.body.delta.messages.lost_count, 0);
+            assert_eq!(document.body.delta.message_recipients.lost_count, 0);
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn recovery_receipt_legacy_schema_still_refuses_identity_loss() {
+        for (mutation, expected_loss) in [
+            (
+                "UPDATE agents SET name = 'GreenField' WHERE id = 41",
+                "agents=1",
+            ),
+            (
+                "UPDATE messages SET subject = 'Changed identity' WHERE id = 73",
+                "messages=1",
+            ),
+            (
+                "DELETE FROM message_recipients WHERE message_id = 73",
+                "message_recipients=1",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("source.sqlite3");
+            let candidate = dir.path().join("candidate.sqlite3");
+            let primary = dir.path().join("storage.sqlite3");
+            let storage_root = dir.path().join("mail-root");
+            seed_recovery_receipt_db(&source, true);
+            seed_recovery_receipt_db(&candidate, true);
+            let conn = crate::CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+            for statement in [
+                "ALTER TABLE agents DROP COLUMN reaper_exempt",
+                "ALTER TABLE agents DROP COLUMN registration_token",
+                "ALTER TABLE messages DROP COLUMN recipients_json",
+            ] {
+                conn.execute_raw(statement).unwrap();
+            }
+            drop(conn);
+            let conn = crate::CanonicalDbConn::open_file(candidate.to_str().unwrap()).unwrap();
+            conn.execute_raw(mutation).unwrap();
+            drop(conn);
+            let source_before = std::fs::read(&source).unwrap();
+            let error =
+                prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+                    .expect_err("legacy schema must not bypass identity continuity");
+            assert!(
+                error
+                    .to_string()
+                    .contains("would lose stable coordination keys")
+            );
+            assert!(error.to_string().contains(expected_loss), "{error}");
+            verify_recovery_receipt_state(&storage_root, &primary)
+                .expect("refusal must not leave a pending promotion intent");
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn recovery_receipt_schema_compatibility_does_not_mask_invalid_evidence() {
+        for (mutation, expected_error) in [
+            (
+                "ALTER TABLE agents RENAME COLUMN name TO missing_name",
+                "agent snapshot query",
+            ),
+            (
+                "UPDATE messages SET recipients_json = X'00FF'",
+                "message recipients_json decode",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("source.sqlite3");
+            let candidate = dir.path().join("candidate.sqlite3");
+            let primary = dir.path().join("storage.sqlite3");
+            let storage_root = dir.path().join("mail-root");
+            seed_recovery_receipt_db(&source, true);
+            seed_recovery_receipt_db(&candidate, true);
+            let conn = crate::CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+            conn.execute_raw(mutation).unwrap();
+            drop(conn);
+            let error =
+                prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+                    .expect_err("healthy source with invalid evidence must refuse promotion");
+            assert!(error.to_string().contains(expected_error), "{error}");
+            verify_recovery_receipt_state(&storage_root, &primary)
+                .expect("refusal must not leave a pending promotion intent");
+        }
     }
 
     #[test]
