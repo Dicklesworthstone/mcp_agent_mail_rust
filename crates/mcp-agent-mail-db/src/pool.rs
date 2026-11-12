@@ -14404,6 +14404,9 @@ pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, Sq
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     let _ = take_last_unhealthy_reason(path);
+    // A cached canonical identity must not admit a new, symlinked spelling
+    // that staging would refuse. Validate the caller's path before reuse.
+    validate_sqlite_target_path(path, "SQLite health-probe source")?;
     let fingerprint = health_verdict_fingerprint(path);
     if let Some(fingerprint) = &fingerprint
         && healthy_verdict_reusable(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint)
@@ -14446,6 +14449,7 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool, SqlError> {
     let _ = take_last_unhealthy_reason(path);
+    validate_sqlite_target_path(path, "SQLite health-probe source")?;
     let fingerprint = health_verdict_fingerprint(path);
     if let Some(fingerprint) = &fingerprint
         && healthy_verdict_reusable(
@@ -32323,6 +32327,34 @@ mod tests {
                 "cached health cannot bypass the staging hard-link refusal"
             );
             assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_never_bypasses_parent_path_admission() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let directory = tempfile::tempdir().expect("parent alias fixture");
+            let authority = directory.path().join("authority");
+            std::fs::create_dir(&authority).expect("create real parent");
+            let primary = authority.join("mailbox.sqlite3");
+            seed_settled_diagnostic_database(&primary);
+            assert!(probe(&primary).expect("cache canonical healthy family"));
+            let staged = health_probe_stagings_for_test(&primary);
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&authority, &alias).expect("create parent alias");
+            let before = std::fs::read(&primary).expect("retain source bytes");
+            let error = probe(&alias.join("mailbox.sqlite3"))
+                .expect_err("cached health must not bypass parent path admission");
+            assert!(error.to_string().contains("symlinked path"), "{error}");
+            assert_eq!(std::fs::read(&primary).unwrap(), before);
+            assert_eq!(std::fs::read_link(&alias).unwrap(), authority);
+            assert!(probe(&primary).expect("canonical family remains healthy"));
+            assert_eq!(health_probe_stagings_for_test(&primary), staged);
         }
     }
 

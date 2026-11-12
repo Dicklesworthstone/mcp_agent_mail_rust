@@ -24,29 +24,140 @@
   control and fix both. Preserve the earlier24ff1a85 compiler packet as
   intermediate; frozen final f25c0288 and all35 declared cases include this
   correction. Do not credit the intermediate check to final source.
-- [x] Run all new negatives and existing real health-cache/staging controls on
-  frozen corrected source. Keep original full13FAIL/readiness-size acceptance
+- [x] Run the first35 negatives/real health-cache/staging controls on frozen
+  corrected f25 source. Keep original full13FAIL/readiness-size acceptance
   open; cache correctness is not a speedup or constant-readiness qualification.
   Actual d5c62529 ends0:35/35PASS,3997skipped,8.155s execution. Every old4 and
   corrected35 identity matches its declaration. Actual stable final DB ELF
   f28550e5 contains the new rejection and corrupt/restore controls. All seven
   sidecar slots and both probe variants preserve unsafe source entries. The
   unchanged-family staging count and real read-pool reuse/retirement pass.
-- [ ] Run the complete default DB library population (4032 compiled cases),
+- [x] A final caller review finds one more concrete eligibility bypass: a new
+  symlinked-parent spelling resolves to the cached canonical identity and can
+  return healthy before the staging path guard. Add a real canonical-cache/
+  parent-alias regression under both variants; preserve canonical reuse and
+  bytes. Retain test-onlyc21f099e (+28 lines overf25), then put the existing
+  path guard before cache reuse in both public health entrypoints.
+- [x] Execute the new old-path counterexample and all36 corrected health cases.
+  Actual olde4177c55 ends100,0PASS/1FAIL,4032skipped,0.064s; the intended
+  assertion sees true through the symlinked parent. Stable actual ELF5f0ceba6.
+  Actual finale12061b4 run787e298a ends0,36/36PASS,3997skipped,2.084s; both
+  variants refuse the alias, preserve source bytes and reuse the canonical
+  verdict afterward. Stable actual ELF070e7b6a; all36 declared identities and
+  all six in-flight native source/config hashes match. The old post-run
+  workspace was unavailable for an independent hash read; do not claim one.
+- [x] Repeat both compiler graphs/strict Clippy on finale12061b4; f25 receipts
+  below are previous-source evidence only. Current final stock full-file
+  UBS0/0critical5003warning2372info/failed_modules[], whole-workspace fmt0 on
+  OVH. The first pinned formatter refuses103 for4 estimated cores on2 slots;
+  an env-prefixed form refuses1 before execution. Unchanged ordinary fmt with
+  automatic worker selection then executes and passes. No formatter policy,
+  Cargo config, controller or budget change. No timeout/window/staging or
+  macOS platform-firmlink exception is changed.
+  Final strict Clippy on114 ends0,915.410s remote execution; all-targets onhz3
+  ends0,506.539s. Each worker's independently read six source/config hashes
+  match finale120. Preserve Cargo's dependency future-incompatibility warning
+  for proc-macro-error2; do not call the log warning-free. Separate production
+  lib+bins on1152480 ends0,1877.755s, and its six hashes also match. A pinned
+  all-target request queues out103; unchanged retry follows observed hz3 slot
+  availability/positive protected headroom. Earlier f25 Clippy is explicitly
+  cancelled143 through owned wrapperb1de4be6 and recovered terminal_acknowledged
+  true; it is never counted as a pass. All final compiler terminals are0.
+  Re-read both new guards, alias/cache-key handling and the
+  new fixture after the repair: no further concrete defect found.
+- [x] Run the previous-source default DB library population (4032 compiled cases),
   with no name filter and every default ignore preserved. Preserve any failure;
   this broader regression run cannot clear the previous storage/tools13FAIL.
-- [ ] Fresh-review final callers/error paths, then run both required compiler
-  graphs, strict Clippy, formatting and the stock changed-file bug scan.
-  Final fmt0 and stock UBS0/0critical4992warning2367info/failed_modules[].
+  Actual6f65c702 reports1984PASS/30FAIL, then the RCH disk monitor refuses
+  PermissionDenied while reading fd; wrapper ends137, complete:false. Keep
+  all2004 unreported eligible cases and14 existing ignores explicit. All16
+  escalation/explorer/query failures hit the unchanged10s pool deadline during
+  initial fixture setup. Fourteen retention cases fail separately:8 explicitly
+  cite unreadable /proc/2212/fd/0;6 miss later boundary/error assertions. A fresh
+  read confirms same-UID systemd with an unreadable descriptor. Do not assume
+  that inventory is clean or change reader/monitor policies. Actual stable DB
+  ELF stillf28550e5. Preserve every raw failure and original full-suite hold.
+  Predeclare a complete final4033-case default DB run after the production
+  check, with no name filter, all default ignores, native30GiB/
+  floor10GiB and original dev/watchdogs/buildjobs4/testthreads2. This existing
+  RCH worker runs as root; no host privileges or inventory/monitor policy are
+  changed. Its result cannot qualify the old ordinary-user environment or
+  clear the original red/size/readiness acceptance. Preserve both sources and
+  report the privilege difference beside the result.
+  Before execution select1156319:1152480 has only1 free slot,129 has negative
+  protected headroom (no request to either);1156319 has0/2 slots used,8 CPUs,
+  26592972KiB available RAM and positive native protected headroom. Full native
+  concurrency stays4 build jobs/2 test threads. No filtering or privilege change.
+- [x] Complete that unfiltered final-source DB run and verify every eligible
+  case identity/ordinal. Actual dbe99928 ends100:4018PASS/1TIMEOUT,14 default
+  ignores,765.336s native execution; all4019 eligible cases report. Stable
+  actual DB ELF2e55450c and independently read worker source/config hashes
+  bind this result to finale12061b4. The sole timeout is
+  queries::tests::autocommit_writer_storm_loses_no_rows_and_keeps_integrity,
+  terminated at240.022s by the unchanged per-test watchdog. No assertion error
+  proves row loss, write-mode drift or a deadlock. Root worker1156319 differs
+  from the old ordinary-user hz3 environment; these passes do not clear its
+  monitor/inventory failures or the original readiness/size/performance gates.
+- [x] Execute the writer-storm diagnostic under owned br-kp1in.29. Admit one
+  unchanged-case diagnostic only after positive protected headroom is observed;
+  retain default DB graph, sourcee120, worker1156319, buildjobs4/testthreads2,
+  dev/watchdogs/native30GiB/floor10GiB and all assertions. Actual215f75a4
+  ends100:0PASS/1TIMEOUT,4032 skipped,240.060s native execution; the same
+  case reaches240.020s. Actual ELF2e55450c is byte-identical to the full run;
+  all six independently read worker hashes match sourcee120. No further retry.
+  Read the real16/32-writer fixture
+  and pool setup before proposing a repair. No concrete defect is established:
+  storage_rootNone already routes this temporary database to ephemeral state.
+  Use existing root strace/proc access on the exact owned process after45s;
+  no package install, ptrace-policy change or live mailbox intervention. The
+  five-second trace interrupts only its tracer, then the test continues to
+  the original watchdog. Keep this instrumented diagnostic distinct from the
+  uninstrumented full-run failure and any performance qualification.
+- [ ] Attribute the underlying writer-storm cause before a liveness repair.
+  Retained capture has22 threads (21 futex waits,1 epoll), open16-writer DB
+  descriptors and active FrankenSQLite worker/timer activity. Correct ELF
+  PT_LOAD file-offset mapping resolves the sampled work to transaction begin,
+  begin_pager_txn_with_busy_timeout/perform_begin_busy_retry_handoff and
+  rollback/reader-claim release in runtime FrankenSQLite0.4.13. This narrows
+  the observed phase; it does not identify why admission remains busy, prove
+  a nonterminating handoff, show row loss, or distinguish one long wait from
+  accumulated statement/application retries. Keep .29 open; do not replace
+  real evidence with a larger timeout, changed write mode or speculative fix.
+- [ ] Attribute these cold-checkout failures using the actual failed cases on
+  the same frozen source/DB feature graph and original host. A detailed syscall
+  diagnostic is evidence about the slow stage, not performance qualification.
+  Actual two-case60fe919e ends0,2/2PASS,4030skipped,1.896s diagnostic execution;
+  the old timeout does not reproduce. Predeclare one expanded detailed trace
+  of all16 checkout failures, keeping actual assertions and budgets intact.
+  That expanded request ends103/queue_timeout before execution; all16 remain
+  unqualified. No further retry or speculative production timeout/init change.
+- [x] Retain the superseded f25 compiler and scanner outcomes separately from
+  the completed finale120 gates above. Previous fmt0 and stock UBS0/
+  0critical4992warning2367info/failed_modules[].
   Superseded24ff check is cancelled143 through its exact owned RCH wrapper,
   not counted as a pass. A final hz3 check attempt queue-times-out103 without
-  execution; final all-targets on1153 and production onhz3 are running.
+  execution. Final production lib+bins onhz3 ends0,1938.356s remote execution;
+  all six source/config hashes match finalf25. Final all-targets on1153 ends0,
+  861.923s; its independently read six hashes also match finalf25. Strict
+  Clippy first refuses120 before compilation on1153's disk reservation floor;
+  unchanged command is admitted on114 with fresh positive native headroom,
+  then explicitly cancelled143 after the later parent-path fix. Recovery
+  acknowledges that terminal outcome. No previous-source Clippy pass is
+  inferred; the separate finale120 Clippy actually completes0.
 - [x] Inspect concurrent publication: a shared process commits/pushes planning
   e2b63bd0, cache fix f08d78cb, and diagnostic fix3f82a642 during qualification.
   Preserve that history. The committed source exactly matches final f25c0288;
   do not count publication or intermediate compiler output as qualification.
-- [ ] Record exact outcomes in Beads, review tracker/cycles and publish normal
-  main/mirror refs without disturbing peer work; release exact reservations.
+  The subsequent parent-path correction is a separate source change with
+  final36 and all four compiler gates above, prepared for scoped publication.
+- [x] Record exact outcomes in Beads and review tracker/cycles for publication.
+  All2867 IDs remain; only comments/updated_at change on asldx/.29/5nr0m,
+  existing ownership/status/criteria/dependencies stay intact, both tracker
+  JSONL copies agree, and active cycles are empty. Final source is byte-exact
+  e120; no Cargo/lock/toolchain/nextest change. Prepare normal main/mirror
+  publication of the32-line source delta and existing TODO/comments, preserving
+  peer history and the seven untracked roots. Final handoff must record actual
+  fetched refs and release of exact reservations1658/1659.
 
 ## November 12 fresh review and baseline-file precision — EmeraldEagle
 
