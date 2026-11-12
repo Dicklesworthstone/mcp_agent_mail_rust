@@ -15,10 +15,8 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(unix)]
 #[path = "snapshot_authority.rs"]
 mod authority;
-#[cfg(unix)]
 use authority::SnapshotAuthority;
 #[cfg(unix)]
 pub use authority::{SnapshotRetentionDeferred, SnapshotRetentionGuard};
@@ -41,21 +39,15 @@ const MAX_SNAPSHOT_METADATA_BYTES: u64 = 64 * 1024;
 /// exports, which do not pass through the automatic exporter's journal lease.
 pub(crate) struct SnapshotPublicationGuard {
     primary: PathBuf,
-    #[cfg(unix)]
     authority: SnapshotAuthority,
 }
 
 impl SnapshotPublicationGuard {
     pub(crate) fn acquire(primary: &Path) -> DbResult<Self> {
         let primary = normalized_snapshot_primary(primary)?;
-        #[cfg(unix)]
         let authority =
             SnapshotAuthority::acquire(&primary, true).map_err(snapshot_authority_error)?;
-        Ok(Self {
-            primary,
-            #[cfg(unix)]
-            authority,
-        })
+        Ok(Self { primary, authority })
     }
 
     pub(crate) fn revalidate(&self, primary: &Path) -> DbResult<()> {
@@ -64,7 +56,6 @@ impl SnapshotPublicationGuard {
                 "snapshot publication authority belongs to another database".to_string(),
             ));
         }
-        #[cfg(unix)]
         self.authority
             .revalidate()
             .map_err(snapshot_authority_error)?;
@@ -771,8 +762,8 @@ pub fn read_snapshot_metadata(primary: &Path) -> Option<VerifiedSnapshotMetadata
 ///
 /// Opens the freshly-written `.bak` to capture row counts + schema version,
 /// then writes the JSON sidecar. Returns the recorded metadata.
-/// Unix publishers share one persistent per-primary authority with verified
-/// readers. Contention refuses before creating an inspection stage.
+/// Publishers on Unix and Windows share one persistent per-primary authority
+/// with verified readers. Contention refuses before creating an inspection stage.
 pub fn record_snapshot_metadata(
     primary: &Path,
     created_us: i64,
@@ -967,7 +958,6 @@ fn inspect_and_record_snapshot_metadata(
     Ok(meta)
 }
 
-#[cfg(unix)]
 fn snapshot_authority_error(error: std::io::Error) -> DbError {
     DbError::Sqlite(format!(
         "snapshot authority unavailable; retry without replacing evidence: {error}"
@@ -979,7 +969,6 @@ struct SelectedVerifiedSnapshot {
     actual_path: PathBuf,
     source: std::fs::File,
     // Retain publication admission through staging, never through promotion.
-    #[cfg(unix)]
     authority: Option<SnapshotAuthority>,
 }
 
@@ -999,22 +988,14 @@ fn select_verified_snapshot_checked(primary: &Path) -> DbResult<Option<SelectedV
     if read_snapshot_metadata(&primary).is_none() {
         return Ok(None);
     }
-    #[cfg(unix)]
     let authority =
         SnapshotAuthority::acquire(&primary, false).map_err(snapshot_authority_error)?;
     let selected = select_verified_snapshot_inner(&primary, |_, _| Ok(()));
-    #[cfg(unix)]
-    {
-        authority.revalidate().map_err(snapshot_authority_error)?;
-        Ok(selected.map(|mut selected| {
-            selected.authority = Some(authority);
-            selected
-        }))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(selected)
-    }
+    authority.revalidate().map_err(snapshot_authority_error)?;
+    Ok(selected.map(|mut selected| {
+        selected.authority = Some(authority);
+        selected
+    }))
 }
 
 fn select_verified_snapshot_inner(
@@ -1120,7 +1101,6 @@ fn select_verified_snapshot_with_work_admission(
             metadata: meta,
             actual_path: candidate,
             source,
-            #[cfg(unix)]
             authority: None,
         }));
     }
@@ -1258,7 +1238,6 @@ pub fn restore_from_verified_snapshot(
 
     // The staged bytes are independently hash-bound and fully verified. Never
     // retain snapshot admission while promotion drains database borrowers.
-    #[cfg(unix)]
     if let Some(authority) = selected.authority {
         authority.revalidate().map_err(snapshot_authority_error)?;
         drop(authority);
@@ -1778,7 +1757,7 @@ mod tests {
         assert_eq!(read_snapshot_metadata(&primary), Some(second));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn snapshot_publication_respects_a_live_authority_owner_before_staging() {
         let dir = tempfile::tempdir().unwrap();
@@ -1812,7 +1791,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn snapshot_selection_holds_shared_authority_and_restore_refuses_busy_publication() {
         let dir = tempfile::tempdir().unwrap();
@@ -1858,7 +1837,7 @@ mod tests {
         assert!(latest_verified_snapshot(&primary).is_some());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn proactive_pool_publication_refuses_a_verified_snapshot_reader_before_staging() {
         let dir = tempfile::tempdir().unwrap();
@@ -2080,7 +2059,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn snapshot_admission_is_released_after_verification_error_and_empty_reads_are_neutral() {
         let dir = tempfile::tempdir().unwrap();
@@ -2115,7 +2094,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn snapshot_publication_excludes_another_process_and_recovers_after_owner_death() {
         use std::io::Read as _;
@@ -2134,8 +2113,7 @@ mod tests {
         std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
         let meta = record_snapshot_metadata(&primary, 41).unwrap();
         let lock_path = primary.with_file_name("storage.sqlite3.bak.authority.lock");
-        use std::os::unix::fs::MetadataExt as _;
-        let inode = std::fs::metadata(&lock_path).unwrap().ino();
+        let identity = same_file::Handle::from_path(&lock_path).unwrap();
         let name = std::thread::current().name().unwrap().to_string();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &name, "--nocapture"])
@@ -2176,8 +2154,8 @@ mod tests {
             43
         );
         assert_eq!(
-            std::fs::metadata(&lock_path).unwrap().ino(),
-            inode,
+            same_file::Handle::from_path(&lock_path).unwrap(),
+            identity,
             "owner death releases admission without stale-lock deletion"
         );
     }

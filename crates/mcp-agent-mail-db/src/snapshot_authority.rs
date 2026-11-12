@@ -4,27 +4,40 @@
 //! processes' authority; a replaced or aliased lock is an error, not stale
 //! evidence to delete. Admission is nonblocking, including within one process.
 
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(any(unix, windows))]
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+#[cfg(any(unix, windows))]
+use std::path::{Component, PathBuf};
+#[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
 use fs2::FileExt as _;
+#[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
+#[cfg(unix)]
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
+#[cfg(unix)]
 const MAX_RETENTION_SEARCH_CANDIDATES: usize = 128;
+#[cfg(unix)]
 const MAX_RETENTION_SEARCH_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(unix)]
 const MAX_RETENTION_SEARCH_WITNESSES: usize = 16_384;
 
 /// A maintenance slice ended before snapshot selection could finish. This is
 /// not missing verification and must never authorize a repair publication.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotRetentionDeferred {
     Deadline,
@@ -33,14 +46,17 @@ pub enum SnapshotRetentionDeferred {
     InventoryChanged,
 }
 
+#[cfg(unix)]
 impl std::fmt::Display for SnapshotRetentionDeferred {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "snapshot retention search deferred: {self:?}")
     }
 }
 
+#[cfg(unix)]
 impl std::error::Error for SnapshotRetentionDeferred {}
 
+#[cfg(unix)]
 impl SnapshotRetentionDeferred {
     #[must_use]
     pub fn from_io_error(error: &io::Error) -> Option<Self> {
@@ -48,6 +64,7 @@ impl SnapshotRetentionDeferred {
     }
 }
 
+#[cfg(unix)]
 struct RetentionSearchBudget {
     deadline: Instant,
     candidates: usize,
@@ -56,6 +73,7 @@ struct RetentionSearchBudget {
     byte_limit: u64,
 }
 
+#[cfg(unix)]
 impl RetentionSearchBudget {
     fn new(deadline: Instant) -> Self {
         Self {
@@ -88,6 +106,7 @@ impl RetentionSearchBudget {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 struct RetentionSearchHint {
     metadata: Vec<u8>,
@@ -102,6 +121,7 @@ struct RetentionSearchHint {
 /// set is unchanged. These witnesses never grant positive verification or
 /// deletion authority; completion without a pin can only reach the existing
 /// one-shot, fully verified repair-publication admission.
+#[cfg(unix)]
 #[derive(Clone, PartialEq, Eq)]
 struct RetentionCandidateWitness {
     path: PathBuf,
@@ -111,6 +131,7 @@ struct RetentionCandidateWitness {
     changed: (i64, i64),
 }
 
+#[cfg(unix)]
 fn retention_candidate_witnesses(
     candidates: &[PathBuf],
 ) -> io::Result<Vec<RetentionCandidateWitness>> {
@@ -142,6 +163,7 @@ fn retention_candidate_witnesses(
     Ok(witnesses)
 }
 
+#[cfg(unix)]
 fn retention_search_hints()
 -> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, RetentionSearchHint>> {
     static HINTS: std::sync::OnceLock<
@@ -150,6 +172,7 @@ fn retention_search_hints()
     HINTS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
+#[cfg(unix)]
 pub(super) struct SnapshotAuthority {
     file: File,
     parent: File,
@@ -163,6 +186,7 @@ pub(super) struct SnapshotAuthority {
 /// the durable recovery election. Holding the election excludes candidate
 /// selection/staging without recording a recovery attempt or opening the live
 /// database. The caller must still validate each inventoried file before moving it.
+#[cfg(unix)]
 #[must_use]
 pub struct SnapshotRetentionGuard {
     authority: SnapshotAuthority,
@@ -177,6 +201,7 @@ pub struct SnapshotRetentionGuard {
     recovery: crate::recovery_breaker::RecoveryBreakerFileLock,
 }
 
+#[cfg(unix)]
 #[derive(PartialEq, Eq)]
 enum RetentionMetadata {
     Absent,
@@ -184,6 +209,7 @@ enum RetentionMetadata {
     Unavailable,
 }
 
+#[cfg(unix)]
 fn retention_metadata(path: &Path) -> RetentionMetadata {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => RetentionMetadata::Absent,
@@ -200,6 +226,7 @@ fn retention_metadata(path: &Path) -> RetentionMetadata {
     }
 }
 
+#[cfg(unix)]
 impl SnapshotRetentionGuard {
     /// Acquire without waiting, then select the exact verified generation.
     /// An unreadable or malformed sidecar stays occupied, never absent.
@@ -695,6 +722,7 @@ impl SnapshotRetentionGuard {
     }
 }
 
+#[cfg(unix)]
 fn retention_generation_created(
     primary: &Path,
     path: &Path,
@@ -742,6 +770,7 @@ fn retention_generation_created(
     Err(invalid("not an eligible superseded backup generation"))
 }
 
+#[cfg(unix)]
 fn ensure_no_recovery_references(primary: &Path) -> io::Result<()> {
     let legacy_lock = crate::pool::sqlite_path_with_suffix(primary, ".recovery.lock");
     match std::fs::symlink_metadata(&legacy_lock) {
@@ -762,6 +791,7 @@ fn ensure_no_recovery_references(primary: &Path) -> io::Result<()> {
 /// Read only through immutable canonical SQLite; never seed or repair a
 /// candidate's identity to make it eligible for deletion. Unknown legacy
 /// schemas, malformed identities, and query errors require byte equality.
+#[cfg(unix)]
 fn immutable_generation_id(path: &Path) -> Option<String> {
     let connection = crate::pool::open_immutable_canonical_sqlite(path).ok()?;
     let rows = connection.query_sync(
@@ -775,10 +805,12 @@ fn immutable_generation_id(path: &Path) -> Option<String> {
     (!generation.is_empty() && generation.len() <= 256).then_some(generation)
 }
 
+#[cfg(any(unix, windows))]
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+#[cfg(unix)]
 fn ensure_same_directory(captured: &File, expected: &File) -> io::Result<()> {
     let captured = captured.metadata()?;
     let expected = expected.metadata()?;
@@ -794,6 +826,7 @@ fn ensure_same_directory(captured: &File, expected: &File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn acquire_retention_controls_with(
     primary: &Path,
     expected_parent: Option<&File>,
@@ -821,6 +854,7 @@ fn acquire_retention_controls_with(
     Ok((recovery, authority))
 }
 
+#[cfg(unix)]
 fn open_directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(invalid("snapshot authority requires an absolute parent"));
@@ -843,6 +877,7 @@ fn open_directory(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
+#[cfg(unix)]
 impl SnapshotAuthority {
     fn ensure_parent(&self, expected: &File) -> io::Result<()> {
         ensure_same_directory(&self.parent, expected)
@@ -977,7 +1012,284 @@ impl SnapshotAuthority {
     }
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+const WINDOWS_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
+#[cfg(windows)]
+const WINDOWS_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const WINDOWS_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const WINDOWS_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Windows retains handles that deny delete sharing for the lock and every
+/// ancestor. Path-based opens therefore cannot move to a replacement parent
+/// while a publication or selected source still holds admission.
+#[cfg(windows)]
+pub(super) struct SnapshotAuthority {
+    file: File,
+    path: PathBuf,
+    parents: Vec<(PathBuf, File)>,
+}
+
+#[cfg(windows)]
+fn validate_windows_directory(directory: &File) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & WINDOWS_REPARSE_POINT != 0 {
+        return Err(invalid(
+            "snapshot authority parent must be a directory without reparse points",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(WINDOWS_SHARE_READ_WRITE)
+        .custom_flags(WINDOWS_OPEN_REPARSE_POINT | WINDOWS_BACKUP_SEMANTICS)
+        .open(path)?;
+    validate_windows_directory(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn pin_windows_parents(path: &Path) -> io::Result<Vec<(PathBuf, File)>> {
+    if !path.is_absolute() {
+        return Err(invalid("snapshot authority requires an absolute parent"));
+    }
+    let mut current = PathBuf::new();
+    let mut parents = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
+            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+            _ => return Err(invalid("snapshot authority refuses parent traversal")),
+        }
+        // Pin each ancestor before opening its child. Denying delete sharing
+        // only on the immediate parent would still permit ancestor replacement.
+        let directory = open_windows_directory(&current)?;
+        parents.push((current.clone(), directory));
+    }
+    if parents.is_empty() {
+        return Err(invalid("snapshot authority has no directory authority"));
+    }
+    Ok(parents)
+}
+
+#[cfg(windows)]
+fn open_windows_lock(path: &Path, exclusive: bool, create: bool) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(exclusive || create)
+        .create_new(create)
+        // Rust's default includes FILE_SHARE_DELETE, which would allow two
+        // processes to lock different files at the same reusable pathname.
+        .share_mode(WINDOWS_SHARE_READ_WRITE)
+        .custom_flags(WINDOWS_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
+impl SnapshotAuthority {
+    pub(super) fn acquire(primary: &Path, exclusive: bool) -> io::Result<Self> {
+        let parent = primary
+            .parent()
+            .ok_or_else(|| invalid("snapshot primary has no parent"))?;
+        let parents = pin_windows_parents(parent)?;
+        let mut name = primary
+            .file_name()
+            .ok_or_else(|| invalid("snapshot primary has no leaf"))?
+            .to_os_string();
+        name.push(".bak.authority.lock");
+        let path = parent.join(name);
+        let (file, created) = match open_windows_lock(&path, exclusive, false) {
+            Ok(file) => (file, false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match open_windows_lock(&path, exclusive, true) {
+                    Ok(file) => (file, true),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        (open_windows_lock(&path, exclusive, false)?, false)
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        let guard = Self {
+            file,
+            path,
+            parents,
+        };
+        guard.revalidate()?;
+        if exclusive {
+            fs2::FileExt::try_lock_exclusive(&guard.file)?;
+        } else {
+            fs2::FileExt::try_lock_shared(&guard.file)?;
+        }
+        guard.revalidate()?;
+        if created {
+            // The new file inherits its directory's ACL, matching the core
+            // private-file helpers. Existing sentinels are never rewritten.
+            guard.file.sync_all()?;
+        }
+        Ok(guard)
+    }
+
+    pub(super) fn revalidate(&self) -> io::Result<()> {
+        use mcp_agent_mail_core::disk::{windows_file_identity, windows_file_link_count};
+        use std::os::windows::fs::MetadataExt as _;
+
+        for (path, retained) in &self.parents {
+            validate_windows_directory(retained)?;
+            let current = open_windows_directory(path)?;
+            if windows_file_identity(retained)? != windows_file_identity(&current)? {
+                return Err(invalid("snapshot authority parent identity changed"));
+            }
+        }
+        let retained = self.file.metadata()?;
+        if !retained.is_file()
+            || retained.file_attributes() & WINDOWS_REPARSE_POINT != 0
+            || retained.len() != 0
+            || windows_file_link_count(&self.file)? != 1
+        {
+            return Err(invalid(
+                "snapshot authority must be an empty single-link regular file without reparse points",
+            ));
+        }
+        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.path)?;
+        if windows_file_identity(&self.file)? != windows_file_identity(&current)? {
+            return Err(invalid("snapshot authority lock identity changed"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(super) struct SnapshotAuthority;
+
+#[cfg(not(any(unix, windows)))]
+impl SnapshotAuthority {
+    pub(super) fn acquire(_primary: &Path, _exclusive: bool) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "snapshot authority is unavailable on this platform",
+        ))
+    }
+
+    pub(super) fn revalidate(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "snapshot authority is unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use mcp_agent_mail_core::disk::{windows_file_identity, windows_file_link_count};
+
+    #[test]
+    fn shared_readers_exclude_publishers_without_serializing_other_primaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let primary = root.join("mail.sqlite3");
+        let first = SnapshotAuthority::acquire(&primary, false).unwrap();
+        let identity = windows_file_identity(&first.file).unwrap();
+        let lock_path = first.path.clone();
+        let second = SnapshotAuthority::acquire(&primary, false).unwrap();
+        assert!(SnapshotAuthority::acquire(&primary, true).is_err());
+        let other = SnapshotAuthority::acquire(&root.join("other.sqlite3"), true).unwrap();
+        drop(first);
+        assert!(SnapshotAuthority::acquire(&primary, true).is_err());
+        drop(second);
+        let publisher = SnapshotAuthority::acquire(&primary, true).unwrap();
+        assert_eq!(windows_file_identity(&publisher.file).unwrap(), identity);
+        assert_eq!(windows_file_link_count(&publisher.file).unwrap(), 1);
+        assert!(SnapshotAuthority::acquire(&primary, false).is_err());
+        assert!(SnapshotAuthority::acquire(&primary, true).is_err());
+        drop(publisher);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"");
+        let reader = SnapshotAuthority::acquire(&primary, false).unwrap();
+        assert_eq!(windows_file_identity(&reader.file).unwrap(), identity);
+        drop(reader);
+        drop(other);
+    }
+
+    #[test]
+    fn admission_pins_the_lock_parent_and_ancestors_until_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ancestor = root.join("workspace");
+        let parent = ancestor.join("mailbox");
+        std::fs::create_dir_all(&parent).unwrap();
+        let primary = parent.join("mail.sqlite3");
+        let guard = SnapshotAuthority::acquire(&primary, true).unwrap();
+        assert!(std::fs::rename(&guard.path, parent.join("replaced-lock")).is_err());
+        assert!(std::fs::rename(&parent, ancestor.join("replaced-mailbox")).is_err());
+        assert!(std::fs::rename(&ancestor, root.join("replaced-workspace")).is_err());
+        guard.revalidate().unwrap();
+        let lock_name = guard.path.file_name().unwrap().to_os_string();
+        drop(guard);
+        let moved = ancestor.join("moved-mailbox");
+        std::fs::rename(&parent, &moved).unwrap();
+        assert_eq!(std::fs::read(moved.join(lock_name)).unwrap(), b"");
+    }
+
+    #[test]
+    fn malformed_lock_entries_are_preserved_and_never_admitted() {
+        for shape in ["contents", "hardlink", "directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let primary = root.join("mail.sqlite3");
+            let lock_path = root.join("mail.sqlite3.bak.authority.lock");
+            let sentinel = root.join("sentinel");
+            match shape {
+                "contents" => std::fs::write(&lock_path, b"retained evidence").unwrap(),
+                "hardlink" => {
+                    std::fs::write(&sentinel, b"").unwrap();
+                    std::fs::hard_link(&sentinel, &lock_path).unwrap();
+                }
+                _ => {
+                    std::fs::create_dir(&lock_path).unwrap();
+                    std::fs::write(lock_path.join("evidence"), b"retained evidence").unwrap();
+                }
+            }
+            assert!(
+                SnapshotAuthority::acquire(&primary, true).is_err(),
+                "{shape}"
+            );
+            assert!(
+                SnapshotAuthority::acquire(&primary, false).is_err(),
+                "{shape}"
+            );
+            match shape {
+                "contents" => assert_eq!(std::fs::read(&lock_path).unwrap(), b"retained evidence"),
+                "hardlink" => {
+                    let file = File::open(&lock_path).unwrap();
+                    assert_eq!(windows_file_link_count(&file).unwrap(), 2);
+                    assert_eq!(std::fs::read(&sentinel).unwrap(), b"");
+                }
+                _ => assert_eq!(
+                    std::fs::read(lock_path.join("evidence")).unwrap(),
+                    b"retained evidence"
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
