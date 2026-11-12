@@ -9,39 +9,93 @@
 - [x] Re-read both prior writer-storm failures and the mapped stack capture.
   Keep the full run and diagnostic RED, with the original240s watchdog and
   root/ordinary-user environment distinction explicit.
-- [ ] Trace the real pool/connection return and engine transaction-admission
+- [x] Trace the real pool/connection return and engine transaction-admission
   paths. Seek a concrete cause before changing runtime behavior or fixtures.
-- [ ] Select one decisive cause-discriminating experiment from that source
+  The pinned sqlmodel-pool uses FIFO reuse; repeated attempts can cycle through
+  different idle handles. A single poisoned-handle retirement is not proved.
+- [x] Select one decisive cause-discriminating experiment from that source
   reading, declare it before execution, and retain its actual terminal outcome.
   A repeat of the old uninstrumented diagnostic supplies no new attribution.
-- [ ] Fix a demonstrated defect in existing code, if one is established; then
-  re-read the repair and callers and run the required exact-source checks.
-  Do not extend a timeout, change write mode or weaken a test to obtain green.
+  Actual1a12a43a ends100,0PASS/1TIMEOUT/4032skipped. All16 barriers pass;
+  15 writers/125 rows finish. Writer9 row5 returns the same page109 snapshot
+  conflict on11 completed attempts, each about20s, and begins attempt11 at
+  237536ms. Acquisitions remain fast. This distinguishes accumulated bounded
+  statement waits/retries from an unbounded deadlock; the underlying snapshot
+  admission cause remains open. No runtime workaround or further writer retry.
+- [ ] Repair the writer snapshot-admission cause when demonstrated. Do not
+  extend a timeout, change write mode, flush the pool speculatively or weaken
+  the test to obtain green. Original .29 liveness/soak/overhead acceptance stays.
 - [x] Find and wire a concrete health-reporting gap under owned br-kp1in.5:
   IntegrityMetrics already has current-failure and accepted-orphan gauges, but
   the server response omits them and the CLI reconstructs both as zero. Carry
   the actual values through producer/DTO/consumer; required fields make missing
   evidence unavailable instead of attested zero. No counter or policy is reset.
-- [ ] Execute old test-only4e81's two counterexamples and corrected3eff's eight
-  declared real-handler/CLI/integrity controls, retaining every outcome. The
+- [x] Execute old test-only4e81's two counterexamples and formatted41895ac2's
+  eight declared real-handler/CLI/integrity controls, retaining every outcome.
+  Old tools aebfcc68 ends100,0/1PASS/1FAIL/4491skipped,1.423s: after explicit
+  real DB bootstrap, actual handler JSON is Null instead of425. Old CLI
+  264a42f5 ends100,0/1PASS/1FAIL/4491skipped,5.214s: after healthy local DB
+  and verdict controls, mapping yields0 instead of425. Stable actual old
+  tools ELF219debe4 and CLI ELFe4028c7e retain these failures. The
   existing isolated handler uses real private SQLite and API-recorded counter
   values; it is not proof of real leaked-page creation or HTTP qualification.
   Health cohorts use buildjobs1/testthreads2 with original dev/watchdogs and
   native30GiB/floor10GiB, fitting observed available slots. The original writer
   diagnostic keeps its buildjobs4 and original assertions. Both source packets
   remain immutable; no metric/performance comparison is claimed.
-- [ ] Re-read corrected health mappings/error paths and complete both compiler
-  graphs, strict Clippy, formatting and stock scans on final3eff. Earlier6f3
-  compiler runs are intermediate after this real source correction.
+- [x] Catch the initial CLI filter's wrong namespace before native outcomes:
+  the actual facade nests these tests under robot::commands::tests. Preserve
+  the initial old1/final4 tools runs and execute omitted old1/final4 CLI cases
+  separately on the same two-package graph. Do not claim a single eight-case
+  run or count selected-but-absent names as executed tests.
+- [x] Re-read corrected health mappings/error paths and fix the new assertion's
+  formatter layout manually. Final formatted41895ac2 differs from3eff only in
+  whitespace. Stock scan:0critical/3615warning/1152info,failed_modules[];
+  final formatter0. No suppression or formatting-policy edit.
+- [x] Final41895ac2 workspace all-targets check0/384.718s and strict Clippy
+  all-targets -Dwarnings0/1032.522s. Clippy retains a dependency future-compat
+  warning for proc-macro-error2 v2.0.1; no warning-free claim. Actual Clippy
+  worker matches nine pinned source/config hashes and rustc. All-targets uses
+  the same worker source directory; no separate in-flight hash claim for it.
+- [x] Complete the separate production lib+bins graph on final41895ac2:
+  exit0, actual vmi1153651 remote span2820.2s, nine independently matched
+  source/config hashes and pinned rustc. The earlier monitor refusals remain
+  below; no test, ordinary-user or release clearance follows from this check.
+- [x] Complete final41895ac2's declared health native controls as two actual
+  root/Linux runs: tools b8a02215,4/4PASS/4488skipped,0.849s; corrected CLI
+  8fb9adab,4/4PASS/4488skipped,3.074s. Exact eight-case census matches the
+  predeclared identities. This is an eight-case union, not a single
+  eight-case run or full-suite/ordinary-user/transport qualification. Stable
+  actual tools ELF d7f53fae and CLI ELF4c3fe25f match the pinned worker packet.
+- [x] Reconcile all superseded/refused/previously uncertain requests without
+  replay. Earlier6f3 compiler requests are cancelled
+  through their exact owned wrappers (original143, daemon130, recovery120,
+  terminal_acknowledged true), never counted as passes. Initial health requests
+  end103 without execution; hz3's later old-source request ends120 at native
+  disk admission, also zero bodies. A later request was mistakenly submitted
+  after negative preflight; its cancellation returned unconfirmed/not_queued
+  during another live owner's daemon-restart pause. Preserve that journal.
+  After maintenance cleared, the same retained request passed native admission
+  and executed on vmi1293453; its actual terminal is100 with the intended
+  Null/425 counterexample above. Exact-wrapper recovery returns0, remote100,
+  terminal_acknowledged true. No replay, fleet-policy change, bypass or local
+  fallback. Production's automatic remote
+  attempts first hit two monitor_unavailable refusals before compilation, then
+  admitted vmi1153651; nine actual worker hashes/rustc match final41895ac2.
 - [x] Inspect the current degraded health/104h-old backup read-only under owned
-  asldx, without touching the shared mailbox, owner or recovery policy.
+  asldx, without repairing the shared mailbox, owner or recovery policy.
   Doctor remains degraded with1 orphaned page and104h50m-old backup; the
   installed binary reports0.3.38, while this workspace is0.3.40. Source already
   has bounded shared backup retry and sticky verification. No daemon cause or
   current-source fix is inferred from the installed result. An unauthenticated
   direct snapshot GET refuses401; no auth policy is bypassed or secret exposed.
-- [ ] Record actual findings/results in the original Beads, review tracker
-  integrity and source scope, publish normal refs and release exact leases.
+- [x] Record actual findings/results as comments4315-4319 on the original Beads;
+  review tracker integrity and source scope before publication. Original .5 route/corpus/host/
+  load/incumbent, .29 lock/slope/soak/overhead and asldx readiness/size criteria
+  remain open; earlier full-suite and ordinary-user failures remain RED.
+- [x] Prepare scoped publication and exact lease release. Source4ff89561 is
+  already published; final documentation/tracker refs and actual lease release
+  will be recorded after push in the existing external review-audit.md.
 
 ## November 12 health-cache review — EmeraldEagle
 
