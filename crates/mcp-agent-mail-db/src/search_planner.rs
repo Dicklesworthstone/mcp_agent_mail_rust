@@ -900,9 +900,12 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
 
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
+    // created_ts is NOT NULL in both the live and recovery schemas. Keep the
+    // indexed column bare so a chronological page can stop at its LIMIT;
+    // COALESCE forced a full project scan and sort even for a 20-row page.
     let message_order_clause = match query.ranking {
-        RankingMode::Recency => "ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC",
-        RankingMode::Oldest => "ORDER BY COALESCE(m.created_ts, 0) ASC, m.id ASC",
+        RankingMode::Recency => "ORDER BY m.created_ts DESC, m.id ASC",
+        RankingMode::Oldest => "ORDER BY m.created_ts ASC, m.id ASC",
         RankingMode::Relevance => "ORDER BY score ASC, m.id ASC",
     };
 
@@ -1075,9 +1078,25 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         // mode, the SQL order is effectively id-only.
         // Time-ordered cursors carry created_ts, negated for Recency, so
         // ascending score order is the page order either way.
+        // Seek to the cursor's timestamp before evaluating its exact score/id
+        // predicate. Existing cursors encode a float, so adjacent large i64
+        // timestamps can share a score. One outward float step keeps that
+        // whole rounding interval eligible; the predicate below still decides
+        // membership. A raw bound at the score itself would drop valid ties.
+        let time_cursor_bound = match query.ranking {
+            RankingMode::Recency => Some(("m.created_ts <= ?", (-cursor.score).next_up())),
+            RankingMode::Oldest => Some(("m.created_ts >= ?", cursor.score.next_down())),
+            RankingMode::Relevance => None,
+        };
+        if let Some((predicate, bound)) = time_cursor_bound
+            && bound.is_finite()
+        {
+            where_clauses.push(predicate.to_string());
+            params.push(PlanParam::Float(bound));
+        }
         let time_cursor_expr = match query.ranking {
-            RankingMode::Recency => Some("-CAST(COALESCE(m.created_ts, 0) AS REAL)"),
-            RankingMode::Oldest => Some("CAST(COALESCE(m.created_ts, 0) AS REAL)"),
+            RankingMode::Recency => Some("-CAST(m.created_ts AS REAL)"),
+            RankingMode::Oldest => Some("CAST(m.created_ts AS REAL)"),
             RankingMode::Relevance => None,
         };
         if let Some(cursor_score_expr) = time_cursor_expr {
@@ -1798,13 +1817,10 @@ mod tests {
         q.ranking = RankingMode::Recency;
         q.cursor = Some(cursor.encode());
         let plan = plan_search(&q);
+        assert!(plan.sql.contains("ORDER BY m.created_ts DESC, m.id ASC"));
         assert!(
             plan.sql
-                .contains("ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC")
-        );
-        assert!(
-            plan.sql
-                .contains("-CAST(COALESCE(m.created_ts, 0) AS REAL) > ?")
+                .contains("m.created_ts <= ? AND (-CAST(m.created_ts AS REAL) > ?")
         );
         assert!(plan.facets_applied.contains(&"cursor".to_string()));
     }
@@ -1820,18 +1836,82 @@ mod tests {
         q.cursor = Some(cursor.encode());
         let plan = plan_search(&q);
         assert!(
-            plan.sql
-                .contains("ORDER BY COALESCE(m.created_ts, 0) ASC, m.id ASC"),
+            plan.sql.contains("ORDER BY m.created_ts ASC, m.id ASC"),
             "{}",
             plan.sql
         );
         assert!(
             plan.sql
-                .contains("(CAST(COALESCE(m.created_ts, 0) AS REAL) > ?"),
+                .contains("m.created_ts >= ? AND (CAST(m.created_ts AS REAL) > ?"),
             "{}",
             plan.sql
         );
         assert!(!plan.sql.contains("-CAST"), "{}", plan.sql);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn chronological_cursor_range_preserves_rounded_timestamp_ties() {
+        // Values above 2^53 are not all representable in the cursor's f64.
+        // Test both sides of its rounding cells, signed limits, and epoch.
+        let anchors = [
+            i64::MIN + 4096,
+            -(1_i64 << 54),
+            -(1_i64 << 53),
+            -1,
+            0,
+            1,
+            1_i64 << 53,
+            1_i64 << 54,
+            i64::MAX - 4096,
+        ];
+        for ranking in [RankingMode::Recency, RankingMode::Oldest] {
+            for anchor in anchors {
+                let score = if ranking == RankingMode::Recency {
+                    -(anchor as f64)
+                } else {
+                    anchor as f64
+                };
+                let query = SearchQuery {
+                    ranking,
+                    cursor: Some(SearchCursor { score, id: 10 }.encode()),
+                    ..SearchQuery::messages("needle", 1)
+                };
+                let plan = plan_search(&query);
+                let floats: Vec<_> = plan
+                    .params
+                    .iter()
+                    .filter_map(|param| match param {
+                        PlanParam::Float(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(floats.len(), 3, "{ranking:?}: {}", plan.sql);
+                assert_eq!(&floats[1..], &[score, score]);
+                let bound = floats[0];
+                for delta in -2048..=2048 {
+                    let timestamp = anchor.saturating_add(delta);
+                    let rounded = timestamp as f64;
+                    let candidate_score = if ranking == RankingMode::Recency {
+                        -rounded
+                    } else {
+                        rounded
+                    };
+                    // Include the equal-score case: a larger message ID may
+                    // legally continue within this timestamp rounding cell.
+                    if candidate_score >= score {
+                        assert!(
+                            if ranking == RankingMode::Recency {
+                                rounded < bound
+                            } else {
+                                rounded > bound
+                            },
+                            "{ranking:?}: {timestamp} at {score} excluded by {bound}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ── plan_search: filter-only (no text) ─────────────────────────
