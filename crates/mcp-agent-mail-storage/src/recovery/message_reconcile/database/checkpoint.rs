@@ -25,10 +25,10 @@ use super::{
     reconcile_message_batch_inner, source_error, validate_pool_binding,
 };
 
-// Version 1 bound hints only to the inode. In-place restore/reconstruction can
-// change the mailbox generation without replacing that file. Such hints must
-// be ignored rather than attached to the restored mailbox's reused row IDs.
-const SCHEMA_VERSION: u32 = 2;
+// Version 1 omitted the logical database generation; version 2 omitted the
+// archive directory identity. Neither can establish that its scan positions
+// still describe the same mailbox and archive after replacement or restore.
+const SCHEMA_VERSION: u32 = 3;
 const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024;
 const CHECKPOINT_OWNED: &str =
     "message reconciliation deferred: checkpoint is owned by another worker";
@@ -42,6 +42,7 @@ pub(super) struct Binding {
     // invalidate a checkpoint. Replacement databases must start a fresh scan.
     generation: String,
     database_generation: String,
+    archive_generation: String,
 }
 
 impl Binding {
@@ -83,8 +84,6 @@ impl Binding {
         #[cfg(not(windows))]
         let metadata = std::fs::metadata(&database)
             .map_err(|error| io_context("read database metadata", &database, error))?;
-        let archive_metadata = std::fs::metadata(&archive)
-            .map_err(|error| io_context("read archive metadata", &archive, error))?;
         if !metadata.is_file() {
             return Err(io_context(
                 "validate database",
@@ -92,13 +91,7 @@ impl Binding {
                 invalid("checkpoint source is not a regular file"),
             ));
         }
-        if !archive_metadata.is_dir() {
-            return Err(io_context(
-                "validate archive",
-                &archive,
-                invalid("checkpoint archive is not a directory"),
-            ));
-        }
+        let archive_generation = archive_generation(&archive)?;
         #[cfg(unix)]
         let generation = {
             use std::os::unix::fs::MetadataExt;
@@ -144,11 +137,92 @@ impl Binding {
             archive,
             generation,
             database_generation: database_generation.to_string(),
+            archive_generation,
         })
     }
 
     fn path(&self) -> io::Result<PathBuf> {
         checkpoint_path(&self.database, &self.archive)
+    }
+}
+
+/// Bind progress to the actual archive directory, not just its pathname.
+/// Ordinary Git/working-copy writes change directory metadata, so only stable
+/// identity participates. A restored tree at the same path needs a fresh scan.
+fn archive_generation(archive: &Path) -> io::Result<String> {
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(archive)
+            .map_err(|error| io_context("open archive identity", archive, error))?
+    };
+    #[cfg(windows)]
+    let metadata = directory
+        .metadata()
+        .map_err(|error| io_context("read archive metadata", archive, error))?;
+    #[cfg(not(windows))]
+    let metadata = std::fs::symlink_metadata(archive)
+        .map_err(|error| io_context("read archive metadata", archive, error))?;
+    if !metadata.is_dir() {
+        return Err(io_context(
+            "validate archive",
+            archive,
+            invalid("checkpoint archive is not a directory"),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io_context(
+                "validate archive",
+                archive,
+                invalid("checkpoint archive is a reparse point"),
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let created = metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|time| (time.as_secs(), time.subsec_nanos()));
+        Ok(format!("{}:{}:{created:?}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let created = metadata
+            .created()
+            .map_err(|error| io_context("read archive creation time", archive, error))?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                io_context(
+                    "capture archive identity",
+                    archive,
+                    io::Error::new(io::ErrorKind::InvalidData, error),
+                )
+            })?;
+        #[cfg(windows)]
+        {
+            // Creation times can survive replacement through NTFS tunneling.
+            // Read the volume and index from the same validated directory handle.
+            let (volume, index) = mcp_agent_mail_core::disk::windows_file_identity(&directory)
+                .map_err(|error| io_context("read archive directory identity", archive, error))?;
+            Ok(format!(
+                "{volume}:{index}:{:?}",
+                (created.as_secs(), created.subsec_nanos())
+            ))
+        }
+        #[cfg(not(windows))]
+        Ok(format!("{:?}", (created.as_secs(), created.subsec_nanos())))
     }
 }
 
@@ -560,7 +634,7 @@ fn open_lock(path: &Path, create: bool) -> io::Result<File> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestoreState {
     Absent,
-    LegacyIgnored,
+    LegacyIgnored(u32),
     Restored,
     Merged,
     CapacityBlocked,
@@ -568,7 +642,7 @@ enum RestoreState {
 
 enum StoredSnapshot {
     Absent,
-    Legacy,
+    Legacy(u32),
     Current(Snapshot),
 }
 
@@ -825,10 +899,9 @@ impl Store {
             Err(error) => return Err(io_context("read snapshot", &self.path, error)),
         };
         // Inspect the version before requiring the current binding's fields.
-        // Version 1 never recorded the logical database generation. Neither a
-        // matching inode nor a recent saved_at timestamp can prove that an
-        // in-place restore did not reuse its row IDs. Discard every legacy
-        // hint; do not synthesize authority from today's generation value.
+        // Version 1 omitted the logical database generation, and version 2
+        // omitted the archive directory identity. Discard every legacy hint;
+        // do not synthesize its missing authority from today's generation.
         let version: SnapshotVersion = serde_json::from_slice(&bytes).map_err(|error| {
             io_context(
                 "decode snapshot version",
@@ -836,10 +909,10 @@ impl Store {
                 io::Error::new(io::ErrorKind::InvalidData, error),
             )
         })?;
-        if version.version == 1 {
+        if matches!(version.version, 1 | 2) {
             self.check_lock()?;
             check_sidecar(&self.path)?;
-            return Ok(StoredSnapshot::Legacy);
+            return Ok(StoredSnapshot::Legacy(version.version));
         }
         let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(|error| {
             io_context(
@@ -860,9 +933,9 @@ impl Store {
     fn load(&self) -> io::Result<Option<Snapshot>> {
         let snapshot = match self.read_snapshot()? {
             StoredSnapshot::Absent => return Ok(None),
-            StoredSnapshot::Legacy => {
+            StoredSnapshot::Legacy(_) => {
                 return Err(invalid(
-                    "legacy checkpoint cannot establish the previous database generation",
+                    "legacy checkpoint cannot establish the previous database/archive generation",
                 ));
             }
             StoredSnapshot::Current(snapshot) => snapshot,
@@ -876,12 +949,12 @@ impl Store {
     fn restore(&self, cursor: &mut ReconcileCursor) -> io::Result<RestoreState> {
         let snapshot = match self.read_snapshot()? {
             StoredSnapshot::Absent => return Ok(RestoreState::Absent),
-            StoredSnapshot::Legacy => {
+            StoredSnapshot::Legacy(version) => {
                 // A fresh worker starts from its default bounded scan. If
                 // publishing the replacement fails, leave this process's
                 // independently collected progress intact on the next pass;
                 // repeatedly rewinding it would prevent convergence.
-                return Ok(RestoreState::LegacyIgnored);
+                return Ok(RestoreState::LegacyIgnored(version));
             }
             StoredSnapshot::Current(snapshot) => snapshot,
         };
@@ -1140,11 +1213,11 @@ pub(super) fn run(
         match store.restore(cursor) {
             Ok(RestoreState::Restored | RestoreState::Merged) => restored = true,
             Ok(RestoreState::Absent) => {}
-            Ok(RestoreState::LegacyIgnored) => {
+            Ok(RestoreState::LegacyIgnored(version)) => {
                 tracing::info!(
                     target: "maintenance", event = "message_archive_checkpoint_legacy_ignored",
-                    version = 1,
-                    reason = "previous database generation cannot be independently established",
+                    version,
+                    reason = "previous database/archive generation cannot be independently established",
                     "legacy reconciliation hints discarded; bounded reconciliation continues"
                 );
             }
@@ -2436,7 +2509,8 @@ mod tests {
         }
     }
 
-    fn write_legacy_checkpoint(store: &Store, cursor: &ReconcileCursor) -> Vec<u8> {
+    fn write_legacy_checkpoint(store: &Store, cursor: &ReconcileCursor, version: u32) -> Vec<u8> {
+        assert!(matches!(version, 1 | 2));
         let binding = Binding::at(
             &store.binding.database,
             &store.binding.archive,
@@ -2450,11 +2524,12 @@ mod tests {
             mcp_agent_mail_db::now_micros(),
         );
         let mut legacy = serde_json::to_value(snapshot).unwrap();
-        legacy["version"] = serde_json::json!(1);
-        legacy["binding"]
-            .as_object_mut()
-            .unwrap()
-            .remove("database_generation");
+        legacy["version"] = serde_json::json!(version);
+        let binding = legacy["binding"].as_object_mut().unwrap();
+        binding.remove("archive_generation");
+        if version == 1 {
+            binding.remove("database_generation");
+        }
         let bytes = serde_json::to_vec(&legacy).unwrap();
         std::fs::write(&store.path, &bytes).unwrap();
         bytes
@@ -2462,10 +2537,18 @@ mod tests {
 
     #[test]
     fn legacy_checkpoint_cannot_borrow_current_generation_or_rewind_live_progress() {
-        for replacement in ["unchanged", "logical", "physical"] {
+        for (version, replacement) in [
+            (1, "unchanged"),
+            (1, "logical"),
+            (1, "physical"),
+            (2, "unchanged"),
+            (2, "logical"),
+            (2, "physical"),
+            (2, "archive"),
+        ] {
             let (_temp, database, archive) = fixture();
             let old = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
-            let legacy_bytes = write_legacy_checkpoint(&old, &debt(Instant::now()));
+            let legacy_bytes = write_legacy_checkpoint(&old, &debt(Instant::now()), version);
             drop(old);
             let generation = if replacement == "logical" {
                 "11223344"
@@ -2476,13 +2559,17 @@ mod tests {
                 std::fs::rename(&database, database.with_extension("retained-source")).unwrap();
                 std::fs::write(&database, b"replacement database").unwrap();
             }
+            if replacement == "archive" {
+                std::fs::rename(&archive, archive.with_extension("retained-archive")).unwrap();
+                std::fs::create_dir(&archive).unwrap();
+            }
             let current =
                 Store::open(Binding::at(&database, &archive, generation).unwrap()).unwrap();
             let mut cursor = ReconcileCursor::settled_before(999);
             assert_eq!(
                 current.restore(&mut cursor).unwrap(),
-                RestoreState::LegacyIgnored,
-                "{replacement}"
+                RestoreState::LegacyIgnored(version),
+                "version {version}, {replacement}"
             );
             assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
             assert!(cursor.retries.is_empty() && cursor.conflict_backoff.is_empty());
@@ -2506,7 +2593,7 @@ mod tests {
             assert_eq!(std::fs::read(&current.path).unwrap(), legacy_bytes);
             assert_eq!(
                 current.restore(&mut cursor).unwrap(),
-                RestoreState::LegacyIgnored
+                RestoreState::LegacyIgnored(version)
             );
             assert_eq!(
                 (cursor.tail_after, cursor.backfill_ceiling),
@@ -2533,24 +2620,26 @@ mod tests {
 
     #[test]
     fn current_checkpoint_without_generation_is_still_invalid() {
-        let (_temp, database, archive) = fixture();
-        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
-        let bytes = write_legacy_checkpoint(&store, &debt(Instant::now()));
-        let mut current: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        current["version"] = serde_json::json!(SCHEMA_VERSION);
-        std::fs::write(&store.path, serde_json::to_vec(&current).unwrap()).unwrap();
-        let mut cursor = ReconcileCursor::settled_before(999);
-        let error = store.restore(&mut cursor).unwrap_err();
-        assert!(error.to_string().contains("database_generation"), "{error}");
-        assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
-        assert!(cursor.retries.is_empty());
+        for (version, missing) in [(1, "database_generation"), (2, "archive_generation")] {
+            let (_temp, database, archive) = fixture();
+            let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+            let bytes = write_legacy_checkpoint(&store, &debt(Instant::now()), version);
+            let mut current: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            current["version"] = serde_json::json!(SCHEMA_VERSION);
+            std::fs::write(&store.path, serde_json::to_vec(&current).unwrap()).unwrap();
+            let mut cursor = ReconcileCursor::settled_before(999);
+            let error = store.restore(&mut cursor).unwrap_err();
+            assert!(error.to_string().contains(missing), "{error}");
+            assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
+            assert!(cursor.retries.is_empty());
+        }
     }
 
     #[test]
     fn failed_legacy_replacement_cannot_reuse_memory_progress_after_in_place_recovery() {
         super::super::tests::retention_fixture(40, |cx, pool, config| {
             let (store, mut cursor) = seed_obsolete_progress(cx, pool, config);
-            let legacy_bytes = write_legacy_checkpoint(&store, &cursor);
+            let legacy_bytes = write_legacy_checkpoint(&store, &cursor, 1);
             cursor.checkpoint_database_generation = Some(store.binding.database_generation.clone());
             cursor.startup_backfill_complete = true;
             cursor.startup_tail_initialized = true;
@@ -2595,10 +2684,13 @@ mod tests {
 
     #[test]
     fn legacy_checkpoint_restarts_bounded_repair_then_resumes_new_progress() {
-        for changed_generation in [false, true] {
+        if super::super::admission_tests::isolated() {
+            return;
+        }
+        for (version, changed_generation) in [(1, false), (1, true), (2, false), (2, true)] {
             super::super::tests::retention_fixture(40, |cx, pool, config| {
                 let (store, previous) = seed_obsolete_progress(cx, pool, config);
-                let legacy_bytes = write_legacy_checkpoint(&store, &previous);
+                let legacy_bytes = write_legacy_checkpoint(&store, &previous, version);
                 if changed_generation {
                     change_logical_generation(cx, pool, &store.binding.database_generation);
                 }
@@ -3321,6 +3413,17 @@ mod tests {
             before,
             Binding::at(&database, &archive, GENERATION).unwrap()
         );
+        std::fs::create_dir(archive.join("new-project")).unwrap();
+        std::fs::write(
+            archive.join("new-project/message.md"),
+            b"ordinary archive write",
+        )
+        .unwrap();
+        assert_eq!(
+            before,
+            Binding::at(&database, &archive, GENERATION).unwrap(),
+            "ordinary archive writes must not invalidate recovery progress"
+        );
         let other = archive.with_file_name("other-archive");
         std::fs::create_dir(&other).unwrap();
         assert_ne!(
@@ -3336,6 +3439,124 @@ mod tests {
             before,
             Binding::at(&database, &archive, GENERATION).unwrap()
         );
+    }
+
+    #[test]
+    fn checkpoint_publication_refuses_a_replaced_archive_directory() {
+        let (_temp, database, archive) = fixture();
+        let binding = Binding::at(&database, &archive, GENERATION).unwrap();
+        let store = Store::open(binding.clone()).unwrap();
+        store.save(&debt(Instant::now())).unwrap();
+        let published = std::fs::read(&store.path).unwrap();
+        std::fs::rename(&archive, archive.with_extension("retained")).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+
+        let error = store.save(&ReconcileCursor::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("validate publication source"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), published);
+        let current = Binding::at(&database, &archive, GENERATION).unwrap();
+        assert_eq!(current.path().unwrap(), binding.path().unwrap());
+        assert_eq!(current.generation, binding.generation);
+        assert_eq!(current.database_generation, binding.database_generation);
+        assert_ne!(current, binding);
+        drop(store);
+
+        let restarted = Store::open(current).unwrap();
+        let mut cursor = ReconcileCursor::settled_before(999);
+        assert!(restarted.restore(&mut cursor).is_err());
+        assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
+        assert!(cursor.retries.is_empty());
+        assert_eq!(std::fs::read(&restarted.path).unwrap(), published);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_archive_root_does_not_restore_the_previous_roots_scan_progress() {
+        const RESTART_ROOT: &str = "AM_TEST_REPLACED_MESSAGE_ARCHIVE_ROOT";
+        const RESTART_DATABASE: &str = "AM_TEST_REPLACED_MESSAGE_ARCHIVE_DATABASE";
+        if let Some(storage_root) = std::env::var_os(RESTART_ROOT) {
+            // The replacement is observed by a fresh process, so no pool or
+            // archive-path cache can supply the previous directory's authority.
+            mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+                let config = Config {
+                    storage_root: PathBuf::from(storage_root),
+                    database_url: std::env::var(RESTART_DATABASE).unwrap(),
+                    ..Config::default()
+                };
+                let pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                    database_url: config.database_url.clone(),
+                    storage_root: Some(config.storage_root.clone()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+                let cx = Cx::for_testing();
+                let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+                let report =
+                    run(&cx, &pool, &config, &mut cursor, &AtomicBool::new(false)).unwrap();
+                assert!(
+                    !report.checkpoint_restored,
+                    "a new archive at the same path cannot reuse the previous root's watermarks: {report:?}"
+                );
+                assert_eq!(report.checkpoint_saved, Some(true));
+                assert!(
+                    report.repaired > 0,
+                    "the first pass must inspect recent lost mail"
+                );
+                assert_message_committed(&cx, &pool, &config, 941 - super::super::IDS_PER_LANE, 40);
+            });
+            return;
+        }
+
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            for id in 901..=940 {
+                let prepared = super::super::prepare_message(cx, pool, id).unwrap();
+                super::super::reconcile_prepared(config, &prepared).unwrap();
+            }
+            assert_message_committed(cx, pool, config, 940, 40);
+            let old_repo = git2::Repository::open(&config.storage_root).unwrap();
+            let old_head = old_repo.head().unwrap().target().unwrap();
+            drop(old_repo);
+
+            let (store, _) = seed_obsolete_progress(cx, pool, config);
+            let checkpoint_path = store.path.clone();
+            let checkpoint_bytes = std::fs::read(&checkpoint_path).unwrap();
+            drop(store);
+
+            // Preserve every old Git object and working copy. Only the archive
+            // directory changes; the SQLite file and its generation stay intact.
+            let retained_archive = config.storage_root.with_extension("retained");
+            std::fs::rename(&config.storage_root, &retained_archive).unwrap();
+            std::fs::create_dir(&config.storage_root).unwrap();
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_bytes);
+            let name = std::thread::current().name().unwrap().to_string();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(RESTART_ROOT, &config.storage_root)
+                .env(RESTART_DATABASE, &config.database_url)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "restarted archive recovery failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(
+                git2::Repository::open(&retained_archive)
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .target(),
+                Some(old_head),
+                "recovery must leave the retained archive intact"
+            );
+        });
     }
 
     #[test]
