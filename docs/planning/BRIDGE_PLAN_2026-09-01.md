@@ -1,5 +1,47 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 12 current-graph retention review — EmeraldEagle
+
+- [x] Verify governing files/current source and preserve all seven untracked
+  roots. Re-read the last integrity repair and its callers; no further defect
+  is established. Preserve peer ownership and already implemented Beads.
+- [x] Select the current gap: b1003328's real background retention progress
+  tests were never executed natively. Read the budget, pin search, lock and
+  continuation-rest paths; keep original deadline/count/byte/safety conditions.
+- [ ] Execute frozen8024bd9c's predeclared14 native server/DB tests: repeated
+  slow-inventory progress, first-unit sharing, zero/expired and strict budgets,
+  pin-search resumption, source revalidation and recovery exclusion. Preserve
+  every actual nonpass; fix only a demonstrated source defect.
+- [ ] Run both compiler graphs, strict all-targets Clippy and formatter on the
+  same current graph; qualify a new exact snapshot if source changes are needed.
+- [x] Preserve frozen8024bd9c's actual strict-Clippy failure: checkpoint
+  StoredSnapshot has a216-byte variant beside4-byte legacy state. Repair only
+  its representation in027d71f6 with Box<Snapshot> and explicit moves at both
+  readers; preserve serialization, source checks and restore/merge behavior.
+- [x] Attempt frozen027d71f6 qualification; its actual Clippy failure below
+  requires another source repair. Preserve its separate formatter queue
+  refusal103; final55945fc7 formatter passes on the admissible static worker.
+  The final graph below supersedes027 for the mandatory checks/native cohort.
+- [x] Preserve027d71f6's next actual Clippy failure: four existing server
+  lints. Frozen55945fc7 keeps lazy retention branching and effective private
+  visibility; the wait owns the signal guard, Unix reads its atomic flag and
+  Windows keeps mutable polling through the same bounded drain.
+- [x] Attempt55945fc7 strict-Clippy qualification; preserve its actual four
+  test-code failures. In424c680b use checked subtraction for the same original
+  one-millisecond fixture instant, add diagnostic messages to three unchanged
+  empty-failure assertions and repair the same two DB fixture subtractions.
+- [ ] Qualify final424c680b with all four mandatory gates and31 predeclared
+  cases:14 retention,8 checkpoint,3 real-process signal,5 supervisor result
+  and1 real-Git archive route. Earlier snapshots remain distinct evidence.
+- [ ] Re-read any fix and callers with fresh eyes; perform focused final
+  verification and stock scan if code changes. Do not claim full-suite,
+  Windows/macOS, real live-mailbox, soak or release qualification from this lane.
+- [ ] Keep original .29/.5/asldx acceptance and all earlier red results open.
+  br-h6k9b's large drain and20 quiet/10 loaded ext4 acceptance is separate,
+  untouched and unqualified. Record source/executable/case evidence on .29.
+- [ ] Review scope, tracker integrity/cycles and peer changes; publish scoped
+  work/evidence and release exact owned leases, retaining actual receipts.
+
 ## November 12 missing-integrity fresh review — EmeraldEagle
 
 - [x] Verify governing files, published source and seven untracked roots;
