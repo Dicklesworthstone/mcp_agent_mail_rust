@@ -14403,6 +14403,7 @@ pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, Sq
 
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let _ = take_last_unhealthy_reason(path);
     let fingerprint = health_verdict_fingerprint(path);
     if let Some(fingerprint) = &fingerprint
         && healthy_verdict_reusable(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint)
@@ -14444,6 +14445,7 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
 /// refusal to the runtime's first database open.
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool, SqlError> {
+    let _ = take_last_unhealthy_reason(path);
     let fingerprint = health_verdict_fingerprint(path);
     if let Some(fingerprint) = &fingerprint
         && healthy_verdict_reusable(
@@ -14469,6 +14471,8 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
             HealthVerdictVariant::WithoutFamilyCleanup,
             fingerprint,
         );
+    } else {
+        transfer_unhealthy_reason(&staged.path, path);
     }
     Ok(healthy)
 }
@@ -32388,6 +32392,47 @@ mod tests {
                 before,
                 "same-size, same-mtime replacement of {suffix} changes family identity"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_probe_replaces_stale_failure_reasons_after_recovery() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let dir = tempfile::tempdir().expect("probe reason fixture");
+            let path = dir.path().join("source.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            assert!(probe(&path).expect("cache healthy source"));
+            let healthy = std::fs::read(&path).expect("retain healthy source bytes");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let damaged = vec![b'x'; 4096];
+            std::fs::write(&path, &damaged).expect("damage private source");
+            assert!(!probe(&path).expect("observe unhealthy source"));
+            assert!(
+                unhealthy_probe_reasons()
+                    .lock()
+                    .unwrap()
+                    .contains_key(&path),
+                "both health variants must retain the failure under the live path"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            std::fs::write(&path, &healthy).expect("restore private source");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .expect("restore original modification time");
+            assert!(probe(&path).expect("observe restored healthy source"));
+            assert!(
+                take_last_unhealthy_reason(&path).is_none(),
+                "a healthy result must not expose a previous failure reason"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), healthy);
         }
     }
 
