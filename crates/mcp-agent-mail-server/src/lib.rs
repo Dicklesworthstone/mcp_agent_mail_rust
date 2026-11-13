@@ -6896,6 +6896,99 @@ impl Drop for SharedPermitGuard {
     }
 }
 
+/// Cancels detached blocking work if its request future is abandoned. Keeping
+/// the permit with the worker preserves backpressure until it exits or the
+/// existing hard-grace/zombie admission policy takes effect.
+struct DispatchCancellationGuard {
+    method: String,
+    cx: Cx,
+    cancel: DispatchCancel,
+    permit: Option<SharedPermit>,
+}
+
+impl DispatchCancellationGuard {
+    fn disarm(&mut self) {
+        self.permit = None;
+    }
+
+    fn request_cancellation(&mut self, grace_secs: u64) {
+        if let Some(permit) = self.permit.take() {
+            self.cancel.request(&self.cx);
+            schedule_dispatch_hard_grace(self.method.clone(), permit, grace_secs);
+        }
+    }
+}
+
+impl Drop for DispatchCancellationGuard {
+    fn drop(&mut self) {
+        if self.permit.is_some() {
+            self.request_cancellation(configured_dispatch_hard_grace_secs());
+        }
+    }
+}
+
+fn schedule_dispatch_hard_grace(method: String, shared_permit: SharedPermit, grace_secs: u64) {
+    // An abandoned result may already have been produced. Avoid retaining a
+    // watchdog thread when the worker has already released its permit.
+    if shared_permit
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+    {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("dispatch-hard-grace".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(grace_secs));
+            let guard = shared_permit.lock().unwrap_or_else(|e| e.into_inner());
+            // If the worker already finished, its SharedPermitGuard took
+            // and dropped the permit — nothing to reconcile.
+            if let Some(permit) = guard.as_ref() {
+                // The worker thread is still alive and ignoring
+                // cancellation. Do NOT drop the permit here: dropping it
+                // would restore admission capacity while the thread keeps
+                // burning a core, letting retries multiply uncancellable
+                // work without bound (#200). Instead, *transfer* the
+                // accounting from the live-dispatch counter to the zombie
+                // counter and leave the permit with the worker. The slot
+                // stays occupied (inflight+zombie is unchanged) so retries
+                // hit backpressure; when the thread finally exits, its
+                // permit Drop clears the zombie slot.
+                if !permit.zombified.swap(true, Ordering::AcqRel) {
+                    // Record the birth first so the admission scan can
+                    // age this zombie out of capacity accounting after
+                    // the TTL even if its thread never exits (br-zp2bt).
+                    register_dispatch_zombie(permit.id, Instant::now());
+                    DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+                    let zombies = DISPATCH_ZOMBIES.fetch_add(1, Ordering::Relaxed) + 1;
+                    let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
+                    metrics.inflight.sub_saturating(1);
+                    metrics.zombies.add(1);
+                    // Publication of the accounting transition is done.
+                    // Do not retain the permit mutex during diagnostic
+                    // allocation/logging or delay a finishing worker.
+                    drop(guard);
+                    let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
+                    tracing::error!(
+                        method = %method,
+                        grace_secs,
+                        zombies,
+                        lock_activity = ?lock_activity,
+                        lock_observation_complete = lock_activity.is_complete(),
+                        "hard grace timeout: blocking work ignored cancellation; \
+                         accounting it as a zombie that occupies admission capacity \
+                         until its thread exits or the zombie admission TTL elapses \
+                         (AM_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS; prevents \
+                         retry-amplified CPU storms without wedging admission)"
+                    );
+                }
+            }
+        })
+        .ok();
+}
+
 struct DispatchThreadState<T> {
     result: Option<Result<T, McpError>>,
     waker: Option<std::task::Waker>,
@@ -6996,9 +7089,17 @@ where
         Arc::clone(&shared_permit),
         work,
     )?;
+    let mut cancellation_guard = DispatchCancellationGuard {
+        method: method.clone(),
+        cx: dispatch_cx,
+        cancel,
+        permit: Some(shared_permit),
+    };
 
     if dispatch_timeout_secs == 0 {
-        return spawn_future.await;
+        let result = spawn_future.await;
+        cancellation_guard.disarm();
+        return result;
     }
 
     let mut spawn_future = Box::pin(spawn_future);
@@ -7009,64 +7110,13 @@ where
     )
     .await
     {
-        Ok(inner) => inner,
+        Ok(inner) => {
+            cancellation_guard.disarm();
+            inner
+        }
         Err(_elapsed) => {
-            cancel.request(&dispatch_cx);
-
             let grace_secs = configured_dispatch_hard_grace_secs();
-            let grace_permit = Arc::clone(&shared_permit);
-            let grace_method = method.clone();
-            std::thread::Builder::new()
-                .name("dispatch-hard-grace".into())
-                .stack_size(mcp_agent_mail_core::worker_stack_size())
-                .spawn(move || {
-                    std::thread::sleep(Duration::from_secs(grace_secs));
-                    let guard = grace_permit.lock().unwrap_or_else(|e| e.into_inner());
-                    // If the worker already finished, its SharedPermitGuard took
-                    // and dropped the permit — nothing to reconcile.
-                    if let Some(permit) = guard.as_ref() {
-                        // The worker thread is still alive and ignoring
-                        // cancellation. Do NOT drop the permit here: dropping it
-                        // would restore admission capacity while the thread keeps
-                        // burning a core, letting retries multiply uncancellable
-                        // work without bound (#200). Instead, *transfer* the
-                        // accounting from the live-dispatch counter to the zombie
-                        // counter and leave the permit with the worker. The slot
-                        // stays occupied (inflight+zombie is unchanged) so retries
-                        // hit backpressure; when the thread finally exits, its
-                        // permit Drop clears the zombie slot.
-                        if !permit.zombified.swap(true, Ordering::AcqRel) {
-                            // Record the birth first so the admission scan can
-                            // age this zombie out of capacity accounting after
-                            // the TTL even if its thread never exits (br-zp2bt).
-                            register_dispatch_zombie(permit.id, Instant::now());
-                            DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
-                            let zombies = DISPATCH_ZOMBIES.fetch_add(1, Ordering::Relaxed) + 1;
-                            let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
-                            metrics.inflight.sub_saturating(1);
-                            metrics.zombies.add(1);
-                            // Publication of the accounting transition is done.
-                            // Do not retain the permit mutex during diagnostic
-                            // allocation/logging or delay a finishing worker.
-                            drop(guard);
-                            let lock_activity =
-                                mcp_agent_mail_core::lock_order::lock_activity_snapshot();
-                            tracing::error!(
-                                method = %grace_method,
-                                grace_secs,
-                                zombies,
-                                lock_activity = ?lock_activity,
-                                lock_observation_complete = lock_activity.is_complete(),
-                                "hard grace timeout: blocking work ignored cancellation; \
-                                 accounting it as a zombie that occupies admission capacity \
-                                 until its thread exits or the zombie admission TTL elapses \
-                                 (AM_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS; prevents \
-                                 retry-amplified CPU storms without wedging admission)"
-                            );
-                        }
-                    }
-                })
-                .ok();
+            cancellation_guard.request_cancellation(grace_secs);
 
             let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
             tracing::error!(
@@ -7076,7 +7126,7 @@ where
                 lock_activity = ?lock_activity,
                 lock_observation_complete = lock_activity.is_complete(),
                 "blocking dispatch timed out; cancellation requested, \
-                 permit will be force-released after {grace_secs}s grace"
+                 surviving work will be accounted as a zombie after {grace_secs}s grace"
             );
             mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
                 .timeouts_total
@@ -20635,6 +20685,250 @@ mod tests {
             rejections, rejections_before,
             "a server fault must not count as a rejection"
         );
+    }
+
+    #[test]
+    fn dropped_dispatch_cancels_its_worker_without_releasing_the_permit() {
+        with_serialized_dispatch_permits(|| {
+            for timeout_secs in [0, 3600] {
+                let dispatch_cx = runtime_request_cx(Budget::INFINITE);
+                let worker_cx = dispatch_cx.clone();
+                let unrelated_cx = runtime_request_cx(Budget::INFINITE);
+                let cancel = DispatchCancel::new();
+                let permit = DispatchPermit::try_acquire().expect("permit available");
+                let shared_permit = Arc::new(Mutex::new(Some(permit)));
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let mut dispatch = Box::pin(run_cancellable_blocking_dispatch(
+                    "test/abandoned-cooperative".to_string(),
+                    timeout_secs,
+                    dispatch_cx.clone(),
+                    cancel.clone(),
+                    Arc::clone(&shared_permit),
+                    move |cancel| {
+                        let _ = started_tx.send(());
+                        let started = Instant::now();
+                        while started.elapsed() < Duration::from_secs(15) {
+                            if cancel.is_requested() && worker_cx.is_cancel_requested() {
+                                let _ = cancelled_tx.send(());
+                                // Cancellation is observed, but the permit must
+                                // remain with this deliberately unfinished worker.
+                                let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                                return Err(dispatch_cancelled_error());
+                            }
+                            match release_rx.recv_timeout(Duration::from_millis(10)) {
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                // An assertion failure drops the sender and lets
+                                // the detached worker exit without being orphaned.
+                                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(dispatch_cancelled_error())
+                    },
+                ));
+
+                block_on(std::future::poll_fn(|task_cx| {
+                    assert!(dispatch.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                }));
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("blocking worker started");
+                assert!(!cancel.is_requested());
+                assert!(!dispatch_cx.is_cancel_requested());
+
+                drop(dispatch);
+
+                assert!(cancel.is_requested(), "drop must signal the worker token");
+                assert!(
+                    dispatch_cx.is_cancel_requested(),
+                    "drop must also cancel the runtime-backed request context"
+                );
+                assert!(
+                    !unrelated_cx.is_cancel_requested() && unrelated_cx.checkpoint().is_ok(),
+                    "cancelling one request must not cancel another runtime request"
+                );
+                cancelled_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("worker observed both cancellation signals");
+                assert!(
+                    lock_mutex(&shared_permit).is_some(),
+                    "abandoning the request must not release a still-running worker's permit"
+                );
+
+                release_tx.send(()).expect("release the cancelled worker");
+                let release_started = Instant::now();
+                while lock_mutex(&shared_permit).is_some()
+                    && release_started.elapsed() < Duration::from_secs(5)
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    lock_mutex(&shared_permit).is_none(),
+                    "the worker must release its permit when it exits"
+                );
+                assert!(!unrelated_cx.is_cancel_requested());
+            }
+        });
+    }
+
+    #[test]
+    fn completed_dispatch_disarms_cancellation_for_success_error_and_panic() {
+        with_serialized_dispatch_permits(|| {
+            for timeout_secs in [0, 3600] {
+                for outcome in ["success", "error", "panic"] {
+                    let dispatch_cx = runtime_request_cx(Budget::INFINITE);
+                    let cancel = DispatchCancel::new();
+                    let permit = DispatchPermit::try_acquire().expect("permit available");
+                    let shared_permit = Arc::new(Mutex::new(Some(permit)));
+                    let result = block_on(run_cancellable_blocking_dispatch(
+                        "test/completed-cancellation-guard".to_string(),
+                        timeout_secs,
+                        dispatch_cx.clone(),
+                        cancel.clone(),
+                        Arc::clone(&shared_permit),
+                        move |_cancel| -> Result<u8, McpError> {
+                            match outcome {
+                                "success" => Ok(7),
+                                "error" => Err(McpError::new(
+                                    McpErrorCode::InternalError,
+                                    "completed worker error",
+                                )),
+                                _ => std::panic::panic_any("completed worker panic"),
+                            }
+                        },
+                    ));
+
+                    match outcome {
+                        "success" => assert_eq!(result.expect("worker succeeded"), 7),
+                        "error" => assert!(
+                            format!("{:?}", result.expect_err("worker returned an error"))
+                                .contains("completed worker error")
+                        ),
+                        _ => {
+                            let error = format!(
+                                "{:?}",
+                                result.expect_err("worker panic must become an MCP error")
+                            );
+                            assert!(error.contains("Blocking dispatch panicked"));
+                            assert!(error.contains("completed worker panic"));
+                        }
+                    }
+                    assert!(
+                        !cancel.is_requested(),
+                        "completed {outcome} with timeout {timeout_secs} must disarm cancellation"
+                    );
+                    assert!(
+                        !dispatch_cx.is_cancel_requested() && dispatch_cx.checkpoint().is_ok(),
+                        "a completed worker must leave its request context uncancelled"
+                    );
+
+                    // The worker publishes its result just before dropping its
+                    // permit, so allow that final thread-exit step to complete.
+                    let release_started = Instant::now();
+                    while lock_mutex(&shared_permit).is_some()
+                        && release_started.elapsed() < Duration::from_secs(5)
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(lock_mutex(&shared_permit).is_none());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn dropped_dispatch_hard_grace_keeps_surviving_worker_in_admission_accounting() {
+        with_serialized_dispatch_permits(|| {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_DISPATCH_HARD_GRACE_SECS", "5")],
+                || {
+                    let dispatch_cx = runtime_request_cx(Budget::INFINITE);
+                    let cancel = DispatchCancel::new();
+                    let permit = DispatchPermit::try_acquire().expect("permit available");
+                    let permit_id = permit.id;
+                    let inflight_before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+                    let zombies_before = DISPATCH_ZOMBIES.load(Ordering::Relaxed);
+                    let admission_before = inflight_before + dispatch_zombie_admission_count();
+                    let shared_permit = Arc::new(Mutex::new(Some(permit)));
+                    let (started_tx, started_rx) = std::sync::mpsc::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let mut dispatch = Box::pin(run_cancellable_blocking_dispatch(
+                        "test/abandoned-uncooperative".to_string(),
+                        0,
+                        dispatch_cx.clone(),
+                        cancel.clone(),
+                        Arc::clone(&shared_permit),
+                        move |_cancel| {
+                            let _ = started_tx.send(());
+                            // Ignore cancellation, but bound the worker and let
+                            // sender disconnection clean up after failed assertions.
+                            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+                            Ok(())
+                        },
+                    ));
+
+                    block_on(std::future::poll_fn(|task_cx| {
+                        assert!(dispatch.as_mut().poll(task_cx).is_pending());
+                        Poll::Ready(())
+                    }));
+                    started_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("blocking worker started");
+                    drop(dispatch);
+                    assert!(cancel.is_requested());
+                    assert!(dispatch_cx.is_cancel_requested());
+                    assert!(lock_mutex(&shared_permit).is_some());
+
+                    let wait_started = Instant::now();
+                    while !lock_mutex(&shared_permit)
+                        .as_ref()
+                        .is_some_and(|permit| permit.zombified.load(Ordering::Acquire))
+                        && wait_started.elapsed() < Duration::from_secs(8)
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    assert!(
+                        lock_mutex(&shared_permit)
+                            .as_ref()
+                            .is_some_and(|permit| permit.zombified.load(Ordering::Acquire)),
+                        "abandoned work that ignores cancellation must become a zombie"
+                    );
+                    assert!(lock_mutex(&DISPATCH_ZOMBIE_TABLE).contains_key(&permit_id));
+                    assert_eq!(
+                        DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                        inflight_before - 1
+                    );
+                    assert_eq!(DISPATCH_ZOMBIES.load(Ordering::Relaxed), zombies_before + 1);
+                    assert_eq!(
+                        DISPATCH_INFLIGHT.load(Ordering::Relaxed)
+                            + dispatch_zombie_admission_count(),
+                        admission_before,
+                        "hard grace must preserve admission occupancy while the worker survives"
+                    );
+
+                    release_tx.send(()).expect("release the surviving worker");
+                    let release_started = Instant::now();
+                    while lock_mutex(&shared_permit).is_some()
+                        && release_started.elapsed() < Duration::from_secs(5)
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(lock_mutex(&shared_permit).is_none());
+                    assert!(!lock_mutex(&DISPATCH_ZOMBIE_TABLE).contains_key(&permit_id));
+                    assert_eq!(DISPATCH_ZOMBIES.load(Ordering::Relaxed), zombies_before);
+                    assert_eq!(
+                        DISPATCH_INFLIGHT.load(Ordering::Relaxed)
+                            + dispatch_zombie_admission_count(),
+                        admission_before - 1,
+                        "admission occupancy must drain when the abandoned worker finally exits"
+                    );
+                },
+            );
+        });
     }
 
     #[test]
