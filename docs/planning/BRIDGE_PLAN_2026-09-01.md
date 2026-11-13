@@ -12,6 +12,11 @@
 - [x] Force a committed generation change after source open/before copy and
   immediately after copy. Independently reopen each image and compare headers
   with its generation/payload; challenge that oracle with a real mixed image.
+- [x] Write a deterministic overlapping-writer control: hold a real transaction
+  with changed headers/payload through the complete native copy, then roll it
+  back. Require the old committed image or a lock/busy refusal before publishing;
+  verify source-family neutrality and log which branch each source engine took.
+  This closes the timing gap in the phase cuts; execution remains pending.
 - [x] Extend the existing isolated CLI archive harness with nonzero headers,
   unknown schema/payload/sequence/trigger and structured secret-free phases.
   Exercise the actual save/restore binaries and independent canonical reopen.
@@ -24,6 +29,8 @@
   Frozen9b8e4e8d:51 DB/share cases (original49 plus2 new) and3 real CLI
   cases (new header save/restore plus original failure/retry and dry-run).
   Same predicates, profiles and budgets. No new TUI/transport/soak claim.
+  Preserve these active requests; the additional writer-overlap case will
+  qualify at its own frozen source after they finish, without double-counting.
 - [ ] Run formatter first, then both workspace compiler graphs and strict
   all-target Clippy on the frozen final source. Complete actual job recovery.
 - [ ] Compare .52 original acceptance against actual evidence; do not close on

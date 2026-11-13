@@ -2269,6 +2269,83 @@ mod tests {
     }
 
     #[test]
+    fn full_archive_cannot_mix_an_active_writers_uncommitted_header_and_payload() {
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("active-writer.sqlite3");
+            let destination = directory.path().join("active-writer-copy.sqlite3");
+            let writer: Box<dyn SnapshotSource> = if live {
+                Box::new(DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                Box::new(private_source(&source))
+            };
+            writer
+                .execute_snapshot(
+                    "PRAGMA user_version=231; PRAGMA application_id=4242; \
+                     CREATE TABLE archive_generation(label TEXT NOT NULL, payload BLOB NOT NULL); \
+                     INSERT INTO archive_generation VALUES('committed',X'00FF')",
+                )
+                .unwrap();
+            // Keep this transaction alive for the entire actual VACUUM, not
+            // merely a before/after phase callback. No scheduling or timing
+            // assumption is needed to overlap the writer with the copy.
+            writer
+                .execute_snapshot(
+                    "BEGIN IMMEDIATE; PRAGMA user_version=232; PRAGMA application_id=4343; \
+                     UPDATE archive_generation SET label='uncommitted',payload=X'0102'",
+                )
+                .unwrap();
+            let before = archive_source_family(&source);
+            let result = if live {
+                create_full_archive_snapshot_with_progress(&source, &destination, &mut |_| Ok(()))
+            } else {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    &source,
+                    &destination,
+                    &mut |_| Ok(()),
+                )
+            };
+            let after = archive_source_family(&source);
+            // End our owned transaction before assertions can unwind.
+            writer.execute_snapshot("ROLLBACK").unwrap();
+            drop(writer);
+            assert_eq!(
+                after, before,
+                "the reader must not change the writer's family"
+            );
+
+            if result.is_ok() {
+                assert_eq!(
+                    archive_generation(&destination),
+                    (231, 4242, "committed".into(), "00FF".into()),
+                    "a copy may not expose any part of the uncommitted transaction"
+                );
+                eprintln!("archive_writer_overlap runtime_source={live} outcome=copied_committed");
+            } else {
+                // Some source engines refuse a concurrent writer. That is
+                // permitted only as a lock/busy refusal before publication.
+                let busy = match &result {
+                    Err(ShareError::Sqlite { message }) => {
+                        let message = message.to_ascii_lowercase();
+                        message.contains("busy") || message.contains("locked")
+                    }
+                    Err(ShareError::Io(error)) => matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ),
+                    _ => false,
+                };
+                assert!(busy, "unexpected active-writer refusal: {result:?}");
+                assert!(matches!(
+                    std::fs::symlink_metadata(&destination),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ));
+                eprintln!("archive_writer_overlap runtime_source={live} outcome=busy_refusal");
+            }
+        }
+    }
+
+    #[test]
     fn full_archive_reads_committed_wal_without_mutating_source_family() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("wal-archive.sqlite3");
