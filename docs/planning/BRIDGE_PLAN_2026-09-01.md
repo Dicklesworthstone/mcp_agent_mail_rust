@@ -193,7 +193,10 @@
     - [x] Workspace all-targets0, strict RCH1864.4s, worker1149989.
     - [x] Strict all-target Clippy0, strict RCH491.5s, same warmed worker;
       actual in-run34 primary and4 core package hashes match the candidate.
-    - [ ] Native53 final runtime cohort, worker1227854; retain exact census/ELFs.
+    - [x] Native53 final runtime cohort0, worker1227854, strict RCH5776.8s;
+      actual execution53/53PASS,4852skipped,12.144s, forced WAL consistent_copy.
+      Exact names match29DB+24share with no missing/extra. Stable actual DB
+      ELF5365a02d/share7d0bef6a and the full census are retained.
     - [ ] Real CLI3 final runtime cohort, worker1156319; retain actual am/it ELFs.
     - [ ] Re-evaluate unchanged .52 acceptance, publish metadata/closure only
       when all decisive gates pass, verify both public refs and release own leases.
