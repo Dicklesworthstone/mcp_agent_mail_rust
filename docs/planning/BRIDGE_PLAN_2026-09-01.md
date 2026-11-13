@@ -1,5 +1,27 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 13 fresh startup review — EmeraldEagle, 20:16 UTC
+
+- [x] Confirm tracked4c95d1e2 is unchanged; reread the watchdog state,
+  completion predicate, worker ownership, native-context cancellation and
+  startup readiness callers. No new watchdog defect established.
+- [x] Read original .87/.90 descriptions and retained failures. Their full
+  initializer, delayed/in-flight, post-shutdown mutation, restart and deadline
+  requirements remain intact. Older native-review9 receipts are not available
+  at their cited local path; do not reconstruct their33-case predicate.
+- [ ] Verify the retained current server ELF98f84c31 and source equality to
+  the current checkout, then execute13 explicitly named startup/serving-pool
+  probes through strict RCH, one exact case per isolated process. Preserve
+  original bodies,1800s per-body buckets and30GiB/10GiB admission limits.
+  These are selected diagnostics, not the missing original33x2 population.
+- [ ] Classify every real result, fix only demonstrated implementation or
+  fixture defects, and rerun the affected real paths plus required compiler
+  gates after any source change. Preserve all original negative outcomes.
+- [ ] Reread archive header/row handoff and regression callers again; perform
+  a second source review after fixes and retain any remaining acceptance gaps.
+- [ ] Update only owned Beads with actual evidence, finish the existing
+  honesty audit, publish scoped work and release the planning reservation.
+
 ## November 13 archive generation review — EmeraldEagle, 07:01 UTC
 
 - [x] Verify unchanged governing files, clean tracked51164443 and preserved
