@@ -585,12 +585,28 @@ fn publish_sqlite_snapshot_image(
     destination: &Path,
     sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<(), ShareError> {
-    // Staging uses synchronous=OFF, so flush the completed image first. Windows
-    // FlushFileBuffers requires write access; File::open is read-only there.
-    let image = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(staged)?;
+    // SQLite may create the image with group/world-readable permissions. The
+    // private staging directory hides those bytes only until publication;
+    // full archives and pre-scrub projections can contain registration tokens.
+    // Bind permission changes to a regular, unaliased handle before exposing
+    // another name. Windows FlushFileBuffers also requires write access.
+    let image = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(staged)?;
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt as _;
+        image.metadata()?.nlink()
+    };
+    #[cfg(windows)]
+    let links = mcp_agent_mail_core::disk::windows_file_link_count(&image)?;
+    #[cfg(any(unix, windows))]
+    if links != 1 {
+        return Err(ShareError::Validation {
+            message: "snapshot staging image must have exactly one hard link".to_string(),
+        });
+    }
+    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&image)?;
+    // Staging uses synchronous=OFF, so persist both data and private metadata
+    // before the no-clobber link makes the completed image visible.
     image.sync_all()?;
 
     // Unlike rename, hard_link atomically refuses every occupied destination,
@@ -4103,6 +4119,149 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_applies_private_mode_before_linking() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for mode in [0o644, 0o664, 0o666] {
+            let dir = tempfile::tempdir().unwrap();
+            let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+            let staged = stage_dir.path().join("private.sqlite3");
+            let destination = dir.path().join("published.sqlite3");
+            let conn = private_source(&staged);
+            conn.execute_raw(
+                "CREATE TABLE private_state(value TEXT); \
+                 INSERT INTO private_state VALUES('synthetic registration token')",
+            )
+            .unwrap();
+            drop(conn);
+            let expected = std::fs::read(&staged).unwrap();
+            // Model SQLite's creation mode explicitly, independently of the
+            // test runner's umask and without changing process-global state.
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            publish_sqlite_snapshot(stage_dir, &staged, &destination, |parent| {
+                assert_eq!(
+                    std::fs::metadata(&destination)?.permissions().mode() & 0o777,
+                    0o600,
+                    "the published link must already be private at the durability barrier"
+                );
+                sync_snapshot_parent(parent)
+            })
+            .unwrap();
+
+            assert_eq!(std::fs::read(&destination).unwrap(), expected);
+            assert_eq!(
+                std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                private_source(&destination)
+                    .query_sync("SELECT value FROM private_state", &[])
+                    .unwrap()[0]
+                    .get_named::<String>("value")
+                    .unwrap(),
+                "synthetic registration token"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_refuses_aliased_staging_without_changing_target() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        for symlink in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+            let staged = stage_dir.path().join("private.sqlite3");
+            let destination = dir.path().join("published.sqlite3");
+            let target = dir.path().join("unrelated.sqlite3");
+            std::fs::write(&target, b"unrelated private bytes").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o664)).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&target, &staged).unwrap();
+            } else {
+                std::fs::hard_link(&target, &staged).unwrap();
+            }
+            let before = std::fs::metadata(&target).unwrap();
+
+            publish_sqlite_snapshot(stage_dir, &staged, &destination, |_| {
+                panic!("aliased staging must fail before publication");
+            })
+            .expect_err("staging must not change permissions through an alias");
+
+            let after = std::fs::metadata(&target).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"unrelated private bytes");
+            assert_eq!(after.permissions().mode(), before.permissions().mode());
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(after.nlink(), before.nlink());
+            assert_eq!(
+                std::fs::symlink_metadata(&staged)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                symlink,
+                "refused staging must remain available for inspection"
+            );
+            assert!(matches!(
+                std::fs::symlink_metadata(&destination),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_pipelines_publish_private_database_images() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite3");
+        let conn = private_source(&source);
+        seed_reply_metadata_source(&conn, false);
+        conn.execute_raw(
+            "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+             UPDATE agents SET registration_token='synthetic registration token'",
+        )
+        .unwrap();
+        drop(conn);
+        let source_before = std::fs::read(&source).unwrap();
+
+        for full in [false, true] {
+            let destination = dir.path().join(if full {
+                "full.sqlite3"
+            } else {
+                "projected.sqlite3"
+            });
+            if full {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    &source,
+                    &destination,
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+            } else {
+                create_private_canonical_sqlite_snapshot(&source, &destination, false).unwrap();
+            }
+            assert_eq!(
+                std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "both full archives and pre-scrub projections must be private"
+            );
+            assert_eq!(
+                private_source(&destination)
+                    .query_sync("SELECT registration_token FROM agents", &[])
+                    .unwrap()[0]
+                    .get_named::<String>("registration_token")
+                    .unwrap(),
+                "synthetic registration token"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        }
+    }
+
     #[test]
     fn snapshot_publication_preserves_raced_destination_and_private_image() {
         let dir = tempfile::tempdir().unwrap();
@@ -4112,6 +4271,13 @@ mod tests {
         std::fs::write(&staged, b"complete private snapshot").unwrap();
         assert!(!destination.exists(), "name was available when selected");
         std::fs::write(&destination, b"another publisher won").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o664)).unwrap();
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o664)).unwrap();
+        }
 
         let error = publish_sqlite_snapshot(stage_dir, &staged, &destination, |_| {
             panic!("a collision must fail before the success durability barrier")
@@ -4130,6 +4296,21 @@ mod tests {
             std::fs::read(&staged).unwrap(),
             b"complete private snapshot"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "a refused publication must retain a private image"
+            );
+            assert_eq!(
+                std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o664,
+                "the winning publisher's permissions must remain unchanged"
+            );
+        }
     }
 
     #[cfg(unix)]
