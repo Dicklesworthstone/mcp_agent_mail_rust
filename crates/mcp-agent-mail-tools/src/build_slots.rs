@@ -384,6 +384,7 @@ enum SlotOperation {
 
 fn enforce_slot_lifecycle(
     agent: &mcp_agent_mail_db::AgentRow,
+    deregistered_at: Option<i64>,
     operation: SlotOperation,
 ) -> McpResult<()> {
     // Withdrawing existing work must remain possible after retirement. This
@@ -391,17 +392,17 @@ fn enforce_slot_lifecycle(
     if matches!(operation, SlotOperation::Release) {
         return Ok(());
     }
-    let (code, state) =
-        if mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
+    let (code, state) = if deregistered_at.is_some()
+        || mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
             &agent.task_description,
         ) {
-            // Imported Python tombstones need not also carry retired_at.
-            ("AGENT_DEREGISTERED", "deregistered")
-        } else if agent.retired_at.is_some() {
-            ("AGENT_RETIRED", "retired")
-        } else {
-            return Ok(());
-        };
+        // Imported Python tombstones need not also carry retired_at.
+        ("AGENT_DEREGISTERED", "deregistered")
+    } else if agent.retired_at.is_some() {
+        ("AGENT_RETIRED", "retired")
+    } else {
+        return Ok(());
+    };
     let action = match operation {
         SlotOperation::Acquire => "acquire",
         SlotOperation::Renew => "renew",
@@ -433,8 +434,13 @@ async fn resolve_authorized_agent_name(
 ) -> McpResult<String> {
     let agent_name = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
         .unwrap_or_else(|| agent_name.to_string());
-    let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name)
-        .await
+    let mut agent = match mcp_agent_mail_db::queries::get_agent(
+        ctx.cx(),
+        pool,
+        project_id,
+        &agent_name,
+    )
+    .await
     {
         asupersync::Outcome::Ok(agent) => agent,
         asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
@@ -450,7 +456,28 @@ async fn resolve_authorized_agent_name(
         other => db_outcome_to_mcp_result(other)?,
     };
     crate::session_identity::authorize_actor(ctx, &agent, false, "manage build slots")?;
-    enforce_slot_lifecycle(&agent, operation)?;
+    let deregistered_at = if !matches!(operation, SlotOperation::Release)
+        && let Some(agent_id) = agent.id
+    {
+        // Resolve the canonical identity as before, but never use its cached
+        // lifecycle to admit new filesystem work. Another process can retire
+        // it without invalidating this process's cache, and a permanent ledger
+        // entry is authoritative even when the profile has no tombstone text.
+        agent = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_agent_by_id_fresh(ctx.cx(), pool, agent_id).await,
+        )?;
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, agent_id).await,
+        )?
+    } else {
+        // Cleanup stays available to authorized inactive and trusted-local
+        // unregistered holders; it never admits new work.
+        None
+    };
+    // The database reads can yield; keep session authority and cancellation
+    // checks current for the refreshed identity before touching lease files.
+    crate::session_identity::authorize_actor(ctx, &agent, false, "manage build slots")?;
+    enforce_slot_lifecycle(&agent, deregistered_at, operation)?;
     Ok(agent.name)
 }
 
@@ -1650,23 +1677,23 @@ mod tests {
             SlotOperation::Renew,
             SlotOperation::Release,
         ] {
-            enforce_slot_lifecycle(&agent, operation).unwrap();
+            enforce_slot_lifecycle(&agent, None, operation).unwrap();
         }
         agent.retired_at = Some(5_000_000);
         for operation in [SlotOperation::Acquire, SlotOperation::Renew] {
-            let error = enforce_slot_lifecycle(&agent, operation).unwrap_err();
+            let error = enforce_slot_lifecycle(&agent, None, operation).unwrap_err();
             assert_eq!(crate::tool_error_code(&error), Some("AGENT_RETIRED"));
         }
-        enforce_slot_lifecycle(&agent, SlotOperation::Release).unwrap();
+        enforce_slot_lifecycle(&agent, None, SlotOperation::Release).unwrap();
         for retired_at in [None, Some(5_000_000)] {
             agent.retired_at = retired_at;
             agent.task_description =
                 "[DEREGISTERED at 2026-10-01 00:00:00] imported identity".into();
             for operation in [SlotOperation::Acquire, SlotOperation::Renew] {
-                let error = enforce_slot_lifecycle(&agent, operation).unwrap_err();
+                let error = enforce_slot_lifecycle(&agent, None, operation).unwrap_err();
                 assert_eq!(crate::tool_error_code(&error), Some("AGENT_DEREGISTERED"));
             }
-            enforce_slot_lifecycle(&agent, SlotOperation::Release).unwrap();
+            enforce_slot_lifecycle(&agent, None, SlotOperation::Release).unwrap();
         }
     }
 
@@ -2096,6 +2123,192 @@ mod tests {
                 .unwrap();
                 assert!(row.retired_at.is_none());
                 assert!(row.task_description.starts_with("[DEREGISTERED "));
+            });
+        });
+    }
+
+    #[test]
+    fn public_slots_refuse_ledger_only_deregistration_and_preserve_release() {
+        lifecycle_mailbox(|ctx, pool, config, key| {
+            fastmcp_core::block_on(async {
+                crate::session_identity::bind(ctx, 71, 81, "BlueLake");
+                acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "existing".into(),
+                    Some(3600),
+                    None,
+                )
+                .await
+                .unwrap();
+                let root = project_archive_root(config, "slot-lifecycle");
+                let path = lease_path_for_holder(&slot_dir(&root, "existing"), "BlueLake", None);
+                let before = std::fs::read(&path).unwrap();
+                let external = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+                external
+                    .execute_raw("INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(81, 123)")
+                    .unwrap();
+                drop(external);
+
+                // A normal profile is not proof of active lifecycle state.
+                let profile = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, 71, "BlueLake").await,
+                )
+                .unwrap();
+                assert!(profile.retired_at.is_none());
+                assert_eq!(profile.task_description, "active");
+                let acquire = acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "new-work".into(),
+                    None,
+                    None,
+                )
+                .await;
+                let renew =
+                    renew_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into(), None)
+                        .await;
+                for result in [acquire, renew] {
+                    assert_eq!(
+                        result.as_ref().err().and_then(crate::tool_error_code),
+                        Some("AGENT_DEREGISTERED")
+                    );
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(!slot_dir(&root, "new-work").exists());
+                let released =
+                    release_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into())
+                        .await
+                        .unwrap();
+                assert!(
+                    serde_json::from_str::<ReleaseBuildSlotResponse>(&released)
+                        .unwrap()
+                        .released
+                );
+                assert!(stored_lease(&path).released_ts.is_some());
+                assert_eq!(
+                    db_outcome_to_mcp_result(
+                        mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, 81)
+                            .await,
+                    )
+                    .unwrap(),
+                    Some(123)
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn public_slots_recheck_external_retirement_before_file_mutation() {
+        lifecycle_mailbox(|ctx, pool, config, key| {
+            fastmcp_core::block_on(async {
+                acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "existing".into(),
+                    Some(3600),
+                    None,
+                )
+                .await
+                .unwrap();
+                let root = project_archive_root(config, "slot-lifecycle");
+                let path = lease_path_for_holder(&slot_dir(&root, "existing"), "BlueLake", None);
+                let before = std::fs::read(&path).unwrap();
+                let external = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+                external
+                    .execute_raw("UPDATE agents SET retired_at = 123 WHERE id = 81")
+                    .unwrap();
+                drop(external);
+                let cached = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, 71, "BlueLake").await,
+                )
+                .unwrap();
+                assert!(
+                    cached.retired_at.is_none(),
+                    "fixture must retain stale cached authority"
+                );
+                let acquire = acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "new-work".into(),
+                    None,
+                    None,
+                )
+                .await;
+                let renew =
+                    renew_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into(), None)
+                        .await;
+                for result in [acquire, renew] {
+                    assert_eq!(
+                        result.as_ref().err().and_then(crate::tool_error_code),
+                        Some("AGENT_RETIRED")
+                    );
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(!slot_dir(&root, "new-work").exists());
+                let released =
+                    release_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into())
+                        .await
+                        .unwrap();
+                assert!(
+                    serde_json::from_str::<ReleaseBuildSlotResponse>(&released)
+                        .unwrap()
+                        .released
+                );
+                assert!(stored_lease(&path).released_ts.is_some());
+            });
+        });
+    }
+
+    #[test]
+    fn public_slots_observe_external_unretirement_despite_cached_retirement() {
+        lifecycle_mailbox(|ctx, pool, _, key| {
+            fastmcp_core::block_on(async {
+                db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::set_agent_retired_at(ctx.cx(), pool, 81, Some(123))
+                        .await,
+                )
+                .unwrap();
+                let external = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+                external
+                    .execute_raw("UPDATE agents SET retired_at = NULL WHERE id = 81")
+                    .unwrap();
+                drop(external);
+                let cached = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, 71, "BlueLake").await,
+                )
+                .unwrap();
+                assert_eq!(cached.retired_at, Some(123));
+                let acquired = acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "resumed".into(),
+                    Some(3600),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<AcquireBuildSlotResponse>(&acquired)
+                        .unwrap()
+                        .granted
+                        .agent,
+                    "BlueLake"
+                );
+                let renewed =
+                    renew_build_slot(ctx, key.into(), "BlueLake".into(), "resumed".into(), None)
+                        .await
+                        .unwrap();
+                assert!(
+                    serde_json::from_str::<RenewBuildSlotResponse>(&renewed)
+                        .unwrap()
+                        .renewed
+                );
             });
         });
     }
