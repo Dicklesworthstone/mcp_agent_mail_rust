@@ -20980,6 +20980,26 @@ mod tests {
 
     #[test]
     fn dispatch_zombie_transfer_never_exposes_a_vacant_admission_slot() {
+        const CHILD: &str = "AM_TEST_DISPATCH_ZOMBIE_TRANSFER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Filling all process-global slots must not interfere with other
+            // handler tests running concurrently under the standard test runner.
+            let test_name = std::thread::current()
+                .name()
+                .expect("current test name")
+                .to_owned();
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated admission transfer regression");
+            assert!(
+                status.success(),
+                "isolated admission transfer regression failed"
+            );
+            return;
+        }
+        assert_eq!(std::env::var(CHILD).unwrap(), "1");
         with_serialized_dispatch_permits(|| {
             let mut held: Vec<_> = (0..MAX_CONCURRENT_DISPATCHES)
                 .map(|_| DispatchPermit::try_acquire().expect("fill real admission capacity"))
@@ -20993,7 +21013,9 @@ mod tests {
                 transferred_id,
                 Box::new(move || {
                     let _ = entered_tx.send(());
-                    let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+                    // The test owns the only sender: resuming or unwinding
+                    // releases this cut, without a timer racing admission.
+                    let _ = resume_rx.recv();
                 }),
             ));
             // Invoke the real transfer immediately; production callers still

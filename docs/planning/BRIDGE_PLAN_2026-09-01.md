@@ -9,18 +9,104 @@
   initializer, delayed/in-flight, post-shutdown mutation, restart and deadline
   requirements remain intact. Older native-review9 receipts are not available
   at their cited local path; do not reconstruct their33-case predicate.
-- [ ] Verify the retained current server ELF98f84c31 and source equality to
-  the current checkout, then execute13 explicitly named startup/serving-pool
+- [x] Check the retained server ELF98f84c31: its cited115 worker path and
+  project target cache are absent; the cause is unknown. The guard returns1.
+  The following orchestration incorrectly continued and used incompatible
+  RCH `--job --source-content-receipt` options, returning2 before any test.
+  Preserve both failures; neither is native evidence. Enforce complete guard
+  success before further submission. Do not invent or replay an old receipt.
+- [x] Finish the admitted122 worker build-only preparation at frozen4c95;
+  capture its actual ELF, then execute13 explicitly named startup/serving-pool
   probes through strict RCH, one exact case per isolated process. Preserve
   original bodies,1800s per-body buckets and30GiB/10GiB admission limits.
   These are selected diagnostics, not the missing original33x2 population.
-- [ ] Classify every real result, fix only demonstrated implementation or
+  Preparation returns0 after112m34s with zero tests. Actual stable ELF42444d52
+  then runs13/13PASS through strict RCH; all exact native results and private
+  environments are retained in review21-baseline-startup.log. A bounded lookup
+  of old build10177 finds no command in an incomplete job listing; its original
+  population remains unrecovered rather than replaced by a new predicate.
+- [x] Classify every real result, fix only demonstrated implementation or
   fixture defects, and rerun the affected real paths plus required compiler
   gates after any source change. Preserve all original negative outcomes.
-- [ ] Reread archive header/row handoff and regression callers again; perform
+- [x] Find the live-to-zombie admission vacancy in the modified scheduler:
+  publishing the live decrement before the zombie increment admits work
+  while the original permit is still held. Publish zombie first, then release
+  the live count; admission acquires that publication. Retain all grace/TTL
+  and capacity values. Add an identity-bound test-only pause at the decrement.
+- [x] Execute the consequential old-order control and corrected regression
+  with real admission permits; rerun existing worker/HTTP controls and all
+  required compiler graphs, formatting and stock UBS. This is internal
+  admission evidence, not a128-worker load or original .90 population claim.
+  Actual51daba40 control:1FAIL at the intended over-admission assertion,
+  native exit100,0.026s; no build/timeout substitution. Corrected2d428fcd:
+  all26 predeclared unique cases PASS,5590skipped,82.092s, native/RCH0.
+  All37 captured code/config files (including the HTTP fixture) match source.
+- [x] Retain the executed negative and final test ELF outside the disposable
+  pooled path before it is reused. The missing old ELF caused the112m cold
+  preparation; two private byte-verified copies avoid repeating that loss.
+  Negative ELFd09ff023/362005280bytes and fixed792da1b2/362001784bytes
+  live under worker122 /data/tmp/am-review21-retained-y9tw_6i9/. Their hashes
+  remain stable through a fresh exact-test replay: expected native101 for the
+  old order and0 for the correction. These repeats add no unique test credit.
+- [x] On the final qualified ELF, run the unchanged GH374 HTTP cancellation
+  case as existing UID1000 in a private environment through strict RCH.
+  Preserve its30s request,5s cleanup and8-message controls; count this as a
+  second user-context execution of the same case, not a new unique case.
+  Real native /proc UID fields are1000/1000/1000/1000. Same fixed ELF792da1b2
+  passes: timeout30001ms, pending0/0, total1/active0/idle1, followup21/14ms;
+  dispatch drains before held lease release, eight messages and all13 recipient
+  read/ack rows stay unchanged. Root cohort has30002ms and followup20/10ms.
+  Private UID1000 copy is retained; replay-user job terminal0, no timeout.
+- [x] Keep the old-order control outside the shared working source: private
+  index commit55a2eae1 moves only the zombie increment below the unchanged
+  pause hook. Canonical cdb96f4d stays corrected, server SHA3824ba23. This
+  unexecuted control is superseded after the second review isolates the
+  saturation test from concurrent standard-runner handler tests: candidate
+  970431c8/server SHA96cdb024 and matching old-order controlba66995c. Private
+  objects do not change HEAD, the normal index or canonical source.
+- [x] Finish the admitted cdb96 all-targets check on115:0,32m08s. Repeat on
+  final970431c8/server96cdb024:0,2m46s. Capture all36 code/config hashes and
+  the clean4314e888 dependency while Cargo is active; final hashes match the
+  frozen candidate. Pinned rustc908501772 is unchanged. Cargo retains the
+  proc-macro-error2 future-compatibility warning; no warning suppression.
+- [x] Isolated-test source96cdb024 formatter0 through strict RCH and stock server UBS0:
+  0critical/3799warnings/1879info, failed_modules[]. Formatter first refuses
+  103 because its default4-slot estimate exceeds this worker's total3;
+  actual formatter work is then requested at1slot and completes normally.
+  The earlier fmt/UBS0 applies to SHA3824ba23 only (3794 warnings/1878 info).
+- [x] Finish the separate970431c8 production graph check:0,8m04s;
+  strict workspace all-targets Clippy `-D warnings`:0,7m37s. Both active
+  worker captures match all36 candidate code/config hashes and the same
+  immutable core/toolchain. Original feature graphs and criteria are intact.
+- [x] Reread the new test's pause lifetime: its5s resume timer can expire
+  before a delayed admission attempt, missing the forbidden interleaving.
+  Keep the cut until its sole test-owned sender sends or drops on unwind.
+  The5s arrival bound, production grace/TTL and testcase deadline are intact.
+  Freeze2d428fcd/serverded59841 with matching old-order control51daba40;
+  their diff remains only the zombie increment's position. Earlier controls
+  are unexecuted snapshots, not additional native negatives.
+- [x] Repeat required checks on2d428fcd/serverded59841: all-targets0,2m36s;
+  separate production0,50.26s; strict Clippy0; formatter0 and stock server
+  UBS0critical/3799warnings/1879info/failed_modules[]. All three active
+  compiler captures match36 candidate files and the pinned core/toolchain.
+  Preserve prior970 passes with their own source. Final native26/26 and the
+  separate retained-image/UID1000 replay are recorded above.
+  The first compiler attempt used nextest's `--build-jobs` with Cargo and
+  failed1 before compilation. Its receipt is retained; corrected `-j 1`
+  check2 then passes after a fresh complete guard. No failed invocation is
+  converted into native credit or removed from the retained receipts.
+- [x] Reread archive header/row handoff and regression callers again; perform
   a second source review after fixes and retain any remaining acceptance gaps.
-- [ ] Update only owned Beads with actual evidence, finish the existing
-  honesty audit, publish scoped work and release the planning reservation.
+  Header and row hydration share their transaction. The uninitialized-header
+  question establishes no new regression against the old checked-header path.
+  Review the cancellation receiver, spawn failure, permit drop, predicate and
+  wakeup paths again; no further implementation defect is established.
+- [x] Update only owned .87/.90 with actual evidence and finish the existing
+  honesty audit. Keep original initializer/warmup,33x2, quiet/loaded deadlines
+  and other full acceptance open; no closure or acceptance/graph change.
+  Prepare the scoped code/tracker/doc publication. Exact subsequent Git ref
+  verification and release of own1783/1792 leases are recorded after execution
+  in /data/tmp/am-archive-reader-20261110.t7ueMuTt/review-audit.md.
 
 ## November 13 archive generation review — EmeraldEagle, 07:01 UTC
 
