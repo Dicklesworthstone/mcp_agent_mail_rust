@@ -6513,6 +6513,11 @@ const MAX_CONCURRENT_DISPATCHES: u32 = 128;
 /// is still within its timeout window and accounted as a live dispatch).
 static DISPATCH_INFLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(test)]
+type DispatchZombieTransferHook = (u64, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static DISPATCH_ZOMBIE_TRANSFER_HOOK: Mutex<Option<DispatchZombieTransferHook>> = Mutex::new(None);
+
 /// Atomic counter tracking *zombie* dispatches: blocking work that outlived its
 /// timeout and hard grace so its dispatch slot was force-released, but whose OS
 /// thread is still alive and burning CPU because the work below the dispatch
@@ -6660,9 +6665,9 @@ impl DispatchPermit {
     /// keep being tracked until their thread exits, but they can no longer
     /// consume admission capacity forever.
     fn try_acquire() -> Option<Self> {
-        // Relaxed ordering is fine: the counter is advisory and races between
-        // concurrent fetch_add calls are harmless (off-by-one at most).
-        let prev = DISPATCH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+        // Pair with the release of a live slot during zombie transfer. Seeing
+        // that lower live count must also observe the preceding zombie entry.
+        let prev = DISPATCH_INFLIGHT.fetch_add(1, Ordering::Acquire);
         let zombies = dispatch_zombie_admission_count();
         if prev.saturating_add(zombies) >= MAX_CONCURRENT_DISPATCHES {
             DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
@@ -6978,7 +6983,7 @@ fn schedule_dispatch_hard_grace(
                 // work without bound (#200). Instead, *transfer* the
                 // accounting from the live-dispatch counter to the zombie
                 // counter and leave the permit with the worker. The slot
-                // stays occupied (inflight+zombie is unchanged) so retries
+                // stays occupied (the transfer never lowers the sum) so retries
                 // hit backpressure; when the thread finally exits, its
                 // permit Drop clears the zombie slot.
                 if !permit.state.zombified.swap(true, Ordering::AcqRel) {
@@ -6986,8 +6991,25 @@ fn schedule_dispatch_hard_grace(
                     // age this zombie out of capacity accounting after
                     // the TTL even if its thread never exits (br-zp2bt).
                     register_dispatch_zombie(permit.id, Instant::now());
-                    DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
                     let zombies = DISPATCH_ZOMBIES.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Publish the zombie before releasing its live count.
+                    // The reverse order exposes a vacant admission slot even
+                    // though the original worker still owns its permit.
+                    DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Release);
+                    #[cfg(test)]
+                    {
+                        let hook = {
+                            let mut pending = lock_mutex(&DISPATCH_ZOMBIE_TRANSFER_HOOK);
+                            if pending.as_ref().is_some_and(|(id, _)| *id == permit.id) {
+                                pending.take().map(|(_, hook)| hook)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
                     let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
                     metrics.inflight.sub_saturating(1);
                     metrics.zombies.add(1);
@@ -20953,6 +20975,55 @@ mod tests {
                     );
                 },
             );
+        });
+    }
+
+    #[test]
+    fn dispatch_zombie_transfer_never_exposes_a_vacant_admission_slot() {
+        with_serialized_dispatch_permits(|| {
+            let mut held: Vec<_> = (0..MAX_CONCURRENT_DISPATCHES)
+                .map(|_| DispatchPermit::try_acquire().expect("fill real admission capacity"))
+                .collect();
+            let transferred = held.pop().expect("one transfer permit");
+            let transferred_id = transferred.id;
+            let shared = Arc::new(Mutex::new(Some(transferred)));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            *lock_mutex(&DISPATCH_ZOMBIE_TRANSFER_HOOK) = Some((
+                transferred_id,
+                Box::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+                }),
+            ));
+            // Invoke the real transfer immediately; production callers still
+            // use their unchanged, clamped hard-grace duration. Other tests
+            // exercise that duration with actual surviving worker threads.
+            let watchdog = schedule_dispatch_hard_grace(
+                "test/admission-transfer".to_string(),
+                Arc::clone(&shared),
+                0,
+            )
+            .expect("spawn real transfer watchdog");
+            let reached = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            // Pause after the live decrement. With the old ordering the zombie
+            // increment has not happened yet, so this incorrectly succeeds.
+            let admitted = DispatchPermit::try_acquire();
+            let _ = resume_tx.send(());
+            let joined = watchdog.join();
+            lock_mutex(&DISPATCH_ZOMBIE_TRANSFER_HOOK).take();
+            let was_admitted = admitted.is_some();
+            drop(admitted);
+            drop(SharedPermitGuard(shared));
+            drop(held);
+            assert!(reached, "the real transfer must reach the paused cut");
+            joined.expect("transfer watchdog finishes");
+            assert!(
+                !was_admitted,
+                "a zombie transfer must not admit work while every original permit is held"
+            );
+            assert_eq!(DISPATCH_INFLIGHT.load(Ordering::Relaxed), 0);
+            assert_eq!(DISPATCH_ZOMBIES.load(Ordering::Relaxed), 0);
         });
     }
 
