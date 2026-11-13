@@ -39663,7 +39663,8 @@ first body
                 ack_required INTEGER NOT NULL DEFAULT 0,
                 created_ts INTEGER NOT NULL,
                 attachments TEXT NOT NULL DEFAULT '[]',
-                recipients_json TEXT NOT NULL DEFAULT '[]'
+                recipients_json TEXT NOT NULL DEFAULT '[]',
+                archive_metadata_json TEXT
             )",
             &[],
         )
@@ -39761,7 +39762,7 @@ first body
 
         let newest = conn
             .query_sync(
-                "SELECT id, subject, thread_id FROM messages ORDER BY id DESC LIMIT 1",
+                "SELECT id, subject, thread_id, archive_metadata_json FROM messages ORDER BY id DESC LIMIT 1",
                 &[],
             )
             .expect("query newest message")
@@ -39783,6 +39784,23 @@ first body
         );
         assert_eq!(new_subject, "compose subject");
         assert_eq!(new_thread.as_deref(), Some("br-123"));
+        assert_eq!(
+            newest.get_named::<String>("archive_metadata_json").unwrap(),
+            "{}"
+        );
+        let legacy = conn
+            .query_sync(
+                "SELECT archive_metadata_json FROM messages WHERE id = 1",
+                &[],
+            )
+            .expect("query legacy archive authority");
+        assert_eq!(
+            legacy[0]
+                .get_named::<Option<String>>("archive_metadata_json")
+                .unwrap(),
+            None,
+            "compose must not invent reply metadata for pre-existing messages"
+        );
 
         let legacy_recips = conn
             .query_sync(
@@ -39941,7 +39959,7 @@ first body
             mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
         let row = conn
             .query_sync(
-                "SELECT thread_id FROM messages WHERE subject = ?1 LIMIT 1",
+                "SELECT thread_id, archive_metadata_json FROM messages WHERE subject = ?1 LIMIT 1",
                 &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
                     "compose no thread".to_string(),
                 )],
@@ -39956,6 +39974,10 @@ first body
         assert!(
             thread_id.is_none(),
             "thread_id should be NULL when compose envelope omits it"
+        );
+        assert_eq!(
+            row.get_named::<String>("archive_metadata_json").unwrap(),
+            "{}"
         );
     }
 
