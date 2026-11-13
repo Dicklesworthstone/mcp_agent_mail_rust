@@ -1,5 +1,43 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 13 delivery observation review — EmeraldEagle
+
+- [x] Verify unchanged governing files and preserve seven untracked roots.
+  Reread the prior six-file fix/callers; no further defect is established.
+- [x] Read merged328d966f/52d58f2c and the live-query-only, activity admission,
+  request identity and nested read-snapshot helpers. Their native/compiler
+  qualification is still missing. Keep .13 ownership and all original criteria.
+- [x] Predeclare frozen c72e97fc's18 native DB/tools controls: the four new
+  recovery/missing-mailbox/receipt-consistency cases, original cancellation,
+  read/ACK, cursor paging/tail/schema and signal-receipt controls. Keep dev
+  profile240s per-test/1800s global, buildjobs1/testthreads2 and native30GiB/
+  floor10GiB; inspect a positive disk guard before strict-RCH submission.
+- [ ] Run both workspace compiler graphs, strict Clippy and formatter on the
+  frozen graph. Preserve actual failures; repair only demonstrated defects
+  without changing predicates, budgets, schemas, fixture realism or gate policy.
+- [x] Preserve c72e97fc's actual production E0277/101: the pooled receipt
+  caller passes RetirablePooledHandle to the generic SyncQuery reader. In
+  ffb577ba borrow DbConn with the existing double-dereference pattern while
+  retaining the checkout owner; add one explanatory comment. No adapter,
+  ownership/cleanup policy, snapshot, test predicate or limit changes.
+- [ ] Qualify ffb577ba with the same18 cases and all four mandatory checks.
+  Original c72 native compilation must reach its own terminal; no runtime
+  pass is claimed from compilation. Preserve every original failure receipt.
+- [x] Execute all18 named cases; compare exact passed IDs with required IDs
+  and bind actual worker source/config and executable identities. Qualify the
+  final source if any fix is needed; record source scan findings unsuppressed.
+  Fixed ffb577ba's c1838aa5 exits0:18/18PASS,5276skipped,7.617s; exact
+  case census has no missing/extra/retried cases. Stable DB/tools ELFs and25
+  in-run source/config hashes match. Stock query scan reports0critical;
+  4198warnings remain. Original c72 native compilation exits101/E0277,
+  executing zero tests. The first fixed production request refuses103;
+  retry on the now-free native worker leaves every gate/policy intact.
+- [x] Reread any fix/callers again. Preserve original .29/.5/asldx/.13 and
+  other red acceptance; these selected controls are not full-suite, transport,
+  live-mailbox, cross-platform, soak, overhead or release qualification.
+- [ ] Review tracker scope/cycles and peer changes; prepare scoped publication
+  and exact lease release. Retain actual operation receipts in review-audit.md.
+
 ## November 12 current-graph retention review — EmeraldEagle
 
 - [x] Verify governing files/current source and preserve all seven untracked
