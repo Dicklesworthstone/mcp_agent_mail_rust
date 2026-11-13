@@ -187,6 +187,16 @@
     Release own upstream connection lease1758 after completion; old1759 expired.
   - [ ] Repeat the exact53 native cases,3 CLI cases and required workspace
     gates on the final Agent Mail dependency graph before evaluating .52 closure.
+    Frozen implementation b6c624ba uses official Git4314 and lock661b4168.
+    - [x] Formatter0, strict RCH39.3s, worker1152480.
+    - [x] Production libraries/binaries0, strict RCH1836.7s, worker1152480.
+    - [x] Workspace all-targets0, strict RCH1864.4s, worker1149989.
+    - [x] Strict all-target Clippy0, strict RCH491.5s, same warmed worker;
+      actual in-run34 primary and4 core package hashes match the candidate.
+    - [ ] Native53 final runtime cohort, worker1227854; retain exact census/ELFs.
+    - [ ] Real CLI3 final runtime cohort, worker1156319; retain actual am/it ELFs.
+    - [ ] Re-evaluate unchanged .52 acceptance, publish metadata/closure only
+      when all decisive gates pass, verify both public refs and release own leases.
 - [x] Run formatter first, then both workspace compiler graphs and strict
   all-target Clippy on the frozen final source. Complete actual job recovery.
   Earlier732 all-targets actually101/E0599: the new canonical verification
