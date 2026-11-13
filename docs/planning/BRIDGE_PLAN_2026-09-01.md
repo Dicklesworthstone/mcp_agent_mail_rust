@@ -12,17 +12,22 @@
   read/ACK, cursor paging/tail/schema and signal-receipt controls. Keep dev
   profile240s per-test/1800s global, buildjobs1/testthreads2 and native30GiB/
   floor10GiB; inspect a positive disk guard before strict-RCH submission.
-- [ ] Run both workspace compiler graphs, strict Clippy and formatter on the
-  frozen graph. Preserve actual failures; repair only demonstrated defects
+- [x] Run both workspace compiler graphs, strict Clippy and formatter on
+  frozen6b758e6a below. Preserve actual failures; repair only concrete defects
   without changing predicates, budgets, schemas, fixture realism or gate policy.
+  Actual production0/1884.948s, all-targets0/436.931s, strict Clippy0/
+  991.713s and fmt0/16.865s remote. The proc-macro-error2 future-compatibility
+  dependency warning remains visible. No release clearance follows.
 - [x] Preserve c72e97fc's actual production E0277/101: the pooled receipt
   caller passes RetirablePooledHandle to the generic SyncQuery reader. In
   ffb577ba borrow DbConn with the existing double-dereference pattern while
   retaining the checkout owner; add one explanatory comment. No adapter,
   ownership/cleanup policy, snapshot, test predicate or limit changes.
-- [ ] Qualify ffb577ba with the same18 cases and all four mandatory checks.
-  Original c72 native compilation must reach its own terminal; no runtime
-  pass is claimed from compilation. Preserve every original failure receipt.
+- [x] Qualify ffb577ba's same18 native cases; original c72 native compilation
+  reaches101/E0277 and executes zero cases. Preserve every failure receipt.
+  Its production retry remains a separate source-bound result. The four
+  final mandatory checks move to the combined source below, not a claim that
+  all four were executed on ffb.
 - [x] Execute all18 named cases; compare exact passed IDs with required IDs
   and bind actual worker source/config and executable identities. Qualify the
   final source if any fix is needed; record source scan findings unsuppressed.
@@ -35,8 +40,28 @@
 - [x] Reread any fix/callers again. Preserve original .29/.5/asldx/.13 and
   other red acceptance; these selected controls are not full-suite, transport,
   live-mailbox, cross-platform, soak, overhead or release qualification.
-- [ ] Review tracker scope/cycles and peer changes; prepare scoped publication
-  and exact lease release. Retain actual operation receipts in review-audit.md.
+- [x] Inspect incoming66b9bb1f/345b32dc completely; preserve both histories
+  through clean merge6b758e6a and import all2870 Beads without cycles. The
+  three validation Beads .97/.98/.99 retain owner/criteria. Predeclare91
+  native cases: the original18 plus all73 build_slots::tests, same limits.
+- [x] Qualify frozen6b758e6a's91 native cases. Actual c71d14fe exits0:
+  91/91PASS,5206skipped,11.473s. All91 unique required IDs match, without
+  missing/extra/retried/adverse cases;26 source/config hashes match on both
+  workers. Stable cached DB ELF2780accb runs its12 controls again; the new
+  tools ELFa6c030ff contains79 required markers. Do not add earlier18 as
+  unique cases or equate these unit/real-file controls with transport proof.
+- [x] Close .97/.98/.99 only when all four final static gates also pass;
+  keep br-sgaee's mounted restart/consumer consistency and atomicity exclusions.
+  All three close at03:48UTC on exact91-case/four-gate evidence. Owner,
+  acceptance and dependencies remain unchanged; no force/policy bypass.
+- [x] Review tracker scope/cycles and peer changes; prepare scoped publication
+  and exact lease release. All2870 records remain; only the three qualified
+  statuses/closure evidence and .29 comments change. Original .29/.5/asldx/
+  br-sgaee/br-h6k9b criteria stay open. Preserve the seven untracked roots.
+  Incoming0800d1ed/0a78a9fb are newer private-snapshot/compensation work,
+  outside frozen6b's qualification. Preserve their history and that boundary.
+  Actual publication/ref/lease receipts follow in existing review-audit.md;
+  this preparation checkbox does not predict those operation outcomes.
 
 ## November 12 current-graph retention review — EmeraldEagle
 
