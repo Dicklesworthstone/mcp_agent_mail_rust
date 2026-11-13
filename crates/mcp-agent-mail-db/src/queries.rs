@@ -35900,7 +35900,13 @@ mod tests {
             };
             let recipients = [(recipient, "to")];
             let Outcome::Ok(IdempotentOutcome::Fresh(message)) = cross_project_message_send(
-                &cx, &pool, target, sender, &recipients, scope, Some(claim),
+                &cx,
+                &pool,
+                target,
+                sender,
+                &recipients,
+                scope,
+                Some(claim),
             )
             .await
             else {
@@ -35957,7 +35963,11 @@ mod tests {
                 .expect("remove committed recipient");
             drop(fixture);
             let Outcome::Err(error) = verify_message_recipients_visible_after_commit(
-                &cx, &pool, target, message_id, &recipients,
+                &cx,
+                &pool,
+                target,
+                message_id,
+                &recipients,
             )
             .await
             else {
@@ -35974,7 +35984,11 @@ mod tests {
                 error,
             )
             .await;
-            assert_eq!(error.to_string(), expected_error, "compensation must commit");
+            assert_eq!(
+                error.to_string(),
+                expected_error,
+                "compensation must commit"
+            );
 
             let verify = crate::DbConn::open_file(pool.sqlite_path().to_string())
                 .expect("independent compensation reader");
@@ -36014,7 +36028,13 @@ mod tests {
                 .expect("revoke contact before retry");
             assert!(matches!(
                 cross_project_message_send(
-                    &cx, &pool, target, sender, &recipients, scope, Some(claim),
+                    &cx,
+                    &pool,
+                    target,
+                    sender,
+                    &recipients,
+                    scope,
+                    Some(claim),
                 )
                 .await,
                 Outcome::Err(DbError::InvalidArgument {
@@ -36027,7 +36047,13 @@ mod tests {
                 .into_result()
                 .expect("restore contact before retry");
             let Outcome::Ok(IdempotentOutcome::Fresh(retried)) = cross_project_message_send(
-                &cx, &pool, target, sender, &recipients, scope, Some(claim),
+                &cx,
+                &pool,
+                target,
+                sender,
+                &recipients,
+                scope,
+                Some(claim),
             )
             .await
             else {
@@ -36045,7 +36071,13 @@ mod tests {
             .into_result()
             .expect("retry recipient must be durable");
             let Outcome::Ok(IdempotentOutcome::Replayed(replayed)) = cross_project_message_send(
-                &cx, &pool, target, sender, &recipients, scope, Some(claim),
+                &cx,
+                &pool,
+                target,
+                sender,
+                &recipients,
+                scope,
+                Some(claim),
             )
             .await
             else {
@@ -36094,7 +36126,11 @@ mod tests {
             let mut messages = Vec::new();
             for attempt in 0..2 {
                 if attempt == 1 {
-                    let conn = pool.acquire(&cx).await.into_result().expect("expiry writer");
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("expiry writer");
                     conn.execute_sync(
                         "UPDATE idempotency_keys SET expires_ts = 0 \
                          WHERE project_id = ? AND tool = ? AND idempotency_key = ?",
@@ -36108,8 +36144,21 @@ mod tests {
                 }
                 let Outcome::Ok(IdempotentOutcome::Fresh(message)) =
                     create_message_with_recipients_idempotent_topic(
-                        &cx, &pool, project_id, sender, "mail", "body", None, None,
-                        None, "normal", false, "[]", &recipients, Some("cc"), claim,
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender,
+                        "mail",
+                        "body",
+                        None,
+                        None,
+                        None,
+                        "normal",
+                        false,
+                        "[]",
+                        &recipients,
+                        Some("cc"),
+                        claim,
                     )
                     .await
                 else {
@@ -36117,7 +36166,13 @@ mod tests {
                 };
                 let message_id = message.id.expect("persisted message id");
                 append_message_delivery_signal_receipt(
-                    &cx, &pool, message_id, recipient, "local", "signal-digest", now_micros(),
+                    &cx,
+                    &pool,
+                    message_id,
+                    recipient,
+                    "local",
+                    "signal-digest",
+                    now_micros(),
                 )
                 .await
                 .into_result()
@@ -36198,13 +36253,13 @@ mod tests {
                         ],
                     )
                     .expect("retained cursor scope");
-                assert_eq!(current.len(), 1, "cleanup must preserve every issued cursor scope");
-                assert!(
-                    current[0].get_as::<i64>(0).unwrap() >= row.get_as::<i64>(3).unwrap()
+                assert_eq!(
+                    current.len(),
+                    1,
+                    "cleanup must preserve every issued cursor scope"
                 );
-                assert!(
-                    current[0].get_as::<i64>(1).unwrap() >= row.get_as::<i64>(4).unwrap()
-                );
+                assert!(current[0].get_as::<i64>(0).unwrap() >= row.get_as::<i64>(3).unwrap());
+                assert!(current[0].get_as::<i64>(1).unwrap() >= row.get_as::<i64>(4).unwrap());
             }
             for event in &event_rows {
                 let event_seq = event.get_as::<i64>(0).expect("event sequence");
@@ -36219,10 +36274,12 @@ mod tests {
                         &[Value::BigInt(project_id), Value::BigInt(affected_viewer)],
                     )
                     .expect("visible event loss cursor");
-                assert_eq!(current.len(), 1, "deleted visible events must record history loss");
-                assert!(
-                    current[0].get_as::<i64>(0).expect("history loss floor") >= event_seq
+                assert_eq!(
+                    current.len(),
+                    1,
+                    "deleted visible events must record history loss"
                 );
+                assert!(current[0].get_as::<i64>(0).expect("history loss floor") >= event_seq);
             }
             let after_sequence = after
                 .query_sync(
@@ -36232,7 +36289,10 @@ mod tests {
                 .expect("delivery allocator after compensation")[0]
                 .get_as::<i64>(0)
                 .expect("delivery sequence");
-            assert_eq!(after_sequence, sequence, "cleanup must not rewind delivery ids");
+            assert_eq!(
+                after_sequence, sequence,
+                "cleanup must not rewind delivery ids"
+            );
             drop(after);
             let stored = lookup_idempotency_result::<MessageRow>(&cx, &pool, claim)
                 .await
@@ -36243,8 +36303,21 @@ mod tests {
             assert_eq!(stored.id, Some(replacement_id));
             let Outcome::Ok(IdempotentOutcome::Replayed(replayed)) =
                 create_message_with_recipients_idempotent_topic(
-                    &cx, &pool, project_id, sender, "mail", "body", None, None,
-                    None, "normal", false, "[]", &recipients, Some("cc"), claim,
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender,
+                    "mail",
+                    "body",
+                    None,
+                    None,
+                    None,
+                    "normal",
+                    false,
+                    "[]",
+                    &recipients,
+                    Some("cc"),
+                    claim,
                 )
                 .await
             else {
@@ -36373,16 +36446,10 @@ mod tests {
                 .expect("verify recipient precondition");
             assert_eq!(recipients[0].get_as::<i64>(0).expect("recipient count"), 1);
             drop(conn);
-            cleanup_committed_message_after_consistency_failure(
-                &cx,
-                &pool,
-                &message,
-                &[2],
-                None,
-            )
-            .await
-            .into_result()
-            .expect("cleanup should succeed");
+            cleanup_committed_message_after_consistency_failure(&cx, &pool, &message, &[2], None)
+                .await
+                .into_result()
+                .expect("cleanup should succeed");
         });
 
         let verify_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -36533,16 +36600,10 @@ mod tests {
                 .expect("verify recipient precondition");
             assert_eq!(recipients[0].get_as::<i64>(0).expect("recipient count"), 0);
             drop(conn);
-            cleanup_committed_message_after_consistency_failure(
-                &cx,
-                &pool,
-                &message,
-                &[2],
-                None,
-            )
-            .await
-            .into_result()
-            .expect("cleanup should succeed");
+            cleanup_committed_message_after_consistency_failure(&cx, &pool, &message, &[2], None)
+                .await
+                .into_result()
+                .expect("cleanup should succeed");
         });
 
         let verify_conn = crate::DbConn::open_file(db_path.display().to_string())

@@ -4153,7 +4153,11 @@ mod tests {
 
             assert_eq!(std::fs::read(&destination).unwrap(), expected);
             assert_eq!(
-                std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o600
             );
             assert_eq!(
@@ -4246,7 +4250,11 @@ mod tests {
                 create_private_canonical_sqlite_snapshot(&source, &destination, false).unwrap();
             }
             assert_eq!(
-                std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o600,
                 "both full archives and pre-scrub projections must be private"
             );
@@ -4306,7 +4314,11 @@ mod tests {
                 "a refused publication must retain a private image"
             );
             assert_eq!(
-                std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o664,
                 "the winning publisher's permissions must remain unchanged"
             );
