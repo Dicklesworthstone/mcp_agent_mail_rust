@@ -17,9 +17,10 @@
   census and both stable DB/share ELF identities match. Original231/4242
   populated header probe passes unchanged for both engines.
 - [ ] Finish final8a00004b's same49 native cases and exact census/ELFs.
-  Requalification loses SSH at05:42UTC; remote completion is unconfirmed.
-  Recover only original rchw-6dfd9fc9-9393-4d13-a7f2-a9d72052c1cd;
-  no replay or native pass claim. No new zero/race/archive-E2E claim.
+  Requalification loses SSH at05:42UTC. Third exact-wrapper recovery settles
+  original rchw-6dfd9fc9-9393-4d13-a7f2-a9d72052c1cd at remote101,
+  terminal_acknowledged=true. No diagnostic/pass census recovered; cause
+  remains unattributed. No replay, native pass or zero/race/archive-E2E claim.
 - [x] Run both mandatory workspace compiler graphs, strict all-targets Clippy
   and formatter on the exact source. Preserve failures; fix only demonstrated
   defects without weakened gates, original predicates or fixture requirements.
@@ -31,12 +32,12 @@
   argument-comma changes. Complete-file non-whitespace comparison, changed
   test-region111/34 literal comparisons and fresh diff review preserve all
   predicates/arguments/SQL. Repair overlay formatter0; stock scans0critical.
-  Final8a's four static gates pass; its native requalification is still pending.
+  Final8a's four static gates pass; native requalification exits101.
 - [ ] Bind selected source/config/worker hashes, exact executed cases and stable
   native executable identities. Reread any repair and callers; requalify final
   source if it changes. Stock source scan findings remain unsuppressed.
   Both final workers'30 source/config hashes match8a; original9bb's exact
-  census/ELFs are retained. Final native census/ELFs await job recovery.
+  census/ELFs are retained. Final native executable/case qualification is unmet.
 - [x] Keep .52 open until its complete original acceptance is met, including
   consistent-generation/race controls and isolated archive E2E. Retain original
   .29/.5/asldx/br-sgaee/br-h6k9b and all whole-suite/writer/scan red boundaries.
@@ -50,6 +51,8 @@
   All2870 records/IDs and original status/criteria/graph are preserved; only
   owned .29/.52 comments, .52 claim and timestamps change. Cycles empty.
   Publication and lease release are recorded only after their actual outcomes.
+  Actual normal merge c01930b4 preserves8501fe17; main and legacy mirror
+  both push successfully and fresh-fetch refs equal c01930b4 at05:47UTC.
 
 ## November 13 delivery observation review — EmeraldEagle
 
