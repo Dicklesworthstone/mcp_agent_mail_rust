@@ -4576,20 +4576,23 @@ impl DbPool {
 
     /// Eagerly open up to `n` connections to avoid first-burst latency.
     ///
-    /// Connections are acquired and immediately returned to the pool idle set.
-    /// Bounded: stops after `timeout` elapses or on first acquire error.
+    /// Connections are held through warmup, then returned to the pool idle set.
+    /// Pending acquisitions share one `timeout` budget and stop on first error.
+    /// Synchronous initialization must yield before a timeout can be observed.
     /// Returns the number of connections successfully warmed up.
     pub async fn warmup(&self, cx: &Cx, n: usize, timeout: std::time::Duration) -> usize {
-        let deadline = Instant::now() + timeout;
+        let deadline = cx.now() + timeout;
         let mut opened = 0usize;
         // Acquire connections in batches; hold them briefly then release.
         let mut batch: Vec<PooledConnection<DbConn>> = Vec::with_capacity(n);
         for _ in 0..n {
-            if Instant::now() >= deadline {
+            if cx.now() >= deadline {
                 break;
             }
-            match self.acquire(cx).await {
-                Outcome::Ok(conn) => {
+            // Dropping a timed-out checkout removes its pending waiter without
+            // cancelling the caller or releasing another caller's connection.
+            match asupersync::time::timeout_at(deadline, self.acquire(cx)).await {
+                Ok(Outcome::Ok(conn)) => {
                     batch.push(conn);
                     opened += 1;
                 }
@@ -26525,6 +26528,67 @@ mod tests {
             stats.total_connections >= 5,
             "pool should have at least 5 total connections after warmup, got {}",
             stats.total_connections
+        );
+    }
+
+    #[test]
+    fn pool_warmup_deadline_bounds_exhausted_pool_wait_and_preserves_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("warmup_deadline.sqlite3");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: sqlite_url_from_path(&database),
+            storage_root: Some(dir.path().join("archive")),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create real single-connection pool");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+        let held = runtime
+            .block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("occupy sole connection before timing warmup");
+        held.execute_raw("CREATE TABLE warmup_budget_probe(value INTEGER); INSERT INTO warmup_budget_probe VALUES (42);")
+            .expect("commit reuse witness");
+
+        let started = Instant::now();
+        let opened = runtime.block_on(pool.warmup(&cx, 1, Duration::from_millis(100)));
+        let elapsed = started.elapsed();
+        let occupied = pool.pool.stats();
+        let caller_cancelled = cx.is_cancel_requested();
+        // Release the real lease and prove reuse before any timing assertion,
+        // including when the old implementation exceeds the warmup budget.
+        drop(held);
+        let reused = runtime
+            .block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("reuse slot after warmup stops waiting");
+        let rows = reused
+            .query_sync("SELECT value FROM warmup_budget_probe", &[])
+            .expect("read committed witness after reuse");
+        let value = rows[0].get_named::<i64>("value").unwrap();
+        drop(reused);
+        eprintln!(
+            "warmup budget: elapsed={elapsed:?}, opened={opened}, occupied={occupied:?}, witness={value}"
+        );
+
+        assert_eq!(opened, 0);
+        assert_eq!(occupied.pending_requests, 0, "warmup leaked a waiter");
+        assert_eq!(occupied.total_connections, 1);
+        assert_eq!(
+            occupied.active_connections, 1,
+            "warmup released a foreign lease"
+        );
+        assert_eq!(occupied.idle_connections, 0);
+        assert!(!caller_cancelled, "warmup cancelled its caller context");
+        assert_eq!(value, 42);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "100ms warmup waited for the pool's full acquire timeout: {elapsed:?}"
         );
     }
 

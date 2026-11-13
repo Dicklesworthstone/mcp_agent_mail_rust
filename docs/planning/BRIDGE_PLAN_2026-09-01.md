@@ -1,5 +1,26 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 13 warmup deadline review — EmeraldEagle, 23:20 UTC
+
+- [x] Reread modified admission, cancellation, initialization and warmup code
+  with callers. No further admission defect established. Warmup checks its
+  deadline only between acquisitions, so an exhausted pool can wait its full
+  ten-second acquire timeout despite a shorter warmup budget.
+- [x] Preserve original .87 initializer and warmup failures and acceptance.
+  Warmup currently has test callers only; this finding does not diagnose the
+  historical startup failures or establish a production startup improvement.
+- [x] Add a real private-file exhausted-pool regression:100ms budget, unchanged
+  default acquire timeout, held lease, pending count and committed42 reuse.
+- [ ] Run the old implementation with the new regression and five original
+  initializer/warmup cases; require an actual consequential timing failure.
+- [ ] Fix the pending acquisition deadline using the caller's clock/context;
+  rerun the identical six cases and relevant real HTTP cancellation controls.
+- [ ] Complete required workspace all-target, separate production, strict
+  Clippy, formatting and stock scanner checks on the final source.
+- [ ] Reread the final implementation and callers; update owned .87 with
+  bounded actual evidence, finish the honesty audit, publish scoped changes
+  and release only this pass's exact leases. Keep unmet acceptance open.
+
 ## November 13 fresh startup review — EmeraldEagle, 20:16 UTC
 
 - [x] Confirm tracked4c95d1e2 is unchanged; reread the watchdog state,
