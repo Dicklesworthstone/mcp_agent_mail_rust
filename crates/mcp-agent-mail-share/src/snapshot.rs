@@ -2136,7 +2136,9 @@ mod tests {
             "-wal-cert-head",
             "-journal",
         ]
-        .map(|suffix| std::fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(path, suffix)).ok())
+        .map(|suffix| {
+            std::fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(path, suffix)).ok()
+        })
     }
 
     #[test]
@@ -2194,11 +2196,13 @@ mod tests {
                     }
                 };
                 let writer = open_writer();
-                writer.execute_snapshot(
-                    "PRAGMA user_version=231; PRAGMA application_id=4242; \
+                writer
+                    .execute_snapshot(
+                        "PRAGMA user_version=231; PRAGMA application_id=4242; \
                      CREATE TABLE archive_generation(label TEXT NOT NULL, payload BLOB NOT NULL); \
                      INSERT INTO archive_generation VALUES('generation-one',X'00FF')",
-                ).unwrap();
+                    )
+                    .unwrap();
                 drop(writer);
                 let mut committed_family = None;
                 let mut progress = |event: FullArchiveProgress| {

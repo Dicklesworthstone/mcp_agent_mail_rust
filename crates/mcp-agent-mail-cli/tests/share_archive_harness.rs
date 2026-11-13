@@ -885,7 +885,8 @@ fn archive_header_metadata_survives_real_save_and_restore() {
     for (user_version, application_id) in [(0, 0), (231, 4242)] {
         let mut fixture = ArchiveFixture::new(7, 0);
         fixture.add_durable_extension();
-        let conn = mcp_agent_mail_db::DbConn::open_file(fixture.database.to_str().unwrap()).unwrap();
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(fixture.database.to_str().unwrap()).unwrap();
         conn.execute_raw(&format!(
             "BEGIN IMMEDIATE; PRAGMA user_version={user_version}; PRAGMA application_id={application_id}; \
              CREATE TABLE operator_sequence(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT); \
@@ -924,7 +925,11 @@ fn archive_header_metadata_survives_real_save_and_restore() {
         assert_eq!(source_family(), before);
         let records = archive_diagnostics(&outcome.stderr);
         assert!(records.iter().any(|record| record["status"] == "completed"));
-        for phase in ["snapshot_full_copy", "snapshot_validate", "snapshot_publish"] {
+        for phase in [
+            "snapshot_full_copy",
+            "snapshot_validate",
+            "snapshot_publish",
+        ] {
             assert!(
                 outcome.stderr.lines().any(|line| {
                     line.starts_with(&format!("archive_save phase={phase} "))
@@ -942,11 +947,16 @@ fn archive_header_metadata_survives_real_save_and_restore() {
         {
             let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
             let mut output = fs::File::create_new(&image).unwrap();
-            std::io::copy(&mut zip.by_name(ARCHIVE_SNAPSHOT_ENTRY).unwrap(), &mut output).unwrap();
+            std::io::copy(
+                &mut zip.by_name(ARCHIVE_SNAPSHOT_ENTRY).unwrap(),
+                &mut output,
+            )
+            .unwrap();
             output.sync_all().unwrap();
         }
         // This is the private extracted image, never the live runtime inode.
-        let copied = mcp_agent_mail_db::CanonicalDbConn::open_file(image.to_str().unwrap()).unwrap();
+        let copied =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(image.to_str().unwrap()).unwrap();
         assert_eq!(
             copied.query_sync("PRAGMA user_version", &[]).unwrap()[0]
                 .get_named::<i64>("user_version")
@@ -1010,13 +1020,17 @@ fn archive_header_metadata_survives_real_save_and_restore() {
         )
         .unwrap();
         assert_eq!(
-            restored_reader.query_sync("PRAGMA user_version", &[]).unwrap()[0]
+            restored_reader
+                .query_sync("PRAGMA user_version", &[])
+                .unwrap()[0]
                 .get_named::<i64>("user_version")
                 .unwrap(),
             user_version
         );
         assert_eq!(
-            restored_reader.query_sync("PRAGMA application_id", &[]).unwrap()[0]
+            restored_reader
+                .query_sync("PRAGMA application_id", &[])
+                .unwrap()[0]
                 .get_named::<i64>("application_id")
                 .unwrap(),
             application_id
