@@ -142,9 +142,22 @@ pub fn append_message_delivery_signal_receipt(
 ///
 /// The mutable recipient `.signal` file is intentionally not read here: it is
 /// a debounced latest-state hint that can point at another message. Only the
-/// append-only receipt ledger establishes the `signaled` fact.
+/// append-only receipt ledger establishes the `signaled` fact. Message,
+/// direct-recipient, and shared-mailbox observations share one read snapshot
+/// so a concurrent acknowledgement or lifecycle change cannot mix generations
+/// of delivery facts. A caller's existing transaction remains owned by it.
 pub fn message_delivery_receipt_from_conn(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    message_id: i64,
+) -> Result<MessageDeliveryReceipt, DbError> {
+    with_read_snapshot(conn, || {
+        message_delivery_receipt_in_snapshot(conn, project_id, message_id)
+    })
+}
+
+fn message_delivery_receipt_in_snapshot(
+    conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     message_id: i64,
 ) -> Result<MessageDeliveryReceipt, DbError> {
@@ -3245,6 +3258,161 @@ mod tests {
                     .expect("rollback must restore event rows and their loss watermark"),
                 before
             );
+        });
+    }
+
+    #[test]
+    fn message_delivery_receipt_snapshot_keeps_direct_and_shared_facts_on_one_commit() {
+        event_snapshot_fixture(|reader, writer, project, viewer| {
+            let shared_viewer = insert_agent(reader, project, "SharedViewer");
+            let message = reader
+                .query_sync(
+                    "SELECT message_id FROM message_recipients WHERE agent_id = ?",
+                    &[Value::BigInt(viewer)],
+                )
+                .unwrap()[0]
+                .get_named::<i64>("message_id")
+                .unwrap();
+            writer
+                .execute_sync(
+                    "INSERT INTO project_mailbox_deliveries \
+                     (message_id, project_id, kind, delivered_ts) VALUES (?, ?, 'to', 1000000)",
+                    &[Value::BigInt(message), Value::BigInt(project)],
+                )
+                .unwrap();
+            reader.execute_raw("PRAGMA query_only = ON").unwrap();
+
+            struct PeerCommit<'a> {
+                reader: &'a DbConn,
+                writer: &'a DbConn,
+                message: i64,
+                shared_viewer: i64,
+                committed: std::cell::Cell<bool>,
+            }
+            impl crate::pool::SyncQuery for PeerCommit<'_> {
+                fn query_sync(
+                    &self,
+                    sql: &str,
+                    params: &[Value],
+                ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                    let rows = self.reader.query_sync(sql, params)?;
+                    if sql.starts_with("SELECT agent.name AS recipient")
+                        && !self.committed.replace(true)
+                    {
+                        self.writer.execute_raw("BEGIN IMMEDIATE")?;
+                        self.writer.execute_sync(
+                            "UPDATE message_recipients SET ack_ts = 2000000 WHERE message_id = ?",
+                            &[Value::BigInt(self.message)],
+                        )?;
+                        self.writer.execute_sync(
+                            "UPDATE project_mailbox_deliveries SET kind = 'cc', delivered_ts = 2000000 \
+                             WHERE message_id = ?",
+                            &[Value::BigInt(self.message)],
+                        )?;
+                        self.writer.execute_sync(
+                            "INSERT INTO project_mailbox_receipts \
+                             (message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, 2000000, 2000000)",
+                            &[
+                                Value::BigInt(self.message),
+                                Value::BigInt(self.shared_viewer),
+                            ],
+                        )?;
+                        self.writer.execute_raw("COMMIT")?;
+                    }
+                    Ok(rows)
+                }
+
+                fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                    self.reader.execute_raw(sql)
+                }
+            }
+
+            let race = PeerCommit {
+                reader,
+                writer,
+                message,
+                shared_viewer,
+                committed: std::cell::Cell::new(false),
+            };
+            let receipt = message_delivery_receipt_from_conn(&race, project, message).unwrap();
+            assert!(
+                race.committed.get(),
+                "the real peer transaction must commit"
+            );
+            assert_eq!(receipt.recipients.len(), 1);
+            assert_eq!(receipt.recipients[0].acknowledged_ts, None);
+            let shared = receipt.project_mailbox.unwrap();
+            assert_eq!(
+                shared.kind, "to",
+                "delivery facts must precede the peer commit"
+            );
+            assert_eq!(shared.delivered_ts, 1_000_000);
+            assert_eq!(shared.agents.len(), 1);
+            assert_eq!(shared.agents[0].agent_id, shared_viewer);
+            assert_eq!(shared.agents[0].read_ts, None);
+            assert_eq!(shared.agents[0].ack_ts, None);
+
+            let fresh = message_delivery_receipt_from_conn(reader, project, message).unwrap();
+            assert_eq!(fresh.recipients[0].acknowledged_ts, Some(2_000_000));
+            let shared = fresh.project_mailbox.unwrap();
+            assert_eq!(shared.kind, "cc");
+            assert_eq!(shared.delivered_ts, 2_000_000);
+            assert_eq!(shared.agents[0].read_ts, Some(2_000_000));
+            assert_eq!(shared.agents[0].ack_ts, Some(2_000_000));
+            assert_eq!(
+                reader.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            reader.execute_raw("BEGIN; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn message_delivery_receipt_snapshot_preserves_caller_transaction_and_error_cleanup() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            let message = reader
+                .query_sync(
+                    "SELECT message_id FROM message_recipients WHERE agent_id = ?",
+                    &[Value::BigInt(viewer)],
+                )
+                .unwrap()[0]
+                .get_named::<i64>("message_id")
+                .unwrap();
+            reader.execute_raw("BEGIN IMMEDIATE").unwrap();
+            reader
+                .execute_sync(
+                    "UPDATE message_recipients SET ack_ts = 3000000 WHERE message_id = ?",
+                    &[Value::BigInt(message)],
+                )
+                .unwrap();
+            let pending = message_delivery_receipt_from_conn(reader, project, message).unwrap();
+            assert_eq!(pending.recipients[0].acknowledged_ts, Some(3_000_000));
+            assert!(matches!(
+                message_delivery_receipt_from_conn(reader, project + 1, message),
+                Err(DbError::NotFound {
+                    entity: "Message",
+                    ..
+                })
+            ));
+            reader.execute_raw("ROLLBACK").unwrap();
+            let restored = message_delivery_receipt_from_conn(reader, project, message).unwrap();
+            assert_eq!(restored.recipients[0].acknowledged_ts, None);
+
+            reader.execute_raw("PRAGMA query_only = ON").unwrap();
+            assert!(matches!(
+                message_delivery_receipt_from_conn(reader, project, i64::MAX),
+                Err(DbError::NotFound {
+                    entity: "Message",
+                    ..
+                })
+            ));
+            assert_eq!(
+                message_delivery_receipt_from_conn(reader, project, message).unwrap(),
+                restored
+            );
+            reader.execute_raw("BEGIN; ROLLBACK").unwrap();
         });
     }
 
