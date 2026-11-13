@@ -1,5 +1,56 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 13 snapshot privacy and compensation review — EmeraldEagle
+
+- [x] Verify governing hashes, tracked9bb34828 and seven untracked roots.
+  Reread the receipt borrow and its owner/callers; no further defect established.
+- [x] Read0800d1ed/0a78a9fb and private-file/no-follow, publication, transaction,
+  delivery-trigger, idempotency and post-commit callers. Preserve tests and
+  original acceptance. Claim unassigned .52 without adding graph structure.
+- [x] Run frozen9bb's49 declared native cases:21 snapshot publication/copy/
+  authority/cancellation controls and28 DB compensation, idempotency, cursor,
+  receipt and post-commit controls. Include .52's original populated231/4242
+  header probe for canonical AND Franken runtime sources; preserve every red.
+  Same dev240s/test/1800s global, buildjobs1/testthreads2, native30GiB and
+  floor10GiB; parse a positive fresh disk guard before strict-RCH submission.
+  Baseline23a368a5 actually exits0:49/49PASS,4851skipped,18.403s; exact
+  census and both stable DB/share ELF identities match. Original231/4242
+  populated header probe passes unchanged for both engines.
+- [ ] Finish final8a00004b's same49 native cases and exact census/ELFs.
+  Requalification loses SSH at05:42UTC; remote completion is unconfirmed.
+  Recover only original rchw-6dfd9fc9-9393-4d13-a7f2-a9d72052c1cd;
+  no replay or native pass claim. No new zero/race/archive-E2E claim.
+- [x] Run both mandatory workspace compiler graphs, strict all-targets Clippy
+  and formatter on the exact source. Preserve failures; fix only demonstrated
+  defects without weakened gates, original predicates or fixture requirements.
+  Final8a00004b production0/1754.660s, all-targets0/399.435s,
+  strict Clippy0/937.028s and fmt0/16.474s remote. The dependency's
+  proc-macro-error2 future-compatibility warning remains visible.
+- [x] Preserve9bb's actual formatter failure1 in compensation and snapshot
+  tests. Manually apply only the reported wrapping and two optional trailing
+  argument-comma changes. Complete-file non-whitespace comparison, changed
+  test-region111/34 literal comparisons and fresh diff review preserve all
+  predicates/arguments/SQL. Repair overlay formatter0; stock scans0critical.
+  Final8a's four static gates pass; its native requalification is still pending.
+- [ ] Bind selected source/config/worker hashes, exact executed cases and stable
+  native executable identities. Reread any repair and callers; requalify final
+  source if it changes. Stock source scan findings remain unsuppressed.
+  Both final workers'30 source/config hashes match8a; original9bb's exact
+  census/ELFs are retained. Final native census/ELFs await job recovery.
+- [x] Keep .52 open until its complete original acceptance is met, including
+  consistent-generation/race controls and isolated archive E2E. Retain original
+  .29/.5/asldx/br-sgaee/br-h6k9b and all whole-suite/writer/scan red boundaries.
+  This marks preservation of unmet criteria, not their completion.
+- [x] Review tracker scope/cycles, preserve peer changes and prepare scoped
+  publication/exact lease release. Actual receipts and the bounded audit go
+  in existing review-audit.md; no new reporting framework.
+  Fetched8501fe17 includes identical formatting plus newer TUI routing/lineage
+  changes in sync/server/recovery. Read its complete diff and relevant helpers;
+  preserve its history without extending8a's qualification to that newer source.
+  All2870 records/IDs and original status/criteria/graph are preserved; only
+  owned .29/.52 comments, .52 claim and timestamps change. Cycles empty.
+  Publication and lease release are recorded only after their actual outcomes.
+
 ## November 13 delivery observation review — EmeraldEagle
 
 - [x] Verify unchanged governing files and preserve seven untracked roots.
