@@ -598,6 +598,78 @@ ORDER BY row_kind, recipient_id";
     }
 
     #[test]
+    fn durable_tui_metadata_recovers_db_only_threaded_compose_after_reopen() {
+        fixture(|_cx, pool, config| {
+            let writer = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let id = mcp_agent_mail_db::sync::dispatch_root_message(
+                &writer,
+                "BlueLake",
+                "TUI handoff",
+                "Keep this exact body.\n",
+                "high",
+                Some("conversation-root"),
+                &[
+                    ("GreenStone".to_string(), "to".to_string()),
+                    ("RedFox".to_string(), "bcc".to_string()),
+                    ("GoldLeaf".to_string(), "cc".to_string()),
+                ],
+            )
+            .unwrap();
+            writer
+                .execute_sync(
+                    "UPDATE message_recipients SET read_ts = 7, ack_ts = 11 \
+                     WHERE message_id = ? AND agent_id = 102",
+                    &[id.into()],
+                )
+                .unwrap();
+            drop(writer);
+
+            // The TUI reports success after the database commit and does not
+            // enqueue an archive bundle. Recover through a fresh file handle,
+            // without the original connection or any surviving message copy.
+            let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let prepared = read_source(id, |sql, params| {
+                reopened
+                    .query_sync(sql, params)
+                    .map_err(ReconcileFailure::source_unavailable)
+            })
+            .unwrap();
+            drop(reopened);
+            assert!(prepared.archive_metadata_known);
+            assert_eq!(prepared.message["thread_id"], "conversation-root");
+            assert!(
+                !prepared
+                    .message
+                    .as_object()
+                    .unwrap()
+                    .contains_key("reply_to")
+            );
+            assert_exact_recovered_bundle(config, &prepared, None);
+
+            let verify = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let deliveries = verify
+                .query_sync(
+                    "SELECT agent_id, read_ts, ack_ts FROM message_recipients \
+                     WHERE message_id = ? ORDER BY agent_id",
+                    &[id.into()],
+                )
+                .unwrap();
+            assert_eq!(deliveries.len(), 3);
+            for delivery in deliveries {
+                let recipient = delivery.get_named::<i64>("agent_id").unwrap();
+                assert_eq!(
+                    delivery.get_named::<Option<i64>>("read_ts").unwrap(),
+                    (recipient == 102).then_some(7),
+                );
+                assert_eq!(
+                    delivery.get_named::<Option<i64>>("ack_ts").unwrap(),
+                    (recipient == 102).then_some(11),
+                );
+            }
+        });
+    }
+
+    #[test]
     fn durable_attachment_content_digest_recovers_uncommitted_image_after_database_reopen() {
         fixture(|cx, pool, config| {
             let config = Config {

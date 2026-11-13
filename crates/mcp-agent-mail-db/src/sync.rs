@@ -1700,9 +1700,12 @@ fn insert_root_message(
         .filter(|tid| !tid.is_empty())
         .map_or(Value::Null, |tid| Value::Text(tid.to_string()));
 
+    // Compose accepts a thread key, not an immediate reply parent. Record
+    // that known absence so DB-only threaded mail can reach the archive after
+    // a restart; NULL is reserved for legacy rows with unknown reply metadata.
     conn.execute_sync(
-        "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+        "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts, archive_metadata_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, '{}')",
         &[
             Value::BigInt(project_id),
             Value::BigInt(sender_id),
@@ -1786,25 +1789,36 @@ fn sync_message_recipients_json(conn: &DbConn, msg_id: i64) -> Result<(), DbErro
         )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    let recipients_json = rows
-        .into_iter()
-        .map(|row| {
-            let name = row
-                .get_named::<String>("name")
-                .map_err(|e| DbError::Sqlite(e.to_string()))?;
-            let kind = row
-                .get_named::<String>("kind")
-                .map_err(|e| DbError::Sqlite(e.to_string()))?;
-            Ok(serde_json::json!({
-                "name": name,
-                "kind": kind,
-            }))
-        })
-        .collect::<Result<Vec<_>, DbError>>()
-        .and_then(|payload| {
-            serde_json::to_string(&payload)
-                .map_err(|e| DbError::Internal(format!("failed to encode recipients JSON: {e}")))
-        })?;
+    // Match the canonical envelope used by ordinary sends. Readers and archive
+    // recovery require all three role arrays, including when a role is empty.
+    let mut to_names = Vec::new();
+    let mut cc_names = Vec::new();
+    let mut bcc_names = Vec::new();
+    for row in rows {
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let kind = row
+            .get_named::<String>("kind")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        match kind.as_str() {
+            "to" => to_names.push(name),
+            "cc" => cc_names.push(name),
+            "bcc" => bcc_names.push(name),
+            _ => {
+                return Err(DbError::invalid(
+                    "recipients",
+                    format!("unsupported recipient kind {kind:?}; expected to, cc, or bcc"),
+                ));
+            }
+        }
+    }
+    let recipients_json = serde_json::json!({
+        "to": to_names,
+        "cc": cc_names,
+        "bcc": bcc_names,
+    })
+    .to_string();
 
     conn.execute_sync(
         "UPDATE messages SET recipients_json = ? WHERE id = ?",
@@ -3790,6 +3804,7 @@ mod tests {
         let _sender = insert_agent(&conn, pid, "Sender");
         let _r1 = insert_agent(&conn, pid, "Recipient1");
         let _r2 = insert_agent(&conn, pid, "Recipient2");
+        let _r3 = insert_agent(&conn, pid, "Recipient3");
 
         let msg_id = dispatch_root_message(
             &conn,
@@ -3801,6 +3816,7 @@ mod tests {
             &[
                 ("Recipient1".to_string(), "to".to_string()),
                 ("Recipient2".to_string(), "cc".to_string()),
+                ("Recipient3".to_string(), "bcc".to_string()),
             ],
         )
         .unwrap();
@@ -3816,7 +3832,7 @@ mod tests {
             .next()
             .and_then(|r| r.get_named::<i64>("cnt").ok())
             .unwrap();
-        assert_eq!(cnt, 2, "should have 2 recipients");
+        assert_eq!(cnt, 3, "should have 3 recipients");
 
         let message_rows = conn
             .query_sync(
@@ -3829,8 +3845,14 @@ mod tests {
             .next()
             .and_then(|row| row.get_named::<String>("recipients_json").ok())
             .unwrap();
-        assert!(recipients_json.contains("Recipient1"));
-        assert!(recipients_json.contains("Recipient2"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            serde_json::json!({
+                "to": ["Recipient1"],
+                "cc": ["Recipient2"],
+                "bcc": ["Recipient3"],
+            })
+        );
     }
 
     #[test]
@@ -3877,9 +3899,14 @@ mod tests {
             .next()
             .and_then(|row| row.get_named::<String>("recipients_json").ok())
             .unwrap();
-        assert!(
-            recipients_json.contains(&format!("[unknown-agent-{recipient_id}]")),
-            "orphaned recipient placeholder missing from {recipients_json}"
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            serde_json::json!({
+                "to": [format!("[unknown-agent-{recipient_id}]")],
+                "cc": [],
+                "bcc": [],
+            }),
+            "orphaned recipient placeholder must retain its role"
         );
     }
 
@@ -4039,6 +4066,46 @@ mod tests {
             cnt, 0,
             "message insert should roll back on unknown recipient"
         );
+    }
+
+    #[test]
+    fn dispatch_root_message_invalid_recipient_kind_rolls_back_message_and_sender() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let _recipient = insert_agent(&conn, pid, "Recipient1");
+
+        let error = dispatch_root_message(
+            &conn,
+            "NewOverseer",
+            "Invalid recipient kind",
+            "Body",
+            "normal",
+            Some("thread"),
+            &[("Recipient1".to_string(), "observer".to_string())],
+        )
+        .expect_err("unsupported kinds must not become canonical To recipients");
+        assert!(matches!(
+            error,
+            DbError::InvalidArgument {
+                field: "recipients",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("unsupported recipient kind"));
+
+        for table in ["messages", "message_recipients", "inbox_delivery_events"] {
+            let rows = conn
+                .query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                .unwrap();
+            assert_eq!(
+                rows[0].get_as::<i64>(0).unwrap(),
+                0,
+                "failed dispatch must roll back {table}"
+            );
+        }
+        let agents = conn.query_sync("SELECT name FROM agents", &[]).unwrap();
+        assert_eq!(agents.len(), 1, "auto-created overseer must roll back");
+        assert_eq!(agents[0].get_named::<String>("name").unwrap(), "Recipient1");
     }
 
     #[test]
