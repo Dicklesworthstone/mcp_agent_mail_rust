@@ -2102,6 +2102,168 @@ mod tests {
         }
     }
 
+    fn archive_generation(path: &Path) -> (i64, i64, String, String) {
+        // Inspect the published, neutralized private image through independent
+        // canonical SQLite, rather than the source engine's cached header.
+        let conn = private_source(path);
+        let row = conn
+            .query_sync(
+                "SELECT label, hex(payload) AS payload FROM archive_generation",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(row.len(), 1);
+        (
+            conn.query_sync("PRAGMA user_version", &[]).unwrap()[0]
+                .get_named("user_version")
+                .unwrap(),
+            conn.query_sync("PRAGMA application_id", &[]).unwrap()[0]
+                .get_named("application_id")
+                .unwrap(),
+            row[0].get_named("label").unwrap(),
+            row[0].get_named("payload").unwrap(),
+        )
+    }
+
+    fn archive_source_family(path: &Path) -> [Option<Vec<u8>>; 8] {
+        [
+            "",
+            "-wal",
+            "-shm",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            "-wal-cert",
+            "-wal-cert-head",
+            "-journal",
+        ]
+        .map(|suffix| std::fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(path, suffix)).ok())
+    }
+
+    #[test]
+    fn full_archive_preserves_zero_headers_with_populated_data() {
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("zero-source.sqlite3");
+            let destination = directory.path().join("zero-copy.sqlite3");
+            let conn: Box<dyn SnapshotSource> = if live {
+                Box::new(DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                Box::new(private_source(&source))
+            };
+            conn.execute_snapshot(
+                "PRAGMA user_version=0; PRAGMA application_id=0; \
+                 CREATE TABLE archive_generation(label TEXT NOT NULL, payload BLOB NOT NULL); \
+                 INSERT INTO archive_generation VALUES('zero-header-generation',X'00FF')",
+            )
+            .unwrap();
+            drop(conn);
+            let before = archive_source_family(&source);
+            if live {
+                create_full_archive_snapshot_with_progress(&source, &destination, &mut |_| Ok(()))
+            } else {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    &source,
+                    &destination,
+                    &mut |_| Ok(()),
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                archive_generation(&destination),
+                (0, 0, "zero-header-generation".into(), "00FF".into())
+            );
+            assert_eq!(archive_source_family(&source), before);
+        }
+    }
+
+    #[test]
+    fn full_archive_headers_and_payload_follow_the_same_committed_generation() {
+        for live in [false, true] {
+            for mutation_cut in [
+                FullArchiveProgressState::Started,
+                FullArchiveProgressState::Finished,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("generation-source.sqlite3");
+                let destination = directory.path().join("generation-copy.sqlite3");
+                let open_writer = || -> Box<dyn SnapshotSource> {
+                    if live {
+                        Box::new(DbConn::open_file(source.display().to_string()).unwrap())
+                    } else {
+                        Box::new(private_source(&source))
+                    }
+                };
+                let writer = open_writer();
+                writer.execute_snapshot(
+                    "PRAGMA user_version=231; PRAGMA application_id=4242; \
+                     CREATE TABLE archive_generation(label TEXT NOT NULL, payload BLOB NOT NULL); \
+                     INSERT INTO archive_generation VALUES('generation-one',X'00FF')",
+                ).unwrap();
+                drop(writer);
+                let mut committed_family = None;
+                let mut progress = |event: FullArchiveProgress| {
+                    if event.phase == "snapshot_full_copy" && event.state == mutation_cut {
+                        assert!(committed_family.is_none(), "mutation cut must occur once");
+                        let writer = open_writer();
+                        writer.execute_snapshot(
+                            "BEGIN IMMEDIATE; PRAGMA user_version=232; PRAGMA application_id=4343; \
+                             UPDATE archive_generation SET label='generation-two',payload=X'0102'; \
+                             COMMIT",
+                        ).unwrap();
+                        drop(writer);
+                        committed_family = Some(archive_source_family(&source));
+                    }
+                    Ok(())
+                };
+                if live {
+                    create_full_archive_snapshot_with_progress(&source, &destination, &mut progress)
+                } else {
+                    create_private_canonical_full_archive_snapshot_with_progress(
+                        &source,
+                        &destination,
+                        &mut progress,
+                    )
+                }
+                .unwrap();
+                assert_eq!(
+                    archive_source_family(&source),
+                    committed_family.expect("source mutation must actually commit")
+                );
+                let first = (231, 4242, "generation-one".into(), "00FF".into());
+                let second = (232, 4343, "generation-two".into(), "0102".into());
+                let copied = archive_generation(&destination);
+                assert!(
+                    copied == first || copied == second,
+                    "headers and payload must belong to one committed generation: {copied:?}"
+                );
+                if mutation_cut == FullArchiveProgressState::Finished {
+                    assert_eq!(
+                        copied, first,
+                        "a completed copy cannot include a later commit"
+                    );
+                }
+
+                // Plant the tempting broken workaround: overwrite a completed
+                // image's header with metadata read from the other generation.
+                // The independently reopened artifact must match neither real
+                // committed source state. The positive copy assertion above
+                // would fail if production performed this outside-snapshot read.
+                let wrong_header = if copied.0 == first.0 {
+                    "PRAGMA user_version=232; PRAGMA application_id=4343"
+                } else {
+                    "PRAGMA user_version=231; PRAGMA application_id=4242"
+                };
+                private_source(&destination)
+                    .execute_raw(wrong_header)
+                    .unwrap();
+                let mixed = archive_generation(&destination);
+                assert_ne!(mixed, first);
+                assert_ne!(mixed, second);
+                assert_eq!((&mixed.2, &mixed.3), (&copied.2, &copied.3));
+            }
+        }
+    }
+
     #[test]
     fn full_archive_reads_committed_wal_without_mutating_source_family() {
         let directory = tempfile::tempdir().unwrap();

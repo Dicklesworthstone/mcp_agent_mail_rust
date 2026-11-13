@@ -881,6 +881,152 @@ fn restore_archive_fixture(
 }
 
 #[test]
+fn archive_header_metadata_survives_real_save_and_restore() {
+    for (user_version, application_id) in [(0, 0), (231, 4242)] {
+        let mut fixture = ArchiveFixture::new(7, 0);
+        fixture.add_durable_extension();
+        let conn = mcp_agent_mail_db::DbConn::open_file(fixture.database.to_str().unwrap()).unwrap();
+        conn.execute_raw(&format!(
+            "BEGIN IMMEDIATE; PRAGMA user_version={user_version}; PRAGMA application_id={application_id}; \
+             CREATE TABLE operator_sequence(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT); \
+             INSERT INTO operator_sequence(value) VALUES('retained sequence'); \
+             UPDATE sqlite_sequence SET seq=500 WHERE name='operator_sequence'; COMMIT"
+        )).unwrap();
+        conn.close_sync().unwrap();
+        fixture.database_hash = archive_file_hash(&fixture.database);
+        let source_family = || {
+            [
+                "",
+                "-wal",
+                "-shm",
+                "-fsqlite-ns-gate",
+                "-fsqlite-ns-use",
+                "-wal-cert",
+                "-wal-cert-head",
+                "-journal",
+            ]
+            .map(|suffix| {
+                fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(
+                    &fixture.database,
+                    suffix,
+                ))
+                .ok()
+            })
+        };
+        let before = source_family();
+        let (archive, outcome) = run_archive_save(
+            &fixture,
+            &archive_cli_binary(),
+            &["--diagnostics", "--progress", "text"],
+            Duration::from_secs(120),
+        );
+        assert_archive_storage(&fixture, &archive, false);
+        assert_eq!(source_family(), before);
+        let records = archive_diagnostics(&outcome.stderr);
+        assert!(records.iter().any(|record| record["status"] == "completed"));
+        for phase in ["snapshot_full_copy", "snapshot_validate", "snapshot_publish"] {
+            assert!(
+                outcome.stderr.lines().any(|line| {
+                    line.starts_with(&format!("archive_save phase={phase} "))
+                        && line.contains("state=completed")
+                }),
+                "missing completed archive phase {phase}: {}",
+                outcome.stderr
+            );
+        }
+        assert!(!outcome.stderr.contains(ARCHIVE_PRIVATE_MARKER));
+        assert!(!outcome.stderr.contains(ARCHIVE_FIXTURE_TOKEN));
+        assert!(!outcome.stdout.contains(ARCHIVE_DIAGNOSTIC_PREFIX));
+
+        let image = fixture.root.path().join("independent-copy.sqlite3");
+        {
+            let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+            let mut output = fs::File::create_new(&image).unwrap();
+            std::io::copy(&mut zip.by_name(ARCHIVE_SNAPSHOT_ENTRY).unwrap(), &mut output).unwrap();
+            output.sync_all().unwrap();
+        }
+        // This is the private extracted image, never the live runtime inode.
+        let copied = mcp_agent_mail_db::CanonicalDbConn::open_file(image.to_str().unwrap()).unwrap();
+        assert_eq!(
+            copied.query_sync("PRAGMA user_version", &[]).unwrap()[0]
+                .get_named::<i64>("user_version")
+                .unwrap(),
+            user_version
+        );
+        assert_eq!(
+            copied.query_sync("PRAGMA application_id", &[]).unwrap()[0]
+                .get_named::<i64>("application_id")
+                .unwrap(),
+            application_id
+        );
+        assert_eq!(
+            copied
+                .query_sync(
+                    "SELECT hex(payload) AS payload FROM operator_durable_state WHERE id=1",
+                    &[],
+                )
+                .unwrap()[0]
+                .get_named::<String>("payload")
+                .unwrap(),
+            "00FF118000"
+        );
+        assert_eq!(
+            copied
+                .query_sync(
+                    "SELECT seq FROM sqlite_sequence WHERE name='operator_sequence'",
+                    &[],
+                )
+                .unwrap()[0]
+                .get_named::<i64>("seq")
+                .unwrap(),
+            500
+        );
+        copied.execute_raw("INSERT INTO operator_sequence(value) VALUES('next'); UPDATE operator_durable_state SET note='trigger witness' WHERE id=1").unwrap();
+        assert_eq!(
+            copied
+                .query_sync("SELECT id FROM operator_sequence WHERE value='next'", &[])
+                .unwrap()[0]
+                .get_named::<i64>("id")
+                .unwrap(),
+            501
+        );
+        assert_eq!(
+            copied
+                .query_sync("SELECT state_id FROM operator_audit", &[])
+                .unwrap()[0]
+                .get_named::<i64>("state_id")
+                .unwrap(),
+            1
+        );
+        copied.close_sync().unwrap();
+
+        let restored = fixture.root.path().join("restored");
+        assert_archive_command_ok(&restore_archive_fixture(&fixture, &archive, &restored));
+        let restored_db = restored.join("mailbox.sqlite3");
+        assert_archive_rows(&restored_db, fixture.messages, true);
+        let restored_reader = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+            &restored_db,
+            "restored header verification",
+        )
+        .unwrap();
+        assert_eq!(
+            restored_reader.query_sync("PRAGMA user_version", &[]).unwrap()[0]
+                .get_named::<i64>("user_version")
+                .unwrap(),
+            user_version
+        );
+        assert_eq!(
+            restored_reader.query_sync("PRAGMA application_id", &[]).unwrap()[0]
+                .get_named::<i64>("application_id")
+                .unwrap(),
+            application_id
+        );
+        assert_eq!(source_family(), before);
+        fixture.assert_source_unchanged();
+    }
+}
+
+#[test]
 fn archive_large_mailbox_policy_roundtrip_preserves_private_state_and_evidence() {
     // Crosses the SQL row-copy page size and contains more than 6,000 real
     // archive files. The ignored benchmark scales this identical CLI path.
