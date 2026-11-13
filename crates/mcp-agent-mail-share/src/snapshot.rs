@@ -2196,6 +2196,12 @@ mod tests {
                     }
                 };
                 let writer = open_writer();
+                if !live {
+                    // Keep WAL/SHM alive so the guarded canonical reader uses
+                    // its locking read-only path. A sidecar-free source is
+                    // opened immutable and must not be changed under it.
+                    writer.execute_snapshot("PRAGMA journal_mode=WAL").unwrap();
+                }
                 writer
                     .execute_snapshot(
                         "PRAGMA user_version=231; PRAGMA application_id=4242; \
@@ -2203,18 +2209,15 @@ mod tests {
                      INSERT INTO archive_generation VALUES('generation-one',X'00FF')",
                     )
                     .unwrap();
-                drop(writer);
                 let mut committed_family = None;
                 let mut progress = |event: FullArchiveProgress| {
                     if event.phase == "snapshot_full_copy" && event.state == mutation_cut {
                         assert!(committed_family.is_none(), "mutation cut must occur once");
-                        let writer = open_writer();
                         writer.execute_snapshot(
                             "BEGIN IMMEDIATE; PRAGMA user_version=232; PRAGMA application_id=4343; \
                              UPDATE archive_generation SET label='generation-two',payload=X'0102'; \
                              COMMIT",
                         ).unwrap();
-                        drop(writer);
                         committed_family = Some(archive_source_family(&source));
                     }
                     Ok(())
@@ -2238,7 +2241,7 @@ mod tests {
                 let copied = archive_generation(&destination);
                 assert!(
                     copied == first || copied == second,
-                    "headers and payload must belong to one committed generation: {copied:?}"
+                    "runtime_source={live} cut={mutation_cut:?}: headers and payload must belong to one committed generation: {copied:?}"
                 );
                 if mutation_cut == FullArchiveProgressState::Finished {
                     assert_eq!(
@@ -2279,6 +2282,9 @@ mod tests {
             } else {
                 Box::new(private_source(&source))
             };
+            if !live {
+                writer.execute_snapshot("PRAGMA journal_mode=WAL").unwrap();
+            }
             writer
                 .execute_snapshot(
                     "PRAGMA user_version=231; PRAGMA application_id=4242; \

@@ -23,6 +23,13 @@
   These checkboxes record written controls, not executed native passes.
 - [ ] Review all edits again; repair only demonstrated defects. Keep source
   assertions, permissions, authority, budgets, deadlines and dependency graph.
+  Frozen9b actually runs51:50PASS/1FAIL. The new generation fixture mutates
+  a sidecar-free canonical source after its immutable reader has opened;
+  that violates SQLite's immutable premise and yields old headers/new rows.
+  Retain the failure. Repair only the fixture: keep canonical WAL/SHM and
+  its writer alive to exercise the supported locking read-only path; keep
+  every tuple/planted-negative/source-neutrality assertion. Runtime race
+  qualification remains pending; this is not a demonstrated Franken defect.
 - [ ] Predeclare focused native cases including the original49 and new controls;
   run strict RCH with fresh admission, same dev240s/test/1800s global,
   native30GiB/floor10GiB. Retain every result and exact source/case identities.
