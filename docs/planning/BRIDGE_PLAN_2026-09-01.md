@@ -1,5 +1,32 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 13 archive generation review — EmeraldEagle, 07:01 UTC
+
+- [x] Verify unchanged governing files, clean tracked51164443 and preserved
+  seven untracked roots. Reread the formatting diff and newer TUI transaction,
+  routing/recovery callers; no further functional defect established yet.
+- [x] Read ready/owned Beads and original .52 criteria. Keep existing fixes
+  credited and unmet platform, live-load, native101 and release gates open.
+- [ ] Add real zero-header copy controls without altering the original231/4242
+  populated probe. Exercise both canonical-private and Franken runtime sources.
+- [ ] Force a committed generation change after source open/before copy and
+  immediately after copy. Independently reopen each image and compare headers
+  with its generation/payload; challenge that oracle with a real mixed image.
+- [ ] Extend the existing isolated CLI archive harness with nonzero headers,
+  unknown schema/payload/sequence/trigger and structured secret-free phases.
+  Exercise the actual save/restore binaries and independent canonical reopen.
+- [ ] Review all edits again; repair only demonstrated defects. Keep source
+  assertions, permissions, authority, budgets, deadlines and dependency graph.
+- [ ] Predeclare focused native cases including the original49 and new controls;
+  run strict RCH with fresh admission, same dev240s/test/1800s global,
+  native30GiB/floor10GiB. Retain every result and exact source/case identities.
+- [ ] Run formatter first, then both workspace compiler graphs and strict
+  all-target Clippy on the frozen final source. Complete actual job recovery.
+- [ ] Compare .52 original acceptance against actual evidence; do not close on
+  phase controls alone if an in-copy or full E2E condition remains unproved.
+- [ ] Update Beads, export/cycles/scope check, preserve incoming history,
+  publish both refs and release only this turn's1734/1735/1736 leases.
+
 ## November 13 snapshot privacy and compensation review — EmeraldEagle
 
 - [x] Verify governing hashes, tracked9bb34828 and seven untracked roots.
