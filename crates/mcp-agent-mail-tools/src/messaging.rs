@@ -5483,8 +5483,10 @@ pub async fn fetch_inbox_events(
     // Cursor delivery is a durable database contract. Do not use the
     // archive-reconstruction read pool here: an archive snapshot has no
     // independent event sequence and would turn a degraded source into a
-    // dishonest empty monitor page. Reading events never creates a project.
-    let pool = get_db_pool_for_request(ctx)?;
+    // dishonest empty monitor page. Query-only reads must not wait for writer
+    // admission or bootstrap recovery just to observe committed deliveries.
+    ensure_request_live(ctx)?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent = resolve_agent(
@@ -5498,7 +5500,6 @@ pub async fn fetch_inbox_events(
     .await?;
     crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
-    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     let page = match mcp_agent_mail_db::queries::fetch_inbox_delivery_events(
         ctx.cx(),
@@ -5542,6 +5543,7 @@ pub async fn fetch_inbox_events(
         }
         outcome => db_outcome_to_mcp_result(outcome)?,
     };
+    crate::tool_util::touch_acting_agent_after_live_read(ctx, &pool, agent.id).await;
 
     let events = if position_now.unwrap_or(false) {
         Vec::new()
@@ -5596,7 +5598,10 @@ pub async fn get_message_delivery_receipt(
     project_key: String,
     message_id: i64,
 ) -> McpResult<String> {
-    let pool = get_db_pool_for_request(ctx)?;
+    // Receipts are existing live-database facts, not a reason to admit a
+    // writer, initialize a mailbox, or reconstruct an archive snapshot.
+    ensure_request_live(ctx)?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let receipt = db_outcome_to_mcp_result(
@@ -7987,6 +7992,287 @@ mod tests {
         .expect("create acknowledgement test message")
         .id
         .expect("message ID")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delivery_observation_reads_bypass_recovery_writer_admission() {
+        // The real promotion barrier is process-wide. Isolate the test so a
+        // blocked pre-fix reader cannot interfere with unrelated tool tests.
+        const CHILD: &str = "AM_TEST_DELIVERY_OBSERVATION_ADMISSION_CHILD";
+        const PROJECT: &str = "/delivery-observation-admission";
+        const OTHER_PROJECT: &str = "/delivery-observation-other";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated delivery observation test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated delivery observation test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        for warm in [false, true] {
+            with_messaging_mailbox(&[("MESSAGING_SESSION_IDENTITY", "true")], |mailbox| {
+                use crate::tool_util::DB_POOL_BOOTSTRAP_PROMOTIONS;
+                use mcp_agent_mail_db::write_barrier::{
+                    active_writer_count, current_thread_holds_promotion_barrier,
+                    try_acquire_promotion_barrier_if_idle,
+                };
+                use std::sync::{atomic::Ordering, mpsc};
+                use std::time::{Duration, Instant};
+
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                let (project_id, recipient_id, messages, cursors) = runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = DbPool::new(&DbPoolConfig::from_env()).expect("seed pool");
+                    let project = ensure_project_row(&cx, &pool, PROJECT).await;
+                    ensure_project_row(&cx, &pool, OTHER_PROJECT).await;
+                    let project_id = project.id.unwrap();
+                    let recipient = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                    let sender = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                    let recipient_id = recipient.id.unwrap();
+                    let mut messages = [0; 2];
+                    for message in &mut messages {
+                        *message = create_ack_test_message(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender.id.unwrap(),
+                            &[(recipient_id, "to")],
+                        )
+                        .await;
+                    }
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed state");
+                    conn.execute_raw(&format!(
+                        "UPDATE message_recipients SET read_ts = 123, ack_ts = 456 \
+                         WHERE message_id = {}; UPDATE agents SET last_active_ts = 1",
+                        messages[0],
+                    ))
+                    .expect("make any observation-side write visible");
+                    let rows = conn
+                        .query_sync("SELECT seq FROM inbox_delivery_events ORDER BY seq", &[])
+                        .expect("durable delivery cursors");
+                    assert_eq!(rows.len(), 2);
+                    let cursors = [
+                        rows[0].get_named::<i64>("seq").unwrap(),
+                        rows[1].get_named::<i64>("seq").unwrap(),
+                    ];
+                    (project_id, recipient_id, messages, cursors)
+                });
+                let cfg = DbPoolConfig::from_env();
+                assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+                let warm_pool =
+                    warm.then(|| (*get_db_pool().expect("warm authoritative pool")).clone());
+                let persisted_state = || {
+                    let conn = mcp_agent_mail_db::DbConn::open_file(
+                        mailbox.database_path.to_str().unwrap(),
+                    )
+                    .expect("independent persisted-state reader");
+                    let activity = conn
+                        .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("n")
+                        .unwrap();
+                    let receipts = conn
+                        .query_sync(
+                            "SELECT message_id, read_ts, ack_ts FROM message_recipients \
+                             ORDER BY message_id",
+                            &[],
+                        )
+                        .unwrap()
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.get_named::<i64>("message_id").unwrap(),
+                                row.get_named::<Option<i64>>("read_ts").unwrap(),
+                                row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (activity, receipts)
+                };
+                let before = persisted_state();
+                assert_eq!(before.0, 2);
+                let bootstraps_before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+                let owner = try_acquire_promotion_barrier_if_idle().expect("hold actual recovery");
+                let (done_tx, done_rx) = mpsc::channel();
+                let mut requests = Vec::new();
+                let mut contexts = Vec::new();
+                for case in 0..7 {
+                    let done_tx = done_tx.clone();
+                    let ctx = McpContext::with_state(
+                        Cx::for_testing(),
+                        case + 1,
+                        fastmcp_core::SessionState::new(),
+                    );
+                    crate::session_identity::bind(&ctx, project_id, recipient_id, "BlueLake");
+                    contexts.push(ctx.clone());
+                    requests.push(std::thread::spawn(move || {
+                        let runtime = RuntimeBuilder::current_thread()
+                            .build()
+                            .expect("request runtime");
+                        let result = runtime.block_on(async {
+                            if case >= 5 {
+                                return get_message_delivery_receipt(
+                                    &ctx,
+                                    if case == 5 { PROJECT } else { OTHER_PROJECT }.to_string(),
+                                    messages[0],
+                                )
+                                .await;
+                            }
+                            let after = match case {
+                                1 => Some(cursors[0]),
+                                2 => None,
+                                3 => Some(cursors[1] + 1),
+                                _ => Some(0),
+                            };
+                            fetch_inbox_events(
+                                &ctx,
+                                PROJECT.to_string(),
+                                if case == 4 {
+                                    "GreenStone"
+                                } else {
+                                    " bluelake "
+                                }
+                                .to_string(),
+                                after,
+                                Some(1),
+                                Some(case == 2),
+                            )
+                            .await
+                        });
+                        done_tx.send((case, result)).unwrap();
+                    }));
+                }
+                drop(done_tx);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut completed = Vec::new();
+                while completed.len() < 7 {
+                    match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(result) => completed.push(result),
+                        Err(_) => break,
+                    }
+                }
+                let finished_while_recovery_owned = completed.len();
+                let during = persisted_state();
+                let held = current_thread_holds_promotion_barrier();
+                let writers = active_writer_count();
+                let bootstraps_during = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+                let cached_writer_during = mcp_agent_mail_db::get_cached_pool(&cfg).is_some();
+                // Cancel and release before asserting even on the old path,
+                // where every observational request waits for writer admission.
+                for ctx in contexts {
+                    ctx.request_cancellation().cancel();
+                }
+                drop(owner);
+                for request in requests {
+                    request.join().expect("delivery observation request exits");
+                }
+                completed.extend(done_rx.try_iter());
+                completed.sort_by_key(|(case, _)| *case);
+                assert_eq!(finished_while_recovery_owned, 7, "warm={warm}");
+                assert!(held, "the reads must preserve recovery ownership");
+                assert_eq!(writers, 0);
+                assert_eq!(bootstraps_during, bootstraps_before);
+                assert_eq!(cached_writer_during, warm);
+                assert_eq!(
+                    during, before,
+                    "observation must preserve activity and receipts"
+                );
+                let first: Value = serde_json::from_str(completed[0].1.as_ref().unwrap()).unwrap();
+                assert_eq!(first["events"].as_array().unwrap().len(), 1);
+                assert_eq!(first["events"][0]["message_id"], messages[0]);
+                assert_eq!(first["events"][0]["from"], "GreenStone");
+                assert!(first["events"][0].get("body_md").is_none());
+                assert_eq!(first["next_cursor"], cursors[0]);
+                assert_eq!(first["tail_cursor"], cursors[1]);
+                assert_eq!(first["has_more"], true);
+                let next: Value = serde_json::from_str(completed[1].1.as_ref().unwrap()).unwrap();
+                assert_eq!(next["events"].as_array().unwrap().len(), 1);
+                assert_eq!(next["events"][0]["message_id"], messages[1]);
+                assert_eq!(next["next_cursor"], cursors[1]);
+                assert_eq!(next["has_more"], false);
+                let tail: Value = serde_json::from_str(completed[2].1.as_ref().unwrap()).unwrap();
+                assert_eq!(tail["events"], json!([]));
+                assert_eq!(tail["next_cursor"], cursors[1]);
+                assert_eq!(tail["has_more"], false);
+                assert_eq!(
+                    crate::tool_error_code(completed[3].1.as_ref().unwrap_err()),
+                    Some("CURSOR_AHEAD")
+                );
+                assert_eq!(
+                    crate::tool_error_code(completed[4].1.as_ref().unwrap_err()),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                let receipt: Value =
+                    serde_json::from_str(completed[5].1.as_ref().unwrap()).unwrap();
+                assert_eq!(receipt["message_id"], messages[0]);
+                assert_eq!(receipt["project_id"], project_id);
+                assert_eq!(receipt["persisted"], true);
+                assert_eq!(receipt["recipients"].as_array().unwrap().len(), 1);
+                assert_eq!(receipt["recipients"][0]["recipient"], "BlueLake");
+                assert_eq!(receipt["recipients"][0]["signaled"], false);
+                assert_eq!(receipt["recipients"][0]["acknowledged"], true);
+                assert_eq!(
+                    receipt["recipients"][0]["acknowledged_at"],
+                    micros_to_iso(456)
+                );
+                assert_eq!(
+                    crate::tool_error_code(completed[6].1.as_ref().unwrap_err()),
+                    Some("NOT_FOUND")
+                );
+                drop(warm_pool);
+            });
+        }
+    }
+
+    #[test]
+    fn delivery_observation_reads_do_not_bootstrap_missing_mailbox() {
+        for events in [false, true] {
+            with_messaging_mailbox(&[], |mailbox| {
+                let cfg = DbPoolConfig::from_env();
+                assert!(!mailbox.database_path.exists());
+                assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                let result = runtime.block_on(async {
+                    let ctx = McpContext::new(Cx::current().expect("request context"), 1);
+                    if events {
+                        fetch_inbox_events(
+                            &ctx,
+                            "/missing-delivery-mailbox".to_string(),
+                            "BlueLake".to_string(),
+                            Some(0),
+                            Some(10),
+                            None,
+                        )
+                        .await
+                    } else {
+                        get_message_delivery_receipt(
+                            &ctx,
+                            "/missing-delivery-mailbox".to_string(),
+                            1,
+                        )
+                        .await
+                    }
+                });
+                assert!(result.is_err(), "missing delivery authority must refuse");
+                assert!(
+                    !mailbox.database_path.exists(),
+                    "a delivery read must not create a DB"
+                );
+                assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+                assert_eq!(std::fs::read_dir(&mailbox.storage_root).unwrap().count(), 0);
+            });
+        }
     }
 
     #[test]
