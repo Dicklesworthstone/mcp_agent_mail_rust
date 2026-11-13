@@ -26,6 +26,9 @@
   and34 worker source/config hashes are retained. A speculative Cargo env
   config attempt first exits96 before tests; its failure is preserved and
   the normal command then passes without that extra flag.
+  Fresh committed444e4b6a repeats the same3 CLI cases:3PASS,325skipped,
+  1.795s tests, terminal0. Actual stable amfb3779ac/it1fddd083 hashes and
+  all34 worker hashes bind this final-source result. No case was dropped.
 - [x] Review all edits again; repair only demonstrated defects. Keep source
   assertions, permissions, authority, budgets, deadlines and dependency graph.
   Frozen9b actually runs51:50PASS/1FAIL. The new generation fixture mutates
@@ -67,6 +70,102 @@
   This is a source-derived risk, not a confirmed mixed-generation defect.
   Predeclared native denominator53: original51, held-writer control and this
   new in-copy control. Same profile/limits; no engine/dependency/runtime edits.
+  Exact444e code actually runs53:52PASS/1FAIL,4852skipped,12.770s, exit100.
+  Failure is the new observer's unfired trace, not a mixed image. The adapter
+  dispatches execute_sync to a dedicated worker, beyond with_default on the
+  caller. All52 other controls pass, including lock-neutral checksums and both
+  held-writer engines copying committed data. Repair the observer in a real
+  isolated scenario child: install global tracing there, arm only during the
+  copy, require actual scenario completion and keep all original assertions.
+  This leaves the generation risk unproved; corrected53 qualification is active.
+- [ ] Fix the now-reproduced live read-only engine window at its source and
+  adopt only qualified immutable code. Corrected observer2031489d actually
+  runs53:52PASS/1FAIL,4852skipped,14.712s. Verified real WAL-only commit and
+  ACK precede canonical output231/4242 with generation-two/0102. This is a
+  genuine mixed-generation image, distinct from the earlier invalid fixture
+  and unfired-observer failures. Preserve all original predicates and reds.
+  Read upstream governing files/README before edits; keep concurrent writers
+  enabled, source read-only, and original .52 open until corrected qualification.
+  All upstream docs are now read. Claimed existing engine bug
+  bd-ro-vacuum-receipt-binds-wal-tz4pk as BronzeKnoll. Wrote the same minimal
+  fix on main0.5 and an isolated main at v0.4.13: return the logical header
+  from the actual row-hydration transaction; retain source receipts, default
+  concurrency and empty/schema-only reset behavior. Added a real held-open
+  WAL writer and independent canonical-output regression. Qualification runs
+  are active; no dependency adoption or engine publication is claimed yet.
+  - [x] Bind the failed native case to actual DB18b7ed2d/sharefca91055 ELFs;
+    source/config matches all34 selected paths. Corrected CLI repeats3/3PASS,
+    325skipped,1.093s, terminal0; all four static gates pass this observer draft.
+  - [ ] Qualify the engine fix and 0.4.13 backport with real regression,
+    existing VACUUM/read-only/empty-reload and concurrency cases; retain failures.
+  - [x] Verify the 0.4.13 core source exactly matches the published archive
+    (SHA256 bb6be9a8...). Current engine main is0.5/Asupersync0.6.2;
+    keep the current runtime graph. br-kp1in.45 records an older strict-release
+    refusal for a submodule-bearing Git dependency; that refusal has not been
+    newly executed here. The installed DSR verifier now includes recursive
+    locked-submodule authentication, while the full private-cache/release lane
+    remains unqualified. Do not report the historical refusal as current proof.
+  - [x] Commit source fix412bcf4f5 and isolated single-crate backport64060b976.
+    Only fsqlite-core advances to0.4.14; root lock changes one version and
+    its registry dependency versions stay unchanged. The new .14 version
+    is not published. Normal merge1158aa66a retains both histories while
+    current main's complete tree stays byte-identical to412bcf4f5.
+  - [ ] Finish the real WAL regression and existing VACUUM/concurrency cases,
+    exact0.4.14 package verification and final source-bound compiler gates.
+    First upstream all-targets raw0 has the old unused-helper warning;
+    first strict Clippy101 catches it. Both original jobs are recovered and
+    terminally acknowledged. Own cleanup during transfer invalidated those
+    original content receipts; preserve that error and rerun on frozen inputs.
+    Final fmt0; new all-targets/Clippy and package dry-run are active.
+    Initial engine regression now actually passes1/1 (4136filtered),0.10s,
+    with stable ELFadf2c2ac...; it predates the unused-helper removal and
+    version bump and is not an exact0.4.14 native claim. Exact64060b976
+    package dry-run passes its real production build and explicitly aborts
+    upload. The final local package SHA256 is
+    a64c39c1b2f7252011f9d6a4ad7c4de473931f89765ad9ba5f2ed83893e3d2ec;
+    all668 packaged Rust files match upstream and clean VCS info names64060.
+    Upstream412bcf4f5 also finishes all-targets/strictClippy/fmt0 with all
+    selected source/config hashes verified. Mergedc2aab9fc4 preserves newer
+    upstream work and all4444 issue IDs/comments; its own clean-source
+    formatter0 and all-targets0; strictClippy, production graph and direct WAL
+    regression are active on this integrated source.
+  - [ ] Qualify the exact package at the Agent Mail consumer before publishing.
+    Temporary Cargo patch points only at the unmodified packaged crate,
+    frozen as build-input Git4314e888. An offline resolver initially changes
+    unrelated broad-range dependency edges; restore their original valid
+    choices manually. Parsed comparison then proves every non-core package
+    and edge unchanged, and cargo metadata --locked accepts the graph.
+    Native53 and CLI3 strict-RCH jobs are active on identical overlay827e3078
+    with immutable dependency4314e888, unchanged profiles/predicates/budgets.
+    Both active workers match all34 primary and4 checked package-file hashes.
+    Earlier read-only capture attempts chose the outer multi-root directory
+    and failed; corrected lookup follows the actual Cargo workspace/manifest.
+    Remove the temporary path patch before final public-source qualification and
+    publication; it must never be committed as the delivered dependency.
+  - [x] Select the documented vendor-free Git alternative in br-kp1in.45.
+    FrankenSQLite's maintained release policy reserves registry publication
+    for DSR. No registry release or policy exception is needed to deliver the
+    exact packaged core as an immutable Git source. Source-retention merge
+    0e7ca29b2 makes4314e888 reachable in upstream main's history while its
+    complete workspace tree stays byte-identical to c2aab9fc4. Verified Git
+    inventory:687 files, zero submodules. All source code matches backport64060.
+    This is a core-only source pin, not a crates.io0.4.14 or binary release.
+  - [x] Publish upstream source history; replace the temporary
+    path with immutable official Git4314e888, keeping the other19 runtime
+    engine packages and every non-core dependency edge unchanged. Verify the
+    actual public fetch before closure. Normal source push d53497a02 preserves
+    both newer upstream WHERE-comparison commits, followed by the compatibility
+    mirror. The first push correctly refused ambient BlackThrush's identity
+    against BronzeKnoll's own lease; truthful AGENT_NAME=BronzeKnoll succeeds
+    without bypassing the guard. Public cargo metadata --locked fetches4314;
+    parsed comparison confirms all823 non-core package entries/edges unchanged.
+  - [x] Exact staged-package native cohort passes53/53,4852skipped,28.633s;
+    the real in-copy WAL commit reports consistent_copy, not a refusal. Strict
+    RCH exits0. The earlier mixed-tuple failure remains retained. The separate
+    staged CLI3 execution is still active. No final public-Git execution claim.
+  - [ ] Finish strict public-source authentication and retain actual receipt.
+  - [ ] Repeat the exact53 native cases,3 CLI cases and required workspace
+    gates on the final Agent Mail dependency graph before evaluating .52 closure.
 - [x] Run formatter first, then both workspace compiler graphs and strict
   all-target Clippy on the frozen final source. Complete actual job recovery.
   Earlier732 all-targets actually101/E0599: the new canonical verification

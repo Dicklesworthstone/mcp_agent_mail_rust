@@ -201,6 +201,10 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
+# br-kp1in.52: bind VACUUM's headers to its schema/row hydration transaction.
+# This core-only 0.4.13 backport has registry dependencies and no submodules;
+# the other 19 engine packages stay on their locked registry versions.
+fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "4314e8880f61e23210435283041c0f5e78e97e6e" }
 # br-kp1in.87: published 0.5.1 still leaks pending-request accounting when
 # an acquisition future is dropped. Pin upstream's waiter guard and full
 # acquisition deadline fix. Patch core too so the pool's workspace dependency

@@ -2481,9 +2481,8 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a078facda750bc751a1e8a52780df872bae2f2aa54ecb04e0f3e8664d72eb638"
+version = "0.4.14"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4314e8880f61e23210435283041c0f5e78e97e6e#4314e8880f61e23210435283041c0f5e78e97e6e"
 dependencies = [
  "asupersync",
  "blake3",

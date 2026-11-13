@@ -23667,6 +23667,7 @@ mod tests {
         use tracing::{Event, Metadata, Subscriber};
 
         const CHILD_SOURCE_ENV: &str = "MCP_AGENT_MAIL_WAL_COPY_WITNESS_CHILD";
+        const SCENARIO_CHILD_ENV: &str = "MCP_AGENT_MAIL_WAL_COPY_SCENARIO_CHILD";
 
         fn family_witness(path: &Path, test_name: &str) -> [Option<String>; 2] {
             // Closing a raw source descriptor in this process could erase a
@@ -23729,6 +23730,7 @@ mod tests {
         }
 
         struct CommitAtReload {
+            copy_active: AtomicBool,
             fired: AtomicBool,
             request: mpsc::SyncSender<bool>,
             response: StdMutex<mpsc::Receiver<()>>,
@@ -23750,7 +23752,9 @@ mod tests {
             fn enter(&self, _span: &Id) {}
             fn exit(&self, _span: &Id) {}
             fn event(&self, event: &Event<'_>) {
-                if event.metadata().target() != "fsqlite.snapshot_publication" {
+                if event.metadata().target() != "fsqlite.snapshot_publication"
+                    || !self.copy_active.load(AtomicOrdering::SeqCst)
+                {
                     return;
                 }
                 let mut scenario = Scenario(false);
@@ -23791,6 +23795,32 @@ mod tests {
             );
             return;
         }
+
+        if std::env::var_os(SCENARIO_CHILD_ENV).is_none() {
+            // The adapter dispatches SQL to a dedicated worker. Run this
+            // real scenario in its own test child so a global observer can
+            // reach that worker without changing other tests' tracing.
+            let test_name = std::thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+                .env(SCENARIO_CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "real WAL scenario child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains("archive_in_copy_wal_commit outcome="),
+                "the real scenario must execute, not merely select zero tests"
+            );
+            eprint!("{stderr}");
+            return;
+        }
+        assert_eq!(std::env::var(SCENARIO_CHILD_ENV).unwrap(), "1");
 
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("wal-generation.sqlite3");
@@ -23853,20 +23883,23 @@ mod tests {
             assert_eq!(generation(&reader), first);
             reader.execute_raw("PRAGMA query_only=OFF").unwrap();
             let observer = Arc::new(CommitAtReload {
+                copy_active: AtomicBool::new(true),
                 fired: AtomicBool::new(false),
                 request: request_tx.clone(),
                 response: StdMutex::new(response_rx),
                 acknowledged: StdMutex::new(None),
             });
-            // In pinned fsqlite 0.4.13 this existing event occurs inside
-            // VACUUM, after current_database_header and before the hydration
-            // transaction opens. No sleeps, mocked reads or engine patch.
-            let result = tracing::subscriber::with_default(Arc::clone(&observer), || {
-                reader.execute_raw(&format!(
-                    "VACUUM INTO '{}'",
-                    destination.to_str().unwrap().replace('\'', "''")
-                ))
-            });
+            // This existing event occurs inside VACUUM before the hydration
+            // transaction opens. Core 0.4.13 read its separate header earlier;
+            // the corrected engine takes both from the hydration transaction.
+            // No sleeps, mocked reads or test-only engine hook is involved.
+            tracing::subscriber::set_global_default(Arc::clone(&observer))
+                .expect("the isolated scenario owns its global observer");
+            let result = reader.execute_raw(&format!(
+                "VACUUM INTO '{}'",
+                destination.to_str().unwrap().replace('\'', "''")
+            ));
+            observer.copy_active.store(false, AtomicOrdering::SeqCst);
             drop(reader);
             let _ = request_tx.send(false);
             let _ = release_tx.send(());
