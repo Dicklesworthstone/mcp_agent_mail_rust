@@ -34,10 +34,18 @@ Agent Mail's staged-package consumer passed all 53 selected native cases
 (including a successful consistent copy across the forced WAL commit) and
 3 real archive CLI cases. Public Cargo fetch and the installed DSR source
 capture/verification authenticate the final Git dependency graph: 812 resolved
-packages, with every non-core lock entry and edge unchanged. The final Agent
-Mail public-Git native/CLI runs and workspace compiler gates are still pending.
-These source and focused checks do not close the broader private-cache,
-multi-platform release, soak, or performance gates.
+packages, with every non-core lock entry and edge unchanged. The delivered
+Agent Mail implementation `b6c624ba` passed all 53 selected native cases,
+3 real archive CLI cases, both workspace compiler graphs, strict Clippy and
+formatting through strict remote execution. The forced WAL commit produced
+a consistent copy; the original mixed-generation failure remains retained.
+
+After integrating three peer fixes at `33c4c6e0`, both compiler graphs,
+strict Clippy, formatting, the expanded 56-case DB/share cohort and the same
+3 archive CLI cases pass again. Separate native lexical-scope and server
+cancellation/compose regressions are still compiling. These focused results
+do not close the broader private-cache, multi-platform release, soak, or
+performance gates.
 
 ## November 1, 2026 — FrankenSQLite 0.4.13 (GH#372)
 

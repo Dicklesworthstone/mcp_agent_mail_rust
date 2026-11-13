@@ -42,7 +42,7 @@
   writer row/headers before the byte baseline, establishing its read mark.
   Keep all eight-family equality checks. Both failed receipts are retained;
   neither establishes a live Franken defect. Exact repaired source scan0.
-- [ ] Predeclare focused native cases including the original49 and new controls;
+- [x] Predeclare focused native cases including the original49 and new controls;
   run strict RCH with fresh admission, same dev240s/test/1800s global,
   native30GiB/floor10GiB. Retain every result and exact source/case identities.
   Frozen9b8e4e8d:51 DB/share cases (original49 plus2 new) and3 real CLI
@@ -61,7 +61,7 @@
   Move the three new share controls' eight-family checksum reads into an
   exact-test child PID. Preserve all equality assertions; these witness child
   executions are not additional capability tests. Requalification is pending.
-- [ ] Exercise the narrower commit inside VACUUM. Pinned fsqlite0.4.13 reads
+- [x] Exercise the narrower commit inside VACUUM. Pinned fsqlite0.4.13 reads
   the header in a transaction separate from row hydration; its read-only
   source receipt hashes main without a WAL horizon. Use its existing
   memdb_reload trace to acknowledge a real WAL-only commit before hydration.
@@ -78,7 +78,7 @@
   isolated scenario child: install global tracing there, arm only during the
   copy, require actual scenario completion and keep all original assertions.
   This leaves the generation risk unproved; corrected53 qualification is active.
-- [ ] Fix the now-reproduced live read-only engine window at its source and
+- [x] Fix the now-reproduced live read-only engine window at its source and
   adopt only qualified immutable code. Corrected observer2031489d actually
   runs53:52PASS/1FAIL,4852skipped,14.712s. Verified real WAL-only commit and
   ACK precede canonical output231/4242 with generation-two/0102. This is a
@@ -185,7 +185,7 @@
     populated successful-copy probe and retained evidence. Source/tracker
     publication7ffc64963 preserves peer comments; no peer status changed.
     Release own upstream connection lease1758 after completion; old1759 expired.
-  - [ ] Repeat the exact53 native cases,3 CLI cases and required workspace
+  - [x] Repeat the exact53 native cases,3 CLI cases and required workspace
     gates on the final Agent Mail dependency graph before evaluating .52 closure.
     Frozen implementation b6c624ba uses official Git4314 and lock661b4168.
     - [x] Formatter0, strict RCH39.3s, worker1152480.
@@ -197,9 +197,46 @@
       actual execution53/53PASS,4852skipped,12.144s, forced WAL consistent_copy.
       Exact names match29DB+24share with no missing/extra. Stable actual DB
       ELF5365a02d/share7d0bef6a and the full census are retained.
-    - [ ] Real CLI3 final runtime cohort, worker1156319; retain actual am/it ELFs.
-    - [ ] Re-evaluate unchanged .52 acceptance, publish metadata/closure only
-      when all decisive gates pass, verify both public refs and release own leases.
+    - [x] Real CLI3 final runtime cohort0, worker1156319, strict RCH5645.4s;
+      actual3/3PASS,325skipped,1.539s. Stable am d70b8911/it8da6a18e retained.
+    - [x] Re-evaluate unchanged .52 acceptance after every decisive gate passes.
+      Closed only .52 at17:53UTC on final b6c624ba and integrated33c4c6e0
+      native/CLI/static evidence; original description/acceptance unchanged.
+    - [ ] Publish final metadata, verify both public refs and release own leases.
+- [ ] Preserve and validate the three peer source commits that arrived during
+  the final archive qualification. Do not attribute their implementation to this
+  pass or inflate b6c624ba's evidence into a pass for their newer code.
+  - [x] Review all four changed files: lifecycle admission5ec868f1, canonical
+    lexical authority2a5184cc and abandoned-worker cancellation33c4c6e0.
+    Their commit messages explicitly report native execution unavailable after
+    dependency fetch137; source review/formatting alone is not runtime proof.
+  - [x] Observe external metadata commits c644472c/5d80574d already preserving
+    and publishing our earlier planning updates; do not claim this process
+    performed those pushes. Fast-forward5d80574d to33c4c6e0, preserving both
+    dirty own metadata files, and import Beads afterward.
+  - [x] Bind the new validation to frozen33c4c6e0, unchanged lock661b4168/core4314.
+    Actual native/CLI/production workers match36 primary source/config files
+    and4 core package hashes. All retain pinned rustc908501772/2026-08-31.
+  - [x] Formatter0 (first request103 asks for4 slots on a2-slot worker and
+    executes nothing; the ordinary one-thread formatter request succeeds).
+  - [x] Integrated workspace all-targets0, strict RCH415.8s.
+  - [x] Integrated production graph0, strict RCH551.2s.
+  - [x] Integrated strict Clippy0, strict RCH562.0s on worker1149989.
+  - [x] Integrated native56/56PASS (original53 plus lifecycle matrix and2
+    real canonical-search boundary tests),4849skipped,20.845s, strict RCH0;
+    exact32DB+24share names match; forced WAL copy is consistent.
+  - [x] Integrated real archive CLI3/3PASS,325skipped,1.566s, strict RCH0.
+  - [ ] Run all9 migrated lexical routing/scope integration cases. The first
+    worker1227854 request103 waits out its queue and executes nothing; retry
+    worker1149989 only after a fresh probe and positive live disk-ledger guard.
+  - [ ] Run4 real server worker/compose regressions. First worker1293453
+    request103 times out in admission, zero execution; retry on the warmed
+    worker1156319 after its CLI run finishes. Do not change quotas or deadlines.
+  - [ ] On that same warmed server build, run the6 existing timeout, hard-grace,
+    zombie-TTL and panic-release regressions. The shared grace scheduler changed,
+    so actual timeout behavior needs coverage alongside request abandonment.
+  - [ ] Retain final case censuses, actual executable identities and source
+    receipts, evaluate unchanged .52 acceptance, and publish only scoped claims.
 - [x] Run formatter first, then both workspace compiler graphs and strict
   all-target Clippy on the frozen final source. Complete actual job recovery.
   Earlier732 all-targets actually101/E0599: the new canonical verification
