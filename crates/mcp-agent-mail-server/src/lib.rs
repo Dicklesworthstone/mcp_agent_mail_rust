@@ -39646,11 +39646,20 @@ first body
                 model TEXT NOT NULL,
                 task_description TEXT NOT NULL,
                 inception_ts INTEGER NOT NULL,
-                last_active_ts INTEGER NOT NULL
+                last_active_ts INTEGER NOT NULL,
+                retired_at INTEGER
             )",
             &[],
         )
         .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE agent_deregistrations (
+                agent_id INTEGER PRIMARY KEY REFERENCES agents(id),
+                deregistered_at INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create agent lifecycle ledger");
         conn.execute_sync(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39828,6 +39837,100 @@ first body
             .and_then(|row| row.get_named::<i64>("c").ok())
             .unwrap_or_default();
         assert_eq!(new_recips, 1, "compose should add exactly one recipient");
+    }
+
+    #[test]
+    fn dispatch_compose_envelope_rechecks_lifecycle_after_drafting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("compose_dispatch_lifecycle.sqlite3");
+        setup_compose_dispatch_test_db(&db_path);
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open lifecycle writer");
+        let config = mcp_agent_mail_core::Config::default();
+        let tui_state = tui_bridge::TuiSharedState::new(&config);
+        let envelope = tui_compose::ComposeEnvelope {
+            sender_name: tui_compose::OVERSEER_AGENT_NAME.to_string(),
+            to: vec!["BlueLake".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Drafted while recipient was active".to_string(),
+            body_md: "Body".to_string(),
+            importance: "normal".to_string(),
+            thread_id: None,
+        };
+        let database_url = format!("sqlite://{}", db_path.display());
+        let counts = || {
+            ["agents", "messages", "message_recipients"].map(|table| {
+                writer
+                    .query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap()
+            })
+        };
+        let sent_count = || {
+            tui_state
+                .recent_events(10)
+                .iter()
+                .filter(|event| matches!(event, tui_events::MailEvent::MessageSent { .. }))
+                .count()
+        };
+
+        // A separate connection changes lifecycle after the user drafts the
+        // message. The one-shot compose writer must check the persisted state.
+        writer
+            .execute_sync("UPDATE agents SET retired_at = 0 WHERE id = 2", &[])
+            .unwrap();
+        dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+        assert_eq!(counts(), [1, 0, 0], "rejection must undo overseer creation");
+        assert_eq!(
+            sent_count(),
+            0,
+            "rejection must not report delivery success"
+        );
+        assert!(
+            tui_state
+                .console_log_since(0)
+                .last()
+                .unwrap()
+                .1
+                .contains("agent_retired")
+        );
+
+        writer
+            .execute_sync("UPDATE agents SET retired_at = NULL WHERE id = 2", &[])
+            .unwrap();
+        dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+        assert_eq!(counts(), [2, 1, 1], "unretirement must restore delivery");
+        assert_eq!(sent_count(), 1);
+        writer
+            .execute_sync("UPDATE message_recipients SET read_ts = 7, ack_ts = 9", &[])
+            .unwrap();
+
+        // Clearing the soft-retirement flag must never revive an identity in
+        // the permanent deregistration ledger, including a zero timestamp.
+        writer
+            .execute_sync(
+                "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (2, 0)",
+                &[],
+            )
+            .unwrap();
+        dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+        assert_eq!(counts(), [2, 1, 1]);
+        assert_eq!(sent_count(), 1);
+        assert!(
+            tui_state
+                .console_log_since(0)
+                .last()
+                .unwrap()
+                .1
+                .contains("agent_deregistered")
+        );
+        let history = writer
+            .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+            .unwrap();
+        assert_eq!(history[0].get_named::<i64>("read_ts").unwrap(), 7);
+        assert_eq!(history[0].get_named::<i64>("ack_ts").unwrap(), 9);
     }
 
     #[test]

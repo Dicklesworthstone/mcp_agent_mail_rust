@@ -1606,16 +1606,20 @@ fn is_agent_name_unique_violation(message: &str) -> bool {
         && normalized.contains("agents.name")
 }
 
-fn lookup_agent_id_by_name(
+/// Resolve a participant after the message transaction has started. The TUI's
+/// displayed roster can be stale; retirement and permanent deregistration are
+/// authoritative even for an overseer that bypasses ordinary contact policy.
+fn lookup_active_agent_id_by_name(
     conn: &DbConn,
     project_id: i64,
     agent_name: &str,
 ) -> Result<Option<i64>, DbError> {
     let rows = conn
         .query_sync(
-            "SELECT id FROM agents \
-             WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE \
-             ORDER BY id ASC LIMIT 1",
+            "SELECT a.id, a.name, a.retired_at, d.deregistered_at \
+             FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.project_id = ?1 AND a.name = ?2 COLLATE NOCASE \
+             ORDER BY a.id ASC LIMIT 1",
             &[
                 Value::BigInt(project_id),
                 Value::Text(agent_name.trim().to_string()),
@@ -1623,10 +1627,35 @@ fn lookup_agent_id_by_name(
         )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| row.get_named::<i64>("id").ok()))
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let name = row
+        .get_named::<String>("name")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    // Match ordinary message admission: a ledger entry wins over retirement,
+    // and a timestamp of zero still means the identity is inactive.
+    if let Some(timestamp) = row
+        .get_named::<Option<i64>>("deregistered_at")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?
+    {
+        return Err(DbError::invalid(
+            "agent_deregistered",
+            format!("Agent '{name}' was deregistered at {timestamp}"),
+        ));
+    }
+    if let Some(timestamp) = row
+        .get_named::<Option<i64>>("retired_at")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?
+    {
+        return Err(DbError::invalid(
+            "agent_retired",
+            format!("Agent '{name}' was retired at {timestamp}"),
+        ));
+    }
+    row.get_named::<i64>("id")
+        .map(Some)
+        .map_err(|error| DbError::Sqlite(error.to_string()))
 }
 
 fn resolve_root_project_id(conn: &DbConn) -> Result<i64, DbError> {
@@ -1650,7 +1679,7 @@ fn resolve_or_create_sender_id(
     sender_name: &str,
     now: i64,
 ) -> Result<i64, DbError> {
-    if let Some(sender_id) = lookup_agent_id_by_name(conn, project_id, sender_name)? {
+    if let Some(sender_id) = lookup_active_agent_id_by_name(conn, project_id, sender_name)? {
         return Ok(sender_id);
     }
 
@@ -1668,7 +1697,8 @@ fn resolve_or_create_sender_id(
         Err(err) => {
             let message = err.to_string();
             if is_agent_name_unique_violation(&message)
-                && let Some(sender_id) = lookup_agent_id_by_name(conn, project_id, sender_name)?
+                && let Some(sender_id) =
+                    lookup_active_agent_id_by_name(conn, project_id, sender_name)?
             {
                 return Ok(sender_id);
             }
@@ -1676,7 +1706,7 @@ fn resolve_or_create_sender_id(
         }
     }
 
-    lookup_agent_id_by_name(conn, project_id, sender_name)?
+    lookup_active_agent_id_by_name(conn, project_id, sender_name)?
         .ok_or_else(|| DbError::Internal("Failed to resolve sender ID after insert".into()))
 }
 
@@ -1741,7 +1771,7 @@ fn insert_message_recipients(
     let mut missing_seen: HashSet<String> = HashSet::new();
 
     for (name, kind) in recipients {
-        let Some(aid) = lookup_agent_id_by_name(conn, project_id, name)? else {
+        let Some(aid) = lookup_active_agent_id_by_name(conn, project_id, name)? else {
             let normalized = name.trim().to_ascii_lowercase();
             if missing_seen.insert(normalized) {
                 missing_names.push(name.trim().to_string());
@@ -1831,7 +1861,8 @@ fn sync_message_recipients_json(conn: &DbConn, msg_id: i64) -> Result<(), DbErro
 /// Dispatch a message from the first available project (TUI context).
 ///
 /// Handles project resolution, sender auto-registration (for overseer),
-/// message insertion, and recipient linking in a single transaction.
+/// lifecycle admission, message insertion, and recipient linking in a single
+/// transaction. Overseer contact-policy bypass never revives inactive agents.
 pub fn dispatch_root_message(
     conn: &DbConn,
     sender_name: &str,
@@ -4025,6 +4056,110 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_root_message_rejects_inactive_participants_and_rolls_back() {
+        for (retired_at, deregistered_at, expected_field) in [
+            (Some(0), None, "agent_retired"),
+            (None, Some(0), "agent_deregistered"),
+            (Some(10), Some(20), "agent_deregistered"),
+        ] {
+            for role in ["sender", "to", "cc", "bcc"] {
+                let conn = test_conn();
+                let project = insert_project(&conn);
+                let active = insert_agent(&conn, project, "Active");
+                let inactive = insert_agent(&conn, project, "Inactive");
+                let historical = insert_message(&conn, project, active, "existing-thread");
+                conn.execute_sync(
+                    "INSERT INTO message_recipients \
+                     (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, 'to', 7, 9)",
+                    &[Value::BigInt(historical), Value::BigInt(inactive)],
+                )
+                .unwrap();
+                if let Some(timestamp) = retired_at {
+                    conn.execute_sync(
+                        "UPDATE agents SET retired_at = ? WHERE id = ?",
+                        &[Value::BigInt(timestamp), Value::BigInt(inactive)],
+                    )
+                    .unwrap();
+                }
+                if let Some(timestamp) = deregistered_at {
+                    conn.execute_sync(
+                        "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (?, ?)",
+                        &[Value::BigInt(inactive), Value::BigInt(timestamp)],
+                    )
+                    .unwrap();
+                }
+                let counts = || {
+                    [
+                        "agents",
+                        "messages",
+                        "message_recipients",
+                        "inbox_delivery_events",
+                    ]
+                    .map(|table| {
+                        conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                            .unwrap()[0]
+                            .get_as::<i64>(0)
+                            .unwrap()
+                    })
+                };
+                let before = counts();
+                let sender = if role == "sender" {
+                    " inactive "
+                } else {
+                    "NewOverseer"
+                };
+                // The active recipient is inserted first, so recipient rejection
+                // must also roll back partial deliveries and the new overseer.
+                let mut recipients = vec![("Active".to_string(), "to".to_string())];
+                if role != "sender" {
+                    recipients.push((" inactive ".to_string(), role.to_string()));
+                }
+                let dispatch = |subject| {
+                    dispatch_root_message(
+                        &conn,
+                        sender,
+                        subject,
+                        "Body",
+                        "normal",
+                        None,
+                        &recipients,
+                    )
+                };
+                let error = dispatch("Rejected draft")
+                    .expect_err("inactive participants must not authorize new work");
+                assert!(
+                    matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field),
+                    "wrong {role} lifecycle error: {error:?}"
+                );
+                assert_eq!(
+                    counts(),
+                    before,
+                    "{role} rejection must leave no partial writes"
+                );
+                let historical_rows = conn
+                    .query_sync(
+                        "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                        &[Value::BigInt(historical)],
+                    )
+                    .unwrap();
+                assert_eq!(historical_rows[0].get_named::<i64>("read_ts").unwrap(), 7);
+                assert_eq!(historical_rows[0].get_named::<i64>("ack_ts").unwrap(), 9);
+
+                if deregistered_at.is_none() {
+                    conn.execute_sync(
+                        "UPDATE agents SET retired_at = NULL, contact_policy = 'block_all' WHERE id = ?",
+                        &[Value::BigInt(inactive)],
+                    )
+                    .unwrap();
+                    dispatch("Unretired draft").expect(
+                        "unretirement restores overseer send/receive despite contact policy",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn dispatch_root_message_unknown_recipient_returns_not_found_and_rolls_back() {
         let conn = test_conn();
         let _pid = insert_project(&conn);
@@ -4667,7 +4802,7 @@ mod tests {
     fn sync_read_write_failure_checks_the_whole_batch_after_the_last_chunk() {
         for ignore_last in [false, true] {
             write_failure_fixture(|conn, project, recipient, first, second| {
-                let sender = lookup_agent_id_by_name(conn, project, "Sender")
+                let sender = lookup_active_agent_id_by_name(conn, project, "Sender")
                     .unwrap()
                     .unwrap();
                 conn.execute_raw("BEGIN IMMEDIATE").unwrap();
