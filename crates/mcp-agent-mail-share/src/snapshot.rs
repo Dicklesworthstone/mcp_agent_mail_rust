@@ -2218,6 +2218,27 @@ mod tests {
                              UPDATE archive_generation SET label='generation-two',payload=X'0102'; \
                              COMMIT",
                         ).unwrap();
+                        // Verify the actual committed input and establish its
+                        // canonical WAL read mark before measuring neutrality.
+                        let rows = writer
+                            .query_snapshot("SELECT label FROM archive_generation", &[])
+                            .unwrap();
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(
+                            rows[0].get_named::<String>("label").unwrap(),
+                            "generation-two"
+                        );
+                        for (pragma, expected) in [("user_version", 232), ("application_id", 4343)]
+                        {
+                            assert_eq!(
+                                writer
+                                    .query_snapshot(&format!("PRAGMA {pragma}"), &[])
+                                    .unwrap()[0]
+                                    .get_named::<i64>(pragma)
+                                    .unwrap(),
+                                expected
+                            );
+                        }
                         committed_family = Some(archive_source_family(&source));
                     }
                     Ok(())
@@ -2292,6 +2313,13 @@ mod tests {
                      INSERT INTO archive_generation VALUES('committed',X'00FF')",
                 )
                 .unwrap();
+            // Establish the committed WAL read mark before the transaction
+            // and byte baseline; the copy must not advance or rewrite it.
+            let rows = writer
+                .query_snapshot("SELECT label FROM archive_generation", &[])
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_named::<String>("label").unwrap(), "committed");
             // Keep this transaction alive for the entire actual VACUUM, not
             // merely a before/after phase callback. No scheduling or timing
             // assumption is needed to overlap the writer with the copy.
