@@ -8,11 +8,13 @@
 - [x] Select the current gap: b1003328's real background retention progress
   tests were never executed natively. Read the budget, pin search, lock and
   continuation-rest paths; keep original deadline/count/byte/safety conditions.
-- [ ] Execute frozen8024bd9c's predeclared14 native server/DB tests: repeated
+- [x] Execute frozen8024bd9c's predeclared14 native server/DB tests: repeated
   slow-inventory progress, first-unit sharing, zero/expired and strict budgets,
   pin-search resumption, source revalidation and recovery exclusion. Preserve
-  every actual nonpass; fix only a demonstrated source defect.
-- [ ] Run both compiler graphs, strict all-targets Clippy and formatter on the
+  every actual nonpass; fix only a demonstrated source defect. Actual f05f7394
+  exits0:14/14PASS,9635skipped,33.517s; exact case set and both stable ELFs
+  match. Final424c680b's31-case requalification is recorded below.
+- [x] Run both compiler graphs, strict all-targets Clippy and formatter on the
   same current graph; qualify a new exact snapshot if source changes are needed.
 - [x] Preserve frozen8024bd9c's actual strict-Clippy failure: checkpoint
   StoredSnapshot has a216-byte variant beside4-byte legacy state. Repair only
@@ -30,23 +32,35 @@
   test-code failures. In424c680b use checked subtraction for the same original
   one-millisecond fixture instant, add diagnostic messages to three unchanged
   empty-failure assertions and repair the same two DB fixture subtractions.
-- [ ] Qualify final424c680b with all four mandatory gates and31 predeclared
+- [x] Qualify final424c680b with all four mandatory gates and31 predeclared
   cases:14 retention,8 checkpoint,3 real-process signal,5 supervisor result
-  and1 real-Git archive route. Earlier snapshots remain distinct evidence.
+  and1 real-Git archive route. Actual a97cb414 exits0:31/31PASS,
+  10749skipped,12.694s. Exact case census has no missing/extra/retried cases;
+  stable actual DB/storage/server ELFs retain all31 markers. The17 in-run
+  worker source/config hashes match424c680b. Earlier snapshots stay distinct.
 - [x] Final424c680b strict workspace all-targets Clippy-Dwarnings exits0
   (752.446s remote); its formatter retry exits0. Keep the earlier formatter
   admission refusal103 and proc-macro-error2 future-compat warning visible.
 - [x] Complete final424c680b's production lib+bins graph (exit0,199.035s
   remote) and separate workspace all-targets check (exit0). All four mandatory
-  static gates pass on the same source. Native execution remains outstanding.
-- [ ] Re-read any fix and callers with fresh eyes; perform focused final
+  static gates pass on the same source, as does the selected31-case native run.
+- [x] Re-read any fix and callers with fresh eyes; perform focused final
   verification and stock scan if code changes. Do not claim full-suite,
   Windows/macOS, real live-mailbox, soak or release qualification from this lane.
-- [ ] Keep original .29/.5/asldx acceptance and all earlier red results open.
+  No further behavioral defect is established. Stock five-file UBS remains
+  red (5 unchanged test-only timestamp findings); the final changed-pair scan
+  exits0 with0critical. No scanner suppression or original-predicate changes.
+- [x] Keep original .29/.5/asldx acceptance and all earlier red results open.
   br-h6k9b's large drain and20 quiet/10 loaded ext4 acceptance is separate,
   untouched and unqualified. Record source/executable/case evidence on .29.
-- [ ] Review scope, tracker integrity/cycles and peer changes; publish scoped
-  work/evidence and release exact owned leases, retaining actual receipts.
+- [x] Review scope/tracker/cycles and prepare scoped publication/exact lease
+  release. Both exports preserve all2867 records and change only .29 comments
+  4326–4331/update time; status, owner, criteria and graph are unchanged.
+  Cycles are empty; seven preexisting untracked roots are preserved. Source
+  027d71f6/55945fc7/424c680b is already public through the shared publisher.
+  Publish the remaining evidence only. Actual final-ref and exact-seven-lease
+  release receipts follow in the existing external review-audit.md after
+  those operations complete; this prepared step does not assert their outcome.
 
 ## November 12 missing-integrity fresh review — EmeraldEagle
 
