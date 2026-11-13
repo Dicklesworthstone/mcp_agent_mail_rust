@@ -2125,8 +2125,15 @@ mod tests {
         )
     }
 
-    fn archive_source_family(path: &Path) -> [Option<Vec<u8>>; 8] {
-        [
+    const ARCHIVE_FAMILY_CHILD_ENV: &str = "MCP_AGENT_MAIL_ARCHIVE_FAMILY_WITNESS_CHILD";
+
+    fn archive_source_family_child() -> bool {
+        use sha2::Digest as _;
+        let Some(path) = std::env::var_os(ARCHIVE_FAMILY_CHILD_ENV) else {
+            return false;
+        };
+        let path = PathBuf::from(path);
+        let fingerprints = [
             "",
             "-wal",
             "-shm",
@@ -2137,12 +2144,55 @@ mod tests {
             "-journal",
         ]
         .map(|suffix| {
-            std::fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(path, suffix)).ok()
-        })
+            match std::fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(
+                &path, suffix,
+            )) {
+                Ok(bytes) => Some(hex::encode(sha2::Sha256::digest(bytes))),
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                    None
+                }
+            }
+        });
+        println!(
+            "archive_source_family_witness={}",
+            serde_json::to_string(&fingerprints).unwrap()
+        );
+        true
+    }
+
+    fn archive_source_family(path: &Path) -> [Option<String>; 8] {
+        // A raw descriptor opened and closed here could release this
+        // process's live SQLite locks. Read bytes only in the child PID.
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(ARCHIVE_FAMILY_CHILD_ENV, path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "family witness child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let json = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("archive_source_family_witness=")
+                    .map(|(_, value)| value)
+            })
+            .expect("child emits a real family witness");
+        let witness: [Option<String>; 8] = serde_json::from_str(json).unwrap();
+        assert!(witness[0].is_some(), "the source main file must exist");
+        witness
     }
 
     #[test]
     fn full_archive_preserves_zero_headers_with_populated_data() {
+        if archive_source_family_child() {
+            return;
+        }
         for live in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let source = directory.path().join("zero-source.sqlite3");
@@ -2180,6 +2230,9 @@ mod tests {
 
     #[test]
     fn full_archive_headers_and_payload_follow_the_same_committed_generation() {
+        if archive_source_family_child() {
+            return;
+        }
         for live in [false, true] {
             for mutation_cut in [
                 FullArchiveProgressState::Started,
@@ -2294,6 +2347,9 @@ mod tests {
 
     #[test]
     fn full_archive_cannot_mix_an_active_writers_uncommitted_header_and_payload() {
+        if archive_source_family_child() {
+            return;
+        }
         for live in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let source = directory.path().join("active-writer.sqlite3");

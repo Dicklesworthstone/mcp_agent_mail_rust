@@ -23657,6 +23657,260 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guarded_full_copy_binds_headers_and_rows_across_a_wal_commit() {
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::mpsc;
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        const CHILD_SOURCE_ENV: &str = "MCP_AGENT_MAIL_WAL_COPY_WITNESS_CHILD";
+
+        fn family_witness(path: &Path, test_name: &str) -> [Option<String>; 2] {
+            // Closing a raw source descriptor in this process could erase a
+            // live writer's POSIX locks. The child only returns checksums.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                .env(CHILD_SOURCE_ENV, path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "WAL witness child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let json = stdout
+                .lines()
+                .find_map(|line| {
+                    line.split_once("wal_copy_source_witness=")
+                        .map(|(_, value)| value)
+                })
+                .expect("child emits a real WAL witness");
+            let witness: [Option<String>; 2] = serde_json::from_str(json).unwrap();
+            assert!(witness[0].is_some(), "the source main file must exist");
+            witness
+        }
+
+        fn generation(conn: &impl SyncQuery) -> (i64, i64, String, String) {
+            let rows = conn
+                .query_sync(
+                    "SELECT label,hex(payload) AS payload FROM vacuum_generation",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            (
+                conn.query_sync("PRAGMA user_version", &[]).unwrap()[0]
+                    .get_named("user_version")
+                    .unwrap(),
+                conn.query_sync("PRAGMA application_id", &[]).unwrap()[0]
+                    .get_named("application_id")
+                    .unwrap(),
+                rows[0].get_named("label").unwrap(),
+                rows[0].get_named("payload").unwrap(),
+            )
+        }
+
+        struct Scenario(bool);
+        impl Visit for Scenario {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "scenario_id" {
+                    self.0 = value == "memdb_reload";
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "scenario_id" {
+                    self.0 = format!("{value:?}") == "\"memdb_reload\"";
+                }
+            }
+        }
+
+        struct CommitAtReload {
+            fired: AtomicBool,
+            request: mpsc::SyncSender<bool>,
+            response: StdMutex<mpsc::Receiver<()>>,
+            acknowledged: StdMutex<Option<Result<(), String>>>,
+        }
+        impl Subscriber for CommitAtReload {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.is_event() && metadata.target() == "fsqlite.snapshot_publication"
+            }
+            fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+                Some(tracing::level_filters::LevelFilter::TRACE)
+            }
+            fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+                // This observer enables events only, so it creates no spans.
+                Id::from_u64(1)
+            }
+            fn record(&self, _span: &Id, _values: &Record<'_>) {}
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+            fn enter(&self, _span: &Id) {}
+            fn exit(&self, _span: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() != "fsqlite.snapshot_publication" {
+                    return;
+                }
+                let mut scenario = Scenario(false);
+                event.record(&mut scenario);
+                if !scenario.0 || self.fired.swap(true, AtomicOrdering::SeqCst) {
+                    return;
+                }
+                let result = self
+                    .request
+                    .send(true)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| {
+                        self.response
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30))
+                            .map_err(|error| error.to_string())
+                    });
+                *self.acknowledged.lock().unwrap() = Some(result);
+            }
+        }
+
+        if let Some(source) = std::env::var_os(CHILD_SOURCE_ENV) {
+            use sha2::Digest as _;
+            let source = PathBuf::from(source);
+            let fingerprints = [source.clone(), sqlite_sidecar_path(&source, "-wal")].map(|path| {
+                match std::fs::read(path) {
+                    Ok(bytes) => Some(hex::encode(sha2::Sha256::digest(bytes))),
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        None
+                    }
+                }
+            });
+            println!(
+                "wal_copy_source_witness={}",
+                serde_json::to_string(&fingerprints).unwrap()
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("wal-generation.sqlite3");
+        let destination = directory.path().join("private-copy.sqlite3");
+        let first = (231, 4242, "generation-one".into(), "00FF".into());
+        let second = (232, 4343, "generation-two".into(), "0102".into());
+        let seed = DbConn::open_file(source.to_str().unwrap()).unwrap();
+        seed.execute_raw(
+            "PRAGMA journal_mode=WAL; PRAGMA user_version=231; PRAGMA application_id=4242; \
+             CREATE TABLE vacuum_generation(label TEXT NOT NULL,payload BLOB NOT NULL); \
+             INSERT INTO vacuum_generation VALUES('generation-one',X'00FF')",
+        )
+        .unwrap();
+        assert_eq!(generation(&seed), first);
+        seed.close_sync().unwrap();
+
+        let witness_test_name = std::thread::current().name().unwrap().to_owned();
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (request_tx, request_rx) = mpsc::sync_channel(1);
+            let (response_tx, response_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let writer_path = source.clone();
+            let expected = second.clone();
+            let writer = scope.spawn(move || {
+                let conn = DbConn::open_file(writer_path.to_str().unwrap()).unwrap();
+                conn.execute_raw("PRAGMA wal_autocheckpoint=0").unwrap();
+                let before = family_witness(&writer_path, &witness_test_name);
+                ready_tx.send(()).unwrap();
+                if request_rx.recv_timeout(Duration::from_secs(30)) != Ok(true) {
+                    return;
+                }
+                conn.execute_raw(
+                    "BEGIN IMMEDIATE; PRAGMA user_version=232; PRAGMA application_id=4343; \
+                     UPDATE vacuum_generation SET label='generation-two',payload=X'0102'; COMMIT",
+                )
+                .unwrap();
+                // Validate the input and establish its real WAL read mark.
+                // A main-file rewrite would not exercise the missing horizon.
+                assert_eq!(generation(&conn), expected);
+                let committed = open_guarded_read_only_franken_existing_file(
+                    &writer_path,
+                    "committed generation input",
+                )
+                .unwrap();
+                assert_eq!(generation(&committed), expected);
+                let after = family_witness(&writer_path, &witness_test_name);
+                assert_eq!(after[0], before[0], "the commit must not rewrite main");
+                assert!(after[1].is_some(), "the committed WAL must exist");
+                assert_ne!(after[1], before[1], "the real WAL must advance");
+                response_tx.send(()).unwrap();
+                // Keep both the writer and its verified committed reader alive
+                // through the copy; the runner's per-test limit remains 240s.
+                let _ = release_rx.recv_timeout(Duration::from_secs(240));
+            });
+            ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            let reader =
+                open_guarded_read_only_franken_existing_file(&source, "archive generation probe")
+                    .unwrap();
+            assert_eq!(generation(&reader), first);
+            reader.execute_raw("PRAGMA query_only=OFF").unwrap();
+            let observer = Arc::new(CommitAtReload {
+                fired: AtomicBool::new(false),
+                request: request_tx.clone(),
+                response: StdMutex::new(response_rx),
+                acknowledged: StdMutex::new(None),
+            });
+            // In pinned fsqlite 0.4.13 this existing event occurs inside
+            // VACUUM, after current_database_header and before the hydration
+            // transaction opens. No sleeps, mocked reads or engine patch.
+            let result = tracing::subscriber::with_default(Arc::clone(&observer), || {
+                reader.execute_raw(&format!(
+                    "VACUUM INTO '{}'",
+                    destination.to_str().unwrap().replace('\'', "''")
+                ))
+            });
+            drop(reader);
+            let _ = request_tx.send(false);
+            let _ = release_tx.send(());
+            writer.join().expect("the real WAL writer must finish");
+            assert!(
+                observer.fired.load(AtomicOrdering::SeqCst),
+                "the engine reload cut must actually fire"
+            );
+            assert_eq!(
+                *observer.acknowledged.lock().unwrap(),
+                Some(Ok(())),
+                "the WAL-only commit must finish before hydration continues"
+            );
+
+            match result {
+                Ok(()) => {
+                    crate::neutralize_private_salvage_artifact(
+                        &destination,
+                        destination.to_str().unwrap(),
+                    )
+                    .unwrap();
+                    let copy =
+                        crate::CanonicalDbConn::open_file(destination.to_str().unwrap()).unwrap();
+                    let copied = generation(&copy);
+                    assert!(
+                        copied == first || copied == second,
+                        "a WAL commit inside VACUUM must never mix header and row generations: {copied:?}"
+                    );
+                    eprintln!("archive_in_copy_wal_commit outcome=consistent_copy");
+                }
+                Err(error) => {
+                    assert!(
+                        is_lock_error(&error.to_string()),
+                        "unexpected generation-race refusal: {error}"
+                    );
+                    assert!(
+                        matches!(std::fs::symlink_metadata(&destination), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                    );
+                    eprintln!("archive_in_copy_wal_commit outcome=busy_refusal");
+                }
+            }
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn guarded_read_only_helpers_preserve_valid_live_wal_byte_identically() {

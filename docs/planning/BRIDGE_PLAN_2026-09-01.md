@@ -16,12 +16,17 @@
   with changed headers/payload through the complete native copy, then roll it
   back. Require the old committed image or a lock/busy refusal before publishing;
   verify source-family neutrality and log which branch each source engine took.
-  This closes the timing gap in the phase cuts; execution remains pending.
+  Actual hash-bound prepared executable test passes for both engines, each
+  copied_committed rather than refusal. Same240s bound; no mixed output.
 - [x] Extend the existing isolated CLI archive harness with nonzero headers,
   unknown schema/payload/sequence/trigger and structured secret-free phases.
   Exercise the actual save/restore binaries and independent canonical reopen.
-  These checkboxes record written controls, not executed native passes.
-- [ ] Review all edits again; repair only demonstrated defects. Keep source
+  Exact e10288bb CLI execution passes all3 selected cases,325skipped,1.286s:
+  header save/restore, failure/retry and dry-run. Actual am/it ELF identities
+  and34 worker source/config hashes are retained. A speculative Cargo env
+  config attempt first exits96 before tests; its failure is preserved and
+  the normal command then passes without that extra flag.
+- [x] Review all edits again; repair only demonstrated defects. Keep source
   assertions, permissions, authority, budgets, deadlines and dependency graph.
   Frozen9b actually runs51:50PASS/1FAIL. The new generation fixture mutates
   a sidecar-free canonical source after its immutable reader has opened;
@@ -29,7 +34,11 @@
   Retain the failure. Repair only the fixture: keep canonical WAL/SHM and
   its writer alive to exercise the supported locking read-only path; keep
   every tuple/planted-negative/source-neutrality assertion. Runtime race
-  qualification remains pending; this is not a demonstrated Franken defect.
+  remains required. Repaireda848 then fails only SHM read-mark byte104
+  (5 to7); main/WAL and all other bytes match. Verify the actual committed
+  writer row/headers before the byte baseline, establishing its read mark.
+  Keep all eight-family equality checks. Both failed receipts are retained;
+  neither establishes a live Franken defect. Exact repaired source scan0.
 - [ ] Predeclare focused native cases including the original49 and new controls;
   run strict RCH with fresh admission, same dev240s/test/1800s global,
   native30GiB/floor10GiB. Retain every result and exact source/case identities.
@@ -38,12 +47,50 @@
   Same predicates, profiles and budgets. No new TUI/transport/soak claim.
   Preserve these active requests; the additional writer-overlap case will
   qualify at its own frozen source after they finish, without double-counting.
-- [ ] Run formatter first, then both workspace compiler graphs and strict
+  Final e377475c source matches all34 hashes captured during the successful
+  a848+snapshot overlay:51/51PASS,4853skipped,11.860s, exact unique census.
+  Stable DB/share executable identities captured; added writer case then
+  executes once through strict RCH on the hash-checked share ELF:1PASS,
+  both engines copied_committed. Total52 unique native cases, not103.
+  Exact e10288bb repeats original51 successfully:51PASS,4853skipped,10.423s.
+- [x] Audit checksum observers for lock interference. Raw opens/closes in a
+  process holding SQLite POSIX locks can invalidate the concurrency premise.
+  Move the three new share controls' eight-family checksum reads into an
+  exact-test child PID. Preserve all equality assertions; these witness child
+  executions are not additional capability tests. Requalification is pending.
+- [ ] Exercise the narrower commit inside VACUUM. Pinned fsqlite0.4.13 reads
+  the header in a transaction separate from row hydration; its read-only
+  source receipt hashes main without a WAL horizon. Use its existing
+  memdb_reload trace to acknowledge a real WAL-only commit before hydration.
+  Verify writer and fresh-reader input, unchanged main/changed WAL, and a
+  wholly old/new canonical-reopened output or typed busy refusal/no image.
+  This is a source-derived risk, not a confirmed mixed-generation defect.
+  Predeclared native denominator53: original51, held-writer control and this
+  new in-copy control. Same profile/limits; no engine/dependency/runtime edits.
+- [x] Run formatter first, then both workspace compiler graphs and strict
   all-target Clippy on the frozen final source. Complete actual job recovery.
+  Earlier732 all-targets actually101/E0599: the new canonical verification
+  connection has Drop, not close_sync. Read its actual adapter Drop; repair
+  only that call to drop(copied) in e10288bb, retaining all CLI assertions.
+  Stock harness scan remains1/nine unchanged criticals; overlay fmt0.
+  Owned RCH maintenance reopens normally. Exact e10288bb final production0/
+  6.122s, all-targets0/276.693s, strict Clippy0/438.123s and fmt0/25.386s
+  remote. Both active native and final-Clippy workers'34 hashes match e102.
+  Clippy reuses the all-target worker114's warmed dependencies. Tests remain
+  source-bound and pending; these four positives do not turn UBS red green.
+  New lock-neutral checksum/in-copy test overlay has formatter0 and stock
+  pool/share scans0critical. Its first all-targets101/E0277 finds unsupported
+  LowerHex on sha2 0.11's digest array; use existing hex::encode in both child
+  readers. Retain the failed gate and exact owned native cancellation/recovery:
+  local143, remote delivery120/daemon130, terminal acknowledged; no pass credit.
+  Corrected overlay9a7be125 then passes production191.854s, all-targets375.371s,
+  strict Clippy442.106s and fmt14.886s, all0. Its53-case native cohort remains
+  active, with all34 worker source/config hashes matching this draft.
 - [ ] Compare .52 original acceptance against actual evidence; do not close on
   phase controls alone if an in-copy or full E2E condition remains unproved.
 - [ ] Update Beads, export/cycles/scope check, preserve incoming history,
-  publish both refs and release only this turn's1734/1735/1736 leases.
+  publish both refs and release only active owned1734/1756/1757 leases;
+  earlier code leases1735/1736/1747/1749/1750/1751 are already released.
 
 ## November 13 snapshot privacy and compensation review — EmeraldEagle
 
