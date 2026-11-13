@@ -11716,7 +11716,8 @@ pub async fn get_message_delivery_receipt(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    match crate::sync::message_delivery_receipt_from_conn(&*conn, project_id, message_id) {
+    // Borrow the database while `conn` retains the pooled retirement guard.
+    match crate::sync::message_delivery_receipt_from_conn(&**conn, project_id, message_id) {
         Ok(receipt) => Outcome::Ok(receipt),
         Err(error) => Outcome::Err(error),
     }
