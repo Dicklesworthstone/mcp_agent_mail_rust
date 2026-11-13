@@ -242,7 +242,7 @@ pub struct SearchOptions {
     /// Whether to emit telemetry events for this query.
     pub track_telemetry: bool,
     /// Search engine override. `None` = the surface's configured engine.
-    /// The rollout kill switches apply either way.
+    /// The rollout kill switches and canonical mailbox authority apply either way.
     pub search_engine: Option<SearchEngine>,
     /// Tool issuing the query (e.g. `"search_messages"`), which selects an
     /// `AM_SEARCH_ENGINE_FOR_<TOOL>` override. `None` = the global engine.
@@ -514,29 +514,44 @@ fn generate_zero_result_guidance(
 // Tantivy routing helpers
 // ────────────────────────────────────────────────────────────────────
 
+#[cfg(all(test, feature = "tantivy-engine"))]
+std::thread_local! {
+    // Exercise changes committed after candidate collection but before the
+    // service hydrates those candidates from the authoritative mailbox.
+    static LEXICAL_CANDIDATE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Try executing a search via the Tantivy bridge. Returns `None` if the
 /// bridge is not initialized (`init_bridge` not called).
 fn try_tantivy_search(
     cx: &Cx,
     pool: &DbPool,
     query: &SearchQuery,
-    canonical_candidates: bool,
 ) -> Result<Option<Vec<SearchResult>>, DbError> {
     #[cfg(feature = "tantivy-engine")]
     {
-        crate::search_v3::search_database_with_cx(
+        let results = crate::search_v3::search_database_with_cx(
             cx,
             pool,
             &lexical_backfill_database_url(pool),
             &direct_surface_index_dir(pool)?,
             query,
-            canonical_candidates,
+            true,
         )
-        .map_err(|error| map_bridge_bootstrap_error(&error))
+        .map_err(|error| map_bridge_bootstrap_error(&error))?;
+        #[cfg(test)]
+        LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+            let hook = hook.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+        Ok(results)
     }
     #[cfg(not(feature = "tantivy-engine"))]
     {
-        let _ = (cx, pool, query, canonical_candidates);
+        let _ = (cx, pool, query);
         Ok(None)
     }
 }
@@ -729,39 +744,6 @@ fn detail_matches_agent_filter(
     }
 }
 
-fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchResult) -> bool {
-    let Some(agent_name) = query.agent_name.as_deref() else {
-        return true;
-    };
-
-    // This path runs after retrieval when deciding whether an unresolved
-    // lexical hit may survive final filtering. Missing metadata must not count
-    // as a match here, or stale index hits can leak through agent filters.
-    let sender_matches = result
-        .from_agent
-        .as_deref()
-        .is_some_and(|from_agent| from_agent.eq_ignore_ascii_case(agent_name));
-
-    // If the result has recipient info, check it.
-    let recipient_matches = result.to.as_ref().is_some_and(|to| {
-        to.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
-            || result
-                .cc
-                .as_ref()
-                .is_some_and(|cc| cc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
-            || result
-                .bcc
-                .as_ref()
-                .is_some_and(|bcc| bcc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
-    });
-
-    match query.direction {
-        Some(Direction::Outbox) => sender_matches,
-        Some(Direction::Inbox) => recipient_matches,
-        None => sender_matches || recipient_matches,
-    }
-}
-
 fn detail_matches_query_filters(
     query: &SearchQuery,
     detail: &crate::queries::ThreadMessageRow,
@@ -812,70 +794,6 @@ fn detail_matches_query_filters(
     true
 }
 
-fn raw_result_matches_query_filters(
-    query: &SearchQuery,
-    result: &SearchResult,
-    product_project_ids: Option<&HashSet<i64>>,
-) -> bool {
-    if let Some(project_id) = query.project_id
-        && result.project_id != Some(project_id)
-    {
-        return false;
-    }
-    if let Some(allowed_projects) = product_project_ids {
-        let Some(pid) = result.project_id else {
-            return false;
-        };
-        if !allowed_projects.contains(&pid) {
-            return false;
-        }
-    }
-    if !unresolved_result_matches_agent_filter(query, result) {
-        return false;
-    }
-    if let Some(thread_id) = query.thread_id.as_deref()
-        && result.thread_id.as_deref() != Some(thread_id)
-    {
-        return false;
-    }
-    if let Some(ack_required) = query.ack_required {
-        let Some(raw_ack) = result.ack_required else {
-            return false;
-        };
-        if raw_ack != ack_required {
-            return false;
-        }
-    }
-    if !query.importance.is_empty() {
-        let Some(raw_importance) = result.importance.as_deref() else {
-            return false;
-        };
-        let Some(level) = crate::search_planner::Importance::parse(raw_importance) else {
-            return false;
-        };
-        if !query.importance.contains(&level) {
-            return false;
-        }
-    }
-    if let Some(min_ts) = query.time_range.min_ts {
-        let Some(raw_ts) = result.created_ts else {
-            return false;
-        };
-        if raw_ts < min_ts {
-            return false;
-        }
-    }
-    if let Some(max_ts) = query.time_range.max_ts {
-        let Some(raw_ts) = result.created_ts else {
-            return false;
-        };
-        if raw_ts > max_ts {
-            return false;
-        }
-    }
-    true
-}
-
 const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
 
 type SemanticContentHashes = HashMap<(DocKind, i64), (Option<i64>, String)>;
@@ -896,7 +814,7 @@ async fn canonicalize_semantic_results(
     results: Vec<SearchResult>,
     proof: &SemanticCandidateProof,
 ) -> Outcome<Vec<SearchResult>, DbError> {
-    let mut results = match canonicalize_message_results(cx, pool, query, results, false).await {
+    let mut results = match canonicalize_message_results(cx, pool, query, results).await {
         Outcome::Ok(results) => results,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -990,7 +908,6 @@ async fn canonicalize_message_results(
     pool: &DbPool,
     query: &SearchQuery,
     raw_results: Vec<SearchResult>,
-    preserve_unresolved_hits: bool,
 ) -> Outcome<Vec<SearchResult>, DbError> {
     if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) || raw_results.is_empty() {
         return Outcome::Ok(raw_results);
@@ -1047,13 +964,9 @@ async fn canonicalize_message_results(
     let mut dropped_filter_mismatch = 0usize;
     for mut result in deduped {
         let Some(detail) = details_by_id.get(&result.id) else {
-            if preserve_unresolved_hits
-                && raw_result_matches_query_filters(query, &result, product_project_ids.as_ref())
-            {
-                canonical.push(result);
-            } else {
-                dropped_missing += 1;
-            }
+            // The index supplies candidates, never authority for a missing
+            // mailbox row. Engine overrides must keep this same boundary.
+            dropped_missing += 1;
             continue;
         };
         let recipient_names = recipient_names_by_message
@@ -5323,17 +5236,17 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
     // canonical mailbox before ranking: rerank must receive the actual message
     // text, and missing/foreign/filter-mismatched rows must not occupy the fused
     // candidate budget. Never preserve unverified index-only hits here.
-    let lexical_results =
-        match canonicalize_message_results(cx, pool, query, lexical_results, false).await {
-            Outcome::Ok(results) => results,
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
+    let lexical_results = match canonicalize_message_results(cx, pool, query, lexical_results).await
+    {
+        Outcome::Ok(results) => results,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
     let semantic_outcome = if let Some(proof) = semantic_proof {
         canonicalize_semantic_results(cx, pool, query, semantic_results, proof).await
     } else {
-        canonicalize_message_results(cx, pool, query, semantic_results, false).await
+        canonicalize_message_results(cx, pool, query, semantic_results).await
     };
     let semantic_results = match semantic_outcome {
         Outcome::Ok(results) => results,
@@ -5870,13 +5783,12 @@ pub async fn execute_search(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-        let raw_results =
-            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
         let raw_results = apply_cursor_window(raw_results, query);
         let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
         let explain = if query.explain {
@@ -5917,13 +5829,12 @@ pub async fn execute_search(
             Ok(results) => results,
             Err(error) => return lexical_failure(cx, map_bridge_bootstrap_error(&error)),
         };
-        let raw_results =
-            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(error) => return Outcome::Err(error),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
         let raw_results = trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
         let explain = query
             .explain
@@ -5953,13 +5864,12 @@ pub async fn execute_search(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-        let raw_results =
-            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
         let raw_results = apply_cursor_window(raw_results, query);
         let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
         let explain = if query.explain {
@@ -6016,13 +5926,14 @@ pub async fn execute_search(
 
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
-        let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
-        let candidates = match try_tantivy_search(cx, pool, query, !explicit_lexical) {
+        // Explicit and configured lexical modes share the canonical service
+        // contract. Rich index-only callers use TantivyBridge::search directly.
+        let candidates = match try_tantivy_search(cx, pool, query) {
             Ok(results) => results,
             Err(error) => return lexical_failure(cx, error),
         };
         if let Some(mut raw_results) = candidates {
-            if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
+            if raw_results.is_empty() && pool.sqlite_path() != ":memory:" {
                 let sqlite_key = sqlite_key_for_pool(pool);
                 let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
                     Ok(v) => v,
@@ -6039,22 +5950,20 @@ pub async fn execute_search(
                         );
                         return lexical_failure(cx, err);
                     }
-                    match try_tantivy_search(cx, pool, query, !explicit_lexical) {
+                    match try_tantivy_search(cx, pool, query) {
                         Ok(Some(rerun_results)) => raw_results = rerun_results,
                         Ok(None) => {}
                         Err(error) => return lexical_failure(cx, error),
                     }
                 }
             }
-            let raw_results =
-                match canonicalize_message_results(cx, pool, query, raw_results, explicit_lexical)
-                    .await
-                {
-                    Outcome::Ok(results) => results,
-                    Outcome::Err(err) => return Outcome::Err(err),
-                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-                };
+            let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await
+            {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
             let raw_results =
                 trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
             let explain = if query.explain {
@@ -6164,7 +6073,7 @@ pub async fn execute_search(
         // running candidate retrieval directly in the current task.
         // Both sources are hydrated and authorized from this pool before
         // fusion and reranking, so stored snippets and total counts are unused.
-        let lexical_results = match try_tantivy_search(cx, pool, &lexical_query, true) {
+        let lexical_results = match try_tantivy_search(cx, pool, &lexical_query) {
             Ok(results) => results,
             Err(error) => return lexical_failure(cx, error),
         };
@@ -7476,6 +7385,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture"])
             .env(CHILD, test_name)
+            .env("AM_SEARCH_ENGINE", "lexical")
             .env("AM_SEARCH_SEMANTIC_ENABLED", "true")
             .output()
             .unwrap();
@@ -9862,99 +9772,212 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "tantivy-engine")]
     #[test]
-    fn unresolved_inbox_results_require_recipient_metadata() {
-        let query = SearchQuery {
-            agent_name: Some("BlueLake".to_string()),
-            direction: Some(Direction::Inbox),
-            ..Default::default()
-        };
-        let result = SearchResult {
-            doc_kind: DocKind::Message,
-            id: 24,
-            project_id: Some(1),
-            title: "subject".to_string(),
-            body: String::new(),
-            score: Some(0.5),
-            importance: Some("normal".to_string()),
-            ack_required: Some(false),
-            created_ts: Some(2_400),
-            thread_id: Some("br-240".to_string()),
-            topic: None,
-            from_agent: Some("RedPeak".to_string()),
-            from_agent_id: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
-            redacted: false,
-            redaction_reason: None,
-        };
-        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    #[allow(clippy::too_many_lines)]
+    fn lexical_service_rejects_deleted_candidates_and_hydrates_live_rows() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::lexical_service_rejects_deleted_candidates_and_hydrates_live_rows",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "lexical-authority.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            for (case, search_engine) in [
+                Some(SearchEngine::Lexical),
+                None,
+                Some(SearchEngine::Hybrid),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // Keep semantic retrieval scoped to this case even when a
+                // real embedder is available in the test environment.
+                let project = crate::queries::ensure_project(
+                    &cx,
+                    &pool,
+                    &format!("/lexical-authority-{case}"),
+                )
+                .await
+                .into_result()
+                .unwrap();
+                let project_id = project.id.unwrap();
+                let sender = crate::queries::register_agent(
+                    &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                let deleted_id = 2 * i64::try_from(case).unwrap() + 1;
+                let live_id = deleted_id + 1;
+                let token = format!("authorityboundary{case}");
+                let query = SearchQuery::messages(&token, project_id);
+                let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+                for (id, body) in [
+                    (deleted_id, "deleted-body-canary"),
+                    (live_id, "previous-body-canary"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO messages \
+                         (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES (?, ?, ?, ?, ?, 1000000)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project_id),
+                            Value::BigInt(sender.id.unwrap()),
+                            Value::Text(token.clone()),
+                            Value::Text(format!("{token} {body}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                crate::close_db_conn(conn, "seed lexical authority regression");
+                ensure_lexical_bridge_initialized(Some(&cx), &pool).unwrap();
+                let candidates = try_tantivy_search(&cx, &pool, &query).unwrap().unwrap();
+                assert_eq!(candidates.len(), 2, "real index must contain both rows");
+                let live_score = candidates.iter().find(|hit| hit.id == live_id).unwrap().score;
+                let bridge = crate::search_v3::get_bridge().unwrap();
+                let indexed = bridge.search(&query);
+                assert_eq!(indexed.len(), 2);
+                assert!(indexed.iter().any(|hit| hit.body.contains("deleted-body-canary")));
+
+                // Commit the race only after execute_search has collected its
+                // actual Tantivy candidates. A pre-search deletion would let
+                // catch-up remove the ghost and miss the service defect.
+                let database_path = pool.sqlite_path().to_string();
+                let index_query = query.clone();
+                LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let conn = crate::DbConn::open_file(&database_path).unwrap();
+                        conn.execute_sync(
+                            "DELETE FROM messages WHERE id = ?",
+                            &[Value::BigInt(deleted_id)],
+                        )
+                        .unwrap();
+                        conn.execute_sync(
+                            "UPDATE messages SET body_md = 'authoritative current body' WHERE id = ?",
+                            &[Value::BigInt(live_id)],
+                        )
+                        .unwrap();
+                        crate::close_db_conn(conn, "commit lexical candidate race");
+                        assert!(
+                            bridge.search(&index_query).iter().any(|hit| hit.id == deleted_id),
+                            "standalone index-only retrieval retains the stale row at the hydration boundary"
+                        );
+                    }));
+                });
+                let options = SearchOptions {
+                    search_engine,
+                    ..Default::default()
+                };
+                let result = execute_search(&cx, &pool, &query, &options).await;
+                assert!(
+                    LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none()),
+                    "search must execute the real candidate boundary for {search_engine:?}"
+                );
+                let response = result.into_result().unwrap();
+                assert_eq!(response.results.len(), 1, "engine {search_engine:?}");
+                let live = &response.results[0].result;
+                assert_eq!(live.id, live_id);
+                assert_eq!(live.body, "authoritative current body");
+                assert_eq!(live.title, token);
+                assert_eq!(live.from_agent.as_deref(), Some("BlueLake"));
+                assert_eq!(live.from_agent_id, sender.id);
+                if resolve_search_engine(&options) == SearchEngine::Lexical {
+                    assert_eq!(live.score, live_score, "canonical hydration preserves ranking");
+                }
+                let wire = serde_json::to_string(&response).unwrap();
+                assert!(!wire.contains("deleted-body-canary"));
+                assert!(!wire.contains("previous-body-canary"));
+            }
+        });
     }
 
+    #[cfg(feature = "tantivy-engine")]
     #[test]
-    fn unresolved_outbox_results_require_sender_metadata() {
-        let query = SearchQuery {
-            agent_name: Some("BlueLake".to_string()),
-            direction: Some(Direction::Outbox),
-            ..Default::default()
-        };
-        let result = SearchResult {
-            doc_kind: DocKind::Message,
-            id: 25,
-            project_id: Some(1),
-            title: "subject".to_string(),
-            body: String::new(),
-            score: Some(0.5),
-            importance: Some("normal".to_string()),
-            ack_required: Some(false),
-            created_ts: Some(2_500),
-            thread_id: Some("br-250".to_string()),
-            topic: None,
-            from_agent: None,
-            from_agent_id: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
-            redacted: false,
-            redaction_reason: None,
-        };
-        assert!(!raw_result_matches_query_filters(&query, &result, None));
-    }
-
-    #[test]
-    fn unresolved_agent_results_require_sender_or_recipient_metadata() {
-        let query = SearchQuery {
-            agent_name: Some("BlueLake".to_string()),
-            ..Default::default()
-        };
-        let result = SearchResult {
-            doc_kind: DocKind::Message,
-            id: 26,
-            project_id: Some(1),
-            title: "subject".to_string(),
-            body: String::new(),
-            score: Some(0.5),
-            importance: Some("normal".to_string()),
-            ack_required: Some(false),
-            created_ts: Some(2_600),
-            thread_id: Some("br-260".to_string()),
-            topic: None,
-            from_agent: None,
-            from_agent_id: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
-            redacted: false,
-            redaction_reason: None,
-        };
-        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    fn lexical_service_preserves_authoritative_read_errors() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::lexical_service_preserves_authoritative_read_errors",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "lexical-read-error.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            let project = crate::queries::ensure_project(&cx, &pool, "/lexical-read-error")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let message = crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap(),
+                "authorityreaderror",
+                "authorityreaderror unverified-body-canary",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let message_id = message.id.unwrap();
+            let database_path = pool.sqlite_path().to_string();
+            LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let conn = crate::DbConn::open_file(&database_path).unwrap();
+                    conn.execute_sync(
+                        "UPDATE messages SET created_ts = 'invalid-canonical-timestamp' WHERE id = ?",
+                        &[Value::BigInt(message_id)],
+                    )
+                    .unwrap();
+                    crate::close_db_conn(conn, "commit lexical canonical read error");
+                }));
+            });
+            let result = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("authorityreaderror", project_id),
+                &SearchOptions {
+                    search_engine: Some(SearchEngine::Lexical),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none()));
+            let canonical = crate::queries::get_messages_details_by_ids(
+                &cx,
+                &pool,
+                &[message_id],
+                Some(project_id),
+            )
+            .await;
+            match (result, canonical) {
+                (Outcome::Err(DbError::Sqlite(actual)), Outcome::Err(DbError::Sqlite(expected))) => {
+                    assert_eq!(actual, expected, "keep the authoritative error type and detail");
+                }
+                other => panic!("canonical read failure must not become an index hit or empty success: {other:?}"),
+            }
+        });
     }
 
     #[test]
