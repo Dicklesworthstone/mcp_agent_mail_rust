@@ -1008,7 +1008,7 @@ fn archive_header_metadata_survives_real_save_and_restore() {
                 .unwrap(),
             1
         );
-        copied.close_sync().unwrap();
+        drop(copied);
 
         let restored = fixture.root.path().join("restored");
         assert_archive_command_ok(&restore_archive_fixture(&fixture, &archive, &restored));
