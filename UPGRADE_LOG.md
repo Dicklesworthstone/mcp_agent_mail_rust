@@ -42,10 +42,10 @@ a consistent copy; the original mixed-generation failure remains retained.
 
 After integrating three peer fixes at `33c4c6e0`, both compiler graphs,
 strict Clippy, formatting, the expanded 56-case DB/share cohort and the same
-3 archive CLI cases pass again. Separate native lexical-scope and server
-cancellation/compose regressions are still compiling. These focused results
-do not close the broader private-cache, multi-platform release, soak, or
-performance gates.
+3 archive CLI cases pass again. All 9 lexical routing/scope integration cases
+and 4 server cancellation/compose regressions also pass on that integrated
+source. These focused results do not close the broader private-cache,
+multi-platform release, soak, or performance gates.
 
 ## November 1, 2026 — FrankenSQLite 0.4.13 (GH#372)
 

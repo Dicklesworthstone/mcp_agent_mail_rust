@@ -6642,7 +6642,13 @@ struct DispatchPermit {
     /// Unique id keying this permit's entry in [`DISPATCH_ZOMBIE_TABLE`]
     /// should it ever be zombified.
     id: u64,
-    zombified: Arc<AtomicBool>,
+    state: Arc<DispatchPermitState>,
+}
+
+#[derive(Default)]
+struct DispatchPermitState {
+    zombified: AtomicBool,
+    completed: Condvar,
 }
 
 impl DispatchPermit {
@@ -6667,7 +6673,7 @@ impl DispatchPermit {
                 .add(1);
             Some(DispatchPermit {
                 id: NEXT_DISPATCH_PERMIT_ID.fetch_add(1, Ordering::Relaxed),
-                zombified: Arc::new(AtomicBool::new(false)),
+                state: Arc::new(DispatchPermitState::default()),
             })
         }
     }
@@ -6675,7 +6681,7 @@ impl DispatchPermit {
 
 impl Drop for DispatchPermit {
     fn drop(&mut self) {
-        if self.zombified.load(Ordering::Acquire) {
+        if self.state.zombified.load(Ordering::Acquire) {
             // The inflight slot was already released at hard grace; this thread
             // was being accounted as a zombie. Release the zombie slot now that
             // the uncancellable work has finally exited.
@@ -6690,6 +6696,7 @@ impl Drop for DispatchPermit {
                 .inflight
                 .sub_saturating(1);
         }
+        self.state.completed.notify_all();
     }
 }
 
@@ -6914,7 +6921,7 @@ impl DispatchCancellationGuard {
     fn request_cancellation(&mut self, grace_secs: u64) {
         if let Some(permit) = self.permit.take() {
             self.cancel.request(&self.cx);
-            schedule_dispatch_hard_grace(self.method.clone(), permit, grace_secs);
+            let _ = schedule_dispatch_hard_grace(self.method.clone(), permit, grace_secs);
         }
     }
 }
@@ -6927,22 +6934,40 @@ impl Drop for DispatchCancellationGuard {
     }
 }
 
-fn schedule_dispatch_hard_grace(method: String, shared_permit: SharedPermit, grace_secs: u64) {
+fn schedule_dispatch_hard_grace(
+    method: String,
+    shared_permit: SharedPermit,
+    grace_secs: u64,
+) -> Option<JoinHandle<()>> {
     // An abandoned result may already have been produced. Avoid retaining a
     // watchdog thread when the worker has already released its permit.
-    if shared_permit
+    let state = shared_permit
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .is_none()
-    {
-        return;
-    }
+        .as_ref()
+        .map(|permit| Arc::clone(&permit.state))?;
     std::thread::Builder::new()
         .name("dispatch-hard-grace".into())
         .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
-            std::thread::sleep(Duration::from_secs(grace_secs));
-            let guard = shared_permit.lock().unwrap_or_else(|e| e.into_inner());
+            let started = Instant::now();
+            let grace = Duration::from_secs(grace_secs);
+            let mut guard = shared_permit.lock().unwrap_or_else(|e| e.into_inner());
+            // Completion and the wait predicate use the same mutex, so a
+            // worker finishing before or during this wait cannot lose its
+            // wakeup. Recheck time after spurious wakes or mutex poisoning:
+            // a surviving worker must still receive its complete hard grace.
+            while guard.is_some() {
+                let remaining = grace.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next_guard, _) = state
+                    .completed
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard = next_guard;
+            }
             // If the worker already finished, its SharedPermitGuard took
             // and dropped the permit — nothing to reconcile.
             if let Some(permit) = guard.as_ref() {
@@ -6956,7 +6981,7 @@ fn schedule_dispatch_hard_grace(method: String, shared_permit: SharedPermit, gra
                 // stays occupied (inflight+zombie is unchanged) so retries
                 // hit backpressure; when the thread finally exits, its
                 // permit Drop clears the zombie slot.
-                if !permit.zombified.swap(true, Ordering::AcqRel) {
+                if !permit.state.zombified.swap(true, Ordering::AcqRel) {
                     // Record the birth first so the admission scan can
                     // age this zombie out of capacity accounting after
                     // the TTL even if its thread never exits (br-zp2bt).
@@ -6986,7 +7011,7 @@ fn schedule_dispatch_hard_grace(method: String, shared_permit: SharedPermit, gra
                 }
             }
         })
-        .ok();
+        .ok()
 }
 
 struct DispatchThreadState<T> {
@@ -20886,7 +20911,7 @@ mod tests {
                     let wait_started = Instant::now();
                     while !lock_mutex(&shared_permit)
                         .as_ref()
-                        .is_some_and(|permit| permit.zombified.load(Ordering::Acquire))
+                        .is_some_and(|permit| permit.state.zombified.load(Ordering::Acquire))
                         && wait_started.elapsed() < Duration::from_secs(8)
                     {
                         std::thread::sleep(Duration::from_millis(25));
@@ -20894,7 +20919,7 @@ mod tests {
                     assert!(
                         lock_mutex(&shared_permit)
                             .as_ref()
-                            .is_some_and(|permit| permit.zombified.load(Ordering::Acquire)),
+                            .is_some_and(|permit| permit.state.zombified.load(Ordering::Acquire)),
                         "abandoned work that ignores cancellation must become a zombie"
                     );
                     assert!(lock_mutex(&DISPATCH_ZOMBIE_TABLE).contains_key(&permit_id));
@@ -20927,6 +20952,74 @@ mod tests {
                         "admission occupancy must drain when the abandoned worker finally exits"
                     );
                 },
+            );
+        });
+    }
+
+    #[test]
+    fn dispatch_hard_grace_watchdog_exits_when_its_worker_finishes() {
+        with_serialized_dispatch_permits(|| {
+            let permit = DispatchPermit::try_acquire().expect("permit available");
+            let inflight_before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+            let zombies_before = DISPATCH_ZOMBIES.load(Ordering::Relaxed);
+            let shared_permit = Arc::new(Mutex::new(Some(permit)));
+            let cancel = DispatchCancel::new();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let receiver = spawn_dispatch_thread(
+                "test/watchdog-completion".to_string(),
+                cancel.clone(),
+                Arc::clone(&shared_permit),
+                move |cancel| -> Result<(), McpError> {
+                    let _ = started_tx.send(());
+                    // Sender disconnection or the bound also ends this real
+                    // worker if an assertion fails before cancellation.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                    cancel.check()
+                },
+            )
+            .expect("spawn real dispatch worker");
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker started");
+            let watchdog_started = Instant::now();
+            let watchdog = schedule_dispatch_hard_grace(
+                "test/watchdog-completion".to_string(),
+                Arc::clone(&shared_permit),
+                DEFAULT_DISPATCH_HARD_GRACE_SECS,
+            )
+            .expect("a running worker needs a hard-grace watchdog");
+
+            cancel.request(&runtime_request_cx(Budget::INFINITE));
+            release_tx.send(()).expect("release the cooperative worker");
+            block_on(receiver).expect_err("worker observes cancellation");
+            let finished = Instant::now();
+            while !watchdog.is_finished() && finished.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                watchdog.is_finished(),
+                "a completed worker must wake its watchdog before the 30s grace expires"
+            );
+            assert!(
+                watchdog_started.elapsed() < Duration::from_secs(DEFAULT_DISPATCH_HARD_GRACE_SECS),
+                "the probe must not pass by waiting out the entire hard grace"
+            );
+            watchdog.join().expect("watchdog exits cleanly");
+            assert!(lock_mutex(&shared_permit).is_none());
+            assert_eq!(
+                DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                inflight_before - 1
+            );
+            assert_eq!(DISPATCH_ZOMBIES.load(Ordering::Relaxed), zombies_before);
+            assert!(
+                schedule_dispatch_hard_grace(
+                    "test/already-completed".to_string(),
+                    shared_permit,
+                    DEFAULT_DISPATCH_HARD_GRACE_SECS,
+                )
+                .is_none(),
+                "an already completed worker needs no watchdog"
             );
         });
     }

@@ -202,14 +202,22 @@
     - [x] Re-evaluate unchanged .52 acceptance after every decisive gate passes.
       Closed only .52 at17:53UTC on final b6c624ba and integrated33c4c6e0
       native/CLI/static evidence; original description/acceptance unchanged.
-    - [ ] Publish final metadata, verify both public refs and release own leases.
-- [ ] Preserve and validate the three peer source commits that arrived during
+    - [x] Publish archive closure c1588bf6 normally; both public refs match.
+      Release six completed source leases1756/1757/1760/1761/1762/1763.
+    - [x] After the separate peer cohorts finish, publish their scoped results
+      and release the two remaining documentation leases1734/1764.
+- [x] Preserve and validate the three peer source commits that arrived during
   the final archive qualification. Do not attribute their implementation to this
   pass or inflate b6c624ba's evidence into a pass for their newer code.
   - [x] Review all four changed files: lifecycle admission5ec868f1, canonical
     lexical authority2a5184cc and abandoned-worker cancellation33c4c6e0.
     Their commit messages explicitly report native execution unavailable after
     dependency fetch137; source review/formatting alone is not runtime proof.
+  - [x] Targeted stock UBS scans all four peer files, exit1:5critical,
+    5937warning/2311info, failed_modules[]. Manually inspect all five criticals:
+    four test-helper failure panics and the public query token form:BlueLake.
+    Every exact flagged line already exists in b6c624ba; none lies on a changed
+    production line. Preserve the raw red scan without suppression/clean claim.
   - [x] Observe external metadata commits c644472c/5d80574d already preserving
     and publishing our earlier planning updates; do not claim this process
     performed those pushes. Fast-forward5d80574d to33c4c6e0, preserving both
@@ -226,17 +234,64 @@
     real canonical-search boundary tests),4849skipped,20.845s, strict RCH0;
     exact32DB+24share names match; forced WAL copy is consistent.
   - [x] Integrated real archive CLI3/3PASS,325skipped,1.566s, strict RCH0.
-  - [ ] Run all9 migrated lexical routing/scope integration cases. The first
+  - [x] Run all9 migrated lexical routing/scope integration cases. The first
     worker1227854 request103 waits out its queue and executes nothing; retry
     worker1149989 only after a fresh probe and positive live disk-ledger guard.
-  - [ ] Run4 real server worker/compose regressions. First worker1293453
+    Actual9/9PASS,809skipped,30.242s, strict RCH0/4976.4s; exact names and
+    stable actual it ELF c5359b1b retained. These validate the peer lexical
+    authority change at33c4c6e0, without attributing its implementation here.
+  - [x] Run4 real server worker/compose regressions. First worker1293453
     request103 times out in admission, zero execution; retry on the warmed
     worker1156319 after its CLI run finishes. Do not change quotas or deadlines.
-  - [ ] On that same warmed server build, run the6 existing timeout, hard-grace,
+    Actual predecessor33c4c6e0 run4/4PASS,5610skipped,5.254s, strict RCH0
+    (4652.3s including build); stable actual server ELF573054c6 and exact
+    case census retained. This predates the watchdog completion fix below.
+  - [x] On that same warmed server build, run the6 existing timeout, hard-grace,
     zombie-TTL and panic-release regressions. The shared grace scheduler changed,
     so actual timeout behavior needs coverage alongside request abandonment.
-  - [ ] Retain final case censuses, actual executable identities and source
+  - [x] Retain final case censuses, actual executable identities and source
     receipts, evaluate unchanged .52 acceptance, and publish only scoped claims.
+- [x] Fix the concrete hard-grace watchdog lifetime found during the fresh
+  server reread; record supporting work on owned br-kp1in.87 without closing
+  its original HTTP waiter-cleanup acceptance. Lease1782 covers server/lib.rs.
+  - [x] Confirm the scheduler's unconditional grace sleep outlives promptly
+    completed workers. Use the existing shared-permit mutex and a completion
+    Condvar so worker exit wakes the watchdog without a lost-wakeup window.
+    Keep spurious/poison wakeups from shortening hard grace; preserve counters,
+    zombie TTL, deadlines, capacity, runtime and the single existing Arc allocation.
+  - [x] Add a real dispatch worker/watchdog regression: cooperative completion
+    must end a30s watchdog within5s, release its permit without zombification,
+    and avoid spawning a watchdog for an already completed worker. Explicitly
+    require the entire probe to finish before grace, so scheduler delay cannot
+    make the old unconditional sleep satisfy the negative control.
+  - [x] Final strengthened server UBS0:0critical/3786warning/1876info,
+    failed_modules[]; formatter0, strict RCH52.2s. Initial formatter1 on one
+    assertion wrap is retained; manual wrapping preserves every predicate.
+  - [x] Both workspace compiler graphs and strict Clippy on the frozen owned
+    overlay. The first all-target check predates only the strengthened timing
+    assertion; repeat that warmed gate on the final exact source before commit.
+    Final sourcec2b0f280/overlaybd5c9dae passes all-targets0/189.4s,
+    production0/1538.8s (including source-lease wait), strictClippy0/198.3s.
+    Earlier d9783dad all-targets0/2268.9s stays separate. All own jobs terminal.
+  - [x] Run all11 server cases: the4 new peer regressions,6 existing timeout/
+    grace/TTL/panic cases and the new completion regression. Keep the active
+    predecessor33c4c6e0 runs separate from qualification of this source change.
+    Add the unchanged original GH374 HTTP cancellation probe to the same warm
+    run (12 cases total):30s request/5s cleanup, real one-connection pool,
+    both waiter counts0, capacity1/0/1 and intact inbox receipts. Its earlier
+    Nov5 pass is historical; this fresh run does not waive the separate .87
+    initializer/warmup failures or establish ordinary-user/platform coverage.
+    Actual final12/12PASS,5603skipped,44.593s; strict RCH0/737.2s. Native
+    worker matches all36 primary/4 core hashes, server sourcec2b0f280 and
+    immutable core4314. HTTP30001ms, pending0/0, pool1/0/1, followup18/12ms;
+    original deadlines, private mailbox and receipts remain unchanged.
+    Stable actual server ELF98f84c3113c2f3a46c9022999e6b39fb60bc39f7a6160950be2cb0d08070f2da.
+  - [x] Re-read the final diff, bind source/ELF/census, and publish this fix
+    with its scoped results. Release leases1734/1764/1782 at verified handoff.
+    .87 stays open for its separate initializer/warmup and remaining
+    ordinary-user/platform qualification; the fresh root HTTP positive does
+    not waive those gates. The external retained audit records final refs
+    and the actual release result after publication.
 - [x] Run formatter first, then both workspace compiler graphs and strict
   all-target Clippy on the frozen final source. Complete actual job recovery.
   Earlier732 all-targets actually101/E0599: the new canonical verification
