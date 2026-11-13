@@ -4061,18 +4061,19 @@ async fn finalize_register_agent_post_commit_probe(
 async fn cleanup_message_after_post_commit_probe_failure(
     cx: &Cx,
     pool: &DbPool,
-    project_id: i64,
-    message_id: i64,
+    message: &MessageRow,
     recipient_agent_ids: &[i64],
+    idempotency: Option<IdempotencyClaim<'_>>,
     error: DbError,
 ) -> DbError {
+    let message_id = message.id.unwrap_or(0);
     let error_text = error.to_string();
     match cleanup_committed_message_after_consistency_failure(
         cx,
         pool,
-        project_id,
-        message_id,
+        message,
         recipient_agent_ids,
+        idempotency,
     )
     .await
     {
@@ -4130,13 +4131,37 @@ async fn cleanup_committed_agent_after_consistency_failure(
     Outcome::Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cleanup_committed_message_after_consistency_failure(
     cx: &Cx,
     pool: &DbPool,
-    project_id: i64,
-    message_id: i64,
+    message: &MessageRow,
     recipient_agent_ids: &[i64],
+    idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<(), DbError> {
+    let Some(message_id) = message.id else {
+        return Outcome::Err(DbError::Internal(
+            "cannot compensate a message without a persisted id".to_string(),
+        ));
+    };
+    let project_id = message.project_id;
+    // Match the exact receipt originally committed with this message. A key
+    // may have expired and been reused, even with the same fingerprint, while
+    // the post-commit probe was running.
+    let original_receipt = if let Some(claim) = idempotency {
+        let result_json = match serde_json::to_string(message) {
+            Ok(result_json) => result_json,
+            Err(error) => {
+                return Outcome::Err(DbError::Internal(format!(
+                    "serialize message compensation receipt: {error}"
+                )));
+            }
+        };
+        Some((claim, result_json))
+    } else {
+        None
+    };
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -4184,6 +4209,31 @@ async fn cleanup_committed_message_after_consistency_failure(
         }
     }
 
+    // Remove delivery evidence while the original recipient/shared-mailbox
+    // visibility is still available to the cursor-loss triggers. Keep cursor
+    // watermarks and SQLite's sequence intact: cleanup must not rewind polling.
+    // Explicit child cleanup also covers signal receipts without delete cascades.
+    for table in [
+        "message_delivery_signal_receipts",
+        "inbox_delivery_events",
+        "project_mailbox_receipts",
+        "project_mailbox_deliveries",
+    ] {
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    &format!("DELETE FROM {table} WHERE message_id = ?"),
+                    &[Value::BigInt(message_id)],
+                )
+                .await
+            )
+        );
+    }
+
     let delete_recipients_sql = "DELETE FROM message_recipients WHERE message_id = ?";
     let delete_recipients_params = [Value::BigInt(message_id)];
     try_in_tx!(
@@ -4209,6 +4259,33 @@ async fn cleanup_committed_message_after_consistency_failure(
             traw_execute(cx, &tracked, delete_message_sql, &delete_message_params).await
         )
     );
+
+    if let Some((claim, result_json)) = original_receipt {
+        // Cross-project sends store the claim in the sender's project, which
+        // can differ from the message's project. Never remove a newer receipt
+        // or another tool's/aggregate result merely because it mentions this id.
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "DELETE FROM idempotency_keys \
+                     WHERE project_id = ? AND tool = ? AND idempotency_key = ? \
+                       AND payload_fingerprint = ? AND result_json = ?",
+                    &[
+                        Value::BigInt(claim.project_id),
+                        Value::Text(claim.tool.to_string()),
+                        Value::Text(claim.key.to_string()),
+                        Value::Text(claim.fingerprint.to_string()),
+                        Value::Text(result_json),
+                    ],
+                )
+                .await
+            )
+        );
+    }
 
     try_in_tx!(
         cx,
@@ -9302,9 +9379,9 @@ pub async fn create_message_with_recipients_guarded(
                 cleanup_message_after_post_commit_probe_failure(
                     cx,
                     pool,
-                    project_id,
-                    message_id,
+                    &row,
                     &recipient_agent_ids,
+                    idempotency,
                     error,
                 )
                 .await,
@@ -35779,6 +35856,404 @@ mod tests {
         });
     }
 
+    fn message_compensation_row_counts(conn: &crate::DbConn, message_id: i64) -> Vec<i64> {
+        [
+            ("messages", "id"),
+            ("message_recipients", "message_id"),
+            ("inbox_delivery_events", "message_id"),
+            ("message_delivery_signal_receipts", "message_id"),
+            ("project_mailbox_deliveries", "message_id"),
+            ("project_mailbox_receipts", "message_id"),
+        ]
+        .into_iter()
+        .map(|(table, column)| {
+            conn.query_sync(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"),
+                &[Value::BigInt(message_id)],
+            )
+            .expect("count persisted message state")[0]
+                .get_as::<i64>(0)
+                .expect("row count")
+        })
+        .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn message_compensation_removes_cross_project_receipt_before_retry() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("message-compensation-cross-project.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let (source, target, sender, recipient) =
+                cross_project_message_fixture(&cx, &pool).await;
+            let scope = Some(CrossProjectMessageScope {
+                sender_project_id: source,
+            });
+            let claim = IdempotencyClaim {
+                project_id: source,
+                tool: "send_message",
+                key: "compensated-send",
+                fingerprint: "original-payload",
+            };
+            let recipients = [(recipient, "to")];
+            let Outcome::Ok(IdempotentOutcome::Fresh(message)) = cross_project_message_send(
+                &cx, &pool, target, sender, &recipients, scope, Some(claim),
+            )
+            .await
+            else {
+                panic!("initial cross-project send must commit");
+            };
+            let message_id = message.id.expect("persisted message id");
+            assert_ne!(claim.project_id, message.project_id);
+            let original_receipt = serde_json::to_string(&message).expect("original receipt");
+            let preserved_claims = [
+                (target, claim.tool, claim.key, original_receipt.clone()),
+                (source, "reply_message", claim.key, original_receipt),
+                (
+                    source,
+                    claim.tool,
+                    "aggregate-send",
+                    serde_json::json!({"message_ids": [message_id]}).to_string(),
+                ),
+            ];
+            let fixture = crate::DbConn::open_file(pool.sqlite_path().to_string())
+                .expect("independent fixture connection");
+            assert_eq!(
+                message_compensation_row_counts(&fixture, message_id),
+                [1, 1, 1, 0, 0, 0]
+            );
+            for (project, tool, key, result_json) in &preserved_claims {
+                fixture
+                    .execute_sync(
+                        "INSERT INTO idempotency_keys \
+                         (project_id, tool, idempotency_key, payload_fingerprint, \
+                          result_json, created_ts, expires_ts) \
+                         SELECT ?, ?, ?, payload_fingerprint, ?, created_ts, expires_ts \
+                         FROM idempotency_keys \
+                         WHERE project_id = ? AND tool = ? AND idempotency_key = ?",
+                        &[
+                            Value::BigInt(*project),
+                            Value::Text((*tool).to_string()),
+                            Value::Text((*key).to_string()),
+                            Value::Text(result_json.clone()),
+                            Value::BigInt(claim.project_id),
+                            Value::Text(claim.tool.to_string()),
+                            Value::Text(claim.key.to_string()),
+                        ],
+                    )
+                    .expect("seed unrelated scoped and aggregate receipts");
+            }
+            // Deliberately remove the committed recipient on a real file handle.
+            // This produces the exact consistency error consumed by production
+            // compensation without depending on a nondeterministic engine fault.
+            fixture
+                .execute_sync(
+                    "DELETE FROM message_recipients WHERE message_id = ?",
+                    &[Value::BigInt(message_id)],
+                )
+                .expect("remove committed recipient");
+            drop(fixture);
+            let Outcome::Err(error) = verify_message_recipients_visible_after_commit(
+                &cx, &pool, target, message_id, &recipients,
+            )
+            .await
+            else {
+                panic!("fresh probe must observe the missing recipient");
+            };
+            assert!(is_message_visibility_probe_consistency_error(&error));
+            let expected_error = error.to_string();
+            let error = cleanup_message_after_post_commit_probe_failure(
+                &cx,
+                &pool,
+                &message,
+                &[recipient],
+                Some(claim),
+                error,
+            )
+            .await;
+            assert_eq!(error.to_string(), expected_error, "compensation must commit");
+
+            let verify = crate::DbConn::open_file(pool.sqlite_path().to_string())
+                .expect("independent compensation reader");
+            assert_eq!(
+                message_compensation_row_counts(&verify, message_id),
+                [0, 0, 0, 0, 0, 0]
+            );
+            for (project, tool, key, result_json) in &preserved_claims {
+                let rows = verify
+                    .query_sync(
+                        "SELECT COUNT(*) FROM idempotency_keys \
+                         WHERE project_id = ? AND tool = ? AND idempotency_key = ? \
+                           AND result_json = ?",
+                        &[
+                            Value::BigInt(*project),
+                            Value::Text((*tool).to_string()),
+                            Value::Text((*key).to_string()),
+                            Value::Text(result_json.clone()),
+                        ],
+                    )
+                    .expect("verify unrelated receipt");
+                assert_eq!(rows[0].get_as::<i64>(0).expect("receipt count"), 1);
+            }
+            drop(verify);
+            assert!(
+                lookup_idempotency_result::<MessageRow>(&cx, &pool, claim)
+                    .await
+                    .into_result()
+                    .expect("lookup compensated claim")
+                    .is_none(),
+                "the read-only replay path must not return a deleted message"
+            );
+
+            respond_contact(&cx, &pool, source, sender, target, recipient, false, 0)
+                .await
+                .into_result()
+                .expect("revoke contact before retry");
+            assert!(matches!(
+                cross_project_message_send(
+                    &cx, &pool, target, sender, &recipients, scope, Some(claim),
+                )
+                .await,
+                Outcome::Err(DbError::InvalidArgument {
+                    field: "cross_project_contact_blocked",
+                    ..
+                })
+            ));
+            respond_contact(&cx, &pool, source, sender, target, recipient, true, 3600)
+                .await
+                .into_result()
+                .expect("restore contact before retry");
+            let Outcome::Ok(IdempotentOutcome::Fresh(retried)) = cross_project_message_send(
+                &cx, &pool, target, sender, &recipients, scope, Some(claim),
+            )
+            .await
+            else {
+                panic!("authorized retry must create a fresh persisted message");
+            };
+            assert!(retried.id.expect("retry id") > message_id);
+            verify_message_recipients_visible_after_commit(
+                &cx,
+                &pool,
+                target,
+                retried.id.unwrap(),
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("retry recipient must be durable");
+            let Outcome::Ok(IdempotentOutcome::Replayed(replayed)) = cross_project_message_send(
+                &cx, &pool, target, sender, &recipients, scope, Some(claim),
+            )
+            .await
+            else {
+                panic!("subsequent retry must replay the replacement message");
+            };
+            assert_eq!(replayed.id, retried.id);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn message_compensation_preserves_reused_receipt_and_delivery_cursors() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("message-compensation-reused-key.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/tmp/message-compensation-reused-key")
+                .await
+                .into_result()
+                .expect("project")
+                .id
+                .unwrap();
+            let mut agents = Vec::new();
+            for name in ["BlueLake", "RedFox", "GreenStone"] {
+                agents.push(
+                    register_agent(
+                        &cx, &pool, project_id, name, "test", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .expect("agent")
+                    .id
+                    .unwrap(),
+                );
+            }
+            let (sender, recipient, viewer) = (agents[0], agents[1], agents[2]);
+            let claim = IdempotencyClaim {
+                project_id,
+                tool: "send_message",
+                key: "reused-send",
+                fingerprint: "same-payload",
+            };
+            let recipients = [(recipient, "to")];
+            let mut messages = Vec::new();
+            for attempt in 0..2 {
+                if attempt == 1 {
+                    let conn = pool.acquire(&cx).await.into_result().expect("expiry writer");
+                    conn.execute_sync(
+                        "UPDATE idempotency_keys SET expires_ts = 0 \
+                         WHERE project_id = ? AND tool = ? AND idempotency_key = ?",
+                        &[
+                            Value::BigInt(claim.project_id),
+                            Value::Text(claim.tool.to_string()),
+                            Value::Text(claim.key.to_string()),
+                        ],
+                    )
+                    .expect("expire original claim before compensation");
+                }
+                let Outcome::Ok(IdempotentOutcome::Fresh(message)) =
+                    create_message_with_recipients_idempotent_topic(
+                        &cx, &pool, project_id, sender, "mail", "body", None, None,
+                        None, "normal", false, "[]", &recipients, Some("cc"), claim,
+                    )
+                    .await
+                else {
+                    panic!("first and expired-key sends must each commit a fresh message");
+                };
+                let message_id = message.id.expect("persisted message id");
+                append_message_delivery_signal_receipt(
+                    &cx, &pool, message_id, recipient, "local", "signal-digest", now_micros(),
+                )
+                .await
+                .into_result()
+                .expect("persist signal evidence");
+                mark_message_read(&cx, &pool, viewer, message_id)
+                    .await
+                    .into_result()
+                    .expect("persist shared-mailbox receipt");
+                messages.push(message);
+            }
+            let original = &messages[0];
+            let replacement = &messages[1];
+            let original_id = original.id.unwrap();
+            let replacement_id = replacement.id.unwrap();
+            assert!(replacement_id > original_id);
+            let before = crate::DbConn::open_file(pool.sqlite_path().to_string())
+                .expect("independent pre-compensation reader");
+            assert_eq!(
+                message_compensation_row_counts(&before, original_id),
+                [1, 1, 2, 1, 1, 1]
+            );
+            assert_eq!(
+                message_compensation_row_counts(&before, replacement_id),
+                [1, 1, 2, 1, 1, 1]
+            );
+            let cursor_rows = before
+                .query_sync(
+                    "SELECT project_id, scope, scope_id, tail_seq, pruned_through_seq \
+                     FROM inbox_delivery_cursor_state",
+                    &[],
+                )
+                .expect("cursor snapshot");
+            let event_rows = before
+                .query_sync(
+                    "SELECT seq, agent_id FROM inbox_delivery_events WHERE message_id = ?",
+                    &[Value::BigInt(original_id)],
+                )
+                .expect("original event sequences");
+            let sequence = before
+                .query_sync(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'inbox_delivery_events'",
+                    &[],
+                )
+                .expect("delivery allocator snapshot")[0]
+                .get_as::<i64>(0)
+                .expect("delivery sequence");
+            drop(before);
+            cleanup_committed_message_after_consistency_failure(
+                &cx,
+                &pool,
+                original,
+                &[recipient],
+                Some(claim),
+            )
+            .await
+            .into_result()
+            .expect("compensate old message without deleting the reused receipt");
+
+            let after = crate::DbConn::open_file(pool.sqlite_path().to_string())
+                .expect("independent post-compensation reader");
+            assert_eq!(
+                message_compensation_row_counts(&after, original_id),
+                [0, 0, 0, 0, 0, 0]
+            );
+            assert_eq!(
+                message_compensation_row_counts(&after, replacement_id),
+                [1, 1, 2, 1, 1, 1]
+            );
+            for row in &cursor_rows {
+                let current = after
+                    .query_sync(
+                        "SELECT tail_seq, pruned_through_seq FROM inbox_delivery_cursor_state \
+                         WHERE project_id = ? AND scope = ? AND scope_id = ?",
+                        &[
+                            Value::BigInt(row.get_as::<i64>(0).expect("cursor project")),
+                            Value::Text(row.get_as::<String>(1).expect("cursor scope")),
+                            Value::BigInt(row.get_as::<i64>(2).expect("cursor owner")),
+                        ],
+                    )
+                    .expect("retained cursor scope");
+                assert_eq!(current.len(), 1, "cleanup must preserve every issued cursor scope");
+                assert!(
+                    current[0].get_as::<i64>(0).unwrap() >= row.get_as::<i64>(3).unwrap()
+                );
+                assert!(
+                    current[0].get_as::<i64>(1).unwrap() >= row.get_as::<i64>(4).unwrap()
+                );
+            }
+            for event in &event_rows {
+                let event_seq = event.get_as::<i64>(0).expect("event sequence");
+                let affected_viewer = match event.get(1) {
+                    Some(Value::Null) => viewer,
+                    _ => recipient,
+                };
+                let current = after
+                    .query_sync(
+                        "SELECT pruned_through_seq FROM inbox_delivery_cursor_state \
+                         WHERE project_id = ? AND scope = 'agent' AND scope_id = ?",
+                        &[Value::BigInt(project_id), Value::BigInt(affected_viewer)],
+                    )
+                    .expect("visible event loss cursor");
+                assert_eq!(current.len(), 1, "deleted visible events must record history loss");
+                assert!(
+                    current[0].get_as::<i64>(0).expect("history loss floor") >= event_seq
+                );
+            }
+            let after_sequence = after
+                .query_sync(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'inbox_delivery_events'",
+                    &[],
+                )
+                .expect("delivery allocator after compensation")[0]
+                .get_as::<i64>(0)
+                .expect("delivery sequence");
+            assert_eq!(after_sequence, sequence, "cleanup must not rewind delivery ids");
+            drop(after);
+            let stored = lookup_idempotency_result::<MessageRow>(&cx, &pool, claim)
+                .await
+                .into_result()
+                .expect("lookup reused key")
+                .expect("reused receipt must survive")
+                .expect("same fingerprint");
+            assert_eq!(stored.id, Some(replacement_id));
+            let Outcome::Ok(IdempotentOutcome::Replayed(replayed)) =
+                create_message_with_recipients_idempotent_topic(
+                    &cx, &pool, project_id, sender, "mail", "body", None, None,
+                    None, "normal", false, "[]", &recipients, Some("cc"), claim,
+                )
+                .await
+            else {
+                panic!("the reused key must continue replaying its current message");
+            };
+            assert_eq!(replayed.id, Some(replacement_id));
+        });
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn cleanup_committed_message_after_consistency_failure_removes_orphaned_message_state() {
@@ -35856,17 +36331,58 @@ mod tests {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
             max_connections: 1,
-            run_migrations: false,
+            run_migrations: true,
             warmup_connections: 0,
             ..Default::default()
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
-            cleanup_committed_message_after_consistency_failure(&cx, &pool, 1, 1, &[2])
+            let message = get_message(&cx, &pool, 1)
                 .await
                 .into_result()
-                .expect("cleanup should succeed");
+                .expect("read original message");
+            // Migrations can rebuild inbox_stats. Re-establish and verify the
+            // stale-count precondition after the pool has initialized.
+            let conn = pool.acquire(&cx).await.into_result().expect("stats writer");
+            conn.execute_sync(
+                "INSERT OR REPLACE INTO inbox_stats \
+                 (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+                 VALUES (2, 1, 1, 1, 100)",
+                &[],
+            )
+            .expect("seed post-migration inbox stats");
+            let stats = conn
+                .query_sync(
+                    "SELECT total_count, unread_count, ack_pending_count \
+                     FROM inbox_stats WHERE agent_id = 2",
+                    &[],
+                )
+                .expect("verify stale stats");
+            assert_eq!(
+                (0..3)
+                    .map(|column| stats[0].get_as::<i64>(column).expect("stat count"))
+                    .collect::<Vec<_>>(),
+                [1, 1, 1]
+            );
+            let recipients = conn
+                .query_sync(
+                    "SELECT COUNT(*) FROM message_recipients WHERE message_id = 1",
+                    &[],
+                )
+                .expect("verify recipient precondition");
+            assert_eq!(recipients[0].get_as::<i64>(0).expect("recipient count"), 1);
+            drop(conn);
+            cleanup_committed_message_after_consistency_failure(
+                &cx,
+                &pool,
+                &message,
+                &[2],
+                None,
+            )
+            .await
+            .into_result()
+            .expect("cleanup should succeed");
         });
 
         let verify_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -35905,6 +36421,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn cleanup_committed_message_after_consistency_failure_rebuilds_stats_when_recipient_rows_are_missing()
      {
         use asupersync::runtime::RuntimeBuilder;
@@ -35974,17 +36491,58 @@ mod tests {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
             max_connections: 1,
-            run_migrations: false,
+            run_migrations: true,
             warmup_connections: 0,
             ..Default::default()
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
-            cleanup_committed_message_after_consistency_failure(&cx, &pool, 1, 1, &[2])
+            let message = get_message(&cx, &pool, 1)
                 .await
                 .into_result()
-                .expect("cleanup should succeed");
+                .expect("read original message");
+            // Migrations can rebuild inbox_stats. Re-establish and verify the
+            // stale-count precondition after the pool has initialized.
+            let conn = pool.acquire(&cx).await.into_result().expect("stats writer");
+            conn.execute_sync(
+                "INSERT OR REPLACE INTO inbox_stats \
+                 (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+                 VALUES (2, 1, 1, 1, 100)",
+                &[],
+            )
+            .expect("seed post-migration inbox stats");
+            let stats = conn
+                .query_sync(
+                    "SELECT total_count, unread_count, ack_pending_count \
+                     FROM inbox_stats WHERE agent_id = 2",
+                    &[],
+                )
+                .expect("verify stale stats");
+            assert_eq!(
+                (0..3)
+                    .map(|column| stats[0].get_as::<i64>(column).expect("stat count"))
+                    .collect::<Vec<_>>(),
+                [1, 1, 1]
+            );
+            let recipients = conn
+                .query_sync(
+                    "SELECT COUNT(*) FROM message_recipients WHERE message_id = 1",
+                    &[],
+                )
+                .expect("verify recipient precondition");
+            assert_eq!(recipients[0].get_as::<i64>(0).expect("recipient count"), 0);
+            drop(conn);
+            cleanup_committed_message_after_consistency_failure(
+                &cx,
+                &pool,
+                &message,
+                &[2],
+                None,
+            )
+            .await
+            .into_result()
+            .expect("cleanup should succeed");
         });
 
         let verify_conn = crate::DbConn::open_file(db_path.display().to_string())
