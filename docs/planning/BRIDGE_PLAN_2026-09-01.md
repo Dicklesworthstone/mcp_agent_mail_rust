@@ -36,8 +36,9 @@
 - [x] Final424c680b strict workspace all-targets Clippy-Dwarnings exits0
   (752.446s remote); its formatter retry exits0. Keep the earlier formatter
   admission refusal103 and proc-macro-error2 future-compat warning visible.
-- [ ] Complete final424c680b's production lib+bins graph and separate workspace
-  all-targets check; native execution remains a distinct outstanding gate.
+- [x] Complete final424c680b's production lib+bins graph (exit0,199.035s
+  remote) and separate workspace all-targets check (exit0). All four mandatory
+  static gates pass on the same source. Native execution remains outstanding.
 - [ ] Re-read any fix and callers with fresh eyes; perform focused final
   verification and stock scan if code changes. Do not claim full-suite,
   Windows/macOS, real live-mailbox, soak or release qualification from this lane.
