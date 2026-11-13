@@ -96,7 +96,7 @@
   - [x] Bind the failed native case to actual DB18b7ed2d/sharefca91055 ELFs;
     source/config matches all34 selected paths. Corrected CLI repeats3/3PASS,
     325skipped,1.093s, terminal0; all four static gates pass this observer draft.
-  - [ ] Qualify the engine fix and 0.4.13 backport with real regression,
+  - [x] Qualify the engine fix and 0.4.13 backport with real regression,
     existing VACUUM/read-only/empty-reload and concurrency cases; retain failures.
   - [x] Verify the 0.4.13 core source exactly matches the published archive
     (SHA256 bb6be9a8...). Current engine main is0.5/Asupersync0.6.2;
@@ -110,7 +110,7 @@
     its registry dependency versions stay unchanged. The new .14 version
     is not published. Normal merge1158aa66a retains both histories while
     current main's complete tree stays byte-identical to412bcf4f5.
-  - [ ] Finish the real WAL regression and existing VACUUM/concurrency cases,
+  - [x] Finish the real WAL regression and existing VACUUM/concurrency cases,
     exact0.4.14 package verification and final source-bound compiler gates.
     First upstream all-targets raw0 has the old unused-helper warning;
     first strict Clippy101 catches it. Both original jobs are recovered and
@@ -127,16 +127,23 @@
     Upstream412bcf4f5 also finishes all-targets/strictClippy/fmt0 with all
     selected source/config hashes verified. Mergedc2aab9fc4 preserves newer
     upstream work and all4444 issue IDs/comments; its own clean-source
-    formatter0 and all-targets0; strictClippy, production graph and direct WAL
-    regression are active on this integrated source.
-  - [ ] Qualify the exact package at the Agent Mail consumer before publishing.
+    formatter0/all-targets0/strictClippy0/production0. Its direct WAL regression
+    passes1/1,4175filtered,0.21s; same stable ELF7c829bf4 also passes49
+    VACUUM/reload/zeroed cases (13.87s) and7 empty/schema-reset cases (0.14s).
+    The last filter selected7, not our predicted4; retain that rejected count
+    assertion and its corrected actual census. No oracle or test changed.
+    Backport64060 also passes19 existing concurrency cases. These earlier main
+    compiler checks do not qualify later incoming peer WHERE optimizations.
+  - [x] Qualify the exact package at the Agent Mail consumer before publishing.
     Temporary Cargo patch points only at the unmodified packaged crate,
     frozen as build-input Git4314e888. An offline resolver initially changes
     unrelated broad-range dependency edges; restore their original valid
     choices manually. Parsed comparison then proves every non-core package
     and edge unchanged, and cargo metadata --locked accepts the graph.
-    Native53 and CLI3 strict-RCH jobs are active on identical overlay827e3078
+    Native53 and CLI3 strict-RCH jobs pass on primary receipt3c9eb7fc
     with immutable dependency4314e888, unchanged profiles/predicates/budgets.
+    The submitted827e3078 combined input fingerprint is distinct from the
+    resulting primary-root receipt3c9eb7fc; retain both source identities.
     Both active workers match all34 primary and4 checked package-file hashes.
     Earlier read-only capture attempts chose the outer multi-root directory
     and failed; corrected lookup follows the actual Cargo workspace/manifest.
@@ -162,8 +169,22 @@
   - [x] Exact staged-package native cohort passes53/53,4852skipped,28.633s;
     the real in-copy WAL commit reports consistent_copy, not a refusal. Strict
     RCH exits0. The earlier mixed-tuple failure remains retained. The separate
-    staged CLI3 execution is still active. No final public-Git execution claim.
-  - [ ] Finish strict public-source authentication and retain actual receipt.
+    staged CLI3 also passes3/3,325skipped,1.956s, terminal0. Actual stable
+    am5e1691af/it0e057ca7 and nativeDB3c925e64/share9b17d89f are retained.
+    No final public-Git execution claim.
+  - [x] Finish strict public-source authentication and retain actual receipt.
+    Unmodified installed DSR capture and verify both authenticate812 packages
+    (792 registry archives,20 Git),46182files; receipt d30689d25ae621d3,
+    lock661b4168fa77462c. This is source admission, not full private-cache or
+    multi-platform release proof. All four active final workers match34
+    primary source/config hashes and4 core package hashes, with actual pinned
+    rustc1.100.0-nightly(908501772,2026-08-30). Initial capture scripts assumed
+    ~/.cargo and a propagated check-job source env; they asserted rather than
+    emit proof. Corrected capture uses actual CARGO_HOME and matched lock SHA.
+  - [x] Close only upstream bd-ro-vacuum-receipt-binds-wal-tz4pk on its named
+    populated successful-copy probe and retained evidence. Source/tracker
+    publication7ffc64963 preserves peer comments; no peer status changed.
+    Release own upstream connection lease1758 after completion; old1759 expired.
   - [ ] Repeat the exact53 native cases,3 CLI cases and required workspace
     gates on the final Agent Mail dependency graph before evaluating .52 closure.
 - [x] Run formatter first, then both workspace compiler graphs and strict

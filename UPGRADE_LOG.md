@@ -24,11 +24,20 @@ crates.io 0.4.14 release or a CLI version change.
 The local package archive's SHA-256 is
 `a64c39c1b2f7252011f9d6a4ad7c4de473931f89765ad9ba5f2ed83893e3d2ec`.
 The backport passed remote Cargo package verification (`publish --dry-run`,
-which explicitly aborted upload) and 19 existing concurrency cases. The
-initial native engine regression passed; that execution preceded the final
-unused-helper removal and version bump. Consumer execution on the exact
-packaged source and final public-source workspace gates are still pending.
-No broader release, soak, or performance gate is closed by these results.
+which explicitly aborted upload) and 19 existing concurrency cases. On the
+integrated upstream source `c2aab9fc4`, the new real-WAL regression passed,
+as did 49 existing VACUUM/reload cases, 7 empty/reset controls and all four
+workspace compiler/format gates. Later incoming peer WHERE optimizations
+are outside those earlier compiler results.
+
+Agent Mail's staged-package consumer passed all 53 selected native cases
+(including a successful consistent copy across the forced WAL commit) and
+3 real archive CLI cases. Public Cargo fetch and the installed DSR source
+capture/verification authenticate the final Git dependency graph: 812 resolved
+packages, with every non-core lock entry and edge unchanged. The final Agent
+Mail public-Git native/CLI runs and workspace compiler gates are still pending.
+These source and focused checks do not close the broader private-cache,
+multi-platform release, soak, or performance gates.
 
 ## November 1, 2026 — FrankenSQLite 0.4.13 (GH#372)
 
