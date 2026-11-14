@@ -1,5 +1,31 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 merged-source review — EmeraldEagle, 03:01 UTC
+
+- [x] Reread the owned warmup, dispatch accounting, shutdown ownership and
+  cancellation paths and their callers. No additional concrete defect found.
+- [x] Review the ready queue and original .87/.90 acceptance. Preserve the
+  original failed evidence and requirements; neither issue closes by repetition.
+- [x] Read the newly merged reservation and ATC changes. Their authors report
+  incomplete native validation; earlier warmup results qualify older source.
+- [x] Submit a frozen3722a6b6 workspace all-target check after a fresh healthy
+  worker probe and complete unchanged30GiB/10GiB disk guard. Submission alone
+  earns no execution or passing result.
+- [ ] Finish the check, inspect actual diagnostics and fix concrete defects.
+- [ ] Execute32 predeclared unique consumer controls:19 existing reservation
+  activity tests, deep-history resource/database read, two ATC restart tests,
+  three trace-qualified CLI tests, six DB warmup/initializer controls and the
+  unchanged GH374 HTTP cancellation test. Require every selected identity to
+  execute; retain failures and unchanged original assertions and deadlines.
+- [ ] Check the separate production graph, strict workspace Clippy and format
+  on the reviewed source. Any source fix also needs focused real regression
+  coverage and stock UBS, then a fresh source/caller reread.
+- [ ] Record actual outcomes and the anti-ceremony disposition in the existing
+  audit and owned Bead comments; preserve any unmet original acceptance.
+- [ ] Flush/validate tracker changes and empty dependency cycles; publish only
+  scoped changes while preserving peer work, verify both required remote refs,
+  and release only this review's own lease1844.
+
 ## November 13 warmup deadline review — EmeraldEagle, 23:20 UTC
 
 - [x] Reread modified admission, cancellation, initialization and warmup code
