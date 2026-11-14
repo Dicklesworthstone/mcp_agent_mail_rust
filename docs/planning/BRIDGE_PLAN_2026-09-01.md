@@ -1,5 +1,36 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 committed force-release review — EmeraldEagle, 18:40 UTC
+
+- [x] Reread the latest quarantine/lint repair and callers; no new defect
+  established there. Triage ready work and claim br-kp1in.19 (comment4394).
+- [x] Identify stale post-commit producer: force-release reads the current
+  row for released_ts but serializes the old reservation's intent/revision.
+- [ ] Add a real competing intent transaction preserving the expired expiry;
+  execute old source with the new regression and two existing release controls.
+- [x] Use the committed row and existing canonical released-artifact serializer.
+- [x] Reread authorization, expiry/revision, notification and response paths;
+  release guards and wire keys remain unchanged. Terminal releases cannot
+  be renewed through the public mutation path; the readback row supplies
+  all emitted intent fields, revision and committed release timestamp.
+- [ ] Execute the 13 force-release cases (all 12 existing plus the regression)
+  and the existing released-heal artifact roundtrip, 14 exact functions
+  predeclared in the retained review29-positive-cases.txt before execution.
+  Verify exact names, nonzero execution and source-bound remote receipts.
+- [x] Check workspace/all-targets: terminal0 on vmi1156319, Cargo13m08s;
+  strict RCH base8a92ae4c/overlayf6221722/tree dd6dfeda.
+- [x] Check production workspace/lib+bins as its separate feature graph:
+  terminal0/Cargo7m25s, same base/overlay/tree on vmi1156319.
+- [x] Run strict workspace/all-target Clippy with warnings denied:
+  terminal0 on the same frozen source/lock/toolchain and strict RCH overlay.
+- [x] Check formatting after manual corrections: terminal0; retain the
+  initial formatting diff (its wrapper returned cat's status, not fmt's).
+- [x] Scan the whole changed Rust file: UBS terminal0/statusok/no failed
+  modules, critical0/warning1316/info557. No scanner suppression; warnings
+  stay visible. Final source/lock/toolchain manifest remains unchanged.
+- [ ] Record scoped Bead evidence with original acceptance unchanged, verify
+  tracker preservation/cycles, publish coherent changes and release owned leases.
+
 ## November 14 legacy rollback quarantine review — EmeraldEagle, 17:08 UTC
 
 - [x] Reread latest source changes and callers; no new defect established in

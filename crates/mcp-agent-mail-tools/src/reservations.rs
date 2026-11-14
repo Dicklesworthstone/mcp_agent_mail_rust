@@ -3567,10 +3567,10 @@ pub async fn force_release_file_reservation(
         )
         .await,
     )?;
-    let released_ts = released_rows
-        .iter()
+    let (reservation, released_ts) = released_rows
+        .into_iter()
         .find(|row| row.id == Some(file_reservation_id))
-        .and_then(|row| row.released_ts)
+        .and_then(|row| row.released_ts.map(|timestamp| (row, timestamp)))
         .ok_or_else(|| {
             legacy_tool_error(
                 "INCONSISTENT_STATE",
@@ -3583,19 +3583,12 @@ pub async fn force_release_file_reservation(
 
     if released_count > 0 {
         let db_generation = fetch_db_generation(ctx, &pool).await;
-        let mut res_json = serde_json::json!({
-            "id": reservation.id.unwrap_or(0),
-            "project": &project.human_key,
-            "agent": &holder_agent_name,
-            "path_pattern": &reservation.path_pattern,
-            "exclusive": reservation.exclusive != 0,
-            "reason": &reservation.reason,
-            "created_ts": micros_to_iso(reservation.created_ts),
-            "expires_ts": micros_to_iso(reservation.expires_ts),
-            "released_ts": released_iso.clone(),
-            "revision": reservation.revision,
-        });
-        stamp_db_generation(&mut res_json, db_generation.as_deref());
+        let res_json = released_reservation_artifact_json(
+            &project.human_key,
+            &holder_agent_name,
+            &reservation,
+            db_generation.as_deref(),
+        );
 
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
             project_slug: project.slug.clone(),
@@ -10784,6 +10777,114 @@ mod tests {
                 let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
                 assert_eq!(parsed["released"].as_i64(), Some(1), "{parsed}");
                 assert!(parsed.get("already_released").is_none(), "{parsed}");
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_archives_committed_expired_intent_after_probe() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/force-release-intent-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let actor = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let created = queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder.id.expect("holder id"),
+                    &["src/committed-intent.rs"],
+                    3600,
+                    true,
+                    "original intent",
+                )
+                .await
+                .into_result()
+                .expect("create reservation");
+                let id = created[0].id.expect("reservation id");
+                let expires_ts = mcp_agent_mail_db::now_micros().saturating_sub(1);
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("expire connection");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &[SqlValue::BigInt(expires_ts), SqlValue::BigInt(id)],
+                )
+                .expect("expire reservation");
+                drop(conn);
+
+                let competing_cx = cx.clone();
+                let competing_pool = get_db_pool().expect("competing connection pool");
+                AFTER_FORCE_RELEASE_ACTIVITY.with_borrow_mut(|hook| {
+                    *hook = Some(Box::pin(async move {
+                        let conn = competing_pool
+                            .acquire(&competing_cx)
+                            .await
+                            .into_result()
+                            .expect("intent connection");
+                        // A committed intent revision need not change the expired
+                        // expiry used by the force-release transaction's guard.
+                        conn.execute_sync(
+                            "UPDATE file_reservations SET exclusive = 0, reason = 'latest expired intent', revision = revision + 1 WHERE id = ?",
+                            &[SqlValue::BigInt(id)],
+                        )
+                        .expect("commit competing intent");
+                    }));
+                });
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = force_release_file_reservation(
+                    &ctx,
+                    project.human_key.clone(),
+                    actor.name,
+                    id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("expired release succeeds");
+                assert!(AFTER_FORCE_RELEASE_ACTIVITY.with_borrow(Option::is_none));
+                let response: Value = serde_json::from_str(&payload).expect("response JSON");
+                assert_eq!(response["released"], 1);
+                let rows = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                    .await
+                    .into_result()
+                    .expect("read committed reservation");
+                let committed = rows.first().expect("committed reservation");
+                assert_eq!(committed.revision, created[0].revision + 1);
+                assert_eq!(committed.exclusive, 0);
+                assert_eq!(committed.reason, "latest expired intent");
+                assert_eq!(committed.expires_ts, expires_ts);
+                let released_ts = committed.released_ts.expect("committed release timestamp");
+                assert!(released_ts > 0);
+                let generation = fetch_db_generation(&ctx, &pool).await;
+                assert!(generation.is_some(), "real database generation");
+                let archive =
+                    crate::reservation_parity::read_project_archive_reservation_for_generation(
+                        &Config::get().storage_root,
+                        &project.slug,
+                        id,
+                        generation.as_deref(),
+                    )
+                    .expect("released artifact on disk");
+                assert_eq!(archive.generation, generation);
+                assert_eq!(archive.revision, Some(created[0].revision + 1));
+                assert_eq!(archive.exclusive, Some(false));
+                assert_eq!(archive.reason, "latest expired intent");
+                assert_eq!(archive.expires_ts, Some(expires_ts));
+                assert_eq!(archive.released_ts, Some(released_ts));
+                assert_eq!(response["reservation"]["exclusive"], false);
+                assert_eq!(response["reservation"]["reason"], "latest expired intent");
+                assert_eq!(response["released_at"], micros_to_iso(released_ts));
+                assert_eq!(
+                    response["reservation"]["released_ts"],
+                    response["released_at"]
+                );
             });
         });
     }
