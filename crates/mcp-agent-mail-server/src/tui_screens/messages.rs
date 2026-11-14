@@ -32,7 +32,8 @@ use ftui_widgets::textarea::TextArea;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::mail_explorer::ExplorerQuery;
+use mcp_agent_mail_db::pool::{DbPoolConfig, SyncQuery};
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 use serde::Deserialize;
@@ -1341,6 +1342,9 @@ pub struct MessageBrowserScreen {
     search_dirty: bool,
     /// Lazy-opened DB connection for message queries.
     db_conn: Option<DbConn>,
+    /// Live mailbox authority behind the displayed connection or snapshot.
+    /// Operator tools use the process config, which must name this same source.
+    mailbox_source: Option<(String, PathBuf)>,
     /// Holds the temp snapshot directory alive when this screen binds to an archive snapshot.
     _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
     /// Whether we attempted to open the DB connection.
@@ -1441,6 +1445,7 @@ impl MessageBrowserScreen {
             debounce_remaining: 0,
             search_dirty: true, // Initial load
             db_conn: None,
+            mailbox_source: None,
             _db_snapshot_dir: None,
             db_conn_attempted: false,
             total_results: 0,
@@ -1495,11 +1500,15 @@ impl MessageBrowserScreen {
         storage_root: &std::path::Path,
         context: &str,
     ) {
+        // A failed rebind may leave earlier rows visible. It must not relabel
+        // their numeric IDs as belonging to the attempted mailbox.
+        self.mailbox_source = None;
         match crate::open_observability_sync_db_connection(database_url, storage_root, context) {
             Ok(Some(db)) => {
                 let (conn, _, snapshot_dir) = db.into_parts();
                 self.db_conn = Some(conn);
                 self._db_snapshot_dir = snapshot_dir;
+                self.mailbox_source = Some((database_url.to_string(), storage_root.to_path_buf()));
             }
             Ok(None) => {}
             Err(error) => {
@@ -2037,31 +2046,43 @@ impl MessageBrowserScreen {
         if ids.is_empty() {
             return Err("no message selected".to_string());
         }
-        let ctx = operator_tool_context();
-        let mut receipts = 0_usize;
+        let mut selected = Vec::with_capacity(ids.len());
         for &id in ids {
             let entry = self
                 .results
                 .iter()
                 .find(|entry| entry.id == id)
                 .ok_or_else(|| format!("message #{id} is no longer listed"))?;
-            let project = entry.project_slug.clone();
-            let recipients: Vec<String> = entry
-                .to_agents
-                .split(", ")
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
-            if project.is_empty() || recipients.is_empty() {
-                return Err(format!(
-                    "message #{id} has no recorded project or recipients"
-                ));
-            }
-            for agent in recipients {
+            selected.push((id, entry.project_slug.clone()));
+        }
+        // Display names can come from a stale snapshot or a live event. A
+        // project address also names a delivery, not an agent. Resolve every
+        // selected message against the live mailbox before the first write.
+        // Drop the read connection before entering any tool's write admission.
+        let plans = {
+            self.verify_receipt_mailbox_source()?;
+            let conn = Self::open_live_recipient_connection(None)?;
+            with_message_delivery_snapshot(&conn, || {
+                selected
+                    .iter()
+                    .map(|(id, project)| message_receipt_targets(&conn, *id, project))
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+        };
+        let ctx = operator_tool_context();
+        let mut receipts = 0_usize;
+        // A later recipient may become unavailable after earlier writes have
+        // succeeded. Refresh after that partial result as well as on success.
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+        for plan in plans {
+            let id = plan.message_id;
+            for agent in plan.recipients {
+                let project = plan.project_key.clone();
                 let result = if acknowledge {
                     block_on(mcp_agent_mail_tools::messaging::acknowledge_message(
                         &ctx,
-                        project.clone(),
+                        project,
                         agent.clone(),
                         id,
                         None,
@@ -2069,7 +2090,7 @@ impl MessageBrowserScreen {
                 } else {
                     block_on(mcp_agent_mail_tools::messaging::mark_message_read(
                         &ctx,
-                        project.clone(),
+                        project,
                         agent.clone(),
                         id,
                     ))
@@ -2093,6 +2114,26 @@ impl MessageBrowserScreen {
                 ids.len()
             ),
         })
+    }
+
+    fn verify_receipt_mailbox_source(&self) -> Result<(), String> {
+        if self._db_snapshot_dir.is_some() {
+            return Err(
+                "These messages come from an archive snapshot whose message IDs may differ from the live mailbox; recover the live mailbox and refresh before recording receipts".to_string(),
+            );
+        }
+        let Some((database_url, storage_root)) = &self.mailbox_source else {
+            return Err("Cannot verify the mailbox behind the displayed messages; refresh before recording receipts".to_string());
+        };
+        let config = Self::runtime_config_from_state(None);
+        let displayed = crate::resolve_server_database_url_sqlite_path(database_url);
+        let current = crate::resolve_server_database_url_sqlite_path(&config.database_url);
+        if displayed.is_none() || displayed != current || storage_root != &config.storage_root {
+            return Err(
+                "Displayed messages belong to a different mailbox than the operator tools; refresh with the same database and storage configuration before recording receipts".to_string(),
+            );
+        }
+        Ok(())
     }
 
     fn submit_quick_reply_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
@@ -4574,6 +4615,221 @@ fn project_slugs_by_id(
     slugs
 }
 
+const MESSAGE_DELIVERY_LOOKUP_BATCH: usize = 256;
+const MESSAGE_DELIVERY_SAVEPOINT: &str = "SAVEPOINT am_tui_message_deliveries";
+const MESSAGE_DELIVERY_RELEASE: &str = "RELEASE SAVEPOINT am_tui_message_deliveries";
+
+struct MessageDeliverySnapshot<'a, C: SyncQuery> {
+    conn: &'a C,
+    active: bool,
+}
+
+impl<C: SyncQuery> Drop for MessageDeliverySnapshot<'_, C> {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.conn.execute_raw(MESSAGE_DELIVERY_RELEASE)
+        {
+            tracing::warn!(%error, "TUI message delivery snapshot cleanup failed");
+        }
+    }
+}
+
+fn with_message_delivery_snapshot<C: SyncQuery, T>(
+    conn: &C,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    conn.execute_raw(MESSAGE_DELIVERY_SAVEPOINT)
+        .map_err(|error| format!("Message delivery snapshot: {error}"))?;
+    let mut snapshot = MessageDeliverySnapshot { conn, active: true };
+    let result = read();
+    conn.execute_raw(MESSAGE_DELIVERY_RELEASE)
+        .map_err(|error| format!("Message delivery snapshot release: {error}"))?;
+    snapshot.active = false;
+    result
+}
+
+/// One displayed address for each shared delivery, including deliveries with
+/// no currently eligible viewers. The Threads screen uses the same projection
+/// as Messages; neither view turns the address into a list of agents.
+pub(super) fn shared_message_addresses(
+    conn: &impl SyncQuery,
+    message_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>, String> {
+    let mut addresses = std::collections::HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(addresses);
+    }
+    with_message_delivery_snapshot(conn, || {
+        if !ExplorerQuery::shared_mailbox_schema_available(conn)
+            .map_err(|error| format!("Message delivery schema: {error}"))?
+        {
+            return Ok(addresses);
+        }
+        let ids: Vec<_> = message_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for chunk in ids.chunks(MESSAGE_DELIVERY_LOOKUP_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let params: Vec<_> = chunk.iter().copied().map(Value::BigInt).collect();
+            let rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT d.message_id, d.project_id, p.slug AS project_slug \
+                         FROM project_mailbox_deliveries d \
+                         JOIN messages m ON m.id = d.message_id AND m.project_id = d.project_id \
+                         LEFT JOIN projects p ON p.id = d.project_id \
+                         WHERE d.message_id IN ({placeholders})"
+                    ),
+                    &params,
+                )
+                .map_err(|error| format!("Shared message addresses: {error}"))?;
+            for row in rows {
+                let id = row
+                    .get_named::<i64>("message_id")
+                    .map_err(|error| format!("Shared message identity: {error}"))?;
+                let project_id = row
+                    .get_named::<i64>("project_id")
+                    .map_err(|error| format!("Shared message project: {error}"))?;
+                let slug = row
+                    .get_named::<Option<String>>("project_slug")
+                    .map_err(|error| format!("Shared message project name: {error}"))?
+                    .filter(|slug| !slug.trim().is_empty())
+                    .unwrap_or_else(|| unknown_project_label(project_id));
+                let address = mcp_agent_mail_db::project_mailbox::project_mailbox_address(&slug);
+                if chunk.binary_search(&id).is_err() || addresses.insert(id, address).is_some() {
+                    return Err("Shared message lookup returned an unexpected identity".to_string());
+                }
+            }
+        }
+        Ok(addresses)
+    })
+}
+
+/// An operator considers a shared message unread when an eligible viewer has
+/// not read it. `m` is the caller's message row. Direct delivery wins inside the
+/// canonical predicate, even when a stale shared receipt says otherwise.
+pub(super) fn shared_message_unread_sql() -> String {
+    let visible = ExplorerQuery::shared_delivery_visibility_sql();
+    format!(
+        "EXISTS (SELECT 1 FROM project_mailbox_deliveries d \
+         JOIN agents viewer ON viewer.project_id = d.project_id \
+         LEFT JOIN project_mailbox_receipts pr \
+                ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+         WHERE d.message_id = m.id AND pr.read_ts IS NULL AND {visible})"
+    )
+}
+
+struct MessageReceiptTargets {
+    message_id: i64,
+    project_key: String,
+    recipients: Vec<String>,
+}
+
+/// Resolve write targets under the caller's live read snapshot. Display text,
+/// denormalized recipients_json and stale screen connections are never write
+/// authority. The tools recheck each current recipient when storing a receipt.
+fn message_receipt_targets(
+    conn: &impl SyncQuery,
+    message_id: i64,
+    project_slug: &str,
+) -> Result<MessageReceiptTargets, String> {
+    let shared = ExplorerQuery::shared_mailbox_schema_available(conn)
+        .map_err(|error| format!("Message delivery schema: {error}"))?;
+    let projects = conn
+        .query_sync(
+            "SELECT m.project_id, p.human_key FROM messages m \
+             JOIN projects p ON p.id = m.project_id WHERE m.id = ? AND p.slug = ?",
+            &[
+                Value::BigInt(message_id),
+                Value::Text(project_slug.to_string()),
+            ],
+        )
+        .map_err(|error| format!("Cannot verify message #{message_id}: {error}"))?;
+    let [project] = projects.as_slice() else {
+        return Err(format!(
+            "message #{message_id} is no longer in the listed project '{project_slug}'"
+        ));
+    };
+    let project_id = project
+        .get_named::<i64>("project_id")
+        .map_err(|error| format!("Message #{message_id} project identity: {error}"))?;
+    let project_key = project
+        .get_named::<String>("human_key")
+        .map_err(|error| format!("Message #{message_id} project key: {error}"))?;
+    if project_key.trim().is_empty() {
+        return Err(format!(
+            "message #{message_id} has no authoritative project key"
+        ));
+    }
+    let mut rows = conn
+        .query_sync(
+            "SELECT direct.agent_id, a.name AS agent_name, a.project_id AS agent_project_id \
+             FROM message_recipients direct LEFT JOIN agents a ON a.id = direct.agent_id \
+             WHERE direct.message_id = ? ORDER BY direct.agent_id",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|error| format!("Cannot read message #{message_id} recipients: {error}"))?;
+    if shared {
+        let visible = ExplorerQuery::shared_delivery_visibility_sql();
+        rows.extend(
+            conn.query_sync(
+                &format!(
+                    "SELECT viewer.id AS agent_id, viewer.name AS agent_name, \
+                     viewer.project_id AS agent_project_id \
+                     FROM project_mailbox_deliveries d JOIN messages m ON m.id = d.message_id \
+                     JOIN agents viewer ON viewer.project_id = d.project_id \
+                     WHERE d.message_id = ? AND d.project_id = ? AND {visible} \
+                     ORDER BY viewer.id"
+                ),
+                &[Value::BigInt(message_id), Value::BigInt(project_id)],
+            )
+            .map_err(|error| {
+                format!("Cannot read message #{message_id} shared viewers: {error}")
+            })?,
+        );
+    }
+    let mut recipients = BTreeMap::new();
+    let mut names = HashSet::new();
+    for row in rows {
+        let agent_id = row
+            .get_named::<i64>("agent_id")
+            .map_err(|error| format!("Message #{message_id} recipient identity: {error}"))?;
+        let name = row
+            .get_named::<String>("agent_name")
+            .map_err(|error| format!("Message #{message_id} recipient #{agent_id}: {error}"))?;
+        let agent_project = row.get_named::<i64>("agent_project_id").map_err(|error| {
+            format!("Message #{message_id} recipient #{agent_id} project: {error}")
+        })?;
+        if agent_project != project_id || name.is_empty() || name.trim() != name {
+            return Err(format!(
+                "message #{message_id} recipient #{agent_id} has no unambiguous project identity"
+            ));
+        }
+        if recipients.contains_key(&agent_id) {
+            continue;
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "message #{message_id} has ambiguous recipient names"
+            ));
+        }
+        recipients.insert(agent_id, name);
+    }
+    if recipients.is_empty() {
+        return Err(format!(
+            "message #{message_id} has no current eligible recipients"
+        ));
+    }
+    Ok(MessageReceiptTargets {
+        message_id,
+        project_key,
+        recipients: recipients.into_values().collect(),
+    })
+}
+
 fn recipient_names_by_message(
     conn: &DbConn,
     message_ids: &[i64],
@@ -4598,7 +4854,8 @@ fn recipient_names_by_message(
          mr.agent_id ASC"
     );
     let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
-    conn.query_sync(&sql, &params)
+    let mut names: std::collections::HashMap<i64, String> = conn
+        .query_sync(&sql, &params)
         .ok()
         .map(|rows| {
             let mut grouped: std::collections::HashMap<i64, Vec<String>> =
@@ -4624,7 +4881,20 @@ fn recipient_names_by_message(
                 .map(|(message_id, names)| (message_id, names.join(", ")))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    match shared_message_addresses(conn, message_ids) {
+        Ok(addresses) => {
+            for (id, address) in addresses {
+                let recipients = names.entry(id).or_default();
+                if !recipients.is_empty() {
+                    recipients.push_str(", ");
+                }
+                recipients.push_str(&address);
+            }
+        }
+        Err(error) => tracing::warn!(%error, "messages screen shared recipient lookup failed"),
+    }
+    names
 }
 
 fn query_raw_message_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<RawMessageRow> {
@@ -4677,6 +4947,11 @@ fn message_entries_from_rows(
     let project_ids: Vec<i64> = rows.iter().map(|row| row.project_id).collect();
     let sender_name_map = agent_names_by_id(conn, &sender_ids);
     let project_slug_map = project_slugs_by_id(conn, &project_ids);
+    let message_ids: Vec<_> = rows.iter().map(|row| row.id).collect();
+    let shared_addresses = shared_message_addresses(conn, &message_ids).unwrap_or_else(|error| {
+        tracing::warn!(%error, "messages screen shared recipient lookup failed");
+        std::collections::HashMap::new()
+    });
 
     rows.into_iter()
         .map(|row| MessageEntry {
@@ -4687,7 +4962,23 @@ fn message_entries_from_rows(
                 .get(&row.sender_id)
                 .cloned()
                 .unwrap_or_else(|| unknown_agent_label(row.sender_id)),
-            to_agents: recipient_names_from_json(&row.recipients_json),
+            to_agents: {
+                let names = recipient_names_from_json(&row.recipients_json);
+                if let Some(address) = shared_addresses.get(&row.id) {
+                    let mut names: Vec<_> = names
+                        .split(", ")
+                        .filter(|name| {
+                            !name.is_empty()
+                                && mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name)
+                                    .is_none()
+                        })
+                        .collect();
+                    names.push(address);
+                    names.join(", ")
+                } else {
+                    names
+                }
+            },
             project_slug: project_slug_map
                 .get(&row.project_id)
                 .cloned()
@@ -10211,6 +10502,151 @@ first body
         );
     }
 
+    fn shared_message_delivery_fixture() -> DbConn {
+        let conn = DbConn::open_memory().expect("shared delivery fixture");
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT); \
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, \
+                 inception_ts INTEGER, retired_at INTEGER, contact_policy TEXT); \
+             CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER); \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, created_ts INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER); \
+             CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER, kind TEXT, delivered_ts INTEGER); \
+             CREATE TABLE project_mailbox_receipts (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); \
+             INSERT INTO projects VALUES (1,'alpha','/alpha'),(2,'beta','/beta'); \
+             INSERT INTO agents VALUES \
+                 (10,1,'GreenCastle',1,NULL,'open'), \
+                 (11,1,'BlueLake',1,NULL,'open'), \
+                 (12,1,'RedFox',1,NULL,'auto'), \
+                 (13,1,'LateFox',1000,NULL,'open'), \
+                 (14,1,'BlockedFox',1,NULL,'block_all'), \
+                 (15,1,'RetiredFox',1,50,'open'), \
+                 (16,1,'GoneFox',1,NULL,'open'), \
+                 (20,2,'GoldHawk',1,NULL,'open'), \
+                 (21,2,'BlueLake',1,NULL,'open'); \
+             INSERT INTO agent_deregistrations VALUES (16,50); \
+             INSERT INTO messages VALUES (100,1,10,100),(101,1,10,110),(200,2,20,100),(201,2,20,100); \
+             INSERT INTO message_recipients VALUES (101,11,'to',NULL,NULL); \
+             INSERT INTO project_mailbox_deliveries VALUES (100,1,'to',100),(101,1,'cc',110),(200,2,'to',100),(201,1,'to',100); \
+             INSERT INTO project_mailbox_receipts VALUES (101,11,7,8),(100,21,9,10);",
+        )
+        .expect("seed shared delivery fixture");
+        conn
+    }
+
+    #[test]
+    fn shared_message_addresses_and_receipt_targets_follow_delivery_authority() {
+        let conn = shared_message_delivery_fixture();
+        let receipt_rows = || {
+            conn.query_sync(
+                "SELECT * FROM project_mailbox_receipts ORDER BY message_id, agent_id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.values().cloned().collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+        };
+        let before = receipt_rows();
+        let addresses = shared_message_addresses(&conn, &[100, 101, 200, 201, 100]).unwrap();
+        assert_eq!(addresses.len(), 3);
+        assert_eq!(addresses[&100], "project:alpha");
+        assert_eq!(addresses[&200], "project:beta");
+        assert!(
+            !addresses.contains_key(&201),
+            "a foreign-project delivery is not an address"
+        );
+        let names = recipient_names_by_message(&conn, &[100, 101]);
+        assert_eq!(names[&100], "project:alpha");
+        assert_eq!(names[&101], "BlueLake, project:alpha");
+        for id in [100, 101] {
+            let targets = with_message_delivery_snapshot(&conn, || {
+                message_receipt_targets(&conn, id, "alpha")
+            })
+            .unwrap();
+            assert_eq!(targets.project_key, "/alpha");
+            assert_eq!(targets.recipients, ["BlueLake", "RedFox"]);
+        }
+        let beta = message_receipt_targets(&conn, 200, "beta").unwrap();
+        assert_eq!(beta.project_key, "/beta");
+        assert_eq!(beta.recipients, ["BlueLake"]);
+        assert!(message_receipt_targets(&conn, 100, "beta").is_err());
+        assert!(message_receipt_targets(&conn, 201, "beta").is_err());
+        assert_eq!(
+            receipt_rows(),
+            before,
+            "all display and targeting reads preserve lazy and foreign receipt state"
+        );
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS count FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("count")
+                .unwrap(),
+            1,
+            "shared reads never fan out direct deliveries"
+        );
+        conn.execute_raw("UPDATE agents SET retired_at=200 WHERE id IN (11,12)")
+            .unwrap();
+        let error = message_receipt_targets(&conn, 100, "alpha").err().unwrap();
+        assert!(error.contains("no current eligible recipients"), "{error}");
+        assert_eq!(
+            shared_message_addresses(&conn, &[100]).unwrap()[&100],
+            "project:alpha"
+        );
+        assert_eq!(
+            message_receipt_targets(&conn, 101, "alpha")
+                .unwrap()
+                .recipients,
+            ["BlueLake"],
+            "a historical direct delivery keeps precedence over shared eligibility"
+        );
+    }
+
+    #[test]
+    fn shared_message_targets_refuse_foreign_recipients_and_incomplete_schema() {
+        let conn = shared_message_delivery_fixture();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (100,21,'to',NULL,NULL)")
+            .unwrap();
+        let error = message_receipt_targets(&conn, 100, "alpha").err().unwrap();
+        assert!(error.contains("unambiguous project identity"), "{error}");
+        conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts")
+            .unwrap();
+        assert!(message_receipt_targets(&conn, 101, "alpha").is_err());
+        assert!(shared_message_addresses(&conn, &[100, 101]).is_err());
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS count FROM retained_receipts", &[])
+                .unwrap()[0]
+                .get_named::<i64>("count")
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn recent_message_projection_canonicalizes_shared_addresses_without_expanding_viewers() {
+        let conn = shared_message_delivery_fixture();
+        let entries = message_entries_from_rows(
+            &conn,
+            vec![RawMessageRow {
+                id: 100,
+                subject: "shared".to_string(),
+                topic: None,
+                body_md: "body".to_string(),
+                thread_id: "thread".to_string(),
+                importance: "normal".to_string(),
+                ack_required: true,
+                created_ts: 100,
+                sender_id: 10,
+                project_id: 1,
+                recipients_json: r#"{"to":["project:/alpha"],"cc":[],"bcc":[]}"#.to_string(),
+            }],
+            true,
+        );
+        assert_eq!(entries[0].to_agents, "project:alpha");
+        assert_eq!(entries[0].from_agent, "GreenCastle");
+        assert_eq!(entries[0].project_slug, "alpha");
+    }
+
     #[test]
     fn message_entries_from_rows_preserve_unknown_sender_and_project_labels() {
         let conn = DbConn::open_memory().expect("open memory sqlite");
@@ -10355,6 +10791,12 @@ first body
             let second = send("second");
             let untouched = send("untouched");
             let mut screen = MessageBrowserScreen::new();
+            let config = MessageBrowserScreen::runtime_config_from_state(None);
+            screen.bind_observability_db(
+                &config.database_url,
+                &config.storage_root,
+                "operator receipt test",
+            );
             for (id, subject) in [
                 (first, "first"),
                 (second, "second"),
@@ -10423,6 +10865,269 @@ first body
             ("error", "batch_acknowledge")
         );
         assert_eq!(text, "no message selected");
+    }
+
+    fn send_to_shared_mailbox(
+        project_key: &str,
+        slug: &str,
+        subject: &str,
+        include_direct: bool,
+    ) -> i64 {
+        let mut recipients = vec![mcp_agent_mail_db::project_mailbox::project_mailbox_address(
+            slug,
+        )];
+        if include_direct {
+            recipients.push("BlueLake".to_string());
+        }
+        let sent: serde_json::Value = serde_json::from_str(
+            &block_on(mcp_agent_mail_tools::messaging::send_message(
+                &operator_tool_context(),
+                project_key.to_string(),
+                "GreenCastle".to_string(),
+                recipients,
+                subject.to_string(),
+                "body".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .expect("send shared message"),
+        )
+        .expect("shared send JSON");
+        sent["deliveries"][0]["payload"]["id"]
+            .as_i64()
+            .expect("shared message id")
+    }
+
+    fn shared_recipient_receipts(id: i64) -> Vec<(String, Option<i64>, Option<i64>)> {
+        crate::tui_screens::with_operator_test_conn(|conn| {
+            conn.query_sync(
+                "SELECT a.name, r.read_ts, r.ack_ts FROM project_mailbox_receipts r \
+                 JOIN agents a ON a.id = r.agent_id WHERE r.message_id = ? ORDER BY a.name",
+                &[Value::BigInt(id)],
+            )
+            .expect("shared receipts")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<String>("name").unwrap(),
+                    row.get_named::<Option<i64>>("read_ts").unwrap(),
+                    row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                )
+            })
+            .collect()
+        })
+    }
+
+    #[test]
+    fn shared_message_actions_create_only_eligible_lazy_receipts_and_keep_direct_precedence() {
+        use crate::tui_screens::{
+            expect_operator_result, seed_operator_test_project, with_operator_test_conn,
+        };
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            let shared = send_to_shared_mailbox(project_key, &slug, "shared", false);
+            let overlap = send_to_shared_mailbox(project_key, &slug, "overlap", true);
+            let untouched = send_to_shared_mailbox(project_key, &slug, "untouched", false);
+            let direct = send_to_bluelake_cc_redfox(project_key, "direct before ineligible shared");
+            with_operator_test_conn(|conn| {
+                conn.execute_sync(
+                    "INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts) \
+                     SELECT ?, id, 7, 8 FROM agents WHERE name = 'BlueLake'",
+                    &[Value::BigInt(overlap)],
+                )
+                .unwrap();
+                let names = recipient_names_by_message(conn, &[shared, overlap]);
+                assert_eq!(names[&shared], format!("project:{slug}"));
+                assert_eq!(names[&overlap], format!("BlueLake, project:{slug}"));
+            });
+            assert!(shared_recipient_receipts(shared).is_empty());
+            assert!(shared_recipient_receipts(untouched).is_empty());
+            assert!(recipient_receipts(shared).is_empty());
+            assert_eq!(
+                recipient_receipts(overlap),
+                [("BlueLake".to_string(), false, false)]
+            );
+            let mut screen = MessageBrowserScreen::new();
+            let config = MessageBrowserScreen::runtime_config_from_state(None);
+            screen.bind_observability_db(
+                &config.database_url,
+                &config.storage_root,
+                "shared receipt test",
+            );
+            for id in [shared, overlap, untouched, direct] {
+                screen.results.push(MessageEntry {
+                    // Display text is deliberately stale and must not become
+                    // mutation authority or accidentally acknowledge the sender.
+                    to_agents: "GreenCastle, project:unrelated".to_string(),
+                    project_slug: slug.clone(),
+                    ..test_message_entry(id, "shared-thread", "shared")
+                });
+            }
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action(&format!("acknowledge:{shared}"), ""));
+            assert_eq!(status, "ok", "{text}");
+            assert!(text.contains("2 recipient"), "{text}");
+            let first = shared_recipient_receipts(shared);
+            assert_eq!(
+                first.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+                ["BlueLake", "RedFox"]
+            );
+            assert!(first.iter().all(|r| r.1.is_some() && r.2.is_some()));
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action(&format!("acknowledge:{shared}"), ""));
+            assert_eq!(status, "ok", "{text}");
+            assert_eq!(
+                shared_recipient_receipts(shared),
+                first,
+                "repeated ACK preserves timestamps"
+            );
+
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action(&format!("mark_read:{overlap}"), ""));
+            assert_eq!(status, "ok", "{text}");
+            assert_eq!(
+                recipient_receipts(overlap),
+                [("BlueLake".to_string(), true, false)]
+            );
+            let shared_overlap = shared_recipient_receipts(overlap);
+            assert_eq!(shared_overlap.len(), 2);
+            assert_eq!(
+                shared_overlap[0],
+                ("BlueLake".to_string(), Some(7), Some(8))
+            );
+            assert_eq!(shared_overlap[1].0, "RedFox");
+            assert!(shared_overlap[1].1.is_some());
+            assert_eq!(shared_overlap[1].2, None);
+            assert!(
+                recipient_receipts(shared).is_empty(),
+                "ACK does not fan out direct deliveries"
+            );
+            assert!(shared_recipient_receipts(untouched).is_empty());
+
+            with_operator_test_conn(|conn| {
+                conn.execute_raw(
+                    "UPDATE agents SET contact_policy = 'block_all' WHERE name IN ('BlueLake', 'RedFox')",
+                )
+                .unwrap();
+            });
+            let error = screen
+                .receipt_for_recipients(&[direct, untouched], true)
+                .unwrap_err();
+            assert!(error.contains("no current eligible recipients"), "{error}");
+            assert_eq!(
+                recipient_receipts(direct),
+                [
+                    ("BlueLake".to_string(), false, false),
+                    ("RedFox".to_string(), false, false),
+                ],
+                "all selected deliveries are checked before the first write"
+            );
+            assert!(shared_recipient_receipts(untouched).is_empty());
+        });
+    }
+
+    #[test]
+    fn message_receipt_actions_refuse_unknown_or_different_mailbox_sources() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            let id = send_to_bluelake_cc_redfox(project_key, "source identity");
+            let config = MessageBrowserScreen::runtime_config_from_state(None);
+            let mut screen = MessageBrowserScreen::new();
+            screen.results.push(MessageEntry {
+                to_agents: "BlueLake, RedFox".to_string(),
+                project_slug: slug,
+                ..test_message_entry(id, "source-thread", "source identity")
+            });
+            for source in [
+                None,
+                Some((
+                    "sqlite:///different-mailbox.sqlite3".to_string(),
+                    config.storage_root.clone(),
+                )),
+                Some((
+                    config.database_url.clone(),
+                    config.storage_root.join("different-storage"),
+                )),
+            ] {
+                screen.mailbox_source = source;
+                let (status, _, text) =
+                    expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                assert_eq!(status, "error", "{text}");
+                assert!(text.contains("mailbox"), "{text}");
+                assert_eq!(
+                    recipient_receipts(id),
+                    [
+                        ("BlueLake".to_string(), false, false),
+                        ("RedFox".to_string(), false, false),
+                    ]
+                );
+            }
+            screen.bind_observability_db(
+                &config.database_url,
+                &config.storage_root,
+                "receipt source test",
+            );
+            assert!(screen.db_conn.is_some());
+            for unavailable in ["sqlite:///:memory:", "postgresql://unsupported"] {
+                screen.bind_observability_db(
+                    unavailable,
+                    &config.storage_root,
+                    "failed receipt source rebind test",
+                );
+                assert!(
+                    screen.db_conn.is_some(),
+                    "the previous read connection remains"
+                );
+                assert!(
+                    screen.mailbox_source.is_none(),
+                    "a failed rebind invalidates receipt authority"
+                );
+                let (status, _, text) =
+                    expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                assert_eq!(status, "error", "{text}");
+                assert!(text.contains("Cannot verify the mailbox"), "{text}");
+                assert!(recipient_receipts(id).iter().all(|r| !r.1 && !r.2));
+            }
+            screen.bind_observability_db(
+                &config.database_url,
+                &config.storage_root,
+                "recovered receipt source test",
+            );
+            let snapshot = tempfile::tempdir().expect("receipt snapshot provenance");
+            screen._db_snapshot_dir = Some(crate::SnapshotDirGuard {
+                path: snapshot.keep(),
+            });
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+            assert_eq!(status, "error", "{text}");
+            assert!(text.contains("archive snapshot"), "{text}");
+            assert_eq!(
+                recipient_receipts(id),
+                [
+                    ("BlueLake".to_string(), false, false),
+                    ("RedFox".to_string(), false, false),
+                ],
+                "a reconstructed numeric ID never authorizes a live receipt"
+            );
+            screen._db_snapshot_dir = None;
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+            assert_eq!(status, "ok", "{text}");
+            assert!(recipient_receipts(id).iter().all(|r| r.1 && r.2));
+        });
     }
 
     #[test]

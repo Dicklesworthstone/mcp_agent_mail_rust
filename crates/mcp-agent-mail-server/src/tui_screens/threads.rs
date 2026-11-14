@@ -28,6 +28,7 @@ use ftui_runtime::program::Cmd;
 use ftui_widgets::tree::TreeGuides;
 
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::mail_explorer::ExplorerQuery;
 use mcp_agent_mail_db::sqlmodel::{Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 use serde::Deserialize;
@@ -333,7 +334,7 @@ struct StoredThreadMetadata {
 struct ThreadRecipients {
     names: Vec<String>,
     /// The Threads screen is an operator view, not an individual inbox.
-    /// Match the thread-list count: unread by at least one direct recipient.
+    /// Match the thread-list count: unread by a direct or eligible shared recipient.
     is_unread: bool,
 }
 
@@ -2626,12 +2627,25 @@ fn unread_counts_by_thread(conn: &DbConn, thread_ids: &[String]) -> HashMap<Stri
         return HashMap::new();
     }
 
+    let shared = match ExplorerQuery::shared_mailbox_schema_available(conn) {
+        Ok(shared) => shared,
+        Err(error) => {
+            tracing::warn!(%error, "threads screen delivery schema unavailable");
+            return HashMap::new();
+        }
+    };
+    let mut unread = "EXISTS (SELECT 1 FROM message_recipients r \
+                      WHERE r.message_id = m.id AND r.read_ts IS NULL)"
+        .to_string();
+    if shared {
+        unread.push_str(" OR ");
+        unread.push_str(&super::messages::shared_message_unread_sql());
+    }
     let placeholders = vec!["?"; thread_ids.len()].join(", ");
     let sql = format!(
-        "SELECT m.thread_id AS thread_id, COUNT(DISTINCT m.id) AS unread \
+        "SELECT m.thread_id AS thread_id, COUNT(*) AS unread \
          FROM messages m \
-         JOIN message_recipients r ON r.message_id = m.id \
-         WHERE m.thread_id IN ({placeholders}) AND r.read_ts IS NULL \
+         WHERE m.thread_id IN ({placeholders}) AND ({unread}) \
          GROUP BY m.thread_id"
     );
     let params: Vec<Value> = thread_ids.iter().cloned().map(Value::Text).collect();
@@ -3092,6 +3106,48 @@ fn thread_recipients_by_message(
             .any(|existing| existing == &agent_name)
         {
             recipients.names.push(agent_name);
+        }
+    }
+
+    let addresses = match super::messages::shared_message_addresses(conn, message_ids) {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            tracing::warn!(%error, "thread shared recipient lookup failed");
+            return grouped;
+        }
+    };
+    // Restrict unread checks to the displayed shared message IDs. The address
+    // is shown even if every viewer has left; no phantom unread receipt is
+    // manufactured for a retired, late-joining or blocked agent.
+    let mut shared_ids: Vec<_> = addresses.keys().copied().collect();
+    shared_ids.sort_unstable();
+    for chunk in shared_ids.chunks(256) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let unread = super::messages::shared_message_unread_sql();
+        let params: Vec<_> = chunk.iter().copied().map(Value::BigInt).collect();
+        let rows = match conn.query_sync(
+            &format!(
+                "SELECT m.id, {unread} AS is_unread FROM messages m \
+                 WHERE m.id IN ({placeholders})"
+            ),
+            &params,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "thread shared unread lookup failed");
+                return grouped;
+            }
+        };
+        for row in rows {
+            let Ok(message_id) = row.get_named::<i64>("id") else {
+                continue;
+            };
+            let Some(address) = addresses.get(&message_id) else {
+                continue;
+            };
+            let recipients = grouped.entry(message_id).or_default();
+            recipients.is_unread |= row.get_named::<i64>("is_unread").ok().unwrap_or(0) != 0;
+            recipients.names.push(address.clone());
         }
     }
 
@@ -6500,6 +6556,130 @@ mod tests {
         assert_eq!(counts.get("t2"), None);
         assert_eq!(counts.get("t3"), None, "only the requested threads");
         assert!(unread_counts_by_thread(&conn, &[]).is_empty());
+    }
+
+    #[test]
+    fn shared_thread_addresses_and_unread_state_follow_effective_delivery_visibility() {
+        let conn = make_thread_messages_db("shared", 0);
+        conn.execute_raw(
+            "ALTER TABLE agents ADD COLUMN project_id INTEGER NOT NULL DEFAULT 1; \
+             ALTER TABLE agents ADD COLUMN inception_ts INTEGER NOT NULL DEFAULT 1; \
+             ALTER TABLE agents ADD COLUMN retired_at INTEGER; \
+             ALTER TABLE agents ADD COLUMN contact_policy TEXT NOT NULL DEFAULT 'open'; \
+             CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER); \
+             CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER, kind TEXT, delivered_ts INTEGER); \
+             CREATE TABLE project_mailbox_receipts (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); \
+             INSERT INTO projects VALUES (2,'other-proj'); \
+             UPDATE agents SET inception_ts = 100 WHERE id = 2; \
+             INSERT INTO agents (id,name,project_id,inception_ts,retired_at,contact_policy) VALUES \
+                 (3,'RedFox',1,1,NULL,'open'), \
+                 (4,'LateFox',1,1000,NULL,'open'), \
+                 (5,'BlockedFox',1,1,NULL,'BLOCK_ALL'), \
+                 (6,'RetiredFox',1,1,50,'open'), \
+                 (7,'GoneFox',1,1,NULL,'open'), \
+                 (8,'OtherSender',2,1,NULL,'open'), \
+                 (9,'Receiver',2,1,NULL,'open'); \
+             INSERT INTO agent_deregistrations VALUES (7,50); \
+             INSERT INTO messages (id,subject,body_md,importance,created_ts,sender_id,project_id,thread_id) VALUES \
+                 (1,'shared only','body','normal',100,1,1,'shared'), \
+                 (2,'direct unread overlap','body','normal',110,1,1,'shared'), \
+                 (3,'direct read overlap','body','normal',120,1,1,'shared'), \
+                 (4,'before registration','body','normal',99,1,1,'shared'), \
+                 (5,'other project','body','normal',100,8,2,'other'), \
+                 (6,'invalid delivery project','body','normal',100,8,2,'other'), \
+                 (7,'unrequested thread','body','normal',100,1,1,'outside'); \
+             INSERT INTO message_recipients VALUES (2,2,NULL),(3,2,7); \
+             INSERT INTO project_mailbox_deliveries VALUES \
+                 (1,1,'to',100),(2,1,'cc',110),(3,1,'to',120),(4,1,'to',99), \
+                 (5,2,'to',100),(6,1,'to',100),(7,1,'to',100); \
+             INSERT INTO project_mailbox_receipts VALUES \
+                 (1,3,7,NULL),(2,2,7,8),(2,3,7,NULL), \
+                 (3,2,NULL,NULL),(3,3,7,NULL),(4,3,7,NULL),(5,2,7,8);",
+        )
+        .expect("seed shared thread deliveries");
+        let counts = unread_counts_by_thread(&conn, &["shared".to_string(), "other".to_string()]);
+        assert_eq!(counts.get("shared"), Some(&2));
+        assert_eq!(counts.get("other"), Some(&1));
+        assert!(!counts.contains_key("outside"));
+        let summaries = fetch_threads(&conn, "", None, 10);
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|t| t.thread_id == "shared")
+                .unwrap()
+                .unread_count,
+            2
+        );
+        let (messages, _) = fetch_thread_messages_paginated(&conn, "shared", 10, 0);
+        let messages: HashMap<_, _> = messages
+            .into_iter()
+            .map(|message| (message.id, message))
+            .collect();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[&1].to_agents, "project:test-proj");
+        assert!(
+            messages[&1].is_unread,
+            "registration exactly at send time is eligible"
+        );
+        assert_eq!(messages[&2].to_agents, "Receiver, project:test-proj");
+        assert!(
+            messages[&2].is_unread,
+            "a stale shared read cannot override an unread direct receipt"
+        );
+        assert!(
+            !messages[&3].is_unread,
+            "an unread shared duplicate cannot override a read direct receipt"
+        );
+        assert!(
+            !messages[&4].is_unread,
+            "late, retired, blocked, deregistered and sender identities are excluded"
+        );
+        let others = thread_recipients_by_message(&conn, &[5, 6]);
+        assert_eq!(others[&5].names, ["project:other-proj"]);
+        assert!(
+            others[&5].is_unread,
+            "another project's same-named agent cannot supply a read receipt"
+        );
+        assert!(
+            !others.contains_key(&6),
+            "a delivery in a different project from its message is not visible"
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT COUNT(*) AS count FROM project_mailbox_receipts",
+                &[]
+            )
+            .unwrap()[0]
+                .get_named::<i64>("count")
+                .unwrap(),
+            7,
+            "display and unread aggregation leave lazy receipts untouched"
+        );
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS count FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("count")
+                .unwrap(),
+            2,
+            "shared display never fans out direct recipients"
+        );
+
+        conn.execute_raw("UPDATE agents SET retired_at = 200 WHERE id IN (2,3)")
+            .unwrap();
+        let recipients = thread_recipients_by_message(&conn, &[1, 2]);
+        assert_eq!(recipients[&1].names, ["project:test-proj"]);
+        assert!(
+            !recipients[&1].is_unread,
+            "the shared address remains without a phantom viewer"
+        );
+        assert!(
+            recipients[&2].is_unread,
+            "historical direct receipts retain their own state"
+        );
+        assert_eq!(
+            unread_counts_by_thread(&conn, &["shared".to_string()]).get("shared"),
+            Some(&1)
+        );
     }
 
     #[test]
