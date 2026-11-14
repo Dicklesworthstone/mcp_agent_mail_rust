@@ -9,18 +9,25 @@
 - [x] Identify concrete br-cxsgx gap: legacy rollback quarantine bypasses the
   existing anchored main-file rename and does not sync successful family moves.
   Its reason-specific sidecar names differ from the newer helper; preserve them.
-- [ ] Add and execute a real symlink-parent regression against old source,
+- [x] Add and execute a real symlink-parent regression against old source,
   alongside the three existing successful-family/collision/rollback controls.
+  Run baeb1393-3d23-4f45-81ff-faf95ba8819c: 3 PASS / 1 FAIL, 4048 skipped,
+  0.104s after 12m28s compilation. Old code follows the foreign parent link
+  and returns Ok(Some); the three original controls pass. Retain exit 100.
 - [x] Connect existing AnchoredRecoveryParent quarantine_self_to and parent
   validation/sync, preserving namespace refusal and ordinary rollback behavior.
-- [ ] Reread error paths, source identity, sidecar naming and restore callers.
+- [x] Reread error paths, source identity, sidecar naming and restore callers.
+  Stop companion moves/rollback through a changed parent; report final sync
+  failure. Broader pathname-race and native-platform acceptance stays open.
 - [ ] Execute 29 recovery cases: initial 27 (previous 17 plus legacy family,
   collision, rollback, namespace and restore controls and the new regression)
   plus two existing anchored-rename delegate controls identified on reread.
   Expanded before positive execution; the old-source four-case set stays fixed.
 - [ ] Check workspace/all-targets and production workspace/lib+bins.
 - [ ] Run strict workspace/all-target Clippy and formatting checks.
-- [ ] Scan the whole changed Rust file and retain warning/error counts.
+- [x] Scan the whole changed Rust file and retain warning/error counts:
+  final UBS2 exit 0, status ok, no failed modules, critical 0 / warning 5147 /
+  info 2435. Formatting2 passes; retain the earlier manual-formatting failures.
 - [ ] Bind every result to exact source/lock/toolchain and strict remote receipt;
   retain initial failures and exclude pending or empty runs from passing claims.
 - [ ] Record scoped Bead progress, preserve original acceptance and peer records,
