@@ -18,6 +18,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -4762,6 +4763,18 @@ pub(crate) struct ReservationPatternActivity {
     pub(crate) matches: bool,
     pub(crate) fs_activity_micros: Option<i64>,
     pub(crate) git_activity_micros: Option<i64>,
+    /// A bounded or failed history scan cannot establish absent Git activity.
+    pub(crate) git_activity_incomplete: bool,
+}
+
+/// Stop an outstanding activity worker when its awaiting request is dropped.
+/// The worker also observes the request's Cx cancellation while it is awaited.
+struct ReservationActivityCancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReservationActivityCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 const RESERVATION_GLOB_MARKERS: &[char] = &['*', '?', '[', '{'];
@@ -5280,6 +5293,9 @@ pub(crate) fn reservation_compute_pattern_activity(
         matches: matched_paths,
         fs_activity_micros: fs_latest,
         git_activity_micros: git_activity,
+        // The single-pattern force-release path still performs its complete
+        // legacy scan; bounded resource enrichment is handled separately.
+        git_activity_incomplete: false,
     }
 }
 
@@ -5354,19 +5370,34 @@ fn reservation_repo_candidate_paths(repo: &git2::Repository) -> Vec<String> {
     paths
 }
 
-/// Latest commit time (micros) touching each pathspec, from ONE history walk
-/// shared by all of them (GH #337).
+const RESERVATION_GIT_ACTIVITY_MAX_COMMITS: usize = 1024;
+const RESERVATION_GIT_ACTIVITY_MAX_TIME: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReservationGitActivity {
+    micros: Option<i64>,
+    complete: bool,
+}
+
+/// Latest observed commit time for each pathspec, from one bounded history walk.
 ///
-/// Per pathspec this matches `reservation_git_latest_activity_micros`:
-/// commits are visited newest-first and a pathspec takes the first commit
-/// whose diff against its first parent (or, for a root commit, whose tree)
-/// has a matching path. The walk stops once every pathspec is resolved.
+/// Resolved patterns retain their exact first matching commit. Only exhausting
+/// the history proves that a valid unresolved pattern has no Git activity.
+/// Budget exhaustion, cancellation and read errors leave it explicitly unknown.
+/// Commit times need not be monotonic along Git ancestry, so an old timestamp
+/// is never a reason to declare the remaining history inactive.
+///
+/// The deadline is cooperative: it is checked between libgit2 operations, not a
+/// hard deadline on a single native filesystem read or tree diff.
 fn reservation_git_latest_activity_micros_batch(
     repo: &git2::Repository,
     pathspecs: &[String],
-) -> Vec<Option<i64>> {
-    let mut results = vec![None; pathspecs.len()];
-    let mut pending: Vec<(usize, git2::Pathspec)> = pathspecs
+    max_commits: usize,
+    deadline: Instant,
+    mut cancelled: impl FnMut() -> bool,
+) -> Vec<ReservationGitActivity> {
+    let mut results = vec![ReservationGitActivity::default(); pathspecs.len()];
+    let mut pending: Vec<(usize, String, git2::Pathspec)> = pathspecs
         .iter()
         .enumerate()
         .filter_map(|(slot, spec)| {
@@ -5376,7 +5407,7 @@ fn reservation_git_latest_activity_micros_batch(
                 .unwrap_or(spec);
             git2::Pathspec::new(std::iter::once(spec))
                 .ok()
-                .map(|pathspec| (slot, pathspec))
+                .map(|pathspec| (slot, spec.to_string(), pathspec))
         })
         .collect();
     if pending.is_empty() {
@@ -5385,51 +5416,75 @@ fn reservation_git_latest_activity_micros_batch(
     let Ok(mut revwalk) = repo.revwalk() else {
         return results;
     };
+    // push_head collapses some reference failures to a generic Git error.
+    // Inspect HEAD itself before deciding that an unborn repository is empty.
+    if let Err(error) = repo.head() {
+        if error.code() == git2::ErrorCode::UnbornBranch {
+            for (slot, _, _) in pending {
+                results[slot].complete = true;
+            }
+        }
+        return results;
+    }
     if revwalk.push_head().is_err() || revwalk.set_sorting(git2::Sort::TIME).is_err() {
         return results;
     }
 
-    let mut changed: Vec<PathBuf> = Vec::new();
-    for oid_result in revwalk {
-        let Ok(oid) = oid_result else { continue };
+    let mut visited = 0;
+    loop {
+        if cancelled() || Instant::now() >= deadline || visited >= max_commits {
+            break;
+        }
+        let Some(oid_result) = revwalk.next() else {
+            for (slot, _, _) in pending {
+                results[slot].complete = true;
+            }
+            break;
+        };
+        visited += 1;
+        let Ok(oid) = oid_result else { break };
         let Ok(commit) = repo.find_commit(oid) else {
-            continue;
+            break;
         };
         let Ok(commit_tree) = commit.tree() else {
-            continue;
+            break;
         };
         let parent_tree = if commit.parent_count() == 0 {
             None
         } else {
             let Ok(parent) = commit.parent(0) else {
-                continue;
+                break;
             };
-            let Ok(tree) = parent.tree() else { continue };
+            let Ok(tree) = parent.tree() else { break };
             Some(tree)
         };
-        let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), None)
-        else {
-            continue;
-        };
-        changed.clear();
-        for delta in diff.deltas() {
-            for path in [delta.new_file().path(), delta.old_file().path()]
-                .into_iter()
-                .flatten()
-            {
-                changed.push(path.to_path_buf());
-            }
+        // Unrelated wide subtrees must not be diffed for every commit in a
+        // history walk about a small reservation page (GH#385).
+        let mut options = git2::DiffOptions::new();
+        for (_, spec, _) in &pending {
+            options.pathspec(spec);
         }
-        if changed.is_empty() {
-            continue;
+        let Ok(diff) =
+            repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(&mut options))
+        else {
+            break;
+        };
+        if cancelled() || Instant::now() >= deadline {
+            break;
         }
         let micros = commit.time().seconds().saturating_mul(1_000_000);
-        pending.retain(|(slot, pathspec)| {
-            let touched = changed
-                .iter()
-                .any(|path| pathspec.matches_path(path, git2::PathspecFlags::DEFAULT));
+        pending.retain(|(slot, _, pathspec)| {
+            let touched = diff.deltas().any(|delta| {
+                [delta.new_file().path(), delta.old_file().path()]
+                    .into_iter()
+                    .flatten()
+                    .any(|path| pathspec.matches_path(path, git2::PathspecFlags::DEFAULT))
+            });
             if touched {
-                results[*slot] = Some(micros);
+                results[*slot] = ReservationGitActivity {
+                    micros: Some(micros),
+                    complete: true,
+                };
             }
             !touched
         });
@@ -5442,16 +5497,18 @@ fn reservation_git_latest_activity_micros_batch(
 
 /// Activity for every distinct pattern of one `file_reservations` read.
 ///
-/// Gives the same per-pattern result as `reservation_compute_pattern_activity`,
-/// but the repository is opened once, its candidate path list is built once,
-/// and one history walk serves every pattern. GH #337: the per-pattern index
-/// scans, working-tree status walks and history walks made each read cost
-/// seconds of CPU per live reservation on a large repository.
+/// The repository is opened once, its candidate path list is built once, and
+/// one bounded history walk serves every pattern. Completed observations retain
+/// the single-pattern semantics; unresolved history is explicitly unknown.
+/// GH #337: per-pattern index, status and history walks made each read cost
+/// seconds of CPU per live reservation on a large repository. GH #385 also
+/// bounds the remaining shared walk and observes request cancellation.
 pub(crate) fn reservation_compute_patterns_activity(
     workspace: Option<&Path>,
     repo_root: Option<&Path>,
     workspace_rel: Option<&Path>,
     patterns: &[String],
+    cancelled: &dyn Fn() -> bool,
 ) -> HashMap<String, ReservationPatternActivity> {
     let mut out: HashMap<String, ReservationPatternActivity> =
         HashMap::with_capacity(patterns.len());
@@ -5461,21 +5518,18 @@ pub(crate) fn reservation_compute_patterns_activity(
         }
         return out;
     };
-    let ls_files_shell = std::env::var("AM_GIT_LS_FILES_SHELL").ok().as_deref() == Some("1");
-    let activity_shell = std::env::var("AM_GIT_RESERVATION_ACTIVITY_SHELL")
-        .ok()
-        .as_deref()
-        == Some("1");
-    if ls_files_shell || activity_shell {
-        // The CLI escape hatches keep their per-pattern behaviour.
+    // Resource enrichment always uses the bounded native walk. The legacy
+    // single-pattern shell switches must not bypass request cancellation or
+    // turn a listing back into one unbounded history process per reservation.
+    if cancelled() {
         for pattern in patterns {
-            let activity = reservation_compute_pattern_activity(
-                Some(workspace),
-                repo_root,
-                workspace_rel,
-                pattern,
+            out.insert(
+                pattern.clone(),
+                ReservationPatternActivity {
+                    git_activity_incomplete: true,
+                    ..ReservationPatternActivity::default()
+                },
             );
-            out.insert(pattern.clone(), activity);
         }
         return out;
     }
@@ -5489,6 +5543,16 @@ pub(crate) fn reservation_compute_patterns_activity(
 
     for pattern in patterns {
         if out.contains_key(pattern) {
+            continue;
+        }
+        if cancelled() {
+            out.insert(
+                pattern.clone(),
+                ReservationPatternActivity {
+                    git_activity_incomplete: true,
+                    ..ReservationPatternActivity::default()
+                },
+            );
             continue;
         }
         let normalized = reservation_normalize_pattern(pattern);
@@ -5547,6 +5611,9 @@ pub(crate) fn reservation_compute_patterns_activity(
                 matches,
                 fs_activity_micros: fs_latest,
                 git_activity_micros: None,
+                // Opening an identified repository can fail. Leave its
+                // activity unknown unless the bounded scan proves a result.
+                git_activity_incomplete: matches && want_git,
             },
         );
     }
@@ -5556,7 +5623,13 @@ pub(crate) fn reservation_compute_patterns_activity(
     {
         let specs: Vec<String> = git_specs.iter().map(|(_, spec)| spec.clone()).collect();
         let start = std::time::Instant::now();
-        let latest = reservation_git_latest_activity_micros_batch(repo, &specs);
+        let latest = reservation_git_latest_activity_micros_batch(
+            repo,
+            &specs,
+            RESERVATION_GIT_ACTIVITY_MAX_COMMITS,
+            start + RESERVATION_GIT_ACTIVITY_MAX_TIME,
+            cancelled,
+        );
         tracing::debug!(
             target: "mcp_agent_mail::tools::reservations::activity",
             patterns = specs.len(),
@@ -5564,9 +5637,10 @@ pub(crate) fn reservation_compute_patterns_activity(
             via = "libgit2_batch",
             "reservation_activity_batch_result"
         );
-        for ((pattern, _), micros) in git_specs.iter().zip(latest) {
+        for ((pattern, _), git_activity) in git_specs.iter().zip(latest) {
             if let Some(activity) = out.get_mut(pattern) {
-                activity.git_activity_micros = micros;
+                activity.git_activity_micros = git_activity.micros;
+                activity.git_activity_incomplete = !git_activity.complete;
             }
         }
     }
@@ -5748,6 +5822,7 @@ mod reservation_activity_tests {
             Some(repo_root.as_path()),
             Some(workspace_rel.as_path()),
             &patterns,
+            &|| false,
         );
         for pattern in &patterns {
             let single = reservation_compute_pattern_activity(
@@ -5776,10 +5851,142 @@ mod reservation_activity_tests {
         assert!(!batched["missing.rs"].matches);
     }
 
+    fn bounded_activity_history() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run_git(root, &["init", "-q", "-b", "main"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test User"]);
+        std::fs::write(root.join("cold.rs"), "old\n").expect("write cold");
+        std::fs::write(root.join("hot.rs"), "0\n").expect("write hot");
+        run_git(root, &["add", "."]);
+        commit_at(root, "root", 1_700_000_000);
+        for revision in 1..=3 {
+            std::fs::write(root.join("hot.rs"), format!("{revision}\n")).expect("update hot");
+            run_git(root, &["add", "hot.rs"]);
+            commit_at(root, "hot", 1_700_000_000 + revision * 100);
+        }
+        tmp
+    }
+
+    #[test]
+    fn reservation_git_activity_budget_preserves_partial_results() {
+        let tmp = bounded_activity_history();
+        let repo = git2::Repository::open(tmp.path()).expect("open");
+        let specs = vec![
+            "hot.rs".to_string(),
+            "cold.rs".to_string(),
+            "never.rs".to_string(),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let bounded =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, 1, deadline, || false);
+        assert_eq!(
+            bounded[0],
+            ReservationGitActivity {
+                micros: Some(1_700_000_300_000_000),
+                complete: true,
+            }
+        );
+        assert_eq!(bounded[1], ReservationGitActivity::default());
+        assert_eq!(bounded[2], ReservationGitActivity::default());
+
+        // Real history exhaustion, not a cutoff, proves no matching commit.
+        let complete =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, 8, deadline, || false);
+        assert!(complete.iter().all(|activity| activity.complete));
+        assert_eq!(complete[0], bounded[0]);
+        assert_eq!(complete[1].micros, Some(1_700_000_000_000_000));
+        assert_eq!(complete[2].micros, None);
+    }
+
+    #[test]
+    fn reservation_git_activity_cancellation_keeps_already_resolved_patterns() {
+        let tmp = bounded_activity_history();
+        let repo = git2::Repository::open(tmp.path()).expect("open");
+        let specs = vec!["hot.rs".to_string(), "cold.rs".to_string()];
+        let mut checkpoints = 0;
+        let activity = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &specs,
+            8,
+            Instant::now() + Duration::from_secs(60),
+            || {
+                checkpoints += 1;
+                // Cancel after the first commit's before/after checkpoints.
+                checkpoints > 2
+            },
+        );
+        assert_eq!(activity[0].micros, Some(1_700_000_300_000_000));
+        assert!(activity[0].complete);
+        assert_eq!(activity[1], ReservationGitActivity::default());
+    }
+
+    #[test]
+    fn reservation_git_activity_deadline_and_dropped_request_leave_history_unknown() {
+        let tmp = bounded_activity_history();
+        let repo = git2::Repository::open(tmp.path()).expect("open");
+        let specs = vec!["cold.rs".to_string()];
+        let expired = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &specs,
+            8,
+            Instant::now(),
+            || false,
+        );
+        assert_eq!(expired, vec![ReservationGitActivity::default()]);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let awaiting_request = ReservationActivityCancelOnDrop(Arc::clone(&cancelled));
+        drop(awaiting_request);
+        let dropped = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &specs,
+            8,
+            Instant::now() + Duration::from_secs(60),
+            || cancelled.load(Ordering::Acquire),
+        );
+        assert_eq!(dropped, vec![ReservationGitActivity::default()]);
+    }
+
+    #[test]
+    fn reservation_git_activity_distinguishes_unborn_history_from_missing_objects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(tmp.path()).expect("init");
+        let specs = vec!["cold.rs".to_string()];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let unborn =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, 8, deadline, || false);
+        assert_eq!(
+            unborn,
+            vec![ReservationGitActivity {
+                micros: None,
+                complete: true,
+            }]
+        );
+
+        // A real commit with an unavailable tree is not an empty history.
+        // Keep the object intact as evidence; no fixture object is removed.
+        let commit = repo
+            .odb()
+            .expect("odb")
+            .write(
+                git2::ObjectType::Commit,
+                b"tree 1111111111111111111111111111111111111111\nauthor Test <test@example.com> 1700000000 +0000\ncommitter Test <test@example.com> 1700000000 +0000\n\nbroken tree\n",
+            )
+            .expect("write commit");
+        repo.reference("refs/heads/main", commit, true, "missing tree fixture")
+            .expect("reference");
+        repo.set_head("refs/heads/main").expect("head");
+        let broken =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, 8, deadline, || false);
+        assert_eq!(broken, vec![ReservationGitActivity::default()]);
+    }
+
     #[test]
     fn reservation_compute_patterns_activity_without_workspace_or_repo() {
         let patterns = vec!["src/**".to_string(), "a.rs".to_string()];
-        let none = reservation_compute_patterns_activity(None, None, None, &patterns);
+        let none = reservation_compute_patterns_activity(None, None, None, &patterns, &|| false);
         assert_eq!(none.len(), 2);
         assert!(
             none.values()
@@ -5788,7 +5995,13 @@ mod reservation_activity_tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("a.rs"), "x\n").expect("write");
-        let plain = reservation_compute_patterns_activity(Some(tmp.path()), None, None, &patterns);
+        let plain = reservation_compute_patterns_activity(
+            Some(tmp.path()),
+            None,
+            None,
+            &patterns,
+            &|| false,
+        );
         for pattern in &patterns {
             let single =
                 reservation_compute_pattern_activity(Some(tmp.path()), None, None, pattern);
@@ -5961,15 +6174,25 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             let workspace_clone = workspace.clone();
             let repo_root_clone = repo_root.map(std::path::PathBuf::from);
             let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
-            asupersync::runtime::spawn_blocking(move || {
+            ctx.checkpoint()?;
+            let activity_cancelled = Arc::new(AtomicBool::new(false));
+            let _cancel_on_drop = ReservationActivityCancelOnDrop(Arc::clone(&activity_cancelled));
+            let activity_cx = ctx.cx().clone();
+            let activity = asupersync::runtime::spawn_blocking(move || {
+                let cancelled = || {
+                    activity_cancelled.load(Ordering::Acquire) || activity_cx.is_cancel_requested()
+                };
                 reservation_compute_patterns_activity(
                     workspace_clone.as_deref(),
                     repo_root_clone.as_deref(),
                     workspace_rel_clone.as_deref(),
                     &distinct_patterns,
+                    &cancelled,
                 )
             })
-            .await
+            .await;
+            ctx.checkpoint()?;
+            activity
         };
 
     let mut reservations: Vec<FileReservationResourceEntry> = Vec::with_capacity(rows.len());
@@ -6017,6 +6240,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         let stale = reservation_row_is_logically_unreleased(&row)
             && workspace_available
             && (agent_missing || agent_inactive)
+            && !pat_activity.git_activity_incomplete
             && !(recent_mail || recent_fs || recent_git);
 
         let mut stale_reasons = Vec::with_capacity(4);
@@ -6042,6 +6266,8 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             }
             if recent_git {
                 stale_reasons.push("git_activity_recent".to_string());
+            } else if pat_activity.git_activity_incomplete {
+                stale_reasons.push("git_activity_unknown".to_string());
             } else {
                 stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
             }
