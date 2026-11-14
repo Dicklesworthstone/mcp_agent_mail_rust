@@ -13,16 +13,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use asupersync::Cx;
+#[cfg(test)]
 use fastmcp_core::block_on;
 use fs2::FileExt;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{DbPool, corruption_circuit_breaker};
+use mcp_agent_mail_db::{DbConn, DbPool, corruption_circuit_breaker};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::outcome;
 use super::{
-    DeferredRetry, MAX_RETRY_BACKOFF, MAX_RETRY_IDS, ReconcileCursor, ReconcileReport, outcome,
-    reconcile_message_batch_inner, source_error, validate_pool_binding,
+    DeferredRetry, MAX_RETRY_BACKOFF, MAX_RETRY_IDS, ReconcileCursor, ReconcileFailure,
+    ReconcileReport, reconcile_message_batch_inner, source_error, validate_pool_binding,
 };
 
 // Version 1 omitted the logical database generation; version 2 omitted the
@@ -285,20 +288,39 @@ fn with_available_checkpoint<T>(
 /// empty table once on this authorized writable connection, without replacing
 /// an existing identity, then release the connection before filesystem I/O.
 fn source_generation(cx: &Cx, pool: &DbPool) -> Result<String, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let rows = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
+    // Generation checks run before selection and again before saving progress.
+    // The runtime registry retains this one-slot pool across worker restarts,
+    // so returning a failed pager can strand both phases on the same handle.
+    // Reuse source retirement and panic redaction; the caller still owns the
+    // original promotion admission for the idempotent empty-identity seed.
+    super::source::with_source_connection(cx, pool, |conn| source_generation_connection(cx, conn))
+        .map_err(|error| error.detail)
+}
+
+fn source_generation_connection(cx: &Cx, conn: &DbConn) -> Result<String, ReconcileFailure> {
+    let query = |sql: &str| {
+        #[cfg(test)]
+        let sql = tests::generation_source_sql(conn, sql);
+        conn.query_sync(sql, &[])
+            .map_err(ReconcileFailure::source_unavailable)
+    };
+    let rows = query("PRAGMA query_only")?;
     if rows.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-        return Err("query-only snapshots cannot authorize message archive repair".into());
+        return Err(
+            "query-only snapshots cannot authorize message archive repair"
+                .to_string()
+                .into(),
+        );
     }
     // Read the whole singleton relation (bounded), not just row zero: an
     // unexpected row must not be mistaken for a fresh, uninitialized mailbox.
     let select = "SELECT singleton, generation_id FROM db_identity LIMIT 2";
-    let mut rows = conn.query_sync(select, &[]).map_err(source_error)?;
+    let mut rows = query(select)?;
     if rows.is_empty() {
         if cx.checkpoint().is_err() || corruption_circuit_breaker().is_tripped() {
-            return Err("message checkpoint identity initialization interrupted".into());
+            return Err("message checkpoint identity initialization interrupted"
+                .to_string()
+                .into());
         }
         if mcp_agent_mail_core::global_metrics()
             .system
@@ -308,6 +330,7 @@ fn source_generation(cx: &Cx, pool: &DbPool) -> Result<String, String> {
         {
             return Err(
                 "message checkpoint identity initialization deferred by critical disk pressure"
+                    .to_string()
                     .into(),
             );
         }
@@ -317,21 +340,31 @@ fn source_generation(cx: &Cx, pool: &DbPool) -> Result<String, String> {
         // Match the reservation writer's lazy generation initialization. The
         // unique singleton key elects one durable token across racing workers;
         // always read back the winner rather than trusting our proposed value.
+        let insert = "INSERT OR IGNORE INTO db_identity (singleton, generation_id) VALUES (0, ?)";
+        #[cfg(test)]
+        let insert = tests::generation_source_sql(conn, insert);
         conn.execute_sync(
-            "INSERT OR IGNORE INTO db_identity (singleton, generation_id) VALUES (0, ?)",
+            insert,
             &[mcp_agent_mail_db::sqlmodel_core::Value::Text(token)],
         )
-        .map_err(source_error)?;
-        rows = conn.query_sync(select, &[]).map_err(source_error)?;
+        .map_err(ReconcileFailure::source_unavailable)?;
+        rows = query(select)?;
     }
     let [row] = rows.as_slice() else {
-        return Err("message checkpoint requires one database generation".into());
+        return Err("message checkpoint requires one database generation"
+            .to_string()
+            .into());
     };
     if row.get_named::<i64>("singleton").map_err(source_error)? != 0 {
-        return Err("message checkpoint database generation has an invalid singleton".into());
+        return Err(
+            "message checkpoint database generation has an invalid singleton"
+                .to_string()
+                .into(),
+        );
     }
     row.get_named::<String>("generation_id")
         .map_err(source_error)
+        .map_err(Into::into)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1275,6 +1308,246 @@ mod tests {
     use std::collections::VecDeque;
 
     const GENERATION: &str = "aabbccdd";
+
+    std::thread_local! {
+        static GENERATION_SOURCE_FAULT: std::cell::Cell<Option<(usize, bool)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn generation_source_sql<'a>(conn: &DbConn, sql: &'a str) -> &'a str {
+        let Some((remaining, panic)) = GENERATION_SOURCE_FAULT.get() else {
+            return sql;
+        };
+        if remaining > 1 {
+            GENERATION_SOURCE_FAULT.set(Some((remaining - 1, panic)));
+            return sql;
+        }
+        GENERATION_SOURCE_FAULT.set(None);
+        // A connection-local witness survives normal return to the pool, but
+        // not retirement. The missing-table query is a real driver failure;
+        // neither control changes the durable identity or any mailbox row.
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        assert!(!panic, "private-checkpoint-generation-panic-payload");
+        // Run the invalid statement through the caller's actual query/execute
+        // error mapping instead of returning a preclassified synthetic error.
+        "SELECT * FROM missing_checkpoint_generation_probe"
+    }
+
+    fn cached_pool_after_generation_failure(cx: &Cx, pool: &DbPool, config: &Config) -> DbPool {
+        let reopened = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            reopened.engine_identity_key(),
+            pool.engine_identity_key(),
+            "factory retry must exercise the retained engine, not a replacement pool"
+        );
+        let conn = outcome(block_on(reopened.acquire(cx))).unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            0,
+            "failed generation handle was returned to the one-slot pool"
+        );
+        drop(conn);
+        reopened
+    }
+
+    fn exercise_generation_failure_before_pass(panic: bool) {
+        if super::super::admission_tests::isolated() {
+            return;
+        }
+        // Cover query-only mode, empty identity read, seed write and winner
+        // read-back. The fourth failure occurs after the authorized seed.
+        for failing_operation in 1..=4 {
+            super::super::tests::retention_fixture(1, |cx, pool, config| {
+                let before = super::super::admission_tests::database_evidence(cx, pool);
+                let path = checkpoint_path(
+                    &std::fs::canonicalize(pool.sqlite_path()).unwrap(),
+                    &std::fs::canonicalize(&config.storage_root).unwrap(),
+                )
+                .unwrap();
+                let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+                cursor.source_identity = pool.sqlite_identity_key();
+                cursor.tail_after = Some(900);
+                cursor.backfill_ceiling = Some(899);
+                cursor.checkpoint_dirty = true;
+                cursor.defer_transient(901, Instant::now());
+                let saved = format!("{cursor:?}");
+                GENERATION_SOURCE_FAULT.set(Some((failing_operation, panic)));
+                let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                }))
+                .expect("generation failure must remain inside the source boundary")
+                .unwrap_err();
+                assert!(GENERATION_SOURCE_FAULT.get().is_none());
+                assert!(failure.contains("source query failed"), "{failure}");
+                if panic {
+                    assert!(failure.contains("panicked"), "{failure}");
+                }
+                assert!(!failure.contains("private-checkpoint-generation-panic-payload"));
+                assert_eq!(format!("{cursor:?}"), saved);
+                assert!(!path.exists());
+                assert!(!path.with_extension("json.lock").exists());
+
+                let reopened = cached_pool_after_generation_failure(cx, pool, config);
+                let conn = outcome(block_on(reopened.acquire(cx))).unwrap();
+                let identities = conn
+                    .query_sync("SELECT generation_id FROM db_identity", &[])
+                    .unwrap();
+                assert_eq!(identities.len(), usize::from(failing_operation == 4));
+                let seeded = identities
+                    .first()
+                    .map(|row| row.get_named::<String>("generation_id").unwrap());
+                drop(conn);
+                let resumed =
+                    run(cx, &reopened, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+                assert_eq!(
+                    (resumed.repaired, resumed.files_created, resumed.retry_len),
+                    (1, 4, 0)
+                );
+                assert_eq!(resumed.checkpoint_saved, Some(true));
+                assert!(!cursor.checkpoint_dirty);
+                if let Some(seeded) = seeded {
+                    assert_eq!(
+                        Binding::capture(cx, &reopened, config)
+                            .unwrap()
+                            .database_generation,
+                        seeded,
+                        "a failed read-back must not replace the stored winner"
+                    );
+                }
+                assert_message_committed(cx, &reopened, config, 901, 1);
+                assert_eq!(
+                    super::super::admission_tests::database_evidence(cx, &reopened),
+                    before
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn generation_sql_failures_retire_reader_before_checkpoint_or_cursor_changes() {
+        exercise_generation_failure_before_pass(false);
+    }
+
+    #[test]
+    fn generation_panics_retire_reader_without_losing_unsaved_retry_debt() {
+        exercise_generation_failure_before_pass(true);
+    }
+
+    fn exercise_generation_failure_after_repair(panic: bool) {
+        if super::super::admission_tests::isolated() {
+            return;
+        }
+        // The admitted pre-pass uses two reads. Fail each read in the second,
+        // post-repair generation observation, before checkpoint publication.
+        for failing_operation in 3..=4 {
+            super::super::tests::retention_fixture(1, |cx, pool, config| {
+                let before = super::super::admission_tests::database_evidence(cx, pool);
+                let binding = Binding::capture(cx, pool, config).unwrap();
+                let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+                cursor.source_identity = pool.sqlite_identity_key();
+                cursor.checkpoint_source_binding = Some(binding.clone());
+                cursor.tail_after = Some(900);
+                cursor.backfill_ceiling = Some(899);
+                cursor.defer_transient(901, Instant::now());
+                let store = Store::open(binding.clone()).unwrap();
+                store.save(&cursor).unwrap();
+                let path = store.path.clone();
+                let saved = std::fs::read(&path).unwrap();
+                drop(store);
+
+                GENERATION_SOURCE_FAULT.set(Some((failing_operation, panic)));
+                let repaired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                }))
+                .expect("a failed save observation must not unwind completed repair")
+                .unwrap();
+                assert!(GENERATION_SOURCE_FAULT.get().is_none());
+                assert_eq!(
+                    (
+                        repaired.repaired,
+                        repaired.files_created,
+                        repaired.retry_len
+                    ),
+                    (1, 4, 0)
+                );
+                assert_eq!(repaired.checkpoint_saved, Some(false));
+                assert!(cursor.checkpoint_dirty);
+                assert_eq!(cursor.tail_after, Some(901));
+                assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+                let reopened = cached_pool_after_generation_failure(cx, pool, config);
+                assert_message_committed(cx, &reopened, config, 901, 1);
+                assert_eq!(Binding::capture(cx, &reopened, config).unwrap(), binding);
+                let resumed =
+                    run(cx, &reopened, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+                assert_eq!(
+                    (resumed.repaired, resumed.unchanged, resumed.retry_len),
+                    (0, 1, 0)
+                );
+                assert_eq!(resumed.checkpoint_saved, Some(true));
+                assert!(!cursor.checkpoint_dirty);
+                let snapshot = Store::open(binding).unwrap().load().unwrap().unwrap();
+                assert_eq!(snapshot.tail_after, Some(901));
+                assert!(snapshot.retries.is_empty());
+                assert_message_committed(cx, &reopened, config, 901, 1);
+                assert_eq!(
+                    super::super::admission_tests::database_evidence(cx, &reopened),
+                    before
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn post_repair_generation_sql_failure_preserves_checkpoint_and_memory_progress() {
+        exercise_generation_failure_after_repair(false);
+    }
+
+    #[test]
+    fn post_repair_generation_panic_preserves_checkpoint_and_memory_progress() {
+        exercise_generation_failure_after_repair(true);
+    }
+
+    #[test]
+    fn valid_query_only_refusal_keeps_the_generation_reader() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            let before = super::super::admission_tests::database_evidence(cx, pool);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let failure = source_generation(cx, pool).unwrap_err();
+            assert!(failure.contains("query-only"), "{failure}");
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1,
+                "a valid source refusal must not retire the healthy reader"
+            );
+            assert!(
+                conn.query_sync("SELECT generation_id FROM db_identity", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            drop(conn);
+            assert_eq!(
+                super::super::admission_tests::database_evidence(cx, pool),
+                before
+            );
+            assert!(!config.storage_root.join(".git").exists());
+        });
+    }
 
     #[test]
     fn unsaved_debt_merges_without_rewinding_the_live_scan_or_shortening_cooldowns() {

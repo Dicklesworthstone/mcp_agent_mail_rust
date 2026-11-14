@@ -86,8 +86,11 @@ pub(super) fn prepare_message_classified(
 /// A retry must not reacquire the reader whose SQL operation just failed.
 /// The maintenance pool has one connection: returning an obsolete pager to it
 /// can turn the bounded retry lane into repeated reads of the same bad handle.
-/// Retire only failed source reads, not valid reads that expose conflicting
-/// durable metadata. Neither path mutates mailbox rows or relaxes validation.
+/// Retire failed source SQL, not valid reads that expose conflicting durable
+/// metadata. Callers never mutate mailbox rows or relax validation here. The
+/// checkpoint generation check may perform its existing `INSERT OR IGNORE`
+/// seed of an empty `db_identity` relation under promotion admission, after
+/// query-only/cancellation/pressure checks, and must reread the stored winner.
 pub(super) fn with_source_connection<T>(
     cx: &Cx,
     pool: &DbPool,
@@ -106,11 +109,12 @@ pub(super) fn with_source_connection<T>(
         }
     };
     // The synchronous driver/decoder may unwind instead of returning an SQL
-    // error. Keep that failure inside the read-only observation: the caller's
+    // error. Keep that failure inside the source observation: the caller's
     // bounded retry lane must retain the message ID, and the uncertain pager
-    // must never return to this one-slot pool. No archive publication or SQL
-    // mutation is included in this boundary. Do not copy the panic payload
-    // into the returned error; it may contain private source data.
+    // must never return to this one-slot pool. Only the checkpoint's admitted,
+    // idempotent identity initialization may write SQL here; archive publication
+    // and mailbox mutation remain outside the boundary. Do not copy the panic
+    // payload into the returned error; it may contain private source data.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&conn)))
         .unwrap_or_else(|_| {
             Err(ReconcileFailure::source_unavailable(
