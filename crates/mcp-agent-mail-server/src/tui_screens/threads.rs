@@ -3008,7 +3008,15 @@ fn fetch_thread_messages_paginated(
                 .get_named::<Option<String>>("archive_metadata_json")
                 .ok()
                 .flatten()
-                .and_then(|raw| serde_json::from_str::<StoredThreadMetadata>(&raw).ok())
+                .and_then(|raw| {
+                    // Derived structs can deserialize from a sequence too:
+                    // [1] must not manufacture a reply parent. Keep the typed
+                    // parser so duplicate keys and non-integer ids still fail.
+                    if !raw.trim_start().starts_with('{') {
+                        return None;
+                    }
+                    serde_json::from_str::<StoredThreadMetadata>(&raw).ok()
+                })
                 .and_then(|metadata| metadata.reply_to)
                 .filter(|parent| *parent > 0 && *parent != message_id);
             let recipients = recipient_map.get(&message_id);
@@ -6184,7 +6192,7 @@ mod tests {
     #[test]
     fn paginated_fetch_preserves_messages_with_unknown_reply_metadata() {
         // A numeric thread id is not an immediate reply parent.
-        let conn = make_thread_messages_db("1", 10);
+        let conn = make_thread_messages_db("1", 22);
         conn.execute_raw(
             r#"UPDATE messages SET archive_metadata_json = '{}' WHERE id = 2;
                UPDATE messages SET archive_metadata_json = 'invalid-json' WHERE id = 3;
@@ -6194,12 +6202,24 @@ mod tests {
                UPDATE messages SET archive_metadata_json = '{"reply_to":0}' WHERE id = 7;
                UPDATE messages SET archive_metadata_json = '{"reply_to":8}' WHERE id = 8;
                UPDATE messages SET archive_metadata_json = '{"reply_to":1,"extension":{"kept":true}}' WHERE id = 9;
-               UPDATE messages SET archive_metadata_json = '{"reply_to":null}' WHERE id = 10;"#,
+               UPDATE messages SET archive_metadata_json = '{"reply_to":null}' WHERE id = 10;
+               UPDATE messages SET archive_metadata_json = '[1]' WHERE id = 11;
+               UPDATE messages SET archive_metadata_json = '[[1]]' WHERE id = 12;
+               UPDATE messages SET archive_metadata_json = '1' WHERE id = 13;
+               UPDATE messages SET archive_metadata_json = 'null' WHERE id = 14;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":true}' WHERE id = 15;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1.0}' WHERE id = 16;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":9223372036854775808}' WHERE id = 17;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":-9223372036854775809}' WHERE id = 18;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":{}}' WHERE id = 19;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":[]}' WHERE id = 20;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1,"reply_to":2}' WHERE id = 21;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1,"reply_to":null}' WHERE id = 22;"#,
         )
         .expect("seed legacy and malformed metadata");
 
-        let (messages, _) = fetch_thread_messages_paginated(&conn, "1", 20, 0);
-        assert_eq!(messages.len(), 10, "bad metadata must not hide messages");
+        let (messages, _) = fetch_thread_messages_paginated(&conn, "1", 30, 0);
+        assert_eq!(messages.len(), 22, "bad metadata must not hide messages");
         for message in &messages {
             assert_eq!(
                 message.reply_to_id,
@@ -6213,7 +6233,7 @@ mod tests {
             tree.iter()
                 .map(|node| 1 + count_descendants(node))
                 .sum::<usize>(),
-            10
+            22
         );
         assert_eq!(tree[0].children[0].message_id, 9);
     }

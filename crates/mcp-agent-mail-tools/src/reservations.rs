@@ -30,8 +30,8 @@ use crate::messaging::{
 };
 use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::resources::{
-    reservation_compute_pattern_activity, reservation_open_repo_root,
-    reservation_project_workspace_path,
+    RESERVATION_ACTIVITY_TIME_BUDGET, reservation_activity_blocking,
+    reservation_compute_patterns_activity, reservation_normalize_pattern, reservation_open_repo_root,
 };
 #[cfg(test)]
 use crate::tool_util::get_db_pool;
@@ -1052,20 +1052,75 @@ fn expand_tilde(input: &str) -> PathBuf {
     PathBuf::from(input)
 }
 
-fn reservation_pattern_activity_for_project(
+async fn reservation_pattern_activity_for_project(
+    ctx: &McpContext,
     project_human_key: &str,
     path_pattern: &str,
-) -> crate::resources::ReservationPatternActivity {
-    let workspace = reservation_project_workspace_path(project_human_key);
-    let repo_info = workspace.as_deref().and_then(reservation_open_repo_root);
-    let repo_root = repo_info.as_ref().map(|(root, _)| root.as_path());
-    let workspace_rel = repo_info.as_ref().map(|(_, rel)| rel.as_path());
-    reservation_compute_pattern_activity(
-        workspace.as_deref(),
-        repo_root,
-        workspace_rel,
-        path_pattern,
-    )
+    recent_since_micros: i64,
+) -> McpResult<(bool, crate::resources::ReservationPatternActivity)> {
+    let project_human_key = project_human_key.to_string();
+    let path_pattern = path_pattern.to_string();
+    reservation_activity_blocking(ctx, RESERVATION_ACTIVITY_TIME_BUDGET, move |keep_going| {
+        let unknown = || crate::resources::ReservationPatternActivity {
+            fs_activity_incomplete: true,
+            git_activity_incomplete: true,
+            ..crate::resources::ReservationPatternActivity::default()
+        };
+        if !keep_going() {
+            return (false, unknown());
+        }
+        let workspace = PathBuf::from(&project_human_key);
+        if !std::fs::symlink_metadata(&workspace).is_ok_and(|meta| meta.is_dir()) {
+            return (false, unknown());
+        }
+        // Use exactly the probe's normalization. Legacy paths such as "./ "
+        // and "./ ." otherwise become an empty probe or a directory glob that
+        // cannot match root-relative descendants.
+        let normalized = reservation_normalize_pattern(&path_pattern);
+        if normalized.is_empty()
+            || normalized.split('/').any(|component| component == ".")
+            || normalized.contains("//")
+            || path_pattern.contains('\0')
+            || path_pattern.contains('\\')
+            || Path::new(path_pattern.trim()).is_absolute()
+            || path_looks_absolute(path_pattern.trim())
+            || invalid_file_reservation_pattern(&path_pattern).is_some()
+        {
+            return (true, unknown());
+        }
+        let repo_info = reservation_open_repo_root(&workspace);
+        // NotFound alone also covers broken .git indirection. Only the
+        // absence of every ancestor marker establishes a non-Git workspace.
+        let repo_unknown = repo_info.is_none()
+            && (!matches!(
+                git2::Repository::discover(&workspace),
+                Err(error) if error.code() == git2::ErrorCode::NotFound
+            ) || workspace.ancestors().any(|ancestor| {
+                !keep_going()
+                    || !matches!(
+                        std::fs::symlink_metadata(ancestor.join(".git")),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    )
+            }));
+        let repo_root = repo_info.as_ref().map(|(root, _)| root.as_path());
+        let workspace_rel = repo_info.as_ref().map(|(_, rel)| rel.as_path());
+        if workspace_rel.is_some_and(|relative| relative.to_str().is_none()) {
+            return (true, unknown());
+        }
+        let mut activity = reservation_compute_patterns_activity(
+            Some(&workspace),
+            repo_root,
+            workspace_rel,
+            std::slice::from_ref(&path_pattern),
+            recent_since_micros,
+            keep_going,
+        )
+        .remove(&path_pattern)
+        .unwrap_or_else(unknown);
+        activity.git_activity_incomplete |= repo_unknown;
+        (true, activity)
+    })
+    .await
 }
 
 fn released_ts_json_value(released_ts: Option<i64>) -> serde_json::Value {
@@ -3215,8 +3270,9 @@ pub async fn renew_file_reservations(
 
 /// Force-release a stale file reservation held by another agent.
 ///
-/// Validates that the reservation appears abandoned (agent inactive beyond threshold
-/// and no recent mail/filesystem/git activity).
+/// Unexpired leases require a known holder and complete, bounded evidence of
+/// agent, mail, filesystem and Git inactivity. The writer transaction rechecks
+/// the observed lease and holder activity. Expired leases need only unchanged expiry.
 ///
 /// # Parameters
 /// - `project_key`: Project identifier
@@ -3228,7 +3284,7 @@ pub async fn renew_file_reservations(
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Force-release a stale file reservation held by another agent after inactivity heuristics.\n\nThe tool validates that the reservation appears abandoned (agent inactive beyond threshold and\nno recent mail/filesystem/git activity). When released, an optional notification is sent to the\nprevious holder summarizing the heuristics."
+    description = "Force-release a stale file reservation held by another agent after inactivity heuristics.\n\nUnexpired leases require a known holder, a readable workspace, and complete evidence of agent and mail inactivity with no recent filesystem or Git activity. Activity probing runs on a blocking worker with a 100 ms cooperative budget and at most 1000 Git commits; unavailable, cancelled, or incomplete evidence never authorizes release. The writer transaction rechecks the observed lease and holder heartbeat, sends, reads, and acknowledgements. Renewal or new activity returns CONFLICT. Expired leases skip optional activity probing but still require unchanged expiry. The automatic reaper exemption does not prevent an explicit force release. When released, an optional notification is sent to the previous holder summarizing the evidence."
 )]
 #[allow(clippy::too_many_lines)]
 pub async fn force_release_file_reservation(
@@ -3341,6 +3397,7 @@ pub async fn force_release_file_reservation(
     );
 
     let now_micros = mcp_agent_mail_db::now_micros();
+    let is_expired = reservation.expires_ts <= now_micros;
     let mut stale_reasons = Vec::new();
 
     // Signal 1: Agent inactivity
@@ -3374,8 +3431,19 @@ pub async fn force_release_file_reservation(
         stale_reasons.push("mail_activity_recent".to_string());
     }
 
-    let pattern_activity =
-        reservation_pattern_activity_for_project(&project.human_key, &reservation.path_pattern);
+    // Expiry already authorizes release; it must not wait on optional history
+    // enrichment. An unexpired lease requires complete activity evidence.
+    let (workspace_available, pattern_activity) = if is_expired {
+        (false, crate::resources::ReservationPatternActivity::default())
+    } else {
+        reservation_pattern_activity_for_project(
+            ctx,
+            &project.human_key,
+            &reservation.path_pattern,
+            now_micros.saturating_sub(grace_micros),
+        )
+        .await?
+    };
     let recent_fs = pattern_activity
         .fs_activity_micros
         .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
@@ -3383,30 +3451,44 @@ pub async fn force_release_file_reservation(
         .git_activity_micros
         .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
 
-    if pattern_activity.matches {
-        if recent_fs {
+    if is_expired {
+        stale_reasons.push("lease_expired".to_string());
+    } else if !workspace_available {
+        stale_reasons.push("workspace_unavailable".to_string());
+    } else {
+        if pattern_activity.fs_activity_incomplete {
+            stale_reasons.push("filesystem_activity_unknown".to_string());
+        } else if recent_fs {
             stale_reasons.push("filesystem_activity_recent".to_string());
-        } else {
+        } else if pattern_activity.matches {
             stale_reasons.push(format!("no_recent_filesystem_activity>{grace_seconds}s"));
+        } else {
+            stale_reasons.push("path_pattern_unmatched".to_string());
         }
-        if recent_git {
+        if pattern_activity.git_activity_incomplete {
+            stale_reasons.push("git_activity_unknown".to_string());
+        } else if recent_git {
             stale_reasons.push("git_activity_recent".to_string());
         } else {
             stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
         }
-    } else {
-        stale_reasons.push("path_pattern_unmatched".to_string());
     }
 
-    // Check if reservation has expired
-    let is_expired = reservation.expires_ts <= now_micros;
-
-    // Must be inactive (agent + all signals stale) OR expired to force-release
-    let all_signals_stale = agent_inactive && mail_stale && !recent_fs && !recent_git;
+    // Unknown evidence cannot authorize revoking another agent's live lease.
+    let activity_unknown = !workspace_available
+        || holder_last_active_ts.is_none()
+        || pattern_activity.fs_activity_incomplete
+        || pattern_activity.git_activity_incomplete;
+    let all_signals_stale =
+        agent_inactive && mail_stale && !activity_unknown && !recent_fs && !recent_git;
     if !all_signals_stale && !is_expired {
         return Err(legacy_tool_error(
             "RESERVATION_ACTIVE",
-            "Reservation still shows recent activity; refusing forced release.",
+            if activity_unknown {
+                "Reservation activity could not be fully checked; refusing forced release. The holder can release it, or wait for the lease to expire."
+            } else {
+                "Reservation still shows recent activity; refusing forced release."
+            },
             true,
             json!({
                 "file_reservation_id": file_reservation_id,
@@ -3415,24 +3497,53 @@ pub async fn force_release_file_reservation(
         ));
     }
 
-    // Actually release the reservation in DB.
-    // We pass the expires_ts we used for heuristics to perform an ATOMIC release.
-    // If another agent renewed the reservation while we were calculating
-    // inactivity, this call will return 0 released rows (MATCH failure).
-    let released_count = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::force_release_reservation(
-            ctx.cx(),
-            &pool,
-            file_reservation_id,
-            Some(reservation.expires_ts),
-        )
-        .await,
-    )?;
+    // Carry the observed lease and activity into the writer transaction.
+    // A renewal, heartbeat or mail receipt committed during the filesystem/Git
+    // scan invalidates the original inactivity evidence.
+    #[cfg(test)]
+    tests::after_force_release_activity().await;
+    ensure_request_live(ctx)?;
+    let released_count = if is_expired {
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::force_release_reservation(
+                ctx.cx(),
+                &pool,
+                file_reservation_id,
+                Some(reservation.expires_ts),
+            )
+            .await,
+        )?
+    } else {
+        let agent_last_active_ts = holder_last_active_ts.ok_or_else(|| {
+            legacy_tool_error(
+                "RESERVATION_ACTIVE",
+                "Reservation holder activity is unavailable; refusing forced release.",
+                true,
+                json!({ "file_reservation_id": file_reservation_id }),
+            )
+        })?;
+        let candidate = mcp_agent_mail_db::queries::StaleReservationCandidate {
+            reservation: reservation.clone(),
+            agent_last_active_ts,
+            last_mail_activity_ts: mail_activity,
+        };
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::force_release_stale_reservation(
+                ctx.cx(),
+                &pool,
+                &candidate,
+                now_micros,
+                inactivity_micros,
+                grace_micros,
+            )
+            .await,
+        )?
+    };
 
     if released_count == 0 {
         return Err(legacy_tool_error(
             "CONFLICT",
-            "Reservation was renewed, released, or expired by another agent while heuristics were being calculated.",
+            "Reservation or holder activity changed while inactivity was being checked; refusing forced release.",
             true,
             json!({ "file_reservation_id": file_reservation_id }),
         ));
@@ -3813,7 +3924,8 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::{Cx, Outcome};
     use fastmcp::McpContext;
-    use mcp_agent_mail_db::{DbPool, ProjectRow, queries};
+    use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+    use mcp_agent_mail_db::{AgentRow, DbPool, FileReservationRow, ProjectRow, queries};
     use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -3832,10 +3944,19 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         static AFTER_RESERVATION_CONFLICT: std::cell::RefCell<Option<ReservationInterleaving>> =
             const { std::cell::RefCell::new(None) };
+        static AFTER_FORCE_RELEASE_ACTIVITY: std::cell::RefCell<Option<ReservationInterleaving>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     pub(super) async fn after_reservation_precheck() {
         let action = AFTER_RESERVATION_PRECHECK.with_borrow_mut(Option::take);
+        if let Some(action) = action {
+            action.await;
+        }
+    }
+
+    pub(super) async fn after_force_release_activity() {
+        let action = AFTER_FORCE_RELEASE_ACTIVITY.with_borrow_mut(Option::take);
         if let Some(action) = action {
             action.await;
         }
@@ -4007,6 +4128,7 @@ mod tests {
                     fn drop(&mut self) {
                         AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| *hook = None);
                         AFTER_RESERVATION_CONFLICT.with_borrow_mut(|hook| *hook = None);
+                        AFTER_FORCE_RELEASE_ACTIVITY.with_borrow_mut(|hook| *hook = None);
                     }
                 }
                 let _clear_hooks = ClearHooks;
@@ -9599,6 +9721,715 @@ mod tests {
                 assert_eq!(parsed["released"].as_i64(), Some(1));
             });
         });
+    }
+
+    struct ForceReleaseFixture {
+        project: ProjectRow,
+        holder: AgentRow,
+        actor: AgentRow,
+        reservation: FileReservationRow,
+    }
+
+    async fn inactive_force_release_fixture(
+        cx: &Cx,
+        pool: &DbPool,
+        project_key: &str,
+        path: &str,
+    ) -> ForceReleaseFixture {
+        let project = ensure_project(cx, pool, project_key).await;
+        let project_id = project.id.expect("project id");
+        let mut holder = register_agent(cx, pool, project_id, "AmberRiver").await;
+        let actor = register_agent(cx, pool, project_id, "BlueLake").await;
+        let reservation = create_test_reservation(
+            cx,
+            pool,
+            project_id,
+            holder.id.expect("holder id"),
+            path,
+            3600,
+            true,
+        )
+        .await;
+        let conn = pool.acquire(cx).await.into_result().expect("fixture connection");
+        conn.execute_sync(
+            "UPDATE agents SET last_active_ts = 1 WHERE id = ?",
+            &[SqlValue::BigInt(holder.id.expect("holder id"))],
+        )
+        .expect("seed old holder heartbeat");
+        holder.last_active_ts = 1;
+        ForceReleaseFixture {
+            project,
+            holder,
+            actor,
+            reservation,
+        }
+    }
+
+    async fn assert_force_release_preserves_claim(cx: &Cx, pool: &DbPool, id: i64) {
+        let rows = queries::get_reservations_by_ids(cx, pool, &[id])
+            .await
+            .into_result()
+            .expect("read preserved lease");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].released_ts.is_none(), "lease must remain unreleased");
+        let conn = pool.acquire(cx).await.into_result().expect("ledger connection");
+        let markers = conn
+            .query_sync(
+                "SELECT reservation_id FROM file_reservation_releases WHERE reservation_id = ?",
+                &[SqlValue::BigInt(id)],
+            )
+            .expect("read release ledger");
+        assert!(markers.is_empty(), "refusal must not publish a release marker");
+    }
+
+    fn force_release_history_fixture(tail: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("workspace");
+        let target = dir.path().join("target.rs");
+        std::fs::write(&target, "fn target() {}\n").expect("write reserved file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .expect("open reserved file")
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+            .expect("set old filesystem activity");
+        let mut options = git2::RepositoryInitOptions::new();
+        options.initial_head("main");
+        let repo = git2::Repository::init_opts(dir.path(), &options).expect("fixture repo");
+        let blob = repo.blob(b"fn target() {}\n").expect("fixture blob");
+        let mut builder = repo.treebuilder(None).expect("fixture tree builder");
+        builder.insert("target.rs", blob, 0o100_644).expect("tree entry");
+        let tree_id = builder.write().expect("write fixture tree");
+        let tree = repo.find_tree(tree_id).expect("fixture tree");
+        let mut head = None;
+        for sequence in 0..=tail {
+            let seconds = 1_700_000_000 + i64::try_from(sequence).expect("fixture depth");
+            let signature = git2::Signature::new(
+                "Force Release Test",
+                "force-release@example.com",
+                &git2::Time::new(seconds, 0),
+            )
+            .expect("fixture signature");
+            let parent = head.map(|id| repo.find_commit(id).expect("fixture parent"));
+            let parents: Vec<_> = parent.iter().collect();
+            head = Some(
+                repo.commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "unchanged reserved file",
+                    &tree,
+                    &parents,
+                )
+                .expect("fixture commit"),
+            );
+        }
+        dir
+    }
+
+    fn force_release_recent_deletion_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("workspace");
+        let mut options = git2::RepositoryInitOptions::new();
+        options.initial_head("main");
+        let repo = git2::Repository::init_opts(dir.path(), &options).expect("fixture repo");
+        let blob = repo.blob(b"previous content\n").expect("fixture blob");
+        let mut builder = repo.treebuilder(None).expect("fixture tree builder");
+        builder.insert("target.rs", blob, 0o100_644).expect("tree entry");
+        let first_tree_id = builder.write().expect("write initial tree");
+        let first_tree = repo.find_tree(first_tree_id).expect("initial tree");
+        let old_signature = git2::Signature::new(
+            "Force Release Test",
+            "force-release@example.com",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .expect("old signature");
+        let first = repo
+            .commit(
+                Some("HEAD"),
+                &old_signature,
+                &old_signature,
+                "old reserved path",
+                &first_tree,
+                &[],
+            )
+            .expect("old commit");
+        let parent = repo.find_commit(first).expect("parent");
+        let empty_tree_id = repo
+            .treebuilder(None)
+            .expect("empty fixture tree")
+            .write()
+            .expect("write empty tree");
+        let empty_tree = repo.find_tree(empty_tree_id).expect("empty tree");
+        let recent_signature = git2::Signature::new(
+            "Force Release Test",
+            "force-release@example.com",
+            &git2::Time::new(mcp_agent_mail_db::now_micros() / 1_000_000, 0),
+        )
+        .expect("recent signature");
+        repo.commit(
+            Some("HEAD"),
+            &recent_signature,
+            &recent_signature,
+            "recent deletion",
+            &empty_tree,
+            &[&parent],
+        )
+        .expect("recent deletion commit");
+        dir
+    }
+
+    #[test]
+    fn force_release_refuses_recent_filesystem_or_deleted_path_git_activity() {
+        for recent_git in [false, true] {
+            with_serialized_reservations(|| {
+                let workspace = if recent_git {
+                    force_release_recent_deletion_fixture()
+                } else {
+                    let workspace = force_release_history_fixture(0);
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(workspace.path().join("target.rs"))
+                        .expect("reserved file")
+                        .set_modified(SystemTime::now())
+                        .expect("set recent filesystem activity");
+                    workspace
+                };
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let fixture = inactive_force_release_fixture(
+                        &cx,
+                        &pool,
+                        &workspace.path().to_string_lossy(),
+                        "target.rs",
+                    )
+                    .await;
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let error = force_release_file_reservation(
+                        &McpContext::new(cx.clone(), 1),
+                        fixture.project.human_key,
+                        fixture.actor.name,
+                        id,
+                        None,
+                        Some(false),
+                    )
+                    .await
+                    .expect_err("recent activity preserves the live lease");
+                    let data = error.data.expect("refusal data");
+                    assert_eq!(data["error"]["type"], "RESERVATION_ACTIVE");
+                    let expected = if recent_git {
+                        "git_activity_recent"
+                    } else {
+                        "filesystem_activity_recent"
+                    };
+                    assert!(
+                        data["error"]["data"]["stale_reasons"]
+                            .as_array()
+                            .expect("reasons")
+                            .contains(&json!(expected)),
+                        "{data}"
+                    );
+                    assert_force_release_preserves_claim(&cx, &pool, id).await;
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn force_release_refuses_unavailable_workspace_but_releases_expired_lease() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let parent = tempfile::tempdir().expect("parent");
+                let missing = parent.path().join("unavailable");
+                let fixture = inactive_force_release_fixture(
+                    &cx,
+                    &pool,
+                    &missing.to_string_lossy(),
+                    "target.rs",
+                )
+                .await;
+                let id = fixture.reservation.id.expect("reservation id");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let error = force_release_file_reservation(
+                    &ctx,
+                    fixture.project.human_key.clone(),
+                    fixture.actor.name.clone(),
+                    id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect_err("missing workspace cannot prove inactivity");
+                let data = error.data.expect("refusal data");
+                assert_eq!(data["error"]["type"], "RESERVATION_ACTIVE");
+                assert!(
+                    data["error"]["data"]["stale_reasons"]
+                        .as_array()
+                        .expect("reasons")
+                        .contains(&json!("workspace_unavailable"))
+                );
+                assert_force_release_preserves_claim(&cx, &pool, id).await;
+
+                let conn = pool.acquire(&cx).await.into_result().expect("expire connection");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = 1 WHERE id = ?",
+                    &[SqlValue::BigInt(id)],
+                )
+                .expect("expire lease");
+                drop(conn);
+                let response = force_release_file_reservation(
+                    &ctx,
+                    fixture.project.human_key,
+                    fixture.actor.name,
+                    id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("expiry does not require workspace activity");
+                let response: Value = serde_json::from_str(&response).expect("response JSON");
+                assert_eq!(response["released"], 1);
+                assert!(
+                    response["reservation"]["stale_reasons"]
+                        .as_array()
+                        .expect("expiry reasons")
+                        .contains(&json!("lease_expired"))
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_refuses_incomplete_deep_history() {
+        with_serialized_reservations(|| {
+            let workspace = force_release_history_fixture(1_001);
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let fixture = inactive_force_release_fixture(
+                    &cx,
+                    &pool,
+                    &workspace.path().to_string_lossy(),
+                    "target.rs",
+                )
+                .await;
+                let id = fixture.reservation.id.expect("reservation id");
+                let error = force_release_file_reservation(
+                    &McpContext::new(cx.clone(), 1),
+                    fixture.project.human_key,
+                    fixture.actor.name,
+                    id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect_err("bounded history cannot authorize forced release");
+                let data = error.data.expect("refusal data");
+                assert_eq!(data["error"]["type"], "RESERVATION_ACTIVE");
+                assert!(
+                    data["error"]["data"]["stale_reasons"]
+                        .as_array()
+                        .expect("reasons")
+                        .contains(&json!("git_activity_unknown"))
+                );
+                assert_force_release_preserves_claim(&cx, &pool, id).await;
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_refuses_legacy_patterns_without_unambiguous_activity_scope() {
+        for pattern in [
+            "./",
+            "././",
+            "./   ",
+            ".",
+            "./ .",
+            "src/./",
+            "src//",
+            "//outside/file",
+            " C:/outside/file",
+        ] {
+            with_serialized_reservations(|| {
+                let workspace = tempfile::tempdir().expect("workspace");
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let fixture = inactive_force_release_fixture(
+                        &cx,
+                        &pool,
+                        &workspace.path().to_string_lossy(),
+                        pattern,
+                    )
+                    .await;
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let error = force_release_file_reservation(
+                        &McpContext::new(cx.clone(), 1),
+                        fixture.project.human_key,
+                        fixture.actor.name,
+                        id,
+                        None,
+                        Some(false),
+                    )
+                    .await
+                    .expect_err("an ambiguous legacy path cannot prove inactivity");
+                    let data = error.data.expect("refusal data");
+                    assert_eq!(data["error"]["type"], "RESERVATION_ACTIVE", "{pattern}");
+                    assert!(
+                        data["error"]["data"]["stale_reasons"]
+                            .as_array()
+                            .expect("reasons")
+                            .contains(&json!("filesystem_activity_unknown")),
+                        "{pattern}: {data}"
+                    );
+                    assert_force_release_preserves_claim(&cx, &pool, id).await;
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn force_release_refuses_unavailable_git_authority() {
+        for marker in ["gitdir: absent-git-directory\n", "malformed git marker\n"] {
+            with_serialized_reservations(|| {
+                let workspace = tempfile::tempdir().expect("workspace");
+                std::fs::write(workspace.path().join(".git"), marker).expect("broken Git fixture");
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let fixture = inactive_force_release_fixture(
+                        &cx,
+                        &pool,
+                        &workspace.path().to_string_lossy(),
+                        "missing.rs",
+                    )
+                    .await;
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let error = force_release_file_reservation(
+                        &McpContext::new(cx.clone(), 1),
+                        fixture.project.human_key,
+                        fixture.actor.name,
+                        id,
+                        None,
+                        Some(false),
+                    )
+                    .await
+                    .expect_err("an unreadable repository is not a non-Git workspace");
+                    let data = error.data.expect("refusal data");
+                    assert_eq!(data["error"]["type"], "RESERVATION_ACTIVE");
+                    assert!(
+                        data["error"]["data"]["stale_reasons"]
+                            .as_array()
+                            .expect("reasons")
+                            .contains(&json!("git_activity_unknown"))
+                    );
+                    assert_force_release_preserves_claim(&cx, &pool, id).await;
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn force_release_refuses_unexpired_missing_holder() {
+        with_serialized_reservations(|| {
+            let workspace = tempfile::tempdir().expect("workspace");
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let fixture = inactive_force_release_fixture(
+                    &cx,
+                    &pool,
+                    &workspace.path().to_string_lossy(),
+                    "missing.rs",
+                )
+                .await;
+                let id = fixture.reservation.id.expect("reservation id");
+                let holder_id = fixture.holder.id.expect("holder id");
+                let conn = pool.acquire(&cx).await.into_result().expect("orphan connection");
+                conn.execute_sync(
+                    "DELETE FROM agents WHERE id = ?",
+                    &[SqlValue::BigInt(holder_id)],
+                )
+                .expect("remove holder identity");
+                // Mirror the legacy orphan fixture below without expiring it.
+                conn.execute_sync(
+                    "INSERT OR REPLACE INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                     VALUES (?, ?, ?, 'missing.rs', 1, 'orphan activity unknown', ?, ?, NULL)",
+                    &[
+                        SqlValue::BigInt(id),
+                        SqlValue::BigInt(fixture.project.id.expect("project id")),
+                        SqlValue::BigInt(holder_id),
+                        SqlValue::BigInt(fixture.reservation.created_ts),
+                        SqlValue::BigInt(fixture.reservation.expires_ts),
+                    ],
+                )
+                .expect("restore unexpired orphaned reservation");
+                drop(conn);
+                let error = force_release_file_reservation(
+                    &McpContext::new(cx.clone(), 1),
+                    fixture.project.human_key,
+                    fixture.actor.name,
+                    id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect_err("unknown holder does not authorize stealing a live lease");
+                let data = error.data.expect("refusal data");
+                assert_eq!(data["error"]["type"], "RESERVATION_ACTIVE");
+                assert!(
+                    data["error"]["data"]["stale_reasons"]
+                        .as_array()
+                        .expect("reasons")
+                        .contains(&json!("agent_missing"))
+                );
+                assert_force_release_preserves_claim(&cx, &pool, id).await;
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_allows_proven_inactivity_including_reaper_exempt_holder() {
+        for (has_git, reaper_exempt) in [(true, false), (true, true), (false, false)] {
+            with_serialized_reservations(|| {
+                let workspace = if has_git {
+                    force_release_history_fixture(0)
+                } else {
+                    tempfile::tempdir().expect("non-Git workspace")
+                };
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let fixture = inactive_force_release_fixture(
+                        &cx,
+                        &pool,
+                        &workspace.path().to_string_lossy(),
+                        "target.rs",
+                    )
+                    .await;
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let conn = pool.acquire(&cx).await.into_result().expect("fixture connection");
+                    conn.execute_sync(
+                        "UPDATE agents SET reaper_exempt = ? WHERE id = ?",
+                        &[
+                            SqlValue::BigInt(i64::from(reaper_exempt)),
+                            SqlValue::BigInt(fixture.holder.id.expect("holder id")),
+                        ],
+                    )
+                    .expect("set reaper-only exemption");
+                    drop(conn);
+                    if reaper_exempt {
+                        let candidate = queries::StaleReservationCandidate {
+                            reservation: fixture.reservation.clone(),
+                            agent_last_active_ts: fixture.holder.last_active_ts,
+                            last_mail_activity_ts: None,
+                        };
+                        let automatic = queries::release_stale_reservations(
+                            &cx,
+                            &pool,
+                            fixture.project.id.expect("project id"),
+                            &[candidate],
+                            mcp_agent_mail_db::now_micros(),
+                            1_800_000_000,
+                            900_000_000,
+                        )
+                        .await
+                        .into_result()
+                        .expect("automatic reaper respects exemption");
+                        assert!(automatic.is_empty());
+                        assert_force_release_preserves_claim(&cx, &pool, id).await;
+                    }
+                    let response = force_release_file_reservation(
+                        &McpContext::new(cx.clone(), 1),
+                        fixture.project.human_key,
+                        fixture.actor.name,
+                        id,
+                        None,
+                        Some(false),
+                    )
+                    .await
+                    .expect("complete old activity permits explicit release");
+                    let response: Value = serde_json::from_str(&response).expect("response JSON");
+                    assert_eq!(response["released"], 1, "{response}");
+                    let rows = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                        .await
+                        .into_result()
+                        .expect("released lease");
+                    assert!(rows[0].released_ts.is_some_and(|ts| ts > 0));
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn force_release_revalidates_activity_and_cancellation_after_probe() {
+        for change in [
+            "heartbeat",
+            "send",
+            "read",
+            "ack",
+            "renewal",
+            "reacquisition",
+            "cancel",
+        ] {
+            with_serialized_reservations(|| {
+                let workspace = tempfile::tempdir().expect("workspace");
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let fixture = inactive_force_release_fixture(
+                        &cx,
+                        &pool,
+                        &workspace.path().to_string_lossy(),
+                        "not-created-yet.rs",
+                    )
+                    .await;
+                    let project_id = fixture.project.id.expect("project id");
+                    let holder_id = fixture.holder.id.expect("holder id");
+                    let actor_id = fixture.actor.id.expect("actor id");
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let message = queries::create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project_id,
+                        actor_id,
+                        "Pending work",
+                        "Read or acknowledge after the activity probe.",
+                        None,
+                        "normal",
+                        true,
+                        "[]",
+                        &[(holder_id, "to")],
+                    )
+                    .await
+                    .into_result()
+                    .expect("seed unread delivery");
+                    let message_id = message.id.expect("message id");
+                    assert_eq!(
+                        queries::get_agent_last_mail_activity(&cx, &pool, holder_id, project_id)
+                            .await
+                            .into_result()
+                            .expect("initial mail evidence"),
+                        None,
+                        "unread incoming mail is not holder activity"
+                    );
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let competing_cx = cx.clone();
+                    let competing_ctx = ctx.clone();
+                    let competing_pool = get_db_pool().expect("competing connection pool");
+                    AFTER_FORCE_RELEASE_ACTIVITY.with_borrow_mut(|hook| {
+                        *hook = Some(Box::pin(async move {
+                            match change {
+                                "heartbeat" => {
+                                    let conn = competing_pool
+                                        .acquire(&competing_cx)
+                                        .await
+                                        .into_result()
+                                        .expect("heartbeat connection");
+                                    conn.execute_sync(
+                                        "UPDATE agents SET last_active_ts = ? WHERE id = ?",
+                                        &[
+                                            SqlValue::BigInt(mcp_agent_mail_db::now_micros()),
+                                            SqlValue::BigInt(holder_id),
+                                        ],
+                                    )
+                                    .expect("commit competing heartbeat");
+                                }
+                                "send" => {
+                                    queries::create_message_with_recipients(
+                                        &competing_cx,
+                                        &competing_pool,
+                                        project_id,
+                                        holder_id,
+                                        "Still working",
+                                        "Committed after the probe.",
+                                        None,
+                                        "normal",
+                                        false,
+                                        "[]",
+                                        &[(actor_id, "to")],
+                                    )
+                                    .await
+                                    .into_result()
+                                    .expect("commit competing send");
+                                }
+                                "read" => {
+                                    queries::mark_message_read(
+                                        &competing_cx,
+                                        &competing_pool,
+                                        holder_id,
+                                        message_id,
+                                    )
+                                    .await
+                                    .into_result()
+                                    .expect("commit competing read");
+                                }
+                                "ack" => {
+                                    queries::acknowledge_message(
+                                        &competing_cx,
+                                        &competing_pool,
+                                        holder_id,
+                                        message_id,
+                                    )
+                                    .await
+                                    .into_result()
+                                    .expect("commit competing acknowledgement");
+                                }
+                                "renewal" => {
+                                    let renewed = queries::renew_reservations(
+                                        &competing_cx,
+                                        &competing_pool,
+                                        project_id,
+                                        holder_id,
+                                        7200,
+                                        None,
+                                        Some(&[id]),
+                                    )
+                                    .await
+                                    .into_result()
+                                    .expect("commit competing renewal");
+                                    assert_eq!(renewed.len(), 1);
+                                }
+                                "reacquisition" => {
+                                    let conn = competing_pool
+                                        .acquire(&competing_cx)
+                                        .await
+                                        .into_result()
+                                        .expect("replacement lease connection");
+                                    conn.execute_sync(
+                                        "UPDATE file_reservations SET created_ts = ?, reason = 'new work' WHERE id = ?",
+                                        &[
+                                            SqlValue::BigInt(mcp_agent_mail_db::now_micros()),
+                                            SqlValue::BigInt(id),
+                                        ],
+                                    )
+                                    .expect("replace observed lease identity without changing expiry");
+                                }
+                                "cancel" => {
+                                    competing_ctx.request_cancellation().cancel();
+                                }
+                                _ => unreachable!("known competing action"),
+                            }
+                        }));
+                    });
+                    let error = force_release_file_reservation(
+                        &ctx,
+                        fixture.project.human_key,
+                        fixture.actor.name,
+                        id,
+                        None,
+                        Some(false),
+                    )
+                    .await
+                    .expect_err("new evidence must prevent release");
+                    assert!(AFTER_FORCE_RELEASE_ACTIVITY.with_borrow(Option::is_none));
+                    if change == "cancel" {
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    } else {
+                        assert_eq!(
+                            error.data.expect("conflict data")["error"]["type"],
+                            "CONFLICT",
+                            "{change}"
+                        );
+                    }
+                    assert_force_release_preserves_claim(&cx, &pool, id).await;
+                });
+            });
+        }
     }
 
     #[test]

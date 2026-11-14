@@ -16496,6 +16496,7 @@ struct StaleReservationReleaseGuard<'a> {
     observed_at: i64,
     inactivity_us: i64,
     grace_us: i64,
+    respect_reaper_exemption: bool,
 }
 
 fn release_reservation_chunk_plan(
@@ -17118,7 +17119,7 @@ async fn stale_reservation_activity_still_matches(
         Err(error) => return Outcome::Err(error),
     };
     if project_id != candidate.reservation.project_id
-        || reaper_exempt != 0
+        || (guard.respect_reaper_exemption && reaper_exempt != 0)
         || last_active_ts != candidate.agent_last_active_ts
         || guard.observed_at.saturating_sub(last_active_ts) <= guard.inactivity_us
     {
@@ -17163,6 +17164,61 @@ pub async fn release_stale_reservations(
     inactivity_us: i64,
     grace_us: i64,
 ) -> Outcome<Vec<i64>, DbError> {
+    release_observed_stale_reservations(
+        cx,
+        pool,
+        project_id,
+        candidates,
+        observed_at,
+        inactivity_us,
+        grace_us,
+        true,
+    )
+    .await
+}
+
+/// Manually force-release an unexpired lease only if its observed inactivity
+/// still holds in the release transaction. Unlike automatic cleanup, an
+/// explicit force-release does not use the holder's reaper exemption. Exact
+/// lease identity, heartbeat and mail/read/ack evidence remain mandatory.
+pub async fn force_release_stale_reservation(
+    cx: &Cx,
+    pool: &DbPool,
+    candidate: &StaleReservationCandidate,
+    observed_at: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+) -> Outcome<usize, DbError> {
+    match release_observed_stale_reservations(
+        cx,
+        pool,
+        candidate.reservation.project_id,
+        std::slice::from_ref(candidate),
+        observed_at,
+        inactivity_us,
+        grace_us,
+        false,
+    )
+    .await
+    {
+        Outcome::Ok(released) => Outcome::Ok(released.len()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn release_observed_stale_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    candidates: &[StaleReservationCandidate],
+    observed_at: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+    respect_reaper_exemption: bool,
+) -> Outcome<Vec<i64>, DbError> {
     if inactivity_us < 0 || grace_us < 0 {
         return Outcome::Err(DbError::InvalidArgument {
             field: "stale reservation thresholds",
@@ -17174,6 +17230,7 @@ pub async fn release_stale_reservations(
         observed_at,
         inactivity_us,
         grace_us,
+        respect_reaper_exemption,
     };
     let mut ids = Vec::with_capacity(candidates.len());
     for candidate in candidates {
