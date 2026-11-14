@@ -1,5 +1,49 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 quarantine destination review — EmeraldEagle, 15:55 UTC
+
+- [x] Reread both recovery repairs and their callers/delegates; no regression
+  established in rejected-stage cleanup. Continue owned br-cxsgx's helper gap.
+- [x] Identify missing destination-parent validation and source-parent sync
+  when the general quarantine helper moves a family between directories.
+- [x] Execute old-source controls: valid cross-directory family move plus
+  destination symlink and directory-swap refusals; use pool_impl::tests names.
+  Run b4be5512-3b6b-4dac-986d-cc022e6faed9 executes 3: 1 PASS / 2 FAIL,
+  4048 skipped, 0.107s, 10m32s compilation. Both guards wrongly return
+  Ok(Some) on old code; the valid cross-directory move passes.
+- [x] Validate both parents before mutations, preserve cross-directory moves,
+  and sync both parents when distinct. Keep original collision/rollback rules.
+  Unix syncs retained directory descriptors and attempts both even when one
+  fails, preserving all errors. Existing non-Unix directory-sync policy stays.
+  Parent-check failures between family moves stop further mutation; directory
+  identity is checked again before returning the quarantine path.
+- [x] Execute all 17 predeclared native cases (prior 14 plus three new
+  controls). Run b82d3048-d315-4528-92d8-5a4030325830: 17 PASS, 4034
+  skipped, 1.777s, 11m12s compilation on vmi1293453. The first Nextest
+  report contains exactly all 17 unique required pool_impl::tests names.
+- [x] Check workspace/all-targets: exit 0 / Cargo 2m00s.
+- [x] Check production workspace/lib+bins: exit 0 / Cargo 1m48s.
+- [x] Run strict workspace/all-target Clippy: exit 0 / Cargo 2m21s.
+- [x] Check workspace formatting: exit 0. Preserve earlier formatting
+  failures and the subsequent manual corrections.
+- [x] Scan the complete changed pool.rs: UBS exit 0, status ok, no failed
+  modules, critical 0 / warning 5135 / info 2423. Warnings remain visible.
+- [x] Bind final checks to pool SHA-256 063d110922c93b1a626253ef7e036f867
+  58211d5cde2d1ef3cca4ff3bf2be4f5 (joined), unchanged lock/toolchain, base
+  1a73b835 and strict RCH overlay 3d43206d. Earlier c07dcc59 checks remain
+  earlier-input evidence: its sync implementation short-circuited after
+  destination failure; the final implementation attempts both syncs.
+- [x] Reread final code, delegates and callers. Preserve collision,
+  companion and rollback controls. This is selected Linux/root component
+  evidence, not full-workspace tests, native Windows/macOS, physical crash
+  qualification or closure of every pathname race. Keep br-cxsgx's original
+  all-path acceptance and in_progress status.
+- [x] Record final scoped Bead evidence (comment 4390), flush exports,
+  verify no cycles
+  and preserve all peer tracker records; prepare one coherent publication.
+  Publication and owned-lease release receipts belong to the final handoff
+  in /data/tmp/am-archive-reader-20261110.t7ueMuTt/review-audit.md.
+
 ## November 14 rejected-stage cleanup review — EmeraldEagle, 14:15 UTC
 
 - [x] Reread the published installer/source-build/receipt/workflow changes;
@@ -28,9 +72,10 @@
   Earlier pool19deea46/overlaye248ea9f: all-target0/Cargo2m00s, production0,
   fmt0, full-file UBS0 with critical0/warning5097/info2389, no failed modules.
   Production Cargo1m43s and strict workspace Clippy0 on the same frozen input.
-  Actual native bodies remain outstanding; no relabelled proof. The existing
-  helper witnesses identity starting at cleanup admission; complete original
-  all-path publication acceptance remains open. No native-platform claim.
+  That earlier input has no native bodies recorded; do not relabel its proof.
+  The existing helper witnesses identity starting at cleanup admission;
+  complete original all-path publication acceptance remains open. No
+  native-platform claim.
   Final pool9f19ae4f/overlay32e7aad0 after rollback correction: all-target0/
   Cargo1m58s, production0/1m51s, strict Clippy0/2m55s, fmt0, complete pool.rs UBS0
   with critical0/warning5099/info2390 and no failed modules. Earlier passes

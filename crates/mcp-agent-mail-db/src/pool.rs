@@ -18458,6 +18458,8 @@ where
 
     let parent_anchor =
         AnchoredRecoveryParent::capture(candidate_path, "quarantine reconstruction candidate")?;
+    let destination_anchor =
+        AnchoredRecoveryParent::capture(primary_path, "quarantine reconstruction destination")?;
     let candidate_witness = if is_real_file(candidate_path) {
         Some(
             SqliteFileWitness::capture_regular(candidate_path).map_err(|error| {
@@ -18479,6 +18481,7 @@ where
         }
         before_move(&candidate);
         parent_anchor.verify_unchanged("quarantine reconstruction candidate")?;
+        destination_anchor.verify_parent_only("quarantine reconstruction destination")?;
         if let Some(ref witness) = candidate_witness {
             let current = SqliteFileWitness::capture_regular(candidate_path).map_err(|error| {
                 SqlError::Custom(format!(
@@ -18545,6 +18548,17 @@ where
     let mut completed_moves = Vec::with_capacity(planned_moves.len() + 1);
     completed_moves.push((candidate_path.to_path_buf(), quarantined.clone()));
     for (source, target) in planned_moves {
+        parent_anchor
+            .verify_parent_only("quarantine reconstruction candidate")
+            .and_then(|()| {
+                destination_anchor.verify_parent_only("quarantine reconstruction destination")
+            })
+            .map_err(|error| {
+                SqlError::Custom(format!(
+                    "quarantine of reconstructed SQLite family at {} is incomplete because a parent directory changed; prior artifacts are preserved without further moves: {error}",
+                    quarantined.display()
+                ))
+            })?;
         if let Err(error) = rename_noreplace_preserving_source(&source, &target) {
             let rollback = rollback_quarantined_candidate_moves(&completed_moves);
             return Err(SqlError::Custom(match rollback {
@@ -18580,12 +18594,37 @@ where
             ),
         }));
     }
-    sync_recovery_parent(&quarantined).map_err(|error| {
-        SqlError::Custom(format!(
-            "quarantined reconstructed SQLite family at {} but could not sync its parent directory: {error}",
-            quarantined.display()
-        ))
-    })?;
+    #[cfg(unix)]
+    let parent_syncs = [
+        destination_anchor.sync_parent("quarantine reconstruction destination"),
+        if AnchoredRecoveryParent::same_inode(
+            &parent_anchor.parent_stat,
+            &destination_anchor.parent_stat,
+        ) {
+            Ok(())
+        } else {
+            parent_anchor.sync_parent("quarantine reconstruction source")
+        },
+    ];
+    #[cfg(not(unix))]
+    let parent_syncs = [
+        sync_recovery_parent(&quarantined),
+        sync_recovery_parent(candidate_path),
+    ];
+    let sync_errors: Vec<_> = parent_syncs
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect();
+    if !sync_errors.is_empty() {
+        return Err(SqlError::Custom(format!(
+            "quarantined reconstructed SQLite family at {} but could not sync its source and destination parent directories: {}",
+            quarantined.display(),
+            sync_errors.join("; ")
+        )));
+    }
+    parent_anchor.verify_parent_only("quarantine reconstruction candidate")?;
+    destination_anchor.verify_parent_only("quarantine reconstruction destination")?;
     Ok(Some(quarantined))
 }
 
@@ -33983,6 +34022,121 @@ mod tests {
                 .join("test.db.reconstruct-failed-20260218_120000_000-01")
         );
         assert_eq!(std::fs::read(&quarantined).unwrap(), b"new-candidate");
+    }
+
+    #[test]
+    fn quarantine_reconstruction_candidate_moves_family_between_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let candidate = source.join("candidate.sqlite3");
+        let certificate = sqlite_sidecar_path(&candidate, "-wal-cert");
+        let primary = destination.join("live.sqlite3");
+        std::fs::write(&candidate, b"candidate-main").unwrap();
+        std::fs::write(&certificate, b"candidate-certificate").unwrap();
+        std::fs::write(&primary, b"live-main").unwrap();
+
+        let quarantined = quarantine_reconstruction_candidate_path(
+            &candidate,
+            &primary,
+            "reconstruct-failed",
+            "20261114_160000_000",
+        )
+        .unwrap()
+        .expect("quarantine family across directories");
+
+        assert_eq!(
+            quarantined,
+            destination.join("live.sqlite3.reconstruct-failed-20261114_160000_000")
+        );
+        assert_eq!(std::fs::read(&quarantined).unwrap(), b"candidate-main");
+        assert_eq!(
+            std::fs::read(sqlite_sidecar_path(&quarantined, "-wal-cert")).unwrap(),
+            b"candidate-certificate"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live-main");
+        assert!(!path_is_occupied(&candidate));
+        assert!(!path_is_occupied(&certificate));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_reconstruction_candidate_refuses_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("candidate.sqlite3");
+        let foreign = dir.path().join("foreign");
+        let linked = dir.path().join("linked");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(&candidate, b"candidate-main").unwrap();
+        std::fs::write(foreign.join("sentinel"), b"foreign-evidence").unwrap();
+        symlink(&foreign, &linked).unwrap();
+
+        let result = quarantine_reconstruction_candidate_path(
+            &candidate,
+            &linked.join("live.sqlite3"),
+            "reconstruct-failed",
+            "20261114_160000_000",
+        );
+
+        assert!(
+            result.is_err(),
+            "destination symlink must be refused: {result:?}"
+        );
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"candidate-main");
+        assert_eq!(
+            std::fs::read(foreign.join("sentinel")).unwrap(),
+            b"foreign-evidence"
+        );
+        assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 1);
+        assert_eq!(std::fs::read_link(&linked).unwrap(), foreign);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_reconstruction_candidate_refuses_destination_parent_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        let foreign = dir.path().join("foreign");
+        let parked = dir.path().join("parked");
+        for parent in [&source, &destination, &foreign] {
+            std::fs::create_dir(parent).unwrap();
+        }
+        let candidate = source.join("candidate.sqlite3");
+        let primary = destination.join("live.sqlite3");
+        std::fs::write(&candidate, b"candidate-main").unwrap();
+        std::fs::write(&primary, b"live-main").unwrap();
+        std::fs::write(foreign.join("sentinel"), b"foreign-evidence").unwrap();
+
+        let result = quarantine_reconstruction_candidate_path_with_hook(
+            &candidate,
+            &primary,
+            "reconstruct-failed",
+            "20261114_160000_000",
+            |_| {
+                std::fs::rename(&destination, &parked).unwrap();
+                std::fs::rename(&foreign, &destination).unwrap();
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "destination swap must be refused: {result:?}"
+        );
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"candidate-main");
+        assert_eq!(
+            std::fs::read(parked.join("live.sqlite3")).unwrap(),
+            b"live-main"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("sentinel")).unwrap(),
+            b"foreign-evidence"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
     }
 
     #[test]
