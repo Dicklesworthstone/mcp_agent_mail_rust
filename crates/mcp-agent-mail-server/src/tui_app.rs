@@ -2527,8 +2527,16 @@ impl MailAppModel {
                 ));
                 Cmd::none()
             }
-            "compose_result" => {
-                self.notify_compose_result(arg == "ok", context);
+            "compose_result" | "quick_reply_result" => {
+                if arg == "pending" {
+                    self.notifications.notify(
+                        Toast::new(context)
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(4)),
+                    );
+                } else {
+                    self.notify_compose_result(arg == "ok", context);
+                }
                 Cmd::none()
             }
             "reservation_create_result" => {
@@ -5068,6 +5076,30 @@ impl Model for MailAppModel {
                 // screen or bring the operator back to the old screen.
                 if let Some(origin) = self.screen_manager.existing_mut(screen) {
                     origin.handle_operator_result(&operation, &result);
+                }
+                // Forms retain their own pending request identity and their
+                // existing success/error presentation. A completed reservation
+                // request with conflicts must still produce a warning.
+                if operation.starts_with("reservation_create:") {
+                    match result {
+                        Ok(result) => self.notify_reservation_create_result(
+                            if result.data["status"] == "warn" {
+                                "warn"
+                            } else {
+                                "ok"
+                            },
+                            &result.summary,
+                        ),
+                        Err(error) => self.notify_reservation_create_result("error", &error),
+                    }
+                    return Cmd::none();
+                }
+                if operation.starts_with("compose:") || operation.starts_with("quick_reply:") {
+                    match result {
+                        Ok(result) => self.notify_compose_result(true, &result.summary),
+                        Err(error) => self.notify_compose_result(false, &error),
+                    }
+                    return Cmd::none();
                 }
                 self.record_action_outcome(match result {
                     Ok(result) => ActionOutcome::Success {
@@ -14596,6 +14628,80 @@ first body
         assert_eq!(model.action_outcomes.iter().filter(|outcome| {
             matches!(outcome, ActionOutcome::InFlight { operation } if operation == "summarize")
         }).count(), 1);
+    }
+
+    #[test]
+    fn completed_forms_preserve_conflict_and_failure_notifications_after_navigation() {
+        use crate::tui_screens::OperatorTaskResult;
+
+        let cases = [
+            (
+                MailScreenId::Reservations,
+                "reservation_create:11",
+                Ok(OperatorTaskResult {
+                    summary: "1 granted, 1 conflicts".to_string(),
+                    data: serde_json::json!({ "status": "warn" }),
+                }),
+                ToastIcon::Warning,
+                "Reservation created with conflicts: 1 granted, 1 conflicts",
+            ),
+            (
+                MailScreenId::Reservations,
+                "reservation_create:12",
+                Err("holder was deregistered".to_string()),
+                ToastIcon::Error,
+                "Reservation create failed: holder was deregistered",
+            ),
+            (
+                MailScreenId::Messages,
+                "compose:13",
+                Ok(OperatorTaskResult {
+                    summary: "to BlueLake".to_string(),
+                    data: serde_json::Value::Null,
+                }),
+                ToastIcon::Info,
+                "Message sent: to BlueLake",
+            ),
+            (
+                MailScreenId::Messages,
+                "quick_reply:14",
+                Err("recipient is no longer active".to_string()),
+                ToastIcon::Error,
+                "Message send failed: recipient is no longer active",
+            ),
+        ];
+        for (screen, operation, result, icon, message) in cases {
+            let mut model = test_model();
+            // Completion must remain visible without bringing the operator
+            // back to the form's screen.
+            assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+            model.update(MailMsg::Screen(MailScreenMsg::OperatorCompleted {
+                screen,
+                operation: operation.to_string(),
+                result,
+            }));
+            model.notifications.tick(Duration::from_millis(16));
+            assert!(
+                model.notifications.visible().iter().any(|toast| {
+                    toast.content.message == message && toast.content.icon == Some(icon)
+                }),
+                "missing notification for {operation}"
+            );
+            assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        }
+    }
+
+    #[test]
+    fn dismissing_a_pending_send_reports_that_it_continues() {
+        for operation in ["compose_result:pending", "quick_reply_result:pending"] {
+            let mut model = test_model();
+            let message = "Draft dismissed; the send continues in the background";
+            model.dispatch_execute_operation(operation, message);
+            model.notifications.tick(Duration::from_millis(16));
+            assert!(model.notifications.visible().iter().any(|toast| {
+                toast.content.message == message && toast.content.icon == Some(ToastIcon::Info)
+            }));
+        }
     }
 
     #[test]

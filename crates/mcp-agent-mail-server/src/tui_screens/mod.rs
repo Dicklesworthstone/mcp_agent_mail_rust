@@ -105,6 +105,53 @@ pub struct OperatorTaskResult {
     pub data: serde_json::Value,
 }
 
+/// Admission for one submitted form. A dropped, unstarted command releases
+/// the form; a started command stays pending until its completion is handled.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingOperatorTask {
+    request_id: u64,
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PendingOperatorTask {
+    pub(crate) fn new(request_id: u64) -> (Self, OperatorTaskStartGuard) {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard = OperatorTaskStartGuard {
+            queued: Some(std::sync::Arc::clone(&active)),
+        };
+        (Self { request_id, active }, guard)
+    }
+
+    pub(crate) const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Move this guard into the task closure before enqueueing it, then call
+/// `started` as its first instruction. This distinguishes a discarded task
+/// from a write whose result is still on its way to the UI.
+pub(crate) struct OperatorTaskStartGuard {
+    queued: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl OperatorTaskStartGuard {
+    pub(crate) fn started(&mut self) {
+        drop(self.queued.take());
+    }
+}
+
+impl Drop for OperatorTaskStartGuard {
+    fn drop(&mut self) {
+        if let Some(active) = self.queued.take() {
+            active.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Run blocking operator work on the TUI runtime's task executor. The task
 /// owns its target identity; completion is delivered to the originating
 /// screen even when the operator has navigated elsewhere in the meantime.
@@ -799,6 +846,46 @@ mod tests {
             result
                 .unwrap_err()
                 .contains("check mailbox state before retrying")
+        );
+    }
+
+    #[test]
+    fn a_dropped_operator_command_releases_form_admission() {
+        let (pending, mut guard) = PendingOperatorTask::new(7);
+        let cmd = operator_task(MailScreenId::Messages, "compose:7", move || {
+            guard.started();
+            Ok(OperatorTaskResult {
+                summary: "sent".to_string(),
+                data: serde_json::Value::Null,
+            })
+        });
+        assert_eq!(pending.request_id(), 7);
+        assert!(pending.is_active());
+        drop(cmd);
+        assert!(
+            !pending.is_active(),
+            "a rejected command must allow form retry"
+        );
+    }
+
+    #[test]
+    fn a_started_operator_command_stays_pending_until_completion_is_delivered() {
+        let (pending, mut guard) = PendingOperatorTask::new(8);
+        let cmd = operator_task(MailScreenId::Messages, "compose:8", move || {
+            guard.started();
+            Err("send failed".to_string())
+        });
+        let Cmd::Task(_, run) = cmd else {
+            panic!("operator task");
+        };
+        let completion = run();
+        assert!(matches!(
+            completion,
+            MailScreenMsg::OperatorCompleted { result: Err(_), .. }
+        ));
+        assert!(
+            pending.is_active(),
+            "do not admit another submit ahead of the queued result"
         );
     }
 
