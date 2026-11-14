@@ -171,8 +171,7 @@ impl DbErrorClass {
 /// Operator guidance for an unreadable commit-certificate family (GH#387).
 /// Listing backups is diagnostic only; it neither opens the mailbox nor
 /// authorizes restoring an older generation over uncheckpointed commits.
-pub const WAL_CERTIFICATE_RECOVERY_GUIDANCE: &str =
-    "Keep the database and its -wal, -shm, -wal-cert, and -wal-cert-head files intact \
+pub const WAL_CERTIFICATE_RECOVERY_GUIDANCE: &str = "Keep the database and its -wal, -shm, -wal-cert, and -wal-cert-head files intact \
      for recovery from a preserved copy. Do not delete or truncate certificate sidecars: \
      they may carry proof of committed WAL data. Automatic repair/reconstruction is \
      not authorized by this failure. Run `am doctor backups --json` to inventory existing \
@@ -1716,12 +1715,10 @@ mod tests {
             "checkpoint handoff is invalid: certificate record footer length mismatch",
             "sidecar has no valid append boundary within its bounded 262292-byte recovery suffix",
         ] {
-            let message = format!(
-                "Connection error: WAL file is corrupt: parallel WAL certificate {detail}"
-            );
+            let message =
+                format!("Connection error: WAL file is corrupt: parallel WAL certificate {detail}");
             for wrapped in [message.clone(), format!("internal error: {message}")] {
-                let classification =
-                    assert_class(&wrapped, DbErrorClass::WalCertificateCorruption);
+                let classification = assert_class(&wrapped, DbErrorClass::WalCertificateCorruption);
                 assert_eq!(classification.severity, DbErrorSeverity::P1);
                 assert!(!classification.repairable, "{wrapped}");
                 assert!(!classification.safe_to_retry, "{wrapped}");
@@ -1785,7 +1782,10 @@ mod tests {
         let certificate = "WAL file is corrupt: parallel WAL certificate suffix does not start at a record boundary";
         for (other, expected) in [
             ("database is locked", DbErrorClass::BusyRetryable),
-            ("Too many open files (os error 24)", DbErrorClass::FdExhaustion),
+            (
+                "Too many open files (os error 24)",
+                DbErrorClass::FdExhaustion,
+            ),
             ("QueuePool limit reached", DbErrorClass::PoolExhaustion),
             ("database or disk is full", DbErrorClass::HostPressure),
             (

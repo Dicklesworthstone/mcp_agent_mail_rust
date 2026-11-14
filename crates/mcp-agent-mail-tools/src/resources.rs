@@ -12390,7 +12390,10 @@ mod resource_shape_tests {
                 let data = error.data.as_ref().expect("structured database error");
                 assert_eq!(data["error"]["type"], "DATABASE_ERROR");
                 assert!(error.message.contains("read-only sqlite source not found"));
-                assert!(!db_path.exists(), "resource read must not create the live DB");
+                assert!(
+                    !db_path.exists(),
+                    "resource read must not create the live DB"
+                );
                 assert_eq!(
                     std::fs::read(&obstruction).expect("retained archive obstruction"),
                     b"retained directory obstruction"
@@ -12424,7 +12427,10 @@ mod resource_shape_tests {
                 let pool = open_live_resource_read_pool()
                     .expect("unrelated archive must not block the empty resource lane");
                 drop(pool);
-                assert!(!db_path.exists(), "resource read must not create the custom DB");
+                assert!(
+                    !db_path.exists(),
+                    "resource read must not create the custom DB"
+                );
                 assert_eq!(
                     std::fs::read(&obstruction).expect("retained unrelated obstruction"),
                     b"unrelated directory obstruction"

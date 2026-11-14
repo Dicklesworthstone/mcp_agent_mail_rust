@@ -47,8 +47,8 @@ use crate::tui_persist::{
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
 use crate::tui_screens::{
-    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState, operator_result,
-    operator_tool_context,
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, OperatorTaskResult,
+    SelectionState, operator_result, operator_task, operator_tool_context,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2042,7 +2042,12 @@ impl MessageBrowserScreen {
 
     /// Acknowledge (or mark read) each listed message for every one of its
     /// recipients, as the operator.
-    fn receipt_for_recipients(&mut self, ids: &[i64], acknowledge: bool) -> Result<String, String> {
+    fn receipt_for_recipients(
+        &self,
+        ids: &[i64],
+        acknowledge: bool,
+        operation: &str,
+    ) -> Result<Cmd<MailScreenMsg>, String> {
         if ids.is_empty() {
             return Err("no message selected".to_string());
         }
@@ -2055,76 +2060,86 @@ impl MessageBrowserScreen {
                 .ok_or_else(|| format!("message #{id} is no longer listed"))?;
             selected.push((id, entry.project_slug.clone()));
         }
-        // Display names can come from a stale snapshot or a live event. A
-        // project address also names a delivery, not an agent. Resolve every
-        // selected message against the live mailbox before the first write.
-        // Drop the read connection before entering any tool's write admission.
-        let plans = {
-            self.verify_receipt_mailbox_source()?;
-            let conn = Self::open_live_recipient_connection(None)?;
-            with_message_delivery_snapshot(&conn, || {
-                selected
-                    .iter()
-                    .map(|(id, project)| message_receipt_targets(&conn, *id, project))
-                    .collect::<Result<Vec<_>, _>>()
-            })?
-        };
-        let ctx = operator_tool_context();
-        let mut receipts = 0_usize;
-        // A later recipient may become unavailable after earlier writes have
-        // succeeded. Refresh after that partial result as well as on success.
-        self.search_dirty = true;
-        self.debounce_remaining = 0;
-        for plan in plans {
-            let id = plan.message_id;
-            for agent in plan.recipients {
-                let project = plan.project_key.clone();
-                let result = if acknowledge {
-                    block_on(mcp_agent_mail_tools::messaging::acknowledge_message(
-                        &ctx,
-                        project,
-                        agent.clone(),
-                        id,
-                        None,
-                    ))
-                } else {
-                    block_on(mcp_agent_mail_tools::messaging::mark_message_read(
-                        &ctx,
-                        project,
-                        agent.clone(),
-                        id,
-                    ))
-                };
-                result.map_err(|err| format!("#{id} for {agent}: {err}"))?;
-                receipts += 1;
-            }
-        }
-        // Re-query so the list shows the new read and ack state.
-        self.search_dirty = true;
-        self.debounce_remaining = 0;
-        let verb = if acknowledge {
-            "acknowledged"
-        } else {
-            "marked read"
-        };
-        Ok(match ids {
-            [id] => format!("#{id} {verb} for {receipts} recipient(s)"),
-            _ => format!(
-                "{} messages {verb} ({receipts} recipient receipts)",
-                ids.len()
-            ),
-        })
-    }
-
-    fn verify_receipt_mailbox_source(&self) -> Result<(), String> {
         if self._db_snapshot_dir.is_some() {
             return Err(
                 "These messages come from an archive snapshot whose message IDs may differ from the live mailbox; recover the live mailbox and refresh before recording receipts".to_string(),
             );
         }
-        let Some((database_url, storage_root)) = &self.mailbox_source else {
+        let Some(mailbox_source) = self.mailbox_source.clone() else {
             return Err("Cannot verify the mailbox behind the displayed messages; refresh before recording receipts".to_string());
         };
+
+        Ok(operator_task(
+            MailScreenId::Messages,
+            operation,
+            move || {
+                // Configuration may have changed while this task was queued.
+                // Display names and snapshot-local IDs never authorize writes.
+                Self::verify_receipt_mailbox_source(&mailbox_source)?;
+                // Resolve every selected delivery before the first write, then
+                // drop the read connection before entering tool write admission.
+                let plans = {
+                    let conn = Self::open_live_recipient_connection(None)?;
+                    with_message_delivery_snapshot(&conn, || {
+                        selected
+                            .iter()
+                            .map(|(id, project)| message_receipt_targets(&conn, *id, project))
+                            .collect::<Result<Vec<_>, _>>()
+                    })?
+                };
+                let ctx = operator_tool_context();
+                let mut receipts = 0_usize;
+                for plan in plans {
+                    let id = plan.message_id;
+                    for agent in plan.recipients {
+                        let project = plan.project_key.clone();
+                        let result = if acknowledge {
+                            block_on(mcp_agent_mail_tools::messaging::acknowledge_message(
+                                &ctx,
+                                project,
+                                agent.clone(),
+                                id,
+                                None,
+                            ))
+                        } else {
+                            block_on(mcp_agent_mail_tools::messaging::mark_message_read(
+                                &ctx,
+                                project,
+                                agent.clone(),
+                                id,
+                            ))
+                        };
+                        result.map_err(|err| {
+                            format!(
+                                "#{id} for {agent}: {err} ({receipts} receipt(s) already recorded)"
+                            )
+                        })?;
+                        receipts += 1;
+                    }
+                }
+                let verb = if acknowledge {
+                    "acknowledged"
+                } else {
+                    "marked read"
+                };
+                let summary = match selected.as_slice() {
+                    [(id, _)] => format!("#{id} {verb} for {receipts} recipient(s)"),
+                    _ => format!(
+                        "{} messages {verb} ({receipts} recipient receipts)",
+                        selected.len()
+                    ),
+                };
+                Ok(OperatorTaskResult {
+                    summary,
+                    data: serde_json::Value::Null,
+                })
+            },
+        ))
+    }
+
+    fn verify_receipt_mailbox_source(
+        (database_url, storage_root): &(String, PathBuf),
+    ) -> Result<(), String> {
         let config = Self::runtime_config_from_state(None);
         let displayed = crate::resolve_server_database_url_sqlite_path(database_url);
         let current = crate::resolve_server_database_url_sqlite_path(&config.database_url);
@@ -3874,8 +3889,24 @@ impl MailScreen for MessageBrowserScreen {
             }
             _ => return Cmd::None,
         };
-        let result = self.receipt_for_recipients(&ids, name.ends_with("acknowledge"));
-        operator_result(name, result)
+        self.receipt_for_recipients(&ids, name.ends_with("acknowledge"), name)
+            .unwrap_or_else(|error| operator_result(name, Err(error)))
+    }
+
+    fn handle_operator_result(
+        &mut self,
+        operation: &str,
+        _result: &Result<OperatorTaskResult, String>,
+    ) {
+        if matches!(
+            operation,
+            "acknowledge" | "mark_read" | "batch_acknowledge" | "batch_mark_read"
+        ) {
+            // A failed later recipient does not undo earlier writes. Refresh
+            // on either outcome, including when this screen is inactive.
+            self.search_dirty = true;
+            self.debounce_remaining = 0;
+        }
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
@@ -10779,9 +10810,17 @@ first body
         })
     }
 
+    fn complete_message_action(
+        screen: &mut MessageBrowserScreen,
+        operation: &str,
+    ) -> (String, String, String) {
+        let cmd = screen.handle_action(operation, "");
+        crate::tui_screens::complete_operator_task(screen, cmd)
+    }
+
     #[test]
     fn action_menu_message_receipts_reach_the_mailbox() {
-        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        use crate::tui_screens::seed_operator_test_project;
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug =
                 seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
@@ -10809,8 +10848,18 @@ first body
                 });
             }
 
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action(&format!("acknowledge:{first}"), ""));
+            let cmd = screen.handle_action(&format!("acknowledge:{first}"), "");
+            assert!(matches!(&cmd, Cmd::Task(..)));
+            assert!(
+                receipts(first).iter().all(|r| !r.1 && !r.2),
+                "scheduling an action does not perform the receipt inline"
+            );
+            // The captured first message remains the target while the
+            // operator is free to move to another row and select it.
+            screen.cursor = 1;
+            screen.selected_message_ids.select(untouched);
+            screen.search_dirty = false;
+            let (status, op, text) = crate::tui_screens::complete_operator_task(&mut screen, cmd);
             assert_eq!(
                 (status.as_str(), op.as_str()),
                 ("ok", "acknowledge"),
@@ -10819,11 +10868,14 @@ first body
             assert!(text.contains("2 recipient"), "{text}");
             let acked: Vec<bool> = receipts(first).iter().map(|r| r.2).collect();
             assert_eq!(acked, [true, true], "both recipients acknowledged");
+            assert!(screen.search_dirty, "completion refreshes receipt state");
+            assert_eq!(screen.cursor, 1, "completion preserves navigation");
+            assert!(screen.selected_message_ids.contains(&untouched));
+            screen.clear_message_selection();
 
             screen.selected_message_ids.select(first);
             screen.selected_message_ids.select(second);
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action("batch_mark_read", "batch:"));
+            let (status, op, text) = complete_message_action(&mut screen, "batch_mark_read");
             assert_eq!(
                 (status.as_str(), op.as_str()),
                 ("ok", "batch_mark_read"),
@@ -10848,8 +10900,7 @@ first body
                 "an unselected message is left alone"
             );
 
-            let (status, _, text) =
-                expect_operator_result(screen.handle_action("mark_read:999999", ""));
+            let (status, _, text) = complete_message_action(&mut screen, "mark_read:999999");
             assert_eq!(status, "error");
             assert!(text.contains("no longer listed"), "{text}");
         });
@@ -10930,9 +10981,7 @@ first body
 
     #[test]
     fn shared_message_actions_create_only_eligible_lazy_receipts_and_keep_direct_precedence() {
-        use crate::tui_screens::{
-            expect_operator_result, seed_operator_test_project, with_operator_test_conn,
-        };
+        use crate::tui_screens::{seed_operator_test_project, with_operator_test_conn};
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug =
                 seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
@@ -10975,7 +11024,7 @@ first body
                 });
             }
             let (status, _, text) =
-                expect_operator_result(screen.handle_action(&format!("acknowledge:{shared}"), ""));
+                complete_message_action(&mut screen, &format!("acknowledge:{shared}"));
             assert_eq!(status, "ok", "{text}");
             assert!(text.contains("2 recipient"), "{text}");
             let first = shared_recipient_receipts(shared);
@@ -10985,7 +11034,7 @@ first body
             );
             assert!(first.iter().all(|r| r.1.is_some() && r.2.is_some()));
             let (status, _, text) =
-                expect_operator_result(screen.handle_action(&format!("acknowledge:{shared}"), ""));
+                complete_message_action(&mut screen, &format!("acknowledge:{shared}"));
             assert_eq!(status, "ok", "{text}");
             assert_eq!(
                 shared_recipient_receipts(shared),
@@ -10994,7 +11043,7 @@ first body
             );
 
             let (status, _, text) =
-                expect_operator_result(screen.handle_action(&format!("mark_read:{overlap}"), ""));
+                complete_message_action(&mut screen, &format!("mark_read:{overlap}"));
             assert_eq!(status, "ok", "{text}");
             assert_eq!(
                 recipient_receipts(overlap),
@@ -11021,9 +11070,12 @@ first body
                 )
                 .unwrap();
             });
-            let error = screen
-                .receipt_for_recipients(&[direct, untouched], true)
-                .unwrap_err();
+            screen.selected_message_ids.select(direct);
+            screen.selected_message_ids.select(untouched);
+            screen.search_dirty = false;
+            let (status, _, error) = complete_message_action(&mut screen, "batch_acknowledge");
+            assert_eq!(status, "error");
+            assert!(screen.search_dirty, "failure also refreshes the screen");
             assert!(error.contains("no current eligible recipients"), "{error}");
             assert_eq!(
                 recipient_receipts(direct),
@@ -11039,7 +11091,7 @@ first body
 
     #[test]
     fn message_receipt_actions_refuse_unknown_or_different_mailbox_sources() {
-        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        use crate::tui_screens::seed_operator_test_project;
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug =
                 seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
@@ -11064,7 +11116,7 @@ first body
             ] {
                 screen.mailbox_source = source;
                 let (status, _, text) =
-                    expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                    complete_message_action(&mut screen, &format!("acknowledge:{id}"));
                 assert_eq!(status, "error", "{text}");
                 assert!(text.contains("mailbox"), "{text}");
                 assert_eq!(
@@ -11096,7 +11148,7 @@ first body
                     "a failed rebind invalidates receipt authority"
                 );
                 let (status, _, text) =
-                    expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                    complete_message_action(&mut screen, &format!("acknowledge:{id}"));
                 assert_eq!(status, "error", "{text}");
                 assert!(text.contains("Cannot verify the mailbox"), "{text}");
                 assert!(recipient_receipts(id).iter().all(|r| !r.1 && !r.2));
@@ -11111,7 +11163,7 @@ first body
                 path: snapshot.keep(),
             });
             let (status, _, text) =
-                expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                complete_message_action(&mut screen, &format!("acknowledge:{id}"));
             assert_eq!(status, "error", "{text}");
             assert!(text.contains("archive snapshot"), "{text}");
             assert_eq!(
@@ -11124,7 +11176,7 @@ first body
             );
             screen._db_snapshot_dir = None;
             let (status, _, text) =
-                expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                complete_message_action(&mut screen, &format!("acknowledge:{id}"));
             assert_eq!(status, "ok", "{text}");
             assert!(recipient_receipts(id).iter().all(|r| r.1 && r.2));
         });

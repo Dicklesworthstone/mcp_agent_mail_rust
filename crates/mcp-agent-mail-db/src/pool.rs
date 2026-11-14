@@ -34932,8 +34932,9 @@ mod tests {
                     .expect("obstruct archive directory");
 
                 let before = if existing_primary {
-                    let conn = crate::CanonicalDbConn::open_file(primary.to_string_lossy().as_ref())
-                        .expect("create healthy primary");
+                    let conn =
+                        crate::CanonicalDbConn::open_file(primary.to_string_lossy().as_ref())
+                            .expect("create healthy primary");
                     conn.execute_raw(&crate::schema::init_schema_sql_base())
                         .expect("initialize primary schema");
                     drop(conn);
@@ -34947,7 +34948,11 @@ mod tests {
 
                 let error = reconcile_archive_state_before_init(&primary, &storage_root)
                     .expect_err("a partial inventory must not authorize reconciliation");
-                assert!(error.to_string().contains("archive inventory is incomplete"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("archive inventory is incomplete")
+                );
                 assert!(
                     has_pending_archive_drift(&primary),
                     "incomplete observations must preserve drift for a later retry"
@@ -34958,7 +34963,10 @@ mod tests {
                         before
                     );
                 } else {
-                    assert!(!primary.exists(), "partial archive must not create a primary");
+                    assert!(
+                        !primary.exists(),
+                        "partial archive must not create a primary"
+                    );
                 }
                 assert_eq!(
                     std::fs::read(&obstruction).expect("read retained obstruction"),
