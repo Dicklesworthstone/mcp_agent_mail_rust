@@ -12553,6 +12553,11 @@ fn is_sqlite_corruption_error_message(message: &str) -> bool {
 }
 
 fn is_sqlite_recovery_error_message(message: &str) -> bool {
+    if mcp_agent_mail_db::classify_db_error_message(message).class
+        == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
+    {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     is_sqlite_corruption_error_message(message)
         || lower.contains("out of memory")
@@ -15093,6 +15098,15 @@ where
         Err(error @ CliError::Io(_)) => return Err(error),
         Err(e) => {
             let msg = e.to_string();
+            if mcp_agent_mail_db::classify_db_error_message(&msg).class
+                == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
+            {
+                return Err(CliError::Other(format!(
+                    "database health probe failed for {}: {msg}; {}",
+                    selected_path.display(),
+                    mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE,
+                )));
+            }
             if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
                 probe_error_was_inconclusive = true;
                 false
@@ -15123,6 +15137,15 @@ where
             Err(error @ CliError::Io(_)) => return Err(error),
             Err(e) => {
                 let msg = e.to_string();
+                if mcp_agent_mail_db::classify_db_error_message(&msg).class
+                    == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
+                {
+                    return Err(CliError::Other(format!(
+                        "database health probe failed for absolute fallback {}: {msg}; {}",
+                        absolute_path.display(),
+                        mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE,
+                    )));
+                }
                 if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
                     probe_error_was_inconclusive = true;
                 } else if mcp_agent_mail_db::is_lock_error(&msg) {
@@ -34885,9 +34908,16 @@ fn doctor_require_recoverable_probe_error(error: &CliError) -> CliResult<()> {
         }
         _ => detail.as_str(),
     };
-    if matches!(error, CliError::Io(_))
-        || !mcp_agent_mail_db::classify_db_error_message(classification_detail).repairable
+    let classification = mcp_agent_mail_db::classify_db_error_message(classification_detail);
+    if !matches!(error, CliError::Io(_))
+        && classification.class == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
     {
+        return Err(CliError::Other(format!(
+            "Database probe cannot validate WAL commit certificates: {detail}; {}",
+            mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE,
+        )));
+    }
+    if matches!(error, CliError::Io(_)) || !classification.repairable {
         return Err(CliError::Other(format!(
             "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: {detail}"
         )));

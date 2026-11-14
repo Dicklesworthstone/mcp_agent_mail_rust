@@ -946,6 +946,27 @@ pub mod tool_util {
             DbError::Sqlite(ref message)
             | DbError::Schema(ref message)
             | DbError::Pool(ref message)
+            | DbError::Internal(ref message)
+                if classification.class
+                    == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption =>
+            {
+                legacy_tool_error(
+                    "DATABASE_ERROR",
+                    format!(
+                        "WAL certificate validation failed: {message}. {}",
+                        mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE
+                    ),
+                    false,
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({ "error_detail": message }),
+                    ),
+                )
+            }
+            DbError::Sqlite(ref message)
+            | DbError::Schema(ref message)
+            | DbError::Pool(ref message)
                 if e.is_corruption() =>
             {
                 let message = message.clone();
@@ -1179,6 +1200,27 @@ pub mod tool_util {
                     }),
                 ),
             ),
+            DbError::IntegrityCorruption { message, details }
+                if classification.class
+                    == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption =>
+            {
+                legacy_tool_error(
+                    "DATABASE_ERROR",
+                    format!(
+                        "WAL certificate validation failed: {message}. {}",
+                        mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE
+                    ),
+                    false,
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                            "corruption_details": details,
+                        }),
+                    ),
+                )
+            }
             DbError::IntegrityCorruption { message, details }
                 if classification.class == mcp_agent_mail_db::DbErrorClass::FtsIndexCorruption =>
             {
@@ -3558,6 +3600,39 @@ body
                 counter.load() > before,
                 "main_db_btree_corruption counter should increment on a classified corruption error"
             );
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_preserves_wal_certificate_authority() {
+            let diagnostic = "WAL file is corrupt: parallel WAL certificate suffix does not start at a record boundary";
+            for error in [
+                DbError::Sqlite(diagnostic.into()),
+                DbError::Schema(diagnostic.into()),
+                DbError::Pool(diagnostic.into()),
+                DbError::Internal(format!("internal error: {diagnostic}")),
+                DbError::IntegrityCorruption {
+                    message: "integrity probe failed".into(),
+                    details: vec![diagnostic.into()],
+                },
+            ] {
+                let err = db_error_to_mcp_error(error);
+                let data = err.data.expect("expected data payload");
+                assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+                assert_eq!(data["error"]["recoverable"], false);
+                let classification = &data["error"]["data"]["db_error_classification"];
+                assert_eq!(classification["class"], "wal_certificate_corruption");
+                assert_eq!(classification["repairable"], false);
+                assert_eq!(classification["safe_to_retry"], false);
+                assert_eq!(classification["safe_to_continue_read_only"], false);
+                assert_eq!(classification["blocks_edits"], true);
+                let message = data["error"]["message"].as_str().unwrap();
+                assert!(
+                    message.contains(mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE)
+                );
+                assert!(!message.contains("consider restoring from backup"));
+                assert!(!message.contains("Run 'am doctor repair'"));
+                assert!(data["error"]["data"]["failure_envelope"].is_object());
+            }
         }
 
         #[test]

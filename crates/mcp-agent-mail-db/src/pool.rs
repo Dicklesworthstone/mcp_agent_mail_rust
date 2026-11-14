@@ -8398,6 +8398,13 @@ pub fn is_checkout_validation_failure(message: &str) -> bool {
 
 #[must_use]
 pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
+    // A certificate validation refusal cannot authorize generic recovery,
+    // even when an outer adapter adds the broad "internal error" wrapper.
+    if crate::error::classify_db_error_message(message).class
+        == crate::error::DbErrorClass::WalCertificateCorruption
+    {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     // FrankenSQLite reports coordinator-launch contention with the generic
     // "internal error" prefix. It is a transient busy condition, not evidence
@@ -10768,6 +10775,11 @@ async fn initialize_sqlite_file_once_with_authorities(
 /// restoration or reinitialization.
 #[must_use]
 pub fn is_corruption_error_message(message: &str) -> bool {
+    if crate::error::classify_db_error_message(message).class
+        == crate::error::DbErrorClass::WalCertificateCorruption
+    {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     // NOTE: "wal file too small" intentionally NOT listed here.
     //
@@ -10824,6 +10836,7 @@ pub fn private_copy_integrity_probe_failure_is_verdict(message: &str) -> bool {
             | crate::error::DbErrorClass::PoolExhaustion
             | crate::error::DbErrorClass::BusyRetryable
             | crate::error::DbErrorClass::LiveOwnerNoActivityLock
+            | crate::error::DbErrorClass::WalCertificateCorruption
     )
 }
 

@@ -122,6 +122,7 @@ fn classify_dimension(err_msg: &str) -> Dimension {
         C::BusyRetryable | C::PoolExhaustion | C::LiveOwnerNoActivityLock => Dimension::Lock,
         C::MainDbBtreeCorruption
         | C::WalSidecarCorruption
+        | C::WalCertificateCorruption
         | C::FtsIndexCorruption
         | C::ForeignKeyInconsistency
         | C::EngineProbeLimitation => Dimension::Corruption,
@@ -1366,6 +1367,13 @@ mod tests {
             classify_dimension("database disk image is malformed"),
             Dimension::Corruption
         );
+        let certificate = "WAL file is corrupt: parallel WAL certificate suffix does not start at a record boundary";
+        assert_eq!(classify_dimension(certificate), Dimension::Corruption);
+        // The dimension groups write-path failures; the precise error class
+        // must still distinguish a certificate refusal from main-file damage.
+        let step = StepResult::failed("send_message", certificate.to_string()).to_json();
+        assert_eq!(step["error_class"], "wal_certificate_corruption");
+        assert_eq!(step["dimension"], "corruption");
         assert_eq!(
             classify_dimension("Permission denied (os error 13)"),
             Dimension::Permissions
