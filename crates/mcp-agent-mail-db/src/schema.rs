@@ -7903,12 +7903,12 @@ mod tests {
             rows[1].get_named::<Option<i64>>("released_ts").unwrap(),
             Some(30)
         );
-        assert!(
+        assert_eq!(
             run_specific_migrations(cx, conn, schema_migrations())
                 .await
                 .into_result()
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Vec::<String>::new()
         );
     }
 

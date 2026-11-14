@@ -35034,7 +35034,7 @@ mod tests {
                     .await
                     .into_result()
                     .unwrap();
-            assert!(released.is_empty());
+            assert_eq!(released, Vec::<i64>::new());
             let renewed = renew_reservations(
                 &cx,
                 &pool,

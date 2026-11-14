@@ -1749,9 +1749,12 @@ const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
 const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
 
 #[cfg(test)]
+type DirectPublicationAfterRepairProbeTestHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(test)]
 thread_local! {
     static DIRECT_PUBLICATION_AFTER_REPAIR_PROBE_TEST_HOOK:
-        std::cell::RefCell<Option<Box<dyn FnOnce(bool)>>> =
+        std::cell::RefCell<Option<DirectPublicationAfterRepairProbeTestHook>> =
             const { std::cell::RefCell::new(None) };
 }
 

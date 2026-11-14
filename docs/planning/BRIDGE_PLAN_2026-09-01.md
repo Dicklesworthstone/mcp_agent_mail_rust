@@ -19,18 +19,54 @@
 - [x] Reread error paths, source identity, sidecar naming and restore callers.
   Stop companion moves/rollback through a changed parent; report final sync
   failure. Broader pathname-race and native-platform acceptance stays open.
-- [ ] Execute 29 recovery cases: initial 27 (previous 17 plus legacy family,
+- [x] Execute 29 recovery cases: initial 27 (previous 17 plus legacy family,
   collision, rollback, namespace and restore controls and the new regression)
   plus two existing anchored-rename delegate controls identified on reread.
   Expanded before positive execution; the old-source four-case set stays fixed.
-- [ ] Check workspace/all-targets and production workspace/lib+bins.
-- [ ] Run strict workspace/all-target Clippy and formatting checks.
+  Original-base run 2cf3798f-62c0-4f35-a711-12672e59d5fb passes all 29,
+  4023 skipped, 19.822s after 24m26s compilation. Exact-name census matches.
+  The shared checkout committed the exact repair in 4912fc5d during the run;
+  peer changes through 62d1200a alter reconstruction/schema/query dependencies.
+  Preserve that history and requalify the committed 62d1200a integration;
+  earlier base cca498a9 / overlay 7e83934b results keep their original scope.
+  Committed-62 run 0cfcbd14-ea73-495c-bda4-21797d571045 passes all 29,
+  4040 skipped, 6.878s, 10m51s compilation; exact-name census matches.
+- [x] Check original-input workspace/all-targets: exit 0 / Cargo 11m52s on vmi1156319.
+  Initial vmi1227854 attempt exited 103 before admission; recover its exact
+  wrapper and retain it separately from the successful compiler result.
+- [x] Check original-input production workspace/lib+bins: exit 0 / Cargo 6m21s.
+- [x] Run strict workspace/all-target Clippy: exit 0 / Cargo 2m58s on the
+  same frozen pool b3c3c0dc / strict RCH overlay 7e83934b input. Formatting2=0.
+- [x] Recheck committed 62d1200a: all-targets and production checks pass;
+  strict Clippy reports three incoming test-only lints (exit 101).
+- [x] Preserve the strict gate: name the existing test-hook type and express
+  both empty-vector assertions as equality to the same typed empty vectors.
+  No suppression, expected-value change or recovery-runtime edit; formatting0.
+- [x] Recheck static gates on 62d1200a plus these three test-file edits:
+  all-target0/Cargo2m13s, production0/1m55s, strict Clippy0/2m44s, fmt0.
+  Strict RCH overlay 289154ac binds the three test-only edits; committed
+  native runs use no-overlay receipt fe0d5151. Pool b3c3c0dc is unchanged.
+  Native recovery cases remain bound to the unchanged committed implementation;
+  do not relabel that run as execution of the test-only lint overlay.
+- [x] Execute the two existing lease-revision/migration tests whose assertion
+  spelling changed, using the already-built committed 62d1200a source. Keep
+  their native evidence distinct from compilation of the lint-only overlay.
+  Run 15720f14-eb0a-4fd1-8315-c87a48839a24: 2 PASS / 4067 skipped,
+  6.770s, Cargo1.41s; exact-name census matches. Includes both SQLite engines
+  for migration preservation and the real revision/ABA cleanup path.
 - [x] Scan the whole changed Rust file and retain warning/error counts:
   final UBS2 exit 0, status ok, no failed modules, critical 0 / warning 5147 /
   info 2435. Formatting2 passes; retain the earlier manual-formatting failures.
-- [ ] Bind every result to exact source/lock/toolchain and strict remote receipt;
+  Additional complete-file scans all exit0/statusok/no failed modules:
+  queries critical0/warning4337/info671; schema0/973/107; storage0/5060/1260.
+- [x] Bind every result to exact source/lock/toolchain and strict remote receipt;
   retain initial failures and exclude pending or empty runs from passing claims.
-- [ ] Record scoped Bead progress, preserve original acceptance and peer records,
+  review28-lint-source.sha256 binds all four Rust files and unchanged lock/
+  toolchain; 62d1200a tree a47e3c45, native fe0d5151, static overlay289154ac.
+  Selected Linux component proof; original all-path/platform acceptance stays
+  open on br-cxsgx. No independent verifier or comprehensive release claim.
+- [x] Record scoped Bead progress (final comment 4393), preserve original
+  acceptance and all 2871 peer tracker records,
   export, verify cycles and prepare one coherent publication. Final publication
   and lease-release receipts go in the existing retained review-audit.md.
 
