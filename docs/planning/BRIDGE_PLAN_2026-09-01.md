@@ -11,15 +11,72 @@
   historical startup failures or establish a production startup improvement.
 - [x] Add a real private-file exhausted-pool regression:100ms budget, unchanged
   default acquire timeout, held lease, pending count and committed42 reuse.
-- [ ] Run the old implementation with the new regression and five original
-  initializer/warmup cases; require an actual consequential timing failure.
-- [ ] Fix the pending acquisition deadline using the caller's clock/context;
-  rerun the identical six cases and relevant real HTTP cancellation controls.
-- [ ] Complete required workspace all-target, separate production, strict
-  Clippy, formatting and stock scanner checks on the final source.
-- [ ] Reread the final implementation and callers; update owned .87 with
-  bounded actual evidence, finish the honesty audit, publish scoped changes
-  and release only this pass's exact leases. Keep unmet acceptance open.
+- [x] Run the old implementation with the new regression and five original
+  initializer/warmup cases: actual6 cases,5PASS/1FAIL,4040skipped,15.283s,
+  native100. The new case fails only its intended elapsed assertion:
+  100ms warmup waits10.000669748s, pending0, foreign lease active1 and
+  committed witness42 retained. All five original cases pass on old code;
+  these repeats do not diagnose their historical failures.
+- [x] Retain the actual old test image before reusing its pooled output:
+  ELFeaeb7e1a/150803640bytes at worker122's
+  /data/tmp/am-review22-retained-r_rut4bh/db-tests-old. Stable full hash,
+  all six embedded identities and active36-file source binding are retained.
+  The post-execution input directory is absent; its cause is unproved.
+  Initial collection fails at that missing source after copying the ELF;
+  subsequent collection verifies the existing copy against the pooled image
+  and explicitly claims only the earlier active-source verification.
+- [x] Prepare the pending-acquisition deadline fix using the caller's clock
+  and one absolute deadline. Another session publishes identical source as
+  23109206, explicitly untested. The old input stays frozen on its worker;
+  no native result is inferred from preparing or publishing the correction.
+- [x] Execute all seven predeclared identities on the correction: six DB
+  cases plus unchanged GH374 real HTTP cancellation,7PASS/0FAIL,
+  9655skipped,37.374s. Final default test features unify both selected
+  packages; this is not production-runtime or release qualification.
+  The100ms exhausted-pool call returns in101.500507ms, pending0,
+  foreign lease active1 and committed42 intact. HTTP timeout30018ms,
+  permit drained before lease release, pending0/0, pool1/0/1 and followup
+  reads69/16ms; original eight-message and recipient-state assertions pass.
+- [x] Preserve the three pre-execution queue-timeout103 attempts (two DB,
+  one combined), each0tests. Final combined request uses documented
+  per-request high priority, then actually executes on122 after another
+  fresh healthy probe and unchanged30GiB/10GiB guard. No worker limits,
+  profile, case assertions, source dependencies or deadlines are weakened.
+  The separate cold HTTP preparation is intentionally cancelled before
+  tests: local143, identity-bound remote120 and no surviving native process
+  for its target. Neither cancellations nor refusals earn test credit.
+- [x] Retain final DB ELFa4328008/151229576bytes and server
+  ELF7e4ed4c0/362005080bytes under worker122
+  /data/tmp/am-review22-fixed-i10bi2wi/. Each copy matches its stable
+  producer and required test identities. All37 active source/config hashes
+  match the frozen3a correction, core4314 and nightly908501772. The later
+  input path is absent; only the recorded active-source check is claimed.
+- [x] Workspace all-target check on final pool SHA3a934258: remote0,33m42s
+  including transfer (Cargo33m07s),36 active source hashes match. Preserve
+  Cargo's proc-macro-error2 future-compatibility warning without suppression.
+- [x] Separate production library/binary graph check on the same source:
+  remote0,9m26s including transfer (Cargo8m51s);36 active hashes match.
+- [x] Strict workspace all-target Clippy with the original -D warnings:
+  remote0,33m03s on114 after115's complete disk guard refused another
+  reservation.36 active source hashes match; no limit or policy change.
+- [x] Workspace formatting check: strict remote0,51.0s, same source overlay.
+- [x] Stock changed-pool UBS0:0critical/5090warnings/2384info, no failed
+  modules. Review all18 findings in changed lines: inline-test failure
+  assertions/setup, row indexing and diagnostic output; no suppression.
+- [x] Reread the final implementation, driver path and callers again; no
+  further concrete defect established. Fresh solo review and the corrected
+  seven-case execution complete; original historical failures stay open.
+- [x] Read current installed health without repair: installed/live am0.3.38
+  reports one leaked page (all rows readable) and a146-hour proactive
+  backup. Live RPC retains a failed full check despite a later passed quick
+  check. Vacuum preview is read-only; locks reports active_other_owner/live.
+  Preserve the live owner and data. No failure cause or repair is claimed.
+- [x] Update only owned .87 with bounded evidence and complete the existing
+  honesty audit. This is supporting internal API work, not a production
+  startup improvement, independent verification or release clearance.
+- [x] Prepare scoped tracker/doc publication. Exact subsequent Git ref
+  verification and release of own1818/1819 leases are recorded after
+  execution in /data/tmp/am-archive-reader-20261110.t7ueMuTt/review-audit.md.
 
 ## November 13 fresh startup review — EmeraldEagle, 20:16 UTC
 
