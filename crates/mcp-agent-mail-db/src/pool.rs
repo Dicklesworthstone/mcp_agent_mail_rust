@@ -18325,32 +18325,27 @@ fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
     if !path_is_occupied(candidate) {
         return;
     }
-    let nonce = format!(
-        "rejected-{}",
-        chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
-    );
-    for collision in 0..=9_999 {
-        let quarantine = sqlite_cleanup_quarantine_path(candidate, &nonce, collision);
-        match rename_noreplace_preserving_source(candidate, &quarantine) {
-            Ok(()) => {
-                let _ = sync_recovery_parent(&quarantine);
-                tracing::warn!(
-                    path = %candidate.display(),
-                    quarantine = %quarantine.display(),
-                    "preserved rejected standalone SQLite staging artifact under a quarantine name"
-                );
-                return;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                tracing::warn!(
-                    path = %candidate.display(),
-                    quarantine = %quarantine.display(),
-                    %error,
-                    "failed to quarantine rejected standalone SQLite staging artifact; source remains in place"
-                );
-                return;
-            }
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    match quarantine_reconstruction_candidate_path(
+        candidate,
+        candidate,
+        "cleanup-quarantine-rejected",
+        &timestamp,
+    ) {
+        Ok(Some(quarantine)) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                quarantine = %quarantine.display(),
+                "preserved rejected standalone SQLite staging artifact under a quarantine name"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                %error,
+                "could not confirm durable quarantine of rejected SQLite staging artifact"
+            );
         }
     }
 }
@@ -18504,12 +18499,20 @@ where
                     let moved_ok = SqliteFileWitness::capture_regular(&candidate)
                         .is_ok_and(|observed| witness.same_generation(&observed));
                     if !moved_ok {
-                        let _ = rename_noreplace_preserving_source(&candidate, candidate_path);
-                        let _ = sync_recovery_parent(candidate_path);
-                        return Err(SqlError::Custom(format!(
-                            "reconstructed SQLite candidate {} changed identity or bytes during quarantine; restored raced artifact",
-                            candidate_path.display()
-                        )));
+                        let rollback = rollback_quarantined_candidate_moves(&[(
+                            candidate_path.to_path_buf(),
+                            candidate.clone(),
+                        )]);
+                        return Err(SqlError::Custom(match rollback {
+                            Ok(()) => format!(
+                                "reconstructed SQLite candidate {} changed identity or bytes during quarantine; restored raced artifact",
+                                candidate_path.display()
+                            ),
+                            Err(error) => format!(
+                                "reconstructed SQLite candidate {} changed identity or bytes during quarantine; {error}",
+                                candidate_path.display()
+                            ),
+                        }));
                     }
                 }
                 quarantined_primary = Some(candidate);
@@ -29155,6 +29158,33 @@ mod tests {
             })
             .expect("rejected staged bytes must remain under a quarantine name");
         assert_eq!(std::fs::read(preserved).unwrap(), b"partial staged bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_stage_cleanup_refuses_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dir.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        let staged = foreign.join("storage.sqlite3.restoring");
+        std::fs::write(&staged, b"foreign staged bytes").unwrap();
+        let linked = dir.path().join("linked");
+        symlink(&foreign, &linked).unwrap();
+
+        cleanup_sqlite_candidate_artifact(&linked.join("storage.sqlite3.restoring"));
+
+        assert_eq!(
+            std::fs::read(&staged).expect("foreign stage must remain at its original path"),
+            b"foreign staged bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(&foreign).unwrap().count(),
+            1,
+            "cleanup through a symlinked ancestor must not publish quarantine files"
+        );
+        assert_eq!(std::fs::read_link(&linked).unwrap(), foreign);
     }
 
     #[test]

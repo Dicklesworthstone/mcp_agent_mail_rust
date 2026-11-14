@@ -1,5 +1,47 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 rejected-stage cleanup review — EmeraldEagle, 14:15 UTC
+
+- [x] Reread the published installer/source-build/receipt/workflow changes;
+  no further concrete defect established in that scope. Preserve prior proof.
+- [x] Triage ready Beads and inspect recovery callers; claim br-cxsgx's
+  remaining rejected-stage cleanup path, which follows ancestor symlinks
+  and discards parent-sync errors despite an existing stronger helper.
+- [x] Execute the new real-filesystem symlink-ancestor regression on old code.
+  First invocation4 runs0/4048skipped after70m31s compilation: incorrect
+  module prefix pool::tests. lib.rs compiles pool.rs as pool_impl. Corrected
+  same-source run100 actually executes1FAIL/0PASS/4047skipped in0.01s: the
+  foreign file is missing after cleanup follows the symlink. Retain both
+  receipts; zero execution is no proof. Final14 names use pool_impl::tests.
+- [x] Reuse anchored no-clobber durable quarantine without changing the
+  existing quarantine naming or companion-family preservation behavior.
+- [x] Correct the reused helper's own post-move rollback branch: it ignored
+  both rename and sync failures before claiming restoration. Use the existing
+  rollback routine and report its actual result; no new failure machinery.
+- [x] Execute positive standalone cleanup, companion preservation, collision,
+  identity-swap and relevant recovery integration controls on final source.
+  Final run3ceb0967-8be0-4f23-96ab-5a527f68d9d1 on129 executes14/14PASS,
+  4034skipped,2.507s after10m36s compilation. Exact unique identities match
+  all14 predeclared functions with the corrected pool_impl::tests prefix.
+- [x] Re-read the complete change and callers; run required workspace checks,
+  strict Clippy, formatting and full changed-file UBS without weakening gates.
+  Earlier pool19deea46/overlaye248ea9f: all-target0/Cargo2m00s, production0,
+  fmt0, full-file UBS0 with critical0/warning5097/info2389, no failed modules.
+  Production Cargo1m43s and strict workspace Clippy0 on the same frozen input.
+  Actual native bodies remain outstanding; no relabelled proof. The existing
+  helper witnesses identity starting at cleanup admission; complete original
+  all-path publication acceptance remains open. No native-platform claim.
+  Final pool9f19ae4f/overlay32e7aad0 after rollback correction: all-target0/
+  Cargo1m58s, production0/1m51s, strict Clippy0/2m55s, fmt0, complete pool.rs UBS0
+  with critical0/warning5099/info2390 and no failed modules. Earlier passes
+  remain tied to the earlier input, not silently promoted to final proof.
+- [x] Preserve original acceptance and proof limits; reread both repaired
+  functions, delegates and callers. Keep br-cxsgx in_progress for its complete
+  original all-path publication acceptance; this is selected Linux evidence.
+  Record final native/static/source evidence, preserve tracker records and
+  check cycles/staged diff. Publication/owned-lease release receipts are kept
+  in /data/tmp/am-archive-reader-20261110.t7ueMuTt/review-audit.md at handoff.
+
 ## November 14 source-install dependency wiring — EmeraldEagle, 12:15 UTC
 
 - [x] Reread the last six source diffs and activity/release callers; no new
