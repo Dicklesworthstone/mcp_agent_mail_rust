@@ -323,6 +323,20 @@ struct StoredRecipients {
     bcc: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StoredThreadMetadata {
+    #[serde(default)]
+    reply_to: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ThreadRecipients {
+    names: Vec<String>,
+    /// The Threads screen is an operator view, not an individual inbox.
+    /// Match the thread-list count: unread by at least one direct recipient.
+    is_unread: bool,
+}
+
 const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -427,14 +441,20 @@ struct TreeRowsCache {
     rows: Vec<ThreadTreeRow>,
 }
 
-/// Compute a cheap hash over message IDs/reply structure and collapsed set
-/// to detect when the tree needs rebuilding.
+/// Hash the reply structure and rendered labels so receipt-only changes also
+/// invalidate cached unread markers and acknowledgement badges.
 fn tree_cache_key_hash(messages: &[ThreadMessage], collapsed: &HashSet<i64>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     messages.len().hash(&mut hasher);
     for m in messages {
         m.id.hash(&mut hasher);
         m.reply_to_id.hash(&mut hasher);
+        m.from_agent.hash(&mut hasher);
+        m.subject.hash(&mut hasher);
+        m.timestamp_micros.hash(&mut hasher);
+        m.timestamp_iso.hash(&mut hasher);
+        m.is_unread.hash(&mut hasher);
+        m.ack_required.hash(&mut hasher);
     }
     // Sort collapsed IDs for deterministic hashing.
     let mut sorted: Vec<_> = collapsed.iter().copied().collect();
@@ -556,6 +576,8 @@ pub struct ThreadExplorerScreen {
     last_refresh: Option<Instant>,
     /// Thread ID of the currently loaded detail (avoids redundant queries).
     loaded_thread_id: String,
+    /// A refreshed list can carry receipt changes without a new message.
+    detail_dirty: bool,
     /// Whether we need to re-fetch the thread list.
     list_dirty: bool,
     /// Search/filter text (empty = show all).
@@ -637,6 +659,7 @@ impl ThreadExplorerScreen {
             db_context_unavailable: false,
             last_refresh: None,
             loaded_thread_id: String::new(),
+            detail_dirty: false,
             list_dirty: true,
             filter_text: String::new(),
             last_loaded_filter_text: String::new(),
@@ -689,6 +712,7 @@ impl ThreadExplorerScreen {
     fn clear_detail_state(&mut self, state: Option<&TuiSharedState>) {
         self.detail_messages.clear();
         self.loaded_thread_id.clear();
+        self.detail_dirty = false;
         self.detail_scroll = 0;
         self.total_thread_messages = 0;
         self.loaded_message_count = 0;
@@ -836,7 +860,10 @@ impl ThreadExplorerScreen {
         // a filter, something is wrong with the aggregation pipeline.
         assert_thread_list_cardinality(global_thread_count, self.threads.len(), &self.filter_text);
 
-        // Refresh detail if thread changed
+        // A read/ACK update need not change the message count or newest
+        // timestamp. Reload the selected window after a data-driven list
+        // refresh while preserving its selection, pagination and expansion.
+        self.detail_dirty = true;
         self.refresh_detail_if_needed(Some(state));
         self.emit_thread_list_diagnostic(state, global_thread_count, text_match_count);
     }
@@ -897,6 +924,7 @@ impl ThreadExplorerScreen {
             current_thread_id == self.loaded_thread_id && !self.loaded_thread_id.is_empty();
 
         if preserving_same_thread
+            && !self.detail_dirty
             && self.total_thread_messages == selected_message_count
             && loaded_last_timestamp == selected_last_timestamp
         {
@@ -944,6 +972,7 @@ impl ThreadExplorerScreen {
         let (messages, offset) =
             fetch_thread_messages_paginated(conn, current_thread_id, reload_limit, 0);
         self.detail_messages = messages;
+        self.detail_dirty = false;
         self.loaded_message_count = self.detail_messages.len();
         let current_thread_id = current_thread_id.to_string();
         self.loaded_thread_id.clone_from(&current_thread_id);
@@ -2948,11 +2977,12 @@ fn fetch_thread_messages_paginated(
     // For "load older", we use offset to skip the most recent ones.
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
+         m.ack_required, m.archive_metadata_json, \
          m.sender_id AS raw_sender_id, a_sender.name AS sender_name \
          FROM messages m \
          LEFT JOIN agents a_sender ON a_sender.id = m.sender_id \
          WHERE m.thread_id = ? \
-         ORDER BY m.created_ts DESC \
+         ORDER BY m.created_ts DESC, m.id DESC \
          LIMIT {limit} OFFSET {offset}"
     );
 
@@ -2964,18 +2994,38 @@ fn fetch_thread_messages_paginated(
         .iter()
         .filter_map(|row| row.get_named::<i64>("id").ok())
         .collect();
-    let recipient_map = thread_recipient_names_by_message(conn, &message_ids);
+    let recipient_map = thread_recipients_by_message(conn, &message_ids);
 
     let mut messages: Vec<ThreadMessage> = rows
         .into_iter()
         .filter_map(|row| {
             let created_ts = row.get_named::<i64>("created_ts").ok()?;
             let message_id = row.get_named::<i64>("id").ok()?;
+            // The persisted archive metadata is the exact immediate parent.
+            // Legacy NULL or malformed metadata is unknown, never a reason
+            // to infer a parent from the thread id or drop the message.
+            let reply_to_id = row
+                .get_named::<Option<String>>("archive_metadata_json")
+                .ok()
+                .flatten()
+                .and_then(|raw| {
+                    // Derived structs can deserialize from a sequence too:
+                    // [1] must not manufacture a reply parent. Keep the typed
+                    // parser so duplicate keys and non-integer ids still fail.
+                    if !raw.trim_start().starts_with('{') {
+                        return None;
+                    }
+                    serde_json::from_str::<StoredThreadMetadata>(&raw).ok()
+                })
+                .and_then(|metadata| metadata.reply_to)
+                .filter(|parent| *parent > 0 && *parent != message_id);
+            let recipients = recipient_map.get(&message_id);
             Some(ThreadMessage {
                 id: message_id,
-                reply_to_id: None,
+                reply_to_id,
                 from_agent: read_thread_agent_label(&row, "sender_name", "raw_sender_id"),
-                to_agents: recipient_map.get(&message_id).cloned().unwrap_or_default(),
+                to_agents: recipients
+                    .map_or_else(String::new, |recipients| recipients.names.join(", ")),
                 subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
                 body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
                 timestamp_iso: micros_to_iso(created_ts),
@@ -2984,8 +3034,8 @@ fn fetch_thread_messages_paginated(
                     .get_named::<String>("importance")
                     .ok()
                     .unwrap_or_else(|| "normal".to_string()),
-                is_unread: false,
-                ack_required: false,
+                is_unread: recipients.is_some_and(|recipients| recipients.is_unread),
+                ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
             })
         })
         .collect();
@@ -3002,14 +3052,18 @@ fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<Th
     messages
 }
 
-fn thread_recipient_names_by_message(conn: &DbConn, message_ids: &[i64]) -> HashMap<i64, String> {
+fn thread_recipients_by_message(
+    conn: &DbConn,
+    message_ids: &[i64],
+) -> HashMap<i64, ThreadRecipients> {
     if message_ids.is_empty() {
         return HashMap::new();
     }
 
     let placeholders = vec!["?"; message_ids.len()].join(", ");
     let sql = format!(
-        "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name \
+        "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name, \
+         mr.read_ts IS NULL AS is_unread \
          FROM message_recipients mr \
          LEFT JOIN agents a ON a.id = mr.agent_id \
          WHERE mr.message_id IN ({placeholders}) \
@@ -3021,22 +3075,20 @@ fn thread_recipient_names_by_message(conn: &DbConn, message_ids: &[i64]) -> Hash
         return HashMap::new();
     };
 
-    let mut grouped: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut grouped: HashMap<i64, ThreadRecipients> = HashMap::new();
     for row in rows {
         let Ok(message_id) = row.get_named::<i64>("message_id") else {
             continue;
         };
         let agent_name = read_thread_agent_label(&row, "agent_name", "raw_agent_id");
-        let names = grouped.entry(message_id).or_default();
-        if !names.iter().any(|existing| existing == &agent_name) {
-            names.push(agent_name);
+        let recipients = grouped.entry(message_id).or_default();
+        recipients.is_unread |= row.get_named::<i64>("is_unread").ok().unwrap_or(0) != 0;
+        if !recipients.names.iter().any(|existing| existing == &agent_name) {
+            recipients.names.push(agent_name);
         }
     }
 
     grouped
-        .into_iter()
-        .map(|(message_id, names)| (message_id, names.join(", ")))
-        .collect()
 }
 
 fn read_thread_non_empty_text(row: &Row, value_column: &str) -> Option<String> {
@@ -4212,9 +4264,9 @@ fn build_thread_tree_items(messages: &[ThreadMessage]) -> Vec<crate::tui_widgets
 
     let mut children_by_parent: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
     for message in messages {
-        let parent_id = message
-            .reply_to_id
-            .filter(|candidate| message_by_id.contains_key(candidate));
+        let parent_id = message.reply_to_id.filter(|candidate| {
+            *candidate != message.id && message_by_id.contains_key(candidate)
+        });
         children_by_parent
             .entry(parent_id)
             .or_default()
@@ -4229,8 +4281,8 @@ fn build_thread_tree_items(messages: &[ThreadMessage]) -> Vec<crate::tui_widgets
         });
     }
 
-    let mut recursion_stack = HashSet::new();
-    children_by_parent
+    let mut visited = HashSet::new();
+    let mut roots: Vec<_> = children_by_parent
         .get(&None)
         .map_or_else(Vec::new, |roots| {
             roots
@@ -4240,20 +4292,40 @@ fn build_thread_tree_items(messages: &[ThreadMessage]) -> Vec<crate::tui_widgets
                         *id,
                         &message_by_id,
                         &children_by_parent,
-                        &mut recursion_stack,
+                        &mut visited,
                     )
                 })
                 .collect()
-        })
+        });
+
+    // Imported reply metadata can contain a cycle with no root. Preserve
+    // every message exactly once by opening any unvisited component at its
+    // earliest message, instead of silently hiding the entire conversation.
+    let mut message_ids: Vec<_> = message_by_id.keys().copied().collect();
+    message_ids.sort_by_key(|id| (message_by_id[id].timestamp_micros, *id));
+    for id in message_ids {
+        if let Some(node) =
+            build_thread_tree_item_node(id, &message_by_id, &children_by_parent, &mut visited)
+        {
+            roots.push(node);
+        }
+    }
+    roots.sort_by_key(|node| {
+        (
+            message_by_id[&node.message_id].timestamp_micros,
+            node.message_id,
+        )
+    });
+    roots
 }
 
 fn build_thread_tree_item_node(
     message_id: i64,
     message_by_id: &HashMap<i64, &ThreadMessage>,
     children_by_parent: &HashMap<Option<i64>, Vec<i64>>,
-    recursion_stack: &mut HashSet<i64>,
+    visited: &mut HashSet<i64>,
 ) -> Option<crate::tui_widgets::ThreadTreeItem> {
-    if !recursion_stack.insert(message_id) {
+    if !visited.insert(message_id) {
         return None;
     }
 
@@ -4277,13 +4349,12 @@ fn build_thread_tree_item_node(
                         *child_id,
                         message_by_id,
                         children_by_parent,
-                        recursion_stack,
+                        visited,
                     )
                 })
                 .collect()
         });
 
-    recursion_stack.remove(&message_id);
     Some(node)
 }
 
@@ -4728,6 +4799,73 @@ mod tests {
         assert!(screen.expanded_message_ids.contains(&8));
         assert!(screen.collapsed_tree_ids.contains(&9));
         assert!(!screen.detail_tree_focus);
+    }
+
+    #[test]
+    fn receipt_only_refresh_preserves_window_selection_and_updates_cached_badges() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = ThreadExplorerScreen::new();
+        screen.page_size = 10;
+        screen.db_conn = Some(make_thread_messages_db("thread-receipts", 25));
+        screen.tick(1, &state);
+        screen.load_older_messages(&state);
+        assert_eq!(screen.loaded_message_count, 25);
+
+        screen.detail_cursor = 7;
+        screen.detail_scroll = 4;
+        screen.expanded_message_ids.insert(8);
+        screen.collapsed_tree_ids.insert(9);
+        screen.detail_tree_focus = false;
+        let before = screen.selected_tree_row().expect("selected message");
+        assert_eq!(before.message_id, 8);
+        assert!(before.label.contains("*Sender"));
+        assert!(!before.label.contains("[ACK]"));
+        assert_eq!(screen.threads[0].unread_count, 25);
+        let last_timestamp = screen.threads[0].last_timestamp_micros;
+
+        let conn = screen.db_conn.as_ref().expect("thread database");
+        conn.execute_raw(
+            "UPDATE message_recipients SET read_ts = 100 WHERE message_id = 8; \
+             UPDATE messages SET ack_required = 1 WHERE id = 8;",
+        )
+        .expect("change receipts and flags without adding a message");
+        assert!(state.push_event(crate::tui_events::MailEvent::tool_call_end(
+            "mark_message_read",
+            1,
+            None,
+            1,
+            1.0,
+            Vec::new(),
+            Some("test-proj".to_string()),
+            Some("Receiver".to_string()),
+        )));
+        screen.last_refresh =
+            Instant::now().checked_sub(Duration::from_secs(REFRESH_INTERVAL_SECS + 1));
+        screen.tick(2, &state);
+        assert!(screen.list_dirty, "the receipt event schedules a refresh");
+        screen.tick(3, &state);
+
+        assert_eq!(screen.threads[0].last_timestamp_micros, last_timestamp);
+        assert_eq!(screen.threads[0].unread_count, 24);
+        assert_eq!(screen.total_thread_messages, 25);
+        assert_eq!(screen.loaded_message_count, 25);
+        assert_eq!(
+            screen.detail_messages.first().map(|message| message.id),
+            Some(1)
+        );
+        let selected = screen.selected_message().expect("same selected message");
+        assert_eq!(selected.id, 8);
+        assert!(!selected.is_unread);
+        assert!(selected.ack_required);
+        let after = screen.selected_tree_row().expect("updated cached label");
+        assert!(!after.label.contains("*Sender"));
+        assert!(after.label.contains("[ACK]"));
+        assert_eq!(screen.detail_scroll, 4);
+        assert!(screen.expanded_message_ids.contains(&8));
+        assert!(screen.collapsed_tree_ids.contains(&9));
+        assert!(!screen.detail_tree_focus);
+        assert!(!screen.list_dirty);
+        assert!(!screen.detail_dirty);
     }
 
     #[test]
@@ -5992,6 +6130,188 @@ mod tests {
     }
 
     #[test]
+    fn paginated_fetch_hydrates_reply_tree_and_recipient_state() {
+        let conn = make_thread_messages_db("thread-hydrated", 5);
+        conn.execute_raw(
+            r#"UPDATE message_recipients SET read_ts = 100;
+               INSERT INTO agents (id, name) VALUES (3, 'OtherReader');
+               INSERT INTO message_recipients (message_id, agent_id) VALUES (2, 3);
+               UPDATE message_recipients SET read_ts = NULL WHERE message_id = 4;
+               DELETE FROM message_recipients WHERE message_id = 5;
+               UPDATE messages SET archive_metadata_json = '{}' WHERE id = 1;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1}', ack_required = 1 WHERE id = 2;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":2}', ack_required = 1 WHERE id = 3;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":9999}' WHERE id = 4;"#,
+        )
+        .expect("seed reply metadata and mixed recipient receipts");
+
+        let (messages, _) = fetch_thread_messages_paginated(&conn, "thread-hydrated", 20, 0);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.id,
+                        message.reply_to_id,
+                        message.is_unread,
+                        message.ack_required,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (1, None, false, false),
+                (2, Some(1), true, true),
+                (3, Some(2), false, true),
+                (4, Some(9999), true, false),
+                (5, None, false, false),
+            ]
+        );
+        assert_eq!(messages[1].to_agents, "Receiver, OtherReader");
+        assert!(messages[4].to_agents.is_empty());
+        assert_eq!(
+            unread_counts_by_thread(&conn, &["thread-hydrated".to_string()])
+                .get("thread-hydrated"),
+            Some(&2),
+            "detail flags and the operator-wide thread count must agree"
+        );
+
+        let tree = build_thread_tree_items(&messages);
+        assert_eq!(
+            tree.iter().map(|node| node.message_id).collect::<Vec<_>>(),
+            vec![1, 4, 5],
+            "the missing parent stays visible as a root"
+        );
+        assert_eq!(tree[0].children[0].message_id, 2);
+        assert!(tree[0].children[0].is_unread);
+        assert!(tree[0].children[0].is_ack_required);
+        assert_eq!(tree[0].children[0].children[0].message_id, 3);
+        assert!(!tree[0].children[0].children[0].is_unread);
+        assert!(tree[0].children[0].children[0].is_ack_required);
+    }
+
+    #[test]
+    fn paginated_fetch_preserves_messages_with_unknown_reply_metadata() {
+        // A numeric thread id is not an immediate reply parent.
+        let conn = make_thread_messages_db("1", 22);
+        conn.execute_raw(
+            r#"UPDATE messages SET archive_metadata_json = '{}' WHERE id = 2;
+               UPDATE messages SET archive_metadata_json = 'invalid-json' WHERE id = 3;
+               UPDATE messages SET archive_metadata_json = '[]' WHERE id = 4;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":"1"}' WHERE id = 5;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":-1}' WHERE id = 6;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":0}' WHERE id = 7;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":8}' WHERE id = 8;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1,"extension":{"kept":true}}' WHERE id = 9;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":null}' WHERE id = 10;
+               UPDATE messages SET archive_metadata_json = '[1]' WHERE id = 11;
+               UPDATE messages SET archive_metadata_json = '[[1]]' WHERE id = 12;
+               UPDATE messages SET archive_metadata_json = '1' WHERE id = 13;
+               UPDATE messages SET archive_metadata_json = 'null' WHERE id = 14;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":true}' WHERE id = 15;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1.0}' WHERE id = 16;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":9223372036854775808}' WHERE id = 17;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":-9223372036854775809}' WHERE id = 18;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":{}}' WHERE id = 19;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":[]}' WHERE id = 20;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1,"reply_to":2}' WHERE id = 21;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":1,"reply_to":null}' WHERE id = 22;"#,
+        )
+        .expect("seed legacy and malformed metadata");
+
+        let (messages, _) = fetch_thread_messages_paginated(&conn, "1", 30, 0);
+        assert_eq!(messages.len(), 22, "bad metadata must not hide messages");
+        for message in &messages {
+            assert_eq!(
+                message.reply_to_id,
+                (message.id == 9).then_some(1),
+                "only authoritative positive parent metadata is used for #{}",
+                message.id
+            );
+        }
+        let tree = build_thread_tree_items(&messages);
+        assert_eq!(
+            tree.iter()
+                .map(|node| 1 + count_descendants(node))
+                .sum::<usize>(),
+            22
+        );
+        assert_eq!(tree[0].children[0].message_id, 9);
+    }
+
+    #[test]
+    fn paginated_fetch_timestamp_ties_do_not_duplicate_or_skip_messages() {
+        let conn = make_thread_messages_db("thread-tied", 8);
+        conn.execute_raw("UPDATE messages SET created_ts = 1700000000000000")
+            .expect("give every message the same timestamp");
+
+        let (recent, _) = fetch_thread_messages_paginated(&conn, "thread-tied", 3, 0);
+        let (older, _) = fetch_thread_messages_paginated(&conn, "thread-tied", 3, 3);
+        let (oldest, _) = fetch_thread_messages_paginated(&conn, "thread-tied", 3, 6);
+        assert_eq!(
+            recent.iter().map(|message| message.id).collect::<Vec<_>>(),
+            vec![6, 7, 8]
+        );
+        assert_eq!(
+            older.iter().map(|message| message.id).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            oldest.iter().map(|message| message.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let tree = build_thread_tree_items(
+            &oldest
+                .into_iter()
+                .chain(older)
+                .chain(recent)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            tree.iter().map(|node| node.message_id).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn paginated_reply_parent_reattaches_when_older_messages_load() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let conn = make_thread_messages_db("thread-parent-page", 3);
+        conn.execute_raw(
+            r#"UPDATE messages SET archive_metadata_json = '{"reply_to":1}' WHERE id = 2;
+               UPDATE messages SET archive_metadata_json = '{"reply_to":2}' WHERE id = 3;"#,
+        )
+        .expect("seed reply chain");
+        let mut screen = ThreadExplorerScreen::new();
+        screen.db_conn = Some(conn);
+        screen.page_size = 2;
+        screen.refresh_thread_list(&state);
+        let initial = screen.detail_tree_rows();
+        assert_eq!(
+            initial
+                .iter()
+                .map(|row| (row.message_id, row.depth))
+                .collect::<Vec<_>>(),
+            vec![(2, 0), (3, 1)],
+            "a parent outside the loaded page must not hide its replies"
+        );
+        assert_eq!(screen.selected_message().map(|message| message.id), Some(3));
+
+        screen.load_older_messages(&state);
+        let expanded = screen.detail_tree_rows();
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|row| (row.message_id, row.depth))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2, 1), (3, 2)]
+        );
+        assert_eq!(screen.selected_message().map(|message| message.id), Some(3));
+        assert_eq!(screen.loaded_message_count, 3);
+        assert!(!screen.has_older_messages());
+    }
+
+    #[test]
     fn paginated_fetch_keeps_rows_with_missing_sender_and_recipient_joins() {
         let conn = make_thread_messages_db("thread-orphaned", 1);
         conn.execute_raw("DELETE FROM agents WHERE id IN (1, 2)")
@@ -6105,6 +6425,8 @@ mod tests {
                sender_id INTEGER NOT NULL, \
                project_id INTEGER NOT NULL, \
                thread_id TEXT NOT NULL, \
+               ack_required INTEGER NOT NULL DEFAULT 0, \
+               archive_metadata_json TEXT, \
                recipients_json TEXT NOT NULL DEFAULT '{}'\
              )",
         )
@@ -6112,7 +6434,8 @@ mod tests {
         conn.execute_raw(
             "CREATE TABLE message_recipients (\
                message_id INTEGER NOT NULL, \
-               agent_id INTEGER NOT NULL\
+               agent_id INTEGER NOT NULL, \
+               read_ts INTEGER\
              )",
         )
         .expect("create recipients table");
@@ -6613,14 +6936,21 @@ mod tests {
         b.timestamp_micros = 200;
         b.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
 
-        let tree = build_thread_tree_items(&[a, b]);
-        // Both reference each other; neither has a valid root parent.
-        // The builder should filter invalid parents and not crash.
-        // Since both have reply_to_id pointing to the other, and both exist,
-        // neither will be a root → they go under their respective parents.
-        // But since no root exists, the result depends on the orphan-promotion logic.
-        // Regardless, the function should not infinite-loop or panic.
-        assert!(!tree.is_empty() || tree.is_empty(), "no crash/hang");
+        let tree = build_thread_tree_items(&[b, a]);
+        assert_eq!(tree.len(), 1, "the earliest cyclic message is a root");
+        assert_eq!(tree[0].message_id, 1);
+        assert_eq!(tree[0].children.len(), 1);
+        assert_eq!(tree[0].children[0].message_id, 2);
+        assert!(tree[0].children[0].children.is_empty());
+        assert_eq!(1 + count_descendants(&tree[0]), 2);
+
+        let mut rows = Vec::new();
+        flatten_thread_tree_rows(&tree, &HashSet::from([1]), &mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+            vec![1],
+            "a collapsed descendant must not reappear as another root"
+        );
     }
 
     #[test]
@@ -6631,12 +6961,9 @@ mod tests {
         msg.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
 
         let tree = build_thread_tree_items(&[msg]);
-        // Self-referencing: reply_to_id=1 exists in message_by_id, so it's
-        // not promoted to root. Instead child_by_parent has entry Some(1)->[1]
-        // and no None roots. The tree handles this gracefully.
-        // The recursion_stack prevents infinite recursion.
-        let total: usize = tree.iter().map(|n| 1 + count_descendants(n)).sum();
-        assert!(total <= 1, "at most 1 node, got {total}");
+        assert_eq!(tree.len(), 1, "a self-reference must remain visible");
+        assert_eq!(tree[0].message_id, 1);
+        assert!(tree[0].children.is_empty());
     }
 
     #[test]

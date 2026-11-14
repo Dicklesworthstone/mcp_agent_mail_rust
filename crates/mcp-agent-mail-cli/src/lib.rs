@@ -3669,7 +3669,11 @@ pub enum ServiceCommand {
     /// Remove the service configuration and stop the running service.
     Uninstall,
     /// Check if the service is running, show PID, uptime, and port.
-    Status,
+    Status {
+        /// Emit native supervisor state and TCP reachability as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Tail service logs (journalctl --user on Linux, log show on macOS).
     Logs {
         /// Number of recent log lines to show (default: 50).
@@ -3978,7 +3982,7 @@ fn command_requires_trusted_user_env(command: Option<&Commands>) -> bool {
                 }
                 | Commands::Setup { .. }
                 | Commands::Service {
-                    action: ServiceCommand::Status
+                    action: ServiceCommand::Status { .. }
                         | ServiceCommand::Logs { .. }
                         | ServiceCommand::Restart,
                 }
@@ -45962,7 +45966,7 @@ fn handle_service(action: ServiceCommand) -> CliResult<()> {
             no_auth,
         } => handle_service_install(host, port, no_auth),
         ServiceCommand::Uninstall => handle_service_uninstall(),
-        ServiceCommand::Status => handle_service_status(),
+        ServiceCommand::Status { json } => handle_service_status(json),
         ServiceCommand::Logs { lines, follow } => handle_service_logs(lines, follow),
         ServiceCommand::Restart => handle_service_restart(),
     }
@@ -46554,8 +46558,501 @@ fn service_uninstall_launchd() -> CliResult<()> {
 
 // -- Status -----------------------------------------------------------------
 
-fn handle_service_status() -> CliResult<()> {
+/// Machine-readable native supervisor state. This path never opens the mailbox.
+mod service_status {
+    use super::{CliError, CliResult, ManagedServiceBinding, ServiceBackend};
+    use serde::Serialize;
+
+    #[derive(Debug, Serialize)]
+    struct Report {
+        schema_version: u32,
+        manager: &'static str,
+        service: &'static str,
+        installed: Option<bool>,
+        manager_available: bool,
+        /// The manager's native state, retained when classification is unknown.
+        state: Option<String>,
+        pid: Option<u32>,
+        host: Option<String>,
+        port: Option<u16>,
+        /// A TCP connection only; it does not establish service identity or health.
+        port_reachable: Option<bool>,
+        error: Option<String>,
+    }
+
+    impl Report {
+        fn unknown(manager: &'static str, installed: Option<bool>, error: String) -> Self {
+            Self {
+                schema_version: 1,
+                manager,
+                service: "unknown",
+                // A missing generated config does not exclude a service loaded
+                // from another path when its manager cannot be queried.
+                installed: installed.filter(|present| *present),
+                manager_available: false,
+                state: None,
+                pid: None,
+                host: None,
+                port: None,
+                port_reachable: None,
+                error: Some(error),
+            }
+        }
+
+        fn not_loaded(manager: &'static str, installed: Option<bool>) -> Self {
+            Self {
+                service: match installed {
+                    Some(false) => "not_installed",
+                    Some(true) => "not_loaded",
+                    None => "unknown",
+                },
+                installed,
+                manager_available: true,
+                state: Some("not_loaded".to_string()),
+                error: None,
+                ..Self::unknown(manager, installed, String::new())
+            }
+        }
+
+        fn with_binding(mut self, binding: Option<ManagedServiceBinding>) -> Self {
+            if let Some(binding) = binding {
+                self.port_reachable = Some(super::process_owner_port_reachable(
+                    &binding.host,
+                    binding.port,
+                ));
+                self.host = Some(binding.host);
+                self.port = Some(binding.port);
+            }
+            self
+        }
+    }
+
+    fn configured(path: Option<std::path::PathBuf>) -> Option<bool> {
+        path.and_then(|path| path.try_exists().ok())
+    }
+
+    fn command_error(command: &str, stderr: &str) -> String {
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            format!("{command} did not return usable service state")
+        } else {
+            format!("{command}: {detail}")
+        }
+    }
+
+    fn systemd_report(
+        success: bool,
+        stdout: &str,
+        stderr: &str,
+        installed: Option<bool>,
+    ) -> Report {
+        let mut load_state = None;
+        let mut active_state = None;
+        let mut sub_state = None;
+        let mut pid = None;
+        for line in stdout.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "LoadState" => load_state = Some(value),
+                "ActiveState" => active_state = Some(value),
+                "SubState" => sub_state = Some(value),
+                "MainPID" => pid = value.parse::<u32>().ok().filter(|pid| *pid != 0),
+                _ => {}
+            }
+        }
+
+        // An absent user bus or executable is not evidence of an absent unit.
+        // Some systemctl versions exit nonzero for a missing unit but still
+        // provide the explicit LoadState=not-found property.
+        if load_state == Some("not-found") {
+            return Report::not_loaded("systemd", installed);
+        }
+        if !success || load_state.is_none_or(str::is_empty) {
+            return Report::unknown("systemd", installed, command_error("systemctl", stderr));
+        }
+        let mut report = Report {
+            installed: Some(true),
+            manager_available: true,
+            state: active_state
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            pid,
+            error: None,
+            ..Report::unknown("systemd", installed, String::new())
+        };
+        report.service = match (active_state, sub_state, pid) {
+            (Some("active"), Some("running"), Some(_)) => "running",
+            (Some("inactive"), _, _) | (Some("active"), Some("exited"), _) => "stopped",
+            (Some("failed"), _, _) => "failed",
+            (Some("activating"), _, _) => "starting",
+            (Some("deactivating"), _, _) => "stopping",
+            (Some("reloading"), _, Some(_)) => "reloading",
+            _ => "unknown",
+        };
+        if report.service == "unknown" {
+            report.error = Some(
+                "systemctl returned incomplete or unrecognized service properties".to_string(),
+            );
+        }
+        report
+    }
+
+    /// Read only the service object's own fields. Nested environment, resource
+    /// coalition and endpoint blocks can also contain state or pid entries.
+    fn launchd_fields(stdout: &str) -> (Option<&str>, Option<u32>) {
+        let root_suffix = format!("/{} = {{", super::LAUNCHD_LABEL);
+        let mut depth = 0_usize;
+        let mut state = None;
+        let mut pid = None;
+        for line in stdout.lines() {
+            let line = line.trim();
+            if depth == 0 {
+                if line.ends_with(&root_suffix) {
+                    depth = 1;
+                }
+                continue;
+            }
+            if line == "}" {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            if line.ends_with(" = {") || line.ends_with(" => {") {
+                depth = depth.saturating_add(1);
+                continue;
+            }
+            if depth != 1 {
+                continue;
+            }
+            let Some((key, value)) = line.split_once(" = ") else {
+                continue;
+            };
+            let value = value.trim();
+            match key {
+                "state" if !value.is_empty() => state = Some(value),
+                "pid" => pid = value.parse::<u32>().ok().filter(|pid| *pid != 0),
+                _ => {}
+            }
+        }
+        (state, pid)
+    }
+
+    fn launchd_report(
+        success: bool,
+        stdout: &str,
+        stderr: &str,
+        installed: Option<bool>,
+    ) -> Report {
+        if !success {
+            // A missing GUI domain, denied access or another launchctl error
+            // cannot establish that this specific service is not installed.
+            let missing_service = format!("Could not find service \"{}\"", super::LAUNCHD_LABEL);
+            if stderr.contains(&missing_service) {
+                return Report::not_loaded("launchd", installed);
+            }
+            return Report::unknown("launchd", installed, command_error("launchctl", stderr));
+        }
+
+        let (state, pid) = launchd_fields(stdout);
+        let mut report = Report {
+            installed: Some(true),
+            manager_available: true,
+            state: state.map(str::to_string),
+            pid,
+            error: None,
+            ..Report::unknown("launchd", installed, String::new())
+        };
+        report.service = match (state, pid) {
+            (Some("running"), Some(_)) => "running",
+            (Some("not running" | "waiting" | "exited"), _) => "stopped",
+            (Some("spawn scheduled" | "starting"), _) => "starting",
+            _ => "unknown",
+        };
+        if report.service == "unknown" {
+            report.error =
+                Some("launchctl returned incomplete or unrecognized service state".to_string());
+        }
+        report
+    }
+
+    fn systemd() -> Report {
+        let installed = configured(super::systemd_unit_path());
+        let mut command = std::process::Command::new("systemctl");
+        command.args([
+            "--user",
+            "--no-pager",
+            "--no-ask-password",
+            "show",
+            super::SYSTEMD_UNIT_NAME,
+            "--property=LoadState,ActiveState,SubState,MainPID",
+        ]);
+        command.env("LC_ALL", "C");
+        for (key, value) in super::systemd_user_env_best_effort() {
+            command.env(key, value);
+        }
+        match command.output() {
+            Ok(output) => systemd_report(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                installed,
+            ),
+            Err(error) => Report::unknown("systemd", installed, format!("systemctl: {error}")),
+        }
+    }
+
+    fn launchd() -> Report {
+        let installed = configured(super::launchd_plist_path());
+        let uid = match super::current_uid() {
+            Ok(uid) => uid,
+            Err(error) => {
+                return Report::unknown("launchd", installed, error.to_string());
+            }
+        };
+        match std::process::Command::new("launchctl")
+            .args(["print", &format!("gui/{uid}/{}", super::LAUNCHD_LABEL)])
+            .env("LC_ALL", "C")
+            .output()
+        {
+            Ok(output) => launchd_report(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                installed,
+            ),
+            Err(error) => Report::unknown("launchd", installed, format!("launchctl: {error}")),
+        }
+    }
+
+    pub(super) fn print(backend: ServiceBackend) -> CliResult<()> {
+        let report = match backend {
+            ServiceBackend::Systemd => {
+                systemd().with_binding(super::systemd_service_configured_bind())
+            }
+            ServiceBackend::Launchd => {
+                launchd().with_binding(super::launchd_service_configured_bind())
+            }
+        };
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|error| CliError::Format(format!("serialize service status: {error}")))?;
+        ftui_runtime::ftui_println!("{json}");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use clap::Parser;
+
+        #[test]
+        fn service_status_json_flag_preserves_the_human_default() {
+            for (args, expected) in [
+                (vec!["am", "service", "status"], false),
+                (vec!["am", "service", "status", "--json"], true),
+            ] {
+                let cli = crate::Cli::try_parse_from(args).expect("service status arguments");
+                assert!(!crate::command_requires_trusted_user_env(cli.command.as_ref()));
+                assert!(matches!(
+                    cli.command,
+                    Some(crate::Commands::Service {
+                        action: crate::ServiceCommand::Status { json },
+                    }) if json == expected
+                ));
+            }
+        }
+
+        #[test]
+        fn systemd_named_properties_report_running_stopped_failed_and_missing() {
+            let running = systemd_report(
+                true,
+                "MainPID=8123\nSubState=running\nLoadState=loaded\nActiveState=active\n",
+                "",
+                Some(false),
+            );
+            assert_eq!(running.service, "running");
+            assert_eq!(running.pid, Some(8123));
+            assert_eq!(running.installed, Some(true));
+            assert!(running.manager_available);
+
+            for (active, sub, expected) in [
+                ("inactive", "dead", "stopped"),
+                ("failed", "failed", "failed"),
+                ("activating", "auto-restart", "starting"),
+                ("active", "exited", "stopped"),
+            ] {
+                let report = systemd_report(
+                    true,
+                    &format!("LoadState=loaded\nActiveState={active}\nSubState={sub}\nMainPID=0\n"),
+                    "",
+                    Some(true),
+                );
+                assert_eq!(report.service, expected);
+                assert_eq!(report.pid, None);
+            }
+
+            for (installed, expected) in [
+                (Some(false), "not_installed"),
+                (Some(true), "not_loaded"),
+                (None, "unknown"),
+            ] {
+                let report = systemd_report(
+                    false,
+                    "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n",
+                    "Unit agent-mail.service could not be found.",
+                    installed,
+                );
+                assert_eq!(report.service, expected);
+                assert!(report.manager_available);
+            }
+        }
+
+        #[test]
+        fn unavailable_managers_and_malformed_output_remain_unknown() {
+            for installed in [Some(false), Some(true), None] {
+                let report = systemd_report(
+                    false,
+                    "",
+                    "Failed to connect to user scope bus: No medium found",
+                    installed,
+                );
+                assert_eq!(report.service, "unknown");
+                assert!(!report.manager_available);
+                assert_eq!(report.installed, installed.filter(|present| *present));
+                assert!(report.error.as_deref().unwrap().contains("user scope bus"));
+
+                let report = launchd_report(
+                    false,
+                    "",
+                    "Could not find domain for user gui: 501",
+                    installed,
+                );
+                assert_eq!(report.service, "unknown");
+                assert!(!report.manager_available);
+                assert_eq!(report.installed, installed.filter(|present| *present));
+            }
+            let report = systemd_report(true, "active\nrunning\n8123\n", "", Some(true));
+            assert_eq!(report.service, "unknown");
+            assert_eq!(report.pid, None);
+
+            let report = systemd_report(
+                true,
+                "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=invalid\n",
+                "",
+                Some(true),
+            );
+            assert_eq!(report.service, "unknown");
+            assert_eq!(report.pid, None);
+        }
+
+        #[test]
+        fn launchd_uses_only_top_level_service_state_and_pid() {
+            let text = r#"gui/501/com.agent-mail = {
+    active count = 1
+    environment = {
+        state = running
+        pid = 99999
+        DESCRIPTION => value with { braces }
+    }
+    state = running
+    pid = 8123
+    resource coalition = {
+        state = active
+        pid = 11111
+    }
+}
+"#;
+            let report = launchd_report(true, text, "", Some(false));
+            assert_eq!(report.service, "running");
+            assert_eq!(report.state.as_deref(), Some("running"));
+            assert_eq!(report.pid, Some(8123));
+            assert_eq!(report.installed, Some(true));
+
+            let stopped = r#"gui/501/com.agent-mail = {
+    environment = {
+        state = running
+        pid = 99999
+    }
+    state = not running
+}
+"#;
+            let report = launchd_report(true, stopped, "", Some(true));
+            assert_eq!(report.service, "stopped");
+            assert_eq!(report.pid, None);
+
+            for text in [
+                "gui/501/com.agent-mail = {\n    state = running\n    pid = 0\n}\n",
+                "environment = {\n    state = running\n    pid = 8123\n}\n",
+            ] {
+                let report = launchd_report(true, text, "", Some(true));
+                assert_eq!(report.service, "unknown");
+                assert_eq!(report.pid, None);
+            }
+        }
+
+        #[test]
+        fn launchd_missing_service_is_distinct_from_an_unavailable_manager() {
+            let stderr =
+                "Bad request.\nCould not find service \"com.agent-mail\" in domain for user gui: 501";
+            for (installed, expected) in [
+                (Some(false), "not_installed"),
+                (Some(true), "not_loaded"),
+                (None, "unknown"),
+            ] {
+                let report = launchd_report(false, "", stderr, installed);
+                assert_eq!(report.service, expected);
+                assert!(report.manager_available);
+            }
+            let report = launchd_report(
+                false,
+                "",
+                "Could not find service \"another-service\" in domain for user gui: 501",
+                Some(false),
+            );
+            assert_eq!(report.service, "unknown");
+            assert!(!report.manager_available);
+        }
+
+        #[test]
+        fn loopback_listener_reachability_does_not_establish_service_state() {
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+            let port = listener.local_addr().expect("listener address").port();
+            let report = systemd_report(
+                true,
+                "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\n",
+                "",
+                Some(true),
+            )
+            .with_binding(Some(ManagedServiceBinding {
+                host: "0.0.0.0".to_string(),
+                port,
+            }));
+            assert_eq!(report.service, "stopped");
+            assert_eq!(report.pid, None);
+            assert_eq!(report.port_reachable, Some(true));
+            assert_eq!(report.host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(report.port, Some(port));
+
+            let unknown = Report::unknown("systemd", None, "manager unavailable".to_string())
+                .with_binding(None);
+            let json = serde_json::to_value(&unknown).expect("serialize report");
+            assert_eq!(json["schema_version"], 1);
+            assert_eq!(json["service"], "unknown");
+            assert!(json["pid"].is_null());
+            assert!(json["host"].is_null());
+            assert!(json["port"].is_null());
+            assert!(json["port_reachable"].is_null());
+        }
+    }
+}
+
+fn handle_service_status(json: bool) -> CliResult<()> {
     let backend = detect_service_backend()?;
+    if json {
+        return service_status::print(backend);
+    }
     let result = match backend {
         ServiceBackend::Systemd => service_status_systemd(),
         ServiceBackend::Launchd => service_status_launchd(),
@@ -47164,7 +47661,7 @@ mod tests {
             },
         };
         let service_status = Commands::Service {
-            action: ServiceCommand::Status,
+            action: ServiceCommand::Status { json: false },
         };
         let service_logs = Commands::Service {
             action: ServiceCommand::Logs {

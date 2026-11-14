@@ -104,6 +104,45 @@ use `DB_MAINTENANCE_ENABLED=false`; checks and backups still run. These settings
 take effect when the server starts. Existing service overrides remain an
 operator decision; inspect them before changing a deployment.
 
+### Inspect a managed service from scripts [read-only]
+
+Use the native service manager for a status report that does not open the
+mailbox database or acquire its ownership lock:
+
+```bash
+am service status
+am service status --json
+am service status --json | jq '{service, pid, host, port, port_reachable}'
+```
+
+The JSON command emits one object with `schema_version: 1`. `manager` is
+`systemd` on Linux or `launchd` on macOS. `service` classifies the manager's
+state as `running`, `stopped`, `starting`, `stopping`, `reloading`, `failed`,
+`not_loaded`, `not_installed`, or `unknown`; `state` preserves the native state.
+`installed` is a boolean when installation is established, otherwise `null`.
+`manager_available` distinguishes a usable manager response from an unavailable
+user bus, missing command, or failed query. Inspect `error` when state is unknown.
+An unavailable manager is never reported as a stopped or absent service.
+
+`pid` comes from the native service manager and is `null` when no positive PID
+is known. `host` and `port` come from the generated service configuration;
+both remain `null` when its binding cannot be read. `port_reachable` reports a
+TCP connection probe, or `null` when the binding is unknown. A reachable port
+does not prove that Agent Mail owns the listener or that the mailbox is healthy.
+A stopped service can therefore have `port_reachable: true` if another process
+owns the port.
+
+A produced report exits successfully even when the service is stopped, missing,
+or unknown, so automation should inspect the fields. For example, this requires
+both a running supervisor state and a reachable configured port:
+
+```bash
+am service status --json | jq -e '.service == "running" and .port_reachable == true'
+```
+
+Unsupported platforms and failures to serialize the report remain command
+errors. Without `--json`, the existing human-readable status output is retained.
+
 ### Verify a mailbox before upgrading [read-only]
 
 Use the installed binary and the same `STORAGE_ROOT` and `DATABASE_URL` as
