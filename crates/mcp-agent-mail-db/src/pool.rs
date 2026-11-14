@@ -19721,21 +19721,33 @@ fn quarantine_reconstructed_candidate(
         )));
     }
 
+    let context = "quarantine reconstructed database candidate";
+    let parent_anchor = AnchoredRecoveryParent::capture(primary_path, context)?;
     let quarantined = sqlite_path_with_file_name_suffix(
         primary_path,
         &format!(".{reason}-{timestamp}"),
         &format!("storage.sqlite3.{reason}-{timestamp}"),
     );
-    rename_noreplace_preserving_source(primary_path, &quarantined).map_err(|e| {
-        SqlError::Custom(format!(
-            "failed to quarantine reconstructed database candidate {}: {e}",
-            primary_path.display()
-        ))
-    })?;
+    parent_anchor
+        .quarantine_self_to(&quarantined)
+        .map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to quarantine reconstructed database candidate {} as {}: {e}",
+                primary_path.display(),
+                quarantined.display()
+            ))
+        })?;
 
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        parent_anchor.verify_parent_only(context)?;
         if let Err(e) = quarantine_sidecar_with_label(primary_path, suffix, reason, timestamp) {
             let sidecar_label = sqlite_recovery_sidecar_label(suffix);
+            parent_anchor.verify_parent_only(context).map_err(|parent_error| {
+                SqlError::Custom(format!(
+                    "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}; rollback was not attempted through a changed parent directory: {parent_error}",
+                    primary_path.display()
+                ))
+            })?;
             if let Err(restore_err) = restore_quarantined_primary_with_sidecar_label(
                 primary_path,
                 &quarantined,
@@ -19754,6 +19766,17 @@ fn quarantine_reconstructed_candidate(
         }
     }
 
+    #[cfg(unix)]
+    let parent_sync = parent_anchor.sync_parent(context);
+    #[cfg(not(unix))]
+    let parent_sync = sync_recovery_parent(&quarantined);
+    parent_sync.map_err(|error| {
+        SqlError::Custom(format!(
+            "quarantined reconstructed SQLite family at {} but could not sync its parent directory: {error}",
+            quarantined.display()
+        ))
+    })?;
+    parent_anchor.verify_parent_only(context)?;
     Ok(Some(quarantined))
 }
 
@@ -33886,6 +33909,46 @@ mod tests {
             b"older failed generation",
             "an older failed generation is evidence, not a replaceable temp file"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_reconstructed_candidate_refuses_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dir.path().join("foreign");
+        let linked = dir.path().join("linked");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("mail.sqlite3"), b"foreign-primary").unwrap();
+        std::fs::write(foreign.join("mail.sqlite3-wal"), b"foreign-wal").unwrap();
+        std::fs::write(foreign.join("sentinel"), b"foreign-evidence").unwrap();
+        symlink(&foreign, &linked).unwrap();
+
+        let result = quarantine_reconstructed_candidate(
+            &linked.join("mail.sqlite3"),
+            "20261114_170000_000",
+            "archive-reconcile-restore",
+        );
+
+        assert!(
+            result.is_err(),
+            "symlinked parent must be refused: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("mail.sqlite3")).unwrap(),
+            b"foreign-primary"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("mail.sqlite3-wal")).unwrap(),
+            b"foreign-wal"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("sentinel")).unwrap(),
+            b"foreign-evidence"
+        );
+        assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 3);
+        assert_eq!(std::fs::read_link(&linked).unwrap(), foreign);
     }
 
     #[test]
