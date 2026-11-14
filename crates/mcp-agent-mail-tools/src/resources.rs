@@ -382,13 +382,18 @@ fn resource_live_database_missing_without_archive_state() -> bool {
         return false;
     };
     let resolved_path = PathBuf::from(&resolved.canonical_path);
+    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+        &config.storage_root,
+        &resolved_path,
+    ) {
+        return !resolved_path.exists();
+    }
+
     let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
-    let archive_has_authoritative_state =
-        crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
-            &config.storage_root,
-            &resolved_path,
-        ) && crate::tool_util::read_archive_inventory_has_state(&archive);
-    !resolved_path.exists() && !archive_has_authoritative_state
+    // An unreadable authoritative archive is unknown, not an empty mailbox.
+    !resolved_path.exists()
+        && archive.parse_errors == 0
+        && !crate::tool_util::read_archive_inventory_has_state(&archive)
 }
 
 // Intentionally async despite containing no awaits: this is the resource
@@ -12353,6 +12358,79 @@ mod resource_shape_tests {
                 assert_eq!(agent_count, 0);
             });
         });
+    }
+
+    #[test]
+    fn resources_refuse_incomplete_empty_archive_instead_of_serving_empty_mailbox() {
+        with_serialized_resources(|| {
+            run_async(|cx: Cx| async move {
+                let config = Config::from_env();
+                let db_path = PathBuf::from(
+                    mcp_agent_mail_db::DbPoolConfig::from_env()
+                        .sqlite_path()
+                        .expect("resource fixture sqlite path"),
+                );
+                assert!(!db_path.exists());
+                assert!(resource_live_database_missing_without_archive_state());
+
+                std::fs::create_dir_all(&config.storage_root).expect("create archive root");
+                let obstruction = config.storage_root.join("projects");
+                std::fs::write(&obstruction, b"retained directory obstruction")
+                    .expect("obstruct projects directory");
+                let inventory = crate::tool_util::read_archive_inventory(&config.storage_root);
+                assert_eq!(inventory.projects, 0);
+                assert_eq!(inventory.unique_message_ids, 0);
+                assert_eq!(inventory.parse_errors, 1);
+                assert!(!resource_live_database_missing_without_archive_state());
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let error = projects_list(&ctx)
+                    .await
+                    .expect_err("an incomplete authoritative archive must not appear empty");
+                let data = error.data.as_ref().expect("structured database error");
+                assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+                assert!(error.message.contains("read-only sqlite source not found"));
+                assert!(!db_path.exists(), "resource read must not create the live DB");
+                assert_eq!(
+                    std::fs::read(&obstruction).expect("retained archive obstruction"),
+                    b"retained directory obstruction"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn resources_ignore_incomplete_unrelated_default_archive_for_missing_custom_db() {
+        let _guard = RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("custom.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("DATABASE_URL", database_url.as_str())],
+            |_isolated_default_root| {
+                Config::reset_cached();
+                let storage_root = Config::from_env().storage_root;
+                std::fs::create_dir_all(&storage_root).expect("create unrelated archive root");
+                let obstruction = storage_root.join("projects");
+                std::fs::write(&obstruction, b"unrelated directory obstruction")
+                    .expect("obstruct unrelated projects directory");
+                let inventory = crate::tool_util::read_archive_inventory(&storage_root);
+                assert_eq!(inventory.parse_errors, 1);
+
+                assert!(resource_live_database_missing_without_archive_state());
+                let pool = open_live_resource_read_pool()
+                    .expect("unrelated archive must not block the empty resource lane");
+                drop(pool);
+                assert!(!db_path.exists(), "resource read must not create the custom DB");
+                assert_eq!(
+                    std::fs::read(&obstruction).expect("retained unrelated obstruction"),
+                    b"unrelated directory obstruction"
+                );
+            },
+        );
     }
 
     #[test]

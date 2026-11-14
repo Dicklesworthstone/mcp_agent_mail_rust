@@ -1274,7 +1274,9 @@ pub fn inspect_mailbox_archive_drift(
         || db_latest_id_ahead
         || (!(archive_messages_ahead || archive_latest_id_ahead)
             && (db_projects_ahead || db_agents_ahead));
-    let state = if archive_inventory.projects == 0
+    let state = if archive_inventory.parse_errors != 0 {
+        MailboxArchiveDriftState::Unknown
+    } else if archive_inventory.projects == 0
         && archive_inventory.agents == 0
         && archive_inventory.unique_message_ids == 0
         && db_inventory.projects == 0
@@ -1331,9 +1333,11 @@ pub fn inspect_mailbox_archive_drift(
                 db_inventory.agents,
                 db_inventory.messages
             ),
-            MailboxArchiveDriftState::Skipped | MailboxArchiveDriftState::Unknown => {
-                "Archive drift state unavailable".to_string()
-            }
+            MailboxArchiveDriftState::Unknown => format!(
+                "Archive inventory is incomplete: {} unreadable or malformed artifacts or directory entries; archive/DB drift cannot be established",
+                archive_inventory.parse_errors
+            ),
+            MailboxArchiveDriftState::Skipped => "Archive drift state unavailable".to_string(),
         },
     }
 }
@@ -2413,6 +2417,15 @@ mod tests {
         assert_eq!(archive_ahead.archive_messages, 1);
         assert_eq!(archive_ahead.archive_latest_message_id, Some(7));
         assert_eq!(archive_ahead.db_messages, 0);
+
+        std::fs::write(messages.join("unreadable.md"), "---json\n{broken\n---\n")
+            .expect("retain malformed archive evidence");
+        let incomplete = inspect_mailbox_archive_drift(&db_path, &storage_root);
+        assert_eq!(incomplete.state, MailboxArchiveDriftState::Unknown);
+        assert_eq!(incomplete.archive_messages, 1);
+        assert_eq!(incomplete.db_projects, 1);
+        assert!(incomplete.detail.contains("incomplete"));
+        assert!(incomplete.detail.contains("1"));
 
         let missing = dir.path().join("missing.sqlite3");
         let unavailable = inspect_mailbox_archive_drift(&missing, &storage_root);

@@ -201,6 +201,48 @@ fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
+/// Inventory callers must distinguish an absent optional directory from a
+/// failed walk. Otherwise unreadable archive state looks like an empty, fully
+/// inspected archive and can authorize a partial read or incremental replay.
+fn inventory_directory_entries(
+    path: &Path,
+    required: bool,
+    errors: &mut usize,
+) -> Option<std::fs::ReadDir> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        // Preexisting symlinks are outside the canonical archive traversal.
+        // A discovered directory that becomes a symlink is an incomplete walk.
+        Ok(metadata) if !required && metadata.file_type().is_symlink() => return None,
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return None,
+        Ok(_) | Err(_) => {
+            *errors += 1;
+            return None;
+        }
+    }
+    match std::fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(_) => {
+            *errors += 1;
+            None
+        }
+    }
+}
+
+fn inventory_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+    errors: &mut usize,
+) -> Option<(PathBuf, std::fs::FileType)> {
+    let result = entry.and_then(|entry| entry.file_type().map(|kind| (entry.path(), kind)));
+    match result {
+        Ok(entry) => Some(entry),
+        Err(_) => {
+            *errors += 1;
+            None
+        }
+    }
+}
+
 const DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT: usize = 5;
 const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
 const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -672,7 +714,8 @@ pub struct ArchiveMessageInventory {
     pub duplicate_canonical_message_ids: usize,
     /// Largest positive canonical message id observed in the archive.
     pub latest_message_id: Option<i64>,
-    /// Number of canonical message files that failed JSON frontmatter parsing.
+    /// Number of canonical artifacts or directory entries that could not be
+    /// read or parsed. A nonzero value means this inventory is incomplete.
     pub parse_errors: usize,
 }
 
@@ -1040,22 +1083,21 @@ impl ArchiveDriftReport {
 ///
 /// This is a heavier variant of [`scan_archive_message_inventory`] that retains
 /// the actual ID set instead of only counting unique entries.
+/// The second result counts both file parse failures and incomplete directory
+/// traversal; a nonzero count must not authorize a partial incremental apply.
 #[must_use]
 pub fn scan_archive_message_ids(storage_root: &Path) -> (BTreeSet<i64>, usize) {
     let mut ids = BTreeSet::new();
     let mut parse_errors: usize = 0;
     let projects_dir = storage_root.join("projects");
-    if !is_real_directory(&projects_dir) {
-        return (ids, parse_errors);
-    }
-
-    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+    let Some(project_entries) =
+        inventory_directory_entries(&projects_dir, false, &mut parse_errors)
+    else {
         return (ids, parse_errors);
     };
 
-    for entry in project_entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+    for entry in project_entries {
+        let Some((path, file_type)) = inventory_entry(entry, &mut parse_errors) else {
             continue;
         };
         if !file_type.is_dir() || file_type.is_symlink() {
@@ -1072,20 +1114,15 @@ fn collect_project_archive_message_ids(
     ids: &mut BTreeSet<i64>,
     parse_errors: &mut usize,
 ) {
-    if !is_real_directory(messages_dir) {
-        return;
-    }
-
-    let Ok(year_entries) = std::fs::read_dir(messages_dir) else {
+    let Some(year_entries) = inventory_directory_entries(messages_dir, false, parse_errors) else {
         return;
     };
 
-    for year_entry in year_entries.flatten() {
-        let year_path = year_entry.path();
-        let Ok(year_type) = year_entry.file_type() else {
+    for year_entry in year_entries {
+        let Some((year_path, year_type)) = inventory_entry(year_entry, parse_errors) else {
             continue;
         };
-        if !year_type.is_dir() || year_type.is_symlink() {
+        if year_type.is_symlink() {
             continue;
         }
         let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
@@ -1095,15 +1132,15 @@ fn collect_project_archive_message_ids(
             continue;
         }
 
-        let Ok(month_entries) = std::fs::read_dir(&year_path) else {
+        let Some(month_entries) = inventory_directory_entries(&year_path, true, parse_errors)
+        else {
             continue;
         };
-        for month_entry in month_entries.flatten() {
-            let month_path = month_entry.path();
-            let Ok(month_type) = month_entry.file_type() else {
+        for month_entry in month_entries {
+            let Some((month_path, month_type)) = inventory_entry(month_entry, parse_errors) else {
                 continue;
             };
-            if !month_type.is_dir() || month_type.is_symlink() {
+            if month_type.is_symlink() {
                 continue;
             }
             let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
@@ -1113,12 +1150,12 @@ fn collect_project_archive_message_ids(
                 continue;
             }
 
-            let Ok(file_entries) = std::fs::read_dir(&month_path) else {
+            let Some(file_entries) = inventory_directory_entries(&month_path, true, parse_errors)
+            else {
                 continue;
             };
-            for file_entry in file_entries.flatten() {
-                let file_path = file_entry.path();
-                let Ok(file_type) = file_entry.file_type() else {
+            for file_entry in file_entries {
+                let Some((file_path, file_type)) = inventory_entry(file_entry, parse_errors) else {
                     continue;
                 };
                 if !file_type.is_file()
@@ -1292,12 +1329,18 @@ pub fn compute_archive_drift_report(
     let (archive_ids, archive_parse_errors) = scan_archive_message_ids(storage_root);
     if archive_parse_errors > 0 {
         warnings.push(format!(
-            "{archive_parse_errors} archive message file(s) failed to parse"
+            "{archive_parse_errors} archive message file(s) or directory entries could not be read or parsed"
         ));
     }
 
     // Scan archive for inventory counts (projects, agents, identities).
     let archive_inventory = scan_archive_message_inventory(storage_root);
+    if archive_inventory.parse_errors > 0 {
+        warnings.push(format!(
+            "Archive inventory is incomplete: {} unreadable or malformed artifacts or directory entries",
+            archive_inventory.parse_errors
+        ));
+    }
 
     if db_path.as_os_str() == ":memory:" {
         warnings.push("DB-side drift comparison skipped for in-memory database".to_string());
@@ -1393,20 +1436,17 @@ pub fn collect_db_project_identities(
 pub fn scan_archive_message_inventory(storage_root: &Path) -> ArchiveMessageInventory {
     let mut inventory = ArchiveMessageInventory::default();
     let projects_dir = storage_root.join("projects");
-    if !is_real_directory(&projects_dir) {
-        return inventory;
-    }
-
-    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+    let Some(project_entries) =
+        inventory_directory_entries(&projects_dir, false, &mut inventory.parse_errors)
+    else {
         return inventory;
     };
 
     let mut seen_ids = BTreeSet::new();
     let mut duplicate_ids = BTreeSet::new();
 
-    for entry in project_entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+    for entry in project_entries {
+        let Some((path, file_type)) = inventory_entry(entry, &mut inventory.parse_errors) else {
             continue;
         };
         if !file_type.is_dir() || file_type.is_symlink() {
@@ -1416,7 +1456,7 @@ pub fn scan_archive_message_inventory(storage_root: &Path) -> ArchiveMessageInve
         if let Some(identity) = scan_archive_project_identity(&path) {
             inventory.project_identities.insert(identity);
         }
-        inventory.agents += count_project_archive_agents(&path);
+        inventory.agents += count_project_archive_agents(&path, &mut inventory.parse_errors);
         scan_project_archive_message_inventory(
             &path.join("messages"),
             &mut inventory,
@@ -1454,28 +1494,27 @@ fn scan_archive_project_identity(project_path: &Path) -> Option<MailboxProjectId
     MailboxProjectIdentity::from_parts(fallback_slug, None, None)
 }
 
-fn count_project_archive_agents(project_dir: &Path) -> usize {
+fn count_project_archive_agents(project_dir: &Path, errors: &mut usize) -> usize {
     let agents_dir = project_dir.join("agents");
-    if !is_real_directory(&agents_dir) {
-        return 0;
-    }
-
-    let Ok(agent_entries) = std::fs::read_dir(&agents_dir) else {
+    let Some(agent_entries) = inventory_directory_entries(&agents_dir, false, errors) else {
         return 0;
     };
 
-    agent_entries
-        .flatten()
-        .filter_map(|entry| {
-            let Ok(file_type) = entry.file_type() else {
-                return None;
-            };
-            if !file_type.is_dir() || file_type.is_symlink() {
-                return None;
-            }
-            is_real_file(&entry.path().join("profile.json")).then_some(())
-        })
-        .count()
+    let mut agents = 0;
+    for entry in agent_entries {
+        let Some((path, file_type)) = inventory_entry(entry, errors) else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        match std::fs::symlink_metadata(path.join("profile.json")) {
+            Ok(metadata) => agents += usize::from(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => *errors += 1,
+        }
+    }
+    agents
 }
 
 fn scan_project_archive_message_inventory(
@@ -1484,20 +1523,18 @@ fn scan_project_archive_message_inventory(
     seen_ids: &mut BTreeSet<i64>,
     duplicate_ids: &mut BTreeSet<i64>,
 ) {
-    if !is_real_directory(messages_dir) {
-        return;
-    }
-
-    let Ok(year_entries) = std::fs::read_dir(messages_dir) else {
+    let Some(year_entries) =
+        inventory_directory_entries(messages_dir, false, &mut inventory.parse_errors)
+    else {
         return;
     };
 
-    for year_entry in year_entries.flatten() {
-        let year_path = year_entry.path();
-        let Ok(year_type) = year_entry.file_type() else {
+    for year_entry in year_entries {
+        let Some((year_path, year_type)) = inventory_entry(year_entry, &mut inventory.parse_errors)
+        else {
             continue;
         };
-        if !year_type.is_dir() || year_type.is_symlink() {
+        if year_type.is_symlink() {
             continue;
         }
         let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
@@ -1507,15 +1544,18 @@ fn scan_project_archive_message_inventory(
             continue;
         }
 
-        let Ok(month_entries) = std::fs::read_dir(&year_path) else {
+        let Some(month_entries) =
+            inventory_directory_entries(&year_path, true, &mut inventory.parse_errors)
+        else {
             continue;
         };
-        for month_entry in month_entries.flatten() {
-            let month_path = month_entry.path();
-            let Ok(month_type) = month_entry.file_type() else {
+        for month_entry in month_entries {
+            let Some((month_path, month_type)) =
+                inventory_entry(month_entry, &mut inventory.parse_errors)
+            else {
                 continue;
             };
-            if !month_type.is_dir() || month_type.is_symlink() {
+            if month_type.is_symlink() {
                 continue;
             }
             let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
@@ -1525,12 +1565,15 @@ fn scan_project_archive_message_inventory(
                 continue;
             }
 
-            let Ok(file_entries) = std::fs::read_dir(&month_path) else {
+            let Some(file_entries) =
+                inventory_directory_entries(&month_path, true, &mut inventory.parse_errors)
+            else {
                 continue;
             };
-            for file_entry in file_entries.flatten() {
-                let file_path = file_entry.path();
-                let Ok(file_type) = file_entry.file_type() else {
+            for file_entry in file_entries {
+                let Some((file_path, file_type)) =
+                    inventory_entry(file_entry, &mut inventory.parse_errors)
+                else {
                     continue;
                 };
                 if !file_type.is_file()
@@ -7363,7 +7406,7 @@ pub fn apply_archive_ahead_delta(
     let (archive_ids, archive_parse_errors) = scan_archive_message_ids(storage_root);
     if archive_parse_errors > 0 {
         return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
-            "{archive_parse_errors} archive message file(s) failed to parse; a partial delta must not be applied"
+            "{archive_parse_errors} archive message file(s) or directory entries could not be read or parsed; a partial delta must not be applied"
         )));
     }
     let db_ids = collect_db_message_ids(db_path)
@@ -16055,6 +16098,94 @@ archive body
         let (ids, parse_errors) = scan_archive_message_ids(root);
         assert_eq!(ids, BTreeSet::from([1, 2]));
         assert_eq!(parse_errors, 1);
+    }
+
+    #[test]
+    fn archive_inventory_reports_unreadable_directory_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("archive");
+        let messages = root.join("projects/alpha/messages/2026/11");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(messages.join("one.md"), "---json\n{\"id\":1}\n---\nbody").unwrap();
+        let inaccessible = root.join("projects/beta/messages");
+        std::fs::create_dir_all(inaccessible.parent().unwrap()).unwrap();
+        std::fs::write(&inaccessible, "retained directory obstruction").unwrap();
+
+        let inventory = scan_archive_message_inventory(&root);
+        assert_eq!(inventory.unique_message_ids, 1);
+        assert_eq!(inventory.latest_message_id, Some(1));
+        assert_eq!(inventory.parse_errors, 1, "a partial walk is not complete");
+        let (ids, errors) = scan_archive_message_ids(&root);
+        assert_eq!(ids, BTreeSet::from([1]));
+        assert_eq!(
+            errors, 1,
+            "incremental replay must also refuse a partial walk"
+        );
+        assert_eq!(
+            std::fs::read(&inaccessible).unwrap(),
+            b"retained directory obstruction"
+        );
+
+        // A missing optional directory is a valid empty archive. A pathname
+        // that cannot be traversed is different, even without any visible IDs.
+        let absent = tmp.path().join("missing");
+        assert_eq!(scan_archive_message_inventory(&absent).parse_errors, 0);
+        assert_eq!(scan_archive_message_ids(&absent), (BTreeSet::new(), 0));
+        let not_directory = tmp.path().join("not-a-directory");
+        std::fs::write(&not_directory, b"original").unwrap();
+        assert_eq!(
+            scan_archive_message_inventory(&not_directory).parse_errors,
+            1
+        );
+        assert_eq!(
+            scan_archive_message_ids(&not_directory),
+            (BTreeSet::new(), 1)
+        );
+    }
+
+    #[test]
+    fn archive_inventory_reports_obstructed_agent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("projects/alpha");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("agents"), b"retained agent evidence").unwrap();
+
+        let inventory = scan_archive_message_inventory(tmp.path());
+        assert_eq!(inventory.projects, 1);
+        assert_eq!(inventory.agents, 0);
+        assert_eq!(inventory.parse_errors, 1);
+    }
+
+    #[test]
+    fn archive_inventory_reports_obstructed_canonical_date_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let messages = tmp.path().join("projects/demo/messages");
+        std::fs::create_dir_all(messages.join("2026/11")).unwrap();
+        std::fs::write(
+            messages.join("2026/11/one.md"),
+            "---json\n{\"id\":1}\n---\nbody",
+        )
+        .unwrap();
+        for path in [messages.join("2025"), messages.join("2026/12")] {
+            std::fs::write(path, b"retained canonical directory obstruction").unwrap();
+        }
+        // Unrelated files do not constitute broken canonical date directories.
+        std::fs::write(messages.join("README.md"), b"archive notes").unwrap();
+        std::fs::write(messages.join("2026/notes.txt"), b"month notes").unwrap();
+
+        let inventory = scan_archive_message_inventory(tmp.path());
+        assert_eq!(inventory.unique_message_ids, 1);
+        assert_eq!(inventory.parse_errors, 2);
+        assert_eq!(
+            scan_archive_message_ids(tmp.path()),
+            (BTreeSet::from([1]), 2)
+        );
+        for path in [messages.join("2025"), messages.join("2026/12")] {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                b"retained canonical directory obstruction"
+            );
+        }
     }
 
     #[test]

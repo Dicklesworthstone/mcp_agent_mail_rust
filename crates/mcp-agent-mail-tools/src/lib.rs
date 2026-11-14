@@ -2078,7 +2078,9 @@ pub mod tool_util {
         // uncached behavior on this and subsequent reads.
         let inventory = scan_read_archive_inventory(storage_root);
         // ubs:ignore — archive generation metadata detects concurrent changes; it is not a cryptographic signature.
-        if clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before) {
+        if inventory.parse_errors == 0
+            && clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before)
+        {
             cache_read_archive_inventory(signature_before, &inventory);
         }
         inventory
@@ -2206,6 +2208,12 @@ pub mod tool_util {
             return Ok(false);
         }
 
+        if archive.parse_errors != 0 {
+            return Err(format!(
+                "archive inventory is incomplete: {} unreadable or malformed artifacts or directory entries",
+                archive.parse_errors
+            ));
+        }
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
         }
@@ -3059,6 +3067,34 @@ body
                 "modifying a tracked archive artifact must bypass the cached HEAD"
             );
 
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn read_archive_inventory_does_not_cache_incomplete_scans() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            let malformed = storage_root.join("projects/demo/messages/2026/02/bad.md");
+            std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+            std::fs::write(&malformed, "---json\n{broken\n---\n").unwrap();
+            commit_archive_tree(&repo, "retain malformed archive evidence");
+
+            assert_eq!(read_archive_inventory(&storage_root).parse_errors, 1);
+            assert_eq!(read_archive_inventory(&storage_root).parse_errors, 1);
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                2,
+                "an unchanged archive token does not prove a failed scan is complete"
+            );
+            assert_eq!(read_archive_inventory_cache_len(), 0);
             reset_read_archive_inventory_cache();
         }
 

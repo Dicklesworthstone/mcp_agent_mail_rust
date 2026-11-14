@@ -606,7 +606,7 @@ fn validate_inventory(
 ) -> Result<(), AcquireError> {
     if inventory.parse_errors != 0 {
         return Err(AcquireError::Failed(format!(
-            "archive inventory found {} malformed canonical message artifact(s); refusing partial publication",
+            "archive inventory found {} unreadable or malformed artifacts or directory entries; refusing partial publication",
             inventory.parse_errors
         )));
     }
@@ -800,6 +800,7 @@ fn snapshot_required(
     database_url: &str,
     inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
 ) -> Result<bool, AcquireError> {
+    validate_inventory(inventory)?;
     let archive_has_state = crate::tool_util::read_archive_inventory_has_state(inventory);
     match live_probe(&scope.sqlite_path) {
         Ok(conn) => {
@@ -2176,6 +2177,14 @@ mod tests {
         }
         let cx = Cx::for_testing();
         assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+        let inventory = crate::tool_util::read_archive_inventory(&slot.scope.storage_root);
+        assert!(
+            matches!(
+                snapshot_required(&slot.scope, &database_url, &inventory),
+                Err(AcquireError::Failed(_))
+            ),
+            "the fallback path must not admit a partial archive inventory either"
+        );
         reset_for_test();
 
         // A readable SQLite file with no message table is not a positive Live
