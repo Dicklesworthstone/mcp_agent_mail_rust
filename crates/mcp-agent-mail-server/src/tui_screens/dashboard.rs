@@ -816,6 +816,7 @@ impl DashboardScreen {
         let current_key = self.current_visible_cache_key();
         {
             let prev_key = self.visible_cache_filter_sig.borrow();
+            // ubs:ignore — UI filter cache metadata, not an authentication secret.
             if *prev_key == current_key {
                 // Cache is still valid — filter state unchanged and event data
                 // wasn't modified (bump happens in tick on dirty.events).
@@ -912,6 +913,7 @@ impl DashboardScreen {
                     self.verbosity.label().to_ascii_lowercase()
                 ));
             }
+            // ubs:ignore — public display-filter state, not an authentication secret.
             if type_filters != "none" {
                 active_filters.push(format!("types:{type_filters}"));
             }
@@ -927,6 +929,7 @@ impl DashboardScreen {
         );
         {
             let mut last = self.last_diagnostic_signature.borrow_mut();
+            // ubs:ignore — display diagnostic deduplication, not secret verification.
             if last.as_ref().is_some_and(|prev| prev == &signature) {
                 return;
             }
@@ -975,7 +978,7 @@ impl DashboardScreen {
             out.push(DetectedAnomaly {
                 severity: AnomalySeverity::High,
                 confidence: 0.95,
-                headline: format!("{} messages awaiting acknowledgement", db.ack_pending),
+                headline: format!("{} recipient acknowledgements pending", db.ack_pending),
                 rationale: "High ack backlog may indicate stalled agents".into(),
                 safe_command: Some("am robot inbox --all --ack-overdue".to_string()),
                 evidence: Some(format!(
@@ -987,7 +990,7 @@ impl DashboardScreen {
             out.push(DetectedAnomaly {
                 severity: AnomalySeverity::Medium,
                 confidence: 0.7,
-                headline: format!("{} ack-pending messages", db.ack_pending),
+                headline: format!("{} recipient acknowledgements pending", db.ack_pending),
                 rationale: "Monitor for growing backlog".into(),
                 safe_command: Some("am robot inbox --all --ack-overdue".to_string()),
                 evidence: Some(format!(
