@@ -17178,8 +17178,10 @@ pub async fn release_stale_reservations(
 }
 
 /// Manually force-release an unexpired lease only if its observed inactivity
-/// still holds in the release transaction. Unlike automatic cleanup, an
-/// explicit force-release does not use the holder's reaper exemption. Exact
+/// still holds in the release transaction.
+///
+/// Unlike automatic cleanup, an explicit force-release does not use the
+/// holder's reaper exemption. Exact
 /// lease identity, heartbeat and mail/read/ack evidence remain mandatory.
 pub async fn force_release_stale_reservation(
     cx: &Cx,

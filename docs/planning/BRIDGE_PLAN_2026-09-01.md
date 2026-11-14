@@ -1,5 +1,57 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 nested-directory activity review — EmeraldEagle, 09:30 UTC
+
+- [x] Reread recent changes and their callers; inspect ready Beads and retain
+  the Mac production check on br-bdo5g and peer-owned populated probes.
+- [x] Identify a concrete force-release gap: nested directory renames preserve
+  file mtimes and can evade the directory reservation's inactivity probe.
+- [x] Reproduce with real filesystem timestamps and a real mailbox release;
+  retain the pre-fix failure and unchanged lease/ledger assertions.
+  Native run bcd52cd0-8617-4d3f-b0ee-112b98a72090 actually executes the
+  regression: old scan releases1 and reports filesystem activity in2023 after
+  a fresh nested rename. Expected failure100,1case,0passed,1284skipped.
+- [x] Include descendant directory activity in the existing bounded literal
+  scan, preserving ordinary glob/file semantics and incomplete evidence.
+- [x] Claim the concrete defect as br-epeb7; give intentional private fixture
+  registrations their documented opt-in. Preserve production registration policy.
+- [x] Reproduce the actual workspace formatting failure on three newly merged
+  files and manually apply only rustfmt's requested layout changes.
+- [x] Triage four UBS false positives: one query-parser token and three
+  diagnostic deduplication comparisons. Add the documented per-line reasons;
+  preserve both original red scans. Two unsuppressed credential controls remain
+  critical/exit1 in the same scanner fixture. Full six-file rescans finish0
+  with no failed modules; existing warnings remain unsuppressed.
+- [x] Verify recent activity refuses release and quiet directory activity
+  permits it; execute the existing activity/cancellation controls.
+  First corrected input47d9 executes36/36PASS,1249skipped,35.323s,
+  runcb70180f-f0eb-41d3-9cb3-73113498e61f. A subsequent fixture reread
+  corrects Windows directory timestamp handle rights. Final input467dd210
+  executes36/36PASS,1249skipped,47.705s, runcbc5dbb7-01f8-4d0c-9f2b-8b7077a0263c;
+  actual unique passing identities equal the36 required names. Linux evidence
+  only; no native Windows qualification claim.
+- [x] Resolve the merged code's actual Clippy failures directly: split the
+  first doc paragraph, distinguish request/runtime context names, invert an
+  equivalent conditional and preserve empty-value predicates with diagnostics.
+- [x] Complete final-source workspace all-target and strict Clippy checks.
+  Both0 on earlier81684718; final467dd210 strict Clippy0 (Cargo2m20s).
+  Final all-target115 request is queue_timeout103, zero compilation; a fresh
+  healthy129 probe/full disk guard admits its replacement, which completes0
+  (Cargo4m43s). No lint allowances or compiler policy changes.
+- [x] Complete separate production and workspace formatting checks on final
+  input467dd210; preserve capacity refusals separately from compiler results.
+  Production0 on114 (Cargo1m48s), actual six source hashes/lock match the
+  checkout. Workspace `cargo fmt --check` completes0 locally without compilation;
+  all compilation and native-test execution remain strict RCH. Final fixture
+  full-file UBS also0, no critical findings or failed modules.
+- [x] Reread all six source-file diffs again and compare tracker semantics:
+  only new br-epeb7 added to2870 existing issues; no old record changed.
+- [x] Prepare the scoped handoff: record the claimed defect's actual evidence,
+  verify tracker exports/cycles and review the exact publication diff. Record
+  commit, push and lease-release completion in the retained audit after execution.
+  Only br-epeb7 closes on its actual final native and mandatory gate evidence;
+  all2870 original issue records and their acceptance remain unchanged.
+
 ## November 14 merged-source review — EmeraldEagle, 03:01 UTC
 
 - [x] Reread the owned warmup, dispatch accounting, shutdown ownership and

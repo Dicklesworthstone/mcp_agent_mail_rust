@@ -881,6 +881,7 @@ impl ThreadExplorerScreen {
         if self
             .last_list_diagnostic_signature
             .as_ref()
+            // ubs:ignore — public diagnostic parameters used to deduplicate UI reports.
             .is_some_and(|prev| prev == &signature)
         {
             return;
@@ -1093,6 +1094,7 @@ impl ThreadExplorerScreen {
         if self
             .last_list_diagnostic_signature
             .as_ref()
+            // ubs:ignore — public diagnostic parameters used to deduplicate UI reports.
             .is_some_and(|prev| prev == &signature)
         {
             return;
@@ -1136,6 +1138,7 @@ impl ThreadExplorerScreen {
         if self
             .last_detail_diagnostic_signature
             .as_ref()
+            // ubs:ignore — public diagnostic parameters used to deduplicate UI reports.
             .is_some_and(|prev| prev == &signature)
         {
             return;
@@ -3083,7 +3086,11 @@ fn thread_recipients_by_message(
         let agent_name = read_thread_agent_label(&row, "agent_name", "raw_agent_id");
         let recipients = grouped.entry(message_id).or_default();
         recipients.is_unread |= row.get_named::<i64>("is_unread").ok().unwrap_or(0) != 0;
-        if !recipients.names.iter().any(|existing| existing == &agent_name) {
+        if !recipients
+            .names
+            .iter()
+            .any(|existing| existing == &agent_name)
+        {
             recipients.names.push(agent_name);
         }
     }
@@ -4264,9 +4271,9 @@ fn build_thread_tree_items(messages: &[ThreadMessage]) -> Vec<crate::tui_widgets
 
     let mut children_by_parent: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
     for message in messages {
-        let parent_id = message.reply_to_id.filter(|candidate| {
-            *candidate != message.id && message_by_id.contains_key(candidate)
-        });
+        let parent_id = message
+            .reply_to_id
+            .filter(|candidate| *candidate != message.id && message_by_id.contains_key(candidate));
         children_by_parent
             .entry(parent_id)
             .or_default()
@@ -4829,16 +4836,18 @@ mod tests {
              UPDATE messages SET ack_required = 1 WHERE id = 8;",
         )
         .expect("change receipts and flags without adding a message");
-        assert!(state.push_event(crate::tui_events::MailEvent::tool_call_end(
-            "mark_message_read",
-            1,
-            None,
-            1,
-            1.0,
-            Vec::new(),
-            Some("test-proj".to_string()),
-            Some("Receiver".to_string()),
-        )));
+        assert!(
+            state.push_event(crate::tui_events::MailEvent::tool_call_end(
+                "mark_message_read",
+                1,
+                None,
+                1,
+                1.0,
+                Vec::new(),
+                Some("test-proj".to_string()),
+                Some("Receiver".to_string()),
+            ))
+        );
         screen.last_refresh =
             Instant::now().checked_sub(Duration::from_secs(REFRESH_INTERVAL_SECS + 1));
         screen.tick(2, &state);
@@ -6167,10 +6176,9 @@ mod tests {
             ]
         );
         assert_eq!(messages[1].to_agents, "Receiver, OtherReader");
-        assert!(messages[4].to_agents.is_empty());
+        assert_eq!(messages[4].to_agents, "");
         assert_eq!(
-            unread_counts_by_thread(&conn, &["thread-hydrated".to_string()])
-                .get("thread-hydrated"),
+            unread_counts_by_thread(&conn, &["thread-hydrated".to_string()]).get("thread-hydrated"),
             Some(&2),
             "detail flags and the operator-wide thread count must agree"
         );
@@ -6941,7 +6949,7 @@ mod tests {
         assert_eq!(tree[0].message_id, 1);
         assert_eq!(tree[0].children.len(), 1);
         assert_eq!(tree[0].children[0].message_id, 2);
-        assert!(tree[0].children[0].children.is_empty());
+        assert_eq!(tree[0].children[0].children.len(), 0);
         assert_eq!(1 + count_descendants(&tree[0]), 2);
 
         let mut rows = Vec::new();
@@ -6963,7 +6971,7 @@ mod tests {
         let tree = build_thread_tree_items(&[msg]);
         assert_eq!(tree.len(), 1, "a self-reference must remain visible");
         assert_eq!(tree[0].message_id, 1);
-        assert!(tree[0].children.is_empty());
+        assert_eq!(tree[0].children.len(), 0);
     }
 
     #[test]

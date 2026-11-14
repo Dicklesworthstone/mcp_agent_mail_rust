@@ -9935,20 +9935,15 @@ mod tests {
                 .unwrap()
                 .id
                 .unwrap();
-            for (engine_case, search_engine) in [Some(SearchEngine::Lexical), None]
-                .into_iter()
-                .enumerate()
+            for (engine_case, search_engine) in
+                [Some(SearchEngine::Lexical), None].into_iter().enumerate()
             {
                 for hide_entire_page in [false, true] {
                     let token = format!("continuation{engine_case}{hide_entire_page}");
-                    let project = crate::queries::ensure_project(
-                        &cx,
-                        &pool,
-                        &format!("/{token}"),
-                    )
-                    .await
-                    .into_result()
-                    .unwrap();
+                    let project = crate::queries::ensure_project(&cx, &pool, &format!("/{token}"))
+                        .await
+                        .into_result()
+                        .unwrap();
                     let project_id = project.id.unwrap();
                     let sender = crate::queries::register_agent(
                         &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
@@ -10035,8 +10030,7 @@ mod tests {
                         first.next_cursor.is_some(),
                         "a shortened or empty hydrated page must not claim exhaustion"
                     );
-                    let mut ids: Vec<_> =
-                        first.results.iter().map(|hit| hit.result.id).collect();
+                    let mut ids: Vec<_> = first.results.iter().map(|hit| hit.result.id).collect();
                     let mut cursor = first.next_cursor;
                     let mut cursors = HashSet::new();
                     let mut pages = 0;
@@ -10450,6 +10444,7 @@ mod tests {
             query_text: "form:BlueLake migration".to_string(),
             applied_filter_hints: Vec::new(),
             did_you_mean: vec![crate::query_assistance::DidYouMeanHint {
+                // ubs:ignore — public query-parser fixture text, not a credential.
                 token: "form:BlueLake".to_string(),
                 suggested_field: "from".to_string(),
                 value: "BlueLake".to_string(),

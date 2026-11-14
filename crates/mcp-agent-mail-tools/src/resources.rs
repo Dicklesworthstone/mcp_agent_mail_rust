@@ -5184,6 +5184,7 @@ fn reservation_glob_walk_latest_micros(
     workspace: &Path,
     start_dir: &Path,
     matcher: &globset::GlobMatcher,
+    include_directory_activity: bool,
     keep_going: &mut dyn FnMut() -> bool,
 ) -> (bool, Option<i64>, bool) {
     let mut stack = vec![start_dir.to_path_buf()];
@@ -5196,9 +5197,25 @@ fn reservation_glob_walk_latest_micros(
         if !keep_going() {
             return (matched_any, fs_latest, true);
         }
-        if !std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+        let Ok(meta) = std::fs::symlink_metadata(&dir) else {
             incomplete = true;
             continue;
+        };
+        if !meta.is_dir() {
+            incomplete = true;
+            continue;
+        }
+        // Renaming a child preserves its file mtime and changes only its
+        // immediate directory. Literal directory leases cover that activity
+        // throughout the subtree, including directories with no files left.
+        if include_directory_activity {
+            if let Ok(modified) = meta.modified()
+                && let Some(micros) = reservation_system_time_to_micros(modified)
+            {
+                fs_latest = Some(fs_latest.map_or(micros, |previous| previous.max(micros)));
+            } else {
+                incomplete = true;
+            }
         }
         let Ok(read_dir) = std::fs::read_dir(&dir) else {
             incomplete = true;
@@ -5327,8 +5344,13 @@ pub(crate) fn reservation_compute_pattern_activity(
         }
 
         if !matched_paths && let Some(matcher) = reservation_glob_matcher(&normalized) {
-            let (fallback_matches, fallback_latest, _) =
-                reservation_glob_walk_latest_micros(workspace, workspace, &matcher, &mut || true);
+            let (fallback_matches, fallback_latest, _) = reservation_glob_walk_latest_micros(
+                workspace,
+                workspace,
+                &matcher,
+                false,
+                &mut || true,
+            );
             matched_paths = fallback_matches;
             fs_latest = fallback_latest;
         } else if !matched_paths {
@@ -5403,7 +5425,7 @@ fn reservation_path_metadata(
 }
 
 /// Filesystem activity for a literal reservation: its own mtime and the
-/// newest file mtime below a directory. Incomplete reads cannot prove quiet.
+/// newest file or directory mtime below it. Incomplete reads cannot prove quiet.
 fn reservation_literal_fs_activity(
     workspace: &Path,
     normalized: &str,
@@ -5430,6 +5452,7 @@ fn reservation_literal_fs_activity(
                 workspace,
                 &workspace.join(normalized),
                 &matcher,
+                true,
                 keep_going,
             );
             if let Some(latest) = latest {
@@ -5761,8 +5784,9 @@ pub(crate) fn reservation_compute_patterns_activity(
             if matched_paths {
                 (true, fs_latest, incomplete)
             } else if let Some(matcher) = reservation_glob_matcher(&normalized) {
-                let (matches, latest, partial) =
-                    reservation_glob_walk_latest_micros(workspace, workspace, &matcher, keep_going);
+                let (matches, latest, partial) = reservation_glob_walk_latest_micros(
+                    workspace, workspace, &matcher, false, keep_going,
+                );
                 (matches, latest, incomplete || partial)
             } else {
                 (false, None, true)
@@ -6367,6 +6391,7 @@ mod reservation_activity_tests {
             tmp.path(),
             &tmp.path().join("unavailable"),
             &matcher,
+            false,
             &mut || true,
         );
         assert!(incomplete, "failed directory reads cannot prove inactivity");
@@ -6387,16 +6412,35 @@ mod reservation_activity_tests {
             (false, None, true)
         );
         let matcher = reservation_glob_matcher("**/*.rs").expect("fixture glob");
-        let (_, _, incomplete) =
-            reservation_glob_walk_latest_micros(tmp.path(), tmp.path(), &matcher, &mut || true);
-        assert!(incomplete, "skipping a linked subtree leaves its activity unknown");
+        let (_, _, incomplete) = reservation_glob_walk_latest_micros(
+            tmp.path(),
+            tmp.path(),
+            &matcher,
+            false,
+            &mut || true,
+        );
+        assert!(
+            incomplete,
+            "skipping a linked subtree leaves its activity unknown"
+        );
 
         let names = tempfile::tempdir().expect("non-UTF8 fixture");
-        std::fs::write(names.path().join(OsString::from_vec(vec![0xff])), "activity")
-            .expect("non-UTF8 fixture file");
-        let (_, _, incomplete) =
-            reservation_glob_walk_latest_micros(names.path(), names.path(), &matcher, &mut || true);
-        assert!(incomplete, "lossy path conversion cannot establish a complete scan");
+        std::fs::write(
+            names.path().join(OsString::from_vec(vec![0xff])),
+            "activity",
+        )
+        .expect("non-UTF8 fixture file");
+        let (_, _, incomplete) = reservation_glob_walk_latest_micros(
+            names.path(),
+            names.path(),
+            &matcher,
+            false,
+            &mut || true,
+        );
+        assert!(
+            incomplete,
+            "lossy path conversion cannot establish a complete scan"
+        );
     }
 
     #[test]
@@ -7062,9 +7106,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         } else {
             stale_reasons.push(format!("no_recent_mail_activity>{grace_seconds}s"));
         }
-        if !workspace_available {
-            stale_reasons.push("workspace_unavailable".to_string());
-        } else {
+        if workspace_available {
             if pat_activity.fs_activity_incomplete {
                 stale_reasons.push("filesystem_activity_unknown".to_string());
             } else if recent_fs {
@@ -7081,6 +7123,8 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             } else {
                 stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
             }
+        } else {
+            stale_reasons.push("workspace_unavailable".to_string());
         }
 
         reservations.push(FileReservationResourceEntry {

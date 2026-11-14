@@ -31,7 +31,8 @@ use crate::messaging::{
 use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::resources::{
     RESERVATION_ACTIVITY_TIME_BUDGET, reservation_activity_blocking,
-    reservation_compute_patterns_activity, reservation_normalize_pattern, reservation_open_repo_root,
+    reservation_compute_patterns_activity, reservation_normalize_pattern,
+    reservation_open_repo_root,
 };
 #[cfg(test)]
 use crate::tool_util::get_db_pool;
@@ -3434,7 +3435,10 @@ pub async fn force_release_file_reservation(
     // Expiry already authorizes release; it must not wait on optional history
     // enrichment. An unexpired lease requires complete activity evidence.
     let (workspace_available, pattern_activity) = if is_expired {
-        (false, crate::resources::ReservationPatternActivity::default())
+        (
+            false,
+            crate::resources::ReservationPatternActivity::default(),
+        )
     } else {
         reservation_pattern_activity_for_project(
             ctx,
@@ -4120,7 +4124,9 @@ mod tests {
         crate::test_support::with_isolated_mailbox(
             &RESERVATION_TEST_LOCK,
             "reservation",
-            &[],
+            // Several activity probes intentionally register real tempdirs in
+            // this helper's private mailbox.
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
             |_| {
                 // Clear the test hooks even when `f` unwinds.
                 struct ClearHooks;
@@ -9750,7 +9756,11 @@ mod tests {
             true,
         )
         .await;
-        let conn = pool.acquire(cx).await.into_result().expect("fixture connection");
+        let conn = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("fixture connection");
         conn.execute_sync(
             "UPDATE agents SET last_active_ts = 1 WHERE id = ?",
             &[SqlValue::BigInt(holder.id.expect("holder id"))],
@@ -9771,15 +9781,25 @@ mod tests {
             .into_result()
             .expect("read preserved lease");
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].released_ts.is_none(), "lease must remain unreleased");
-        let conn = pool.acquire(cx).await.into_result().expect("ledger connection");
+        assert!(
+            rows[0].released_ts.is_none(),
+            "lease must remain unreleased"
+        );
+        let conn = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("ledger connection");
         let markers = conn
             .query_sync(
                 "SELECT reservation_id FROM file_reservation_releases WHERE reservation_id = ?",
                 &[SqlValue::BigInt(id)],
             )
             .expect("read release ledger");
-        assert!(markers.is_empty(), "refusal must not publish a release marker");
+        assert!(
+            markers.is_empty(),
+            "refusal must not publish a release marker"
+        );
     }
 
     fn force_release_history_fixture(tail: usize) -> tempfile::TempDir {
@@ -9797,7 +9817,9 @@ mod tests {
         let repo = git2::Repository::init_opts(dir.path(), &options).expect("fixture repo");
         let blob = repo.blob(b"fn target() {}\n").expect("fixture blob");
         let mut builder = repo.treebuilder(None).expect("fixture tree builder");
-        builder.insert("target.rs", blob, 0o100_644).expect("tree entry");
+        builder
+            .insert("target.rs", blob, 0o100_644)
+            .expect("tree entry");
         let tree_id = builder.write().expect("write fixture tree");
         let tree = repo.find_tree(tree_id).expect("fixture tree");
         let mut head = None;
@@ -9833,7 +9855,9 @@ mod tests {
         let repo = git2::Repository::init_opts(dir.path(), &options).expect("fixture repo");
         let blob = repo.blob(b"previous content\n").expect("fixture blob");
         let mut builder = repo.treebuilder(None).expect("fixture tree builder");
-        builder.insert("target.rs", blob, 0o100_644).expect("tree entry");
+        builder
+            .insert("target.rs", blob, 0o100_644)
+            .expect("tree entry");
         let first_tree_id = builder.write().expect("write initial tree");
         let first_tree = repo.find_tree(first_tree_id).expect("initial tree");
         let old_signature = git2::Signature::new(
@@ -9934,6 +9958,102 @@ mod tests {
     }
 
     #[test]
+    fn force_release_directory_lease_preserves_recent_nested_rename() {
+        for recent_rename in [true, false] {
+            with_serialized_reservations(|| {
+                let workspace = tempfile::tempdir().expect("directory workspace");
+                let root = workspace.path().join("src");
+                let nested = root.join("nested");
+                let original = nested.join("original.rs");
+                std::fs::create_dir_all(&nested).expect("nested directory");
+                std::fs::write(&original, "old file contents\n").expect("reserved descendant");
+                let old = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+                let mut timestamp_options = std::fs::OpenOptions::new();
+                timestamp_options.read(true);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt as _;
+                    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+                    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                    timestamp_options
+                        .access_mode(FILE_WRITE_ATTRIBUTES)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+                }
+                for path in [&original, &nested, &root] {
+                    timestamp_options
+                        .open(path)
+                        .expect("open fixture entry")
+                        .set_times(std::fs::FileTimes::new().set_modified(old))
+                        .expect("backdate fixture entry");
+                }
+                let current = if recent_rename {
+                    let renamed = nested.join("renamed.rs");
+                    std::fs::rename(&original, &renamed).expect("rename within reserved directory");
+                    assert!(
+                        std::fs::metadata(&nested).unwrap().modified().unwrap() > old,
+                        "the rename must change the nested directory timestamp"
+                    );
+                    renamed
+                } else {
+                    original
+                };
+                assert_eq!(
+                    std::fs::metadata(&current).unwrap().modified().unwrap(),
+                    old
+                );
+                assert_eq!(std::fs::metadata(&root).unwrap().modified().unwrap(), old);
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let fixture = inactive_force_release_fixture(
+                        &cx,
+                        &pool,
+                        &workspace.path().to_string_lossy(),
+                        "src",
+                    )
+                    .await;
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let result = force_release_file_reservation(
+                        &McpContext::new(cx.clone(), 1),
+                        fixture.project.human_key,
+                        fixture.actor.name,
+                        id,
+                        None,
+                        Some(false),
+                    )
+                    .await;
+                    if recent_rename {
+                        let data = result
+                            .expect_err("nested rename activity must preserve the live lease")
+                            .data
+                            .expect("refusal data");
+                        assert_eq!(data["error"]["type"], "RESERVATION_ACTIVE");
+                        assert!(
+                            data["error"]["data"]["stale_reasons"]
+                                .as_array()
+                                .expect("reasons")
+                                .contains(&json!("filesystem_activity_recent")),
+                            "{data}"
+                        );
+                        assert_force_release_preserves_claim(&cx, &pool, id).await;
+                    } else {
+                        let response: Value = serde_json::from_str(
+                            &result.expect("a quiet directory remains releasable"),
+                        )
+                        .expect("release response");
+                        assert_eq!(response["released"], 1, "{response}");
+                        let released = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                            .await
+                            .into_result()
+                            .expect("read quiet directory release");
+                        assert_eq!(released.len(), 1);
+                        assert!(released[0].released_ts.is_some_and(|ts| ts > 0));
+                    }
+                });
+            });
+        }
+    }
+
+    #[test]
     fn force_release_refuses_unavailable_workspace_but_releases_expired_lease() {
         with_serialized_reservations(|| {
             run_async(|cx| async move {
@@ -9969,7 +10089,11 @@ mod tests {
                 );
                 assert_force_release_preserves_claim(&cx, &pool, id).await;
 
-                let conn = pool.acquire(&cx).await.into_result().expect("expire connection");
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("expire connection");
                 conn.execute_sync(
                     "UPDATE file_reservations SET expires_ts = 1 WHERE id = ?",
                     &[SqlValue::BigInt(id)],
@@ -10140,7 +10264,11 @@ mod tests {
                 .await;
                 let id = fixture.reservation.id.expect("reservation id");
                 let holder_id = fixture.holder.id.expect("holder id");
-                let conn = pool.acquire(&cx).await.into_result().expect("orphan connection");
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("orphan connection");
                 conn.execute_sync(
                     "DELETE FROM agents WHERE id = ?",
                     &[SqlValue::BigInt(holder_id)],
@@ -10203,7 +10331,11 @@ mod tests {
                     )
                     .await;
                     let id = fixture.reservation.id.expect("reservation id");
-                    let conn = pool.acquire(&cx).await.into_result().expect("fixture connection");
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("fixture connection");
                     conn.execute_sync(
                         "UPDATE agents SET reaper_exempt = ? WHERE id = ?",
                         &[
@@ -10231,7 +10363,7 @@ mod tests {
                         .await
                         .into_result()
                         .expect("automatic reaper respects exemption");
-                        assert!(automatic.is_empty());
+                        assert_eq!(automatic, [] as [i64; 0]);
                         assert_force_release_preserves_claim(&cx, &pool, id).await;
                     }
                     let response = force_release_file_reservation(
@@ -10309,7 +10441,7 @@ mod tests {
                     );
                     let ctx = McpContext::new(cx.clone(), 1);
                     let competing_cx = cx.clone();
-                    let competing_ctx = ctx.clone();
+                    let competing_request = ctx.clone();
                     let competing_pool = get_db_pool().expect("competing connection pool");
                     AFTER_FORCE_RELEASE_ACTIVITY.with_borrow_mut(|hook| {
                         *hook = Some(Box::pin(async move {
@@ -10400,7 +10532,7 @@ mod tests {
                                     .expect("replace observed lease identity without changing expiry");
                                 }
                                 "cancel" => {
-                                    competing_ctx.request_cancellation().cancel();
+                                    competing_request.request_cancellation().cancel();
                                 }
                                 _ => unreachable!("known competing action"),
                             }

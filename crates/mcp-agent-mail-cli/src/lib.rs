@@ -46853,7 +46853,9 @@ mod service_status {
                 (vec!["am", "service", "status", "--json"], true),
             ] {
                 let cli = crate::Cli::try_parse_from(args).expect("service status arguments");
-                assert!(!crate::command_requires_trusted_user_env(cli.command.as_ref()));
+                assert!(!crate::command_requires_trusted_user_env(
+                    cli.command.as_ref()
+                ));
                 assert!(matches!(
                     cli.command,
                     Some(crate::Commands::Service {
@@ -46993,8 +46995,7 @@ mod service_status {
 
         #[test]
         fn launchd_missing_service_is_distinct_from_an_unavailable_manager() {
-            let stderr =
-                "Bad request.\nCould not find service \"com.agent-mail\" in domain for user gui: 501";
+            let stderr = "Bad request.\nCould not find service \"com.agent-mail\" in domain for user gui: 501";
             for (installed, expected) in [
                 (Some(false), "not_installed"),
                 (Some(true), "not_loaded"),
