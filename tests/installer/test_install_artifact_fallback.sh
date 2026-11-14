@@ -23,6 +23,10 @@ if [ -z "$minisign_bin" ] || [ ! -x "$minisign_bin" ]; then
     echo "FATAL: real minisign is required for installer release replay regressions (apt install minisign or brew install minisign)" >&2
     exit 2
 fi
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "FATAL: real Cargo metadata is required for source dependency boundary regressions" >&2
+    exit 2
+fi
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 step() { echo "[ARTIFACT_FALLBACK_TEST $(ts)] $*" >&2; }
@@ -74,9 +78,7 @@ extract_function() {
     echo 'SOURCE_INSTALL_RECEIPT_ENABLED=0'
     echo 'SOURCE_INSTALL_RELEASE_TAG='
     echo 'SOURCE_INSTALL_COMMIT='
-    echo 'SOURCE_INSTALL_FRANKENSEARCH_COMMIT='
-    echo 'SOURCE_INSTALL_FAST_CMAES_COMMIT='
-    echo 'SOURCE_INSTALL_BEADS_RUST_COMMIT='
+    echo 'SOURCE_INSTALL_CARGO_LOCK_SHA256='
     echo 'TXN_NONCE='
     echo 'TXN_HAD_SERVER='
     echo 'TXN_HAD_CLI='
@@ -137,6 +139,8 @@ extract_function() {
     extract_function ensure_real_directory_tree
     extract_function ensure_real_file_target_path
     extract_function file_sha256_hex
+    extract_function source_dependency_lock_sha256
+    extract_function validate_source_dependency_paths
     extract_function installer_path_mode
     extract_function installer_path_link_count
     extract_function installer_entry_exists
@@ -1659,13 +1663,110 @@ if find "$normal_dir" -maxdepth 2 -name 'source-receipt*' | grep -q .; then
     exit 1
 fi
 
+source_lock_root="$transaction_root/cases/source-lock"
+mkdir -p "$source_lock_root/valid"
+cp "$REPO_ROOT/Cargo.lock" "$source_lock_root/valid/Cargo.lock"
+source_lock_hash=$(EXTRACT="$extract" SOURCE_ROOT="$source_lock_root/valid" bash -c '
+    set -euo pipefail
+    source "$EXTRACT"
+    source_dependency_lock_sha256 "$SOURCE_ROOT"
+')
+if command -v sha256sum >/dev/null 2>&1; then
+    expected_lock_hash=$(sha256sum "$REPO_ROOT/Cargo.lock" | awk '{print $1}')
+else
+    expected_lock_hash=$(shasum -a 256 "$REPO_ROOT/Cargo.lock" | awk '{print $1}')
+fi
+[ "$source_lock_hash" = "$expected_lock_hash" ] || {
+    echo "FAIL: source dependency digest does not bind the actual Cargo.lock bytes" >&2
+    exit 1
+}
+for invalid_lock in missing empty symlink; do
+    mkdir -p "$source_lock_root/$invalid_lock"
+    case "$invalid_lock" in
+        empty) : >"$source_lock_root/$invalid_lock/Cargo.lock" ;;
+        symlink) ln -s "$REPO_ROOT/Cargo.lock" "$source_lock_root/$invalid_lock/Cargo.lock" ;;
+    esac
+    if EXTRACT="$extract" SOURCE_ROOT="$source_lock_root/$invalid_lock" bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        source_dependency_lock_sha256 "$SOURCE_ROOT"
+    '; then
+        echo "FAIL: source dependency digest accepted a $invalid_lock lockfile" >&2
+        exit 1
+    fi
+done
+
+source_paths_root="$transaction_root/cases/source-paths space-ü"
+for parser in python perl; do
+    parser_dir="$source_paths_root/parser-$parser"
+    mkdir -p "$parser_dir"
+    case "$parser" in
+        python) ln -s "$(type -P python3)" "$parser_dir/python3" ;;
+        perl) ln -s "$(type -P perl)" "$parser_dir/perl" ;;
+    esac
+done
+for shape in internal external symlink; do
+    source_root="$source_paths_root/$shape"
+    dependency_root="$source_root/dependency"
+    dependency_path=dependency
+    if [ "$shape" != internal ]; then
+        dependency_root="$source_root-sibling"
+        dependency_path="../$shape-sibling"
+    fi
+    mkdir -p "$source_root/src" "$dependency_root/src"
+    if [ "$shape" = symlink ]; then
+        ln -s "$dependency_root" "$source_root/dependency"
+        dependency_path=dependency
+    fi
+    printf '[package]\nname = "source_path_fixture"\nversion = "0.0.0"\nedition = "2021"\n[workspace]\nexclude = ["dependency"]\n[dependencies]\nsource_path_dep = { path = "%s" }\n' \
+        "$dependency_path" >"$source_root/Cargo.toml"
+    printf '[package]\nname = "source_path_dep"\nversion = "0.0.0"\nedition = "2021"\n[workspace]\n' \
+        >"$dependency_root/Cargo.toml"
+    printf 'pub fn fixture() {}\n' >"$source_root/src/lib.rs"
+    printf 'pub fn dependency() {}\n' >"$dependency_root/src/lib.rs"
+    cargo generate-lockfile --offline --manifest-path "$source_root/Cargo.toml"
+    cargo metadata --locked --offline --format-version 1 \
+        --manifest-path "$source_root/Cargo.toml" >"$source_root/metadata.json"
+    for parser in python perl; do
+        accepted=0
+        if PATH="$source_paths_root/parser-$parser" EXTRACT="$extract" \
+            SOURCE_ROOT="$source_root" METADATA="$source_root/metadata.json" "$BASH" -c '
+                set -euo pipefail
+                source "$EXTRACT"
+                validate_source_dependency_paths "$SOURCE_ROOT" "$METADATA"
+            '; then accepted=1; fi
+        if { [ "$shape" = internal ] && [ "$accepted" -ne 1 ]; } || \
+            { [ "$shape" != internal ] && [ "$accepted" -ne 0 ]; }; then
+            echo "FAIL: $parser dependency verification returned $accepted for $shape real Cargo graph" >&2
+            exit 1
+        fi
+    done
+done
+for malformed in missing-packages empty-packages; do
+    case "$malformed" in
+        missing-packages) printf '{}\n' >"$source_paths_root/$malformed.json" ;;
+        empty-packages) printf '{"packages":[]}\n' >"$source_paths_root/$malformed.json" ;;
+    esac
+    for parser in python perl; do
+        if PATH="$source_paths_root/parser-$parser" EXTRACT="$extract" \
+            SOURCE_ROOT="$source_paths_root/internal" METADATA="$source_paths_root/$malformed.json" "$BASH" -c '
+                set -euo pipefail
+                source "$EXTRACT"
+                validate_source_dependency_paths "$SOURCE_ROOT" "$METADATA"
+            '; then
+            echo "FAIL: $parser accepted $malformed dependency metadata" >&2
+            exit 1
+        fi
+    done
+done
+
 source_receipt_dir="$transaction_root/cases/source-receipt"
 source_receipt_archive_path_file="$transaction_root/cases/source-receipt-archive-path"
 mkdir -p "$source_receipt_dir"
 cp "$transaction_root/old/am" "$source_receipt_dir/am"
 cp "$transaction_root/old/mcp-agent-mail" "$source_receipt_dir/mcp-agent-mail"
 EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_receipt_dir" \
-    ARCHIVE_PATH_FILE="$source_receipt_archive_path_file" bash -c '
+    SOURCE_LOCK_HASH="$source_lock_hash" ARCHIVE_PATH_FILE="$source_receipt_archive_path_file" bash -c '
         set -euo pipefail
         source "$EXTRACT"
         BIN_CLI=am
@@ -1675,9 +1776,7 @@ EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_recei
         SOURCE_INSTALL_RECEIPT_ENABLED=1
         SOURCE_INSTALL_RELEASE_TAG=v9.9.9
         SOURCE_INSTALL_COMMIT=1111111111111111111111111111111111111111
-        SOURCE_INSTALL_FRANKENSEARCH_COMMIT=2222222222222222222222222222222222222222
-        SOURCE_INSTALL_FAST_CMAES_COMMIT=3333333333333333333333333333333333333333
-        SOURCE_INSTALL_BEADS_RUST_COMMIT=4444444444444444444444444444444444444444
+        SOURCE_INSTALL_CARGO_LOCK_SHA256="$SOURCE_LOCK_HASH"
         install_binary_pair_transactional "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR"
         validate_binary_transaction_source_receipt "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH"
         printf "%s\n" "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH" >"$ARCHIVE_PATH_FILE"
@@ -1701,19 +1800,48 @@ source_cli_hash=$(EXTRACT="$extract" SOURCE_PATH="$transaction_root/new/am" bash
 ')
 source_receipt_expected="$transaction_root/cases/source-receipt.expected"
 printf '%s\n' \
-    'schema=1' \
+    'schema=2' \
     'install_method=exact-tag-source' \
     'release_tag=v9.9.9' \
     'source_commit=1111111111111111111111111111111111111111' \
-    'frankensearch_commit=2222222222222222222222222222222222222222' \
-    'fast_cmaes_commit=3333333333333333333333333333333333333333' \
-    'beads_rust_commit=4444444444444444444444444444444444444444' \
+    "cargo_lock_sha256=$source_lock_hash" \
     "server_sha256=$source_server_hash" \
     "cli_sha256=$source_cli_hash" >"$source_receipt_expected"
 if ! cmp -s "$source_receipt_expected" "$source_receipt_archive/source-receipt"; then
-    echo "FAIL: committed source receipt did not bind the exact tag, revisions, and pair hashes" >&2
+    echo "FAIL: committed source receipt did not bind the exact tag, source, lockfile, and pair hashes" >&2
     exit 1
 fi
+
+for malformed_receipt in invalid-lock obsolete-schema; do
+    malformed_dir="$transaction_root/cases/source-receipt-$malformed_receipt"
+    mkdir -p "$malformed_dir"
+    case "$malformed_receipt" in
+        invalid-lock)
+            sed 's/^cargo_lock_sha256=.*/cargo_lock_sha256=invalid/' \
+                "$source_receipt_archive/source-receipt" >"$malformed_dir/source-receipt" ;;
+        obsolete-schema)
+            sed 's/^schema=2$/schema=1/' \
+                "$source_receipt_archive/source-receipt" >"$malformed_dir/source-receipt" ;;
+    esac
+    malformed_hash=$(EXTRACT="$extract" SOURCE_PATH="$malformed_dir/source-receipt" bash -c '
+        source "$EXTRACT"
+        file_sha256_hex "$SOURCE_PATH"
+    ')
+    printf '%s\n' "$malformed_hash" >"$malformed_dir/source-receipt.sha256"
+    chmod 600 "$malformed_dir/source-receipt" "$malformed_dir/source-receipt.sha256"
+    if EXTRACT="$extract" RECEIPT_DIR="$malformed_dir" RECEIPT_HASH="$malformed_hash" \
+        SERVER_HASH="$source_server_hash" CLI_HASH="$source_cli_hash" bash -c '
+            set -euo pipefail
+            source "$EXTRACT"
+            TXN_SOURCE_RECEIPT_HASH="$RECEIPT_HASH"
+            TXN_NEW_SERVER_HASH="$SERVER_HASH"
+            TXN_NEW_CLI_HASH="$CLI_HASH"
+            validate_binary_transaction_source_receipt "$RECEIPT_DIR"
+        '; then
+        echo "FAIL: source receipt accepted $malformed_receipt with a valid hash witness" >&2
+        exit 1
+    fi
+done
 
 source_receipt_extra_dir="$transaction_root/cases/source-receipt-extra-field"
 mkdir -p "$source_receipt_extra_dir"
@@ -1747,7 +1875,7 @@ mkdir -p "$source_receipt_corrupt_dir"
 cp "$transaction_root/old/am" "$source_receipt_corrupt_dir/am"
 cp "$transaction_root/old/mcp-agent-mail" "$source_receipt_corrupt_dir/mcp-agent-mail"
 if EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_receipt_corrupt_dir" \
-    bash -c '
+    SOURCE_LOCK_HASH="$source_lock_hash" bash -c '
         set -euo pipefail
         source "$EXTRACT"
         BIN_CLI=am
@@ -1757,9 +1885,7 @@ if EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_re
         SOURCE_INSTALL_RECEIPT_ENABLED=1
         SOURCE_INSTALL_RELEASE_TAG=v9.9.9
         SOURCE_INSTALL_COMMIT=1111111111111111111111111111111111111111
-        SOURCE_INSTALL_FRANKENSEARCH_COMMIT=2222222222222222222222222222222222222222
-        SOURCE_INSTALL_FAST_CMAES_COMMIT=3333333333333333333333333333333333333333
-        SOURCE_INSTALL_BEADS_RUST_COMMIT=4444444444444444444444444444444444444444
+        SOURCE_INSTALL_CARGO_LOCK_SHA256="$SOURCE_LOCK_HASH"
         install_binary_pair_transactional \
             "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR" prepared
     '; then
@@ -1791,7 +1917,7 @@ mkdir -p "$source_receipt_missing_dir"
 cp "$transaction_root/old/am" "$source_receipt_missing_dir/am"
 cp "$transaction_root/old/mcp-agent-mail" "$source_receipt_missing_dir/mcp-agent-mail"
 if EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_receipt_missing_dir" \
-    bash -c '
+    SOURCE_LOCK_HASH="$source_lock_hash" bash -c '
         set -euo pipefail
         source "$EXTRACT"
         BIN_CLI=am
@@ -1801,9 +1927,7 @@ if EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_re
         SOURCE_INSTALL_RECEIPT_ENABLED=1
         SOURCE_INSTALL_RELEASE_TAG=v9.9.9
         SOURCE_INSTALL_COMMIT=1111111111111111111111111111111111111111
-        SOURCE_INSTALL_FRANKENSEARCH_COMMIT=2222222222222222222222222222222222222222
-        SOURCE_INSTALL_FAST_CMAES_COMMIT=3333333333333333333333333333333333333333
-        SOURCE_INSTALL_BEADS_RUST_COMMIT=4444444444444444444444444444444444444444
+        SOURCE_INSTALL_CARGO_LOCK_SHA256="$SOURCE_LOCK_HASH"
         install_binary_pair_transactional \
             "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR" prepared
     '; then
@@ -2044,9 +2168,11 @@ fi
 
 for source_control in \
     'fetch --quiet --depth 1 origin "refs/tags/${release_tag}"' \
-    'release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT' \
-    'release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT' \
-    'release_dependency_pin "$TMP/src" BEADS_RUST_COMMIT' \
+    'source_lock_hash=$(source_dependency_lock_sha256 "$TMP/src")' \
+    'built_lock_hash=$(source_dependency_lock_sha256 "$TMP/src")' \
+    '[ "$built_lock_hash" != "$source_lock_hash" ]' \
+    'cargo metadata --locked --format-version 1' \
+    'validate_source_dependency_paths "$TMP/src" "$TMP/source-metadata.json"' \
     'CARGO_TARGET_DIR="$source_target_dir"' \
     'cargo build --locked --release -p mcp-agent-mail -p mcp-agent-mail-cli' \
     'The installer will not silently substitute a source build.'; do
@@ -2055,6 +2181,10 @@ for source_control in \
         exit 1
     fi
 done
+if grep -Eq 'checkout_pinned_dependency|release_dependency_pin|frankensearch-rel-0332' "$INSTALL_SH"; then
+    echo "FAIL: source installation still provisions unused sibling checkouts" >&2
+    exit 1
+fi
 if grep -Fq 'binary-download:fallback_to_source' "$INSTALL_SH"; then
     echo "FAIL: release archive failure still silently changes into a source build" >&2
     exit 1

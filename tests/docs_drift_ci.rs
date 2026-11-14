@@ -23,6 +23,7 @@ mod container_release_contract {
     fn read(relative: &str) -> String {
         let path = workspace_root().join(relative);
         fs::read_to_string(&path)
+            // ubs:ignore — fail this test if its required repository fixture cannot be read.
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
     }
 
@@ -363,9 +364,6 @@ mod dist_release_contract {
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
     const SETUP_ZIG_ACTION: &str = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29";
-    // Must match the `BEADS_RUST_COMMIT` env pin in .github/workflows/dist.yml
-    // (beads_rust 0.5.4 source, pinned in 4e8c661a).
-    const BEADS_RUST_COMMIT: &str = "ba6ff75da25529c8cad8395352f5c5fc2162ee95";
     const RELEASE_TARGETS: [&str; 6] = [
         "x86_64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
@@ -394,6 +392,7 @@ mod dist_release_contract {
     fn read_workflow() -> String {
         let path = workspace_root().join(".github/workflows/dist.yml");
         fs::read_to_string(&path)
+            // ubs:ignore — fail this test if its required release workflow cannot be read.
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
     }
 
@@ -537,6 +536,10 @@ mod dist_release_contract {
             "            target: x86_64-pc-windows-msvc",
         );
         require_once(workflow, exact_matrix)?;
+        require_once(
+            workflow,
+            "    runs-on: ${{ matrix.os }}\n    timeout-minutes: 180\n    defaults:\n      run:\n        shell: bash",
+        )?;
         require_exactly(workflow, "            target: ", RELEASE_TARGETS.len())?;
         for target in RELEASE_TARGETS {
             require_once(workflow, &format!("            target: {target}"))?;
@@ -728,7 +731,30 @@ mod dist_release_contract {
             "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
             2,
         )?;
-        require_exactly(workflow, "set -euo pipefail", 19)?;
+        for step in workflow.split("\n      - ").skip(1) {
+            let mut powershell = false;
+            let mut lines = step.lines();
+            while let Some(line) = lines.next() {
+                let trimmed = line.trim();
+                powershell |= trimmed == "shell: pwsh";
+                let Some(run) = trimmed.strip_prefix("run:") else {
+                    continue;
+                };
+                if run.trim().starts_with('|') || run.trim().starts_with('>') {
+                    let expected = if powershell {
+                        "$ErrorActionPreference = \"Stop\""
+                    } else {
+                        "set -euo pipefail"
+                    };
+                    let first_command =
+                        lines.find(|body| !body.trim().is_empty() && !body.trim().starts_with('#'));
+                    if first_command.is_none_or(|body| body.trim() != expected) {
+                        return Err(format!("multiline release step must start with {expected}"));
+                    }
+                }
+                break;
+            }
+        }
         require_exactly(workflow, "assert_glibc_floor() {", 2)?;
         require_exactly(
             workflow,
@@ -909,17 +935,19 @@ mod dist_release_contract {
             workflow,
             "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
         )?;
-        require_once(workflow, &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"))?;
-        require_exactly(
-            workflow,
-            "# Retain this pin for the installer's source-receipt contract.",
-            3,
-        )?;
-        require_exactly(
-            workflow,
-            "checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust \"$BEADS_RUST_COMMIT\"",
-            3,
-        )?;
+        for obsolete in [
+            "checkout_pinned",
+            "../frankensearch-rel-0332",
+            "../fast_cmaes",
+            "../beads_rust",
+        ] {
+            if workflow.contains(obsolete) {
+                return Err(format!(
+                    "release workflow still provisions unused sibling: {obsolete}"
+                ));
+            }
+        }
+        require_once(workflow, "git config --global core.longpaths true")?;
         require_in_order(
             workflow,
             &[
@@ -1053,6 +1081,24 @@ mod dist_release_contract {
             mutate(&workflow, "set -euo pipefail", "set -eu"),
             mutate(
                 &workflow,
+                "    defaults:\n      run:\n        shell: bash",
+                "    defaults:\n      run:\n        shell: pwsh",
+            ),
+            {
+                let mut compensated = mutate(
+                    &workflow,
+                    "      - name: Configure Git long paths\n        shell: bash\n        run: |\n          set -euo pipefail",
+                    "      - name: Configure Git long paths\n        shell: bash\n        run: |\n          : # strict mode removed",
+                );
+                compensated.push_str("\n# set -euo pipefail\n");
+                assert_eq!(
+                    compensated.matches("set -euo pipefail").count(),
+                    workflow.matches("set -euo pipefail").count()
+                );
+                compensated
+            },
+            mutate(
+                &workflow,
                 "needs: [release_contract, lint, test, build, linux_portability]",
                 "needs: [release_contract, build]",
             ),
@@ -1119,8 +1165,8 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                BEADS_RUST_COMMIT,
-                "b5dc5444270d82218e8de6bb4c6320731e0bdd00",
+                "- name: Configure Git long paths",
+                "- name: checkout_pinned obsolete sibling",
             ),
             mutate(
                 &workflow,
@@ -1504,6 +1550,7 @@ mod notify_acfs_contract {
     fn read_workflow() -> String {
         let path = workspace_root().join(".github/workflows/notify-acfs.yml");
         fs::read_to_string(&path)
+            // ubs:ignore — fail this test if its required notification workflow cannot be read.
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
     }
 

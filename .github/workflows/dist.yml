@@ -13,11 +13,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Release sibling path dependencies are pinned so rerunning a tag resolves
-  # the same source bytes even after their default branches advance.
+  # Keep the optional search revision aligned with Cargo.toml and Cargo.lock.
+  # Cargo resolves all external dependencies; no sibling checkout is needed.
   FRANKENSEARCH_COMMIT: 616c9a7a6bdada97d81f760808996911ba3be294
-  FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
-  BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
   CARGO_ZIGBUILD_VERSION: '0.23.3'
   LINUX_GLIBC_FLOOR: '2.28'
 
@@ -117,36 +115,6 @@ jobs:
           ref: ${{ needs.release_contract.outputs.revision }}
           persist-credentials: false
 
-      - name: Checkout pinned sibling dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          checkout_pinned() {
-            local repo_url="$1"
-            local destination="$2"
-            local expected_commit="$3"
-            local actual_commit
-
-            git init --quiet "$destination"
-            git -C "$destination" remote add origin "$repo_url"
-            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
-            git -C "$destination" checkout --quiet --detach FETCH_HEAD
-            actual_commit="$(git -C "$destination" rev-parse HEAD)"
-            if [ "$actual_commit" != "$expected_commit" ]; then
-              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
-              exit 1
-            fi
-          }
-
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
-          # frankensearch's tools/optimize_params workspace member depends on
-          # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Retain this pin for the installer's source-receipt contract.
-          # Compiled beads_rust resolves from the registry via Cargo.lock.
-          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
@@ -187,36 +155,6 @@ jobs:
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
           persist-credentials: false
-
-      - name: Checkout pinned sibling dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          checkout_pinned() {
-            local repo_url="$1"
-            local destination="$2"
-            local expected_commit="$3"
-            local actual_commit
-
-            git init --quiet "$destination"
-            git -C "$destination" remote add origin "$repo_url"
-            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
-            git -C "$destination" checkout --quiet --detach FETCH_HEAD
-            actual_commit="$(git -C "$destination" rev-parse HEAD)"
-            if [ "$actual_commit" != "$expected_commit" ]; then
-              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
-              exit 1
-            fi
-          }
-
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
-          # frankensearch's tools/optimize_params workspace member depends on
-          # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Retain this pin for the installer's source-receipt contract.
-          # Compiled beads_rust resolves from the registry via Cargo.lock.
-          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -263,6 +201,9 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -270,39 +211,15 @@ jobs:
           ref: ${{ needs.release_contract.outputs.revision }}
           persist-credentials: false
 
-      - name: Checkout pinned sibling dependencies
+      - name: Configure Git long paths
         shell: bash
         run: |
           set -euo pipefail
 
           # Windows MAX_PATH (260 chars) trips on frankensqlite's perf-fixture
-          # paths; enable git's long-path support before creating sibling
-          # checkouts. No-op on Unix runners (the setting is harmless).
+          # paths; enable long paths before Cargo fetches Git dependencies.
+          # No-op on Unix runners (the setting is harmless).
           git config --global core.longpaths true
-          checkout_pinned() {
-            local repo_url="$1"
-            local destination="$2"
-            local expected_commit="$3"
-            local actual_commit
-
-            git init --quiet "$destination"
-            git -C "$destination" remote add origin "$repo_url"
-            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
-            git -C "$destination" checkout --quiet --detach FETCH_HEAD
-            actual_commit="$(git -C "$destination" rev-parse HEAD)"
-            if [ "$actual_commit" != "$expected_commit" ]; then
-              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
-              exit 1
-            fi
-          }
-
-          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch-rel-0332 "$FRANKENSEARCH_COMMIT"
-          # frankensearch's tools/optimize_params workspace member depends on
-          # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # Retain this pin for the installer's source-receipt contract.
-          # Compiled beads_rust resolves from the registry via Cargo.lock.
-          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05

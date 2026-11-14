@@ -129,6 +129,13 @@ strip = true        # Remove debug symbols
 
 ### Release Coordination
 
+Explicit `install.sh --from-source` and release builds use Cargo.lock directly,
+without sibling checkouts. Source-install receipts bind its SHA-256 alongside
+the exact tag, source commit and both binary hashes; the lockfile must stay
+unchanged through the locked build. Full Cargo metadata must show that every
+local path dependency resolves inside the tagged checkout, including through
+symlinks; Python 3 or Perl with JSON::PP performs that verification.
+
 Whenever the `mcp_agent_mail_rust` version changes, you must also refresh the pinned installer checksums in `/dp/agentic_coding_flywheel_setup`, even if you expect the `mcp_agent_mail` hash to stay the same.
 
 ```bash

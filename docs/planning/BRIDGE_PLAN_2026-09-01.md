@@ -1,5 +1,67 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 source-install dependency wiring — EmeraldEagle, 12:15 UTC
+
+- [x] Reread the last six source diffs and activity/release callers; no new
+  defect established in3c56ade7. Preserve the earlier exact36-case qualification.
+- [x] Triage ready Beads and inspect real quarantine call sites; existing safe
+  helpers are already wired. Continue owned br-ku0kl's concrete installer gap.
+- [x] Replace obsolete sibling provenance with the exact Cargo.lock digest;
+  retain exact tag, source commit, both binary hashes and transaction authority.
+- [x] Remove unused sibling fetches from explicit source installation and
+  three dist build lanes; preserve locked Cargo and Windows long-path setup.
+- [x] Update source-install documentation and existing behavioral controls.
+  Keep original wrong-version, tamper, interrupt and rollback assertions intact.
+- [x] Execute positive source-receipt publication and negative controls with
+  the real filesystem/Minisign; label synthetic binary/version fixtures accurately.
+  First attempt1 misses two old fixture variable sets; corrected full script0.
+  New lockfile and valid-witness malformed-receipt controls execute alongside
+  the unchanged version, tamper, interruption and rollback assertions.
+- [x] Correct the final reread's external-path gap: --locked does not pin
+  mutable path dependency contents. Validate full resolved Cargo metadata
+  before building; require physical containment beneath the tagged checkout.
+  Both Python and Perl pass real offline Cargo internal/external/symlink
+  cases on a Unicode/space path and reject missing/empty package metadata.
+  Preserve installer3's heredoc fixture-extraction failure; indentation fixes
+  only extraction, and installer4 executes the entire script successfully.
+  Installer5 also passes after strengthening both escape fixtures to share
+  the source directory's text prefix, preserving the physical boundary check.
+- [x] Fix the native cohort's actual obsolete strict-mode count failure:
+  native1 runs14, passes13 and fails1 because two unused fetch steps are gone
+  (17 strict-mode commands, old guard expected19). Replace the count with a
+  per-step first-command check; retain existing mutations and add a removed
+  strict-mode control with a compensating comment that preserves the count.
+- [x] Make the mixed-platform build job's Bash shell explicit; retain the
+  Windows zip step's PowerShell override and guard both against regression.
+- [x] Run changed-file scans, shell/workflow validation, native docs checks
+  and required workspace compiler/production/Clippy/fmt checks on frozen input.
+- [x] Reread implementation and validation changes; retain actual failed or
+  refused attempts and keep original release/platform acceptance open.
+  Earlier58e3baad all-target0 (Cargo2m10s), production0 (1m59s), strict
+  Clippy0 (2m36s), formatting0; native1's actual13/1 result stays retained.
+  Intermediatea4e5672d all-target0/19.89s, production0/2.98s, Clippy0/29.86s.
+  Final frozen2220c401 native2 executes14/14PASS,69skipped,1.118s,
+  run1e3fcabf-d1b2-4e57-a1b1-bdf1229b382c; exact unique identities match
+  the predeclared cohort. Cargo compilation56.18s on129; no platform claim.
+  Final all-target0/3.34s, production0/0.51s, strict Clippy0/3.32s on114;
+  workspace fmt0, Actionlint0 and complete Rust/Bash UBS0, no failed modules.
+  Rust's48 warnings/115 infos remain visible; Bash2files has no findings.
+  Actionlint0; full ShellCheck48 findings exactly match baseline, none suppressed.
+  Three expected test-fixture panics have precise UBS reasons; full rescan0,
+  while an unsuppressed runtime panic remains critical/exit1 in the control.
+  After boundary tests, ShellCheck51 includes six intentional literal-source
+  infos replacing three old-pin infos; none are suppressed. Static inspection
+  finds all34 paths in13 workspace manifests inside the checkout. The optional
+  remote resolved-graph probe is blocked by DCG and earns no evidence credit.
+- [ ] Pair upstream publication with the canonical ACFS checksum refresh;
+  current consumer exactly pins old installer16c12f59. Preserve other entries
+  and run its required external checker; no Actions enablement or dispatch.
+  External checker built through strict RCH; current-policy validate/list/
+  check--dry-run--local all0,48 planned installers and zero executed. ACFS
+  clean checkout fast-forwarded to da040b35; JSONL import completed after pull.
+- [ ] Flush/preserve tracker exports, check cycles and exact staged diff,
+  publish one coherent change, verify remote refs and release only own leases.
+
 ## November 14 nested-directory activity review — EmeraldEagle, 09:30 UTC
 
 - [x] Reread recent changes and their callers; inspect ready Beads and retain
